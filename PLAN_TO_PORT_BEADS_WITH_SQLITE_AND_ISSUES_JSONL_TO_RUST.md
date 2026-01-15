@@ -1278,6 +1278,122 @@ nursery = { level = "warn", priority = -1 }
 
 ---
 
+## New Features Beyond bd Parity
+
+These features do NOT exist in legacy beads and represent genuine additions in `br`:
+
+### 1. Local History Backup (.br_history/)
+
+**Already documented above.** Automatic timestamped backups of `issues.jsonl` with rotation.
+
+### 2. Bulk Update Operations
+
+Legacy `bd` can batch-close issues but cannot batch-update other fields.
+
+```bash
+# Update multiple issues at once
+br update bd-1 bd-2 bd-3 --status in_progress
+br update bd-1 bd-2 bd-3 --assignee alice --priority 1
+br update bd-1 bd-2 bd-3 --add-label urgent
+```
+
+**Implementation:**
+- Accept multiple issue IDs as positional arguments
+- Apply the same field changes to all
+- Report per-issue success/failure
+- Mark all as dirty for export
+
+### 3. Saved Queries (Named Filters)
+
+No persistent filter storage in legacy beads. Users must re-type complex queries.
+
+```bash
+# Save a query
+br query save my-bugs --assignee=me --type=bug --status=open
+br query save urgent-backend --label=backend --priority=0,1
+
+# Run a saved query
+br query run my-bugs
+br query run urgent-backend --format=json
+
+# List saved queries
+br query list
+
+# Delete a query
+br query delete my-bugs
+```
+
+**Implementation:**
+- Store in `config` table as JSON: `{"name": "my-bugs", "filters": {...}}`
+- Support all list/ready/blocked filter flags
+- Compose with additional flags at runtime
+
+### 4. CSV Export
+
+Legacy beads exports JSON/JSONL only. CSV is useful for:
+- Spreadsheet users (Excel, Google Sheets)
+- Non-technical stakeholders
+- Quick data analysis
+
+```bash
+# Full export
+br export --format=csv > issues.csv
+
+# Selected fields
+br export --format=csv --fields=id,title,status,priority,assignee
+
+# With filters
+br list --status=open --format=csv
+```
+
+**Implementation:**
+- Use `csv` crate for proper escaping
+- Default fields: id, title, status, priority, type, assignee, created_at, updated_at
+- Optional: include description (may have newlines)
+
+### 5. Changelog Generation
+
+Generate release notes from closed issues, grouped by type.
+
+```bash
+# Since date
+br changelog --since 2025-01-01
+
+# Since git tag
+br changelog --since-tag v1.0.0
+
+# Since commit
+br changelog --since-commit abc123
+
+# Output formats
+br changelog --since-tag v1.0.0 --format=markdown
+br changelog --since-tag v1.0.0 --format=json
+```
+
+**Example Output:**
+```markdown
+## Changelog (v1.0.0 → HEAD)
+
+### Features
+- Add dark mode support (bd-45)
+- Implement user preferences (bd-52)
+
+### Bug Fixes
+- Fix login crash on empty password (bd-67)
+- Resolve race condition in sync (bd-71)
+
+### Chores
+- Update dependencies (bd-80)
+```
+
+**Implementation:**
+- Query issues where `closed_at > since_date`
+- Group by `issue_type`
+- Sort by priority within groups
+- Support markdown and JSON output
+
+---
+
 ## Implementation Phases
 
 ### Phase 1: Foundation (MVP)
@@ -1303,11 +1419,12 @@ nursery = { level = "warn", priority = -1 }
 **Goal:** Feature parity with essential Go beads commands.
 
 **Deliverables:**
-- [ ] update command
+- [ ] update command (single issue)
+- [ ] **bulk update** (multiple issues: `br update bd-1 bd-2 --status X`)
 - [ ] close command (single and batch)
 - [ ] ready command (unblocked issues)
 - [ ] blocked command
-- [ ] dep command (add, remove, tree)
+- [ ] dep command (add, remove)
 - [ ] label command (add, remove)
 - [ ] stats command
 - [ ] search command (SQLite FTS or basic LIKE)
@@ -1326,6 +1443,8 @@ nursery = { level = "warn", priority = -1 }
 - [ ] config command
 - [ ] doctor command (health checks)
 - [ ] Repo detection (find .beads/ directory)
+- [ ] **Saved queries** (`br query save/run/list/delete`)
+- [ ] **CSV export** (`br export --format=csv`)
 
 **Note:** No automatic git commit/push. No hook installation. User runs `git add/commit` manually.
 
@@ -1351,10 +1470,12 @@ nursery = { level = "warn", priority = -1 }
 
 **Deliverables:**
 - [ ] Shell completions (bash, zsh, fish, PowerShell)
-- [ ] TUI mode (optional, using ratatui)
-- [ ] Markdown rendering (glamour-style)
+- [ ] **Changelog generation** (`br changelog --since-tag v1.0.0`)
+- [ ] Markdown rendering in `br show` (glamour-style)
 - [ ] Color themes
 - [ ] Install scripts
+
+**Note:** No TUI — that's `bv`'s domain.
 
 ---
 
