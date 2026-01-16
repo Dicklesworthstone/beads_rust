@@ -44,38 +44,41 @@ Update it as soon as new work is discovered or completed.
 - [x] Documented **JSONL content merge driver** (tombstone TTL, conflict rules, dependency merge).
 - [x] Documented **export error policies + manifest** (strict/best-effort/partial/required-core).
 - [x] Documented **doctor/cleanup/compact** maintenance commands (excluded but specified).
+- [x] Cross-verified core JSON output shapes against CLI behavior/tests (list/show/ready/blocked/search/stats/count/stale/dep/label/comments).
+- [x] Added explicit **orphans** command output schema and UX details (JSON + text).
+- [x] Clarified count/grouping ordering and JSON ordering guarantees.
+- [x] Captured show JSON array behavior + compatibility note (tests accept object).
 
-### Follow-up deep dives (keep expanding)
+### Session checklist (expanded deep-dive tasks)
 
-- [ ] **Import/export correctness audit (still incomplete):**
-  - [x] Export error policy modes + manifest shape.
-  - [ ] Confirm export **data coverage** and `core` vs `enrichment` semantics in manifests.
-  - [ ] Capture JSON output shapes for `bd export` / `bd import` (warnings, summaries, manifests).
-  - [ ] Confirm import update precedence on **equal timestamps** + `protect_local_export_ids`.
-  - [ ] Verify `--rename-on-import` reference rewrite scope (fields + deps + comments).
-- [ ] **Sync + merge driver integration (git-heavy, non-classic):**
-  - [ ] Document merge-driver install + `.gitattributes` wiring during `bd init`.
-  - [ ] Confirm `resolve-conflicts` flow and merge artifact cleanup.
-  - [ ] Record mass-delete safety thresholds + config keys (sync-branch).
-- [ ] **Maintenance/repair commands (non-classic):**
-  - [ ] `repair` command behavior and JSON output.
-  - [ ] `migrate` subcommands (`hash-ids`, `issues`, `sync`, `tombstones`) for parity decisions.
-  - [ ] Verify tombstone pruning rules (age vs dependency-driven purge) in `internal/compact`.
-- [ ] **Hierarchy + templates + epics:**
-  - [ ] Re-verify epic command details + JSON output.
-- [ ] **Integrations + automation (explicitly excluded):**
-  - [ ] Confirm hooks/daemon/gate/mol/agent/swarm/linear/jira/mail JSON outputs for exclusion clarity.
-- [ ] **Config key catalog validation:**
-  - [ ] Cross-check config keys vs migrations + YAML-only keys.
-  - [ ] Confirm default values and env var bindings.
-- [ ] **Conformance harness plan:**
-  - [ ] Map each classic command to a test case with expected JSON output.
-  - [ ] Record parity checks for schema + JSONL shapes.
-- [ ] **Interactive workflows:**
-  - [ ] Document `create-form` behavior + output shapes.
-- [ ] **Open design decisions (classic port):**
-  - [ ] Decide whether `br` needs a JSONL merge driver at all (git ops excluded).
-  - [ ] If yes: expand merge schema to avoid dropping non-core fields (labels/comments/assignee/design/etc).
+- [x] Add error/exit-code matrix for **core commands** (JSON vs text; stdout vs stderr; exit codes).
+- [x] Add **golden text output snapshots** for list/show/dep tree/ready/blocked.
+- [x] Expand **non-invasive exclusions** with explicit do-not-port behaviors and commands.
+- [x] Add **storage invariants & transactional guarantees** (indexes, constraints, dirty markers).
+- [x] Expand **ID/prefix routing edge cases** (validation, rename-prefix, cross-prefix dup rules).
+
+### Open TODOs (keep granular + current)
+
+- [ ] **Reconcile doc vs issue tracker**:
+  - [ ] Verify whether previously marked “completed” items are fully covered and close any redundant beads issues.
+  - [ ] If gaps remain, link them to a bead ID and leave explicit sub-tasks here.
+- [ ] **Sync + merge driver integration** (beads_rust-f0g):
+  - [ ] Confirm merge-driver install in `bd init` (git config + `.gitattributes` edits).
+  - [ ] Document `resolve-conflicts` backup/cleanup behavior in detail.
+  - [ ] Capture sync-branch mass-delete thresholds + config keys.
+- [ ] **Hierarchy + templates + epics validation** (beads_rust-hwb):
+  - [ ] Re-verify epic status/close JSON shapes against tests.
+  - [ ] Confirm template semantics in hierarchy (epic+label conventions).
+- [ ] **Integrations/automation JSON shapes** (beads_rust-17u):
+  - [ ] Hooks install/uninstall/list outputs.
+  - [ ] Daemon status/health JSON shapes (if still present in legacy).
+  - [ ] Gate/mol/agent/swarm outputs (for exclusion clarity).
+  - [ ] Linear/Jira sync outputs (excluded but documented).
+- [ ] **Create-form interactive workflow** (beads_rust-yfq):
+  - [ ] Capture prompt order, defaults, and JSON output (if any).
+- [ ] **Merge-driver scope decision for br** (beads_rust-o27):
+  - [ ] Decide opt‑out vs keep (if no git ops).
+  - [ ] If keep: expand merge schema to full issue model to avoid data loss.
 
 ---
 
@@ -3802,7 +3805,7 @@ The Rust port targets the **classic** issue tracker (SQLite + JSONL) and intenti
 
 **Included in `br` v1 (classic parity):**
 - Init & core CRUD: `init`, `create`, `update`, `close`, `reopen`, `delete` (tombstone)
-- Views & queries: `list`, `show`, `ready`, `blocked`, `search`, `stats`, `stale`
+- Views & queries: `list`, `show`, `ready`, `blocked`, `search`, `stats`, `count`, `stale`, `orphans`
 - Structure: `dep`, `label`, `comments`
 - Sync: `sync --flush-only`, `sync --import-only` (no git ops)
 - Config: `config get/set/list/unset` (yaml-only vs DB-backed)
@@ -3827,6 +3830,10 @@ This matrix is a compact reference for core flags. It is not exhaustive, but it 
 | `show` | `--short`, `--thread`, `--refs`, `--children` | JSON returns IssueDetails |
 | `ready` | `--assignee`, `--unassigned`, `--priority`, `--label`, `--label-any`, `--type`, `--parent`, `--mol-type`, `--limit`, `--sort`, `--include-deferred` | `--gated` and molecule routing are Gastown-only (exclude) |
 | `blocked` | `--parent` | Reads blocked cache |
+| `status`/`stats` | `--json`, `--assigned`, `--all`, `--no-activity` | JSON returns `StatusOutput` with summary + optional git activity |
+| `count` | filters match `list` + `--by-status/priority/type/assignee/label` | Grouped JSON returns `{total, groups[]}` |
+| `stale` | `--days`, `--status`, `--limit` | JSON returns array of Issue |
+| `orphans` | `--details`, `--fix` | `--fix` is interactive; JSON output is list of orphanIssueOutput |
 
 ### 15.21 `br` Compatibility Checklist (Classic)
 
@@ -3881,7 +3888,7 @@ Porting note:
 Porting note:
 - Comments are part of the core sync surface (export/import) and should be preserved.
 
-### 15.24 Stale and Count Views
+### 15.24 Stale, Count, and Orphans Views
 
 **Stale**:
 - Shows issues not updated in `N` days (default 30), optionally filtered by status.
@@ -3892,8 +3899,20 @@ Porting note:
 - Optional group-by: `status`, `priority`, `type`, `assignee`, or `label`.
 - When grouped by label, each issue contributes to **each** label it has; unlabeled issues are grouped under `(no labels)`.
 
+**Orphans**:
+- Identifies **open or in_progress** issues referenced in git commits but not closed.
+- Uses `git log --oneline --all` and matches IDs of the form `(prefix-xyz)`:
+  - Prefix is read from DB config `issue_prefix` (fallback default `bd`).
+  - Pattern supports hierarchical IDs (e.g., `bd-abc.1`).
+- Only the **first (most recent)** commit per issue is recorded as `latest_commit`.
+- Returns empty list (no error) if:
+  - Not a git repo
+  - No `.beads/` directory
+  - No database present
+
 Porting note:
 - These are read-only views but rely on the same `IssueFilter` semantics as list/search.
+- `orphans --fix` is interactive and intentionally **not** JSON-driven (keep it explicit).
 
 ### 15.25 Dependency Tree and Cycle Detection Details
 
@@ -4577,6 +4596,7 @@ Porting note:
 - Time fields serialize as RFC3339 strings (Go `time.Time` JSON).
 - `omitempty` fields are omitted when empty.
 - JSON is pretty-printed with 2-space indent in core CLI (`outputJSON`).
+  - `comments` uses `json.MarshalIndent` directly but matches the same indent.
 - JSON errors (when `--json` is active) are emitted to stderr as:
   `{ "error": "...", "code": "..." }` (code may be omitted).
 
@@ -4599,6 +4619,10 @@ Porting note:
   }
 ]
 ```
+**Schema notes**:
+- `IssueWithCounts` = all Issue JSON fields (see §3.1, classic subset) **plus**
+  `dependency_count` and `dependent_count` (ints).
+- `ContentHash`, routing fields, and other `json:"-"` fields are never emitted.
 **Text formats**:
 - **Compact (default)**: one line per issue  
   `STATUS_ICON [pin] ID [P#] [type] @assignee [labels] - Title`
@@ -4642,6 +4666,16 @@ Porting note:
   }
 ]
 ```
+**Schema notes**:
+- `IssueDetails` = all Issue JSON fields **plus**:
+  - `labels`: array of strings (may be empty)
+  - `dependencies`: array of `IssueWithDependencyMetadata`
+  - `dependents`: array of `IssueWithDependencyMetadata`
+  - `comments`: array of `Comment`
+  - `parent`: computed from `parent-child` dependency (may be omitted)
+- `IssueWithDependencyMetadata` = Issue fields + `dependency_type`.
+**Compatibility**:
+- Canonical output is an **array**; legacy tests accept a single object as a fallback.
 **Text formats**:
 - **Short (`--short`)**: same line format as pretty list (`STATUS_ICON ID ●P# [type] Title`).
 - **Full**:
@@ -4750,6 +4784,9 @@ Porting note:
   ]
 }
 ```
+**Ordering note**:
+- Direct mode sorts `groups` by the `group` string before JSON output.
+- Daemon mode preserves map iteration order (not stable); treat JSON group order as unspecified.
 **Text**:
 - No grouping: prints a single number.
 - Grouped: `Total: N` then `group: count` sorted by group key.
@@ -4806,6 +4843,9 @@ or (for `--blocks`):
 ["backend", "ui"]
 ```
 **label list-all JSON**: array of `{label,count}` objects.
+**Error/output notes**:
+- Batch add/remove emits JSON **only** for successful mutations; failures print to stderr.
+- `label list-all` outputs `[]` if no labels exist.
 
 **Text**:
 - Add/remove prints per-issue confirmation.
@@ -4823,6 +4863,28 @@ or (for `--blocks`):
 - List: “Comments on <id>” then `[author] at YYYY-MM-DD HH:MM` followed by
   markdown-rendered comment text indented.
 - Add: “Comment added to <id>”.
+
+#### 15.41.12 orphans
+
+**JSON shape**: array of `orphanIssueOutput`
+```json
+[
+  {
+    "issue_id": "bd-abc",
+    "title": "Fix edge-case",
+    "status": "in_progress",
+    "latest_commit": "deadbeef",
+    "latest_commit_message": "Fix edge-case for parser"
+  }
+]
+```
+**Text**:
+- Header: `Found N orphaned issue(s)` then numbered list.
+- Each item prints `ID: Title` and `Status`.
+- With `--details`, includes `Latest commit: <sha> - <message>`.
+**Fix mode**:
+- `--fix` prompts for confirmation, then runs `bd close <id> --reason Implemented` per issue.
+- Interactive by design (no JSON batch output for fix path).
 
 ---
 
@@ -6858,6 +6920,10 @@ This section synthesizes **actual import/export correctness rules** from
 - `partial`: retry then skip; manifest records missing data.
 - `required-core`: issues/deps must succeed; labels/comments best‑effort.
 
+**Core vs enrichment data**:
+- **Core**: issues + dependencies (export fails if these cannot be read).
+- **Enrichment**: labels + comments (may be omitted under `best-effort` / `required-core`).
+
 **Retry/backoff**:
 - Export fetches are wrapped in **exponential backoff** using the retry settings.
 
@@ -6877,6 +6943,11 @@ This section synthesizes **actual import/export correctness rules** from
 }
 ```
 
+**Encoding errors**:
+- If `export.skip_encoding_errors=true`, individual issues that fail JSON
+  encoding are **skipped** with warnings and added to `failed_issues`
+  (manifest `complete=false`).
+
 #### 15.84.2 Export Correctness Rules (sync_export)
 
 - Includes **tombstones** for sync propagation.
@@ -6895,7 +6966,9 @@ This section synthesizes **actual import/export correctness rules** from
 
 **Core precedence**:
 - Updates are **timestamp‑gated**: only apply if incoming `updated_at` is **newer**.
-- Equal or older timestamps → **skip update** (local wins).
+- **Equal timestamps** are treated as **local wins** (skip update).
+- `--protect-left-snapshot` adds an extra guard: if local snapshot time is
+  **>= incoming** (not strictly newer), the update is skipped (GH#865).
 
 **Matching order**:
 1. **external_ref** (if present): updates existing issue by external_ref (timestamp‑gated).
@@ -6910,7 +6983,10 @@ This section synthesizes **actual import/export correctness rules** from
 
 **Prefix mismatch**:
 - Detected across all incoming issues.
-- `--rename-on-import` rewrites IDs and all references to DB prefix.
+- `--rename-on-import` rewrites IDs and **all references** to DB prefix:
+  - Fields: `title`, `description`, `design`, `acceptance_criteria`, `notes`.
+  - Dependencies: `issue_id`, `depends_on_id`.
+  - Comments: text body.
 - In multi‑repo mode, prefix validation is skipped.
 
 **Orphan handling** (`import.missing_parents` config or flag):
@@ -6938,6 +7014,9 @@ This section synthesizes **actual import/export correctness rules** from
 **Export**:
 - `export --format jsonl` emits JSONL itself; no separate summary JSON.
 - Obsidian format emits Markdown, not JSON.
+- **Daemon/RPC export** returns JSON summary:
+  - `{ "exported_count": N, "path": "...", "skipped_count": M, "warnings": [...]? }`
+- **Daemon/RPC import** is **not implemented** (returns error: use `--no-daemon`).
 
 **Port note**:
 - `br` should either implement proper JSON summaries or **omit** the `--json`
