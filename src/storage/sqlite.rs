@@ -165,11 +165,7 @@ impl SqliteStorage {
         tx.commit()?;
 
         // Rebuild blocked cache after transaction commits (if needed)
-        if needs_cache_rebuild {
-            // We need to rebuild the cache. Since we're now outside the transaction,
-            // rebuild_blocked_cache will start its own transaction.
-            self.rebuild_blocked_cache()?;
-        }
+        self.rebuild_blocked_cache(needs_cache_rebuild)?;
 
         Ok(result)
     }
@@ -181,30 +177,62 @@ impl SqliteStorage {
     /// Returns an error if the issue cannot be inserted (e.g. ID collision).
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         self.mutate("create_issue", actor, |tx, ctx| {
+            let status_str = issue.status.as_str();
+            let issue_type_str = issue.issue_type.as_str();
+            let created_at_str = issue.created_at.to_rfc3339();
+            let updated_at_str = issue.updated_at.to_rfc3339();
+            let closed_at_str = issue.closed_at.map(|dt| dt.to_rfc3339());
+            let due_at_str = issue.due_at.map(|dt| dt.to_rfc3339());
+            let defer_until_str = issue.defer_until.map(|dt| dt.to_rfc3339());
+            let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
+            let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
+
             tx.execute(
                 "INSERT INTO issues (
-                    id, title, description, status, priority, issue_type,
-                    assignee, owner, estimated_minutes,
-                    created_at, created_by, updated_at,
-                    due_at, defer_until, external_ref,
-                    ephemeral, pinned, is_template
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    id, content_hash, title, description, design, acceptance_criteria, notes,
+                    status, priority, issue_type, assignee, owner, estimated_minutes,
+                    created_at, created_by, updated_at, closed_at, close_reason,
+                    closed_by_session, due_at, defer_until, external_ref, source_system,
+                    deleted_at, deleted_by, delete_reason, original_type, compaction_level,
+                    compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                    pinned, is_template
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )",
                 rusqlite::params![
                     issue.id,
+                    issue.content_hash,
                     issue.title,
                     issue.description,
-                    issue.status.as_str(),
+                    issue.design,
+                    issue.acceptance_criteria,
+                    issue.notes,
+                    status_str,
                     issue.priority.0,
-                    issue.issue_type.as_str(),
+                    issue_type_str,
                     issue.assignee,
                     issue.owner,
                     issue.estimated_minutes,
-                    issue.created_at.to_rfc3339(),
+                    created_at_str,
                     issue.created_by,
-                    issue.updated_at.to_rfc3339(),
-                    issue.due_at.map(|t| t.to_rfc3339()),
-                    issue.defer_until.map(|t| t.to_rfc3339()),
+                    updated_at_str,
+                    closed_at_str,
+                    issue.close_reason,
+                    issue.closed_by_session,
+                    due_at_str,
+                    defer_until_str,
                     issue.external_ref,
+                    issue.source_system,
+                    deleted_at_str,
+                    issue.deleted_by,
+                    issue.delete_reason,
+                    issue.original_type,
+                    issue.compaction_level,
+                    compacted_at_str,
+                    issue.compacted_at_commit,
+                    issue.original_size,
+                    issue.sender,
                     i32::from(issue.ephemeral),
                     i32::from(issue.pinned),
                     i32::from(issue.is_template),
@@ -230,12 +258,12 @@ impl SqliteStorage {
     /// Returns an error if the issue doesn't exist or the update fails.
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
-        let existing = self
+        let mut issue = self
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
         if updates.is_empty() {
-            return Ok(existing);
+            return Ok(issue);
         }
 
         self.mutate("update_issue", actor, |tx, ctx| {
@@ -250,11 +278,13 @@ impl SqliteStorage {
 
             // Title
             if let Some(ref title) = updates.title {
+                let old_title = issue.title.clone();
+                issue.title.clone_from(title);
                 add_update("title", Box::new(title.clone()));
                 ctx.record_field_change(
                     EventType::Updated,
                     id,
-                    Some(existing.title.clone()),
+                    Some(old_title),
                     Some(title.clone()),
                     Some("Title changed".to_string()),
                 );
@@ -262,21 +292,26 @@ impl SqliteStorage {
 
             // Simple text fields
             if let Some(ref val) = updates.description {
+                issue.description.clone_from(val);
                 add_update("description", Box::new(val.clone()));
             }
             if let Some(ref val) = updates.design {
+                issue.design.clone_from(val);
                 add_update("design", Box::new(val.clone()));
             }
             if let Some(ref val) = updates.acceptance_criteria {
+                issue.acceptance_criteria.clone_from(val);
                 add_update("acceptance_criteria", Box::new(val.clone()));
             }
             if let Some(ref val) = updates.notes {
+                issue.notes.clone_from(val);
                 add_update("notes", Box::new(val.clone()));
             }
 
             // Status
             if let Some(ref status) = updates.status {
-                let old_status = existing.status.as_str().to_string();
+                let old_status = issue.status.as_str().to_string();
+                issue.status.clone_from(status);
                 add_update("status", Box::new(status.as_str().to_string()));
                 ctx.record_field_change(
                     EventType::StatusChanged,
@@ -290,7 +325,8 @@ impl SqliteStorage {
 
             // Priority
             if let Some(priority) = updates.priority {
-                let old_priority = existing.priority.0;
+                let old_priority = issue.priority.0;
+                issue.priority = priority;
                 add_update("priority", Box::new(priority.0));
                 if priority.0 != old_priority {
                     ctx.record_field_change(
@@ -305,12 +341,14 @@ impl SqliteStorage {
 
             // Issue type
             if let Some(ref issue_type) = updates.issue_type {
+                issue.issue_type.clone_from(issue_type);
                 add_update("issue_type", Box::new(issue_type.as_str().to_string()));
             }
 
             // Assignee
             if let Some(ref assignee_opt) = updates.assignee {
-                let old_assignee = existing.assignee.clone();
+                let old_assignee = issue.assignee.clone();
+                issue.assignee.clone_from(assignee_opt);
                 add_update("assignee", Box::new(assignee_opt.clone()));
                 if old_assignee != *assignee_opt {
                     ctx.record_field_change(
@@ -325,29 +363,37 @@ impl SqliteStorage {
 
             // Simple Option fields
             if let Some(ref val) = updates.owner {
+                issue.owner.clone_from(val);
                 add_update("owner", Box::new(val.clone()));
             }
             if let Some(ref val) = updates.estimated_minutes {
+                issue.estimated_minutes = *val;
                 add_update("estimated_minutes", Box::new(*val));
             }
             if let Some(ref val) = updates.external_ref {
+                issue.external_ref.clone_from(val);
                 add_update("external_ref", Box::new(val.clone()));
             }
             if let Some(ref val) = updates.close_reason {
+                issue.close_reason.clone_from(val);
                 add_update("close_reason", Box::new(val.clone()));
             }
             if let Some(ref val) = updates.closed_by_session {
+                issue.closed_by_session.clone_from(val);
                 add_update("closed_by_session", Box::new(val.clone()));
             }
 
             // Date fields
             if let Some(ref val) = updates.due_at {
+                issue.due_at = *val;
                 add_update("due_at", Box::new(val.map(|d| d.to_rfc3339())));
             }
             if let Some(ref val) = updates.defer_until {
+                issue.defer_until = *val;
                 add_update("defer_until", Box::new(val.map(|d| d.to_rfc3339())));
             }
             if let Some(ref val) = updates.closed_at {
+                issue.closed_at = *val;
                 add_update("closed_at", Box::new(val.map(|d| d.to_rfc3339())));
             }
 
@@ -359,6 +405,11 @@ impl SqliteStorage {
             // Always update updated_at
             set_clauses.push("updated_at = ?".to_string());
             params.push(Box::new(Utc::now().to_rfc3339()));
+
+            // Update content hash
+            let new_hash = issue.compute_content_hash();
+            set_clauses.push("content_hash = ?".to_string());
+            params.push(Box::new(new_hash));
 
             // Build and execute SQL
             let sql = format!("UPDATE issues SET {} WHERE id = ?", set_clauses.join(", "));
@@ -841,8 +892,12 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub fn rebuild_blocked_cache(&mut self) -> Result<usize> {
+    #[allow(clippy::too_many_lines)]
+    pub fn rebuild_blocked_cache(&mut self, force_rebuild: bool) -> Result<usize> {
         const MAX_DEPTH: i32 = 50;
+        if !force_rebuild {
+            return Ok(0);
+        }
         let tx = self.conn.transaction()?;
 
         // Clear existing cache
@@ -1367,6 +1422,48 @@ impl SqliteStorage {
             .query_map([issue_id], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(labels)
+    }
+
+    /// Get labels for multiple issues efficiently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_labels_for_issues(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+        // SQLite has a finite variable limit (default 999). Chunk to avoid query failures.
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT issue_id, label FROM labels WHERE issue_id IN ({}) ORDER BY issue_id, label",
+                placeholders.join(",")
+            );
+
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+
+            for row in rows {
+                let (issue_id, label) = row?;
+                map.entry(issue_id).or_default().push(label);
+            }
+        }
+
+        Ok(map)
     }
 
     /// Get all unique labels with their issue counts.
@@ -2372,6 +2469,7 @@ impl SqliteStorage {
     /// Detect all cycles in the dependency graph.
     ///
     /// Returns a list of cycles, where each cycle is a vector of issue IDs.
+    /// Uses an iterative DFS to avoid stack overflow on deep graphs.
     ///
     /// # Errors
     ///
@@ -2399,49 +2497,52 @@ impl SqliteStorage {
         let mut rec_stack = HashSet::new();
         let mut path = Vec::new();
 
-        // Helper function for DFS cycle detection
-        #[allow(clippy::items_after_statements)]
-        fn dfs(
-            node: &str,
-            graph: &HashMap<String, Vec<String>>,
-            visited: &mut HashSet<String>,
-            rec_stack: &mut HashSet<String>,
-            path: &mut Vec<String>,
-            cycles: &mut Vec<Vec<String>>,
-        ) {
-            visited.insert(node.to_string());
-            rec_stack.insert(node.to_string());
-            path.push(node.to_string());
+        // Stack stores (node_id, neighbor_index)
+        let mut stack: Vec<(String, usize)> = Vec::new();
 
-            if let Some(neighbors) = graph.get(node) {
-                for neighbor in neighbors {
-                    if !visited.contains(neighbor) {
-                        dfs(neighbor, graph, visited, rec_stack, path, cycles);
-                    } else if rec_stack.contains(neighbor) {
-                        // Found a cycle - extract it
-                        if let Some(start_idx) = path.iter().position(|x| x == neighbor) {
-                            let mut cycle: Vec<String> = path[start_idx..].to_vec();
-                            cycle.push(neighbor.clone()); // Close the cycle
-                            cycles.push(cycle);
-                        }
-                    }
-                }
+        // Sort keys for deterministic output
+        let mut keys: Vec<_> = graph.keys().cloned().collect();
+        keys.sort();
+
+        for node in keys {
+            if visited.contains(&node) {
+                continue;
             }
 
-            path.pop();
-            rec_stack.remove(node);
-        }
+            stack.push((node.clone(), 0));
+            visited.insert(node.clone());
+            rec_stack.insert(node.clone());
+            path.push(node.clone());
 
-        for node in graph.keys() {
-            if !visited.contains(node) {
-                dfs(
-                    node,
-                    &graph,
-                    &mut visited,
-                    &mut rec_stack,
-                    &mut path,
-                    &mut cycles,
-                );
+            while let Some((u, idx)) = stack.last_mut() {
+                let neighbors = graph.get(u);
+
+                if let Some(neighbors) = neighbors {
+                    if *idx < neighbors.len() {
+                        let v = &neighbors[*idx];
+                        *idx += 1;
+
+                        if rec_stack.contains(v) {
+                            // Found a cycle: reconstruct it from the current path
+                            if let Some(start_pos) = path.iter().position(|x| x == v) {
+                                let mut cycle = path[start_pos..].to_vec();
+                                cycle.push(v.clone()); // Close the loop
+                                cycles.push(cycle);
+                            }
+                        } else if !visited.contains(v) {
+                            visited.insert(v.clone());
+                            rec_stack.insert(v.clone());
+                            path.push(v.clone());
+                            stack.push((v.clone(), 0));
+                        }
+                        continue;
+                    }
+                }
+
+                // Finished processing all neighbors of u
+                rec_stack.remove(u);
+                path.pop();
+                stack.pop();
             }
         }
 
@@ -3650,5 +3751,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_update_issue_recomputes_hash() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = Issue {
+            id: "bd-hash".to_string(),
+            title: "Original Title".to_string(),
+            content_hash: Some("placeholder".to_string()),
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_by: None,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        };
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Get initial hash
+        let initial = storage.get_issue("bd-hash").unwrap().unwrap();
+        let initial_hash = initial.content_hash.unwrap();
+
+        // Update title
+        let update = IssueUpdate {
+            title: Some("New Title".to_string()),
+            ..Default::default()
+        };
+        storage.update_issue("bd-hash", &update, "tester").unwrap();
+
+        // Check new hash
+        let updated = storage.get_issue("bd-hash").unwrap().unwrap();
+        let updated_hash = updated.content_hash.unwrap();
+
+        assert_ne!(initial_hash, updated_hash, "Hash should change when title changes");
     }
 }

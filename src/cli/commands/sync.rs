@@ -10,8 +10,9 @@ use crate::sync::{
     ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy, ImportConfig,
     METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, OrphanMode,
     compute_jsonl_hash, count_issues_in_jsonl, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, import_from_jsonl,
+    get_issue_ids_from_jsonl, import_from_jsonl, require_safe_sync_overwrite_path,
 };
+use crate::sync::history::HistoryConfig;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -65,6 +66,7 @@ struct SyncPathPolicy {
     jsonl_path: PathBuf,
     jsonl_temp_path: PathBuf,
     manifest_path: PathBuf,
+    beads_dir: PathBuf,
     is_external: bool,
 }
 
@@ -103,7 +105,14 @@ pub fn execute(args: &SyncArgs, json: bool, cli: &config::CliOverrides) -> Resul
     }
 
     if args.flush_only {
-        execute_flush(&mut storage, &path_policy, args, use_json, retention_days)
+        execute_flush(
+            &mut storage,
+            &beads_dir,
+            &path_policy,
+            args,
+            use_json,
+            retention_days,
+        )
     } else {
         execute_import(&mut storage, &path_policy, args, use_json)
     }
@@ -154,7 +163,7 @@ fn validate_sync_paths(
     let extension = jsonl_path
         .extension()
         .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
     if extension.as_deref() != Some("jsonl") {
         return Err(BeadsError::Config(format!(
             "JSONL path must end with .jsonl: {}",
@@ -202,6 +211,7 @@ fn validate_sync_paths(
         jsonl_path,
         jsonl_temp_path,
         manifest_path,
+        beads_dir: canonical_beads,
         is_external,
     })
 }
@@ -294,6 +304,7 @@ fn execute_status(
 #[allow(clippy::too_many_lines)]
 fn execute_flush(
     storage: &mut crate::storage::SqliteStorage,
+    _beads_dir: &Path,
     path_policy: &SyncPathPolicy,
     args: &SyncArgs,
     json: bool,
@@ -401,6 +412,9 @@ fn execute_flush(
         is_default_path: true,
         error_policy: export_policy,
         retention_days,
+        beads_dir: Some(path_policy.beads_dir.clone()),
+        allow_external_jsonl: args.allow_external_jsonl,
+        history: HistoryConfig::default(),
     };
 
     // Execute export
@@ -435,6 +449,12 @@ fn execute_flush(
             "errors": &report.errors,
         });
         let manifest_file = path_policy.manifest_path.clone();
+        require_safe_sync_overwrite_path(
+            &manifest_file,
+            &path_policy.beads_dir,
+            args.allow_external_jsonl,
+            "write manifest",
+        )?;
         fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
         Some(manifest_file.to_string_lossy().to_string())
     } else {
@@ -442,13 +462,15 @@ fn execute_flush(
     };
 
     // Output result
+    let cleared_dirty =
+        export_result.exported_ids.len() + export_result.skipped_tombstone_ids.len();
     let result = FlushResult {
         exported_issues: report.issues_exported,
         exported_dependencies: report.dependencies_exported,
         exported_labels: report.labels_exported,
         exported_comments: report.comments_exported,
         content_hash: export_result.content_hash,
-        cleared_dirty: dirty_ids.len(),
+        cleared_dirty,
         policy: report.policy_used,
         success_rate: report.success_rate(),
         errors: report.errors.clone(),
@@ -631,6 +653,8 @@ fn execute_import(
         clear_duplicate_external_refs: false,
         orphan_mode,
         force_upsert: args.force,
+        beads_dir: Some(path_policy.beads_dir.clone()),
+        allow_external_jsonl: args.allow_external_jsonl,
     };
 
     // Get expected prefix from config
