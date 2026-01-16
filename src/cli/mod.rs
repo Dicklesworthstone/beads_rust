@@ -91,31 +91,22 @@ pub enum Commands {
     },
 
     /// Update an issue
-    Update {
-        /// Issue IDs
-        ids: Vec<String>,
-    },
+    Update(UpdateArgs),
 
     /// Close an issue
-    Close {
-        /// Issue IDs
-        ids: Vec<String>,
-    },
+    Close(CloseArgs),
 
     /// Reopen an issue
-    Reopen {
-        /// Issue IDs
-        ids: Vec<String>,
-    },
+    Reopen(ReopenArgs),
 
     /// Delete an issue (creates tombstone)
     Delete(DeleteArgs),
 
-    /// List ready issues
-    Ready,
+    /// List ready issues (unblocked, not deferred)
+    Ready(ReadyArgs),
 
     /// List blocked issues
-    Blocked,
+    Blocked(BlockedArgs),
 
     /// Search issues
     Search(SearchArgs),
@@ -133,30 +124,26 @@ pub enum Commands {
     },
 
     /// Manage comments
-    Comments {
-        #[command(subcommand)]
-        command: CommentCommands,
-    },
+    #[command(alias = "comment")]
+    Comments(CommentsArgs),
 
     /// Show project statistics
-    Stats,
+    Stats(StatsArgs),
 
     /// Alias for stats
-    Status,
+    Status(StatsArgs),
 
     /// Count issues with optional grouping
     Count(CountArgs),
+
+    /// List stale issues
+    Stale(StaleArgs),
 
     /// Configuration management
     Config,
 
     /// Sync with JSONL
-    Sync {
-        #[arg(long)]
-        flush_only: bool,
-        #[arg(long)]
-        import_only: bool,
-    },
+    Sync(SyncArgs),
 
     /// Run read-only diagnostics
     Doctor,
@@ -185,6 +172,54 @@ pub struct CreateArgs {
     /// Description
     #[arg(long, short = 'd')]
     pub description: Option<String>,
+
+    /// Assign to person
+    #[arg(long, short = 'a')]
+    pub assignee: Option<String>,
+
+    /// Set owner email
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Labels (comma-separated)
+    #[arg(long, short = 'l', value_delimiter = ',')]
+    pub labels: Vec<String>,
+
+    /// Parent issue ID (creates parent-child dep)
+    #[arg(long)]
+    pub parent: Option<String>,
+
+    /// Dependencies (format: type:id,type:id)
+    #[arg(long, value_delimiter = ',')]
+    pub deps: Vec<String>,
+
+    /// Time estimate in minutes
+    #[arg(long, short = 'e')]
+    pub estimate: Option<i32>,
+
+    /// Due date (RFC3339 or relative)
+    #[arg(long)]
+    pub due: Option<String>,
+
+    /// Defer until date (RFC3339 or relative)
+    #[arg(long)]
+    pub defer: Option<String>,
+
+    /// External reference
+    #[arg(long)]
+    pub external_ref: Option<String>,
+
+    /// Mark as ephemeral (not exported to JSONL)
+    #[arg(long)]
+    pub ephemeral: bool,
+
+    /// Preview without creating
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output only issue ID
+    #[arg(long)]
+    pub silent: bool,
 }
 
 #[derive(Args, Debug)]
@@ -203,6 +238,93 @@ pub struct QuickArgs {
     /// Labels to apply (repeatable, comma-separated allowed)
     #[arg(long, short = 'l')]
     pub labels: Vec<String>,
+}
+
+#[derive(Args, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct UpdateArgs {
+    /// Issue IDs to update
+    pub ids: Vec<String>,
+
+    /// Update title
+    #[arg(long)]
+    pub title: Option<String>,
+
+    /// Update description
+    #[arg(long, visible_alias = "body")]
+    pub description: Option<String>,
+
+    /// Update design notes
+    #[arg(long)]
+    pub design: Option<String>,
+
+    /// Update acceptance criteria
+    #[arg(long, visible_alias = "acceptance")]
+    pub acceptance_criteria: Option<String>,
+
+    /// Update additional notes
+    #[arg(long)]
+    pub notes: Option<String>,
+
+    /// Change status
+    #[arg(long, short = 's')]
+    pub status: Option<String>,
+
+    /// Change priority (0-4 or P0-P4)
+    #[arg(long, short = 'p')]
+    pub priority: Option<String>,
+
+    /// Change issue type
+    #[arg(long = "type", short = 't')]
+    pub type_: Option<String>,
+
+    /// Assign to user (empty string clears)
+    #[arg(long)]
+    pub assignee: Option<String>,
+
+    /// Set owner (empty string clears)
+    #[arg(long)]
+    pub owner: Option<String>,
+
+    /// Atomic claim (assignee=actor + `status=in_progress`)
+    #[arg(long)]
+    pub claim: bool,
+
+    /// Set due date (empty string clears)
+    #[arg(long)]
+    pub due: Option<String>,
+
+    /// Set defer until date (empty string clears)
+    #[arg(long)]
+    pub defer: Option<String>,
+
+    /// Set time estimate
+    #[arg(long)]
+    pub estimate: Option<i32>,
+
+    /// Add label(s)
+    #[arg(long)]
+    pub add_label: Vec<String>,
+
+    /// Remove label(s)
+    #[arg(long)]
+    pub remove_label: Vec<String>,
+
+    /// Set label(s) (replaces all)
+    #[arg(long)]
+    pub set_labels: Option<String>,
+
+    /// Reparent to new parent (empty string removes parent)
+    #[arg(long)]
+    pub parent: Option<String>,
+
+    /// Set external reference
+    #[arg(long)]
+    pub external_ref: Option<String>,
+
+    /// Set `closed_by_session` when closing
+    #[arg(long)]
+    pub session: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -337,25 +459,180 @@ pub struct SearchArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum DepCommands {
-    Add,
-    Remove,
-    List,
-    Tree,
-    Cycles,
+    /// Add a dependency: <issue> depends on <depends-on>
+    Add(DepAddArgs),
+    /// Remove a dependency
+    Remove(DepRemoveArgs),
+    /// List dependencies of an issue
+    List(DepListArgs),
+    /// Show dependency tree rooted at issue
+    Tree(DepTreeArgs),
+    /// Detect and report dependency cycles
+    Cycles(DepCyclesArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DepAddArgs {
+    /// Issue ID (the one that will depend on something)
+    pub issue: String,
+
+    /// Target issue ID (the one being depended on)
+    pub depends_on: String,
+
+    /// Dependency type (blocks, parent-child, related, etc.)
+    #[arg(long = "type", short = 't', default_value = "blocks")]
+    pub dep_type: String,
+
+    /// Optional JSON metadata
+    #[arg(long)]
+    pub metadata: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct DepRemoveArgs {
+    /// Issue ID
+    pub issue: String,
+
+    /// Target issue ID to remove dependency to
+    pub depends_on: String,
+}
+
+#[derive(Args, Debug)]
+pub struct DepListArgs {
+    /// Issue ID
+    pub issue: String,
+
+    /// Direction: down (what issue depends on), up (what depends on issue), both
+    #[arg(long, default_value = "down", value_enum)]
+    pub direction: DepDirection,
+
+    /// Filter by dependency type
+    #[arg(long = "type", short = 't')]
+    pub dep_type: Option<String>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum DepDirection {
+    /// Dependencies this issue has (what it waits on)
+    #[default]
+    Down,
+    /// Dependents (what waits on this issue)
+    Up,
+    /// Both directions
+    Both,
+}
+
+#[derive(Args, Debug)]
+pub struct DepTreeArgs {
+    /// Issue ID (root of tree)
+    pub issue: String,
+
+    /// Maximum depth (default: 10)
+    #[arg(long, default_value_t = 10)]
+    pub max_depth: usize,
+
+    /// Output format: text, mermaid
+    #[arg(long, default_value = "text")]
+    pub format: String,
+}
+
+#[derive(Args, Debug)]
+pub struct DepCyclesArgs {
+    /// Only check blocking dependency types
+    #[arg(long)]
+    pub blocking_only: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum LabelCommands {
-    Add,
-    Remove,
-    List,
+    /// Add label(s) to issue(s)
+    Add(LabelAddArgs),
+    /// Remove label(s) from issue(s)
+    Remove(LabelRemoveArgs),
+    /// List labels for an issue or all unique labels
+    List(LabelListArgs),
+    /// List all unique labels with counts
+    #[command(name = "list-all")]
     ListAll,
+    /// Rename a label across all issues
+    Rename(LabelRenameArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct LabelAddArgs {
+    /// Issue ID(s) to add label to
+    pub issues: Vec<String>,
+
+    /// Label to add
+    #[arg(long, short = 'l')]
+    pub label: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct LabelRemoveArgs {
+    /// Issue ID(s) to remove label from
+    pub issues: Vec<String>,
+
+    /// Label to remove
+    #[arg(long, short = 'l')]
+    pub label: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct LabelListArgs {
+    /// Issue ID (optional - if omitted, lists all unique labels)
+    pub issue: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct LabelRenameArgs {
+    /// Current label name
+    pub old_name: String,
+
+    /// New label name
+    pub new_name: String,
+}
+
+#[derive(Args, Debug)]
+pub struct CommentsArgs {
+    #[command(subcommand)]
+    pub command: Option<CommentCommands>,
+
+    /// Issue ID (for listing comments)
+    pub id: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum CommentCommands {
-    Add,
-    List,
+    Add(CommentAddArgs),
+    List(CommentListArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CommentAddArgs {
+    /// Issue ID
+    pub id: String,
+
+    /// Comment text
+    pub text: Vec<String>,
+
+    /// Read comment text from file
+    #[arg(short = 'f', long = "file")]
+    pub file: Option<PathBuf>,
+
+    /// Override author (defaults to actor/env/git)
+    #[arg(long)]
+    pub author: Option<String>,
+
+    /// Comment text (alternative flag)
+    #[arg(long = "message")]
+    pub message: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct CommentListArgs {
+    /// Issue ID
+    pub id: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -404,4 +681,216 @@ pub enum CountBy {
     Type,
     Assignee,
     Label,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct StaleArgs {
+    /// Minimum days since last update
+    #[arg(long, default_value_t = 30)]
+    pub days: i64,
+
+    /// Filter by status (repeatable or comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    pub status: Vec<String>,
+}
+
+/// Arguments for the ready command.
+#[derive(Args, Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ReadyArgs {
+    /// Maximum number of issues to return (default: 20, 0 = unlimited)
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+
+    /// Filter by assignee (no value = current actor)
+    #[arg(long)]
+    pub assignee: Option<String>,
+
+    /// Show only unassigned issues
+    #[arg(long)]
+    pub unassigned: bool,
+
+    /// Filter by label (AND logic, can be repeated)
+    #[arg(long, short = 'l')]
+    pub label: Vec<String>,
+
+    /// Filter by label (OR logic, can be repeated)
+    #[arg(long)]
+    pub label_any: Vec<String>,
+
+    /// Filter by issue type (can be repeated)
+    #[arg(long = "type", short = 't')]
+    pub type_: Vec<String>,
+
+    /// Filter by priority (can be repeated, 0-4 or P0-P4)
+    #[arg(long, short = 'p')]
+    pub priority: Vec<String>,
+
+    /// Sort policy: hybrid (default), priority, oldest
+    #[arg(long, default_value = "hybrid", value_enum)]
+    pub sort: SortPolicy,
+
+    /// Include deferred issues
+    #[arg(long)]
+    pub include_deferred: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for the blocked command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct BlockedArgs {
+    /// Maximum number of issues to return (default: 50, 0 = unlimited)
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
+
+    /// Include full blocker details in text output
+    #[arg(long)]
+    pub detailed: bool,
+
+    /// Filter by issue type (can be repeated)
+    #[arg(long = "type", short = 't')]
+    pub type_: Vec<String>,
+
+    /// Filter by priority (can be repeated, 0-4)
+    #[arg(long, short = 'p')]
+    pub priority: Vec<u8>,
+
+    /// Filter by label (AND logic, can be repeated)
+    #[arg(long, short = 'l')]
+    pub label: Vec<String>,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for the close command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CloseArgs {
+    /// Issue IDs to close (uses last-touched if empty)
+    pub ids: Vec<String>,
+
+    /// Close reason
+    #[arg(long, short = 'r')]
+    pub reason: Option<String>,
+
+    /// Close even if blocked by open dependencies
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// After closing, return newly unblocked issues (single ID only)
+    #[arg(long)]
+    pub suggest_next: bool,
+
+    /// Session ID for tracking
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for the reopen command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ReopenArgs {
+    /// Issue IDs to reopen (uses last-touched if empty)
+    pub ids: Vec<String>,
+
+    /// Reason for reopening (stored as a comment)
+    #[arg(long, short = 'r')]
+    pub reason: Option<String>,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Sort policy for ready command.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum SortPolicy {
+    /// P0/P1 first by `created_at`, then others by `created_at`
+    #[default]
+    Hybrid,
+    /// Sort by priority ASC, then `created_at` ASC
+    Priority,
+    /// Sort by `created_at` ASC only
+    Oldest,
+}
+
+/// Arguments for the sync command.
+#[derive(Args, Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SyncArgs {
+    /// Export database to JSONL
+    #[arg(long)]
+    pub flush_only: bool,
+
+    /// Import JSONL to database
+    #[arg(long)]
+    pub import_only: bool,
+
+    /// Show sync status
+    #[arg(long)]
+    pub status: bool,
+
+    /// Override safety checks
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// Allow JSONL path outside .beads (explicit opt-in)
+    #[arg(long)]
+    pub allow_external_jsonl: bool,
+
+    /// Write manifest file with export summary
+    #[arg(long)]
+    pub manifest: bool,
+
+    /// Export error policy (strict, best-effort, partial, required-core)
+    #[arg(long = "error-policy")]
+    pub error_policy: Option<String>,
+
+    /// Orphan handling mode (strict, resurrect, skip, allow)
+    #[arg(long)]
+    pub orphans: Option<String>,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for the stats command.
+#[derive(Args, Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct StatsArgs {
+    /// Show breakdown by issue type
+    #[arg(long)]
+    pub by_type: bool,
+
+    /// Show breakdown by priority
+    #[arg(long)]
+    pub by_priority: bool,
+
+    /// Show breakdown by assignee
+    #[arg(long)]
+    pub by_assignee: bool,
+
+    /// Show breakdown by label
+    #[arg(long)]
+    pub by_label: bool,
+
+    /// Include recent activity stats (requires git)
+    #[arg(long)]
+    pub activity: bool,
+
+    /// Activity window in hours (default: 24)
+    #[arg(long, default_value_t = 24)]
+    pub activity_hours: u32,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
 }
