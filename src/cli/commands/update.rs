@@ -5,7 +5,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, Status};
 use crate::storage::{IssueUpdate, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 use crate::validation::LabelValidator;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -45,8 +45,8 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides) -> Result<()> {
 
     let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
     let actor = config::resolve_actor(&config_layer);
-    let (resolver, all_ids) = build_resolver(&config_layer, &storage)?;
-    let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &all_ids)?;
+    let resolver = build_resolver(&config_layer, &storage)?;
+    let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage)?;
 
     let update = build_update(args, &actor)?;
     let has_updates = !update.is_empty()
@@ -107,7 +107,6 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides) -> Result<()> {
             id,
             args.parent.as_deref(),
             &resolver,
-            &all_ids,
             &actor,
         )?;
 
@@ -178,19 +177,19 @@ fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &I
 
 fn build_resolver(
     config_layer: &config::ConfigLayer,
-    storage: &SqliteStorage,
-) -> Result<(IdResolver, Vec<String>)> {
+    _storage: &SqliteStorage,
+) -> Result<IdResolver> {
     let id_config = config::id_config_from_layer(config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage.get_all_ids()?;
-    Ok((resolver, all_ids))
+    Ok(IdResolver::new(ResolverConfig::with_prefix(
+        id_config.prefix,
+    )))
 }
 
 fn resolve_target_ids(
     args: &UpdateArgs,
     beads_dir: &std::path::Path,
     resolver: &IdResolver,
-    all_ids: &[String],
+    storage: &SqliteStorage,
 ) -> Result<Vec<String>> {
     let mut ids = args.ids.clone();
     if ids.is_empty() {
@@ -206,8 +205,8 @@ fn resolve_target_ids(
 
     let resolved_ids = resolver.resolve_all(
         &ids,
-        |id| all_ids.iter().any(|existing| existing == id),
-        |hash| find_matching_ids(all_ids, hash),
+        |id| storage.id_exists(id).unwrap_or(false),
+        |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
     )?;
 
     Ok(resolved_ids.into_iter().map(|r| r.id).collect())
@@ -285,12 +284,16 @@ fn optional_date_field(value: Option<&str>) -> Result<Option<Option<DateTime<Utc
         .transpose()
 }
 
-fn resolve_issue_id(resolver: &IdResolver, all_ids: &[String], input: &str) -> Result<String> {
+fn resolve_issue_id(
+    resolver: &IdResolver,
+    storage: &SqliteStorage,
+    input: &str,
+) -> Result<String> {
     resolver
         .resolve(
             input,
-            |id| all_ids.iter().any(|existing| existing == id),
-            |hash| find_matching_ids(all_ids, hash),
+            |id| storage.id_exists(id).unwrap_or(false),
+            |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
         )
         .map(|resolved| resolved.id)
 }
@@ -300,7 +303,6 @@ fn apply_parent_update(
     issue_id: &str,
     parent: Option<&str>,
     resolver: &IdResolver,
-    all_ids: &[String],
     actor: &str,
 ) -> Result<()> {
     let Some(parent_value) = parent else {
@@ -312,7 +314,8 @@ fn apply_parent_update(
         return Ok(());
     }
 
-    let parent_id = resolve_issue_id(resolver, all_ids, parent_value)?;
+    // Use immutable reference to storage for resolution
+    let parent_id = resolve_issue_id(resolver, storage, parent_value)?;
     if parent_id == issue_id {
         return Err(BeadsError::validation(
             "parent",

@@ -2,7 +2,7 @@
 
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig};
 
 /// Execute the show command.
 ///
@@ -28,14 +28,13 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
     let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
-    let all_ids = storage.get_all_ids()?;
 
     let mut details_list = Vec::new();
     for id_input in target_ids {
         let resolution = resolver.resolve(
             &id_input,
-            |id| all_ids.iter().any(|existing| existing == id),
-            |hash| find_matching_ids(&all_ids, hash),
+            |id| storage.id_exists(id).unwrap_or(false),
+            |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
         )?;
 
         // Fetch full details including comments and events

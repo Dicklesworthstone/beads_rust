@@ -50,6 +50,8 @@ fn main() {
         }
         Commands::Config(args) => commands::config::execute(&args, cli.json, &overrides),
         Commands::History(args) => commands::history::execute(args, &overrides),
+        Commands::Defer(args) => commands::defer::execute_defer(&args, cli.json, &overrides),
+        Commands::Undefer(args) => commands::defer::execute_undefer(&args, cli.json, &overrides),
     };
 
     if let Err(e) = result {
@@ -71,7 +73,10 @@ fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
     if use_json {
         // Output structured JSON to stderr
         let json = structured.to_json();
-        eprintln!("{}", serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string()));
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
+        );
     } else {
         // Human-readable output with color if stderr is a terminal
         let use_color = io::stderr().is_terminal();
