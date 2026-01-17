@@ -3,6 +3,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::util::id::IdGenerator;
+use crate::util::markdown_import::parse_markdown_file;
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
@@ -16,6 +17,10 @@ use std::str::FromStr;
 /// Returns an error if validation fails, the database cannot be opened, or the issue cannot be created.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: CreateArgs, cli: &config::CliOverrides) -> Result<()> {
+    if let Some(ref file_path) = args.file {
+        return execute_import(file_path, &args, cli);
+    }
+
     // 1. Resolve title
     let title = args
         .title
@@ -61,7 +66,7 @@ pub fn execute(args: CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     let issue_type = if let Some(t) = args.type_ {
         IssueType::from_str(&t)?
     } else {
-        default_issue_type
+        default_issue_type.clone()
     };
 
     let due_at = parse_optional_date(args.due.as_deref())?;
@@ -203,6 +208,161 @@ pub fn execute(args: CreateArgs, cli: &config::CliOverrides) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&issue)?);
     } else {
         println!("Created {}: {}", issue.id, issue.title);
+    }
+
+    storage_ctx.flush_no_db_if_dirty()?;
+    Ok(())
+}
+
+fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
+    let parsed_issues = parse_markdown_file(path)?;
+    if parsed_issues.is_empty() {
+        return Ok(());
+    }
+
+    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+
+    let id_config = config::id_config_from_layer(&layer);
+    let default_priority = config::default_priority_from_layer(&layer)?;
+    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
+    let actor = config::resolve_actor(&layer);
+    let now = Utc::now();
+
+    let storage = &mut storage_ctx.storage;
+    let id_gen = IdGenerator::new(id_config);
+
+    // Track created IDs for output
+    let mut created_ids = Vec::new();
+
+    for parsed in parsed_issues {
+        let count = storage.count_issues()?;
+        let id = id_gen.generate(
+            &parsed.title,
+            parsed.description.as_deref(),
+            None,
+            now,
+            count,
+            |id| storage.id_exists(id).unwrap_or(false),
+        );
+
+        let priority = if let Some(ref p) = parsed.priority {
+            Priority::from_str(p)?
+        } else {
+            default_priority
+        };
+
+        let issue_type = if let Some(ref t) = parsed.issue_type {
+            IssueType::from_str(t)?
+        } else {
+            default_issue_type.clone()
+        };
+
+        let mut issue = Issue {
+            id: id.clone(),
+            title: parsed.title,
+            description: parsed.description,
+            status: Status::Open,
+            priority,
+            issue_type,
+            created_at: now,
+            updated_at: now,
+            assignee: parsed.assignee,
+            // Use defaults or optional overrides from args (e.g. owner) if applicable?
+            // Usually import uses data from file only, but args might set defaults?
+            // bd create --file x.md --owner me -> applies to all?
+            // For now, let's strictly use file content + defaults.
+            owner: args.owner.clone(),
+            estimated_minutes: args.estimate, // Apply global estimate if provided? Or None.
+            // Let's apply global args as overrides/defaults where appropriate
+            due_at: parse_optional_date(args.due.as_deref())?,
+            defer_until: parse_optional_date(args.defer.as_deref())?,
+            external_ref: args.external_ref.clone(),
+            ephemeral: args.ephemeral,
+            // File specific fields
+            design: parsed.design,
+            acceptance_criteria: parsed.acceptance_criteria,
+            // ...
+            content_hash: None,
+            notes: None,
+            created_by: None,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            source_system: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        };
+
+        // Compute content hash
+        issue.content_hash = Some(issue.compute_content_hash());
+
+        // Validate
+        IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+
+        // Dry run
+        if args.dry_run {
+            println!("Dry run: would create issue {}", issue.id);
+            continue;
+        }
+
+        // Create
+        storage.create_issue(&issue, &actor)?;
+
+        // Labels
+        // Combine file labels and CLI labels
+        let mut labels = parsed.labels;
+        labels.extend(args.labels.clone());
+        for label in labels {
+            if !label.trim().is_empty() {
+                LabelValidator::validate(&label)
+                    .map_err(|e| BeadsError::validation("label", e.message))?;
+                storage.add_label(&id, &label, &actor)?;
+            }
+        }
+
+        // Dependencies
+        // File deps format: "type:id" or "id"
+        // CLI deps format: "type:id" or "id"
+        let mut deps = parsed.dependencies;
+        deps.extend(args.deps.clone());
+        for dep_str in deps {
+            let (type_str, dep_id) = if let Some((t, i)) = dep_str.split_once(':') {
+                (t, i)
+            } else {
+                ("blocks", dep_str.as_str())
+            };
+            if dep_id == id {
+                // Self dep ignored or error? Error is safer.
+                return Err(BeadsError::validation(
+                    "deps",
+                    format!("issue {id} cannot depend on itself"),
+                ));
+            }
+            storage.add_dependency(&id, dep_id, type_str, &actor)?;
+        }
+
+        created_ids.push(id);
+    }
+
+    if !created_ids.is_empty() && !args.dry_run {
+        println!("Created {} issues:", created_ids.len());
+        for id in created_ids {
+            println!("  {id}");
+        }
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
