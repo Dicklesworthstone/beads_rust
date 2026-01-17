@@ -115,7 +115,7 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
             let _ = writeln!(
                 output,
                 "  [{}] {}: {}",
-                comment.created_at.format("%Y-%m-%d %H:%M"),
+                comment.created_at.format("%Y-%m-%d %H:%M UTC"),
                 comment.author,
                 comment.body
             );

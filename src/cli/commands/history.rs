@@ -43,7 +43,7 @@ fn list_backups(history_dir: &Path) -> Result<()> {
     for entry in backups {
         let filename = entry.path.file_name().unwrap().to_string_lossy();
         let size = format_size(entry.size);
-        let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+        let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
         println!("{filename:<30} {size:<10} {timestamp:<20}");
     }
 

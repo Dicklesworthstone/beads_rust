@@ -557,8 +557,12 @@ fn cli_import_malformed_preserves_db() {
         "Import should fail on malformed JSON"
     );
 
-    // List after - DB should still have original issue
-    let list2_run = run_br(&workspace, ["list", "--json"], "list_after");
+    // List after - DB should still have original issue (use --no-auto-import --allow-stale to ignore corrupt/newer JSONL)
+    let list2_run = run_br(
+        &workspace,
+        ["list", "--json", "--no-auto-import", "--allow-stale"],
+        "list_after",
+    );
     artifacts.log("list_after", &list2_run.stdout);
     artifacts.log("list_after_stderr", &list2_run.stderr);
 

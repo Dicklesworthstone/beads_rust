@@ -14,6 +14,7 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::str::FromStr;
 
 /// Execute the list command.
 ///
@@ -21,8 +22,6 @@ use std::path::Path;
 ///
 /// Returns an error if the database cannot be opened or the query fails.
 pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
-    validate_priority_range(&args.priority)?;
-
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -125,17 +124,6 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
     Ok(())
 }
 
-fn validate_priority_range(priorities: &[u8]) -> Result<()> {
-    for &priority in priorities {
-        if priority > 4 {
-            return Err(BeadsError::InvalidPriority {
-                priority: i32::from(priority),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Convert CLI args to storage filter.
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     // Parse status strings to Status enums
@@ -169,7 +157,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         let parsed: Vec<Priority> = args
             .priority
             .iter()
-            .map(|&p| Priority(i32::from(p)))
+            .filter_map(|p| p.parse().ok())
             .collect();
         Some(parsed)
     };
@@ -402,14 +390,5 @@ mod tests {
         };
         assert!(needs_client_filters(&args));
         info!("test_needs_client_filters_detects_fields: assertions passed");
-    }
-
-    #[test]
-    fn test_validate_priority_range_rejects_out_of_range() {
-        init_logging();
-        info!("test_validate_priority_range_rejects_out_of_range: starting");
-        let err = validate_priority_range(&[9]).unwrap_err();
-        assert!(matches!(err, BeadsError::InvalidPriority { priority: 9 }));
-        info!("test_validate_priority_range_rejects_out_of_range: assertions passed");
     }
 }

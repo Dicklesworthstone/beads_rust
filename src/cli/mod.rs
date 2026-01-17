@@ -273,7 +273,7 @@ pub enum ShellType {
     Elvish,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct CreateArgs {
     /// Issue title
     pub title: Option<String>,
@@ -545,7 +545,7 @@ pub struct ListArgs {
 
     /// Filter by priority (can be repeated)
     #[arg(long, short = 'p')]
-    pub priority: Vec<u8>,
+    pub priority: Vec<String>,
 
     /// Filter by minimum priority (0=critical, 4=backlog)
     #[arg(long)]
@@ -1051,7 +1051,7 @@ pub struct BlockedArgs {
 
     /// Filter by priority (can be repeated, 0-4)
     #[arg(long, short = 'p')]
-    pub priority: Vec<u8>,
+    pub priority: Vec<String>,
 
     /// Filter by label (AND logic, can be repeated)
     #[arg(long, short = 'l')]

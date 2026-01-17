@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::storage::SqliteStorage;
 use crate::util::id::IdGenerator;
-use crate::util::markdown_import::parse_markdown_file;
+use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
@@ -27,6 +27,18 @@ pub struct CreateConfig {
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     if let Some(ref file_path) = args.file {
+        if args.title.is_some() || args.title_flag.is_some() {
+            return Err(BeadsError::validation(
+                "file",
+                "cannot be combined with title arguments",
+            ));
+        }
+        if args.dry_run {
+            return Err(BeadsError::validation(
+                "dry_run",
+                "--dry-run is not supported with --file",
+            ));
+        }
         return execute_import(file_path, args, cli);
     }
 
@@ -327,6 +339,9 @@ fn add_relations(
 fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     let parsed_issues = parse_markdown_file(path)?;
     if parsed_issues.is_empty() {
+        if cli.json.unwrap_or(false) {
+            println!("[]");
+        }
         return Ok(());
     }
 
@@ -339,17 +354,27 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
     let now = Utc::now();
+    let json_mode = cli.json.unwrap_or(false);
+    let due_at = parse_optional_date(args.due.as_deref())?;
+    let defer_until = parse_optional_date(args.defer.as_deref())?;
 
     let storage = &mut storage_ctx.storage;
     let id_gen = IdGenerator::new(id_config);
 
     // Track created IDs for output
     let mut created_ids = Vec::new();
+    let mut created_issues = Vec::new();
 
     for parsed in parsed_issues {
+        let title = parsed.title.trim().to_string();
+        if title.is_empty() {
+            eprintln!("✗ Failed to create issue: title cannot be empty");
+            continue;
+        }
+
         let count = storage.count_issues()?;
         let id = id_gen.generate(
-            &parsed.title,
+            &title,
             parsed.description.as_deref(),
             None,
             now,
@@ -358,20 +383,32 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
         );
 
         let priority = if let Some(ref p) = parsed.priority {
-            Priority::from_str(p)?
+            match Priority::from_str(p) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("✗ Failed to create {title}: {err}");
+                    continue;
+                }
+            }
         } else {
             default_priority
         };
 
         let issue_type = if let Some(ref t) = parsed.issue_type {
-            IssueType::from_str(t)?
+            match IssueType::from_str(t) {
+                Ok(value) => value,
+                Err(err) => {
+                    eprintln!("✗ Failed to create {title}: {err}");
+                    continue;
+                }
+            }
         } else {
             default_issue_type.clone()
         };
 
         let mut issue = Issue {
             id: id.clone(),
-            title: parsed.title,
+            title: title.clone(),
             description: parsed.description,
             status: Status::Open,
             priority,
@@ -381,8 +418,8 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
             assignee: parsed.assignee,
             owner: args.owner.clone(),
             estimated_minutes: args.estimate,
-            due_at: parse_optional_date(args.due.as_deref())?,
-            defer_until: parse_optional_date(args.defer.as_deref())?,
+            due_at,
+            defer_until,
             external_ref: args.external_ref.clone(),
             ephemeral: args.ephemeral,
             design: parsed.design,
@@ -411,70 +448,81 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
         };
 
         issue.content_hash = Some(issue.compute_content_hash());
-        IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
-
-        if args.dry_run {
-            println!("Dry run: would create issue {}", issue.id);
+        if let Err(err) =
+            IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)
+        {
+            eprintln!("✗ Failed to create {title}: {err}");
             continue;
         }
 
-        storage.create_issue(&issue, &actor)?;
+        if let Err(err) = storage.create_issue(&issue, &actor) {
+            eprintln!("✗ Failed to create {title}: {err}");
+            continue;
+        }
 
         let mut labels = parsed.labels;
         labels.extend(args.labels.clone());
         for label in labels {
-            if !label.trim().is_empty() {
-                LabelValidator::validate(&label)
-                    .map_err(|e| BeadsError::validation("label", e.message))?;
-                storage.add_label(&id, &label, &actor)?;
+            let label = label.trim().to_string();
+            if label.is_empty() {
+                continue;
+            }
+            if let Err(err) = LabelValidator::validate(&label) {
+                eprintln!(
+                    "warning: skipping invalid label '{label}' for issue {id}: {}",
+                    err.message
+                );
+                continue;
+            }
+            if let Err(err) = storage.add_label(&id, &label, &actor) {
+                eprintln!("warning: failed to add label '{label}' for issue {id}: {err}");
             }
         }
 
         let mut deps = parsed.dependencies;
         deps.extend(args.deps.clone());
         for dep_str in deps {
-            let (type_str, dep_id) = if let Some((t, i)) = dep_str.split_once(':') {
-                (t, i)
-            } else {
-                ("blocks", dep_str.as_str())
-            };
+            let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
+            if !valid {
+                eprintln!("warning: skipping invalid dependency type '{type_str}' for issue {id}");
+                continue;
+            }
+            if type_str.eq_ignore_ascii_case("blocked-by") {
+                type_str = "blocks".to_string();
+            }
             if dep_id == id {
-                return Err(BeadsError::validation(
-                    "deps",
-                    format!("issue {id} cannot depend on itself"),
-                ));
+                eprintln!("warning: skipping self-dependency for issue {id}");
+                continue;
             }
-
-            // Strict dependency type validation
-            let dep_type: DependencyType =
-                type_str.parse().map_err(|_| BeadsError::Validation {
-                    field: "deps".to_string(),
-                    reason: format!("Invalid dependency type: {type_str}"),
-                })?;
-
-            // Disallow accidental custom types from typos
-            if let DependencyType::Custom(_) = dep_type {
-                return Err(BeadsError::Validation {
-                    field: "deps".to_string(),
-                    reason: format!(
-                        "Unknown dependency type: '{type_str}'. \
-                         Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
-                         related, discovered-from, replies-to, relates-to, duplicates, \
-                         supersedes, caused-by"
-                    ),
-                });
+            if let Err(err) = storage.add_dependency(&id, &dep_id, &type_str, &actor) {
+                eprintln!(
+                    "warning: failed to add dependency '{type_str}:{dep_id}' for issue {id}: {err}"
+                );
             }
-
-            storage.add_dependency(&id, dep_id, type_str, &actor)?;
         }
 
-        created_ids.push(id);
+        if json_mode {
+            if let Some(full_issue) = storage.get_issue_for_export(&id)? {
+                created_issues.push(full_issue);
+            } else {
+                eprintln!("warning: could not load created issue {id} for JSON output");
+            }
+        }
+
+        created_ids.push((id, title));
     }
 
-    if !created_ids.is_empty() && !args.dry_run {
-        println!("Created {} issues:", created_ids.len());
-        for id in created_ids {
-            println!("  {id}");
+    if json_mode {
+        let json_output = serde_json::to_string_pretty(&created_issues)?;
+        println!("{json_output}");
+    } else if !created_ids.is_empty() {
+        println!(
+            "✓ Created {} issues from {}:",
+            created_ids.len(),
+            path.display()
+        );
+        for (id, title) in created_ids {
+            println!("  ✓ {id}: {title}");
         }
     }
 

@@ -221,7 +221,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     needs: check
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
 
@@ -244,6 +244,14 @@ jobs:
             ${{ runner.os }}-cargo-bench-
             ${{ runner.os }}-cargo-
 
+      - name: Restore criterion baseline cache
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion/
+          key: ${{ runner.os }}-criterion-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-criterion-
+
       - name: Snapshot benchmark baseline (if present)
         run: |
           if [ -d target/criterion ]; then
@@ -252,7 +260,13 @@ jobs:
           fi
 
       - name: Run benchmarks
-        run: cargo bench --bench benchmarks -- --noplot --save-baseline main
+        run: |
+          set -euo pipefail
+          if find target/criterion -path "*/main/estimates.json" -type f | grep -q .; then
+            cargo bench --bench storage_perf -- --noplot --baseline main --save-baseline main
+          else
+            cargo bench --bench storage_perf -- --noplot --save-baseline main
+          fi
         continue-on-error: true
 
       - name: Check benchmark regressions (10% threshold)
@@ -309,6 +323,13 @@ jobs:
           name: benchmark-results
           path: target/criterion/
           if-no-files-found: ignore
+
+      - name: Save criterion baseline cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion/
+          key: ${{ runner.os }}-criterion-${{ github.run_id }}
 
   # Verify version auditing info is correctly embedded
   version-audit:

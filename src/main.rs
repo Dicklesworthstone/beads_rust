@@ -179,7 +179,13 @@ fn run_auto_import(
     allow_stale: bool,
     no_auto_import: bool,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    // If not initialized, skip auto-import (e.g. running 'br init')
+    let beads_dir = match config::discover_beads_dir(Some(Path::new("."))) {
+        Ok(dir) => dir,
+        Err(BeadsError::NotInitialized) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+
     let config::OpenStorageResult {
         mut storage,
         paths,

@@ -114,7 +114,7 @@ fn list_comments_by_id(
 
     println!("Comments for {issue_id}:");
     for comment in comments {
-        let timestamp = comment.created_at.format("%Y-%m-%d %H:%M");
+        let timestamp = comment.created_at.format("%Y-%m-%d %H:%M UTC");
         println!("[{}] at {}", comment.author, timestamp);
         println!("{}", comment.body.trim_end_matches('\n'));
         println!();

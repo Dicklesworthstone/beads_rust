@@ -20,8 +20,6 @@ use crate::format::BlockedIssue;
 pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Result<()> {
     tracing::info!("Fetching blocked issues from cache");
 
-    validate_priority_range(&args.priority)?;
-
     let beads_dir = discover_beads_dir(None)?;
     let storage_ctx = open_storage_with_cli(&beads_dir, overrides)?;
     let storage = &storage_ctx.storage;
@@ -125,17 +123,6 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
     Ok(())
 }
 
-fn validate_priority_range(priorities: &[u8]) -> Result<()> {
-    for &priority in priorities {
-        if priority > 4 {
-            return Err(BeadsError::InvalidPriority {
-                priority: i32::from(priority),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Sort blocked issues by priority (ascending), then by blocker count (descending).
 fn sort_blocked_issues(issues: &mut [BlockedIssue]) {
     issues.sort_by(|a, b| {
@@ -158,14 +145,23 @@ fn filter_by_type(issues: &mut Vec<BlockedIssue>, types: &[String]) {
 }
 
 /// Filter blocked issues by priority.
-fn filter_by_priority(issues: &mut Vec<BlockedIssue>, priorities: &[u8]) {
+fn filter_by_priority(issues: &mut Vec<BlockedIssue>, priorities: &[String]) {
     if priorities.is_empty() {
         return;
     }
+    let parsed: Vec<crate::model::Priority> = priorities
+        .iter()
+        .filter_map(|p| std::str::FromStr::from_str(p).ok())
+        .collect();
+
+    if parsed.is_empty() {
+        return;
+    }
+
     issues.retain(|bi| {
-        priorities
+        parsed
             .iter()
-            .any(|&p| i32::from(p) == bi.issue.priority.0)
+            .any(|&p| p == bi.issue.priority)
     });
 }
 

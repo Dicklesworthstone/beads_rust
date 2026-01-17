@@ -12,6 +12,7 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
+use std::str::FromStr;
 
 /// Execute the search command.
 ///
@@ -27,8 +28,6 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
             reason: "search query cannot be empty".to_string(),
         });
     }
-
-    validate_priority_range(&args.filters.priority)?;
 
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -106,17 +105,6 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
     Ok(())
 }
 
-fn validate_priority_range(priorities: &[u8]) -> Result<()> {
-    for &priority in priorities {
-        if priority > 4 {
-            return Err(BeadsError::InvalidPriority {
-                priority: i32::from(priority),
-            });
-        }
-    }
-    Ok(())
-}
-
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     let statuses = if args.status.is_empty() {
         None
@@ -143,11 +131,10 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        let parsed: Vec<Priority> = args
-            .priority
-            .iter()
-            .map(|&p| Priority(i32::from(p)))
-            .collect();
+        let mut parsed = Vec::new();
+        for p in &args.priority {
+            parsed.push(Priority::from_str(p)?);
+        }
         Some(parsed)
     };
 
@@ -181,14 +168,10 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
 
 fn needs_client_filters(args: &ListArgs) -> bool {
     !args.id.is_empty()
-        || !args.label.is_empty()
-        || !args.label_any.is_empty()
         || args.priority_min.is_some()
         || args.priority_max.is_some()
         || args.desc_contains.is_some()
         || args.notes_contains.is_some()
-        || args.sort.is_some()
-        || args.reverse
         || args.deferred
         || args.overdue
 }
