@@ -56,6 +56,10 @@ pub struct Cli {
     /// Quiet mode (no output except errors)
     #[arg(short, long, global = true)]
     pub quiet: bool,
+
+    /// Disable colored output
+    #[arg(long, global = true)]
+    pub no_color: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -194,6 +198,10 @@ EXAMPLES:
 
     /// Show version information
     Version,
+
+    /// Upgrade br to the latest version
+    #[cfg(feature = "self_update")]
+    Upgrade(UpgradeArgs),
 
     /// Generate shell completions
     Completions(CompletionsArgs),
@@ -1057,9 +1065,13 @@ pub struct StatsArgs {
     #[arg(long)]
     pub by_label: bool,
 
-    /// Include recent activity stats (requires git)
+    /// Include recent activity stats (requires git). Now shown by default.
     #[arg(long)]
     pub activity: bool,
+
+    /// Skip recent activity stats (for performance)
+    #[arg(long)]
+    pub no_activity: bool,
 
     /// Activity window in hours (default: 24)
     #[arg(long, default_value_t = 24)]
@@ -1102,4 +1114,25 @@ pub enum HistoryCommands {
         #[arg(long)]
         older_than: Option<u32>,
     },
+}
+
+/// Arguments for the upgrade command.
+#[cfg(feature = "self_update")]
+#[derive(Args, Debug, Clone, Default)]
+pub struct UpgradeArgs {
+    /// Check only, don't install
+    #[arg(long)]
+    pub check: bool,
+
+    /// Force reinstall current version
+    #[arg(long)]
+    pub force: bool,
+
+    /// Install specific version (e.g., "0.2.0")
+    #[arg(long)]
+    pub version: Option<String>,
+
+    /// Show what would happen without making changes
+    #[arg(long)]
+    pub dry_run: bool,
 }

@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::warn;
@@ -393,6 +394,7 @@ pub struct CliOverrides {
     pub actor: Option<String>,
     pub identity: Option<String>,
     pub json: Option<bool>,
+    pub display_color: Option<bool>,
     pub no_db: Option<bool>,
     pub no_daemon: Option<bool>,
     pub no_auto_flush: Option<bool>,
@@ -416,6 +418,9 @@ impl CliOverrides {
         }
         if let Some(json) = self.json {
             insert_key_value(&mut layer, "json", json.to_string());
+        }
+        if let Some(display_color) = self.display_color {
+            insert_key_value(&mut layer, "display.color", display_color.to_string());
         }
         if let Some(no_db) = self.no_db {
             insert_key_value(&mut layer, "no-db", no_db.to_string());
@@ -574,6 +579,32 @@ pub fn default_priority_from_layer(layer: &ConfigLayer) -> Result<Priority> {
 pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
     get_value(layer, &["default_type", "default-type"])
         .map_or_else(|| Ok(IssueType::Task), |value| IssueType::from_str(value))
+}
+
+/// Resolve display color preference from a merged config layer.
+///
+/// Accepts keys: `display.color`, `display-color`, `display_color`.
+#[must_use]
+pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    get_value(layer, &["display.color", "display-color", "display_color"])
+        .and_then(|value| parse_bool(value))
+}
+
+/// Determine whether human-readable output should use ANSI color.
+///
+/// Precedence:
+/// 1) Config `display.color` (if set)
+/// 2) `NO_COLOR` environment variable (standard)
+/// 3) stdout is a terminal
+#[must_use]
+pub fn should_use_color(layer: &ConfigLayer) -> bool {
+    if let Some(value) = display_color_from_layer(layer) {
+        return value;
+    }
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
 }
 
 /// Resolve external project mappings from config.
@@ -1438,6 +1469,7 @@ labels:
             db: Some(PathBuf::from("/cli/path.db")),
             actor: Some("cli_actor".to_string()),
             json: Some(true),
+            display_color: None,
             no_db: Some(true),
             no_daemon: Some(true),
             no_auto_flush: Some(true),

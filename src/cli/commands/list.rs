@@ -6,11 +6,12 @@
 use crate::cli::ListArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueWithCounts, format_issue_line};
+use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
 
 /// Execute the list command.
@@ -24,6 +25,17 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let max_width = if std::io::stdout().is_terminal() {
+        Some(terminal_width())
+    } else {
+        None
+    };
+    let format_options = TextFormatOptions {
+        use_color,
+        max_width,
+    };
 
     // Build filter from args
     let mut filters = build_filters(args)?;
@@ -74,7 +86,7 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
         println!("No issues found.");
     } else {
         for issue in &issues {
-            let line = format_issue_line(issue);
+            let line = format_issue_line_with(issue, format_options);
             println!("{line}");
         }
         println!("\n{} issue(s)", issues.len());

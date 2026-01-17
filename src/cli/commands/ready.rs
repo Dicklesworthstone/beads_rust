@@ -5,9 +5,10 @@
 use crate::cli::{ReadyArgs, SortPolicy};
 use crate::config;
 use crate::error::Result;
-use crate::format::IssueWithCounts;
+use crate::format::{IssueWithCounts, format_priority_badge, terminal_width, truncate_title};
 use crate::model::{IssueType, Priority};
 use crate::storage::{ReadyFilters, ReadySortPolicy};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
@@ -24,6 +25,12 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
 
     let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+    let use_color = config::should_use_color(&config_layer);
+    let max_width = if std::io::stdout().is_terminal() {
+        Some(terminal_width())
+    } else {
+        None
+    };
 
     let filters = ReadyFilters {
         assignee: args.assignee.clone(),
@@ -94,17 +101,38 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
         );
         for (i, iwc) in issues_with_counts.iter().enumerate() {
             let assignee = iwc.issue.assignee.as_deref().unwrap_or("unassigned");
-            println!(
-                "{}. [P{}] {} {} ({assignee})",
-                i + 1,
-                iwc.issue.priority.0,
-                iwc.issue.id,
-                iwc.issue.title
-            );
+            let line = format_ready_line(i + 1, &iwc.issue, assignee, use_color, max_width);
+            println!("{line}");
         }
     }
 
     Ok(())
+}
+
+fn format_ready_line(
+    index: usize,
+    issue: &crate::model::Issue,
+    assignee: &str,
+    use_color: bool,
+    max_width: Option<usize>,
+) -> String {
+    let priority_badge_plain = format!("[{}]", crate::format::format_priority(&issue.priority));
+    let prefix_plain = format!("{index}. {priority_badge_plain} {} ", issue.id);
+    let suffix_plain = format!(" ({assignee})");
+    let title = max_width.map_or_else(
+        || issue.title.clone(),
+        |width| {
+            let max_title =
+                width.saturating_sub(prefix_plain.chars().count() + suffix_plain.chars().count());
+            truncate_title(&issue.title, max_title)
+        },
+    );
+
+    let priority_badge = format_priority_badge(&issue.priority, use_color);
+    format!(
+        "{index}. {priority_badge} {} {title}{suffix_plain}",
+        issue.id
+    )
 }
 
 /// Parse type filter strings to `IssueType` enums.

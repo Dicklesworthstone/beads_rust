@@ -2,6 +2,7 @@
 
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::{format_priority_badge, format_status_label};
 use crate::util::id::{IdResolver, ResolverConfig};
 
 /// Execute the show command.
@@ -28,6 +29,7 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
     let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let use_color = config::should_use_color(&config_layer);
 
     let mut details_list = Vec::new();
     for id_input in target_ids {
@@ -51,7 +53,7 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
         println!("{output}");
     } else {
         for details in details_list {
-            print_issue_details(&details);
+            print_issue_details(&details, use_color);
             println!("----------------------------------------");
         }
     }
@@ -59,11 +61,13 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
     Ok(())
 }
 
-fn print_issue_details(details: &crate::format::IssueDetails) {
+fn print_issue_details(details: &crate::format::IssueDetails, use_color: bool) {
     let issue = &details.issue;
+    let priority_badge = format_priority_badge(&issue.priority, use_color);
+    let status_label = format_status_label(&issue.status, use_color);
     println!(
-        "{} {} [{}] [{}]",
-        issue.id, issue.title, issue.priority, issue.status
+        "{} {} {priority_badge} [{}]",
+        issue.id, issue.title, status_label
     );
 
     if let Some(assignee) = &issue.assignee {

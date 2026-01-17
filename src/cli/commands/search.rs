@@ -5,11 +5,12 @@
 use crate::cli::{ListArgs, SearchArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueWithCounts, format_issue_line};
+use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
 use crate::model::{IssueType, Priority, Status};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::Path;
 
 /// Execute the search command.
@@ -31,6 +32,17 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
 
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let max_width = if std::io::stdout().is_terminal() {
+        Some(terminal_width())
+    } else {
+        None
+    };
+    let format_options = TextFormatOptions {
+        use_color,
+        max_width,
+    };
 
     let mut filters = build_filters(&args.filters)?;
     let client_filters = needs_client_filters(&args.filters);
@@ -80,7 +92,7 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
             query
         );
         for iwc in &issues_with_counts {
-            let line = format_issue_line(&iwc.issue);
+            let line = format_issue_line_with(&iwc.issue, format_options);
             println!("{line}");
         }
     }

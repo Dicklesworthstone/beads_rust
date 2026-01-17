@@ -45,6 +45,8 @@ fn main() {
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides),
         Commands::Doctor => commands::doctor::execute(cli.json, &overrides),
         Commands::Version => commands::version::execute(cli.json),
+        #[cfg(feature = "self_update")]
+        Commands::Upgrade(args) => commands::upgrade::execute(&args, cli.json),
         Commands::Completions(args) => commands::completions::execute(&args),
         Commands::Stats(args) | Commands::Status(args) => {
             commands::stats::execute(&args, cli.json || args.robot, &overrides)
@@ -69,7 +71,6 @@ fn main() {
             };
             commands::update::execute(&update_args, &overrides)
         }
-        Commands::Upgrade(args) => commands::upgrade::execute(&args, cli.json),
     };
 
     if let Err(e) = result {
@@ -110,6 +111,7 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         actor: cli.actor.clone(),
         identity: None,
         json: Some(cli.json),
+        display_color: if cli.no_color { Some(false) } else { None },
         no_db: Some(cli.no_db),
         no_daemon: Some(cli.no_daemon),
         no_auto_flush: Some(cli.no_auto_flush),

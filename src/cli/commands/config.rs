@@ -587,6 +587,11 @@ fn get_config_options() -> Vec<(&'static str, &'static str, Option<&'static str>
             Some("30000"),
         ),
         (
+            "display.color",
+            "Enable colored output (true/false). Default is auto based on terminal.",
+            None,
+        ),
+        (
             "flush-debounce",
             "Auto-flush debounce interval in milliseconds",
             Some("500"),
