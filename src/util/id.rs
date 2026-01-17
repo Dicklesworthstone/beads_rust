@@ -609,7 +609,7 @@ impl IdResolver {
                     }
                     1 => {
                         return Ok(ResolvedId {
-                            id: matches.into_iter().next().expect("length checked to be 1"),
+                            id: matches.into_iter().next().unwrap_or_default(),
                             match_type: MatchType::Substring,
                             original_input: input.to_string(),
                         });

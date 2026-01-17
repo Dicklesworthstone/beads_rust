@@ -270,6 +270,33 @@ fn split_list_content(content: &str) -> Vec<String> {
     }
 }
 
+/// Validate a dependency type string.
+///
+/// Returns the dependency type if valid, or None if invalid.
+#[must_use]
+pub fn validate_dependency_type(dep_type: &str) -> Option<&str> {
+    match dep_type.to_lowercase().as_str() {
+        "blocks" | "blocked-by" | "parent-child" | "related" | "duplicates" => Some(dep_type),
+        _ => None,
+    }
+}
+
+/// Parse a dependency string into (type, id).
+///
+/// Accepts "type:id" or bare "id" (defaults to "blocks").
+///
+/// Returns (`dep_type`, `dep_id`, `is_valid_type`) where `is_valid_type` indicates
+/// whether the type was recognized.
+#[must_use]
+pub fn parse_dependency(dep_str: &str) -> (String, String, bool) {
+    if let Some((type_part, id_part)) = dep_str.split_once(':') {
+        let is_valid = validate_dependency_type(type_part).is_some();
+        (type_part.to_string(), id_part.to_string(), is_valid)
+    } else {
+        ("blocks".to_string(), dep_str.to_string(), true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +429,34 @@ This is the actual description.
             issues[0].description,
             Some("This is the actual description.".to_string())
         );
+    }
+
+    #[test]
+    fn test_validate_dependency_type() {
+        assert!(validate_dependency_type("blocks").is_some());
+        assert!(validate_dependency_type("blocked-by").is_some());
+        assert!(validate_dependency_type("parent-child").is_some());
+        assert!(validate_dependency_type("related").is_some());
+        assert!(validate_dependency_type("duplicates").is_some());
+        assert!(validate_dependency_type("invalid").is_none());
+    }
+
+    #[test]
+    fn test_parse_dependency() {
+        let (t, id, valid) = parse_dependency("blocks:bd-123");
+        assert_eq!(t, "blocks");
+        assert_eq!(id, "bd-123");
+        assert!(valid);
+
+        let (t, id, valid) = parse_dependency("bd-456");
+        assert_eq!(t, "blocks");
+        assert_eq!(id, "bd-456");
+        assert!(valid);
+
+        let (t, id, valid) = parse_dependency("invalid:bd-789");
+        assert_eq!(t, "invalid");
+        assert_eq!(id, "bd-789");
+        assert!(!valid);
     }
 
     #[test]
