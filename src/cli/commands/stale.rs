@@ -94,6 +94,11 @@ fn filter_stale_issues(mut issues: Vec<Issue>, now: DateTime<Utc>, days: i64) ->
 mod tests {
     use super::*;
     use crate::model::{IssueType, Priority};
+    use tracing::info;
+
+    fn init_logging() {
+        crate::logging::init_test_logging();
+    }
 
     fn make_issue(id: &str, updated_at: DateTime<Utc>) -> Issue {
         Issue {
@@ -140,6 +145,8 @@ mod tests {
 
     #[test]
     fn test_filter_stale_issues_orders_oldest_first() {
+        init_logging();
+        info!("test_filter_stale_issues_orders_oldest_first: starting");
         let now = Utc::now();
         let issues = vec![
             make_issue("bd-1", now - Duration::days(10)),
@@ -151,5 +158,6 @@ mod tests {
         assert_eq!(stale.len(), 2);
         assert_eq!(stale[0].id, "bd-3");
         assert_eq!(stale[1].id, "bd-2");
+        info!("test_filter_stale_issues_orders_oldest_first: assertions passed");
     }
 }
