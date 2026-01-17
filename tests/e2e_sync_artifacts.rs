@@ -303,6 +303,12 @@ fn e2e_sync_export_with_artifacts() {
 
     // Verify manifest was created
     let manifest_path = workspace.root.join(".beads").join(".manifest.json");
+    if !manifest_path.exists() {
+        eprintln!("Manifest missing! Contents of .beads:");
+        for entry in fs::read_dir(workspace.root.join(".beads")).unwrap() {
+            eprintln!("  {:?}", entry.unwrap().path());
+        }
+    }
     assert!(
         manifest_path.exists(),
         "Manifest file should exist after export with --manifest"
@@ -805,7 +811,12 @@ fn e2e_staleness_hash_check_prevents_false_touch() {
     );
     assert!(status1.status.success(), "status check failed");
     let payload1 = common::cli::extract_json_payload(&status1.stdout);
-    let json1: serde_json::Value = serde_json::from_str(&payload1).expect("parse status json");
+    let json1: serde_json::Value = serde_json::from_str(&payload1).unwrap_or_else(|e| {
+        panic!(
+            "parse status json failed: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+            e, status1.stdout, status1.stderr
+        );
+    });
     assert!(
         !json1["jsonl_newer"].as_bool().unwrap_or(true),
         "JSONL should not be marked newer after export"
@@ -902,7 +913,12 @@ fn e2e_staleness_detects_real_content_change() {
     );
     assert!(status.status.success(), "status check failed");
     let payload = common::cli::extract_json_payload(&status.stdout);
-    let json: serde_json::Value = serde_json::from_str(&payload).expect("parse status json");
+    let json: serde_json::Value = serde_json::from_str(&payload).unwrap_or_else(|e| {
+        panic!(
+            "parse status json failed: {}\nSTDOUT:\n{}\nSTDERR:\n{}",
+            e, status.stdout, status.stderr
+        );
+    });
 
     // Real content change should trigger staleness
     assert!(

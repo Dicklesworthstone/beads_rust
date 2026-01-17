@@ -1624,12 +1624,7 @@ pub fn auto_flush(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<AutoF
     // Configure export with defaults
     let export_config = ExportConfig {
         force: false,
-        is_default_path: true,
-        error_policy: ExportErrorPolicy::Strict,
-        retention_days: None,
-        beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: false,
-        history: history::HistoryConfig::default(),
+        ..Default::default()
     };
 
     // Perform export
@@ -2196,11 +2191,11 @@ impl MergeReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictResolution {
     /// Always keep the local (`SQLite`) version.
+    #[default]
     PreferLocal,
     /// Always keep the external (`JSONL`) version.
     PreferExternal,
     /// Use `updated_at` timestamp to determine winner (default).
-    #[default]
     PreferNewer,
     /// Report conflict without auto-resolving.
     Manual,
@@ -2728,8 +2723,8 @@ mod tests {
         assert_eq!(count_issues_in_jsonl(&path).unwrap(), 0);
 
         // Two issues
-        let issue1 = make_test_issue("bd-1", "One");
-        let issue2 = make_test_issue("bd-2", "Two");
+        let issue1 = make_test_issue("bd-001", "One");
+        let issue2 = make_test_issue("bd-002", "Two");
         let content = format!(
             "{}\n{}\n",
             serde_json::to_string(&issue1).unwrap(),
@@ -2744,8 +2739,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.jsonl");
 
-        let issue1 = make_test_issue("bd-aaa", "One");
-        let issue2 = make_test_issue("bd-bbb", "Two");
+        let issue1 = make_test_issue("bd-001", "One");
+        let issue2 = make_test_issue("bd-002", "Two");
         let content = format!(
             "{}\n{}\n",
             serde_json::to_string(&issue1).unwrap(),
@@ -2755,8 +2750,8 @@ mod tests {
 
         let ids = get_issue_ids_from_jsonl(&path).unwrap();
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains("bd-aaa"));
-        assert!(ids.contains("bd-bbb"));
+        assert!(ids.contains("bd-001"));
+        assert!(ids.contains("bd-002"));
     }
 
     #[test]
@@ -2925,6 +2920,7 @@ mod tests {
 
         // Create JSONL with same ID but older timestamp
         let mut incoming = make_test_issue("test-001", "Older title");
+        incoming.created_at = Utc::now() - chrono::Duration::hours(2); // Fix timestamp to be valid
         incoming.updated_at = Utc::now() - chrono::Duration::hours(1);
         let json = serde_json::to_string(&incoming).unwrap();
         fs::write(&path, format!("{json}\n")).unwrap();
@@ -3314,7 +3310,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("issues.jsonl");
 
-        let issue = make_issue_at("xx-1", "Bad prefix", fixed_time(100));
+        let issue = make_issue_at("xx-001", "Bad prefix", fixed_time(100));
         let json = serde_json::to_string(&issue).unwrap();
         fs::write(&path, format!("{json}\n")).unwrap();
 
@@ -3329,9 +3325,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("issues.jsonl");
 
-        let mut issue1 = make_issue_at("bd-1", "Issue 1", fixed_time(100));
+        let mut issue1 = make_issue_at("bd-001", "Issue 1", fixed_time(100));
         issue1.external_ref = Some("JIRA-1".to_string());
-        let mut issue2 = make_issue_at("bd-2", "Issue 2", fixed_time(120));
+        let mut issue2 = make_issue_at("bd-002", "Issue 2", fixed_time(120));
         issue2.external_ref = Some("JIRA-1".to_string());
 
         let content = format!(
@@ -3352,9 +3348,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("issues.jsonl");
 
-        let mut issue1 = make_issue_at("bd-1", "Issue 1", fixed_time(100));
+        let mut issue1 = make_issue_at("bd-001", "Issue 1", fixed_time(100));
         issue1.external_ref = Some("JIRA-1".to_string());
-        let mut issue2 = make_issue_at("bd-2", "Issue 2", fixed_time(120));
+        let mut issue2 = make_issue_at("bd-002", "Issue 2", fixed_time(120));
         issue2.external_ref = Some("JIRA-1".to_string());
 
         let content = format!(
@@ -3372,8 +3368,8 @@ mod tests {
 
         assert_eq!(result.imported_count, 2);
         assert_eq!(result.skipped_count, 0);
-        let first = storage.get_issue("bd-1").unwrap().unwrap();
-        let second = storage.get_issue("bd-2").unwrap().unwrap();
+        let first = storage.get_issue("bd-001").unwrap().unwrap();
+        let second = storage.get_issue("bd-002").unwrap().unwrap();
         assert_eq!(first.external_ref.as_deref(), Some("JIRA-1"));
         assert!(second.external_ref.is_none());
     }
@@ -3860,9 +3856,13 @@ mod tests {
     #[test]
     fn test_merge_deleted_local_modified_external() {
         // Issue in base and external (modified), deleted in local -> conflict (or keep external with PreferNewer)
-        let base = make_issue_with_hash("bd-6", "Base", fixed_time_merge(100), Some("hash6"));
-        let external =
-            make_issue_with_hash("bd-6", "Modified", fixed_time_merge(200), Some("hash6_mod"));
+        let base = make_issue_with_hash("bd-006", "Base", fixed_time_merge(100), Some("hash6"));
+        let external = make_issue_with_hash(
+            "bd-006",
+            "Modified",
+            fixed_time_merge(200),
+            Some("hash6_mod"),
+        );
 
         let result_manual = merge_issue(
             Some(&base),
@@ -3887,10 +3887,14 @@ mod tests {
     #[test]
     fn test_merge_only_local_modified() {
         // Issue in all three, only local modified -> keep local
-        let base = make_issue_with_hash("bd-7", "Base", fixed_time_merge(100), Some("hash7"));
-        let local =
-            make_issue_with_hash("bd-7", "Modified", fixed_time_merge(200), Some("hash7_mod"));
-        let external = make_issue_with_hash("bd-7", "Base", fixed_time_merge(100), Some("hash7")); // Same as base
+        let base = make_issue_with_hash("bd-007", "Base", fixed_time_merge(100), Some("hash7"));
+        let local = make_issue_with_hash(
+            "bd-007",
+            "Modified",
+            fixed_time_merge(200),
+            Some("hash7_mod"),
+        );
+        let external = make_issue_with_hash("bd-007", "Base", fixed_time_merge(100), Some("hash7")); // Same as base
 
         let result = merge_issue(
             Some(&base),
@@ -3898,19 +3902,20 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        match result {
-            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "Modified"),
-            _ => panic!("Expected KeepWithNote"),
-        }
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.title == "Modified"));
     }
 
     #[test]
     fn test_merge_only_external_modified() {
         // Issue in all three, only external modified -> keep external
-        let base = make_issue_with_hash("bd-8", "Base", fixed_time_merge(100), Some("hash8"));
-        let local = make_issue_with_hash("bd-8", "Base", fixed_time_merge(100), Some("hash8")); // Same as base
-        let external =
-            make_issue_with_hash("bd-8", "Modified", fixed_time_merge(200), Some("hash8_mod"));
+        let base = make_issue_with_hash("bd-008", "Base", fixed_time_merge(100), Some("hash8"));
+        let local = make_issue_with_hash("bd-008", "Base", fixed_time_merge(100), Some("hash8")); // Same as base
+        let external = make_issue_with_hash(
+            "bd-008",
+            "Modified",
+            fixed_time_merge(200),
+            Some("hash8_ext"),
+        );
 
         let result = merge_issue(
             Some(&base),
@@ -3918,24 +3923,21 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        match result {
-            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "Modified"),
-            _ => panic!("Expected KeepWithNote"),
-        }
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.title == "Modified"));
     }
 
     #[test]
     fn test_merge_both_modified_prefer_newer() {
         // Issue in all three, both modified -> keep newer
-        let base = make_issue_with_hash("bd-9", "Base", fixed_time_merge(100), Some("hash9"));
+        let base = make_issue_with_hash("bd-009", "Base", fixed_time_merge(100), Some("hash9"));
         let local = make_issue_with_hash(
-            "bd-9",
+            "bd-009",
             "Local Mod",
             fixed_time_merge(200),
             Some("hash9_local"),
         );
         let external = make_issue_with_hash(
-            "bd-9",
+            "bd-009",
             "External Mod",
             fixed_time_merge(300),
             Some("hash9_ext"),
@@ -3947,23 +3949,20 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        match result {
-            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "External Mod"),
-            _ => panic!("Expected KeepWithNote"),
-        }
+        assert!(matches!(result, MergeResult::KeepWithNote(issue, _) if issue.title == "External Mod"));
     }
 
     #[test]
     fn test_merge_both_modified_prefer_local() {
-        let base = make_issue_with_hash("bd-10", "Base", fixed_time_merge(100), Some("hash10"));
+        let base = make_issue_with_hash("bd-010", "Base", fixed_time_merge(100), Some("hash10"));
         let local = make_issue_with_hash(
-            "bd-10",
+            "bd-010",
             "Local Mod",
             fixed_time_merge(200),
             Some("hash10_local"),
         );
         let external = make_issue_with_hash(
-            "bd-10",
+            "bd-010",
             "External Mod",
             fixed_time_merge(300),
             Some("hash10_ext"),
@@ -3975,17 +3974,14 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferLocal,
         );
-        match result {
-            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "Local Mod"),
-            _ => panic!("Expected KeepWithNote"),
-        }
+        assert!(matches!(result, MergeResult::KeepWithNote(issue, _) if issue.title == "Local Mod"));
     }
 
     #[test]
     fn test_merge_convergent_creation_same_content() {
         // Both created independently with same content hash -> keep one
-        let local = make_issue_with_hash("bd-11", "Same", fixed_time_merge(100), Some("hash11"));
-        let external = make_issue_with_hash("bd-11", "Same", fixed_time_merge(100), Some("hash11"));
+        let local = make_issue_with_hash("bd-011", "Same", fixed_time_merge(100), Some("hash11"));
+        let external = make_issue_with_hash("bd-011", "Same", fixed_time_merge(100), Some("hash11"));
 
         let result = merge_issue(
             None,
@@ -4000,13 +3996,13 @@ mod tests {
     fn test_merge_convergent_creation_different_content() {
         // Both created independently with different content -> keep newer
         let local = make_issue_with_hash(
-            "bd-12",
+            "bd-012",
             "Local",
             fixed_time_merge(100),
             Some("hash12_local"),
         );
         let external = make_issue_with_hash(
-            "bd-12",
+            "bd-012",
             "External",
             fixed_time_merge(200),
             Some("hash12_ext"),
@@ -4018,18 +4014,16 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        match result {
-            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "External"),
-            _ => panic!("Expected KeepWithNote"),
-        }
+        assert!(matches!(result, MergeResult::KeepWithNote(issue, _) if issue.title == "External"));
     }
 
     #[test]
     fn test_merge_neither_changed() {
         // Issue in all three, neither changed -> keep (use left by convention)
-        let base = make_issue_with_hash("bd-13", "Same", fixed_time_merge(100), Some("hash13"));
-        let local = make_issue_with_hash("bd-13", "Same", fixed_time_merge(100), Some("hash13"));
-        let external = make_issue_with_hash("bd-13", "Same", fixed_time_merge(100), Some("hash13"));
+        let base = make_issue_with_hash("bd-013", "Same", fixed_time_merge(100), Some("hash13"));
+        let local = make_issue_with_hash("bd-013", "Same", fixed_time_merge(100), Some("hash13"));
+        let external =
+            make_issue_with_hash("bd-013", "Same", fixed_time_merge(100), Some("hash13"));
 
         let result = merge_issue(
             Some(&base),
@@ -4037,7 +4031,7 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        assert!(matches!(result, MergeResult::Keep(issue) if issue.id == "bd-13"));
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.id == "bd-013"));
     }
 
     #[test]
@@ -4046,21 +4040,21 @@ mod tests {
         let mut left = std::collections::HashMap::new();
         let mut right = std::collections::HashMap::new();
 
-        base.insert("bd-1".to_string(), make_test_issue("bd-1", "Base"));
-        base.insert("bd-2".to_string(), make_test_issue("bd-2", "Base"));
-        left.insert("bd-2".to_string(), make_test_issue("bd-2", "Left"));
-        left.insert("bd-3".to_string(), make_test_issue("bd-3", "Left"));
-        right.insert("bd-3".to_string(), make_test_issue("bd-3", "Right"));
-        right.insert("bd-4".to_string(), make_test_issue("bd-4", "Right"));
+        base.insert("bd-001".to_string(), make_test_issue("bd-001", "Base"));
+        base.insert("bd-002".to_string(), make_test_issue("bd-002", "Base"));
+        left.insert("bd-002".to_string(), make_test_issue("bd-002", "Left"));
+        left.insert("bd-003".to_string(), make_test_issue("bd-003", "Left"));
+        right.insert("bd-003".to_string(), make_test_issue("bd-003", "Right"));
+        right.insert("bd-004".to_string(), make_test_issue("bd-004", "Right"));
 
         let ctx = MergeContext::new(base, left, right);
         let ids = ctx.all_issue_ids();
 
         assert_eq!(ids.len(), 4);
-        assert!(ids.contains("bd-1"));
-        assert!(ids.contains("bd-2"));
-        assert!(ids.contains("bd-3"));
-        assert!(ids.contains("bd-4"));
+        assert!(ids.contains("bd-001"));
+        assert!(ids.contains("bd-002"));
+        assert!(ids.contains("bd-003"));
+        assert!(ids.contains("bd-004"));
     }
 
     #[test]
@@ -4070,7 +4064,7 @@ mod tests {
 
         report
             .conflicts
-            .push(("bd-1".to_string(), ConflictType::DeleteVsModify));
+            .push(("bd-001".to_string(), ConflictType::DeleteVsModify));
         assert!(report.has_conflicts());
     }
 
@@ -4079,9 +4073,9 @@ mod tests {
         let mut report = MergeReport::default();
         assert_eq!(report.total_actions(), 0);
 
-        report.kept.push("bd-1".to_string());
-        report.kept.push("bd-2".to_string());
-        report.deleted.push("bd-3".to_string());
+        report.kept.push("bd-001".to_string());
+        report.kept.push("bd-002".to_string());
+        report.deleted.push("bd-003".to_string());
         assert_eq!(report.total_actions(), 3);
     }
 
@@ -4092,31 +4086,32 @@ mod tests {
     #[test]
     fn test_three_way_merge_basic() {
         // Setup: one issue in each state
-        let base_issue = make_issue_with_hash("bd-1", "Base", fixed_time_merge(100), Some("hash1"));
+        let base_issue =
+            make_issue_with_hash("bd-001", "Base", fixed_time_merge(100), Some("hash1"));
         let local_issue =
-            make_issue_with_hash("bd-2", "Local Only", fixed_time_merge(200), Some("hash2"));
+            make_issue_with_hash("bd-002", "Local Only", fixed_time_merge(200), Some("hash2"));
         let external_issue = make_issue_with_hash(
-            "bd-3",
+            "bd-003",
             "External Only",
             fixed_time_merge(300),
             Some("hash3"),
         );
 
         let mut base = std::collections::HashMap::new();
-        base.insert("bd-1".to_string(), base_issue.clone());
+        base.insert("bd-001".to_string(), base_issue.clone());
 
         let mut left = std::collections::HashMap::new();
-        left.insert("bd-1".to_string(), base_issue.clone());
-        left.insert("bd-2".to_string(), local_issue);
+        left.insert("bd-001".to_string(), base_issue.clone());
+        left.insert("bd-002".to_string(), local_issue);
 
         let mut right = std::collections::HashMap::new();
-        right.insert("bd-1".to_string(), base_issue);
-        right.insert("bd-3".to_string(), external_issue);
+        right.insert("bd-001".to_string(), base_issue);
+        right.insert("bd-003".to_string(), external_issue);
 
         let context = MergeContext::new(base, left, right);
         let report = three_way_merge(&context, ConflictResolution::PreferNewer, None);
 
-        // Should keep bd-1 (in all three), bd-2 (local only), bd-3 (external only)
+        // Should keep bd-001 (in all three), bd-002 (local only), bd-003 (external only)
         assert_eq!(report.kept.len(), 3);
         assert!(report.conflicts.is_empty());
         assert!(report.deleted.is_empty());
@@ -4126,7 +4121,7 @@ mod tests {
     fn test_three_way_merge_with_tombstone_protection() {
         // Setup: tombstoned issue trying to resurrect from external
         let external_issue = make_issue_with_hash(
-            "bd-tombstoned",
+            "bd-tomb",
             "Should Not Resurrect",
             fixed_time_merge(300),
             Some("hash1"),
@@ -4135,31 +4130,27 @@ mod tests {
         let base = std::collections::HashMap::new();
         let left = std::collections::HashMap::new();
         let mut right = std::collections::HashMap::new();
-        right.insert("bd-tombstoned".to_string(), external_issue);
+        right.insert("bd-tomb".to_string(), external_issue);
 
         let context = MergeContext::new(base, left, right);
 
         // Create tombstones set
         let mut tombstones = std::collections::HashSet::new();
-        tombstones.insert("bd-tombstoned".to_string());
+        tombstones.insert("bd-tomb".to_string());
 
         let report = three_way_merge(&context, ConflictResolution::PreferNewer, Some(&tombstones));
 
         // Should NOT keep the tombstoned issue
         assert!(report.kept.is_empty());
         assert_eq!(report.tombstone_protected.len(), 1);
-        assert!(
-            report
-                .tombstone_protected
-                .contains(&"bd-tombstoned".to_string())
-        );
+        assert!(report.tombstone_protected.contains(&"bd-tomb".to_string()));
     }
 
     #[test]
     fn test_three_way_merge_tombstone_allows_local() {
         // Setup: tombstoned issue exists in local - should be allowed
         let local_issue = make_issue_with_hash(
-            "bd-tombstoned",
+            "bd-tomb",
             "Local Tombstoned",
             fixed_time_merge(200),
             Some("hash1"),
@@ -4167,13 +4158,13 @@ mod tests {
 
         let base = std::collections::HashMap::new();
         let mut left = std::collections::HashMap::new();
-        left.insert("bd-tombstoned".to_string(), local_issue);
+        left.insert("bd-tomb".to_string(), local_issue);
         let right = std::collections::HashMap::new();
 
         let context = MergeContext::new(base, left, right);
 
         let mut tombstones = std::collections::HashSet::new();
-        tombstones.insert("bd-tombstoned".to_string());
+        tombstones.insert("bd-tomb".to_string());
 
         let report = three_way_merge(&context, ConflictResolution::PreferNewer, Some(&tombstones));
 
@@ -4185,15 +4176,11 @@ mod tests {
     #[test]
     fn test_three_way_merge_deletions() {
         // Setup: issue in base but deleted in both left and right
-        let base_issue = make_issue_with_hash(
-            "bd-deleted",
-            "To Delete",
-            fixed_time_merge(100),
-            Some("hash1"),
-        );
+        let base_issue =
+            make_issue_with_hash("bd-del", "To Delete", fixed_time_merge(100), Some("hash1"));
 
         let mut base = std::collections::HashMap::new();
-        base.insert("bd-deleted".to_string(), base_issue);
+        base.insert("bd-del".to_string(), base_issue);
 
         let left = std::collections::HashMap::new();
         let right = std::collections::HashMap::new();
@@ -4203,36 +4190,36 @@ mod tests {
 
         assert!(report.kept.is_empty());
         assert_eq!(report.deleted.len(), 1);
-        assert!(report.deleted.contains(&"bd-deleted".to_string()));
+        assert!(report.deleted.contains(&"bd-del".to_string()));
     }
 
     #[test]
     fn test_three_way_merge_with_notes() {
         // Setup: issue modified in both left and right
         let base_issue = make_issue_with_hash(
-            "bd-1",
+            "bd-001",
             "Base Title",
             fixed_time_merge(100),
             Some("base_hash"),
         );
         let local_issue = make_issue_with_hash(
-            "bd-1",
+            "bd-001",
             "Local Modified",
             fixed_time_merge(200),
-            Some("local_hash"),
+            Some("mod_hash"),
         );
         let external_issue = make_issue_with_hash(
-            "bd-1",
+            "bd-001",
             "External Modified",
             fixed_time_merge(300),
             Some("external_hash"),
         );
 
         let mut base = std::collections::HashMap::new();
-        base.insert("bd-1".to_string(), base_issue);
+        base.insert("bd-001".to_string(), base_issue);
 
         let mut left = std::collections::HashMap::new();
-        left.insert("bd-1".to_string(), local_issue);
+        left.insert("bd-001".to_string(), local_issue);
 
         let right = std::collections::HashMap::new(); // Deleted externally
 
@@ -4262,15 +4249,19 @@ mod tests {
     fn test_three_way_merge_conflict_manual_strategy() {
         // Setup: issue deleted externally but modified locally with Manual strategy
         let base_issue =
-            make_issue_with_hash("bd-1", "Base", fixed_time_merge(100), Some("base_hash"));
-        let local_issue =
-            make_issue_with_hash("bd-1", "Modified", fixed_time_merge(200), Some("mod_hash"));
+            make_issue_with_hash("bd-001", "Base", fixed_time_merge(100), Some("base_hash"));
+        let local_issue = make_issue_with_hash(
+            "bd-001",
+            "Modified",
+            fixed_time_merge(200),
+            Some("mod_hash"),
+        );
 
         let mut base = std::collections::HashMap::new();
-        base.insert("bd-1".to_string(), base_issue);
+        base.insert("bd-001".to_string(), base_issue);
 
         let mut left = std::collections::HashMap::new();
-        left.insert("bd-1".to_string(), local_issue);
+        left.insert("bd-001".to_string(), local_issue);
 
         let right = std::collections::HashMap::new(); // Deleted externally
 
