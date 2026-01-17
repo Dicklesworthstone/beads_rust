@@ -214,6 +214,9 @@ EXAMPLES:
 
     /// Manage local history backups
     History(HistoryArgs),
+
+    /// Find open issues referenced in git commits
+    Orphans(OrphansArgs),
 }
 
 /// Arguments for the completions command.
@@ -313,6 +316,10 @@ pub struct CreateArgs {
     /// Output only issue ID
     #[arg(long)]
     pub silent: bool,
+
+    /// Create issues from a markdown file (bulk import)
+    #[arg(long, short = 'f')]
+    pub file: Option<std::path::PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -451,6 +458,18 @@ pub struct DeleteArgs {
     pub dry_run: bool,
 }
 
+/// Output format for list command.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum OutputFormat {
+    /// Human-readable text (default)
+    #[default]
+    Text,
+    /// JSON output
+    Json,
+    /// CSV output with configurable fields
+    Csv,
+}
+
 /// Arguments for the list command.
 #[derive(Args, Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -538,6 +557,20 @@ pub struct ListArgs {
     /// Use tree/pretty output format
     #[arg(long)]
     pub pretty: bool,
+
+    /// Output format (text, json, csv)
+    #[arg(long, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+
+    /// CSV fields to include (comma-separated)
+    ///
+    /// Available: id, title, description, status, priority, `issue_type`,
+    /// assignee, owner, `created_at`, `updated_at`, `closed_at`, `due_at`,
+    /// `defer_until`, notes, `external_ref`
+    ///
+    /// Default: id, title, status, priority, `issue_type`, assignee, `created_at`, `updated_at`
+    #[arg(long, value_name = "FIELDS")]
+    pub fields: Option<String>,
 }
 
 /// Arguments for the search command.
@@ -1146,6 +1179,22 @@ pub enum HistoryCommands {
         #[arg(long)]
         older_than: Option<u32>,
     },
+}
+
+/// Arguments for the orphans command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct OrphansArgs {
+    /// Include latest commit hash and message in human output
+    #[arg(long)]
+    pub details: bool,
+
+    /// Interactive close flow (prompt to close each orphan)
+    #[arg(long)]
+    pub fix: bool,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
 }
 
 /// Arguments for the upgrade command.
