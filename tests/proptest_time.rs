@@ -38,10 +38,8 @@ proptest! {
     ) {
         init_test_logging();
 
-        let timestamp = format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            year, month, day, hour, minute, second
-        );
+        let timestamp =
+            format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
         info!("proptest_rfc3339: timestamp={timestamp}");
 
         let result = parse_flexible_timestamp(&timestamp, "test");
@@ -49,7 +47,8 @@ proptest! {
         prop_assert!(result.is_ok(), "Valid RFC3339 should parse: {timestamp}");
 
         let parsed = result.unwrap();
-        prop_assert_eq!(parsed.year() as u32, year, "Year should match");
+        let year_i32 = i32::try_from(year).expect("year fits i32");
+        prop_assert_eq!(parsed.year(), year_i32, "Year should match");
         prop_assert_eq!(parsed.month(), month, "Month should match");
         prop_assert_eq!(parsed.day(), day, "Day should match");
         prop_assert_eq!(parsed.hour(), hour, "Hour should match");
@@ -69,10 +68,8 @@ proptest! {
     ) {
         init_test_logging();
 
-        let original = format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
-            year, month, day, hour, minute, second
-        );
+        let original =
+            format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00:00");
         info!("proptest_roundtrip: original={original}");
 
         let parsed = parse_flexible_timestamp(&original, "test");
@@ -210,7 +207,7 @@ proptest! {
     ) {
         init_test_logging();
 
-        let date = format!("{:04}-{:02}-{:02}", year, month, day);
+        let date = format!("{year:04}-{month:02}-{day:02}");
         info!("proptest_simple_date: date={date}");
 
         let result = parse_flexible_timestamp(&date, "test");
@@ -218,7 +215,8 @@ proptest! {
         prop_assert!(result.is_ok(), "Simple date should parse: {date}");
 
         let parsed = result.unwrap();
-        prop_assert_eq!(parsed.year() as u32, year, "Year should match");
+        let year_i32 = i32::try_from(year).expect("year fits i32");
+        prop_assert_eq!(parsed.year(), year_i32, "Year should match");
         prop_assert_eq!(parsed.month(), month, "Month should match");
         prop_assert_eq!(parsed.day(), day, "Day should match");
     }

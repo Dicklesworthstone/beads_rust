@@ -270,9 +270,7 @@ fn hash_low_collision_rate() {
         batch_size,
         "Should have {batch_size} unique hashes"
     );
-    info!(
-        "proptest_hash_collision: PASS - {batch_size} unique hashes, 0 collisions"
-    );
+    info!("proptest_hash_collision: PASS - {batch_size} unique hashes, 0 collisions");
 }
 
 /// Property: Hash is stable across issue type changes

@@ -9,6 +9,7 @@
 use chrono::Utc;
 use proptest::prelude::*;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use tracing::info;
 
 use beads_rust::util::id::{
@@ -171,7 +172,7 @@ proptest! {
 
         let mut id = format!("bd-{hash}");
         for seg in &child_segments {
-            id.push_str(&format!(".{seg}"));
+            let _ = write!(id, ".{seg}");
         }
 
         info!(
