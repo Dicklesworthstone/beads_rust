@@ -492,8 +492,10 @@ fn parse_optional_date(s: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::init_test_logging;
     use crate::util::id::IdConfig;
     use chrono::Datelike;
+    use tracing::info;
 
     // Helper to create basic args
     fn default_args() -> CreateArgs {
@@ -539,6 +541,8 @@ mod tests {
 
     #[test]
     fn test_create_issue_basic_success() {
+        init_test_logging();
+        info!("test_create_issue_basic_success: starting");
         let mut storage = setup_memory_storage();
         let args = default_args();
         let config = default_config();
@@ -554,10 +558,13 @@ mod tests {
         let loaded = storage.get_issue(&issue.id).expect("get issue");
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().title, "Test Issue");
+        info!("test_create_issue_basic_success: assertions passed");
     }
 
     #[test]
     fn test_create_issue_validation_empty_title() {
+        init_test_logging();
+        info!("test_create_issue_validation_empty_title: starting");
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.title = None;
@@ -565,10 +572,13 @@ mod tests {
 
         let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "title"));
+        info!("test_create_issue_validation_empty_title: assertions passed");
     }
 
     #[test]
     fn test_create_issue_dry_run_no_writes() {
+        init_test_logging();
+        info!("test_create_issue_dry_run_no_writes: starting");
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.dry_run = true;
@@ -580,10 +590,13 @@ mod tests {
         assert_eq!(issue.title, "Test Issue");
         let loaded = storage.get_issue(&issue.id).expect("get issue");
         assert!(loaded.is_none(), "dry run should not persist issue");
+        info!("test_create_issue_dry_run_no_writes: assertions passed");
     }
 
     #[test]
     fn test_create_issue_with_overrides() {
+        init_test_logging();
+        info!("test_create_issue_with_overrides: starting");
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.priority = Some("0".to_string());
@@ -596,10 +609,13 @@ mod tests {
         assert_eq!(issue.priority, Priority::CRITICAL);
         assert_eq!(issue.issue_type, IssueType::Bug);
         assert_eq!(issue.description, Some("Desc".to_string()));
+        info!("test_create_issue_with_overrides: assertions passed");
     }
 
     #[test]
     fn test_create_issue_with_labels_and_deps() {
+        init_test_logging();
+        info!("test_create_issue_with_labels_and_deps: starting");
         let mut storage = setup_memory_storage();
         let config = default_config();
 
@@ -625,10 +641,13 @@ mod tests {
         let deps = storage.get_dependencies(&issue.id).expect("get deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], target.id);
+        info!("test_create_issue_with_labels_and_deps: assertions passed");
     }
 
     #[test]
     fn test_create_parent_dependency() {
+        init_test_logging();
+        info!("test_create_parent_dependency: starting");
         let mut storage = setup_memory_storage();
         let config = default_config();
 
@@ -643,10 +662,13 @@ mod tests {
         let deps = storage.get_dependencies(&child.id).expect("get deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], parent.id);
+        info!("test_create_parent_dependency: assertions passed");
     }
 
     #[test]
     fn test_create_issue_invalid_type_rejected() {
+        init_test_logging();
+        info!("test_create_issue_invalid_type_rejected: starting");
         // Custom/unknown types are rejected for bd conformance
         let mut storage = setup_memory_storage();
         let mut args = default_args();
@@ -655,6 +677,7 @@ mod tests {
 
         let result = create_issue_impl(&mut storage, &args, &config);
         assert!(result.is_err(), "create should fail with invalid type");
+        info!("test_create_issue_invalid_type_rejected: assertions passed");
     }
 
     // =========================================================================
@@ -663,20 +686,28 @@ mod tests {
 
     #[test]
     fn test_parse_optional_date_none() {
+        init_test_logging();
+        info!("test_parse_optional_date_none: starting");
         let result = parse_optional_date(None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+        info!("test_parse_optional_date_none: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_empty_string() {
+        init_test_logging();
+        info!("test_parse_optional_date_empty_string: starting");
         let result = parse_optional_date(Some(""));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+        info!("test_parse_optional_date_empty_string: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_iso8601() {
+        init_test_logging();
+        info!("test_parse_optional_date_iso8601: starting");
         let result = parse_optional_date(Some("2026-01-17T10:00:00Z"));
         assert!(result.is_ok());
         let date = result.unwrap();
@@ -685,10 +716,13 @@ mod tests {
         assert_eq!(dt.year(), 2026);
         assert_eq!(dt.month(), 1);
         assert_eq!(dt.day(), 17);
+        info!("test_parse_optional_date_iso8601: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_simple_date() {
+        init_test_logging();
+        info!("test_parse_optional_date_simple_date: starting");
         let result = parse_optional_date(Some("2026-12-31"));
         assert!(result.is_ok());
         let date = result.unwrap();
@@ -697,27 +731,37 @@ mod tests {
         assert_eq!(dt.year(), 2026);
         assert_eq!(dt.month(), 12);
         assert_eq!(dt.day(), 31);
+        info!("test_parse_optional_date_simple_date: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_with_timezone() {
+        init_test_logging();
+        info!("test_parse_optional_date_with_timezone: starting");
         let result = parse_optional_date(Some("2026-06-15T14:30:00+05:30"));
         assert!(result.is_ok());
         let date = result.unwrap();
         assert!(date.is_some());
+        info!("test_parse_optional_date_with_timezone: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_invalid_format() {
+        init_test_logging();
+        info!("test_parse_optional_date_invalid_format: starting");
         let result = parse_optional_date(Some("not-a-date"));
         assert!(result.is_err());
+        info!("test_parse_optional_date_invalid_format: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_partial_date() {
+        init_test_logging();
+        info!("test_parse_optional_date_partial_date: starting");
         // Flexible parser may accept various formats
         let result = parse_optional_date(Some("2026-01"));
         let _ = result;
+        info!("test_parse_optional_date_partial_date: assertions passed");
     }
 
     // =========================================================================
@@ -726,6 +770,8 @@ mod tests {
 
     #[test]
     fn test_parse_optional_date_year_boundaries() {
+        init_test_logging();
+        info!("test_parse_optional_date_year_boundaries: starting");
         // Far future date
         let result = parse_optional_date(Some("2099-12-31"));
         assert!(result.is_ok());
@@ -733,10 +779,13 @@ mod tests {
         // Past date
         let result = parse_optional_date(Some("2000-01-01"));
         assert!(result.is_ok());
+        info!("test_parse_optional_date_year_boundaries: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_leap_year() {
+        init_test_logging();
+        info!("test_parse_optional_date_leap_year: starting");
         // Feb 29 on leap year
         let result = parse_optional_date(Some("2024-02-29"));
         assert!(result.is_ok());
@@ -745,10 +794,13 @@ mod tests {
         let dt = date.unwrap();
         assert_eq!(dt.month(), 2);
         assert_eq!(dt.day(), 29);
+        info!("test_parse_optional_date_leap_year: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_end_of_month() {
+        init_test_logging();
+        info!("test_parse_optional_date_end_of_month: starting");
         // 31-day month
         let result = parse_optional_date(Some("2026-03-31"));
         assert!(result.is_ok());
@@ -756,6 +808,7 @@ mod tests {
         // 30-day month
         let result = parse_optional_date(Some("2026-04-30"));
         assert!(result.is_ok());
+        info!("test_parse_optional_date_end_of_month: assertions passed");
     }
 
     // =========================================================================
@@ -764,9 +817,12 @@ mod tests {
 
     #[test]
     fn test_parse_optional_date_whitespace_only() {
+        init_test_logging();
+        info!("test_parse_optional_date_whitespace_only: starting");
         // Should be treated as non-empty by the string check, but may fail parsing
         let result = parse_optional_date(Some("   "));
         // Behavior depends on implementation - just ensure no panic
         let _ = result;
+        info!("test_parse_optional_date_whitespace_only: assertions passed");
     }
 }
