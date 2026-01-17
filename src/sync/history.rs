@@ -6,8 +6,9 @@
 //! - Listing and restoring backups
 
 use crate::error::{BeadsError, Result};
-use chrono::{DateTime, Utc};
-use std::fs;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 /// Configuration for history backups.
@@ -143,9 +144,18 @@ pub fn list_backups(history_dir: &Path) -> Result<Vec<BackupEntry>> {
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
                 {
                     // Parse timestamp from filename: issues.YYYYMMDD_HHMMSS.jsonl
+                    // Expected format: issues.20230101_120000.jsonl
+                    let timestamp = if name.len() >= 22 {
+                        let ts_str = &name[7..22]; // "20230101_120000"
+                        match NaiveDateTime::parse_from_str(ts_str, "%Y%m%d_%H%M%S") {
+                            Ok(dt) => Utc.from_utc_datetime(&dt),
+                            Err(_) => continue, // Strictly require valid timestamp
+                        }
+                    } else {
+                        continue; // Skip files that don't match length requirement
+                    };
+
                     if let Ok(metadata) = fs::metadata(&path) {
-                        let timestamp =
-                            DateTime::<Utc>::from(metadata.modified().map_err(BeadsError::Io)?);
                         backups.push(BackupEntry {
                             path,
                             timestamp,
@@ -170,9 +180,46 @@ fn get_latest_backup(history_dir: &Path) -> Result<Option<BackupEntry>> {
 
 /// Compare two files by content hash.
 fn files_are_identical(p1: &Path, p2: &Path) -> Result<bool> {
-    let c1 = fs::read(p1).map_err(BeadsError::Io)?;
-    let c2 = fs::read(p2).map_err(BeadsError::Io)?;
-    Ok(c1 == c2)
+    let f1 = File::open(p1).map_err(BeadsError::Io)?;
+    let f2 = File::open(p2).map_err(BeadsError::Io)?;
+
+    let len1 = f1.metadata().map_err(BeadsError::Io)?.len();
+    let len2 = f2.metadata().map_err(BeadsError::Io)?.len();
+
+    if len1 != len2 {
+        return Ok(false);
+    }
+
+    let mut reader1 = BufReader::new(f1);
+    let mut reader2 = BufReader::new(f2);
+
+    let mut buf1 = [0u8; 8192];
+    let mut buf2 = [0u8; 8192];
+
+    loop {
+        let n1 = reader1.read(&mut buf1).map_err(BeadsError::Io)?;
+        if n1 == 0 {
+            break;
+        }
+
+        // Fill buffer 2 to match n1
+        let mut n2_total = 0;
+        while n2_total < n1 {
+            let n2 = reader2
+                .read(&mut buf2[n2_total..n1])
+                .map_err(BeadsError::Io)?;
+            if n2 == 0 {
+                return Ok(false); // Unexpected EOF
+            }
+            n2_total += n2;
+        }
+
+        if buf1[..n1] != buf2[..n1] {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 /// Prune old backups based on count and age.
@@ -214,6 +261,99 @@ pub fn prune_backups(
     }
 
     Ok(deleted_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_backup_rotation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        // Create dummy jsonl
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        File::create(&jsonl_path)
+            .unwrap()
+            .write_all(b"test")
+            .unwrap();
+
+        let config = HistoryConfig {
+            enabled: true,
+            max_count: 2,
+            max_age_days: 30,
+        };
+
+        // Create 3 backups (should rotate)
+        backup_before_export(&beads_dir, &config).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2)); // Ensure >1s for timestamp resolution
+
+        // Modify file to force new backup
+        File::create(&jsonl_path)
+            .unwrap()
+            .write_all(b"test2")
+            .unwrap();
+        backup_before_export(&beads_dir, &config).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        File::create(&jsonl_path)
+            .unwrap()
+            .write_all(b"test3")
+            .unwrap();
+        backup_before_export(&beads_dir, &config).unwrap();
+
+        let backups = list_backups(&history_dir).unwrap();
+        assert_eq!(backups.len(), 2);
+    }
+
+    #[test]
+    fn test_deduplication() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        File::create(&jsonl_path)
+            .unwrap()
+            .write_all(b"content")
+            .unwrap();
+
+        let config = HistoryConfig::default();
+
+        // First backup
+        backup_before_export(&beads_dir, &config).unwrap();
+
+        // Second backup (same content) - should be skipped
+        backup_before_export(&beads_dir, &config).unwrap();
+
+        let backups = list_backups(&history_dir).unwrap();
+        assert_eq!(backups.len(), 1);
+    }
+
+    #[test]
+    fn test_list_backups_parsing() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+
+        // Create files with manual timestamps
+        File::create(history_dir.join("issues.20230101_100000.jsonl")).unwrap();
+        File::create(history_dir.join("issues.20230102_100000.jsonl")).unwrap();
+        File::create(history_dir.join("issues.invalid_name.jsonl")).unwrap();
+
+        let backups = list_backups(history_dir).unwrap();
+        assert_eq!(backups.len(), 2);
+
+        // Newest first
+        assert!(backups[0].path.to_string_lossy().contains("20230102"));
+        assert!(backups[1].path.to_string_lossy().contains("20230101"));
+    }
 }
 
 // Re-export needed chrono type for parsing
