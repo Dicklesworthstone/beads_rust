@@ -43,10 +43,8 @@ pub const ALL_FIELDS: &[&str] = &[
 /// Doubles any existing quotes within the value.
 #[must_use]
 pub fn escape_field(value: &str) -> String {
-    let needs_quoting = value.contains(',')
-        || value.contains('"')
-        || value.contains('\n')
-        || value.contains('\r');
+    let needs_quoting =
+        value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r');
 
     if needs_quoting {
         let escaped = value.replace('"', "\"\"");
@@ -73,9 +71,7 @@ pub fn get_field_value(issue: &Issue, field: &str) -> String {
         "closed_at" => issue
             .closed_at
             .map_or_else(String::new, |dt| dt.to_rfc3339()),
-        "due_at" => issue
-            .due_at
-            .map_or_else(String::new, |dt| dt.to_rfc3339()),
+        "due_at" => issue.due_at.map_or_else(String::new, |dt| dt.to_rfc3339()),
         "defer_until" => issue
             .defer_until
             .map_or_else(String::new, |dt| dt.to_rfc3339()),
@@ -91,12 +87,11 @@ pub fn get_field_value(issue: &Issue, field: &str) -> String {
 #[must_use]
 pub fn parse_fields(fields_arg: Option<&str>) -> Vec<&'static str> {
     match fields_arg {
-        Some(arg) if !arg.is_empty() => {
-            arg.split(',')
-                .map(str::trim)
-                .filter_map(|f| ALL_FIELDS.iter().find(|&&af| af == f).copied())
-                .collect()
-        }
+        Some(arg) if !arg.is_empty() => arg
+            .split(',')
+            .map(str::trim)
+            .filter_map(|f| ALL_FIELDS.iter().find(|&&af| af == f).copied())
+            .collect(),
         _ => DEFAULT_FIELDS.to_vec(),
     }
 }

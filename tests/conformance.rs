@@ -928,8 +928,16 @@ fn conformance_close_issue() {
     let br_show = workspace.run_br(["show", br_id, "--json"], "show_after_close");
     let bd_show = workspace.run_bd(["show", bd_id, "--json"], "show_after_close");
 
-    assert!(br_show.status.success(), "br show failed: {}", br_show.stderr);
-    assert!(bd_show.status.success(), "bd show failed: {}", bd_show.stderr);
+    assert!(
+        br_show.status.success(),
+        "br show failed: {}",
+        br_show.stderr
+    );
+    assert!(
+        bd_show.status.success(),
+        "bd show failed: {}",
+        bd_show.stderr
+    );
 
     let br_show_json = extract_json_payload(&br_show.stdout);
     let bd_show_json = extract_json_payload(&bd_show.stdout);
@@ -938,8 +946,16 @@ fn conformance_close_issue() {
     let bd_show_val: Value = serde_json::from_str(&bd_show_json).expect("parse");
 
     // Handle array or object response
-    let br_issue = if br_show_val.is_array() { &br_show_val[0] } else { &br_show_val };
-    let bd_issue = if bd_show_val.is_array() { &bd_show_val[0] } else { &bd_show_val };
+    let br_issue = if br_show_val.is_array() {
+        &br_show_val[0]
+    } else {
+        &br_show_val
+    };
+    let bd_issue = if bd_show_val.is_array() {
+        &bd_show_val[0]
+    } else {
+        &bd_show_val
+    };
 
     assert_eq!(
         br_issue["status"].as_str(),

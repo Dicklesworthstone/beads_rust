@@ -55,9 +55,7 @@ pub fn execute(args: &OrphansArgs, json: bool, cli: &config::CliOverrides) -> Re
 
     // Get issue prefix from config
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
-    let prefix = config_layer
-        .get_string("issue_prefix")
-        .unwrap_or_else(|| "bd".to_string());
+    let prefix = config::id_config_from_layer(&config_layer).prefix;
 
     // Check if we're in a git repo by running git rev-parse
     if !is_git_repo() {
@@ -210,7 +208,7 @@ fn parse_git_log(log_output: &str, prefix: &str) -> Result<Vec<(String, String, 
     // Pattern matches (prefix-id) including hierarchical IDs like bd-abc.1
     // The prefix can be any word characters, ID is alphanumeric with optional .N suffix
     let pattern = format!(r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)", regex::escape(prefix));
-    let re = Regex::new(&pattern)?;
+    let re = Regex::new(&pattern).map_err(|e| crate::error::BeadsError::Config(format!("Invalid regex pattern: {}", e)))?;
 
     let mut results = Vec::new();
 
@@ -255,10 +253,10 @@ mod tests {
 
     #[test]
     fn test_parse_git_log_extracts_issue_ids() {
-        let log = r#"abc1234 Fix bug (bd-abc)
+        let log = r"abc1234 Fix bug (bd-abc)
 def5678 Another commit
 ghi9012 Implement feature (bd-xyz123)
-jkl3456 Multi-ref (bd-foo) and (bd-bar)"#;
+jkl3456 Multi-ref (bd-foo) and (bd-bar)";
 
         let refs = parse_git_log(log, "bd").unwrap();
 
@@ -297,9 +295,9 @@ jkl3456 Multi-ref (bd-foo) and (bd-bar)"#;
 
     #[test]
     fn test_parse_git_log_preserves_order() {
-        let log = r#"aaa Latest (bd-1)
+        let log = r"aaa Latest (bd-1)
 bbb Middle (bd-2)
-ccc Oldest (bd-1)"#;
+ccc Oldest (bd-1)";
 
         let refs = parse_git_log(log, "bd").unwrap();
 

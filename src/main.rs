@@ -61,9 +61,6 @@ fn main() {
         }
         Commands::Config(args) => commands::config::execute(&args, cli.json, &overrides),
         Commands::History(args) => commands::history::execute(args, &overrides),
-        Commands::Orphans(args) => {
-            commands::orphans::execute(&args, cli.json || args.robot, &overrides)
-        }
         Commands::Defer(args) => {
             let update_args = beads_rust::cli::UpdateArgs {
                 ids: args.ids,
@@ -81,6 +78,9 @@ fn main() {
                 ..Default::default()
             };
             commands::update::execute(&update_args, &overrides)
+        }
+        Commands::Orphans(args) => {
+            commands::orphans::execute(&args, cli.json || args.robot, &overrides)
         }
     };
 

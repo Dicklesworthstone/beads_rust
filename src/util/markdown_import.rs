@@ -97,7 +97,7 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
         .map(|e| e.to_lowercase());
 
     match extension.as_deref() {
-        Some("md") | Some("markdown") => {}
+        Some("md" | "markdown") => {}
         _ => {
             return Err(BeadsError::validation(
                 "file",
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_issue() {
-        let content = r#"## My First Issue
+        let content = r"## My First Issue
 ### Description
 This is the description.
 
@@ -306,7 +306,7 @@ This is the description.
 
 ### Type
 bug
-"#;
+";
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "My First Issue");
@@ -320,7 +320,7 @@ bug
 
     #[test]
     fn test_parse_multiple_issues() {
-        let content = r#"## Issue One
+        let content = r"## Issue One
 ### Type
 task
 
@@ -331,7 +331,7 @@ feature
 ## Issue Three
 ### Type
 bug
-"#;
+";
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 3);
         assert_eq!(issues[0].title, "Issue One");
@@ -342,14 +342,14 @@ bug
     #[test]
     fn test_implicit_description_quirk() {
         // Only first non-empty line before H3 is captured
-        let content = r#"## Issue Title
+        let content = r"## Issue Title
 First line becomes description
 This line is ignored
 And this one too
 
 ### Priority
 2
-"#;
+";
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(

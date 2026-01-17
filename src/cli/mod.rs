@@ -215,7 +215,7 @@ EXAMPLES:
     /// Manage local history backups
     History(HistoryArgs),
 
-    /// Find open issues referenced in git commits
+    /// List issues referenced in git commits but still open
     Orphans(OrphansArgs),
 }
 
@@ -1181,14 +1181,13 @@ pub enum HistoryCommands {
     },
 }
 
-/// Arguments for the orphans command.
 #[derive(Args, Debug, Clone, Default)]
 pub struct OrphansArgs {
-    /// Include latest commit hash and message in human output
+    /// Show commit details
     #[arg(long)]
     pub details: bool,
 
-    /// Interactive close flow (prompt to close each orphan)
+    /// Interactive fix mode (close referenced issues)
     #[arg(long)]
     pub fix: bool,
 

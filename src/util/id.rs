@@ -1020,9 +1020,12 @@ mod tests {
         let prefix = "bd";
         let hash = "abc123456789";
         let nonce = 1001;
-        
+
         // Ensure the fixed format is valid
         let good_id = format!("{prefix}-{hash}{nonce}");
-        assert!(parse_id(&good_id).is_ok(), "Fixed fallback format should parse correctly");
+        assert!(
+            parse_id(&good_id).is_ok(),
+            "Fixed fallback format should parse correctly"
+        );
     }
 }
