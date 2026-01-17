@@ -1090,7 +1090,7 @@ impl SqliteStorage {
                          COALESCE(GROUP_CONCAT(d.depends_on_id || ':' || COALESCE(i.status, 'unknown'), ','), '')
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')
+                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
                     AND d.depends_on_id NOT LIKE 'external:%'
                     AND (
                       -- The blocker is in a blocking state
