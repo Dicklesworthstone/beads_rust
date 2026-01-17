@@ -109,10 +109,7 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
     // Check for path traversal
     let path_str = path.to_string_lossy();
     if path_str.contains("..") {
-        return Err(BeadsError::validation(
-            "file",
-            "path must not contain '..'",
-        ));
+        return Err(BeadsError::validation("file", "path must not contain '..'"));
     }
 
     // Check file exists
@@ -124,9 +121,8 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
     }
 
     // Read file content
-    let content = fs::read_to_string(path).map_err(|e| {
-        BeadsError::validation("file", format!("cannot read file: {e}"))
-    })?;
+    let content = fs::read_to_string(path)
+        .map_err(|e| BeadsError::validation("file", format!("cannot read file: {e}")))?;
 
     parse_markdown_content(&content)
 }
@@ -314,7 +310,10 @@ bug
         let issues = parse_markdown_content(content).unwrap();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].title, "My First Issue");
-        assert_eq!(issues[0].description, Some("This is the description.".to_string()));
+        assert_eq!(
+            issues[0].description,
+            Some("This is the description.".to_string())
+        );
         assert_eq!(issues[0].priority, Some("1".to_string()));
         assert_eq!(issues[0].issue_type, Some("bug".to_string()));
     }
@@ -401,7 +400,13 @@ blocks:bd-123, bd-456, related:bd-789
 "#;
         let issues = parse_markdown_content(content).unwrap();
         assert!(issues[0].acceptance_criteria.is_some());
-        assert!(issues[0].acceptance_criteria.as_ref().unwrap().contains("First criterion"));
+        assert!(
+            issues[0]
+                .acceptance_criteria
+                .as_ref()
+                .unwrap()
+                .contains("First criterion")
+        );
     }
 
     #[test]
