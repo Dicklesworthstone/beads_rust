@@ -12,7 +12,6 @@ pub mod doctor;
 pub mod history;
 pub mod init;
 pub mod label;
-// WIP: lint module incomplete (missing LintArgs in cli mod)
 pub mod lint;
 pub mod list;
 pub mod q;
@@ -24,4 +23,5 @@ pub mod stale;
 pub mod stats;
 pub mod sync;
 pub mod update;
+pub mod upgrade;
 pub mod version;

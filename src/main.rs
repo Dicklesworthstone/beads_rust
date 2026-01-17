@@ -37,10 +37,7 @@ fn main() {
         Commands::Label { command } => commands::label::execute(&command, cli.json, &overrides),
         Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides),
         Commands::Stale(args) => commands::stale::execute(&args, cli.json, &overrides),
-        Commands::Lint(_args) => {
-            eprintln!("Lint command not implemented yet.");
-            Ok(())
-        },
+        Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides),
         Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides),
         Commands::Blocked(args) => {
             commands::blocked::execute(&args, cli.json || args.robot, &overrides)
@@ -66,12 +63,13 @@ fn main() {
         Commands::Undefer(args) => {
             let update_args = beads_rust::cli::UpdateArgs {
                 ids: args.ids,
-                defer: Some("".to_string()), // Clear defer date
+                defer: Some(String::new()),       // Clear defer date
                 status: Some("open".to_string()), // Reset to open
                 ..Default::default()
             };
             commands::update::execute(&update_args, &overrides)
         }
+        Commands::Upgrade(args) => commands::upgrade::execute(&args, cli.json),
     };
 
     if let Err(e) = result {

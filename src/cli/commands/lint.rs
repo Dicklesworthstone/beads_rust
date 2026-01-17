@@ -37,20 +37,15 @@ struct LintSummary {
 }
 
 impl LintSummary {
-    fn exit_code(&self, json: bool) -> i32 {
-        if json {
-            0
-        } else if self.warnings > 0 {
-            1
-        } else {
-            0
-        }
+    const fn exit_code(&self, json: bool) -> i32 {
+        if json || self.warnings == 0 { 0 } else { 1 }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 struct RequiredSection {
     heading: &'static str,
+    #[allow(dead_code)] // Kept for future use in suggestions
     hint: &'static str,
 }
 
@@ -128,8 +123,10 @@ pub fn execute(args: &LintArgs, json: bool, cli: &config::CliOverrides) -> Resul
 }
 
 fn build_filters(args: &LintArgs) -> Result<ListFilters> {
-    let mut filters = ListFilters::default();
-    filters.include_templates = false;
+    let mut filters = ListFilters {
+        include_templates: false,
+        ..ListFilters::default()
+    };
 
     if let Some(ref type_str) = args.type_ {
         let issue_type: IssueType = type_str.parse()?;
@@ -216,7 +213,7 @@ fn lint_issue(issue: &Issue) -> Option<LintResult> {
     })
 }
 
-fn required_sections(issue_type: &IssueType) -> &'static [RequiredSection] {
+const fn required_sections(issue_type: &IssueType) -> &'static [RequiredSection] {
     match issue_type {
         IssueType::Bug => &BUG_SECTIONS,
         IssueType::Task | IssueType::Feature => &TASK_SECTIONS,
@@ -241,11 +238,11 @@ fn missing_sections(description: &str, required: &[RequiredSection]) -> Vec<Requ
 }
 
 fn strip_heading_prefix(heading: &str) -> &str {
-    heading
-        .trim()
+    let trimmed = heading.trim();
+    trimmed
         .strip_prefix("## ")
-        .or_else(|| heading.trim().strip_prefix("# "))
-        .unwrap_or(heading.trim())
+        .or_else(|| trimmed.strip_prefix("# "))
+        .unwrap_or(trimmed)
 }
 
 #[cfg(test)]
