@@ -244,15 +244,16 @@ fn append_entry(beads_dir: &Path, entry: &mut AuditEntry) -> Result<String> {
         entry.created_at = Some(Utc::now());
     }
 
+    // Serialize to memory first to ensure atomic-ish write
+    let mut line = serde_json::to_vec(&entry)?;
+    line.push(b'\n');
+
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
 
-    let mut writer = io::BufWriter::new(&mut file);
-    serde_json::to_writer(&mut writer, &entry)?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
+    file.write_all(&line)?;
 
     Ok(entry.id.as_ref().expect("id set before append").clone())
 }
