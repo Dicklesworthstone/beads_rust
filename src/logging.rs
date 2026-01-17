@@ -22,6 +22,7 @@ pub fn init_logging(verbosity: u8, quiet: bool, log_file: Option<&Path>) -> Resu
         .or_else(|_| EnvFilter::try_new(default_filter(verbosity, quiet)))?;
 
     let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
         .with_target(true)
         .with_level(true)
         .with_file(cfg!(debug_assertions))

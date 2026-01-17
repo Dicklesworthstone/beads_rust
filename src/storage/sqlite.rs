@@ -724,14 +724,14 @@ impl SqliteStorage {
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        // Ready condition 1: status is open or in_progress (or deferred if requested)
+        // Ready condition 1: status is `open` OR `in_progress`
         if filters.include_deferred {
             sql.push_str(" AND status IN ('open', 'in_progress', 'deferred')");
         } else {
             sql.push_str(" AND status IN ('open', 'in_progress')");
         }
 
-        // Ready condition 3: defer_until is NULL or <= now (unless include_deferred)
+        // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
         if !filters.include_deferred {
             sql.push_str(" AND (defer_until IS NULL OR defer_until <= datetime('now'))");
         }
@@ -1137,7 +1137,7 @@ impl SqliteStorage {
         // Check for cycles if this is a blocking dependency
         if let Ok(dt) = dep_type.parse::<DependencyType>() {
             if dt.is_blocking() && self.would_create_cycle(issue_id, depends_on_id)? {
-                return Err(BeadsError::CycleDetected {
+                return Err(BeadsError::DependencyCycle {
                     path: format!("Adding dependency {issue_id} -> {depends_on_id} would create a cycle"),
                 });
             }
@@ -3356,18 +3356,18 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
 
-        let blocker = make_issue("bd-parent", "Parent", Status::Open, 1, None, t1, None);
-        let blocked = make_issue("bd-child", "Child", Status::Open, 2, None, t1, None);
+        let blocker = make_issue("bd-blocker", "Blocker", Status::Open, 1, None, t1, None);
+        let blocked = make_issue("bd-blocked", "Blocked", Status::Open, 2, None, t1, None);
         storage.create_issue(&blocker, "tester").unwrap();
         storage.create_issue(&blocked, "tester").unwrap();
 
         storage
-            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
             .unwrap();
 
         let blocked_issues = storage.get_blocked_issues().unwrap();
         assert_eq!(blocked_issues.len(), 1);
-        assert_eq!(blocked_issues[0].0.id, "bd-child");
+        assert_eq!(blocked_issues[0].0.id, "bd-blocked");
         assert_eq!(blocked_issues[0].1.len(), 1);
     }
 

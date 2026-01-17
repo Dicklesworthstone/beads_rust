@@ -4,6 +4,7 @@
 //! cascade/force/dry-run modes.
 
 use crate::cli::DeleteArgs;
+use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::storage::SqliteStorage;
 use serde::Serialize;
@@ -48,7 +49,7 @@ impl DeleteResult {
 /// - Has dependents without --force or --cascade
 /// - Database operation fails
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &DeleteArgs) -> Result<()> {
+pub fn execute(args: &DeleteArgs, cli: &config::CliOverrides) -> Result<()> {
     // 1. Collect IDs from args and/or file
     let mut ids: Vec<String> = args.ids.clone();
 
@@ -69,12 +70,10 @@ pub fn execute(args: &DeleteArgs) -> Result<()> {
         .collect();
 
     // 2. Open storage
-    let beads_dir = Path::new(".beads");
-    if !beads_dir.exists() {
-        return Err(BeadsError::NotInitialized);
-    }
-    let db_path = beads_dir.join("beads.db");
-    let mut storage = SqliteStorage::open(&db_path)?;
+    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let (mut storage, _paths) =
+        config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
 
     // 3. Validate all IDs exist
     for id in &ids {
@@ -148,7 +147,7 @@ pub fn execute(args: &DeleteArgs) -> Result<()> {
     }
 
     // 7. Get actor
-    let actor = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let actor = config::resolve_actor(&config_layer);
 
     // 8. Perform deletion
     let mut result = DeleteResult::new();

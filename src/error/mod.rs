@@ -9,10 +9,13 @@
 //! - Supports `anyhow` integration for gradual migration
 //! - Provides recovery hints for user-facing errors
 //! - Matches bd's exit code conventions
+//! - Provides structured JSON output for AI coding agents
 
 mod context;
+mod structured;
 
 pub use context::{OptionExt, ResultExt};
+pub use structured::{ErrorCode, StructuredError};
 
 use std::path::PathBuf;
 use thiserror::Error;

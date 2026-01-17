@@ -166,6 +166,26 @@ Once basic functionality works, we'll create conformance tests that:
 
 ---
 
+## Sync Safety Maintenance
+
+When modifying sync-related code (`src/sync/`, `src/cli/commands/sync.rs`), you MUST follow the maintenance checklist:
+
+**See: [`docs/SYNC_MAINTENANCE_CHECKLIST.md`](docs/SYNC_MAINTENANCE_CHECKLIST.md)**
+
+Quick summary:
+1. **No git operations** — Static check: `grep -rn 'Command::new.*git' src/sync/`
+2. **Path allowlist** — Verify only `.beads/` files are touched
+3. **Run safety tests** — `cargo test e2e_sync --release`
+4. **Review logs** — Check for unexpected safety events
+5. **Update docs** — If behavior changed
+
+Related documentation:
+- [SYNC_SAFETY.md](docs/SYNC_SAFETY.md) — User-facing safety model
+- [E2E_SYNC_TESTS.md](docs/E2E_SYNC_TESTS.md) — Test execution guide
+- [.beads/SYNC_SAFETY_INVARIANTS.md](.beads/SYNC_SAFETY_INVARIANTS.md) — Technical invariants
+
+---
+
 ## Third-Party Library Usage
 
 If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to find the latest documentation and best practices before coding. Prefer primary docs.

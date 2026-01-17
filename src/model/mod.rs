@@ -81,7 +81,9 @@ impl FromStr for Status {
             "closed" => Ok(Self::Closed),
             "tombstone" => Ok(Self::Tombstone),
             "pinned" => Ok(Self::Pinned),
-            other => Ok(Self::Custom(other.to_string())),
+            other => Err(crate::error::BeadsError::InvalidStatus {
+                status: other.to_string(),
+            }),
         }
     }
 }
@@ -498,6 +500,30 @@ impl Issue {
 
         format!("{:x}", hasher.finalize())
     }
+
+    /// Check if this issue is a tombstone that has exceeded its TTL.
+    #[must_use]
+    pub fn is_expired_tombstone(&self, retention_days: Option<u64>) -> bool {
+        if self.status != Status::Tombstone {
+            return false;
+        }
+
+        let Some(days) = retention_days else {
+            return false;
+        };
+
+        if days == 0 {
+            return false; // Keep forever if 0 (though usually means disabled/immediate, assume safe default)
+        }
+
+        let Some(deleted_at) = self.deleted_at else {
+            return false; // Keep if deletion time is unknown
+        };
+
+        let days_i64 = i64::try_from(days).unwrap_or(i64::MAX);
+        let expiration_time = deleted_at + chrono::Duration::days(days_i64);
+        Utc::now() > expiration_time
+    }
 }
 
 /// Relationship between two issues.
@@ -532,7 +558,7 @@ pub struct Dependency {
 /// A comment on an issue.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Comment {
-    pub id: String,
+    pub id: i64,
     pub issue_id: String,
     pub author: String,
     #[serde(rename = "text")]

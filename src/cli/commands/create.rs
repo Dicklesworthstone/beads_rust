@@ -35,6 +35,8 @@ pub fn execute(args: CreateArgs, cli: &config::CliOverrides) -> Result<()> {
 
     let layer = config::load_config(&beads_dir, Some(&storage), cli)?;
     let id_config = config::id_config_from_layer(&layer);
+    let default_priority = config::default_priority_from_layer(&layer)?;
+    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
 
     // 3. Generate ID
     let id_gen = IdGenerator::new(id_config);
@@ -54,13 +56,13 @@ pub fn execute(args: CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     let priority = if let Some(p) = args.priority {
         Priority::from_str(&p)?
     } else {
-        Priority::MEDIUM
+        default_priority
     };
 
     let issue_type = if let Some(t) = args.type_ {
         IssueType::from_str(&t)?
     } else {
-        IssueType::Task
+        default_issue_type
     };
 
     let due_at = parse_optional_date(args.due.as_deref())?;

@@ -1,13 +1,20 @@
 //! Doctor command implementation.
 
+#![allow(clippy::option_if_let_else)]
+
+use crate::config;
 use crate::error::Result;
+use crate::sync::{
+    scan_conflict_markers, validate_no_git_path, validate_sync_path, PathValidation,
+};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize)]
+/// Check result status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum CheckStatus {
     Ok,
@@ -311,7 +318,11 @@ fn check_db_count(
     jsonl_count: Option<usize>,
     checks: &mut Vec<CheckResult>,
 ) -> Result<()> {
-    let db_count: i64 = conn.query_row("SELECT count(*) FROM issues", [], |row| row.get(0))?;
+    let db_count: i64 = conn.query_row(
+        "SELECT count(*) FROM issues WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%'",
+        [],
+        |row| row.get(0),
+    )?;
 
     if let Some(jsonl_count) = jsonl_count {
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -349,16 +360,338 @@ fn check_db_count(
     Ok(())
 }
 
+// ============================================================================
+// SYNC SAFETY CHECKS (beads_rust-0v1.2.6)
+// ============================================================================
+
+/// Check if the JSONL path is within the sync allowlist.
+///
+/// This validates that the JSONL path:
+/// 1. Does not target git internals (.git/)
+/// 2. Is within the .beads directory (or has explicit external opt-in)
+/// 3. Has an allowed extension
+#[allow(clippy::too_many_lines)]
+fn check_sync_jsonl_path(
+    jsonl_path: &Path,
+    beads_dir: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
+    let check_name = "sync_jsonl_path";
+
+    // 1. Check if path is valid UTF-8
+    if let Some(_name) = jsonl_path.file_name().and_then(|n| n.to_str()) {
+        // 2. Check for git path access (critical safety invariant)
+        let git_check = validate_no_git_path(jsonl_path);
+        if !git_check.is_allowed() {
+            let reason = git_check.rejection_reason().unwrap_or_default();
+            push_check(
+                checks,
+                check_name,
+                CheckStatus::Error,
+                Some(format!("JSONL path targets git internals: {reason}")),
+                Some(serde_json::json!({
+                    "path": jsonl_path.display().to_string(),
+                    "reason": reason,
+                    "remediation": "Move JSONL file inside .beads/ directory"
+                })),
+            );
+            return;
+        }
+
+        // 3. Check if path is within beads_dir allowlist
+        let path_validation = validate_sync_path(jsonl_path, beads_dir);
+        match path_validation {
+            PathValidation::Allowed => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Ok,
+                    Some("JSONL path is within sync allowlist".to_string()),
+                    Some(serde_json::json!({
+                        "path": jsonl_path.display().to_string(),
+                        "beads_dir": beads_dir.display().to_string()
+                    })),
+                );
+            }
+            PathValidation::OutsideBeadsDir { path, beads_dir: bd } => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Warn,
+                    Some("JSONL path is outside .beads/ directory".to_string()),
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "beads_dir": bd.display().to_string(),
+                        "remediation": "Use --allow-external-jsonl flag or move JSONL inside .beads/"
+                    })),
+                );
+            }
+            PathValidation::DisallowedExtension { path, extension } => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Error,
+                    Some(format!("JSONL path has disallowed extension: {extension}")),
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "extension": extension,
+                        "remediation": "Use a .jsonl extension for JSONL files"
+                    })),
+                );
+            }
+            PathValidation::TraversalAttempt { path } => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Error,
+                    Some("JSONL path contains traversal sequences".to_string()),
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "remediation": "Remove '..' sequences from path"
+                    })),
+                );
+            }
+            PathValidation::SymlinkEscape { path, target } => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Error,
+                    Some("JSONL path is a symlink pointing outside .beads/".to_string()),
+                    Some(serde_json::json!({
+                        "symlink": path.display().to_string(),
+                        "target": target.display().to_string(),
+                        "remediation": "Remove symlink and use a regular file inside .beads/"
+                    })),
+                );
+            }
+            PathValidation::CanonicalizationFailed { path, error } => {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Warn,
+                    Some(format!("Could not verify JSONL path: {error}")),
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "error": error
+                    })),
+                );
+            }
+            PathValidation::GitPathAttempt { path } => {
+                // Already handled above, but include for completeness
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Error,
+                    Some("JSONL path targets git internals".to_string()),
+                    Some(serde_json::json!({
+                        "path": path.display().to_string(),
+                        "remediation": "Move JSONL file inside .beads/ directory"
+                    })),
+                );
+            }
+        }
+    } else {
+        push_check(
+            checks,
+            check_name,
+            CheckStatus::Error,
+            Some("Invalid JSONL path (not valid UTF-8)".to_string()),
+            Some(serde_json::json!({
+                "path": jsonl_path.display().to_string(),
+                "remediation": "Ensure the path is valid UTF-8"
+            })),
+        );
+    }
+}
+
+/// Check for git merge conflict markers in the JSONL file.
+///
+/// Conflict markers indicate an unresolved merge and must be resolved
+/// before any sync operations can proceed safely.
+#[allow(clippy::unnecessary_wraps)]
+fn check_sync_conflict_markers(jsonl_path: &Path, checks: &mut Vec<CheckResult>) {
+    let check_name = "sync_conflict_markers";
+
+    if !jsonl_path.exists() {
+        return;
+    }
+
+    match scan_conflict_markers(jsonl_path) {
+        Ok(markers) => {
+            if markers.is_empty() {
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Ok,
+                    Some("No merge conflict markers found".to_string()),
+                    None,
+                );
+            } else {
+                // Format first few markers for display
+                let preview: Vec<serde_json::Value> = markers
+                    .iter()
+                    .take(5)
+                    .map(|m| {
+                        serde_json::json!({
+                            "line": m.line,
+                            "type": format!("{:?}", m.marker_type),
+                            "branch": m.branch.as_deref().unwrap_or("")
+                        })
+                    })
+                    .collect();
+
+                push_check(
+                    checks,
+                    check_name,
+                    CheckStatus::Error,
+                    Some(format!(
+                        "Found {} merge conflict marker(s) in JSONL",
+                        markers.len()
+                    )),
+                    Some(serde_json::json!({
+                        "path": jsonl_path.display().to_string(),
+                        "count": markers.len(),
+                        "markers_preview": preview,
+                        "remediation": "Resolve git merge conflicts in the JSONL file before running sync"
+                    })),
+                );
+            }
+        }
+        Err(e) => {
+            push_check(
+                checks,
+                check_name,
+                CheckStatus::Warn,
+                Some(format!("Could not scan for conflict markers: {e}")),
+                Some(serde_json::json!({
+                    "path": jsonl_path.display().to_string(),
+                    "error": e.to_string()
+                })),
+            );
+        }
+    }
+}
+
+/// Check sync metadata consistency.
+///
+/// Validates that sync-related metadata is consistent and not stale.
+#[allow(clippy::too_many_lines)]
+fn check_sync_metadata(
+    conn: &Connection,
+    jsonl_path: Option<&Path>,
+    checks: &mut Vec<CheckResult>,
+) {
+    // Get metadata
+    let last_import: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'last_import_time'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let last_export: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'last_export_time'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let jsonl_hash: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'jsonl_content_hash'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Check dirty issues count
+    let dirty_count: i64 = conn
+        .query_row("SELECT count(*) FROM dirty_issues", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    let mut details = serde_json::json!({
+        "dirty_issues": dirty_count
+    });
+
+    if let Some(ts) = &last_import {
+        details["last_import"] = serde_json::json!(ts);
+    }
+    if let Some(ts) = &last_export {
+        details["last_export"] = serde_json::json!(ts);
+    }
+    if let Some(hash) = &jsonl_hash {
+        details["jsonl_hash"] = serde_json::json!(&hash[..16.min(hash.len())]);
+    }
+
+    // Determine staleness
+    let (jsonl_newer, db_newer) = if let Some(p) = jsonl_path {
+        if p.exists() {
+            let jsonl_mtime = fs::metadata(p).and_then(|m| m.modified()).ok();
+
+            // JSONL is newer if it was modified after last import
+            let j_newer = last_import
+                .as_ref()
+                .is_none_or(|import_time| {
+                    chrono::DateTime::parse_from_rfc3339(import_time)
+                        .is_ok_and(|import_ts| {
+                            let import_sys_time = std::time::SystemTime::from(import_ts);
+                            jsonl_mtime.is_some_and(|m| m > import_sys_time)
+                        })
+                });
+
+            // DB is newer if there are dirty issues
+            let d_newer = dirty_count > 0;
+            (j_newer, d_newer)
+        } else {
+            (false, dirty_count > 0)
+        }
+    } else {
+        (false, dirty_count > 0)
+    };
+
+    // Check 1: Metadata consistency
+    if last_export.is_none() && dirty_count > 0 {
+        push_check(
+            checks,
+            "sync.metadata",
+            CheckStatus::Warn,
+            Some("JSONL exists but no export recorded; consider running sync --flush-only".to_string()),
+            Some(details),
+        );
+    } else if jsonl_newer && db_newer {
+        push_check(
+            checks,
+            "sync.metadata",
+            CheckStatus::Ok,
+            Some("Sync metadata is consistent".to_string()),
+            Some(details),
+        );
+    } else {
+        push_check(
+            checks,
+            "sync.metadata",
+            CheckStatus::Warn,
+            Some(format!(
+                "Sync metadata is stale: JSONL is {} and DB is {}",
+                if jsonl_newer { "newer" } else { "older" },
+                if db_newer { "newer" } else { "older" }
+            )),
+            Some(details),
+        );
+    }
+}
+
 /// Execute the doctor command.
 ///
 /// # Errors
 ///
 /// Returns an error if report serialization fails or if IO operations fail.
-pub fn execute(json: bool) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+pub fn execute(json: bool, cli: &config::CliOverrides) -> Result<()> {
     let mut checks = Vec::new();
-    let beads_dir = Path::new(".beads");
-
-    if !beads_dir.exists() {
+    let Ok(beads_dir) = config::discover_beads_dir(None) else {
         push_check(
             &mut checks,
             "beads_dir",
@@ -372,12 +705,42 @@ pub fn execute(json: bool) -> Result<()> {
         };
         print_report(&report, json)?;
         std::process::exit(1);
-    }
+    };
 
-    check_merge_artifacts(beads_dir, &mut checks)?;
+    let paths = match config::resolve_paths(&beads_dir, cli.db.as_ref()) {
+        Ok(paths) => paths,
+        Err(err) => {
+            push_check(
+                &mut checks,
+                "metadata",
+                CheckStatus::Error,
+                Some(format!("Failed to read metadata.json: {err}")),
+                None,
+            );
+            let report = DoctorReport {
+                ok: !has_error(&checks),
+                checks,
+            };
+            print_report(&report, json)?;
+            std::process::exit(1);
+        }
+    };
 
-    let jsonl_path = discover_jsonl(beads_dir);
+    check_merge_artifacts(&beads_dir, &mut checks)?;
+
+    let jsonl_path = if paths.jsonl_path.exists() {
+        Some(paths.jsonl_path.clone())
+    } else {
+        discover_jsonl(&beads_dir)
+    };
     let jsonl_count = if let Some(path) = jsonl_path.as_ref() {
+        // SYNC SAFETY CHECKS (beads_rust-0v1.2.6)
+        // Check JSONL path is within sync allowlist
+        check_sync_jsonl_path(path, &beads_dir, &mut checks);
+
+        // Check for merge conflict markers
+        check_sync_conflict_markers(path, &mut checks);
+
         match check_jsonl(path, &mut checks) {
             Ok(count) => Some(count),
             Err(err) => {
@@ -402,13 +765,16 @@ pub fn execute(json: bool) -> Result<()> {
         None
     };
 
-    let db_path = beads_dir.join("beads.db");
+    let db_path = paths.db_path;
     if db_path.exists() {
         match Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
             Ok(conn) => {
                 required_schema_checks(&conn, &mut checks)?;
                 check_integrity(&conn, &mut checks)?;
                 check_db_count(&conn, jsonl_count, &mut checks)?;
+
+                // SYNC SAFETY CHECK: metadata consistency (beads_rust-0v1.2.6)
+                check_sync_metadata(&conn, Some(&paths.jsonl_path), &mut checks);
             }
             Err(err) => {
                 push_check(
@@ -425,8 +791,8 @@ pub fn execute(json: bool) -> Result<()> {
             &mut checks,
             "db.exists",
             CheckStatus::Error,
-            Some("Missing .beads/beads.db".to_string()),
-            None,
+            Some(format!("Missing database file at {}", db_path.display())),
+            Some(serde_json::json!({ "path": db_path.display().to_string() })),
         );
     }
 

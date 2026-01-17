@@ -82,7 +82,7 @@ pub const SCHEMA_SQL: &str = r"
 
     -- Comments
     CREATE TABLE IF NOT EXISTS comments (
-        id TEXT PRIMARY KEY,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
         issue_id TEXT NOT NULL,
         author TEXT NOT NULL,
         text TEXT NOT NULL,
@@ -159,11 +159,42 @@ pub const SCHEMA_SQL: &str = r"
 pub fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)?;
 
+    // Run migrations for existing databases
+    run_migrations(conn)?;
+
     // Set journal mode to WAL for concurrency
     conn.pragma_update(None, "journal_mode", "WAL")?;
 
     // Enable foreign keys
     conn.pragma_update(None, "foreign_keys", "ON")?;
+
+    Ok(())
+}
+
+/// Run schema migrations for existing databases.
+///
+/// This handles upgrades for tables that may have been created with older schemas.
+fn run_migrations(conn: &Connection) -> Result<()> {
+    // Migration: Ensure blocked_issues_cache has blocked_by_json column
+    // If the table exists but lacks the column, drop and recreate it (it's a cache)
+    let has_blocked_by_json: bool = conn
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='blocked_by_json'",
+        )
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_blocked_by_json {
+        // Table exists but lacks the column - drop and recreate
+        conn.execute("DROP TABLE IF EXISTS blocked_issues_cache", [])?;
+        conn.execute(
+            "CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by_json TEXT NOT NULL
+            )",
+            [],
+        )?;
+    }
 
     Ok(())
 }

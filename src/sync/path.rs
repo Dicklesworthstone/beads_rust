@@ -112,8 +112,69 @@ impl PathValidation {
                 path.display(),
                 error
             )),
+            Self::GitPathAttempt { path } => Some(format!(
+                "Path '{}' targets git internals - sync never accesses .git/ (safety invariant NGI-3)",
+                path.display()
+            )),
         }
     }
+}
+
+/// Validates that a path does not target git internals.
+///
+/// This is a hard safety invariant: sync operations NEVER access `.git/` directories.
+/// This check runs regardless of `allow_external` settings.
+///
+/// # Safety Invariants
+///
+/// - NGI-1: br sync NEVER executes git subprocess commands
+/// - NGI-3: br sync NEVER modifies .git/ directory
+///
+/// # Returns
+///
+/// * `PathValidation::Allowed` if path does not target git
+/// * `PathValidation::GitPathAttempt` if path contains `.git` component
+#[must_use]
+pub fn validate_no_git_path(path: &Path) -> PathValidation {
+    fn has_git_component(candidate: &Path) -> bool {
+        for component in candidate.components() {
+            if let std::path::Component::Normal(name) = component {
+                if name == ".git" {
+                    return true;
+                }
+            }
+        }
+
+        let path_str = candidate.to_string_lossy();
+        path_str.contains("/.git/")
+            || path_str.contains("\\.git\\")
+            || path_str.ends_with("/.git")
+            || path_str.ends_with("\\.git")
+    }
+
+    // Check raw path first
+    if has_git_component(path) {
+        return PathValidation::GitPathAttempt {
+            path: path.to_path_buf(),
+        };
+    }
+
+    // Resolve the canonical path when possible (catches symlinks to .git)
+    if let Ok(canonical) = path.canonicalize() {
+        if has_git_component(&canonical) {
+            return PathValidation::GitPathAttempt { path: canonical };
+        }
+    } else if let Some(parent) = path.parent() {
+        if let Ok(canonical_parent) = parent.canonicalize() {
+            if has_git_component(&canonical_parent) {
+                return PathValidation::GitPathAttempt {
+                    path: canonical_parent,
+                };
+            }
+        }
+    }
+
+    PathValidation::Allowed
 }
 
 /// Validates that a path is allowed for sync operations.
@@ -144,6 +205,17 @@ impl PathValidation {
 pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     // Log the validation attempt
     debug!(path = %path.display(), beads_dir = %beads_dir.display(), "Validating sync path");
+
+    // CRITICAL: Check for git path access first (hard invariant - NGI-3)
+    let git_check = validate_no_git_path(path);
+    if !git_check.is_allowed() {
+        warn!(
+            path = %path.display(),
+            reason = %git_check.rejection_reason().unwrap_or_default(),
+            "Git path access blocked"
+        );
+        return git_check;
+    }
 
     // Check for obvious traversal attempts in the raw path
     let path_str = path.to_string_lossy();
@@ -347,6 +419,233 @@ pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
 
     // Full validation for edge cases
     validate_sync_path(path, beads_dir).is_allowed()
+}
+
+/// Validates a path for sync operations with optional external path support.
+///
+/// This is the main entry point for sync path validation. It enforces:
+/// 1. Git paths are ALWAYS rejected (hard invariant)
+/// 2. Paths outside `.beads/` require explicit `allow_external` opt-in
+/// 3. External paths must still be valid JSONL files (not arbitrary files)
+///
+/// # Arguments
+///
+/// * `path` - The path to validate
+/// * `beads_dir` - The `.beads` directory path
+/// * `allow_external` - Whether to allow paths outside `.beads/`
+///
+/// # Errors
+///
+/// Returns `BeadsError::Config` with a descriptive message if validation fails.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Normal case: path inside .beads/
+/// validate_sync_path_with_external(&path, &beads_dir, false)?;
+///
+/// // External JSONL with opt-in
+/// validate_sync_path_with_external(&external_jsonl, &beads_dir, true)?;
+/// ```
+pub fn validate_sync_path_with_external(
+    path: &Path,
+    beads_dir: &Path,
+    allow_external: bool,
+) -> Result<()> {
+    // CRITICAL: Git paths are ALWAYS rejected, even with allow_external
+    let git_check = validate_no_git_path(path);
+    if !git_check.is_allowed() {
+        return Err(BeadsError::Config(
+            git_check
+                .rejection_reason()
+                .unwrap_or_else(|| "Git path access denied".to_string()),
+        ));
+    }
+
+    // If external paths are allowed, only validate file type (not containment)
+    if allow_external {
+        // Log the external path usage (safety invariant PC-2)
+        tracing::info!(path = %path.display(), "Using external JSONL path (--allow-external-jsonl)");
+
+        // Still validate it's a JSONL file
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Case-sensitive check is intentional: JSONL files should use lowercase .jsonl extension
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        if !file_name.ends_with(".jsonl") && !file_name.ends_with(".jsonl.tmp") {
+            return Err(BeadsError::Config(format!(
+                "External path '{}' must be a .jsonl file",
+                path.display()
+            )));
+        }
+
+        // Check for traversal attempts even in external paths
+        let path_str = path.to_string_lossy();
+        if path_str.contains("..") {
+            return Err(BeadsError::Config(format!(
+                "Path '{}' contains traversal sequences",
+                path.display()
+            )));
+        }
+
+        return Ok(());
+    }
+
+    // Standard validation for paths within .beads/
+    require_valid_sync_path(path, beads_dir)
+}
+
+/// Require that a path is safe for destructive sync operations (delete/overwrite).
+///
+/// This guard enforces the sync allowlist and ensures we never delete or overwrite
+/// files outside `.beads/`, except for explicitly allowed external JSONL paths.
+///
+/// # Errors
+///
+/// Returns `BeadsError::Config` if the path is unsafe. Rejections are logged with
+/// the attempted operation for auditability.
+pub fn require_safe_sync_overwrite_path(
+    path: &Path,
+    beads_dir: &Path,
+    allow_external: bool,
+    operation: &str,
+) -> Result<()> {
+    let canonical_beads = beads_dir
+        .canonicalize()
+        .unwrap_or_else(|_| beads_dir.to_path_buf());
+    let is_internal = path.starts_with(beads_dir) || path.starts_with(&canonical_beads);
+
+    if is_internal {
+        let validation = validate_sync_path(path, beads_dir);
+        if validation.is_allowed() {
+            debug!(
+                path = %path.display(),
+                operation,
+                "Sync path approved for destructive operation"
+            );
+            return Ok(());
+        }
+
+        let reason = validation
+            .rejection_reason()
+            .unwrap_or_else(|| "Path validation failed".to_string());
+        warn!(
+            path = %path.display(),
+            operation,
+            reason = %reason,
+            "Sync destructive path rejected"
+        );
+        return Err(BeadsError::Config(reason));
+    }
+
+    if !allow_external {
+        let reason = format!("Refusing to {operation} outside .beads: {}", path.display());
+        warn!(
+            path = %path.display(),
+            operation,
+            reason = %reason,
+            "Sync destructive path rejected"
+        );
+        return Err(BeadsError::Config(reason));
+    }
+
+    match validate_sync_path_with_external(path, beads_dir, true) {
+        Ok(()) => {
+            debug!(
+                path = %path.display(),
+                operation,
+                "External sync path approved for destructive operation"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                operation,
+                error = %err,
+                "Sync destructive path rejected"
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Validates a temp file path for atomic write operations.
+///
+/// Temp files must:
+/// 1. Be in the same directory as the target file (for atomic rename)
+/// 2. Not target git internals
+/// 3. Have the `.tmp` extension
+///
+/// # Errors
+///
+/// Returns `BeadsError::Config` if validation fails.
+pub fn validate_temp_file_path(
+    temp_path: &Path,
+    target_path: &Path,
+    beads_dir: &Path,
+    allow_external: bool,
+) -> Result<()> {
+    // Git check is always enforced
+    let git_check = validate_no_git_path(temp_path);
+    if !git_check.is_allowed() {
+        return Err(BeadsError::Config(
+            git_check
+                .rejection_reason()
+                .unwrap_or_else(|| "Git path access denied".to_string()),
+        ));
+    }
+
+    // Verify temp file is in the same directory as target (PC-4)
+    let temp_parent = temp_path.parent();
+    let target_parent = target_path.parent();
+
+    if temp_parent != target_parent {
+        return Err(BeadsError::Config(format!(
+            "Temp file '{}' must be in the same directory as target '{}' (safety invariant PC-4)",
+            temp_path.display(),
+            target_path.display()
+        )));
+    }
+
+    let has_tmp_extension = temp_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"));
+    if !has_tmp_extension {
+        return Err(BeadsError::Config(format!(
+            "Temp file '{}' must use a .tmp extension",
+            temp_path.display()
+        )));
+    }
+
+    // If external is allowed for the target, it's allowed for the temp file too
+    if allow_external {
+        return Ok(());
+    }
+
+    // For internal paths, validate containment
+    let canonical_beads = beads_dir
+        .canonicalize()
+        .unwrap_or_else(|_| beads_dir.to_path_buf());
+
+    if let Some(parent) = temp_parent {
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if !canonical_parent.starts_with(&canonical_beads) {
+            return Err(BeadsError::Config(format!(
+                "Temp file '{}' is outside allowed directory '{}'",
+                temp_path.display(),
+                beads_dir.display()
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -555,6 +854,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_no_git_path_rejects_symlinked_git_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("create temp dir");
+        let git_dir = temp.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+
+        let symlink_parent = temp.path().join("gitlink");
+        symlink(&git_dir, &symlink_parent).expect("create git symlink");
+
+        let candidate = symlink_parent.join("issues.jsonl");
+        let result = validate_no_git_path(&candidate);
+        assert!(
+            matches!(result, PathValidation::GitPathAttempt { .. }),
+            "Symlinked parents targeting .git should be rejected"
+        );
+    }
+
     #[test]
     fn test_validation_logs_rejection() {
         // This test verifies the logging behavior by checking the return value
@@ -568,6 +887,54 @@ mod tests {
         assert!(
             reason.unwrap().contains("traversal"),
             "Reason should mention traversal"
+        );
+    }
+
+    #[test]
+    fn test_safe_overwrite_blocks_external_without_flag() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let path = temp.path().join("outside.jsonl");
+
+        let result = require_safe_sync_overwrite_path(&path, &beads_dir, false, "overwrite");
+        assert!(
+            result.is_err(),
+            "External overwrite should be rejected without flag"
+        );
+    }
+
+    #[test]
+    fn test_safe_overwrite_allows_external_jsonl_with_flag() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let path = temp.path().join("outside.jsonl");
+
+        let result = require_safe_sync_overwrite_path(&path, &beads_dir, true, "overwrite");
+        assert!(
+            result.is_ok(),
+            "External JSONL overwrite should be allowed with flag"
+        );
+    }
+
+    #[test]
+    fn test_safe_overwrite_rejects_external_non_jsonl() {
+        let (temp, beads_dir) = setup_test_beads_dir();
+        let path = temp.path().join("outside.txt");
+
+        let result = require_safe_sync_overwrite_path(&path, &beads_dir, true, "overwrite");
+        assert!(
+            result.is_err(),
+            "External non-JSONL overwrite should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_safe_overwrite_allows_manifest_inside_beads() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join(".manifest.json");
+
+        let result = require_safe_sync_overwrite_path(&path, &beads_dir, true, "overwrite");
+        assert!(
+            result.is_ok(),
+            "Manifest overwrite should be allowed inside .beads"
         );
     }
 }

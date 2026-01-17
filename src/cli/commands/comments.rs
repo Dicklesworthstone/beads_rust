@@ -14,20 +14,26 @@ use std::process::Command;
 /// # Errors
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
-pub fn execute(args: &CommentsArgs, actor: Option<&str>, json: bool) -> Result<()> {
+pub fn execute(args: &CommentsArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
-    let (mut storage, _paths) = config::open_storage(&beads_dir, None)?;
+    let (mut storage, _paths) =
+        config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
 
-    let config_layer =
-        config::load_config(&beads_dir, Some(&storage), &config::CliOverrides::default())?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage.get_all_ids()?;
+    let actor = config::actor_from_layer(&config_layer);
 
     match &args.command {
-        Some(CommentCommands::Add(add_args)) => {
-            add_comment(add_args, &mut storage, &resolver, &all_ids, actor, json)
-        }
+        Some(CommentCommands::Add(add_args)) => add_comment(
+            add_args,
+            &mut storage,
+            &resolver,
+            &all_ids,
+            actor.as_deref(),
+            json,
+        ),
         Some(CommentCommands::List(list_args)) => {
             list_comments(list_args, &storage, &resolver, &all_ids, json)
         }
@@ -186,4 +192,122 @@ fn git_user_name() -> Option<String> {
 
     let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if name.is_empty() { None } else { Some(name) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_resolve_author_with_override() {
+        // When author override is provided, it should be used
+        let result = resolve_author(Some("custom_author"), Some("actor_name"));
+        assert_eq!(result, "custom_author");
+    }
+
+    #[test]
+    fn test_resolve_author_empty_override_uses_actor() {
+        // Empty override should fall through to actor
+        let result = resolve_author(Some(""), Some("actor_name"));
+        assert_eq!(result, "actor_name");
+    }
+
+    #[test]
+    fn test_resolve_author_whitespace_override_uses_actor() {
+        // Whitespace-only override should fall through to actor
+        let result = resolve_author(Some("   "), Some("actor_name"));
+        assert_eq!(result, "actor_name");
+    }
+
+    #[test]
+    fn test_resolve_author_no_override_uses_actor() {
+        // No override should use actor
+        let result = resolve_author(None, Some("actor_name"));
+        assert_eq!(result, "actor_name");
+    }
+
+    #[test]
+    fn test_resolve_author_empty_actor_falls_through() {
+        // Empty actor should fall through to env/git/USER/unknown
+        // Since we can't easily control env, just test that it doesn't panic
+        // and returns something non-empty
+        let result = resolve_author(None, Some(""));
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn test_read_comment_text_from_message_flag() {
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec![],
+            file: None,
+            author: None,
+            message: Some("message flag content".to_string()),
+        };
+        let result = read_comment_text(&args).unwrap();
+        assert_eq!(result, "message flag content");
+    }
+
+    #[test]
+    fn test_read_comment_text_from_positional_args() {
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec!["hello".to_string(), "world".to_string()],
+            file: None,
+            author: None,
+            message: None,
+        };
+        let result = read_comment_text(&args).unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_read_comment_text_from_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "Comment from file").unwrap();
+        file.flush().unwrap();
+
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec![],
+            file: Some(file.path().to_path_buf()),
+            author: None,
+            message: None,
+        };
+        let result = read_comment_text(&args).unwrap();
+        assert!(result.contains("Comment from file"));
+    }
+
+    #[test]
+    fn test_read_comment_text_file_takes_precedence() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "File content").unwrap();
+        file.flush().unwrap();
+
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec!["text content".to_string()],
+            file: Some(file.path().to_path_buf()),
+            author: None,
+            message: Some("message content".to_string()),
+        };
+        let result = read_comment_text(&args).unwrap();
+        // File should take precedence
+        assert!(result.contains("File content"));
+    }
+
+    #[test]
+    fn test_read_comment_text_no_input_fails() {
+        let args = CommentAddArgs {
+            id: "test-id".to_string(),
+            text: vec![],
+            file: None,
+            author: None,
+            message: None,
+        };
+        let result = read_comment_text(&args);
+        assert!(result.is_err());
+    }
 }

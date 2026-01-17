@@ -31,7 +31,7 @@ pub mod sync;
 pub mod util;
 pub mod validation;
 
-pub use error::{BeadsError, Result};
+pub use error::{BeadsError, ErrorCode, Result, StructuredError};
 
 /// Run the CLI application.
 ///

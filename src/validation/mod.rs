@@ -146,7 +146,7 @@ impl DependencyValidator {
             ));
         }
 
-        if store.would_create_cycle(&dep.issue_id, &dep.depends_on_id)? {
+        if dep.dep_type.is_blocking() && store.would_create_cycle(&dep.issue_id, &dep.depends_on_id)? {
             errors.push(ValidationError::new(
                 "depends_on_id",
                 "would create dependency cycle",
@@ -188,11 +188,11 @@ impl LabelValidator {
 
         if !label
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
         {
             return Err(ValidationError::new(
                 "label",
-                "invalid characters (only alphanumeric, hyphen, underscore allowed)",
+                "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
             ));
         }
 
@@ -496,6 +496,11 @@ mod tests {
     }
 
     #[test]
+    fn label_validation_allows_namespaced_labels() {
+        assert!(LabelValidator::validate("team:backend").is_ok());
+    }
+
+    #[test]
     fn comment_validation_rejects_empty_body() {
         let comment = Comment {
             id: 1,
@@ -607,6 +612,20 @@ mod tests {
             BeadsError::Validation { field, .. } => assert_eq!(field, "depends_on_id"),
             _ => panic!("expected validation error"),
         }
+    }
+
+    #[test]
+    fn dependency_validation_allows_non_blocking_cycle() {
+        let mut dep = base_dependency();
+        dep.dep_type = DependencyType::Related;
+        let store = FakeStore {
+            issue_exists: true,
+            depends_on_exists: true,
+            dependency_exists: false,
+            would_cycle: true,
+        };
+
+        assert!(DependencyValidator::validate(&dep, &store).is_ok());
     }
 
     #[test]

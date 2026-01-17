@@ -3,6 +3,7 @@
 //! Classic bd-style LIKE search across title/description/id with list-like filters.
 
 use crate::cli::{ListArgs, SearchArgs};
+use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueWithCounts, format_issue_line};
 use crate::model::{IssueType, Priority, Status};
@@ -17,7 +18,7 @@ use std::path::Path;
 ///
 /// Returns an error if the query is empty, the database cannot be opened,
 /// or the query fails.
-pub fn execute(args: &SearchArgs, json: bool) -> Result<()> {
+pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
     let query = args.query.trim();
     if query.is_empty() {
         return Err(BeadsError::Validation {
@@ -26,14 +27,12 @@ pub fn execute(args: &SearchArgs, json: bool) -> Result<()> {
         });
     }
 
-    let beads_dir = Path::new(".beads");
-    if !beads_dir.exists() {
-        return Err(BeadsError::NotInitialized);
-    }
-    let db_path = beads_dir.join("beads.db");
-    let storage = SqliteStorage::open(&db_path)?;
+    validate_priority_range(&args.filters.priority)?;
 
-    let mut filters = build_filters(&args.filters);
+    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+
+    let mut filters = build_filters(&args.filters)?;
     let client_filters = needs_client_filters(&args.filters);
     let limit = if client_filters {
         filters.limit.take()
@@ -89,27 +88,38 @@ pub fn execute(args: &SearchArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_filters(args: &ListArgs) -> ListFilters {
+fn validate_priority_range(priorities: &[u8]) -> Result<()> {
+    for &priority in priorities {
+        if priority > 4 {
+            return Err(BeadsError::InvalidPriority {
+                priority: i32::from(priority),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     let statuses = if args.status.is_empty() {
         None
     } else {
-        let parsed: Vec<Status> = args.status.iter().filter_map(|s| s.parse().ok()).collect();
-        if parsed.is_empty() {
-            None
-        } else {
-            Some(parsed)
-        }
+        Some(
+            args.status
+                .iter()
+                .map(|s| s.parse())
+                .collect::<Result<Vec<Status>>>()?,
+        )
     };
 
     let types = if args.type_.is_empty() {
         None
     } else {
-        let parsed: Vec<IssueType> = args.type_.iter().filter_map(|t| t.parse().ok()).collect();
-        if parsed.is_empty() {
-            None
-        } else {
-            Some(parsed)
-        }
+        Some(
+            args.type_
+                .iter()
+                .map(|t| t.parse())
+                .collect::<Result<Vec<IssueType>>>()?,
+        )
     };
 
     let priorities = if args.priority.is_empty() {
@@ -123,17 +133,22 @@ fn build_filters(args: &ListArgs) -> ListFilters {
         Some(parsed)
     };
 
-    ListFilters {
+    let include_closed = args.all
+        || statuses
+            .as_ref()
+            .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
+
+    Ok(ListFilters {
         statuses,
         types,
         priorities,
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
-        include_closed: args.all,
+        include_closed,
         include_templates: false,
         title_contains: args.title_contains.clone(),
         limit: args.limit,
-    }
+    })
 }
 
 fn needs_client_filters(args: &ListArgs) -> bool {
@@ -166,8 +181,8 @@ fn apply_client_filters(
     let now = Utc::now();
     let min_priority = args.priority_min.map(i32::from);
     let max_priority = args.priority_max.map(i32::from);
-    let desc_needle = args.desc_contains.as_deref().map(|s| s.to_lowercase());
-    let notes_needle = args.notes_contains.as_deref().map(|s| s.to_lowercase());
+    let desc_needle = args.desc_contains.as_deref().map(str::to_lowercase);
+    let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
     let include_deferred = args.deferred
         || args
             .status

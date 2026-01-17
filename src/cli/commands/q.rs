@@ -1,7 +1,7 @@
 use crate::cli::QuickArgs;
+use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, IssueType, Priority, Status};
-use crate::storage::SqliteStorage;
 use crate::util::id::IdGenerator;
 use crate::validation::LabelValidator;
 use chrono::Utc;
@@ -26,32 +26,33 @@ fn split_labels(values: &[String]) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error if validation fails, the database cannot be opened, or creation fails.
-pub fn execute(args: QuickArgs) -> Result<()> {
+pub fn execute(args: QuickArgs, cli: &config::CliOverrides) -> Result<()> {
     let title = args.title.join(" ").trim().to_string();
     if title.is_empty() {
         return Err(BeadsError::validation("title", "cannot be empty"));
     }
 
-    let beads_dir = Path::new(".beads");
-    if !beads_dir.exists() {
-        return Err(BeadsError::NotInitialized);
-    }
-    let db_path = beads_dir.join("beads.db");
-    let mut storage = SqliteStorage::open(&db_path)?;
+    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let (mut storage, _paths) =
+        config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let layer = config::load_config(&beads_dir, Some(&storage), cli)?;
+    let id_config = config::id_config_from_layer(&layer);
+    let default_priority = config::default_priority_from_layer(&layer)?;
+    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
 
     let priority = if let Some(p) = args.priority {
         Priority::from_str(&p)?
     } else {
-        Priority::MEDIUM
+        default_priority
     };
 
     let issue_type = if let Some(t) = args.type_ {
         IssueType::from_str(&t)?
     } else {
-        IssueType::Task
+        default_issue_type
     };
 
-    let id_gen = IdGenerator::with_defaults();
+    let id_gen = IdGenerator::new(id_config);
     let now = Utc::now();
     let count = storage.count_issues()?;
 
@@ -100,7 +101,7 @@ pub fn execute(args: QuickArgs) -> Result<()> {
         comments: vec![],
     };
 
-    let actor = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let actor = config::resolve_actor(&layer);
     storage.create_issue(&issue, &actor)?;
 
     let labels = split_labels(&args.labels);

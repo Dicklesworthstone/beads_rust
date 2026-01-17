@@ -1,10 +1,10 @@
 use crate::cli::{CountArgs, CountBy};
-use crate::error::{BeadsError, Result};
+use crate::config;
+use crate::error::Result;
 use crate::model::{IssueType, Priority, Status};
 use crate::storage::{ListFilters, SqliteStorage};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 #[derive(Serialize)]
 struct CountOutput {
@@ -28,14 +28,9 @@ struct CountGroupedOutput {
 /// # Errors
 ///
 /// Returns an error if filters are invalid or the database query fails.
-pub fn execute(args: &CountArgs, json: bool) -> Result<()> {
-    let beads_dir = Path::new(".beads");
-    if !beads_dir.exists() {
-        return Err(BeadsError::NotInitialized);
-    }
-
-    let db_path = beads_dir.join("beads.db");
-    let storage = SqliteStorage::open(&db_path)?;
+pub fn execute(args: &CountArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+    let beads_dir = config::discover_beads_dir(None)?;
+    let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
 
     let mut filters = ListFilters::default();
     let statuses = parse_statuses(&args.status)?;

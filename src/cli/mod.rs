@@ -140,9 +140,44 @@ pub enum Commands {
     Stale(StaleArgs),
 
     /// Configuration management
-    Config,
+    Config(ConfigArgs),
 
-    /// Sync with JSONL
+    /// Sync database with JSONL file (export or import)
+    ///
+    /// IMPORTANT: br sync NEVER executes git commands or auto-commits.
+    /// All file operations are confined to .beads/ by default.
+    /// Use -v for detailed safety logging, -vv for debug output.
+    #[command(long_about = "Sync database with JSONL file (export or import).
+
+SAFETY GUARANTEES:
+  • br sync NEVER executes git commands or auto-commits
+  • br sync NEVER modifies files outside .beads/ (unless --allow-external-jsonl)
+  • All writes use atomic temp-file-then-rename pattern
+  • Safety guards prevent accidental data loss
+
+MODES (one required unless --status):
+  --flush-only    Export database to JSONL (safe by default)
+  --import-only   Import JSONL into database (validates first)
+  --status        Show sync status (read-only)
+
+SAFETY GUARDS:
+  Export guards (bypassed with --force):
+    • Empty DB Guard: Refuses to export empty DB over non-empty JSONL
+    • Stale DB Guard: Refuses to export if JSONL has issues missing from DB
+
+  Import guards (cannot be bypassed):
+    • Conflict markers: Rejects files with git merge conflict markers
+    • Invalid JSON: Rejects malformed JSONL entries
+
+VERBOSE LOGGING:
+  -v     Show INFO-level safety guard decisions
+  -vv    Show DEBUG-level file operations
+
+EXAMPLES:
+  br sync --flush-only           Export database to .beads/issues.jsonl
+  br sync --flush-only -v        Export with safety logging
+  br sync --import-only          Import from JSONL (validates first)
+  br sync --status               Show current sync status")]
     Sync(SyncArgs),
 
     /// Run read-only diagnostics
@@ -150,6 +185,41 @@ pub enum Commands {
 
     /// Show version information
     Version,
+
+    /// Generate shell completions
+    Completions(CompletionsArgs),
+
+    /// Manage local history backups
+    History(HistoryArgs),
+}
+
+/// Arguments for the completions command.
+#[derive(Args, Debug, Clone)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for
+    #[arg(value_enum)]
+    pub shell: ShellType,
+
+    /// Output directory (default: stdout)
+    #[arg(long, short = 'o')]
+    pub output: Option<std::path::PathBuf>,
+}
+
+/// Supported shells for completion generation.
+#[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ShellType {
+    /// Bash shell
+    Bash,
+    /// Zsh shell
+    Zsh,
+    /// Fish shell
+    Fish,
+    #[value(name = "powershell")]
+    #[value(alias = "pwsh")]
+    /// `PowerShell`
+    PowerShell,
+    /// Elvish
+    Elvish,
 }
 
 #[derive(Args, Debug)]
@@ -825,23 +895,38 @@ pub enum SortPolicy {
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SyncArgs {
-    /// Export database to JSONL
-    #[arg(long)]
+    /// Export database to JSONL (DB → .beads/issues.jsonl)
+    ///
+    /// Writes all issues from `SQLite` database to JSONL format.
+    ///
+    /// This is the default if the database is newer than the JSONL file.
+    #[arg(short = 'f', long, group = "sync_action")]
     pub flush_only: bool,
 
-    /// Import JSONL to database
+    /// Import JSONL to database (JSONL → DB)
+    ///
+    /// Validates JSONL before import. Rejects files with git merge
+    /// conflict markers or invalid JSON (cannot be bypassed).
     #[arg(long)]
     pub import_only: bool,
 
-    /// Show sync status
+    /// Show sync status (read-only)
+    ///
+    /// Displays hash comparison and freshness info without modifications.
     #[arg(long)]
     pub status: bool,
 
-    /// Override safety checks
+    /// Override safety guards (use with caution!)
+    ///
+    /// Bypasses Empty DB Guard and Stale DB Guard for export.
+    /// Does NOT bypass conflict marker detection or JSON validation.
     #[arg(long, short = 'f')]
     pub force: bool,
 
-    /// Allow JSONL path outside .beads (explicit opt-in)
+    /// Allow using a JSONL path outside the .beads directory.
+    ///
+    /// This flag enables paths set via `BEADS_JSONL` environment variable.
+    /// Paths inside .git/ are always rejected regardless of this flag.
     #[arg(long)]
     pub allow_external_jsonl: bool,
 
@@ -849,17 +934,54 @@ pub struct SyncArgs {
     #[arg(long)]
     pub manifest: bool,
 
-    /// Export error policy (strict, best-effort, partial, required-core)
+    /// Export error policy: strict (default), best-effort, partial, required-core
+    ///
+    /// Controls how export handles serialization errors for individual issues.
     #[arg(long = "error-policy")]
     pub error_policy: Option<String>,
 
-    /// Orphan handling mode (strict, resurrect, skip, allow)
+    /// Orphan handling mode: strict (default), resurrect, skip, allow
+    ///
+    /// Controls how import handles orphaned dependencies (refs to deleted issues).
     #[arg(long)]
     pub orphans: Option<String>,
 
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+}
+
+/// Arguments for the config command.
+#[derive(Args, Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ConfigArgs {
+    /// List all available config options with descriptions
+    #[arg(long, short = 'l')]
+    pub list: bool,
+
+    /// Get a specific config value by key
+    #[arg(long, short = 'g', value_name = "KEY")]
+    pub get: Option<String>,
+
+    /// Set a config value in user config (format: key=value)
+    #[arg(long, short = 's', value_name = "KEY=VALUE")]
+    pub set: Option<String>,
+
+    /// Open user config file in $EDITOR
+    #[arg(long, short = 'e')]
+    pub edit: bool,
+
+    /// Show config file paths
+    #[arg(long, short = 'p')]
+    pub path: bool,
+
+    /// Show only project config (from .beads/config.yaml)
+    #[arg(long)]
+    pub project: bool,
+
+    /// Show only user config (from ~/.config/bd/config.yaml)
+    #[arg(long)]
+    pub user: bool,
 }
 
 /// Arguments for the stats command.
@@ -893,4 +1015,38 @@ pub struct StatsArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    #[command(subcommand)]
+    pub command: Option<HistoryCommands>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HistoryCommands {
+    /// List history backups
+    List,
+    /// Diff backup against current JSONL
+    Diff {
+        /// Backup filename (e.g. issues.2025-01-01T12-00-00.jsonl)
+        file: String,
+    },
+    /// Restore from backup
+    Restore {
+        /// Backup filename
+        file: String,
+        /// Force overwrite
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// Prune old backups
+    Prune {
+        /// Number of backups to keep (default: 100)
+        #[arg(long, default_value_t = 100)]
+        keep: usize,
+        /// Remove backups older than N days
+        #[arg(long)]
+        older_than: Option<u32>,
+    },
 }

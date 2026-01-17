@@ -1,0 +1,6 @@
+time=2026-01-16T11:29:36.682-05:00 level=INFO msg="Daemon started (interval: %v, auto-commit: %v, auto-push: %v)" !BADKEY=5s !BADKEY=false !BADKEY=false
+time=2026-01-16T11:29:36.690-05:00 level=INFO msg="using database" path=/data/projects/beads_rust/temp_test/.beads/beads.db
+time=2026-01-16T11:29:36.886-05:00 level=ERROR msg="cannot open database" error="migration tombstone_closed_at failed: failed to copy issues data: sqlite3: constraint failed: NOT NULL constraint failed: issues_new.description"
+time=2026-01-16T11:30:10.939-05:00 level=INFO msg="Daemon started (interval: %v, auto-commit: %v, auto-push: %v)" !BADKEY=5s !BADKEY=false !BADKEY=false
+time=2026-01-16T11:30:10.941-05:00 level=INFO msg="using database" path=/data/projects/beads_rust/temp_test/.beads/beads.db
+time=2026-01-16T11:30:10.962-05:00 level=ERROR msg="cannot open database" error="migration tombstone_closed_at failed: failed to copy issues data: sqlite3: constraint failed: NOT NULL constraint failed: issues_new.description"

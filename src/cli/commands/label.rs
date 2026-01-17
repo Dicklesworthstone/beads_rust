@@ -12,9 +12,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info};
 
-/// Reserved label prefix that should be rejected.
-const RESERVED_PREFIX: &str = "provides:";
-
 /// Execute the label command.
 ///
 /// # Errors
@@ -75,17 +72,9 @@ fn validate_label(label: &str) -> Result<()> {
         return Err(BeadsError::validation("label", "label cannot be empty"));
     }
 
-    // Check for reserved prefix
-    if label.starts_with(RESERVED_PREFIX) {
-        return Err(BeadsError::validation(
-            "label",
-            format!("label prefix '{RESERVED_PREFIX}' is reserved"),
-        ));
-    }
-
     // Validate characters: alphanumeric, dash, underscore, colon (for namespacing)
     for c in label.chars() {
-        if !c.is_alphanumeric() && c != '-' && c != '_' && c != ':' {
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != ':' {
             return Err(BeadsError::validation(
                 "label",
                 format!(
@@ -420,9 +409,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_label_reserved() {
-        assert!(validate_label("provides:auth").is_err());
-        assert!(validate_label("provides:").is_err());
+    fn test_validate_label_namespaced_allows_provides() {
+        assert!(validate_label("provides:auth").is_ok());
+        assert!(validate_label("provides:").is_ok());
     }
 
     #[test]

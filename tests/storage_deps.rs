@@ -478,13 +478,13 @@ fn detect_all_cycles_finds_cycles() {
 
     // Create cycle: A -> B -> C -> A
     storage
-        .add_dependency(&a.id, &b.id, DependencyType::Blocks.as_str(), "tester")
+        .add_dependency(&a.id, &b.id, DependencyType::Related.as_str(), "tester")
         .unwrap();
     storage
-        .add_dependency(&b.id, &c.id, DependencyType::Blocks.as_str(), "tester")
+        .add_dependency(&b.id, &c.id, DependencyType::Related.as_str(), "tester")
         .unwrap();
     storage
-        .add_dependency(&c.id, &a.id, DependencyType::Blocks.as_str(), "tester")
+        .add_dependency(&c.id, &a.id, DependencyType::Related.as_str(), "tester")
         .unwrap();
 
     let cycles = storage.detect_all_cycles().unwrap();
@@ -652,7 +652,7 @@ fn deep_hierarchy_transitive_blocked() {
 
     // l5 should be blocked because it transitively depends on root (open)
     // Need to rebuild blocked cache first
-    storage.rebuild_blocked_cache().unwrap();
+    storage.rebuild_blocked_cache(true).unwrap();
 
     let blocked_ids = blocked_ids_for(&storage);
     // All issues except root should be blocked
@@ -750,7 +750,7 @@ fn diamond_pattern_blocked_propagation() {
         .unwrap();
 
     // Rebuild blocked cache
-    storage.rebuild_blocked_cache().unwrap();
+    storage.rebuild_blocked_cache(true).unwrap();
 
     let blocked_ids = blocked_ids_for(&storage);
     // A, B, C are all blocked (depend on D which is open)
@@ -775,7 +775,7 @@ fn blocked_cache_invalidated_on_add_dependency() {
     storage.create_issue(&blocked, "tester").unwrap();
 
     // Initially no blocked issues
-    storage.rebuild_blocked_cache().unwrap();
+    storage.rebuild_blocked_cache(true).unwrap();
     let initial_blocked = blocked_ids_for(&storage);
     assert!(!initial_blocked.contains(&blocked.id));
 

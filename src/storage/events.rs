@@ -218,7 +218,7 @@ pub fn insert_dependency_added_event(
     dep_type: &str,
     depends_on_id: &str,
 ) -> Result<i64> {
-    let comment = format!("Added dependency: {issue_id} {dep_type} {depends_on_id}");
+    let comment = format!("Added dependency on {depends_on_id} ({dep_type})");
     insert_event(
         tx,
         issue_id,

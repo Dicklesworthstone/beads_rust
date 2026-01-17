@@ -5,11 +5,11 @@
 use crate::cli::{ReadyArgs, SortPolicy};
 use crate::config;
 use crate::error::Result;
-use crate::format::{IssueWithCounts, format_issue_line};
+use crate::format::IssueWithCounts;
 use crate::model::{IssueType, Priority};
 use crate::storage::{ReadyFilters, ReadySortPolicy};
-use std::str::FromStr;
 use std::path::Path;
+use std::str::FromStr;
 use tracing::{debug, info, trace};
 
 /// Execute the ready command.
@@ -17,10 +17,10 @@ use tracing::{debug, info, trace};
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or the query fails.
-pub fn execute(args: &ReadyArgs, json: bool) -> Result<()> {
+pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
-    let (storage, _paths) = config::open_storage(&beads_dir, None)?;
+    let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
 
     let filters = ReadyFilters {
         assignee: args.assignee.clone(),
@@ -82,8 +82,14 @@ pub fn execute(args: &ReadyArgs, json: bool) -> Result<()> {
             }
         );
         for (i, iwc) in issues_with_counts.iter().enumerate() {
-            let line = format_issue_line(&iwc.issue);
-            println!("{}. {line}", i + 1);
+            let assignee = iwc.issue.assignee.as_deref().unwrap_or("unassigned");
+            println!(
+                "{}. [P{}] {} {} ({assignee})",
+                i + 1,
+                iwc.issue.priority.0,
+                iwc.issue.id,
+                iwc.issue.title
+            );
         }
     }
 
