@@ -32,7 +32,7 @@ fn test_config_set_shadowed_by_project_config() {
         get1.stderr
     );
 
-    // 4. Set prefix=USER (this currently writes to ~/.config/bd/config.yaml)
+    // 4. Set prefix=USER (this writes to ~/.config/beads/config.yaml by default)
     // We need to set HOME env var to our temp home
     let env_vars = vec![("HOME", home_dir.to_str().unwrap())];
     let set = run_br_with_env(

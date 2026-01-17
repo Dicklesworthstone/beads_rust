@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 36
 expression: normalize_json(&json)
 ---
 [

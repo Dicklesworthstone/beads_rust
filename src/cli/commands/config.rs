@@ -513,12 +513,17 @@ fn output_layer(layer: &ConfigLayer, source: &str, json_mode: bool) -> Result<()
 
 /// Get user config path.
 fn get_user_config_path() -> Option<PathBuf> {
-    env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".config")
-            .join("bd")
-            .join("config.yaml")
-    })
+    let home = env::var("HOME").ok()?;
+    let config_root = PathBuf::from(home).join(".config");
+    let beads_path = config_root.join("beads").join("config.yaml");
+    if beads_path.exists() {
+        return Some(beads_path);
+    }
+    let legacy_path = config_root.join("bd").join("config.yaml");
+    if legacy_path.exists() {
+        return Some(legacy_path);
+    }
+    Some(beads_path)
 }
 
 /// Get legacy user config path.
@@ -537,7 +542,11 @@ mod tests {
         // This test may fail if HOME is not set, which is fine
         if let Some(path) = get_user_config_path() {
             assert!(path.ends_with("config.yaml"));
-            assert!(path.to_string_lossy().contains(".config/bd"));
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.contains(".config/beads") || path_str.contains(".config/bd"),
+                "unexpected user config path: {path_str}"
+            );
         }
     }
 

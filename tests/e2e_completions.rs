@@ -9,6 +9,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, run_br};
+use tracing::info;
 
 // =============================================================================
 // Helper Functions
@@ -53,6 +54,8 @@ fn assert_contains_flags(output: &str, shell_name: &str) {
 
 #[test]
 fn e2e_completions_bash_generates_valid_script() {
+    common::init_test_logging();
+    info!("e2e_completions_bash_generates_valid_script: start");
     // Generate bash completions and verify it's a valid bash script
     let workspace = BrWorkspace::new();
     // Note: completions don't require init
@@ -73,10 +76,13 @@ fn e2e_completions_bash_generates_valid_script() {
         completions.stdout.contains("COMPREPLY"),
         "bash completions should use COMPREPLY"
     );
+    info!("e2e_completions_bash_generates_valid_script: done");
 }
 
 #[test]
 fn e2e_completions_bash_contains_subcommands() {
+    common::init_test_logging();
+    info!("e2e_completions_bash_contains_subcommands: start");
     let workspace = BrWorkspace::new();
 
     let completions = run_br(
@@ -91,10 +97,13 @@ fn e2e_completions_bash_contains_subcommands() {
     );
 
     assert_contains_subcommands(&completions.stdout, "bash");
+    info!("e2e_completions_bash_contains_subcommands: done");
 }
 
 #[test]
 fn e2e_completions_bash_contains_flags() {
+    common::init_test_logging();
+    info!("e2e_completions_bash_contains_flags: start");
     let workspace = BrWorkspace::new();
 
     let completions = run_br(
@@ -109,6 +118,7 @@ fn e2e_completions_bash_contains_flags() {
     );
 
     assert_contains_flags(&completions.stdout, "bash");
+    info!("e2e_completions_bash_contains_flags: done");
 }
 
 // =============================================================================
@@ -117,6 +127,8 @@ fn e2e_completions_bash_contains_flags() {
 
 #[test]
 fn e2e_completions_zsh_generates_valid_script() {
+    common::init_test_logging();
+    info!("e2e_completions_zsh_generates_valid_script: start");
     // Generate zsh completions and verify structure
     let workspace = BrWorkspace::new();
 
@@ -132,10 +144,13 @@ fn e2e_completions_zsh_generates_valid_script() {
         completions.stdout.contains("#compdef") || completions.stdout.contains("_br"),
         "zsh completions should have compdef or _br function"
     );
+    info!("e2e_completions_zsh_generates_valid_script: done");
 }
 
 #[test]
 fn e2e_completions_zsh_contains_subcommands() {
+    common::init_test_logging();
+    info!("e2e_completions_zsh_contains_subcommands: start");
     let workspace = BrWorkspace::new();
 
     let completions = run_br(
@@ -150,6 +165,7 @@ fn e2e_completions_zsh_contains_subcommands() {
     );
 
     assert_contains_subcommands(&completions.stdout, "zsh");
+    info!("e2e_completions_zsh_contains_subcommands: done");
 }
 
 // =============================================================================
@@ -158,6 +174,8 @@ fn e2e_completions_zsh_contains_subcommands() {
 
 #[test]
 fn e2e_completions_fish_generates_valid_script() {
+    common::init_test_logging();
+    info!("e2e_completions_fish_generates_valid_script: start");
     // Generate fish completions and verify structure
     let workspace = BrWorkspace::new();
 
@@ -173,10 +191,13 @@ fn e2e_completions_fish_generates_valid_script() {
         completions.stdout.contains("complete"),
         "fish completions should use 'complete' command"
     );
+    info!("e2e_completions_fish_generates_valid_script: done");
 }
 
 #[test]
 fn e2e_completions_fish_contains_subcommands() {
+    common::init_test_logging();
+    info!("e2e_completions_fish_contains_subcommands: start");
     let workspace = BrWorkspace::new();
 
     let completions = run_br(
@@ -191,6 +212,7 @@ fn e2e_completions_fish_contains_subcommands() {
     );
 
     assert_contains_subcommands(&completions.stdout, "fish");
+    info!("e2e_completions_fish_contains_subcommands: done");
 }
 
 // =============================================================================
@@ -199,6 +221,8 @@ fn e2e_completions_fish_contains_subcommands() {
 
 #[test]
 fn e2e_completions_powershell_generates_valid_script() {
+    common::init_test_logging();
+    info!("e2e_completions_powershell_generates_valid_script: start");
     // Generate PowerShell completions and verify structure
     let workspace = BrWorkspace::new();
 
@@ -219,10 +243,13 @@ fn e2e_completions_powershell_generates_valid_script() {
             || completions.stdout.contains("$scriptBlock"),
         "powershell completions should have argument completer"
     );
+    info!("e2e_completions_powershell_generates_valid_script: done");
 }
 
 #[test]
 fn e2e_completions_powershell_contains_subcommands() {
+    common::init_test_logging();
+    info!("e2e_completions_powershell_contains_subcommands: start");
     let workspace = BrWorkspace::new();
 
     let completions = run_br(
@@ -237,6 +264,7 @@ fn e2e_completions_powershell_contains_subcommands() {
     );
 
     assert_contains_subcommands(&completions.stdout, "powershell");
+    info!("e2e_completions_powershell_contains_subcommands: done");
 }
 
 // =============================================================================
@@ -245,6 +273,8 @@ fn e2e_completions_powershell_contains_subcommands() {
 
 #[test]
 fn e2e_completions_elvish_generates_valid_script() {
+    common::init_test_logging();
+    info!("e2e_completions_elvish_generates_valid_script: start");
     // Generate elvish completions and verify structure
     let workspace = BrWorkspace::new();
 
@@ -260,6 +290,7 @@ fn e2e_completions_elvish_generates_valid_script() {
         completions.stdout.contains("edit:") || completions.stdout.contains("set edit:"),
         "elvish completions should have edit: namespace"
     );
+    info!("e2e_completions_elvish_generates_valid_script: done");
 }
 
 // =============================================================================
@@ -268,6 +299,8 @@ fn e2e_completions_elvish_generates_valid_script() {
 
 #[test]
 fn e2e_completions_unknown_shell_error() {
+    common::init_test_logging();
+    info!("e2e_completions_unknown_shell_error: start");
     // Unknown shell should result in error
     let workspace = BrWorkspace::new();
 
@@ -276,10 +309,13 @@ fn e2e_completions_unknown_shell_error() {
         !completions.status.success(),
         "completions for unknown shell should fail"
     );
+    info!("e2e_completions_unknown_shell_error: done");
 }
 
 #[test]
 fn e2e_completions_idempotent() {
+    common::init_test_logging();
+    info!("e2e_completions_idempotent: start");
     // Running completions twice should produce identical output
     let workspace = BrWorkspace::new();
 
@@ -289,10 +325,13 @@ fn e2e_completions_idempotent() {
     assert!(run1.status.success(), "run1 failed: {}", run1.stderr);
     assert!(run2.status.success(), "run2 failed: {}", run2.stderr);
     assert_eq!(run1.stdout, run2.stdout, "completions should be idempotent");
+    info!("e2e_completions_idempotent: done");
 }
 
 #[test]
 fn e2e_completions_no_workspace_required() {
+    common::init_test_logging();
+    info!("e2e_completions_no_workspace_required: start");
     // Completions should work without an initialized workspace
     let workspace = BrWorkspace::new();
     // Deliberately NOT calling init_workspace
@@ -307,10 +346,13 @@ fn e2e_completions_no_workspace_required() {
         "completions should work without initialized workspace: {}",
         completions.stderr
     );
+    info!("e2e_completions_no_workspace_required: done");
 }
 
 #[test]
 fn e2e_completions_with_initialized_workspace() {
+    common::init_test_logging();
+    info!("e2e_completions_with_initialized_workspace: start");
     // Completions should also work with an initialized workspace
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -325,6 +367,7 @@ fn e2e_completions_with_initialized_workspace() {
         "completions should work with initialized workspace: {}",
         completions.stderr
     );
+    info!("e2e_completions_with_initialized_workspace: done");
 }
 
 // =============================================================================
@@ -333,6 +376,8 @@ fn e2e_completions_with_initialized_workspace() {
 
 #[test]
 fn e2e_completions_all_shells_succeed() {
+    common::init_test_logging();
+    info!("e2e_completions_all_shells_succeed: start");
     // All supported shells should generate completions successfully
     let workspace = BrWorkspace::new();
     let shells = ["bash", "zsh", "fish", "powershell", "elvish"];
@@ -353,10 +398,13 @@ fn e2e_completions_all_shells_succeed() {
             "completions for {shell} should produce output"
         );
     }
+    info!("e2e_completions_all_shells_succeed: done");
 }
 
 #[test]
 fn e2e_completions_all_shells_have_help() {
+    common::init_test_logging();
+    info!("e2e_completions_all_shells_have_help: start");
     // All shell completions should include --help descriptions
     let workspace = BrWorkspace::new();
     let shells = ["bash", "zsh", "fish", "powershell", "elvish"];
@@ -377,4 +425,5 @@ fn e2e_completions_all_shells_have_help() {
             "completions for {shell} should reference help"
         );
     }
+    info!("e2e_completions_all_shells_have_help: done");
 }

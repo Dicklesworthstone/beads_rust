@@ -358,7 +358,7 @@ Configuration sources in precedence order (highest wins):
 1. CLI overrides        (--json, --db, --actor)
 2. Environment vars     (BD_ACTOR, BEADS_JSONL)
 3. Project config       (.beads/config.yaml)
-4. User config          (~/.config/bd/config.yaml)
+4. User config          (~/.config/beads/config.yaml; falls back to ~/.config/bd/config.yaml)
 5. Legacy user config   (~/.beads/config.yaml)
 6. DB config table      (config table in SQLite)
 7. Defaults
