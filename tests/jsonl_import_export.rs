@@ -21,7 +21,12 @@ fn issue_with_id(id: &str, title: &str) -> Issue {
 fn export_import_roundtrip_preserves_relationships() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     let mut alpha = fixtures::issue("Alpha");
+    // Ensure created_at is strictly before any updates (SQLite CURRENT_TIMESTAMP has low precision)
+    alpha.created_at = Utc::now() - Duration::hours(1);
+    alpha.updated_at = alpha.created_at;
     let mut beta = fixtures::issue("Beta");
+    beta.created_at = alpha.created_at;
+    beta.updated_at = alpha.created_at;
 
     alpha.priority = Priority::HIGH;
     alpha.external_ref = Some("ext-1".to_string());
@@ -106,7 +111,7 @@ fn import_rejects_malformed_json() {
 fn import_rejects_prefix_mismatch() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("issues.jsonl");
-    let issue = issue_with_id("xx-1", "Mismatch");
+    let issue = issue_with_id("xx-001", "Mismatch");
     let json = serde_json::to_string(&issue).unwrap();
     fs::write(&path, format!("{json}\n")).unwrap();
 
@@ -122,6 +127,7 @@ fn import_sets_closed_at_when_missing() {
     let path = temp.path().join("issues.jsonl");
     let mut issue = issue_with_id("test-closed", "Closed");
     issue.status = Status::Closed;
+    issue.created_at = Utc::now() - Duration::hours(2);
     issue.updated_at = Utc::now() - Duration::hours(1);
     issue.closed_at = None;
     let json = serde_json::to_string(&issue).unwrap();
@@ -270,11 +276,13 @@ fn import_collision_by_id_skips_when_older() {
 
     // Create existing issue with newer timestamp
     let mut existing = issue_with_id("test-001", "Newer title");
+    existing.created_at = Utc::now() - Duration::hours(2);
     existing.updated_at = Utc::now();
     storage.create_issue(&existing, "tester").unwrap();
 
     // Create JSONL with same ID but older timestamp
     let mut incoming = issue_with_id("test-001", "Older title");
+    incoming.created_at = existing.created_at;
     incoming.updated_at = Utc::now() - Duration::hours(1);
     let json = serde_json::to_string(&incoming).unwrap();
     fs::write(&path, format!("{json}\n")).unwrap();
@@ -476,9 +484,8 @@ fn import_repopulates_export_hashes() {
 }
 
 #[test]
-fn import_allows_invalid_id_format_currently() {
-    // CURRENT BEHAVIOR: Import skips IssueValidator, so invalid IDs are accepted.
-    // This test confirms the bug exists.
+fn import_rejects_invalid_id_format() {
+    // Import now validates issues, so invalid IDs should be rejected.
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("issues.jsonl");
     let issue = issue_with_id("test-INVALID", "Invalid ID");
@@ -488,12 +495,10 @@ fn import_allows_invalid_id_format_currently() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     let result = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"));
 
+    assert!(result.is_err(), "Import should fail for invalid IDs");
+    let err = result.unwrap_err().to_string();
     assert!(
-        result.is_ok(),
-        "Import currently succeeds for invalid IDs (bug)"
+        err.contains("Validation failed"),
+        "Expected validation error, got: {err}"
     );
-
-    // Verify it's in the DB
-    let imported = storage.get_issue("test-INVALID").unwrap().unwrap();
-    assert_eq!(imported.title, "Invalid ID");
 }

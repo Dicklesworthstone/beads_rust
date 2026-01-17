@@ -353,27 +353,30 @@ pub fn insert_restored_event(
 ///
 /// Returns an error if the database query fails.
 pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
-    let events = if limit > 0 {
-        let query = r"
+    let query = if limit > 0 {
+        r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
             LIMIT ?2
-            ";
-        let mut stmt = conn.prepare(query)?;
-        let rows = stmt.query_map(params![issue_id, limit], |row| event_from_row(row))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            "
     } else {
-        let query = r"
+        r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
-            ";
-        let mut stmt = conn.prepare(query)?;
-        let rows = stmt.query_map(params![issue_id], |row| event_from_row(row))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            "
+    };
+
+    let mut stmt = conn.prepare(query)?;
+    let events: Vec<Event> = if limit > 0 {
+        stmt.query_map(params![issue_id, limit], event_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![issue_id], event_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
     };
 
     Ok(events)
@@ -416,25 +419,28 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
 ///
 /// Returns an error if the database query fails.
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
-    let events = if limit > 0 {
-        let query = r"
+    let query = if limit > 0 {
+        r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
             LIMIT ?1
-            ";
-        let mut stmt = conn.prepare(query)?;
-        let rows = stmt.query_map(params![limit], |row| event_from_row(row))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            "
     } else {
-        let query = r"
+        r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
-            ";
-        let mut stmt = conn.prepare(query)?;
-        let rows = stmt.query_map([], |row| event_from_row(row))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            "
+    };
+
+    let mut stmt = conn.prepare(query)?;
+    let events: Vec<Event> = if limit > 0 {
+        stmt.query_map(params![limit], event_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map([], event_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
     };
 
     Ok(events)

@@ -236,6 +236,7 @@ impl SnapshotDiff {
 
 /// E2E test: Basic export cycle with artifact capture.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_export_with_artifacts() {
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_export");
@@ -253,7 +254,15 @@ fn e2e_sync_export_with_artifacts() {
     // Create issues with various attributes
     let create1 = run_br(
         &workspace,
-        ["create", "First issue", "-t", "task", "-p", "1"],
+        [
+            "create",
+            "First issue",
+            "-t",
+            "task",
+            "-p",
+            "1",
+            "--no-auto-flush",
+        ],
         "create1",
     );
     artifacts.record_command(
@@ -270,7 +279,15 @@ fn e2e_sync_export_with_artifacts() {
 
     let create2 = run_br(
         &workspace,
-        ["create", "Second issue", "-t", "bug", "-p", "2"],
+        [
+            "create",
+            "Second issue",
+            "-t",
+            "bug",
+            "-p",
+            "2",
+            "--no-auto-flush",
+        ],
         "create2",
     );
     artifacts.record_command(
@@ -359,7 +376,11 @@ fn e2e_sync_import_with_artifacts() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed");
 
-    let create = run_br(&workspace, ["create", "Original issue"], "create");
+    let create = run_br(
+        &workspace,
+        ["create", "Original issue", "--no-auto-flush"],
+        "create",
+    );
     assert!(create.status.success(), "create failed");
 
     // Export first
@@ -452,7 +473,7 @@ fn e2e_sync_full_cycle_with_artifacts() {
     {
         let create = run_br(
             &workspace,
-            ["create", title, "-t", typ],
+            ["create", title, "-t", typ, "--no-auto-flush"],
             &format!("create{i}"),
         );
         artifacts.record_command(
