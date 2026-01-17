@@ -1875,6 +1875,127 @@ fn conformance_blocked_shows_blockers() {
 }
 
 #[test]
+fn conformance_blocked_multiple_blockers() {
+    common::init_test_logging();
+    info!("Starting conformance_blocked_multiple_blockers test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_blocker1 = workspace.run_br(["create", "Blocker 1", "--json"], "blocker1");
+    let bd_blocker1 = workspace.run_bd(["create", "Blocker 1", "--json"], "blocker1");
+    let br_blocker2 = workspace.run_br(["create", "Blocker 2", "--json"], "blocker2");
+    let bd_blocker2 = workspace.run_bd(["create", "Blocker 2", "--json"], "blocker2");
+    let br_blocked = workspace.run_br(["create", "Blocked issue", "--json"], "blocked_multi");
+    let bd_blocked = workspace.run_bd(["create", "Blocked issue", "--json"], "blocked_multi");
+
+    let br_blocker1_id = serde_json::from_str::<Value>(&extract_json_payload(&br_blocker1.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br blocker1 id");
+    let bd_blocker1_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_blocker1.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd blocker1 id");
+    let br_blocker2_id = serde_json::from_str::<Value>(&extract_json_payload(&br_blocker2.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br blocker2 id");
+    let bd_blocker2_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_blocker2.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd blocker2 id");
+    let br_blocked_id = serde_json::from_str::<Value>(&extract_json_payload(&br_blocked.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br blocked id");
+    let bd_blocked_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_blocked.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd blocked id");
+
+    let br_dep1 = workspace.run_br(
+        ["dep", "add", &br_blocked_id, &br_blocker1_id],
+        "dep_add1",
+    );
+    let br_dep2 = workspace.run_br(
+        ["dep", "add", &br_blocked_id, &br_blocker2_id],
+        "dep_add2",
+    );
+    let bd_dep1 = workspace.run_bd(
+        ["dep", "add", &bd_blocked_id, &bd_blocker1_id],
+        "dep_add1",
+    );
+    let bd_dep2 = workspace.run_bd(
+        ["dep", "add", &bd_blocked_id, &bd_blocker2_id],
+        "dep_add2",
+    );
+
+    assert!(br_dep1.status.success(), "br dep1 failed: {}", br_dep1.stderr);
+    assert!(br_dep2.status.success(), "br dep2 failed: {}", br_dep2.stderr);
+    assert!(bd_dep1.status.success(), "bd dep1 failed: {}", bd_dep1.stderr);
+    assert!(bd_dep2.status.success(), "bd dep2 failed: {}", bd_dep2.stderr);
+
+    let br_blocked_out = workspace.run_br(["blocked", "--json"], "blocked_multi");
+    let bd_blocked_out = workspace.run_bd(["blocked", "--json"], "blocked_multi");
+
+    assert!(
+        br_blocked_out.status.success(),
+        "br blocked failed: {}",
+        br_blocked_out.stderr
+    );
+    assert!(
+        bd_blocked_out.status.success(),
+        "bd blocked failed: {}",
+        bd_blocked_out.stderr
+    );
+
+    let br_val: Value =
+        serde_json::from_str(&extract_json_payload(&br_blocked_out.stdout)).unwrap_or_default();
+    let bd_val: Value =
+        serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout)).unwrap_or_default();
+
+    fn has_blocker(val: &Value, blocked_id: &str, blocker_id: &str) -> bool {
+        let Some(arr) = val.as_array() else {
+            return false;
+        };
+        for item in arr {
+            if item.get("id").and_then(|v| v.as_str()) != Some(blocked_id) {
+                continue;
+            }
+            if let Some(blocked_by) = item.get("blocked_by").and_then(|v| v.as_array()) {
+                return blocked_by.iter().any(|entry| {
+                    entry
+                        .as_str()
+                        .map(|s| s.split(':').next().unwrap_or(s) == blocker_id)
+                        .unwrap_or(false)
+                });
+            }
+        }
+        false
+    }
+
+    assert!(
+        has_blocker(&br_val, &br_blocked_id, &br_blocker1_id),
+        "br blocked should include blocker1"
+    );
+    assert!(
+        has_blocker(&br_val, &br_blocked_id, &br_blocker2_id),
+        "br blocked should include blocker2"
+    );
+    assert!(
+        has_blocker(&bd_val, &bd_blocked_id, &bd_blocker1_id),
+        "bd blocked should include blocker1"
+    );
+    assert!(
+        has_blocker(&bd_val, &bd_blocked_id, &bd_blocker2_id),
+        "bd blocked should include blocker2"
+    );
+
+    info!("conformance_blocked_multiple_blockers passed");
+}
+
+#[test]
 fn conformance_stats() {
     common::init_test_logging();
     info!("Starting conformance_stats test");
