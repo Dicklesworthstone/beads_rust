@@ -251,9 +251,10 @@ fn set_config_value(kv: &str, json_mode: bool) -> Result<()> {
     // Load existing config or create new
     let mut config: serde_yaml::Value = if config_path.exists() {
         let contents = fs::read_to_string(&config_path)?;
-        serde_yaml::from_str(&contents).unwrap_or(serde_yaml::Value::Mapping(Default::default()))
+        serde_yaml::from_str(&contents)
+            .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::default()))
     } else {
-        serde_yaml::Value::Mapping(Default::default())
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::default())
     };
 
     // Set the value
@@ -282,7 +283,10 @@ fn set_config_value(kv: &str, json_mode: bool) -> Result<()> {
                     if let serde_yaml::Value::Mapping(m) = current {
                         let key = serde_yaml::Value::String(part.to_string());
                         if !m.contains_key(&key) {
-                            m.insert(key.clone(), serde_yaml::Value::Mapping(Default::default()));
+                            m.insert(
+                                key.clone(),
+                                serde_yaml::Value::Mapping(serde_yaml::Mapping::default()),
+                            );
                         }
                         current = m.get_mut(&key).unwrap();
                     }

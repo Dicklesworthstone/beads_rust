@@ -5,7 +5,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
 use crate::storage::IssueUpdate;
-use crate::util::id::{find_matching_ids, IdResolver, ResolverConfig};
+use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, TimeZone, Utc};
 use serde::Serialize;
 
@@ -42,7 +42,7 @@ pub struct UndeferResult {
     pub skipped: Vec<SkippedIssue>,
 }
 
-/// Parse a flexible time specification into a DateTime.
+/// Parse a flexible time specification into a `DateTime`.
 ///
 /// Supports:
 /// - RFC3339: `2025-01-15T12:00:00Z`, `2025-01-15T12:00:00+00:00`
@@ -61,9 +61,10 @@ fn parse_defer_time(s: &str) -> Result<DateTime<Utc>> {
     if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
         let naive_dt = date.and_time(time);
-        let local_dt = Local.from_local_datetime(&naive_dt).single().ok_or_else(|| {
-            BeadsError::validation("defer_until", "ambiguous local time")
-        })?;
+        let local_dt = Local
+            .from_local_datetime(&naive_dt)
+            .single()
+            .ok_or_else(|| BeadsError::validation("defer_until", "ambiguous local time"))?;
         return Ok(local_dt.with_timezone(&Utc));
     }
 
@@ -77,7 +78,12 @@ fn parse_defer_time(s: &str) -> Result<DateTime<Utc>> {
                     'h' => Duration::hours(amount),
                     'd' => Duration::days(amount),
                     'w' => Duration::weeks(amount),
-                    _ => return Err(BeadsError::validation("defer_until", "invalid unit (use m, h, d, w)")),
+                    _ => {
+                        return Err(BeadsError::validation(
+                            "defer_until",
+                            "invalid unit (use m, h, d, w)",
+                        ));
+                    }
                 };
                 return Ok(Utc::now() + duration);
             }
@@ -91,18 +97,20 @@ fn parse_defer_time(s: &str) -> Result<DateTime<Utc>> {
             let tomorrow = now.date_naive() + Duration::days(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = tomorrow.and_time(time);
-            let local_dt = Local.from_local_datetime(&naive_dt).single().ok_or_else(|| {
-                BeadsError::validation("defer_until", "ambiguous local time")
-            })?;
+            let local_dt = Local
+                .from_local_datetime(&naive_dt)
+                .single()
+                .ok_or_else(|| BeadsError::validation("defer_until", "ambiguous local time"))?;
             Ok(local_dt.with_timezone(&Utc))
         }
         "next-week" | "nextweek" => {
             let next_week = now.date_naive() + Duration::weeks(1);
             let time = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
             let naive_dt = next_week.and_time(time);
-            let local_dt = Local.from_local_datetime(&naive_dt).single().ok_or_else(|| {
-                BeadsError::validation("defer_until", "ambiguous local time")
-            })?;
+            let local_dt = Local
+                .from_local_datetime(&naive_dt)
+                .single()
+                .ok_or_else(|| BeadsError::validation("defer_until", "ambiguous local time"))?;
             Ok(local_dt.with_timezone(&Utc))
         }
         _ => Err(BeadsError::validation(
@@ -359,11 +367,11 @@ pub fn execute_undefer(args: &UndeferArgs, json: bool, cli: &config::CliOverride
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
     use crate::cli::commands;
     use crate::config::CliOverrides;
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use chrono::Datelike;
     use std::env;
     use std::path::PathBuf;
     use std::sync::Mutex;
