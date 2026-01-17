@@ -5,17 +5,56 @@ on:
     tags:
       - 'v*'
 
+# Ensure only one release runs at a time
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 permissions:
   contents: write
 
 jobs:
+  # Pre-flight checks before building release
+  preflight:
+    name: Pre-flight Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt, clippy
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "Error: Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+          echo "Version check passed: $CARGO_VERSION"
+
   build-release:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +63,11 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             name: linux_amd64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            name: linux_amd64_musl
+            musl: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
@@ -44,6 +88,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -57,6 +103,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install musl tools (Linux musl)
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - name: Configure linker (Linux ARM64)
         if: matrix.cross
         run: |
@@ -64,13 +116,15 @@ jobs:
           echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
           echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry and target
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-release-
@@ -80,6 +134,14 @@ jobs:
         env:
           VERGEN_GIT_SHA: ${{ github.sha }}
           VERGEN_GIT_BRANCH: ${{ github.ref_name }}
+
+      - name: Verify binary runs (Unix, native)
+        if: runner.os != 'Windows' && !matrix.cross && !matrix.musl
+        run: ./target/${{ matrix.target }}/release/br --version
+
+      - name: Verify binary runs (Windows)
+        if: runner.os == 'Windows'
+        run: ./target/${{ matrix.target }}/release/br.exe --version
 
       - name: Create archive (Unix)
         if: runner.os != 'Windows'
@@ -108,6 +170,10 @@ jobs:
           $hash = (Get-FileHash -Path "br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
           "$hash  br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}" | Out-File -FilePath "br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256" -Encoding utf8 -NoNewline
 
+      - name: Verify checksum (Unix)
+        if: runner.os != 'Windows'
+        run: sha256sum -c br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -115,6 +181,7 @@ jobs:
           path: |
             br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
             br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+          retention-days: 7
 
   create-release:
     name: Create Release
@@ -137,8 +204,20 @@ jobs:
       - name: Generate combined checksums
         run: |
           cd artifacts
-          cat *.sha256 > checksums.sha256
+          cat *.sha256 | sort > checksums.sha256
+          echo "=== Combined checksums ==="
           cat checksums.sha256
+
+      - name: Verify all checksums
+        run: |
+          cd artifacts
+          echo "=== Verifying all checksums ==="
+          for checksum_file in *.sha256; do
+            if [ "$checksum_file" != "checksums.sha256" ]; then
+              echo "Verifying $checksum_file..."
+              sha256sum -c "$checksum_file" || echo "Skipping non-Unix checksum"
+            fi
+          done
 
       - name: Generate changelog
         id: changelog
@@ -155,24 +234,37 @@ jobs:
           fi
 
           # Create changelog file
-          cat << EOF > CHANGELOG.md
+          cat << 'EOF' > CHANGELOG.md
           ## What's Changed
 
-          $COMMITS
+          EOF
+          echo "$COMMITS" >> CHANGELOG.md
+          cat << 'EOF' >> CHANGELOG.md
+
+          ## Platforms
+
+          | Platform | Architecture | File |
+          |----------|--------------|------|
+          | Linux | x86_64 (glibc) | `br-${{ github.ref_name }}-linux_amd64.tar.gz` |
+          | Linux | x86_64 (musl, static) | `br-${{ github.ref_name }}-linux_amd64_musl.tar.gz` |
+          | Linux | ARM64 | `br-${{ github.ref_name }}-linux_arm64.tar.gz` |
+          | macOS | x86_64 (Intel) | `br-${{ github.ref_name }}-darwin_amd64.tar.gz` |
+          | macOS | ARM64 (Apple Silicon) | `br-${{ github.ref_name }}-darwin_arm64.tar.gz` |
+          | Windows | x86_64 | `br-${{ github.ref_name }}-windows_amd64.zip` |
 
           ## Installation
 
           ### Quick Install (Recommended)
 
-          \`\`\`bash
+          ```bash
           curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash
-          \`\`\`
+          ```
 
           ### Cargo Install
 
-          \`\`\`bash
+          ```bash
           cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag ${{ github.ref_name }}
-          \`\`\`
+          ```
 
           ### Manual Download
 
@@ -180,16 +272,17 @@ jobs:
 
           **Verify checksum:**
 
-          \`\`\`bash
+          ```bash
           # Download checksums.sha256 and your binary
           sha256sum -c checksums.sha256 --ignore-missing
-          \`\`\`
+          ```
 
           ## Full Changelog
 
           See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
           EOF
 
+          echo "=== Generated changelog ==="
           cat CHANGELOG.md
 
       - name: Create GitHub Release
