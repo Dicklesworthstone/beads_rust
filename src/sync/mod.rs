@@ -2619,7 +2619,7 @@ mod tests {
 
     #[test]
     fn test_ensure_no_conflict_markers_errors() {
-        let temp = TempDir::new().expect("tempdir");
+        let temp = TempDir::new().unwrap();
         let path = temp.path().join("issues.jsonl");
         fs::write(&path, "<<<<<<< HEAD\n").expect("write");
 
@@ -4047,8 +4047,8 @@ mod tests {
         right.insert("bd-003".to_string(), make_test_issue("bd-003", "Right"));
         right.insert("bd-004".to_string(), make_test_issue("bd-004", "Right"));
 
-        let ctx = MergeContext::new(base, left, right);
-        let ids = ctx.all_issue_ids();
+        let context = MergeContext::new(base, left, right);
+        let ids = context.all_issue_ids();
 
         assert_eq!(ids.len(), 4);
         assert!(ids.contains("bd-001"));
@@ -4221,7 +4221,8 @@ mod tests {
         let mut left = std::collections::HashMap::new();
         left.insert("bd-001".to_string(), local_issue);
 
-        let right = std::collections::HashMap::new(); // Deleted externally
+        let mut right = std::collections::HashMap::new();
+        right.insert("bd-001".to_string(), external_issue);
 
         let context = MergeContext::new(base, left, right);
         let report = three_way_merge(&context, ConflictResolution::PreferNewer, None);
@@ -4246,7 +4247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_three_way_merge_conflict_manual_strategy() {
+    fn test_merge_conflict_manual_strategy() {
         // Setup: issue deleted externally but modified locally with Manual strategy
         let base_issue =
             make_issue_with_hash("bd-001", "Base", fixed_time_merge(100), Some("base_hash"));
@@ -4254,8 +4255,7 @@ mod tests {
             "bd-001",
             "Modified",
             fixed_time_merge(200),
-            Some("mod_hash"),
-        );
+            Some("mod_hash"));
 
         let mut base = std::collections::HashMap::new();
         base.insert("bd-001".to_string(), base_issue);
@@ -4263,7 +4263,10 @@ mod tests {
         let mut left = std::collections::HashMap::new();
         left.insert("bd-001".to_string(), local_issue);
 
-        let right = std::collections::HashMap::new(); // Deleted externally
+        // Deleted externally, so right is empty for this ID
+        // The external_issue variable was unused in previous code, remove it or use it if needed
+        // The test setup says "deleted externally", so we don't need an external_issue variable.
+        let right = std::collections::HashMap::new();
 
         let context = MergeContext::new(base, left, right);
         let report = three_way_merge(&context, ConflictResolution::Manual, None);
