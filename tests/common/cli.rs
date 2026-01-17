@@ -64,17 +64,18 @@ where
     run_br_full(workspace, args, env_vars, None, label)
 }
 
-pub fn run_br_with_stdin<I, S>(
-    workspace: &BrWorkspace,
-    args: I,
-    input: &str,
-    label: &str,
-) -> BrRun
+pub fn run_br_with_stdin<I, S>(workspace: &BrWorkspace, args: I, input: &str, label: &str) -> BrRun
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_br_full(workspace, args, std::iter::empty::<(String, String)>(), Some(input), label)
+    run_br_full(
+        workspace,
+        args,
+        std::iter::empty::<(String, String)>(),
+        Some(input),
+        label,
+    )
 }
 
 fn run_br_full<I, S, E, K, V>(

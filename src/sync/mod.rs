@@ -1566,6 +1566,126 @@ pub const METADATA_LAST_EXPORT_TIME: &str = "last_export_time";
 /// Metadata key for the last import time.
 pub const METADATA_LAST_IMPORT_TIME: &str = "last_import_time";
 
+/// Result of a staleness check between JSONL and DB.
+#[derive(Debug, Clone, Copy)]
+pub struct StalenessCheck {
+    pub jsonl_exists: bool,
+    pub jsonl_newer: bool,
+    pub db_newer: bool,
+}
+
+/// Compute staleness based on JSONL mtime + content hash and DB dirty state.
+///
+/// Uses Lstat (`symlink_metadata`) for JSONL mtime to match classic bd behavior.
+///
+/// # Errors
+///
+/// Returns an error if reading dirty state, metadata, JSONL mtime, or hashing fails.
+pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
+    let dirty_count = storage.get_dirty_issue_ids()?.len();
+    let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
+    let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
+    let jsonl_exists = jsonl_path.exists();
+
+    let (jsonl_newer, db_newer) = if jsonl_exists {
+        let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
+
+        let mtime_newer = last_import_time.as_ref().is_none_or(|import_time| {
+            chrono::DateTime::parse_from_rfc3339(import_time).is_ok_and(|import_ts| {
+                let import_sys_time = std::time::SystemTime::from(import_ts);
+                jsonl_mtime > import_sys_time
+            })
+        });
+
+        let jsonl_newer = if mtime_newer {
+            jsonl_content_hash.as_ref().is_none_or(|stored_hash| {
+                compute_jsonl_hash(jsonl_path)
+                    .map_or(true, |current_hash| &current_hash != stored_hash)
+            })
+        } else {
+            false
+        };
+
+        (jsonl_newer, dirty_count > 0)
+    } else {
+        (false, dirty_count > 0)
+    };
+
+    Ok(StalenessCheck {
+        jsonl_exists,
+        jsonl_newer,
+        db_newer,
+    })
+}
+
+/// Result of an auto-import attempt.
+#[derive(Debug, Default)]
+pub struct AutoImportResult {
+    /// Whether an import was attempted.
+    pub attempted: bool,
+    /// Number of issues imported (created or updated).
+    pub imported_count: usize,
+}
+
+/// Auto-import JSONL if it is newer than the DB.
+///
+/// Honors `--no-auto-import` and `--allow-stale` behavior.
+///
+/// # Errors
+///
+/// Returns an error if staleness checks, metadata reads, or import steps fail.
+pub fn auto_import_if_stale(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    expected_prefix: Option<&str>,
+    allow_stale: bool,
+    no_auto_import: bool,
+) -> Result<AutoImportResult> {
+    let staleness = compute_staleness(storage, jsonl_path)?;
+    if !staleness.jsonl_newer {
+        return Ok(AutoImportResult::default());
+    }
+
+    if allow_stale {
+        tracing::warn!(
+            jsonl_path = %jsonl_path.display(),
+            "JSONL is newer than DB; skipping auto-import due to --allow-stale"
+        );
+        return Ok(AutoImportResult::default());
+    }
+
+    if no_auto_import {
+        return Err(BeadsError::Config(
+            "JSONL is newer than the database (auto-import disabled).\n\
+             Hint: run `br sync --import-only` or rerun without --no-auto-import.\n\
+             To proceed without importing, use --allow-stale."
+                .to_string(),
+        ));
+    }
+
+    let import_config = ImportConfig {
+        skip_prefix_validation: true,
+        beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl: false,
+        show_progress: false,
+        ..Default::default()
+    };
+
+    let result = import_from_jsonl(storage, jsonl_path, &import_config, expected_prefix)?;
+
+    tracing::info!(
+        imported_count = result.imported_count,
+        jsonl_path = %jsonl_path.display(),
+        "Auto-import completed"
+    );
+
+    Ok(AutoImportResult {
+        attempted: true,
+        imported_count: result.imported_count,
+    })
+}
+
 /// Finalize an export by updating metadata, clearing dirty flags, and recording export hashes.
 ///
 /// This should be called after a successful export to the default JSONL path.

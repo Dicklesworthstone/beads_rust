@@ -564,6 +564,8 @@ fn e2e_audit_record_via_stdin() {
 
 #[test]
 fn e2e_audit_record_created_at_auto_set() {
+    common::init_test_logging();
+    info!("e2e_audit_record_created_at_auto_set: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -590,10 +592,13 @@ fn e2e_audit_record_created_at_auto_set() {
         created_at.contains('T') && created_at.contains('Z'),
         "created_at should be ISO 8601: {created_at}"
     );
+    info!("e2e_audit_record_created_at_auto_set: done");
 }
 
 #[test]
 fn e2e_audit_unique_ids() {
+    common::init_test_logging();
+    info!("e2e_audit_unique_ids: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -619,10 +624,13 @@ fn e2e_audit_unique_ids() {
         sorted.len()
     };
     assert_eq!(unique_count, ids.len(), "all IDs should be unique: {ids:?}");
+    info!("e2e_audit_unique_ids: done");
 }
 
 #[test]
 fn e2e_audit_interactions_file_created() {
+    common::init_test_logging();
+    info!("e2e_audit_interactions_file_created: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -645,10 +653,13 @@ fn e2e_audit_interactions_file_created() {
         path.exists(),
         "interactions.jsonl should exist after first record"
     );
+    info!("e2e_audit_interactions_file_created: done");
 }
 
 #[test]
 fn e2e_audit_with_actor_override() {
+    common::init_test_logging();
+    info!("e2e_audit_with_actor_override: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -676,4 +687,5 @@ fn e2e_audit_with_actor_override() {
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["actor"], "test-agent");
+    info!("e2e_audit_with_actor_override: done");
 }
