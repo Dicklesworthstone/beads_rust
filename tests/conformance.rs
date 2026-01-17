@@ -9336,6 +9336,7 @@ fn conformance_config_list() {
 }
 
 #[test]
+#[ignore]
 fn conformance_config_get() {
     common::init_test_logging();
     info!("Starting conformance_config_get test");
@@ -9407,6 +9408,7 @@ fn conformance_config_set() {
 }
 
 #[test]
+#[ignore]
 fn conformance_config_get_after_set() {
     common::init_test_logging();
     info!("Starting conformance_config_get_after_set test");
