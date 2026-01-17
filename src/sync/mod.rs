@@ -1908,17 +1908,15 @@ pub fn import_from_jsonl(
         // Determine action
         let action = determine_action(&collision, &effective_issue, storage, config.force_upsert)?;
 
-        // Collect hash if we are importing
-        if matches!(
-            action,
-            CollisionAction::Insert | CollisionAction::Update { .. }
-        ) {
-            let final_id = match &action {
-                CollisionAction::Update { existing_id } => existing_id.clone(),
-                _ => effective_issue.id.clone(),
-            };
-            new_export_hashes.push((final_id, computed_hash.clone()));
-        }
+        // Collect hash for export_hashes table
+        // We record the incoming hash so that if the DB matches it, we know we are synced.
+        // If DB differs (e.g. newer local version), it will be flagged as dirty/changed later.
+        // We must use the correct ID (existing ID if matched).
+        let final_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => effective_issue.id.clone(),
+        };
+        new_export_hashes.push((final_id, computed_hash.clone()));
 
         // Process the action
         process_import_action(storage, &action, &effective_issue, &mut result)?;
@@ -2010,6 +2008,359 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+// ============================================================================
+// 3-Way Merge Types and Functions
+// ============================================================================
+
+/// Types of conflicts that can occur during 3-way merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictType {
+    /// Issue was modified locally but deleted externally (or vice versa).
+    DeleteVsModify,
+    /// Issue was created in both local and external with different content.
+    ConvergentCreation,
+}
+
+/// Result of merging a single issue across base, left (local), and right (external).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeResult {
+    /// No action needed (e.g., issue doesn't exist in any source).
+    NoAction,
+    /// Keep the specified issue.
+    Keep(Issue),
+    /// Keep the specified issue with a note about the merge decision.
+    KeepWithNote(Issue, String),
+    /// Delete the issue.
+    Delete,
+    /// A conflict was detected that requires manual resolution.
+    Conflict(ConflictType),
+}
+
+/// Context for performing a 3-way merge operation.
+#[derive(Debug, Default)]
+pub struct MergeContext {
+    /// Base state (last known common state).
+    pub base: std::collections::HashMap<String, Issue>,
+    /// Left state (current SQLite/local changes).
+    pub left: std::collections::HashMap<String, Issue>,
+    /// Right state (current JSONL/external changes).
+    pub right: std::collections::HashMap<String, Issue>,
+}
+
+impl MergeContext {
+    /// Create a new merge context from the three states.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn new(
+        base: std::collections::HashMap<String, Issue>,
+        left: std::collections::HashMap<String, Issue>,
+        right: std::collections::HashMap<String, Issue>,
+    ) -> Self {
+        Self { base, left, right }
+    }
+
+    /// Get all unique issue IDs across all three states.
+    #[must_use]
+    pub fn all_issue_ids(&self) -> std::collections::HashSet<String> {
+        let mut ids = std::collections::HashSet::new();
+        ids.extend(self.base.keys().cloned());
+        ids.extend(self.left.keys().cloned());
+        ids.extend(self.right.keys().cloned());
+        ids
+    }
+}
+
+/// Report of a 3-way merge operation.
+#[derive(Debug, Default)]
+pub struct MergeReport {
+    /// Issues that were kept (created or updated).
+    pub kept: Vec<String>,
+    /// Issues that were deleted.
+    pub deleted: Vec<String>,
+    /// Conflicts that were detected.
+    pub conflicts: Vec<(String, ConflictType)>,
+    /// Issues that were skipped due to tombstone protection.
+    pub tombstone_protected: Vec<String>,
+    /// Notes about merge decisions.
+    pub notes: Vec<(String, String)>,
+}
+
+impl MergeReport {
+    /// Returns true if there were any conflicts.
+    #[must_use]
+    pub fn has_conflicts(&self) -> bool {
+        !self.conflicts.is_empty()
+    }
+
+    /// Total number of actions taken.
+    #[must_use]
+    pub fn total_actions(&self) -> usize {
+        self.kept.len() + self.deleted.len()
+    }
+}
+
+/// Strategy for resolving conflicts during merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictResolution {
+    /// Always keep the local (`SQLite`) version.
+    PreferLocal,
+    /// Always keep the external (`JSONL`) version.
+    PreferExternal,
+    /// Use `updated_at` timestamp to determine winner (default).
+    #[default]
+    PreferNewer,
+    /// Report conflict without auto-resolving.
+    Manual,
+}
+
+/// Merge a single issue given its state in base, left (local), and right (external).
+///
+/// This implements the core 3-way merge logic for a single issue:
+/// - New local issues are kept
+/// - New external issues are imported
+/// - Deletions are handled based on whether the other side modified
+/// - Both-modified uses `updated_at` as tiebreaker (or specified strategy)
+///
+/// # Arguments
+/// * `base` - The issue in the base (common ancestor) state, if it existed
+/// * `left` - The issue in the local (`SQLite`) state, if it exists
+/// * `right` - The issue in the external (JSONL) state, if it exists
+/// * `strategy` - How to resolve conflicts when both sides modified
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn merge_issue(
+    base: Option<&Issue>,
+    left: Option<&Issue>,
+    right: Option<&Issue>,
+    strategy: ConflictResolution,
+) -> MergeResult {
+    match (base, left, right) {
+        // Case 1: Only in base (deleted in both local and external) -> no action
+        (Some(_), None, None) => MergeResult::Delete,
+
+        // Case 2: Only in left (new local) -> keep
+        (None, Some(l), None) => MergeResult::Keep(l.clone()),
+
+        // Case 3: Only in right (new external) -> keep
+        (None, None, Some(r)) => MergeResult::Keep(r.clone()),
+
+        // Case 4: In base and left only (deleted in right/external)
+        (Some(b), Some(l), None) => {
+            // Was it modified locally after base?
+            if l.updated_at > b.updated_at {
+                // Local modified but external deleted - conflict
+                match strategy {
+                    ConflictResolution::PreferLocal => MergeResult::KeepWithNote(
+                        l.clone(),
+                        "Local modified, external deleted - kept local".to_string(),
+                    ),
+                    ConflictResolution::PreferExternal => MergeResult::Delete,
+                    ConflictResolution::PreferNewer => {
+                        // Keep local since it was modified more recently than base
+                        MergeResult::KeepWithNote(
+                            l.clone(),
+                            "Local modified after base, external deleted - kept local".to_string(),
+                        )
+                    }
+                    ConflictResolution::Manual => {
+                        MergeResult::Conflict(ConflictType::DeleteVsModify)
+                    }
+                }
+            } else {
+                // Local unchanged since base, external deleted -> delete
+                MergeResult::Delete
+            }
+        }
+
+        // Case 5: In base and right only (deleted locally)
+        (Some(b), None, Some(r)) => {
+            // Was it modified externally after base?
+            if r.updated_at > b.updated_at {
+                // External modified but local deleted - conflict
+                match strategy {
+                    ConflictResolution::PreferLocal => MergeResult::Delete,
+                    ConflictResolution::PreferExternal => MergeResult::KeepWithNote(
+                        r.clone(),
+                        "External modified, local deleted - kept external".to_string(),
+                    ),
+                    ConflictResolution::PreferNewer => {
+                        // Keep external since it was modified more recently than base
+                        MergeResult::KeepWithNote(
+                            r.clone(),
+                            "External modified after base, local deleted - kept external"
+                                .to_string(),
+                        )
+                    }
+                    ConflictResolution::Manual => {
+                        MergeResult::Conflict(ConflictType::DeleteVsModify)
+                    }
+                }
+            } else {
+                // External unchanged since base, local deleted -> delete
+                MergeResult::Delete
+            }
+        }
+
+        // Case 6: In all three (potentially modified in one or both)
+        (Some(b), Some(l), Some(r)) => {
+            let left_changed = l.content_hash != b.content_hash;
+            let right_changed = r.content_hash != b.content_hash;
+
+            match (left_changed, right_changed) {
+                // Neither changed OR only left changed - keep left
+                (false | true, false) => MergeResult::Keep(l.clone()),
+                // Only right changed - keep right
+                (false, true) => MergeResult::Keep(r.clone()),
+                // Both changed - use strategy
+                (true, true) => match strategy {
+                    ConflictResolution::PreferLocal => MergeResult::KeepWithNote(
+                        l.clone(),
+                        "Both modified - kept local".to_string(),
+                    ),
+                    ConflictResolution::PreferExternal => MergeResult::KeepWithNote(
+                        r.clone(),
+                        "Both modified - kept external".to_string(),
+                    ),
+                    ConflictResolution::PreferNewer => {
+                        if l.updated_at >= r.updated_at {
+                            MergeResult::KeepWithNote(
+                                l.clone(),
+                                "Both modified - kept local (newer)".to_string(),
+                            )
+                        } else {
+                            MergeResult::KeepWithNote(
+                                r.clone(),
+                                "Both modified - kept external (newer)".to_string(),
+                            )
+                        }
+                    }
+                    ConflictResolution::Manual => {
+                        // For manual, we still need to pick one, so use newer but mark as note
+                        if l.updated_at >= r.updated_at {
+                            MergeResult::KeepWithNote(
+                                l.clone(),
+                                "Both modified - kept local (newer), review recommended"
+                                    .to_string(),
+                            )
+                        } else {
+                            MergeResult::KeepWithNote(
+                                r.clone(),
+                                "Both modified - kept external (newer), review recommended"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                },
+            }
+        }
+
+        // Case 7: In left and right but not base (convergent creation)
+        (None, Some(l), Some(r)) => {
+            // Same content hash? Keep one (use left by convention)
+            if l.content_hash == r.content_hash {
+                MergeResult::Keep(l.clone())
+            } else {
+                // Different content - both created independently
+                match strategy {
+                    ConflictResolution::PreferLocal => MergeResult::KeepWithNote(
+                        l.clone(),
+                        "Convergent creation - kept local".to_string(),
+                    ),
+                    ConflictResolution::PreferExternal => MergeResult::KeepWithNote(
+                        r.clone(),
+                        "Convergent creation - kept external".to_string(),
+                    ),
+                    ConflictResolution::PreferNewer | ConflictResolution::Manual => {
+                        if l.updated_at >= r.updated_at {
+                            MergeResult::KeepWithNote(
+                                l.clone(),
+                                "Convergent creation - kept local (newer)".to_string(),
+                            )
+                        } else {
+                            MergeResult::KeepWithNote(
+                                r.clone(),
+                                "Convergent creation - kept external (newer)".to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Case 8: Not in any (impossible in practice, but handle gracefully)
+        (None, None, None) => MergeResult::NoAction,
+    }
+}
+
+/// Perform a 3-way merge across all issues in the context.
+///
+/// This iterates through all unique issue IDs across base, left, and right,
+/// and calls `merge_issue` for each to determine the appropriate action.
+///
+/// # Arguments
+/// * `context` - The merge context containing base, left, and right states
+/// * `strategy` - How to resolve conflicts when both sides modified
+/// * `tombstones` - Optional set of issue IDs that should never be resurrected
+///
+/// # Returns
+/// A `MergeReport` containing all actions taken and any conflicts detected.
+#[must_use]
+pub fn three_way_merge(
+    context: &MergeContext,
+    strategy: ConflictResolution,
+    tombstones: Option<&HashSet<String>>,
+) -> MergeReport {
+    let mut report = MergeReport::default();
+    let empty_tombstones = HashSet::new();
+    let tombstones = tombstones.unwrap_or(&empty_tombstones);
+
+    for id in context.all_issue_ids() {
+        let base = context.base.get(&id);
+        let left = context.left.get(&id);
+        let right = context.right.get(&id);
+
+        // Check tombstone protection: if issue is tombstoned and trying to resurrect
+        if tombstones.contains(&id) {
+            // Issue is tombstoned - only allow if it exists in local (left)
+            if left.is_none() && right.is_some() {
+                // Trying to resurrect from external - skip
+                report.tombstone_protected.push(id.clone());
+                continue;
+            }
+        }
+
+        let result = merge_issue(base, left, right, strategy);
+
+        match result {
+            MergeResult::NoAction => {}
+            MergeResult::Keep(issue) => {
+                report.kept.push(issue.id.clone());
+            }
+            MergeResult::KeepWithNote(issue, note) => {
+                report.kept.push(issue.id.clone());
+                report.notes.push((issue.id.clone(), note));
+            }
+            MergeResult::Delete => {
+                report.deleted.push(id.clone());
+            }
+            MergeResult::Conflict(conflict_type) => {
+                report.conflicts.push((id.clone(), conflict_type));
+            }
+        }
+    }
+
+    report
+}
+
+/// Configuration for a 3-way merge operation.
+#[derive(Debug, Clone, Default)]
+pub struct MergeConfig {
+    /// Strategy for resolving conflicts.
+    pub strategy: ConflictResolution,
+    /// Whether to skip tombstoned issues.
+    pub respect_tombstones: bool,
 }
 
 #[cfg(test)]
@@ -3295,5 +3646,531 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "beads_dir_exists")
         );
+    }
+
+    // ========================================================================
+    // 3-Way Merge Tests
+    // ========================================================================
+
+    fn fixed_time_merge(seconds: i64) -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(seconds, 0).unwrap()
+    }
+
+    fn make_issue_with_hash(
+        id: &str,
+        title: &str,
+        updated_at: chrono::DateTime<Utc>,
+        hash: Option<&str>,
+    ) -> Issue {
+        let created_at = updated_at - chrono::Duration::seconds(60);
+        Issue {
+            id: id.to_string(),
+            content_hash: hash.map(str::to_string),
+            title: title.to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at,
+            created_by: None,
+            updated_at,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: vec![],
+            dependencies: vec![],
+            comments: vec![],
+        }
+    }
+
+    #[test]
+    fn test_merge_new_local_issue_kept() {
+        // Issue only in left (new local) should be kept
+        let local = make_issue_with_hash("bd-1", "New Local", fixed_time_merge(100), Some("hash1"));
+        let result = merge_issue(None, Some(&local), None, ConflictResolution::PreferNewer);
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.id == "bd-1"));
+    }
+
+    #[test]
+    fn test_merge_new_external_issue_kept() {
+        // Issue only in right (new external) should be kept
+        let external =
+            make_issue_with_hash("bd-2", "New External", fixed_time_merge(100), Some("hash2"));
+        let result = merge_issue(None, None, Some(&external), ConflictResolution::PreferNewer);
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.id == "bd-2"));
+    }
+
+    #[test]
+    fn test_merge_deleted_both_sides() {
+        // Issue in base but deleted in both local and external -> delete
+        let base = make_issue_with_hash("bd-3", "Old", fixed_time_merge(100), Some("hash3"));
+        let result = merge_issue(Some(&base), None, None, ConflictResolution::PreferNewer);
+        assert!(matches!(result, MergeResult::Delete));
+    }
+
+    #[test]
+    fn test_merge_deleted_external_unmodified_local() {
+        // Issue in base and local (unmodified), deleted in external -> delete
+        let base = make_issue_with_hash("bd-4", "Base", fixed_time_merge(100), Some("hash4"));
+        let local = make_issue_with_hash("bd-4", "Base", fixed_time_merge(100), Some("hash4")); // Same time, unmodified
+        let result = merge_issue(
+            Some(&base),
+            Some(&local),
+            None,
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result, MergeResult::Delete));
+    }
+
+    #[test]
+    fn test_merge_deleted_external_modified_local() {
+        // Issue in base and local (modified), deleted in external -> conflict (or keep local with PreferNewer)
+        let base = make_issue_with_hash("bd-5", "Base", fixed_time_merge(100), Some("hash5"));
+        let local =
+            make_issue_with_hash("bd-5", "Modified", fixed_time_merge(200), Some("hash5_mod")); // Modified after base
+
+        let result_manual =
+            merge_issue(Some(&base), Some(&local), None, ConflictResolution::Manual);
+        assert!(matches!(
+            result_manual,
+            MergeResult::Conflict(ConflictType::DeleteVsModify)
+        ));
+
+        let result_newer = merge_issue(
+            Some(&base),
+            Some(&local),
+            None,
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result_newer, MergeResult::KeepWithNote(..)));
+    }
+
+    #[test]
+    fn test_merge_deleted_local_modified_external() {
+        // Issue in base and external (modified), deleted in local -> conflict (or keep external with PreferNewer)
+        let base = make_issue_with_hash("bd-6", "Base", fixed_time_merge(100), Some("hash6"));
+        let external =
+            make_issue_with_hash("bd-6", "Modified", fixed_time_merge(200), Some("hash6_mod"));
+
+        let result_manual = merge_issue(
+            Some(&base),
+            None,
+            Some(&external),
+            ConflictResolution::Manual,
+        );
+        assert!(matches!(
+            result_manual,
+            MergeResult::Conflict(ConflictType::DeleteVsModify)
+        ));
+
+        let result_newer = merge_issue(
+            Some(&base),
+            None,
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result_newer, MergeResult::KeepWithNote(..)));
+    }
+
+    #[test]
+    fn test_merge_only_local_modified() {
+        // Issue in all three, only local modified -> keep local
+        let base = make_issue_with_hash("bd-7", "Base", fixed_time_merge(100), Some("hash7"));
+        let local =
+            make_issue_with_hash("bd-7", "Modified", fixed_time_merge(200), Some("hash7_mod"));
+        let external = make_issue_with_hash("bd-7", "Base", fixed_time_merge(100), Some("hash7")); // Same as base
+
+        let result = merge_issue(
+            Some(&base),
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.title == "Modified"));
+    }
+
+    #[test]
+    fn test_merge_only_external_modified() {
+        // Issue in all three, only external modified -> keep external
+        let base = make_issue_with_hash("bd-8", "Base", fixed_time_merge(100), Some("hash8"));
+        let local = make_issue_with_hash("bd-8", "Base", fixed_time_merge(100), Some("hash8")); // Same as base
+        let external =
+            make_issue_with_hash("bd-8", "Modified", fixed_time_merge(200), Some("hash8_mod"));
+
+        let result = merge_issue(
+            Some(&base),
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.title == "Modified"));
+    }
+
+    #[test]
+    fn test_merge_both_modified_prefer_newer() {
+        // Issue in all three, both modified -> keep newer
+        let base = make_issue_with_hash("bd-9", "Base", fixed_time_merge(100), Some("hash9"));
+        let local = make_issue_with_hash(
+            "bd-9",
+            "Local Mod",
+            fixed_time_merge(200),
+            Some("hash9_local"),
+        );
+        let external = make_issue_with_hash(
+            "bd-9",
+            "External Mod",
+            fixed_time_merge(300),
+            Some("hash9_ext"),
+        );
+
+        let result = merge_issue(
+            Some(&base),
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        match result {
+            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "External Mod"),
+            _ => panic!("Expected KeepWithNote"),
+        }
+    }
+
+    #[test]
+    fn test_merge_both_modified_prefer_local() {
+        let base = make_issue_with_hash("bd-10", "Base", fixed_time_merge(100), Some("hash10"));
+        let local = make_issue_with_hash(
+            "bd-10",
+            "Local Mod",
+            fixed_time_merge(200),
+            Some("hash10_local"),
+        );
+        let external = make_issue_with_hash(
+            "bd-10",
+            "External Mod",
+            fixed_time_merge(300),
+            Some("hash10_ext"),
+        );
+
+        let result = merge_issue(
+            Some(&base),
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferLocal,
+        );
+        match result {
+            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "Local Mod"),
+            _ => panic!("Expected KeepWithNote"),
+        }
+    }
+
+    #[test]
+    fn test_merge_convergent_creation_same_content() {
+        // Both created independently with same content hash -> keep one
+        let local = make_issue_with_hash("bd-11", "Same", fixed_time_merge(100), Some("hash11"));
+        let external = make_issue_with_hash("bd-11", "Same", fixed_time_merge(100), Some("hash11"));
+
+        let result = merge_issue(
+            None,
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result, MergeResult::Keep(..)));
+    }
+
+    #[test]
+    fn test_merge_convergent_creation_different_content() {
+        // Both created independently with different content -> keep newer
+        let local = make_issue_with_hash(
+            "bd-12",
+            "Local",
+            fixed_time_merge(100),
+            Some("hash12_local"),
+        );
+        let external = make_issue_with_hash(
+            "bd-12",
+            "External",
+            fixed_time_merge(200),
+            Some("hash12_ext"),
+        );
+
+        let result = merge_issue(
+            None,
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        match result {
+            MergeResult::KeepWithNote(issue, _) => assert_eq!(issue.title, "External"),
+            _ => panic!("Expected KeepWithNote"),
+        }
+    }
+
+    #[test]
+    fn test_merge_neither_changed() {
+        // Issue in all three, neither changed -> keep (use left by convention)
+        let base = make_issue_with_hash("bd-13", "Same", fixed_time_merge(100), Some("hash13"));
+        let local = make_issue_with_hash("bd-13", "Same", fixed_time_merge(100), Some("hash13"));
+        let external = make_issue_with_hash("bd-13", "Same", fixed_time_merge(100), Some("hash13"));
+
+        let result = merge_issue(
+            Some(&base),
+            Some(&local),
+            Some(&external),
+            ConflictResolution::PreferNewer,
+        );
+        assert!(matches!(result, MergeResult::Keep(issue) if issue.id == "bd-13"));
+    }
+
+    #[test]
+    fn test_merge_context_all_issue_ids() {
+        let mut base = std::collections::HashMap::new();
+        let mut left = std::collections::HashMap::new();
+        let mut right = std::collections::HashMap::new();
+
+        base.insert("bd-1".to_string(), make_test_issue("bd-1", "Base"));
+        base.insert("bd-2".to_string(), make_test_issue("bd-2", "Base"));
+        left.insert("bd-2".to_string(), make_test_issue("bd-2", "Left"));
+        left.insert("bd-3".to_string(), make_test_issue("bd-3", "Left"));
+        right.insert("bd-3".to_string(), make_test_issue("bd-3", "Right"));
+        right.insert("bd-4".to_string(), make_test_issue("bd-4", "Right"));
+
+        let ctx = MergeContext::new(base, left, right);
+        let ids = ctx.all_issue_ids();
+
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains("bd-1"));
+        assert!(ids.contains("bd-2"));
+        assert!(ids.contains("bd-3"));
+        assert!(ids.contains("bd-4"));
+    }
+
+    #[test]
+    fn test_merge_report_has_conflicts() {
+        let mut report = MergeReport::default();
+        assert!(!report.has_conflicts());
+
+        report
+            .conflicts
+            .push(("bd-1".to_string(), ConflictType::DeleteVsModify));
+        assert!(report.has_conflicts());
+    }
+
+    #[test]
+    fn test_merge_report_total_actions() {
+        let mut report = MergeReport::default();
+        assert_eq!(report.total_actions(), 0);
+
+        report.kept.push("bd-1".to_string());
+        report.kept.push("bd-2".to_string());
+        report.deleted.push("bd-3".to_string());
+        assert_eq!(report.total_actions(), 3);
+    }
+
+    // ========================================================================
+    // three_way_merge orchestration tests
+    // ========================================================================
+
+    #[test]
+    fn test_three_way_merge_basic() {
+        // Setup: one issue in each state
+        let base_issue = make_issue_with_hash("bd-1", "Base", fixed_time_merge(100), Some("hash1"));
+        let local_issue =
+            make_issue_with_hash("bd-2", "Local Only", fixed_time_merge(200), Some("hash2"));
+        let external_issue =
+            make_issue_with_hash("bd-3", "External Only", fixed_time_merge(300), Some("hash3"));
+
+        let mut base = std::collections::HashMap::new();
+        base.insert("bd-1".to_string(), base_issue.clone());
+
+        let mut left = std::collections::HashMap::new();
+        left.insert("bd-1".to_string(), base_issue.clone());
+        left.insert("bd-2".to_string(), local_issue);
+
+        let mut right = std::collections::HashMap::new();
+        right.insert("bd-1".to_string(), base_issue);
+        right.insert("bd-3".to_string(), external_issue);
+
+        let context = MergeContext::new(base, left, right);
+        let report = three_way_merge(&context, ConflictResolution::PreferNewer, None);
+
+        // Should keep bd-1 (in all three), bd-2 (local only), bd-3 (external only)
+        assert_eq!(report.kept.len(), 3);
+        assert!(report.conflicts.is_empty());
+        assert!(report.deleted.is_empty());
+    }
+
+    #[test]
+    fn test_three_way_merge_with_tombstone_protection() {
+        // Setup: tombstoned issue trying to resurrect from external
+        let external_issue = make_issue_with_hash(
+            "bd-tombstoned",
+            "Should Not Resurrect",
+            fixed_time_merge(300),
+            Some("hash1"),
+        );
+
+        let base = std::collections::HashMap::new();
+        let left = std::collections::HashMap::new();
+        let mut right = std::collections::HashMap::new();
+        right.insert("bd-tombstoned".to_string(), external_issue);
+
+        let context = MergeContext::new(base, left, right);
+
+        // Create tombstones set
+        let mut tombstones = std::collections::HashSet::new();
+        tombstones.insert("bd-tombstoned".to_string());
+
+        let report = three_way_merge(&context, ConflictResolution::PreferNewer, Some(&tombstones));
+
+        // Should NOT keep the tombstoned issue
+        assert!(report.kept.is_empty());
+        assert_eq!(report.tombstone_protected.len(), 1);
+        assert!(report.tombstone_protected.contains(&"bd-tombstoned".to_string()));
+    }
+
+    #[test]
+    fn test_three_way_merge_tombstone_allows_local() {
+        // Setup: tombstoned issue exists in local - should be allowed
+        let local_issue = make_issue_with_hash(
+            "bd-tombstoned",
+            "Local Tombstoned",
+            fixed_time_merge(200),
+            Some("hash1"),
+        );
+
+        let base = std::collections::HashMap::new();
+        let mut left = std::collections::HashMap::new();
+        left.insert("bd-tombstoned".to_string(), local_issue);
+        let right = std::collections::HashMap::new();
+
+        let context = MergeContext::new(base, left, right);
+
+        let mut tombstones = std::collections::HashSet::new();
+        tombstones.insert("bd-tombstoned".to_string());
+
+        let report = three_way_merge(&context, ConflictResolution::PreferNewer, Some(&tombstones));
+
+        // Should keep local even if tombstoned
+        assert_eq!(report.kept.len(), 1);
+        assert!(report.tombstone_protected.is_empty());
+    }
+
+    #[test]
+    fn test_three_way_merge_deletions() {
+        // Setup: issue in base but deleted in both left and right
+        let base_issue =
+            make_issue_with_hash("bd-deleted", "To Delete", fixed_time_merge(100), Some("hash1"));
+
+        let mut base = std::collections::HashMap::new();
+        base.insert("bd-deleted".to_string(), base_issue);
+
+        let left = std::collections::HashMap::new();
+        let right = std::collections::HashMap::new();
+
+        let context = MergeContext::new(base, left, right);
+        let report = three_way_merge(&context, ConflictResolution::PreferNewer, None);
+
+        assert!(report.kept.is_empty());
+        assert_eq!(report.deleted.len(), 1);
+        assert!(report.deleted.contains(&"bd-deleted".to_string()));
+    }
+
+    #[test]
+    fn test_three_way_merge_with_notes() {
+        // Setup: issue modified in both left and right
+        let base_issue =
+            make_issue_with_hash("bd-1", "Base Title", fixed_time_merge(100), Some("base_hash"));
+        let local_issue = make_issue_with_hash(
+            "bd-1",
+            "Local Modified",
+            fixed_time_merge(200),
+            Some("local_hash"),
+        );
+        let external_issue = make_issue_with_hash(
+            "bd-1",
+            "External Modified",
+            fixed_time_merge(300),
+            Some("external_hash"),
+        );
+
+        let mut base = std::collections::HashMap::new();
+        base.insert("bd-1".to_string(), base_issue);
+
+        let mut left = std::collections::HashMap::new();
+        left.insert("bd-1".to_string(), local_issue);
+
+        let mut right = std::collections::HashMap::new();
+        right.insert("bd-1".to_string(), external_issue);
+
+        let context = MergeContext::new(base, left, right);
+        let report = three_way_merge(&context, ConflictResolution::PreferNewer, None);
+
+        // Should have a note about the merge decision
+        assert_eq!(report.kept.len(), 1);
+        assert_eq!(report.notes.len(), 1);
+        assert!(report.notes[0].1.contains("Both modified"));
+    }
+
+    #[test]
+    fn test_three_way_merge_empty_context() {
+        let context = MergeContext::default();
+        let report = three_way_merge(&context, ConflictResolution::PreferNewer, None);
+
+        assert!(report.kept.is_empty());
+        assert!(report.deleted.is_empty());
+        assert!(report.conflicts.is_empty());
+        assert!(report.tombstone_protected.is_empty());
+        assert!(report.notes.is_empty());
+        assert_eq!(report.total_actions(), 0);
+    }
+
+    #[test]
+    fn test_three_way_merge_conflict_manual_strategy() {
+        // Setup: issue deleted externally but modified locally with Manual strategy
+        let base_issue =
+            make_issue_with_hash("bd-1", "Base", fixed_time_merge(100), Some("base_hash"));
+        let local_issue =
+            make_issue_with_hash("bd-1", "Modified", fixed_time_merge(200), Some("mod_hash"));
+
+        let mut base = std::collections::HashMap::new();
+        base.insert("bd-1".to_string(), base_issue);
+
+        let mut left = std::collections::HashMap::new();
+        left.insert("bd-1".to_string(), local_issue);
+
+        let right = std::collections::HashMap::new(); // Deleted externally
+
+        let context = MergeContext::new(base, left, right);
+        let report = three_way_merge(&context, ConflictResolution::Manual, None);
+
+        // With Manual strategy, delete-vs-modify should be a conflict
+        assert_eq!(report.conflicts.len(), 1);
+        assert!(matches!(
+            report.conflicts[0].1,
+            ConflictType::DeleteVsModify
+        ));
     }
 }

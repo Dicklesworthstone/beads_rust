@@ -3,7 +3,8 @@ mod common;
 use beads_rust::model::{DependencyType, Issue, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
-    ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl, read_issues_from_jsonl,
+    ExportConfig, ImportConfig, export_to_jsonl, finalize_export, import_from_jsonl,
+    read_issues_from_jsonl,
 };
 use chrono::{Duration, Utc};
 use common::fixtures;
@@ -448,6 +449,12 @@ fn import_repopulates_export_hashes() {
     let issue = issue_with_id("test-hash", "Hash Test");
     storage.create_issue(&issue, "tester").unwrap();
     let export_result = export_to_jsonl(&storage, &path, &ExportConfig::default()).unwrap();
+    finalize_export(
+        &mut storage,
+        &export_result,
+        Some(&export_result.issue_hashes),
+    )
+    .unwrap();
     let original_hash = export_result.issue_hashes[0].1.clone();
 
     // Verify hash exists
@@ -461,13 +468,7 @@ fn import_repopulates_export_hashes() {
     assert!(storage.get_export_hash("test-hash").unwrap().is_none());
 
     // Import the file back
-    import_from_jsonl(
-        &mut storage,
-        &path,
-        &ImportConfig::default(),
-        Some("test-"),
-    )
-    .unwrap();
+    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-")).unwrap();
 
     // Verify hash is restored
     let (restored_hash, _) = storage.get_export_hash("test-hash").unwrap().unwrap();
