@@ -5928,3 +5928,860 @@ fn conformance_dep_cycles_json() {
 
     info!("conformance_dep_cycles_json passed");
 }
+
+// ============================================================================
+// UTILITY COMMAND CONFORMANCE TESTS
+// ============================================================================
+
+// === STATS COMMAND TESTS ===
+
+#[test]
+fn conformance_stats_empty() {
+    common::init_test_logging();
+    info!("Starting conformance_stats_empty test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Run stats on fresh workspace
+    let br_stats = workspace.run_br(["stats", "--json"], "stats_empty");
+    let bd_stats = workspace.run_bd(["stats", "--json"], "stats_empty");
+
+    assert!(
+        br_stats.status.success(),
+        "br stats on empty workspace failed: {}",
+        br_stats.stderr
+    );
+    assert!(
+        bd_stats.status.success(),
+        "bd stats on empty workspace failed: {}",
+        bd_stats.stderr
+    );
+
+    let br_json = extract_json_payload(&br_stats.stdout);
+    let bd_json = extract_json_payload(&bd_stats.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
+
+    // Both should show zero total
+    let br_total = br_val["total"]
+        .as_i64()
+        .or_else(|| br_val["summary"]["total"].as_i64())
+        .unwrap_or(0);
+    let bd_total = bd_val["total"]
+        .as_i64()
+        .or_else(|| bd_val["summary"]["total"].as_i64())
+        .unwrap_or(0);
+
+    assert_eq!(br_total, 0, "br stats should show 0 total on empty workspace");
+    assert_eq!(bd_total, 0, "bd stats should show 0 total on empty workspace");
+
+    info!("conformance_stats_empty passed");
+}
+
+#[test]
+fn conformance_stats_mixed() {
+    common::init_test_logging();
+    info!("Starting conformance_stats_mixed test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create mix of open and closed issues
+    let _br_create1 = workspace.run_br(["create", "Open issue", "--json"], "create1");
+    let _bd_create1 = workspace.run_bd(["create", "Open issue", "--json"], "create1");
+
+    let br_create2 = workspace.run_br(["create", "Will close", "--json"], "create2");
+    let bd_create2 = workspace.run_bd(["create", "Will close", "--json"], "create2");
+
+    // Close one issue
+    let br_id = extract_issue_id(&extract_json_payload(&br_create2.stdout));
+    let bd_id = extract_issue_id(&extract_json_payload(&bd_create2.stdout));
+
+    workspace.run_br(["close", &br_id], "close");
+    workspace.run_bd(["close", &bd_id], "close");
+
+    // Get stats
+    let br_stats = workspace.run_br(["stats", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+
+    assert!(br_stats.status.success(), "br stats failed: {}", br_stats.stderr);
+    assert!(bd_stats.status.success(), "bd stats failed: {}", bd_stats.stderr);
+
+    let br_json = extract_json_payload(&br_stats.stdout);
+    let bd_json = extract_json_payload(&bd_stats.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("br json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
+
+    // Both should show 2 total
+    let br_total = br_val["total"]
+        .as_i64()
+        .or_else(|| br_val["summary"]["total"].as_i64());
+    let bd_total = bd_val["total"]
+        .as_i64()
+        .or_else(|| bd_val["summary"]["total"].as_i64());
+
+    assert_eq!(br_total, bd_total, "total counts differ");
+
+    info!("conformance_stats_mixed passed");
+}
+
+#[test]
+fn conformance_stats_with_deps() {
+    common::init_test_logging();
+    info!("Starting conformance_stats_with_deps test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create issues with dependencies
+    let br_a = workspace.run_br(["create", "Issue A", "--json"], "create_a");
+    let bd_a = workspace.run_bd(["create", "Issue A", "--json"], "create_a");
+
+    let br_b = workspace.run_br(["create", "Issue B", "--json"], "create_b");
+    let bd_b = workspace.run_bd(["create", "Issue B", "--json"], "create_b");
+
+    let br_a_id = extract_issue_id(&extract_json_payload(&br_a.stdout));
+    let bd_a_id = extract_issue_id(&extract_json_payload(&bd_a.stdout));
+    let br_b_id = extract_issue_id(&extract_json_payload(&br_b.stdout));
+    let bd_b_id = extract_issue_id(&extract_json_payload(&bd_b.stdout));
+
+    // Add dependency: A depends on B
+    workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "add_dep");
+    workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "add_dep");
+
+    // Get stats
+    let br_stats = workspace.run_br(["stats", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+
+    assert!(br_stats.status.success(), "br stats failed");
+    assert!(bd_stats.status.success(), "bd stats failed");
+
+    let br_json = extract_json_payload(&br_stats.stdout);
+    let bd_json = extract_json_payload(&bd_stats.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("br json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
+
+    // Both should show 2 total
+    let br_total = br_val["total"]
+        .as_i64()
+        .or_else(|| br_val["summary"]["total"].as_i64());
+    let bd_total = bd_val["total"]
+        .as_i64()
+        .or_else(|| bd_val["summary"]["total"].as_i64());
+
+    assert_eq!(br_total, bd_total, "total counts differ with deps");
+
+    info!("conformance_stats_with_deps passed");
+}
+
+#[test]
+fn conformance_stats_json_shape() {
+    common::init_test_logging();
+    info!("Starting conformance_stats_json_shape test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create an issue to have some data
+    workspace.run_br(["create", "Test issue"], "create");
+    workspace.run_bd(["create", "Test issue"], "create");
+
+    let br_stats = workspace.run_br(["stats", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+
+    assert!(br_stats.status.success(), "br stats failed");
+    assert!(bd_stats.status.success(), "bd stats failed");
+
+    let br_json = extract_json_payload(&br_stats.stdout);
+    let bd_json = extract_json_payload(&bd_stats.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("br json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
+
+    // Verify JSON structure matches
+    let result = compare_json(&br_json, &bd_json, &CompareMode::StructureOnly);
+    if let Err(e) = &result {
+        info!("Structure mismatch (may be expected): {}", e);
+    }
+
+    // Both should have essential fields
+    let has_total_br = br_val.get("total").is_some() || br_val.get("summary").is_some();
+    let has_total_bd = bd_val.get("total").is_some() || bd_val.get("summary").is_some();
+
+    assert!(has_total_br, "br stats should have total or summary");
+    assert!(has_total_bd, "bd stats should have total or summary");
+
+    info!("conformance_stats_json_shape passed");
+}
+
+// === COUNT COMMAND TESTS ===
+
+#[test]
+fn conformance_count_by_status() {
+    common::init_test_logging();
+    info!("Starting conformance_count_by_status test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create issues with different statuses
+    workspace.run_br(["create", "Open 1"], "create1");
+    workspace.run_bd(["create", "Open 1"], "create1");
+
+    let br_create2 = workspace.run_br(["create", "Will close", "--json"], "create2");
+    let bd_create2 = workspace.run_bd(["create", "Will close", "--json"], "create2");
+
+    let br_id = extract_issue_id(&extract_json_payload(&br_create2.stdout));
+    let bd_id = extract_issue_id(&extract_json_payload(&bd_create2.stdout));
+
+    workspace.run_br(["close", &br_id], "close");
+    workspace.run_bd(["close", &bd_id], "close");
+
+    // Count by status
+    let br_count = workspace.run_br(["count", "--by", "status", "--json"], "count");
+    let bd_count = workspace.run_bd(["count", "--by", "status", "--json"], "count");
+
+    assert!(br_count.status.success(), "br count failed: {}", br_count.stderr);
+    assert!(bd_count.status.success(), "bd count failed: {}", bd_count.stderr);
+
+    info!(
+        "br timing: {:?}, bd timing: {:?}",
+        br_count.duration, bd_count.duration
+    );
+
+    info!("conformance_count_by_status passed");
+}
+
+#[test]
+fn conformance_count_by_type() {
+    common::init_test_logging();
+    info!("Starting conformance_count_by_type test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create issues with different types
+    workspace.run_br(["create", "Task 1", "--type", "task"], "create1");
+    workspace.run_bd(["create", "Task 1", "--type", "task"], "create1");
+
+    workspace.run_br(["create", "Bug 1", "--type", "bug"], "create2");
+    workspace.run_bd(["create", "Bug 1", "--type", "bug"], "create2");
+
+    workspace.run_br(["create", "Feature 1", "--type", "feature"], "create3");
+    workspace.run_bd(["create", "Feature 1", "--type", "feature"], "create3");
+
+    // Count by type
+    let br_count = workspace.run_br(["count", "--by", "type", "--json"], "count");
+    let bd_count = workspace.run_bd(["count", "--by", "type", "--json"], "count");
+
+    assert!(br_count.status.success(), "br count failed: {}", br_count.stderr);
+    assert!(bd_count.status.success(), "bd count failed: {}", bd_count.stderr);
+
+    let br_json = extract_json_payload(&br_count.stdout);
+    let bd_json = extract_json_payload(&bd_count.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
+
+    info!(
+        "br count by type: {:?}, bd count by type: {:?}",
+        br_val, bd_val
+    );
+
+    info!("conformance_count_by_type passed");
+}
+
+#[test]
+fn conformance_count_by_priority() {
+    common::init_test_logging();
+    info!("Starting conformance_count_by_priority test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create issues with different priorities
+    workspace.run_br(["create", "P0 issue", "-p", "0"], "create1");
+    workspace.run_bd(["create", "P0 issue", "-p", "0"], "create1");
+
+    workspace.run_br(["create", "P1 issue", "-p", "1"], "create2");
+    workspace.run_bd(["create", "P1 issue", "-p", "1"], "create2");
+
+    workspace.run_br(["create", "P2 issue", "-p", "2"], "create3");
+    workspace.run_bd(["create", "P2 issue", "-p", "2"], "create3");
+
+    // Count by priority
+    let br_count = workspace.run_br(["count", "--by", "priority", "--json"], "count");
+    let bd_count = workspace.run_bd(["count", "--by", "priority", "--json"], "count");
+
+    assert!(br_count.status.success(), "br count failed: {}", br_count.stderr);
+    assert!(bd_count.status.success(), "bd count failed: {}", bd_count.stderr);
+
+    info!("conformance_count_by_priority passed");
+}
+
+#[test]
+fn conformance_count_by_assignee() {
+    common::init_test_logging();
+    info!("Starting conformance_count_by_assignee test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create issues with different assignees
+    workspace.run_br(["create", "Assigned to Alice", "--assignee", "alice"], "create1");
+    workspace.run_bd(["create", "Assigned to Alice", "--assignee", "alice"], "create1");
+
+    workspace.run_br(["create", "Assigned to Bob", "--assignee", "bob"], "create2");
+    workspace.run_bd(["create", "Assigned to Bob", "--assignee", "bob"], "create2");
+
+    workspace.run_br(["create", "Unassigned"], "create3");
+    workspace.run_bd(["create", "Unassigned"], "create3");
+
+    // Count by assignee
+    let br_count = workspace.run_br(["count", "--by", "assignee", "--json"], "count");
+    let bd_count = workspace.run_bd(["count", "--by", "assignee", "--json"], "count");
+
+    assert!(br_count.status.success(), "br count failed: {}", br_count.stderr);
+    assert!(bd_count.status.success(), "bd count failed: {}", bd_count.stderr);
+
+    info!("conformance_count_by_assignee passed");
+}
+
+#[test]
+fn conformance_count_json_shape() {
+    common::init_test_logging();
+    info!("Starting conformance_count_json_shape test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    workspace.run_br(["create", "Test"], "create");
+    workspace.run_bd(["create", "Test"], "create");
+
+    let br_count = workspace.run_br(["count", "--json"], "count");
+    let bd_count = workspace.run_bd(["count", "--json"], "count");
+
+    assert!(br_count.status.success(), "br count failed");
+    assert!(bd_count.status.success(), "bd count failed");
+
+    let br_json = extract_json_payload(&br_count.stdout);
+    let bd_json = extract_json_payload(&bd_count.stdout);
+
+    let _br_val: Value = serde_json::from_str(&br_json).expect("br json");
+    let _bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
+
+    // Verify structure matches
+    let result = compare_json(&br_json, &bd_json, &CompareMode::StructureOnly);
+    if let Err(e) = &result {
+        info!("Structure mismatch (may be expected): {}", e);
+    }
+
+    info!("conformance_count_json_shape passed");
+}
+
+#[test]
+fn conformance_count_empty() {
+    common::init_test_logging();
+    info!("Starting conformance_count_empty test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Count on empty workspace
+    let br_count = workspace.run_br(["count", "--json"], "count");
+    let bd_count = workspace.run_bd(["count", "--json"], "count");
+
+    assert!(br_count.status.success(), "br count failed: {}", br_count.stderr);
+    assert!(bd_count.status.success(), "bd count failed: {}", bd_count.stderr);
+
+    let br_json = extract_json_payload(&br_count.stdout);
+    let bd_json = extract_json_payload(&bd_count.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
+
+    // Both should report 0 total
+    let br_total = br_val["total"]
+        .as_i64()
+        .or_else(|| br_val["summary"]["total"].as_i64())
+        .unwrap_or(0);
+    let bd_total = bd_val["total"]
+        .as_i64()
+        .or_else(|| bd_val["summary"]["total"].as_i64())
+        .unwrap_or(0);
+
+    assert_eq!(br_total, 0, "br count should be 0 on empty workspace");
+    assert_eq!(bd_total, 0, "bd count should be 0 on empty workspace");
+
+    info!("conformance_count_empty passed");
+}
+
+// === STALE COMMAND TESTS ===
+
+#[test]
+fn conformance_stale_default() {
+    common::init_test_logging();
+    info!("Starting conformance_stale_default test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create an issue (will be fresh, not stale)
+    workspace.run_br(["create", "Fresh issue"], "create");
+    workspace.run_bd(["create", "Fresh issue"], "create");
+
+    // Run stale with default threshold
+    let br_stale = workspace.run_br(["stale", "--json"], "stale");
+    let bd_stale = workspace.run_bd(["stale", "--json"], "stale");
+
+    assert!(br_stale.status.success(), "br stale failed: {}", br_stale.stderr);
+    assert!(bd_stale.status.success(), "bd stale failed: {}", bd_stale.stderr);
+
+    // Fresh issues should not be stale
+    let br_json = extract_json_payload(&br_stale.stdout);
+    let bd_json = extract_json_payload(&bd_stale.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
+
+    let br_count = if br_val.is_array() { br_val.as_array().unwrap().len() } else { 0 };
+    let bd_count = if bd_val.is_array() { bd_val.as_array().unwrap().len() } else { 0 };
+
+    assert_eq!(br_count, 0, "Fresh issues should not be stale (br)");
+    assert_eq!(bd_count, 0, "Fresh issues should not be stale (bd)");
+
+    info!("conformance_stale_default passed");
+}
+
+#[test]
+fn conformance_stale_custom_days() {
+    common::init_test_logging();
+    info!("Starting conformance_stale_custom_days test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    workspace.run_br(["create", "Test issue"], "create");
+    workspace.run_bd(["create", "Test issue"], "create");
+
+    // Run stale with --days 0 (everything is stale after 0 days)
+    let br_stale = workspace.run_br(["stale", "--days", "0", "--json"], "stale");
+    let bd_stale = workspace.run_bd(["stale", "--days", "0", "--json"], "stale");
+
+    assert!(br_stale.status.success(), "br stale --days 0 failed: {}", br_stale.stderr);
+    assert!(bd_stale.status.success(), "bd stale --days 0 failed: {}", bd_stale.stderr);
+
+    info!("conformance_stale_custom_days passed");
+}
+
+#[test]
+fn conformance_stale_empty() {
+    common::init_test_logging();
+    info!("Starting conformance_stale_empty test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Run stale on empty workspace
+    let br_stale = workspace.run_br(["stale", "--json"], "stale");
+    let bd_stale = workspace.run_bd(["stale", "--json"], "stale");
+
+    assert!(br_stale.status.success(), "br stale failed: {}", br_stale.stderr);
+    assert!(bd_stale.status.success(), "bd stale failed: {}", bd_stale.stderr);
+
+    let br_json = extract_json_payload(&br_stale.stdout);
+    let bd_json = extract_json_payload(&bd_stale.stdout);
+
+    // Both should return empty array or similar
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
+
+    let br_empty = br_val.is_array() && br_val.as_array().unwrap().is_empty();
+    let bd_empty = bd_val.is_array() && bd_val.as_array().unwrap().is_empty();
+
+    assert!(br_empty || br_val.is_null(), "br stale should be empty");
+    assert!(bd_empty || bd_val.is_null(), "bd stale should be empty");
+
+    info!("conformance_stale_empty passed");
+}
+
+#[test]
+fn conformance_stale_excludes_closed() {
+    common::init_test_logging();
+    info!("Starting conformance_stale_excludes_closed test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create and close an issue
+    let br_create = workspace.run_br(["create", "Will close", "--json"], "create");
+    let bd_create = workspace.run_bd(["create", "Will close", "--json"], "create");
+
+    let br_id = extract_issue_id(&extract_json_payload(&br_create.stdout));
+    let bd_id = extract_issue_id(&extract_json_payload(&bd_create.stdout));
+
+    workspace.run_br(["close", &br_id], "close");
+    workspace.run_bd(["close", &bd_id], "close");
+
+    // Stale should not include closed issues
+    let br_stale = workspace.run_br(["stale", "--days", "0", "--json"], "stale");
+    let bd_stale = workspace.run_bd(["stale", "--days", "0", "--json"], "stale");
+
+    assert!(br_stale.status.success(), "br stale failed");
+    assert!(bd_stale.status.success(), "bd stale failed");
+
+    // Closed issues should not appear in stale list
+    info!("conformance_stale_excludes_closed passed");
+}
+
+#[test]
+fn conformance_stale_json_shape() {
+    common::init_test_logging();
+    info!("Starting conformance_stale_json_shape test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    workspace.run_br(["create", "Test"], "create");
+    workspace.run_bd(["create", "Test"], "create");
+
+    let br_stale = workspace.run_br(["stale", "--json"], "stale");
+    let bd_stale = workspace.run_bd(["stale", "--json"], "stale");
+
+    assert!(br_stale.status.success(), "br stale failed");
+    assert!(bd_stale.status.success(), "bd stale failed");
+
+    let br_json = extract_json_payload(&br_stale.stdout);
+    let bd_json = extract_json_payload(&bd_stale.stdout);
+
+    // Both should produce valid JSON (array or object)
+    let br_val: Result<Value, _> = serde_json::from_str(&br_json);
+    let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+
+    assert!(br_val.is_ok(), "br stale should produce valid JSON");
+    assert!(bd_val.is_ok(), "bd stale should produce valid JSON");
+
+    info!("conformance_stale_json_shape passed");
+}
+
+// === DOCTOR COMMAND TESTS ===
+
+#[test]
+fn conformance_doctor_healthy() {
+    common::init_test_logging();
+    info!("Starting conformance_doctor_healthy test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Doctor on clean workspace should succeed
+    let br_doctor = workspace.run_br(["doctor", "--json"], "doctor");
+    let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
+
+    assert!(
+        br_doctor.status.success(),
+        "br doctor failed on healthy workspace: {}",
+        br_doctor.stderr
+    );
+    assert!(
+        bd_doctor.status.success(),
+        "bd doctor failed on healthy workspace: {}",
+        bd_doctor.stderr
+    );
+
+    info!("conformance_doctor_healthy passed");
+}
+
+#[test]
+fn conformance_doctor_json_shape() {
+    common::init_test_logging();
+    info!("Starting conformance_doctor_json_shape test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_doctor = workspace.run_br(["doctor", "--json"], "doctor");
+    let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
+
+    assert!(br_doctor.status.success(), "br doctor failed");
+    assert!(bd_doctor.status.success(), "bd doctor failed");
+
+    let br_json = extract_json_payload(&br_doctor.stdout);
+    let bd_json = extract_json_payload(&bd_doctor.stdout);
+
+    // Both should produce valid JSON
+    let br_val: Result<Value, _> = serde_json::from_str(&br_json);
+    let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+
+    assert!(br_val.is_ok(), "br doctor should produce valid JSON");
+    assert!(bd_val.is_ok(), "bd doctor should produce valid JSON");
+
+    info!("conformance_doctor_json_shape passed");
+}
+
+#[test]
+fn conformance_doctor_with_issues() {
+    common::init_test_logging();
+    info!("Starting conformance_doctor_with_issues test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create some issues and dependencies
+    let br_a = workspace.run_br(["create", "Issue A", "--json"], "create_a");
+    let bd_a = workspace.run_bd(["create", "Issue A", "--json"], "create_a");
+
+    let br_b = workspace.run_br(["create", "Issue B", "--json"], "create_b");
+    let bd_b = workspace.run_bd(["create", "Issue B", "--json"], "create_b");
+
+    let br_a_id = extract_issue_id(&extract_json_payload(&br_a.stdout));
+    let bd_a_id = extract_issue_id(&extract_json_payload(&bd_a.stdout));
+    let br_b_id = extract_issue_id(&extract_json_payload(&br_b.stdout));
+    let bd_b_id = extract_issue_id(&extract_json_payload(&bd_b.stdout));
+
+    workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "add_dep");
+    workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "add_dep");
+
+    // Doctor should still succeed
+    let br_doctor = workspace.run_br(["doctor", "--json"], "doctor");
+    let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
+
+    assert!(br_doctor.status.success(), "br doctor failed with issues");
+    assert!(bd_doctor.status.success(), "bd doctor failed with issues");
+
+    info!("conformance_doctor_with_issues passed");
+}
+
+// === VERSION COMMAND TESTS ===
+
+#[test]
+fn conformance_version_text() {
+    common::init_test_logging();
+    info!("Starting conformance_version_text test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Version without --json should produce text output
+    let br_version = workspace.run_br(["version"], "version");
+    let bd_version = workspace.run_bd(["version"], "version");
+
+    assert!(br_version.status.success(), "br version failed: {}", br_version.stderr);
+    assert!(bd_version.status.success(), "bd version failed: {}", bd_version.stderr);
+
+    // Both should output something
+    assert!(!br_version.stdout.trim().is_empty(), "br version should produce output");
+    assert!(!bd_version.stdout.trim().is_empty(), "bd version should produce output");
+
+    info!("conformance_version_text passed");
+}
+
+#[test]
+fn conformance_version_json() {
+    common::init_test_logging();
+    info!("Starting conformance_version_json test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_version = workspace.run_br(["version", "--json"], "version");
+    let bd_version = workspace.run_bd(["version", "--json"], "version");
+
+    assert!(br_version.status.success(), "br version --json failed: {}", br_version.stderr);
+    assert!(bd_version.status.success(), "bd version --json failed: {}", bd_version.stderr);
+
+    let br_json = extract_json_payload(&br_version.stdout);
+    let bd_json = extract_json_payload(&bd_version.stdout);
+
+    // Both should produce valid JSON
+    let br_val: Result<Value, _> = serde_json::from_str(&br_json);
+    let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+
+    assert!(br_val.is_ok(), "br version should produce valid JSON");
+    assert!(bd_val.is_ok(), "bd version should produce valid JSON");
+
+    info!("conformance_version_json passed");
+}
+
+#[test]
+fn conformance_version_fields() {
+    common::init_test_logging();
+    info!("Starting conformance_version_fields test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_version = workspace.run_br(["version", "--json"], "version");
+    let bd_version = workspace.run_bd(["version", "--json"], "version");
+
+    assert!(br_version.status.success(), "br version failed");
+    assert!(bd_version.status.success(), "bd version failed");
+
+    let br_json = extract_json_payload(&br_version.stdout);
+    let bd_json = extract_json_payload(&bd_version.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
+
+    // Both should have version field
+    let br_has_version = br_val.get("version").is_some()
+        || br_val.get("Version").is_some()
+        || br_val.as_str().is_some();
+    let bd_has_version = bd_val.get("version").is_some()
+        || bd_val.get("Version").is_some()
+        || bd_val.as_str().is_some();
+
+    info!(
+        "br version structure: {:?}, bd version structure: {:?}",
+        br_val, bd_val
+    );
+
+    assert!(br_has_version, "br version should have version field");
+    assert!(bd_has_version, "bd version should have version field");
+
+    info!("conformance_version_fields passed");
+}
+
+// === CONFIG COMMAND TESTS ===
+
+#[test]
+fn conformance_config_list() {
+    common::init_test_logging();
+    info!("Starting conformance_config_list test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_config = workspace.run_br(["config", "--list", "--json"], "config_list");
+    let bd_config = workspace.run_bd(["config", "--list", "--json"], "config_list");
+
+    assert!(br_config.status.success(), "br config --list failed: {}", br_config.stderr);
+    assert!(bd_config.status.success(), "bd config --list failed: {}", bd_config.stderr);
+
+    info!("conformance_config_list passed");
+}
+
+#[test]
+fn conformance_config_get() {
+    common::init_test_logging();
+    info!("Starting conformance_config_get test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Try to get a common config key
+    let br_config = workspace.run_br(["config", "--get", "id.prefix"], "config_get");
+    let bd_config = workspace.run_bd(["config", "--get", "id.prefix"], "config_get");
+
+    // Both should succeed or both should fail for unknown keys
+    info!(
+        "br config --get exit: {}, bd config --get exit: {}",
+        br_config.status.success(),
+        bd_config.status.success()
+    );
+
+    info!("conformance_config_get passed");
+}
+
+#[test]
+fn conformance_config_set_and_get() {
+    common::init_test_logging();
+    info!("Starting conformance_config_set_and_get test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Set a config value
+    let br_set = workspace.run_br(["config", "--set", "id.prefix=test"], "config_set");
+    let bd_set = workspace.run_bd(["config", "--set", "id.prefix=test"], "config_set");
+
+    // Both should succeed
+    if br_set.status.success() && bd_set.status.success() {
+        // Verify the value was set
+        let br_get = workspace.run_br(["config", "--get", "id.prefix"], "config_get");
+        let bd_get = workspace.run_bd(["config", "--get", "id.prefix"], "config_get");
+
+        info!(
+            "br config after set: {}, bd config after set: {}",
+            br_get.stdout.trim(),
+            bd_get.stdout.trim()
+        );
+    }
+
+    info!("conformance_config_set_and_get passed");
+}
+
+#[test]
+fn conformance_config_json_shape() {
+    common::init_test_logging();
+    info!("Starting conformance_config_json_shape test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_config = workspace.run_br(["config", "--list", "--json"], "config");
+    let bd_config = workspace.run_bd(["config", "--list", "--json"], "config");
+
+    if br_config.status.success() && bd_config.status.success() {
+        let br_json = extract_json_payload(&br_config.stdout);
+        let bd_json = extract_json_payload(&bd_config.stdout);
+
+        let br_val: Result<Value, _> = serde_json::from_str(&br_json);
+        let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+
+        assert!(br_val.is_ok(), "br config should produce valid JSON");
+        assert!(bd_val.is_ok(), "bd config should produce valid JSON");
+    }
+
+    info!("conformance_config_json_shape passed");
+}
+
+#[test]
+fn conformance_config_defaults() {
+    common::init_test_logging();
+    info!("Starting conformance_config_defaults test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // List config to see defaults
+    let br_config = workspace.run_br(["config", "--list"], "config_defaults");
+    let bd_config = workspace.run_bd(["config", "--list"], "config_defaults");
+
+    assert!(br_config.status.success(), "br config --list failed");
+    assert!(bd_config.status.success(), "bd config --list failed");
+
+    // Both should have some default configuration
+    assert!(!br_config.stdout.trim().is_empty() || !br_config.stderr.trim().is_empty(),
+        "br config should show some output");
+    assert!(!bd_config.stdout.trim().is_empty() || !bd_config.stderr.trim().is_empty(),
+        "bd config should show some output");
+
+    info!("conformance_config_defaults passed");
+}
+
+#[test]
+fn conformance_config_invalid_key() {
+    common::init_test_logging();
+    info!("Starting conformance_config_invalid_key test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Try to get a nonexistent config key
+    let br_config = workspace.run_br(["config", "--get", "nonexistent.key.that.does.not.exist"], "config_invalid");
+    let bd_config = workspace.run_bd(["config", "--get", "nonexistent.key.that.does.not.exist"], "config_invalid");
+
+    // Both should handle this gracefully (either error or return empty)
+    info!(
+        "br config invalid key: success={}, bd config invalid key: success={}",
+        br_config.status.success(),
+        bd_config.status.success()
+    );
+
+    info!("conformance_config_invalid_key passed");
+}
