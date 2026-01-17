@@ -177,6 +177,15 @@ fn apply_client_filters(
     };
 
     let label_filters = !args.label.is_empty() || !args.label_any.is_empty();
+
+    // Pre-fetch labels if needed to avoid N+1 query
+    let labels_map = if label_filters {
+        let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+        storage.get_labels_for_issues(&issue_ids)?
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let mut filtered = Vec::new();
     let now = Utc::now();
     let min_priority = args.priority_min.map(i32::from);
@@ -244,7 +253,8 @@ fn apply_client_filters(
         }
 
         if label_filters {
-            let labels = storage.get_labels(&issue.id)?;
+            let empty_labels = Vec::new();
+            let labels = labels_map.get(&issue.id).unwrap_or(&empty_labels);
             if !args.label.is_empty() && !args.label.iter().all(|label| labels.contains(label)) {
                 continue;
             }
