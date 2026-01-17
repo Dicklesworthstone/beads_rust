@@ -73,7 +73,8 @@ fn e2e_lint_clean_workspace_no_issues() {
     assert!(lint.status.success(), "lint failed: {}", lint.stderr);
     assert!(
         lint.stdout.contains("No template warnings found"),
-        "expected clean message, got: {}", lint.stdout
+        "expected clean message, got: {}",
+        lint.stdout
     );
 }
 
@@ -111,7 +112,8 @@ fn e2e_lint_issue_with_all_required_sections_passes() {
     assert!(lint.status.success(), "lint failed: {}", lint.stderr);
     assert!(
         lint.stdout.contains("No template warnings found"),
-        "expected no warnings for complete bug, got: {}", lint.stdout
+        "expected no warnings for complete bug, got: {}",
+        lint.stdout
     );
 }
 
@@ -274,7 +276,8 @@ fn e2e_lint_chore_no_required_sections() {
     assert!(lint.status.success(), "lint failed: {}", lint.stderr);
     assert!(
         lint.stdout.contains("No template warnings found"),
-        "chore should not have required sections, got: {}", lint.stdout
+        "chore should not have required sections, got: {}",
+        lint.stdout
     );
 }
 
@@ -347,7 +350,8 @@ fn e2e_lint_filter_by_status_all() {
     );
     assert!(
         lint_all.status.success(),
-        "lint failed: {}", lint_all.stderr
+        "lint failed: {}",
+        lint_all.stderr
     );
 
     let json_str = extract_json_payload(&lint_all.stdout);
@@ -447,7 +451,8 @@ fn e2e_lint_json_exit_code_always_zero() {
     let lint = run_br(&workspace, ["lint", "--json"], "lint_json_exit_code");
     assert!(
         lint.status.success(),
-        "JSON mode should always exit 0, got: {}", lint.status
+        "JSON mode should always exit 0, got: {}",
+        lint.status
     );
 }
 
@@ -508,7 +513,8 @@ fn e2e_lint_before_init_fails() {
         lint.stderr.contains("not found")
             || lint.stderr.contains("initialize")
             || lint.stderr.contains("No .beads"),
-        "error should mention workspace not initialized, got: {}", lint.stderr
+        "error should mention workspace not initialized, got: {}",
+        lint.stderr
     );
 }
 
@@ -549,11 +555,13 @@ fn e2e_lint_unknown_type_filter_no_matches() {
     // Unknown types are valid (treated as custom types), just match no issues
     assert!(
         lint.status.success(),
-        "unknown type should succeed (custom types are valid), got stderr: {}", lint.stderr
+        "unknown type should succeed (custom types are valid), got stderr: {}",
+        lint.stderr
     );
     assert!(
         lint.stdout.contains("0 issues checked"),
-        "should check 0 issues for unknown type, got: {}", lint.stdout
+        "should check 0 issues for unknown type, got: {}",
+        lint.stdout
     );
 }
 
@@ -575,7 +583,8 @@ fn e2e_lint_case_insensitive_section_matching() {
     assert!(lint.status.success(), "lint failed: {}", lint.stderr);
     assert!(
         lint.stdout.contains("No template warnings found"),
-        "case-insensitive matching should work, got: {}", lint.stdout
+        "case-insensitive matching should work, got: {}",
+        lint.stdout
     );
 }
 

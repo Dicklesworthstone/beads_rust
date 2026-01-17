@@ -60,7 +60,8 @@ fn e2e_completions_bash_generates_valid_script() {
     let completions = run_br(&workspace, ["completions", "bash"], "completions_bash");
     assert!(
         completions.status.success(),
-        "completions bash failed: {}", completions.stderr
+        "completions bash failed: {}",
+        completions.stderr
     );
 
     // Bash completions should define the completion function
@@ -85,7 +86,8 @@ fn e2e_completions_bash_contains_subcommands() {
     );
     assert!(
         completions.status.success(),
-        "completions failed: {}", completions.stderr
+        "completions failed: {}",
+        completions.stderr
     );
 
     assert_contains_subcommands(&completions.stdout, "bash");
@@ -102,7 +104,8 @@ fn e2e_completions_bash_contains_flags() {
     );
     assert!(
         completions.status.success(),
-        "completions failed: {}", completions.stderr
+        "completions failed: {}",
+        completions.stderr
     );
 
     assert_contains_flags(&completions.stdout, "bash");
@@ -120,7 +123,8 @@ fn e2e_completions_zsh_generates_valid_script() {
     let completions = run_br(&workspace, ["completions", "zsh"], "completions_zsh");
     assert!(
         completions.status.success(),
-        "completions zsh failed: {}", completions.stderr
+        "completions zsh failed: {}",
+        completions.stderr
     );
 
     // Zsh completions should have the compdef directive
@@ -141,7 +145,8 @@ fn e2e_completions_zsh_contains_subcommands() {
     );
     assert!(
         completions.status.success(),
-        "completions failed: {}", completions.stderr
+        "completions failed: {}",
+        completions.stderr
     );
 
     assert_contains_subcommands(&completions.stdout, "zsh");
@@ -159,7 +164,8 @@ fn e2e_completions_fish_generates_valid_script() {
     let completions = run_br(&workspace, ["completions", "fish"], "completions_fish");
     assert!(
         completions.status.success(),
-        "completions fish failed: {}", completions.stderr
+        "completions fish failed: {}",
+        completions.stderr
     );
 
     // Fish completions use 'complete' command
@@ -180,7 +186,8 @@ fn e2e_completions_fish_contains_subcommands() {
     );
     assert!(
         completions.status.success(),
-        "completions failed: {}", completions.stderr
+        "completions failed: {}",
+        completions.stderr
     );
 
     assert_contains_subcommands(&completions.stdout, "fish");
@@ -202,7 +209,8 @@ fn e2e_completions_powershell_generates_valid_script() {
     );
     assert!(
         completions.status.success(),
-        "completions powershell failed: {}", completions.stderr
+        "completions powershell failed: {}",
+        completions.stderr
     );
 
     // PowerShell completions should register argument completer
@@ -224,7 +232,8 @@ fn e2e_completions_powershell_contains_subcommands() {
     );
     assert!(
         completions.status.success(),
-        "completions failed: {}", completions.stderr
+        "completions failed: {}",
+        completions.stderr
     );
 
     assert_contains_subcommands(&completions.stdout, "powershell");
@@ -242,7 +251,8 @@ fn e2e_completions_elvish_generates_valid_script() {
     let completions = run_br(&workspace, ["completions", "elvish"], "completions_elvish");
     assert!(
         completions.status.success(),
-        "completions elvish failed: {}", completions.stderr
+        "completions elvish failed: {}",
+        completions.stderr
     );
 
     // Elvish completions should have edit:completion or set edit:
@@ -294,7 +304,8 @@ fn e2e_completions_no_workspace_required() {
     );
     assert!(
         completions.status.success(),
-        "completions should work without initialized workspace: {}", completions.stderr
+        "completions should work without initialized workspace: {}",
+        completions.stderr
     );
 }
 
@@ -311,7 +322,8 @@ fn e2e_completions_with_initialized_workspace() {
     );
     assert!(
         completions.status.success(),
-        "completions should work with initialized workspace: {}", completions.stderr
+        "completions should work with initialized workspace: {}",
+        completions.stderr
     );
 }
 
@@ -333,7 +345,8 @@ fn e2e_completions_all_shells_succeed() {
         );
         assert!(
             completions.status.success(),
-            "completions for {shell} failed: {}", completions.stderr
+            "completions for {shell} failed: {}",
+            completions.stderr
         );
         assert!(
             !completions.stdout.is_empty(),

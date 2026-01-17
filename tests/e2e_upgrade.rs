@@ -31,11 +31,13 @@ fn e2e_version_shows_version() {
     let version = run_br(&workspace, ["version"], "version_basic");
     assert!(
         version.status.success(),
-        "version command failed: {}", version.stderr
+        "version command failed: {}",
+        version.stderr
     );
     assert!(
         version.stdout.contains("br version"),
-        "output should contain 'br version', got: {}", version.stdout
+        "output should contain 'br version', got: {}",
+        version.stdout
     );
 }
 
@@ -47,7 +49,8 @@ fn e2e_version_json_output() {
     let version = run_br(&workspace, ["version", "--json"], "version_json");
     assert!(
         version.status.success(),
-        "version --json failed: {}", version.stderr
+        "version --json failed: {}",
+        version.stderr
     );
 
     let json_str = extract_json_payload(&version.stdout);
@@ -69,7 +72,8 @@ fn e2e_version_no_workspace_required() {
     let version = run_br(&workspace, ["version"], "version_no_workspace");
     assert!(
         version.status.success(),
-        "version should work without workspace: {}", version.stderr
+        "version should work without workspace: {}",
+        version.stderr
     );
 }
 
@@ -304,7 +308,8 @@ fn e2e_upgrade_help_works() {
     let upgrade = run_br(&workspace, ["upgrade", "--help"], "upgrade_help");
     assert!(
         upgrade.status.success(),
-        "upgrade --help failed: {}", upgrade.stderr
+        "upgrade --help failed: {}",
+        upgrade.stderr
     );
     assert!(
         upgrade.stdout.contains("--check") && upgrade.stdout.contains("--dry-run"),

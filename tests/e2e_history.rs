@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::cli::{run_br, BrWorkspace};
+use common::cli::{BrWorkspace, run_br};
 use std::fs;
 use std::thread;
 use std::time::Duration;
@@ -18,17 +18,17 @@ use std::time::Duration;
 /// Helper to run sync --flush-only.
 fn sync_flush(workspace: &BrWorkspace) {
     let sync = run_br(workspace, ["sync", "--flush-only"], "sync_flush");
-    assert!(sync.status.success(), "sync should succeed: {}", sync.stderr);
+    assert!(
+        sync.status.success(),
+        "sync should succeed: {}",
+        sync.stderr
+    );
 }
 
 /// Helper to create an issue without auto-flush.
 /// This ensures the dirty flag is preserved for explicit sync calls.
 fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) {
-    let create = run_br(
-        workspace,
-        ["--no-auto-flush", "create", title],
-        label,
-    );
+    let create = run_br(workspace, ["--no-auto-flush", "create", title], label);
     assert!(create.status.success(), "create failed: {}", create.stderr);
 }
 
@@ -93,7 +93,11 @@ fn e2e_history_list_empty_initially() {
 
     // List history - should be empty
     let list = run_br(&workspace, ["history", "list"], "history_list_empty");
-    assert!(list.status.success(), "history list failed: {}", list.stderr);
+    assert!(
+        list.status.success(),
+        "history list failed: {}",
+        list.stderr
+    );
     assert!(
         list.stdout.contains("No backups found")
             || list.stdout.contains('0')
@@ -116,7 +120,11 @@ fn e2e_history_list_after_sync_creates_backup() {
 
     // List history - should have at least one backup
     let list = run_br(&workspace, ["history", "list"], "history_list_with_backup");
-    assert!(list.status.success(), "history list failed: {}", list.stderr);
+    assert!(
+        list.status.success(),
+        "history list failed: {}",
+        list.stderr
+    );
 
     let backups = list_backup_files(&workspace);
     assert!(
@@ -167,8 +175,7 @@ fn e2e_history_multiple_backups_chronological_order() {
     // Should have multiple backups
     assert!(
         backups.len() >= 2,
-        "should have multiple backups: {:?}",
-        backups
+        "should have multiple backups: {backups:?}"
     );
 
     // Backups should be sorted by timestamp (list_backup_files sorts them)
@@ -266,8 +273,7 @@ fn e2e_history_prune_keeps_recent() {
     let backups_before = list_backup_files(&workspace);
     assert!(
         backups_before.len() >= 3,
-        "should have multiple backups: {:?}",
-        backups_before
+        "should have multiple backups: {backups_before:?}"
     );
 
     // Prune keeping only 2
@@ -412,9 +418,7 @@ fn e2e_history_backup_deduplication() {
     assert_eq!(
         backups_after_second.len(),
         count_after_first,
-        "should not create duplicate backup for identical content: before={:?}, after={:?}",
-        backups_after_first,
-        backups_after_second
+        "should not create duplicate backup for identical content: before={backups_after_first:?}, after={backups_after_second:?}"
     );
 }
 
@@ -451,8 +455,7 @@ fn e2e_history_with_many_issues() {
     let backup_size = fs::metadata(&backup_path).unwrap().len();
     assert!(
         backup_size > 100,
-        "backup should have content: {} bytes",
-        backup_size
+        "backup should have content: {backup_size} bytes"
     );
 }
 

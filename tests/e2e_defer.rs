@@ -283,7 +283,8 @@ fn defer_until_past_allows() {
     );
     assert!(
         defer.status.success(),
-        "defer with past date should succeed: {}", defer.stderr
+        "defer with past date should succeed: {}",
+        defer.stderr
     );
 
     let payload = extract_json_payload(&defer.stdout);
@@ -326,7 +327,8 @@ fn undefer_sets_status_open() {
     let undefer = run_br(&workspace, ["undefer", &id], "undefer");
     assert!(
         undefer.status.success(),
-        "undefer failed: {}", undefer.stderr
+        "undefer failed: {}",
+        undefer.stderr
     );
 
     let show = run_br(&workspace, ["show", &id, "--json"], "show");
