@@ -12,8 +12,8 @@ use crate::storage::ListFilters;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::process::Command;
+use std::io::{self, BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 
 /// Output format for orphan issues.
 #[derive(Debug, Clone, Serialize)]
@@ -182,22 +182,30 @@ fn is_git_repo() -> bool {
 /// Returns Vec of (`commit_hash`, `commit_message`, `issue_id`) tuples.
 /// The list is ordered from most recent to oldest commit.
 fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
-    let output = Command::new("git")
+    let mut child = Command::new("git")
         .args(["log", "--oneline", "--all"])
-        .output()?;
+        .stdout(Stdio::piped())
+        .spawn()?;
 
-    if !output.status.success() {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        crate::error::BeadsError::Config("Failed to capture git stdout".to_string())
+    })?;
+
+    let reader = BufReader::new(stdout);
+    let refs = parse_git_log(reader, prefix)?;
+
+    let status = child.wait()?;
+    if !status.success() {
         return Ok(Vec::new());
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_git_log(&stdout, prefix)
+    Ok(refs)
 }
 
 /// Parse git log output and extract issue ID references.
 ///
 /// Looks for patterns like `(bd-abc123)` or `bd-abc123` in commit messages.
-fn parse_git_log(log_output: &str, prefix: &str) -> Result<Vec<(String, String, String)>> {
+fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, String, String)>> {
     // Pattern matches prefix-id including hierarchical IDs like bd-abc.1
     // We use word boundaries \b to avoid matching suffix/prefix (e.g. abd-123 or bd-123a)
     // although matching bd-123a is technically valid if 123a is the hash.
@@ -208,7 +216,9 @@ fn parse_git_log(log_output: &str, prefix: &str) -> Result<Vec<(String, String, 
 
     let mut results = Vec::new();
 
-    for line in log_output.lines() {
+    for line in reader.lines() {
+        let line = line.map_err(|e| crate::error::BeadsError::Config(format!("IO error: {e}")))?;
+        
         // Each line is: <short_hash> <message>
         let parts: Vec<&str> = line.splitn(2, ' ').collect();
         if parts.len() < 2 {
@@ -245,6 +255,7 @@ fn output_empty(json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_parse_git_log_extracts_issue_ids() {
@@ -253,7 +264,7 @@ def5678 Another commit
 ghi9012 Implement feature bd-xyz123
 jkl3456 Multi-ref (bd-foo) and bd-bar";
 
-        let refs = parse_git_log(log, "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
 
         assert_eq!(refs.len(), 4);
         assert_eq!(refs[0].2, "bd-abc");
@@ -265,7 +276,7 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
     #[test]
     fn test_parse_git_log_hierarchical_ids() {
         let log = "abc1234 Fix child (bd-parent.1)";
-        let refs = parse_git_log(log, "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
 
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].2, "bd-parent.1");
@@ -274,7 +285,7 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
     #[test]
     fn test_parse_git_log_custom_prefix() {
         let log = "abc1234 Fix issue (proj-xyz)";
-        let refs = parse_git_log(log, "proj").unwrap();
+        let refs = parse_git_log(Cursor::new(log), "proj").unwrap();
 
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].2, "proj-xyz");
@@ -283,7 +294,7 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
     #[test]
     fn test_parse_git_log_no_matches() {
         let log = "abc1234 Regular commit without issue refs";
-        let refs = parse_git_log(log, "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
 
         assert!(refs.is_empty());
     }
@@ -294,7 +305,7 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
 bbb Middle (bd-2)
 ccc Oldest (bd-1)";
 
-        let refs = parse_git_log(log, "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
 
         // First occurrence of bd-1 should be from the latest commit
         assert_eq!(refs[0].0, "aaa");
