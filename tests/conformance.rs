@@ -2068,6 +2068,102 @@ fn conformance_blocked_multiple_blockers() {
 }
 
 #[test]
+fn conformance_blocked_chain() {
+    common::init_test_logging();
+    info!("Starting conformance_blocked_chain test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_a = workspace.run_br(["create", "Blocked A", "--json"], "blocked_a");
+    let bd_a = workspace.run_bd(["create", "Blocked A", "--json"], "blocked_a");
+    let br_b = workspace.run_br(["create", "Blocked B", "--json"], "blocked_b");
+    let bd_b = workspace.run_bd(["create", "Blocked B", "--json"], "blocked_b");
+    let br_c = workspace.run_br(["create", "Blocker C", "--json"], "blocked_c");
+    let bd_c = workspace.run_bd(["create", "Blocker C", "--json"], "blocked_c");
+
+    let br_a_id = serde_json::from_str::<Value>(&extract_json_payload(&br_a.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br a id");
+    let bd_a_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_a.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd a id");
+    let br_b_id = serde_json::from_str::<Value>(&extract_json_payload(&br_b.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br b id");
+    let bd_b_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_b.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd b id");
+    let br_c_id = serde_json::from_str::<Value>(&extract_json_payload(&br_c.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br c id");
+    let bd_c_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_c.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd c id");
+
+    let br_dep1 = workspace.run_br(["dep", "add", &br_a_id, &br_b_id], "dep_a_b");
+    let br_dep2 = workspace.run_br(["dep", "add", &br_b_id, &br_c_id], "dep_b_c");
+    let bd_dep1 = workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "dep_a_b");
+    let bd_dep2 = workspace.run_bd(["dep", "add", &bd_b_id, &bd_c_id], "dep_b_c");
+
+    assert!(br_dep1.status.success(), "br dep a->b failed: {}", br_dep1.stderr);
+    assert!(br_dep2.status.success(), "br dep b->c failed: {}", br_dep2.stderr);
+    assert!(bd_dep1.status.success(), "bd dep a->b failed: {}", bd_dep1.stderr);
+    assert!(bd_dep2.status.success(), "bd dep b->c failed: {}", bd_dep2.stderr);
+
+    let br_blocked_out = workspace.run_br(["blocked", "--json"], "blocked_chain");
+    let bd_blocked_out = workspace.run_bd(["blocked", "--json"], "blocked_chain");
+
+    assert!(
+        br_blocked_out.status.success(),
+        "br blocked failed: {}",
+        br_blocked_out.stderr
+    );
+    assert!(
+        bd_blocked_out.status.success(),
+        "bd blocked failed: {}",
+        bd_blocked_out.stderr
+    );
+
+    let br_val: Value =
+        serde_json::from_str(&extract_json_payload(&br_blocked_out.stdout)).unwrap_or_default();
+    let bd_val: Value =
+        serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout)).unwrap_or_default();
+
+    let br_ids: Vec<&str> = br_val
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let bd_ids: Vec<&str> = bd_val
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    assert!(br_ids.contains(&br_a_id.as_str()));
+    assert!(br_ids.contains(&br_b_id.as_str()));
+    assert!(!br_ids.contains(&br_c_id.as_str()));
+    assert!(bd_ids.contains(&bd_a_id.as_str()));
+    assert!(bd_ids.contains(&bd_b_id.as_str()));
+    assert!(!bd_ids.contains(&bd_c_id.as_str()));
+
+    info!("conformance_blocked_chain passed");
+}
+
+#[test]
 fn conformance_stats() {
     common::init_test_logging();
     info!("Starting conformance_stats test");
