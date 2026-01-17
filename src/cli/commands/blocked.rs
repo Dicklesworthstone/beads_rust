@@ -119,7 +119,7 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
         let output = serde_json::to_string_pretty(&blocked_issues).map_err(BeadsError::Json)?;
         println!("{output}");
     } else {
-        print_text_output(&blocked_issues, args.detailed, &storage);
+        print_text_output(&blocked_issues, args.detailed, storage);
     }
 
     Ok(())

@@ -25,11 +25,12 @@ pub fn execute(command: &EpicCommands, json: bool, cli: &config::CliOverrides) -
 
 fn execute_status(args: &EpicStatusArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
-    let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
-    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let storage = &storage_ctx.storage;
+    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
     let use_color = config::should_use_color(&config_layer);
 
-    let mut epics = load_epic_statuses(&storage)?;
+    let mut epics = load_epic_statuses(storage)?;
     if args.eligible_only {
         epics.retain(|e| e.eligible_for_close);
     }
@@ -60,14 +61,15 @@ struct CloseEligibleResult {
 fn execute_close_eligible(
     args: &EpicCloseEligibleArgs,
     json: bool,
-    cli: &config::CliOverrides) -> Result<()> {
+    cli: &config::CliOverrides,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
-    let (mut storage, _paths) =
-        config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
-    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let actor = config::resolve_actor(&config_layer);
 
-    let mut epics = load_epic_statuses(&storage)?;
+    let storage = &mut storage_ctx.storage;
+    let mut epics = load_epic_statuses(storage)?;
     epics.retain(|e| e.eligible_for_close);
 
     if epics.is_empty() {
@@ -124,6 +126,7 @@ fn execute_close_eligible(
         }
     }
 
+    storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
 }
 
@@ -188,9 +191,7 @@ fn render_epic_status(epic_status: &EpicStatus, use_color: bool) {
     };
 
     println!("{status_icon} {id} {title}");
-    println!(
-        "   Progress: {closed}/{total} children closed ({percentage}%)"
-    );
+    println!("   Progress: {closed}/{total} children closed ({percentage}%)");
     if epic_status.eligible_for_close {
         let line = if use_color {
             "Eligible for closure".green().to_string()
@@ -303,7 +304,9 @@ mod tests {
             close_reason: Some(Some("Done".to_string())),
             ..Default::default()
         };
-        storage.update_issue("bd-task-1", &update, "tester").unwrap();
+        storage
+            .update_issue("bd-task-1", &update, "tester")
+            .unwrap();
 
         let epics = load_epic_statuses(&storage).unwrap();
         let epic_status = find_epic(&epics, "bd-epic-1").expect("epic not found");
@@ -311,7 +314,9 @@ mod tests {
         assert_eq!(epic_status.closed_children, 1);
         assert!(!epic_status.eligible_for_close);
 
-        storage.update_issue("bd-task-2", &update, "tester").unwrap();
+        storage
+            .update_issue("bd-task-2", &update, "tester")
+            .unwrap();
         let epics = load_epic_statuses(&storage).unwrap();
         let epic_status = find_epic(&epics, "bd-epic-1").expect("epic not found");
         assert_eq!(epic_status.total_children, 2);
