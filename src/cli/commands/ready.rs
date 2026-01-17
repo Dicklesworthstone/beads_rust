@@ -171,17 +171,27 @@ fn parse_priorities(priorities: &[String]) -> Result<Option<Vec<Priority>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::info;
+
+    fn init_logging() {
+        crate::logging::init_test_logging();
+    }
 
     #[test]
     fn test_parse_types() {
+        init_logging();
+        info!("test_parse_types: starting");
         let t = parse_types(&["bug".to_string(), "feature".to_string()]);
         assert!(t.is_some());
         let t = t.unwrap();
         assert_eq!(t.len(), 2);
+        info!("test_parse_types: assertions passed");
     }
 
     #[test]
     fn test_parse_priorities() {
+        init_logging();
+        info!("test_parse_priorities: starting");
         let p = parse_priorities(&["0".to_string(), "P1".to_string(), "2".to_string()])
             .expect("parse priorities")
             .unwrap();
@@ -189,5 +199,6 @@ mod tests {
         assert_eq!(p[0].0, 0);
         assert_eq!(p[1].0, 1);
         assert_eq!(p[2].0, 2);
+        info!("test_parse_priorities: assertions passed");
     }
 }
