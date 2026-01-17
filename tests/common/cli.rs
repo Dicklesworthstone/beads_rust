@@ -45,6 +45,7 @@ where
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
     cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("HOME", &workspace.root);
 
     let start = Instant::now();
     let output = cmd.output().expect("run br");

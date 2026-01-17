@@ -487,9 +487,12 @@ fn import_allows_invalid_id_format_currently() {
 
     let mut storage = SqliteStorage::open_memory().unwrap();
     let result = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"));
-    
-    assert!(result.is_ok(), "Import currently succeeds for invalid IDs (bug)");
-    
+
+    assert!(
+        result.is_ok(),
+        "Import currently succeeds for invalid IDs (bug)"
+    );
+
     // Verify it's in the DB
     let imported = storage.get_issue("test-INVALID").unwrap().unwrap();
     assert_eq!(imported.title, "Invalid ID");

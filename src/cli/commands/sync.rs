@@ -346,6 +346,9 @@ fn execute_flush(
     json: bool,
     retention_days: Option<u64>,
 ) -> Result<()> {
+    // DEBUG PRINT
+    eprintln!("DEBUG: execute_flush args.manifest={}", args.manifest);
+
     info!("Starting JSONL export");
     let export_policy = parse_export_policy(args)?;
     let jsonl_path = &path_policy.jsonl_path;
@@ -476,6 +479,7 @@ fn execute_flush(
 
     // Write manifest if requested
     let manifest_path = if args.manifest {
+        eprintln!("DEBUG: Entering manifest creation block");
         let manifest = serde_json::json!({
             "export_time": chrono::Utc::now().to_rfc3339(),
             "issues_count": export_result.exported_count,
@@ -485,6 +489,7 @@ fn execute_flush(
             "errors": &report.errors,
         });
         let manifest_file = path_policy.manifest_path.clone();
+        eprintln!("DEBUG: manifest_file={}", manifest_file.display());
         require_safe_sync_overwrite_path(
             &manifest_file,
             &path_policy.beads_dir,
@@ -492,6 +497,7 @@ fn execute_flush(
             "write manifest",
         )?;
         fs::write(&manifest_file, serde_json::to_string_pretty(&manifest)?)?;
+        eprintln!("DEBUG: Wrote manifest");
         Some(manifest_file.to_string_lossy().to_string())
     } else {
         None
