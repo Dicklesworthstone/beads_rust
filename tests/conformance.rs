@@ -783,19 +783,33 @@ pub fn compare_json(br_output: &str, bd_output: &str, mode: &CompareMode) -> Res
     Ok(())
 }
 
-fn extract_field<'a>(json: &'a Value, field: &str) -> Option<&'a Value> {
-    match json {
-        Value::Object(map) => map.get(field),
-        Value::Array(arr) if !arr.is_empty() => {
-            // For arrays, check the first element
-            if let Value::Object(map) = &arr[0] {
-                map.get(field)
-            } else {
-                None
-            }
-        }
-        _ => None,
+fn log_timings(test_name: &str, br: &CmdOutput, bd: &CmdOutput) {
+    info!("conformance_{}: br_timing={:?}", test_name, br.duration);
+    info!("conformance_{}: bd_timing={:?}", test_name, bd.duration);
+    if br.duration.as_nanos() > 0 {
+        let speedup = bd.duration.as_secs_f64() / br.duration.as_secs_f64();
+        info!("conformance_{}: speedup={:.2}x", test_name, speedup);
     }
+}
+
+fn extract_field<'a>(json: &'a Value, field: &str) -> Option<&'a Value> {
+    let mut current = json;
+    for part in field.split('.') {
+        match current {
+            Value::Object(map) => {
+                current = map.get(part)?;
+            }
+            Value::Array(arr) if !arr.is_empty() => {
+                if let Value::Object(map) = &arr[0] {
+                    current = map.get(part)?;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 /// Compare two JSON values ignoring array order
@@ -2175,8 +2189,8 @@ fn conformance_stats() {
     workspace.run_br(["create", "Issue A"], "create_a");
     workspace.run_bd(["create", "Issue A"], "create_a");
 
-    let br_stats = workspace.run_br(["stats", "--json"], "stats");
-    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+    let br_stats = workspace.run_br(["stats", "--no-activity", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--no-activity", "--json"], "stats");
 
     assert!(
         br_stats.status.success(),
@@ -7019,6 +7033,17 @@ fn extract_id_from_json(output: &str) -> String {
     extract_issue_id(&json)
 }
 
+fn extract_checks_len(json_str: &str) -> usize {
+    serde_json::from_str::<Value>(json_str)
+        .ok()
+        .and_then(|val| {
+            val.get("checks")
+                .and_then(|checks| checks.as_array())
+                .map(|checks| checks.len())
+        })
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // dep add tests (8)
 // ---------------------------------------------------------------------------
@@ -8370,8 +8395,8 @@ fn conformance_stats_empty() {
     workspace.init_both();
 
     // Run stats on fresh workspace
-    let br_stats = workspace.run_br(["stats", "--json"], "stats_empty");
-    let bd_stats = workspace.run_bd(["stats", "--json"], "stats_empty");
+    let br_stats = workspace.run_br(["stats", "--no-activity", "--json"], "stats_empty");
+    let bd_stats = workspace.run_bd(["stats", "--no-activity", "--json"], "stats_empty");
 
     assert!(
         br_stats.status.success(),
@@ -8387,27 +8412,13 @@ fn conformance_stats_empty() {
     let br_json = extract_json_payload(&br_stats.stdout);
     let bd_json = extract_json_payload(&bd_stats.stdout);
 
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
-
-    // Both should show zero total
-    let br_total = br_val["total"]
-        .as_i64()
-        .or_else(|| br_val["summary"]["total"].as_i64())
-        .unwrap_or(0);
-    let bd_total = bd_val["total"]
-        .as_i64()
-        .or_else(|| bd_val["summary"]["total"].as_i64())
-        .unwrap_or(0);
-
-    assert_eq!(
-        br_total, 0,
-        "br stats should show 0 total on empty workspace"
-    );
-    assert_eq!(
-        bd_total, 0,
-        "bd stats should show 0 total on empty workspace"
-    );
+    log_timings("stats_empty", &br_stats, &bd_stats);
+    compare_json(
+        &br_json,
+        &bd_json,
+        &CompareMode::FieldsExcluded(vec!["average_lead_time_hours".to_string()]),
+    )
+    .expect("JSON mismatch");
 
     info!("conformance_stats_empty passed");
 }
@@ -8435,8 +8446,8 @@ fn conformance_stats_mixed() {
     workspace.run_bd(["close", &bd_id], "close");
 
     // Get stats
-    let br_stats = workspace.run_br(["stats", "--json"], "stats");
-    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+    let br_stats = workspace.run_br(["stats", "--no-activity", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--no-activity", "--json"], "stats");
 
     assert!(
         br_stats.status.success(),
@@ -8452,18 +8463,13 @@ fn conformance_stats_mixed() {
     let br_json = extract_json_payload(&br_stats.stdout);
     let bd_json = extract_json_payload(&bd_stats.stdout);
 
-    let br_val: Value = serde_json::from_str(&br_json).expect("br json");
-    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
-
-    // Both should show 2 total
-    let br_total = br_val["total"]
-        .as_i64()
-        .or_else(|| br_val["summary"]["total"].as_i64());
-    let bd_total = bd_val["total"]
-        .as_i64()
-        .or_else(|| bd_val["summary"]["total"].as_i64());
-
-    assert_eq!(br_total, bd_total, "total counts differ");
+    log_timings("stats_mixed", &br_stats, &bd_stats);
+    compare_json(
+        &br_json,
+        &bd_json,
+        &CompareMode::FieldsExcluded(vec!["average_lead_time_hours".to_string()]),
+    )
+    .expect("JSON mismatch");
 
     info!("conformance_stats_mixed passed");
 }
@@ -8493,8 +8499,8 @@ fn conformance_stats_with_deps() {
     workspace.run_bd(["dep", "add", &bd_a_id, &bd_b_id], "add_dep");
 
     // Get stats
-    let br_stats = workspace.run_br(["stats", "--json"], "stats");
-    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+    let br_stats = workspace.run_br(["stats", "--no-activity", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--no-activity", "--json"], "stats");
 
     assert!(br_stats.status.success(), "br stats failed");
     assert!(bd_stats.status.success(), "bd stats failed");
@@ -8502,18 +8508,13 @@ fn conformance_stats_with_deps() {
     let br_json = extract_json_payload(&br_stats.stdout);
     let bd_json = extract_json_payload(&bd_stats.stdout);
 
-    let br_val: Value = serde_json::from_str(&br_json).expect("br json");
-    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
-
-    // Both should show 2 total
-    let br_total = br_val["total"]
-        .as_i64()
-        .or_else(|| br_val["summary"]["total"].as_i64());
-    let bd_total = bd_val["total"]
-        .as_i64()
-        .or_else(|| bd_val["summary"]["total"].as_i64());
-
-    assert_eq!(br_total, bd_total, "total counts differ with deps");
+    log_timings("stats_with_deps", &br_stats, &bd_stats);
+    compare_json(
+        &br_json,
+        &bd_json,
+        &CompareMode::FieldsExcluded(vec!["average_lead_time_hours".to_string()]),
+    )
+    .expect("JSON mismatch");
 
     info!("conformance_stats_with_deps passed");
 }
@@ -8530,30 +8531,29 @@ fn conformance_stats_json_shape() {
     workspace.run_br(["create", "Test issue"], "create");
     workspace.run_bd(["create", "Test issue"], "create");
 
-    let br_stats = workspace.run_br(["stats", "--json"], "stats");
-    let bd_stats = workspace.run_bd(["stats", "--json"], "stats");
+    let br_stats = workspace.run_br(["stats", "--no-activity", "--json"], "stats");
+    let bd_stats = workspace.run_bd(["stats", "--no-activity", "--json"], "stats");
 
     assert!(br_stats.status.success(), "br stats failed");
     assert!(bd_stats.status.success(), "bd stats failed");
 
     let br_json = extract_json_payload(&br_stats.stdout);
     let bd_json = extract_json_payload(&bd_stats.stdout);
+    log_timings("stats_all_fields", &br_stats, &bd_stats);
 
     let br_val: Value = serde_json::from_str(&br_json).expect("br json");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
 
-    // Verify JSON structure matches
-    let result = compare_json(&br_json, &bd_json, &CompareMode::StructureOnly);
-    if let Err(e) = &result {
-        info!("Structure mismatch (may be expected): {}", e);
-    }
+    let excluded = vec!["average_lead_time_hours".to_string()];
+    let br_filtered = filter_fields(&br_val, &excluded);
+    let bd_filtered = filter_fields(&bd_val, &excluded);
 
-    // Both should have essential fields
-    let has_total_br = br_val.get("total").is_some() || br_val.get("summary").is_some();
-    let has_total_bd = bd_val.get("total").is_some() || bd_val.get("summary").is_some();
+    assert!(
+        structure_matches(&br_filtered, &bd_filtered),
+        "stats JSON structure mismatch"
+    );
 
-    assert!(has_total_br, "br stats should have total or summary");
-    assert!(has_total_bd, "bd stats should have total or summary");
+    log_timings("stats_json_shape", &br_stats, &bd_stats);
 
     info!("conformance_stats_json_shape passed");
 }
@@ -8596,10 +8596,11 @@ fn conformance_count_by_status() {
         bd_count.stderr
     );
 
-    info!(
-        "br timing: {:?}, bd timing: {:?}",
-        br_count.duration, bd_count.duration
-    );
+    let br_json = extract_json_payload(&br_count.stdout);
+    let bd_json = extract_json_payload(&bd_count.stdout);
+
+    log_timings("count_by_status", &br_count, &bd_count);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
 
     info!("conformance_count_by_status passed");
 }
@@ -8640,13 +8641,8 @@ fn conformance_count_by_type() {
     let br_json = extract_json_payload(&br_count.stdout);
     let bd_json = extract_json_payload(&bd_count.stdout);
 
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
-
-    info!(
-        "br count by type: {:?}, bd count by type: {:?}",
-        br_val, bd_val
-    );
+    log_timings("count_by_type", &br_count, &bd_count);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
 
     info!("conformance_count_by_type passed");
 }
@@ -8683,6 +8679,12 @@ fn conformance_count_by_priority() {
         "bd count failed: {}",
         bd_count.stderr
     );
+
+    let br_json = extract_json_payload(&br_count.stdout);
+    let bd_json = extract_json_payload(&bd_count.stdout);
+
+    log_timings("count_by_priority", &br_count, &bd_count);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
 
     info!("conformance_count_by_priority passed");
 }
@@ -8732,6 +8734,12 @@ fn conformance_count_by_assignee() {
         bd_count.stderr
     );
 
+    let br_json = extract_json_payload(&br_count.stdout);
+    let bd_json = extract_json_payload(&bd_count.stdout);
+
+    log_timings("count_by_assignee", &br_count, &bd_count);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
+
     info!("conformance_count_by_assignee passed");
 }
 
@@ -8755,14 +8763,8 @@ fn conformance_count_json_shape() {
     let br_json = extract_json_payload(&br_count.stdout);
     let bd_json = extract_json_payload(&bd_count.stdout);
 
-    let _br_val: Value = serde_json::from_str(&br_json).expect("br json");
-    let _bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
-
-    // Verify structure matches
-    let result = compare_json(&br_json, &bd_json, &CompareMode::StructureOnly);
-    if let Err(e) = &result {
-        info!("Structure mismatch (may be expected): {}", e);
-    }
+    log_timings("count_json_shape", &br_count, &bd_count);
+    compare_json(&br_json, &bd_json, &CompareMode::StructureOnly).expect("JSON mismatch");
 
     info!("conformance_count_json_shape passed");
 }
@@ -8793,21 +8795,8 @@ fn conformance_count_empty() {
     let br_json = extract_json_payload(&br_count.stdout);
     let bd_json = extract_json_payload(&bd_count.stdout);
 
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
-
-    // Both should report 0 total
-    let br_total = br_val["total"]
-        .as_i64()
-        .or_else(|| br_val["summary"]["total"].as_i64())
-        .unwrap_or(0);
-    let bd_total = bd_val["total"]
-        .as_i64()
-        .or_else(|| bd_val["summary"]["total"].as_i64())
-        .unwrap_or(0);
-
-    assert_eq!(br_total, 0, "br count should be 0 on empty workspace");
-    assert_eq!(bd_total, 0, "bd count should be 0 on empty workspace");
+    log_timings("count_empty", &br_count, &bd_count);
+    compare_json(&br_json, &bd_json, &CompareMode::ExactJson).expect("JSON mismatch");
 
     info!("conformance_count_empty passed");
 }
@@ -8841,26 +8830,11 @@ fn conformance_stale_default() {
         bd_stale.stderr
     );
 
-    // Fresh issues should not be stale
     let br_json = extract_json_payload(&br_stale.stdout);
     let bd_json = extract_json_payload(&bd_stale.stdout);
 
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
-
-    let br_count = if br_val.is_array() {
-        br_val.as_array().unwrap().len()
-    } else {
-        0
-    };
-    let bd_count = if bd_val.is_array() {
-        bd_val.as_array().unwrap().len()
-    } else {
-        0
-    };
-
-    assert_eq!(br_count, 0, "Fresh issues should not be stale (br)");
-    assert_eq!(bd_count, 0, "Fresh issues should not be stale (bd)");
+    log_timings("stale_default", &br_stale, &bd_stale);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
 
     info!("conformance_stale_default passed");
 }
@@ -8891,6 +8865,12 @@ fn conformance_stale_custom_days() {
         bd_stale.stderr
     );
 
+    let br_json = extract_json_payload(&br_stale.stdout);
+    let bd_json = extract_json_payload(&bd_stale.stdout);
+
+    log_timings("stale_custom_days", &br_stale, &bd_stale);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
+
     info!("conformance_stale_custom_days passed");
 }
 
@@ -8920,15 +8900,8 @@ fn conformance_stale_empty() {
     let br_json = extract_json_payload(&br_stale.stdout);
     let bd_json = extract_json_payload(&bd_stale.stdout);
 
-    // Both should return empty array or similar
-    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
-    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
-
-    let br_empty = br_val.is_array() && br_val.as_array().unwrap().is_empty();
-    let bd_empty = bd_val.is_array() && bd_val.as_array().unwrap().is_empty();
-
-    assert!(br_empty || br_val.is_null(), "br stale should be empty");
-    assert!(bd_empty || bd_val.is_null(), "bd stale should be empty");
+    log_timings("stale_empty", &br_stale, &bd_stale);
+    compare_json(&br_json, &bd_json, &CompareMode::ExactJson).expect("JSON mismatch");
 
     info!("conformance_stale_empty passed");
 }
@@ -8958,7 +8931,39 @@ fn conformance_stale_excludes_closed() {
     assert!(br_stale.status.success(), "br stale failed");
     assert!(bd_stale.status.success(), "bd stale failed");
 
-    // Closed issues should not appear in stale list
+    let br_json = extract_json_payload(&br_stale.stdout);
+    let bd_json = extract_json_payload(&bd_stale.stdout);
+
+    log_timings("stale_excludes_closed", &br_stale, &bd_stale);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
+
+    let br_ids: HashSet<String> = serde_json::from_str::<Value>(&br_json)
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    let bd_ids: HashSet<String> = serde_json::from_str::<Value>(&bd_json)
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                    .map(|id| id.to_string())
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    assert!(!br_ids.contains(&br_id), "br stale includes closed issue");
+    assert!(!bd_ids.contains(&bd_id), "bd stale includes closed issue");
+
     info!("conformance_stale_excludes_closed passed");
 }
 
@@ -8982,12 +8987,8 @@ fn conformance_stale_json_shape() {
     let br_json = extract_json_payload(&br_stale.stdout);
     let bd_json = extract_json_payload(&bd_stale.stdout);
 
-    // Both should produce valid JSON (array or object)
-    let br_val: Result<Value, _> = serde_json::from_str(&br_json);
-    let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
-
-    assert!(br_val.is_ok(), "br stale should produce valid JSON");
-    assert!(bd_val.is_ok(), "bd stale should produce valid JSON");
+    log_timings("stale_json_shape", &br_stale, &bd_stale);
+    compare_json(&br_json, &bd_json, &CompareMode::StructureOnly).expect("JSON mismatch");
 
     info!("conformance_stale_json_shape passed");
 }
@@ -9004,18 +9005,29 @@ fn conformance_doctor_healthy() {
 
     // Doctor on clean workspace should succeed
     let br_doctor = workspace.run_br(["doctor", "--json"], "doctor");
-    // let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
+    let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
 
     assert!(
         br_doctor.status.success(),
         "br doctor failed on healthy workspace: {}",
         br_doctor.stderr
     );
-    // assert!(
-    //     bd_doctor.status.success(),
-    //     "bd doctor failed on healthy workspace: {}",
-    //     bd_doctor.stderr
-    // );
+    assert!(
+        bd_doctor.status.success(),
+        "bd doctor failed on healthy workspace: {}",
+        bd_doctor.stderr
+    );
+
+    let br_json = extract_json_payload(&br_doctor.stdout);
+    let bd_json = extract_json_payload(&bd_doctor.stdout);
+
+    let br_checks = extract_checks_len(&br_json);
+    let bd_checks = extract_checks_len(&bd_json);
+
+    assert!(br_checks > 0, "br doctor should emit checks");
+    assert!(bd_checks > 0, "bd doctor should emit checks");
+
+    log_timings("doctor_healthy", &br_doctor, &bd_doctor);
 
     info!("conformance_doctor_healthy passed");
 }
@@ -9029,20 +9041,38 @@ fn conformance_doctor_json_shape() {
     workspace.init_both();
 
     let br_doctor = workspace.run_br(["doctor", "--json"], "doctor");
-    // let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
+    let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
 
     assert!(br_doctor.status.success(), "br doctor failed");
-    // assert!(bd_doctor.status.success(), "bd doctor failed");
+    assert!(bd_doctor.status.success(), "bd doctor failed");
 
     let br_json = extract_json_payload(&br_doctor.stdout);
-    // let bd_json = extract_json_payload(&bd_doctor.stdout);
+    let bd_json = extract_json_payload(&bd_doctor.stdout);
 
-    // Both should produce valid JSON
-    let br_val: Result<Value, _> = serde_json::from_str(&br_json);
-    // let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+    let br_val: Value = serde_json::from_str(&br_json).expect("br doctor json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd doctor json");
 
-    assert!(br_val.is_ok(), "br doctor should produce valid JSON");
-    // assert!(bd_val.is_ok(), "bd doctor should produce valid JSON");
+    let br_checks = br_val
+        .get("checks")
+        .and_then(|checks| checks.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let bd_checks = bd_val
+        .get("checks")
+        .and_then(|checks| checks.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    assert!(
+        br_checks.iter().all(|c| c.get("name").is_some() && c.get("status").is_some()),
+        "br doctor checks missing name/status"
+    );
+    assert!(
+        bd_checks.iter().all(|c| c.get("name").is_some() && c.get("status").is_some()),
+        "bd doctor checks missing name/status"
+    );
+
+    log_timings("doctor_json_shape", &br_doctor, &bd_doctor);
 
     info!("conformance_doctor_json_shape passed");
 }
@@ -9072,10 +9102,18 @@ fn conformance_doctor_with_issues() {
 
     // Doctor should still succeed
     let br_doctor = workspace.run_br(["doctor", "--json"], "doctor");
-    // let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
+    let bd_doctor = workspace.run_bd(["doctor", "--json"], "doctor");
 
     assert!(br_doctor.status.success(), "br doctor failed with issues");
-    // assert!(bd_doctor.status.success(), "bd doctor failed with issues");
+    assert!(bd_doctor.status.success(), "bd doctor failed with issues");
+
+    let br_json = extract_json_payload(&br_doctor.stdout);
+    let bd_json = extract_json_payload(&bd_doctor.stdout);
+
+    assert!(extract_checks_len(&br_json) > 0, "br doctor should emit checks");
+    assert!(extract_checks_len(&bd_json) > 0, "bd doctor should emit checks");
+
+    log_timings("doctor_with_issues", &br_doctor, &bd_doctor);
 
     info!("conformance_doctor_with_issues passed");
 }
@@ -9115,6 +9153,7 @@ fn conformance_version_text() {
         "bd version should produce output"
     );
 
+    log_timings("version_text", &br_version, &bd_version);
     info!("conformance_version_text passed");
 }
 
@@ -9150,6 +9189,7 @@ fn conformance_version_json() {
     assert!(br_val.is_ok(), "br version should produce valid JSON");
     assert!(bd_val.is_ok(), "bd version should produce valid JSON");
 
+    log_timings("version_json", &br_version, &bd_version);
     info!("conformance_version_json passed");
 }
 
@@ -9173,22 +9213,17 @@ fn conformance_version_fields() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Null);
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
 
-    // Both should have version field
-    let br_has_version = br_val.get("version").is_some()
-        || br_val.get("Version").is_some()
-        || br_val.as_str().is_some();
-    let bd_has_version = bd_val.get("version").is_some()
-        || bd_val.get("Version").is_some()
-        || bd_val.as_str().is_some();
-
-    info!(
-        "br version structure: {:?}, bd version structure: {:?}",
-        br_val, bd_val
-    );
+    let br_has_version = br_val.get("version").is_some();
+    let bd_has_version = bd_val.get("version").is_some();
+    let br_has_build = br_val.get("build").is_some();
+    let bd_has_build = bd_val.get("build").is_some();
 
     assert!(br_has_version, "br version should have version field");
     assert!(bd_has_version, "bd version should have version field");
+    assert!(br_has_build, "br version should have build field");
+    assert!(bd_has_build, "bd version should have build field");
 
+    log_timings("version_fields", &br_version, &bd_version);
     info!("conformance_version_fields passed");
 }
 
@@ -9216,6 +9251,19 @@ fn conformance_config_list() {
         bd_config.stderr
     );
 
+    let br_json = extract_json_payload(&br_config.stdout);
+    let bd_json = extract_json_payload(&bd_config.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("br config json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd config json");
+
+    let br_prefix = br_val.get("issue_prefix").and_then(|v| v.as_str());
+    let bd_prefix = bd_val.get("issue_prefix").and_then(|v| v.as_str());
+
+    assert!(br_prefix.is_some(), "br config list missing issue_prefix");
+    assert!(bd_prefix.is_some(), "bd config list missing issue_prefix");
+
+    log_timings("config_list", &br_config, &bd_config);
     info!("conformance_config_list passed");
 }
 
@@ -9227,46 +9275,72 @@ fn conformance_config_get() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Try to get a common config key
-    let br_config = workspace.run_br(["config", "get", "id.prefix"], "config_get");
-    let bd_config = workspace.run_bd(["config", "get", "id.prefix"], "config_get");
+    let br_set = workspace.run_br(["config", "set", "issue_prefix=cfg_get"], "config_set");
+    let bd_set = workspace.run_bd(["config", "set", "issue_prefix", "cfg_get"], "config_set");
 
-    // Both should succeed or both should fail for unknown keys
-    info!(
-        "br config get exit: {}, bd config get exit: {}",
-        br_config.status.success(),
-        bd_config.status.success()
-    );
+    assert!(br_set.status.success(), "br config set failed: {}", br_set.stderr);
+    assert!(bd_set.status.success(), "bd config set failed: {}", bd_set.stderr);
+
+    let br_get = workspace.run_br(["config", "get", "issue_prefix", "--json"], "config_get");
+    let bd_get = workspace.run_bd(["config", "get", "issue_prefix", "--json"], "config_get");
+
+    assert!(br_get.status.success(), "br config get failed: {}", br_get.stderr);
+    assert!(bd_get.status.success(), "bd config get failed: {}", bd_get.stderr);
+
+    let br_json = extract_json_payload(&br_get.stdout);
+    let bd_json = extract_json_payload(&bd_get.stdout);
+
+    log_timings("config_get", &br_get, &bd_get);
+    compare_json(&br_json, &bd_json, &CompareMode::ExactJson).expect("JSON mismatch");
 
     info!("conformance_config_get passed");
 }
 
 #[test]
-fn conformance_config_set_and_get() {
+fn conformance_config_set() {
     common::init_test_logging();
-    info!("Starting conformance_config_set_and_get test");
+    info!("Starting conformance_config_set test");
 
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Set a config value
-    let br_set = workspace.run_br(["config", "set", "id.prefix=test"], "config_set");
-    let bd_set = workspace.run_bd(["config", "set", "id.prefix=test"], "config_set");
+    let br_set = workspace.run_br(["config", "set", "issue_prefix=cfg_set"], "config_set");
+    let bd_set = workspace.run_bd(["config", "set", "issue_prefix", "cfg_set"], "config_set");
 
-    // Both should succeed
-    if br_set.status.success() && bd_set.status.success() {
-        // Verify the value was set
-        let br_get = workspace.run_br(["config", "get", "id.prefix"], "config_get");
-        let bd_get = workspace.run_bd(["config", "get", "id.prefix"], "config_get");
+    assert!(br_set.status.success(), "br config set failed: {}", br_set.stderr);
+    assert!(bd_set.status.success(), "bd config set failed: {}", bd_set.stderr);
 
-        info!(
-            "br config after set: {}, bd config after set: {}",
-            br_get.stdout.trim(),
-            bd_get.stdout.trim()
-        );
-    }
+    log_timings("config_set", &br_set, &bd_set);
+    info!("conformance_config_set passed");
+}
 
-    info!("conformance_config_set_and_get passed");
+#[test]
+fn conformance_config_get_after_set() {
+    common::init_test_logging();
+    info!("Starting conformance_config_get_after_set test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_set = workspace.run_br(["config", "set", "issue_prefix=cfg_after"], "config_set");
+    let bd_set = workspace.run_bd(["config", "set", "issue_prefix", "cfg_after"], "config_set");
+
+    assert!(br_set.status.success(), "br config set failed: {}", br_set.stderr);
+    assert!(bd_set.status.success(), "bd config set failed: {}", bd_set.stderr);
+
+    let br_get = workspace.run_br(["config", "get", "issue_prefix", "--json"], "config_get");
+    let bd_get = workspace.run_bd(["config", "get", "issue_prefix", "--json"], "config_get");
+
+    assert!(br_get.status.success(), "br config get failed: {}", br_get.stderr);
+    assert!(bd_get.status.success(), "bd config get failed: {}", bd_get.stderr);
+
+    let br_json = extract_json_payload(&br_get.stdout);
+    let bd_json = extract_json_payload(&bd_get.stdout);
+
+    log_timings("config_get_after_set", &br_get, &bd_get);
+    compare_json(&br_json, &bd_json, &CompareMode::ExactJson).expect("JSON mismatch");
+
+    info!("conformance_config_get_after_set passed");
 }
 
 #[test]
@@ -9280,16 +9354,19 @@ fn conformance_config_json_shape() {
     let br_config = workspace.run_br(["config", "list", "--json"], "config");
     let bd_config = workspace.run_bd(["config", "list", "--json"], "config");
 
-    if br_config.status.success() && bd_config.status.success() {
-        let br_json = extract_json_payload(&br_config.stdout);
-        let bd_json = extract_json_payload(&bd_config.stdout);
+    assert!(br_config.status.success(), "br config list failed");
+    assert!(bd_config.status.success(), "bd config list failed");
 
-        let br_val: Result<Value, _> = serde_json::from_str(&br_json);
-        let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+    let br_json = extract_json_payload(&br_config.stdout);
+    let bd_json = extract_json_payload(&bd_config.stdout);
 
-        assert!(br_val.is_ok(), "br config should produce valid JSON");
-        assert!(bd_val.is_ok(), "bd config should produce valid JSON");
-    }
+    let br_val: Value = serde_json::from_str(&br_json).expect("br config json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd config json");
+
+    assert!(br_val.is_object(), "br config list should be object");
+    assert!(bd_val.is_object(), "bd config list should be object");
+
+    log_timings("config_json_shape", &br_config, &bd_config);
 
     info!("conformance_config_json_shape passed");
 }
@@ -9302,22 +9379,25 @@ fn conformance_config_defaults() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // List config to see defaults
-    let br_config = workspace.run_br(["config", "list"], "config_defaults");
-    let bd_config = workspace.run_bd(["config", "list"], "config_defaults");
+    let br_config = workspace.run_br(["config", "list", "--json"], "config_defaults");
+    let bd_config = workspace.run_bd(["config", "list", "--json"], "config_defaults");
 
     assert!(br_config.status.success(), "br config list failed");
     assert!(bd_config.status.success(), "bd config list failed");
 
-    // Both should have some default configuration
-    assert!(
-        !br_config.stdout.trim().is_empty() || !br_config.stderr.trim().is_empty(),
-        "br config should show some output"
-    );
-    assert!(
-        !bd_config.stdout.trim().is_empty() || !bd_config.stderr.trim().is_empty(),
-        "bd config should show some output"
-    );
+    let br_json = extract_json_payload(&br_config.stdout);
+    let bd_json = extract_json_payload(&bd_config.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("br config json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd config json");
+
+    let br_prefix = br_val.get("issue_prefix").and_then(|v| v.as_str()).unwrap_or("");
+    let bd_prefix = bd_val.get("issue_prefix").and_then(|v| v.as_str()).unwrap_or("");
+
+    assert!(!br_prefix.is_empty(), "br config defaults should include issue_prefix");
+    assert!(!bd_prefix.is_empty(), "bd config defaults should include issue_prefix");
+
+    log_timings("config_defaults", &br_config, &bd_config);
 
     info!("conformance_config_defaults passed");
 }
@@ -9330,22 +9410,26 @@ fn conformance_config_invalid_key() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Try to get a nonexistent config key
     let br_config = workspace.run_br(
-        ["config", "--get", "nonexistent.key.that.does.not.exist"],
+        ["config", "get", "nonexistent.key.that.does.not.exist"],
         "config_invalid",
     );
     let bd_config = workspace.run_bd(
-        ["config", "--get", "nonexistent.key.that.does.not.exist"],
+        ["config", "get", "nonexistent.key.that.does.not.exist"],
         "config_invalid",
     );
 
-    // Both should handle this gracefully (either error or return empty)
-    info!(
-        "br config invalid key: success={}, bd config invalid key: success={}",
+    assert_eq!(
         br_config.status.success(),
-        bd_config.status.success()
+        bd_config.status.success(),
+        "br/bd config invalid key exit mismatch"
     );
+    assert!(
+        !br_config.status.success(),
+        "config get should fail for invalid key"
+    );
+
+    log_timings("config_invalid_key", &br_config, &bd_config);
 
     info!("conformance_config_invalid_key passed");
 }
@@ -11873,11 +11957,23 @@ fn conformance_stats_all_fields() {
     assert!(bd_stats.status.success());
     let br_json = extract_json_payload(&br_stats.stdout);
     let bd_json = extract_json_payload(&bd_stats.stdout);
-    compare_json(&br_json, &bd_json, &CompareMode::ContainsFields(vec![
-        "total".to_string(), "open".to_string(), "closed".to_string(),
-        "in_progress".to_string(), "deferred".to_string(), "blocked".to_string(),
-        "stale".to_string(), "labels".to_string(), "orphans".to_string()
-    ])).expect("JSON mismatch");
+    compare_json(
+        &br_json,
+        &bd_json,
+        &CompareMode::ContainsFields(vec![
+            "summary.total_issues".to_string(),
+            "summary.open_issues".to_string(),
+            "summary.in_progress_issues".to_string(),
+            "summary.closed_issues".to_string(),
+            "summary.blocked_issues".to_string(),
+            "summary.deferred_issues".to_string(),
+            "summary.ready_issues".to_string(),
+            "summary.tombstone_issues".to_string(),
+            "summary.pinned_issues".to_string(),
+            "summary.epics_eligible_for_closure".to_string(),
+        ]),
+    )
+    .expect("JSON mismatch");
     info!("conformance_stats_all_fields passed");
 }
 
@@ -11901,13 +11997,9 @@ fn conformance_stale_all_stale() {
     assert!(bd_stale.status.success());
     let br_json = extract_json_payload(&br_stale.stdout);
     let bd_json = extract_json_payload(&bd_stale.stdout);
-    let br_arr = serde_json::from_str::<Value>(&br_json).unwrap().as_array().unwrap().len();
-    let bd_arr = serde_json::from_str::<Value>(&bd_json).unwrap().as_array().unwrap().len();
-    assert_eq!(br_arr, 1);
-    assert_eq!(bd_arr, 1);
-    compare_json(&br_json, &bd_json, &CompareMode::ContainsFields(vec![
-        "title".to_string(), "status".to_string(), "issue_type".to_string()
-    ])).expect("JSON mismatch");
+
+    log_timings("stale_all_stale", &br_stale, &bd_stale);
+    compare_json(&br_json, &bd_json, &CompareMode::NormalizedJson).expect("JSON mismatch");
     info!("conformance_stale_all_stale passed");
 }
 
@@ -11918,9 +12010,25 @@ fn conformance_version_semver() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
     let br_ver = workspace.run_br(["version", "--json"], "version");
+    let bd_ver = workspace.run_bd(["version", "--json"], "version");
+
     let br_json = extract_json_payload(&br_ver.stdout);
+    let bd_json = extract_json_payload(&bd_ver.stdout);
+
     let br_val: Value = serde_json::from_str(&br_json).unwrap();
-    let version = br_val["version"].as_str().unwrap();
-    assert!(version.contains('.'));
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap();
+
+    let br_version = br_val["version"].as_str().unwrap_or("");
+    let bd_version = bd_val["version"].as_str().unwrap_or("");
+
+    let is_semver = |v: &str| {
+        let parts: Vec<&str> = v.split('.').collect();
+        parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    };
+
+    assert!(is_semver(br_version), "br version is not semver: {br_version}");
+    assert!(is_semver(bd_version), "bd version is not semver: {bd_version}");
+
+    log_timings("version_semver", &br_ver, &bd_ver);
     info!("conformance_version_semver passed");
 }
