@@ -45,6 +45,12 @@ pub fn normalize_output(output: &str) -> String {
     let date_re = Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex");
     normalized = date_re.replace_all(&normalized, "YYYY-MM-DD").to_string();
 
+    // Mask git hash in version string e.g. (main@91a4389)
+    let version_re = Regex::new(r"\(main@[a-f0-9]+\)").expect("version regex");
+    normalized = version_re
+        .replace_all(&normalized, "(main@GIT_HASH)")
+        .to_string();
+
     normalized
 }
 
