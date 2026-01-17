@@ -108,10 +108,28 @@ fn dep_add(
 
     // Parse and validate dependency type
     let dep_type_str = &args.dep_type;
-    let dep_type: DependencyType = dep_type_str.parse().unwrap_or_else(|_| {
-        eprintln!("Warning: Unknown dependency type '{dep_type_str}', using 'blocks'");
-        DependencyType::Blocks
-    });
+    let dep_type: DependencyType = dep_type_str.parse().map_err(|_| {
+        BeadsError::Validation {
+            field: "type".to_string(),
+            reason: format!("Invalid dependency type: {dep_type_str}"),
+        }
+    })?;
+
+    // Disallow accidental custom types from typos
+    if let DependencyType::Custom(_) = dep_type {
+        // We enforce standard types for reliability unless it looks like a deliberate custom type
+        // For now, let's strictly enforce known types to prevent typos like "parent_child"
+        // which would otherwise be accepted as a non-blocking custom type.
+        return Err(BeadsError::Validation {
+            field: "type".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{dep_type_str}'. \
+                 Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
 
     // Self-dependency check
     if issue_id == depends_on_id {

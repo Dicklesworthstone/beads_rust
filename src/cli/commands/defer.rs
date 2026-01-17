@@ -450,6 +450,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_defer_time_negative() {
+        let before = Utc::now();
+        let result = parse_flexible_timestamp("-1d", "defer_until").unwrap();
+        let after = Utc::now();
+
+        // Result should be about 1 day ago
+        assert!(result < before - Duration::hours(23));
+        assert!(result > after - Duration::hours(25));
+    }
+
+    #[test]
     fn execute_defer_sets_status_and_until() {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");

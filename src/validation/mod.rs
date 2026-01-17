@@ -267,7 +267,7 @@ pub fn is_valid_id_format(id: &str) -> bool {
         return false;
     }
 
-    if hash.len() < 3 || hash.len() > 8 {
+    if hash.len() < 1 || hash.len() > 25 {
         return false;
     }
 
@@ -682,9 +682,21 @@ mod tests {
     fn id_format_validation_rejects_invalid_ids() {
         assert!(!is_valid_id_format("BD-abc123"));
         assert!(!is_valid_id_format("bd-ABC"));
-        assert!(!is_valid_id_format("bd-1"));
-        assert!(!is_valid_id_format("bd-abc123456"));
+        // 1 char hash is now allowed (min 1)
+        assert!(is_valid_id_format("bd-1"));
+        // 9 char hash is now allowed (max 25)
+        assert!(is_valid_id_format("bd-abc123456"));
+        
         assert!(!is_valid_id_format("bd_abc"));
+        
+        // Too long (26 chars)
+        assert!(!is_valid_id_format("bd-abc12345678901234567890123456"));
+    }
+
+    #[test]
+    fn id_format_validation_accepts_long_hash() {
+        // Fallback generates 12+ chars. Should be accepted.
+        assert!(is_valid_id_format("bd-abc123456789"));
     }
 
     // =========================================================================

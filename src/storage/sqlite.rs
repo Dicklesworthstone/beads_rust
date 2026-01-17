@@ -2173,6 +2173,39 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get all comments for all issues.
+    ///
+    /// Returns a map from `issue_id` to its list of comments.
+    /// This avoids N+1 queries when populating issues for export.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_all_comments(&self) -> Result<HashMap<String, Vec<Comment>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, issue_id, author, text, created_at
+             FROM comments
+             ORDER BY issue_id, created_at ASC",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok(Comment {
+                id: row.get(0)?,
+                issue_id: row.get(1)?,
+                author: row.get(2)?,
+                body: row.get(3)?,
+                created_at: parse_datetime(&row.get::<_, String>(4)?),
+            })
+        })?;
+
+        let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
+        for row in rows {
+            let comment = row?;
+            map.entry(comment.issue_id.clone()).or_default().push(comment);
+        }
+        Ok(map)
+    }
+
     /// Get all labels for all issues.
     ///
     /// Returns a map from `issue_id` to its list of labels.
@@ -2521,6 +2554,10 @@ impl SqliteStorage {
     }
 
     /// Set metadata (in tx).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn set_metadata_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
@@ -2530,6 +2567,10 @@ impl SqliteStorage {
     }
 
     /// Clear all export hashes (in tx).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn clear_all_export_hashes_in_tx(conn: &Connection) -> Result<usize> {
         let count = conn.execute("DELETE FROM export_hashes", [])?;
         Ok(count)
@@ -2732,6 +2773,10 @@ impl SqliteStorage {
     }
 
     /// Get dependencies as full Dependency structs for export.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn get_dependencies_full(&self, issue_id: &str) -> Result<Vec<crate::model::Dependency>> {
         let mut stmt = self.conn.prepare(
             "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
@@ -4324,5 +4369,70 @@ mod tests {
         // Delete non-existent key
         let deleted_again = storage.delete_config("nonexistent").unwrap();
         assert!(!deleted_again, "Should return false when key doesn't exist");
+    }
+
+    #[test]
+    fn test_open_creates_database() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("new_db.db");
+
+        assert!(!db_path.exists(), "Database should not exist yet");
+
+        let _storage = SqliteStorage::open(&db_path).unwrap();
+
+        assert!(db_path.exists(), "Database file should be created");
+    }
+
+    #[test]
+    fn test_pragmas_are_set_correctly() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        // Check foreign keys are enabled
+        let fk: i32 = storage
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "Foreign keys should be enabled");
+
+        // Check journal mode (memory DBs use 'memory' mode)
+        let mode: String = storage
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            mode.to_lowercase() == "wal" || mode.to_lowercase() == "memory",
+            "Journal mode should be WAL or memory"
+        );
+    }
+
+    #[test]
+    fn test_create_duplicate_id_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-dup-1", "First issue", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Try to create another issue with the same ID
+        let dup = make_issue("bd-dup-1", "Duplicate", Status::Open, 2, None, t1, None);
+        let result = storage.create_issue(&dup, "tester");
+
+        assert!(result.is_err(), "Creating duplicate ID should fail");
+    }
+
+    #[test]
+    fn test_get_issue_not_found_returns_none() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        let result = storage.get_issue("nonexistent-id").unwrap();
+
+        assert!(result.is_none(), "Getting non-existent issue should return None");
+    }
+
+    #[test]
+    fn test_open_nonexistent_parent_fails() {
+        let result = SqliteStorage::open(Path::new("/nonexistent/path/to/db.db"));
+
+        assert!(result.is_err(), "Opening DB in non-existent directory should fail");
     }
 }

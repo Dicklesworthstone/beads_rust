@@ -17,7 +17,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
 use beads_rust::model::{Issue, IssueType, Priority, Status};
-use beads_rust::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::io::Cursor;

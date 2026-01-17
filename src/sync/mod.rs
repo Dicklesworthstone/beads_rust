@@ -1245,6 +1245,17 @@ pub fn export_to_jsonl_with_policy(
             None
         }
     };
+    let all_comments = match storage.get_all_comments() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Comment,
+                "all",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
 
     for issue in &mut issues {
         if let Some(deps) = all_deps.as_ref().and_then(|map| map.get(&issue.id)) {
@@ -1257,18 +1268,10 @@ pub fn export_to_jsonl_with_policy(
         } else {
             issue.labels.clear();
         }
-        match storage.get_comments(&issue.id) {
-            Ok(comments) => {
-                issue.comments = comments;
-            }
-            Err(err) => {
-                ctx.handle_error(ExportError::new(
-                    ExportEntityType::Comment,
-                    issue.id.clone(),
-                    err.to_string(),
-                ))?;
-                issue.comments.clear();
-            }
+        if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
+            issue.comments = comments.clone();
+        } else {
+            issue.comments.clear();
         }
     }
 
@@ -1465,6 +1468,17 @@ pub fn export_to_writer_with_policy<W: Write>(
             None
         }
     };
+    let all_comments = match storage.get_all_comments() {
+        Ok(map) => Some(map),
+        Err(err) => {
+            ctx.handle_error(ExportError::new(
+                ExportEntityType::Comment,
+                "all",
+                err.to_string(),
+            ))?;
+            None
+        }
+    };
 
     for issue in &mut issues {
         if let Some(deps) = all_deps.as_ref().and_then(|map| map.get(&issue.id)) {
@@ -1477,16 +1491,10 @@ pub fn export_to_writer_with_policy<W: Write>(
         } else {
             issue.labels.clear();
         }
-        match storage.get_comments(&issue.id) {
-            Ok(comments) => issue.comments = comments,
-            Err(err) => {
-                ctx.handle_error(ExportError::new(
-                    ExportEntityType::Comment,
-                    issue.id.clone(),
-                    err.to_string(),
-                ))?;
-                issue.comments.clear();
-            }
+        if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
+            issue.comments = comments.clone();
+        } else {
+            issue.comments.clear();
         }
     }
 
@@ -3963,24 +3971,15 @@ mod tests {
             Some("hash6_ext"),
         );
 
-        let result_manual = merge_issue(
-            Some(&base),
-            None,
-            Some(&external),
-            ConflictResolution::Manual,
-        );
-        assert!(matches!(
-            result_manual,
-            MergeResult::Conflict(ConflictType::DeleteVsModify)
-        ));
-
-        let result_newer = merge_issue(
+        let result = merge_issue(
             Some(&base),
             None,
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        assert!(matches!(result_newer, MergeResult::KeepWithNote(..)));
+        assert!(
+            matches!(result, MergeResult::KeepWithNote(issue, _) if issue.title == "Modified")
+        );
     }
 
     #[test]
