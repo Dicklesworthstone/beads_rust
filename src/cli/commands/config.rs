@@ -312,44 +312,78 @@ fn set_config_value(kv: &str, json_mode: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete a config value from the database.
-///
-/// This only removes DB-stored config values, not YAML config.
+/// Delete a config value from the database AND user config (YAML).
 fn delete_config_value(key: &str, json_mode: bool, overrides: &CliOverrides) -> Result<()> {
-    // Need beads dir for database access
-    let beads_dir = discover_beads_dir(None)?;
+    // 1. Delete from DB
+    let beads_dir = discover_beads_dir(None).ok();
+    let mut db_deleted = false;
 
-    // Open storage
-    let mut storage_ctx = crate::config::open_storage_with_cli(&beads_dir, overrides)?;
-    let storage = &mut storage_ctx.storage;
-
-    // Check if this is a startup-only key (can't be stored in DB)
-    if crate::config::is_startup_key(key) {
-        return Err(crate::error::BeadsError::Validation {
-            field: "config".to_string(),
-            reason: format!(
-                "Key '{key}' is a startup-only key stored in YAML config, not the database. \
-                 Edit the config file directly with 'br config --edit'."
-            ),
-        });
+    if let Some(dir) = beads_dir {
+        // Only try to open DB if we have a beads dir
+        if let Ok(mut storage_ctx) = crate::config::open_storage_with_cli(&dir, overrides) {
+            // We ignore is_startup_key check here to allow deleting from YAML even if not in DB
+            db_deleted = storage_ctx.storage.delete_config(key).unwrap_or(false);
+        }
     }
 
-    // Delete from DB
-    let deleted = storage.delete_config(key)?;
+    // 2. Delete from User YAML
+    let mut yaml_deleted = false;
+    if let Some(config_path) = get_user_config_path() {
+        if config_path.exists() {
+            let contents = fs::read_to_string(&config_path)?;
+            let mut config: serde_yaml::Value = serde_yaml::from_str(&contents)
+                .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::default()));
+            
+            if delete_from_yaml(&mut config, key) {
+                let yaml_str = serde_yaml::to_string(&config)?;
+                fs::write(&config_path, yaml_str)?;
+                yaml_deleted = true;
+            }
+        }
+    }
 
     if json_mode {
         let output = json!({
             "key": key,
-            "deleted": deleted,
+            "deleted_from_db": db_deleted,
+            "deleted_from_yaml": yaml_deleted,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
-    } else if deleted {
-        println!("Deleted config key: {key}");
+    } else if db_deleted || yaml_deleted {
+        if db_deleted && yaml_deleted {
+            println!("Deleted config key: {key} (from DB and YAML)");
+        } else if db_deleted {
+            println!("Deleted config key: {key} (from DB)");
+        } else {
+            println!("Deleted config key: {key} (from YAML)");
+        }
     } else {
-        println!("Config key not found in database: {key}");
+        println!("Config key not found: {key}");
     }
 
     Ok(())
+}
+
+fn delete_from_yaml(value: &mut serde_yaml::Value, key: &str) -> bool {
+    let parts: Vec<&str> = key.split('.').collect();
+    delete_nested(value, &parts)
+}
+
+fn delete_nested(value: &mut serde_yaml::Value, path: &[&str]) -> bool {
+    if path.is_empty() { return false; }
+    
+    if let serde_yaml::Value::Mapping(map) = value {
+        let key = serde_yaml::Value::String(path[0].to_string());
+        
+        if path.len() == 1 {
+            return map.remove(&key).is_some();
+        }
+        
+        if let Some(child) = map.get_mut(&key) {
+            return delete_nested(child, &path[1..]);
+        }
+    }
+    false
 }
 
 /// Show merged configuration.

@@ -70,7 +70,7 @@ pub fn execute(args: &ReopenArgs, json: bool, cli: &config::CliOverrides) -> Res
     // Resolve all IDs
     let resolved_ids = resolver.resolve_all(
         &ids,
-        |id| all_ids.iter().any(|existing| existing == id),
+        |id| all_ids.binary_search_by(|p| p.as_str().cmp(id)).is_ok(),
         |hash| find_matching_ids(&all_ids, hash),
     )?;
 
