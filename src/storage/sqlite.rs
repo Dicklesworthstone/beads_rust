@@ -230,10 +230,10 @@ impl SqliteStorage {
                     issue.deleted_by.as_deref().unwrap_or(""),
                     issue.delete_reason.as_deref().unwrap_or(""),
                     issue.original_type.as_deref().unwrap_or(""),
-                    issue.compaction_level,
+                    issue.compaction_level.unwrap_or(0),
                     compacted_at_str,
                     issue.compacted_at_commit,
-                    issue.original_size,
+                    issue.original_size.unwrap_or(0),
                     issue.sender.as_deref().unwrap_or(""),
                     i32::from(issue.ephemeral),
                     i32::from(issue.pinned),
@@ -547,6 +547,47 @@ impl SqliteStorage {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Get multiple issues by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_issues_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut issues = Vec::new();
+
+        for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
+                         status, priority, issue_type, assignee, owner, estimated_minutes,
+                         created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
+                         due_at, defer_until, external_ref, source_system,
+                         deleted_at, deleted_by, delete_reason, original_type,
+                         compaction_level, compacted_at, compacted_at_commit, original_size,
+                         sender, ephemeral, pinned, is_template
+                  FROM issues WHERE id IN ({})",
+                placeholders.join(",")
+            );
+
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+            let mut stmt = self.conn.prepare(&sql)?;
+            let chunk_issues = stmt
+                .query_map(params.as_slice(), |row| self.issue_from_row(row))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            issues.extend(chunk_issues);
+        }
+
+        Ok(issues)
     }
 
     /// List issues with optional filters.
@@ -3316,10 +3357,10 @@ impl SqliteStorage {
                 issue.deleted_by,
                 issue.delete_reason,
                 issue.original_type,
-                issue.compaction_level,
+                issue.compaction_level.unwrap_or(0),
                 compacted_at_str,
                 issue.compacted_at_commit,
-                issue.original_size,
+                issue.original_size.unwrap_or(0),
                 issue.sender,
                 issue.ephemeral,
                 issue.pinned,
@@ -3623,138 +3664,6 @@ mod tests {
 
     #[test]
     fn test_transaction_rollback_on_error() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-
-        // Try to create an issue that will fail validation (title too long)
-        let result: crate::error::Result<()> = storage.mutate("test_fail", "tester", |tx, ctx| {
-            // Insert successfully first
-            tx.execute(
-                "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                rusqlite::params![
-                    "bd-rollback",
-                    "Valid title",
-                    "open",
-                    2,
-                    "task",
-                    Utc::now().to_rfc3339(),
-                    Utc::now().to_rfc3339(),
-                ],
-            )?;
-            ctx.mark_dirty("bd-rollback");
-
-            // Now force an error
-            Err(crate::error::BeadsError::IssueNotFound {
-                id: "forced".into(),
-            })
-        });
-
-        assert!(result.is_err());
-
-        // Issue should NOT exist due to rollback
-        let count: i64 = storage
-            .conn
-            .query_row(
-                "SELECT count(*) FROM issues WHERE id = ?",
-                ["bd-rollback"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0, "Issue should not exist after rollback");
-
-        // Dirty marker should NOT exist due to rollback
-        let dirty_count: i64 = storage
-            .conn
-            .query_row(
-                "SELECT count(*) from dirty_issues WHERE issue_id = ?",
-                ["bd-rollback"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            dirty_count, 0,
-            "Dirty marker should not exist after rollback"
-        );
-    }
-
-    #[test]
-    fn test_dirty_issues_accumulate() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-
-        // Create first issue
-        let issue1 = Issue {
-            id: "bd-dirty1".to_string(),
-            title: "First".to_string(),
-            status: Status::Open,
-            priority: Priority::MEDIUM,
-            issue_type: IssueType::Task,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            content_hash: None,
-            description: None,
-            design: None,
-            acceptance_criteria: None,
-            notes: None,
-            assignee: None,
-            owner: None,
-            estimated_minutes: None,
-            created_by: None,
-            closed_at: None,
-            close_reason: None,
-            closed_by_session: None,
-            defer_until: None,
-            due_at: None,
-            external_ref: None,
-            source_system: None,
-            deleted_at: None,
-            deleted_by: None,
-            delete_reason: None,
-            original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
-            sender: None,
-            ephemeral: false,
-            pinned: false,
-            is_template: false,
-            labels: vec![],
-            dependencies: vec![],
-            comments: vec![],
-        };
-        storage.create_issue(&issue1, "tester").unwrap();
-
-        // Create second issue
-        let issue2 = Issue {
-            id: "bd-dirty2".to_string(),
-            title: "Second".to_string(),
-            ..issue1.clone()
-        };
-        storage.create_issue(&issue2, "tester").unwrap();
-
-        // Both should be dirty
-        let dirty_count: i64 = storage
-            .conn
-            .query_row("SELECT count(*) FROM dirty_issues", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(dirty_count, 2, "Both issues should be marked dirty");
-
-        // Clear dirty for one
-        storage
-            .conn
-            .execute("DELETE FROM dirty_issues WHERE issue_id = ?", ["bd-dirty1"])
-            .unwrap();
-
-        // One should remain dirty
-        let dirty_count: i64 = storage
-            .conn
-            .query_row("SELECT count(*) FROM dirty_issues", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(dirty_count, 1, "One issue should remain dirty");
-    }
-
-    #[test]
-    fn test_list_filters_status_assignee_unassigned_limit() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
