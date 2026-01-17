@@ -862,12 +862,18 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blocked_by_blocks_deps_only(&self) -> Result<HashSet<String>> {
+        // Returns issues that:
+        // 1. Have a 'blocks' type dependency
+        // 2. Where the blocker is not closed/tombstone
+        // 3. AND the blocked issue itself is not closed/tombstone
         let mut stmt = self.conn.prepare(
             r"SELECT DISTINCT d.issue_id
               FROM dependencies d
-              JOIN issues i ON d.depends_on_id = i.id
+              JOIN issues blocker ON d.depends_on_id = blocker.id
+              JOIN issues blocked ON d.issue_id = blocked.id
               WHERE d.type = 'blocks'
-                AND i.status NOT IN ('closed', 'tombstone')",
+                AND blocker.status NOT IN ('closed', 'tombstone')
+                AND blocked.status NOT IN ('closed', 'tombstone')",
         )?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
@@ -1668,14 +1674,20 @@ impl SqliteStorage {
     /// Get all unique labels with their issue counts.
     ///
     /// Returns a vector of (label, count) pairs sorted alphabetically by label.
+    /// Excludes labels on tombstoned (deleted) issues.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
     pub fn get_unique_labels_with_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT label, COUNT(*) as count FROM labels GROUP BY label ORDER BY label")?;
+        let mut stmt = self.conn.prepare(
+            r"SELECT l.label, COUNT(*) as count
+              FROM labels l
+              JOIN issues i ON l.issue_id = i.id
+              WHERE i.status != 'tombstone'
+              GROUP BY l.label
+              ORDER BY l.label",
+        )?;
         let results = stmt
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))

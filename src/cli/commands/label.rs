@@ -8,7 +8,6 @@ use crate::error::{BeadsError, Result};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info};
 
@@ -245,10 +244,8 @@ fn label_list(
         }
     } else {
         // List all unique labels (without counts - use list-all for counts)
-        let all_labels = storage.get_all_labels()?;
-        let mut unique_labels: Vec<String> = all_labels.values().flatten().cloned().collect();
-        unique_labels.sort();
-        unique_labels.dedup();
+        let labels_with_counts = storage.get_unique_labels_with_counts()?;
+        let unique_labels: Vec<String> = labels_with_counts.into_iter().map(|(l, _)| l).collect();
 
         if json {
             println!("{}", serde_json::to_string_pretty(&unique_labels)?);
@@ -266,22 +263,15 @@ fn label_list(
 }
 
 fn label_list_all(storage: &SqliteStorage, json: bool) -> Result<()> {
-    let all_labels = storage.get_all_labels()?;
+    let labels_with_counts = storage.get_unique_labels_with_counts()?;
 
-    // Count occurrences of each label
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for labels in all_labels.values() {
-        for label in labels {
-            *counts.entry(label.clone()).or_insert(0) += 1;
-        }
-    }
-
-    // Sort by label name
-    let mut label_counts: Vec<LabelCount> = counts
+    let label_counts: Vec<LabelCount> = labels_with_counts
         .into_iter()
-        .map(|(label, count)| LabelCount { label, count })
+        .map(|(label, count)| LabelCount {
+            label,
+            count: usize::try_from(count).unwrap_or(0),
+        })
         .collect();
-    label_counts.sort_by(|a, b| a.label.cmp(&b.label));
 
     if json {
         println!("{}", serde_json::to_string_pretty(&label_counts)?);
