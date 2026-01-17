@@ -489,7 +489,7 @@ fn bench_cycle_detection(c: &mut Criterion) {
 
 /// Benchmark ID generation.
 fn bench_generate_id(c: &mut Criterion) {
-    use beads_rust::util::id::{IdGenerator, IdConfig};
+    use beads_rust::util::id::{IdConfig, IdGenerator};
     use std::collections::HashSet;
 
     let mut group = c.benchmark_group("id/generate");
@@ -501,14 +501,7 @@ fn bench_generate_id(c: &mut Criterion) {
 
         b.iter(|| {
             let title = format!("Benchmark issue {counter}");
-            let id = generator.generate(
-                black_box(&title),
-                None,
-                None,
-                now,
-                counter,
-                |_| false,
-            );
+            let id = generator.generate(black_box(&title), None, None, now, counter, |_| false);
             counter += 1;
             black_box(id)
         });
@@ -523,14 +516,9 @@ fn bench_generate_id(c: &mut Criterion) {
 
         b.iter(|| {
             let title = format!("Benchmark issue {counter}");
-            let id = generator.generate(
-                black_box(&title),
-                None,
-                None,
-                now,
-                counter,
-                |id| existing.contains(id),
-            );
+            let id = generator.generate(black_box(&title), None, None, now, counter, |id| {
+                existing.contains(id)
+            });
             existing.insert(id.clone());
             counter += 1;
             black_box(id)
@@ -580,7 +568,7 @@ fn bench_content_hash(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::new("batch", size), &issues, |b, issues| {
             b.iter(|| {
-                let hashes: Vec<_> = issues.iter().map(|i| content_hash(i)).collect();
+                let hashes: Vec<_> = issues.iter().map(content_hash).collect();
                 black_box(hashes)
             });
         });
@@ -606,7 +594,9 @@ fn bench_search(c: &mut Criterion) {
             &storage,
             |b, storage| {
                 b.iter(|| {
-                    let results = storage.search_issues(black_box("Benchmark"), &filters).unwrap();
+                    let results = storage
+                        .search_issues(black_box("Benchmark"), &filters)
+                        .unwrap();
                     black_box(results)
                 });
             },
@@ -617,7 +607,9 @@ fn bench_search(c: &mut Criterion) {
             &storage,
             |b, storage| {
                 b.iter(|| {
-                    let results = storage.search_issues(black_box("Description"), &filters).unwrap();
+                    let results = storage
+                        .search_issues(black_box("Description"), &filters)
+                        .unwrap();
                     black_box(results)
                 });
             },
@@ -647,6 +639,11 @@ criterion_group!(
 
 criterion_group!(sync_benches, bench_export, bench_import,);
 
-criterion_group!(id_benches, bench_generate_id, bench_id_hash, bench_content_hash,);
+criterion_group!(
+    id_benches,
+    bench_generate_id,
+    bench_id_hash,
+    bench_content_hash,
+);
 
 criterion_main!(storage_benches, sync_benches, id_benches);
