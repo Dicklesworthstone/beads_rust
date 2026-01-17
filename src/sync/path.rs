@@ -408,9 +408,10 @@ pub fn require_valid_sync_path(path: &Path, beads_dir: &Path) -> Result<()> {
 #[must_use]
 pub fn is_sync_path_allowed(path: &Path, beads_dir: &Path) -> bool {
     // Quick check without full canonicalization for obvious cases
-    let path_str = path.to_string_lossy();
-    if path_str.contains("..") {
-        return false;
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return false;
+        }
     }
 
     // Check if path is under beads_dir and has allowed extension
@@ -484,12 +485,13 @@ pub fn validate_sync_path_with_external(
         }
 
         // Check for traversal attempts even in external paths
-        let path_str = path.to_string_lossy();
-        if path_str.contains("..") {
-            return Err(BeadsError::Config(format!(
-                "Path '{}' contains traversal sequences",
-                path.display()
-            )));
+        for component in path.components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(BeadsError::Config(format!(
+                    "Path '{}' contains traversal sequences",
+                    path.display()
+                )));
+            }
         }
 
         return Ok(());

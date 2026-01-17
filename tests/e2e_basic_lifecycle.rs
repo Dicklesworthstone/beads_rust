@@ -112,7 +112,11 @@ fn e2e_sync_roundtrip() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let create = run_br(&workspace, ["create", "Original title"], "create");
+    let create = run_br(
+        &workspace,
+        ["create", "Original title", "--no-auto-flush"],
+        "create",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let id = parse_created_id(&create.stdout);
     assert!(!id.is_empty(), "missing created id");
@@ -223,7 +227,11 @@ fn e2e_sync_manifest() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let create = run_br(&workspace, ["create", "Manifest issue"], "create");
+    let create = run_br(
+        &workspace,
+        ["create", "Manifest issue", "--no-auto-flush"],
+        "create",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
 
     let sync = run_br(
@@ -532,13 +540,21 @@ fn e2e_sync_content_hash_consistency() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // Create issues
-    let create1 = run_br(&workspace, ["create", "Issue A"], "create1");
+    let create1 = run_br(
+        &workspace,
+        ["create", "Issue A", "--no-auto-flush"],
+        "create1",
+    );
     assert!(
         create1.status.success(),
         "create1 failed: {}",
         create1.stderr
     );
-    let create2 = run_br(&workspace, ["create", "Issue B"], "create2");
+    let create2 = run_br(
+        &workspace,
+        ["create", "Issue B", "--no-auto-flush"],
+        "create2",
+    );
     assert!(
         create2.status.success(),
         "create2 failed: {}",
