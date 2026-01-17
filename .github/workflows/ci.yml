@@ -244,9 +244,64 @@ jobs:
             ${{ runner.os }}-cargo-bench-
             ${{ runner.os }}-cargo-
 
+      - name: Snapshot benchmark baseline (if present)
+        run: |
+          if [ -d target/criterion ]; then
+            mkdir -p target/criterion_prev
+            cp -a target/criterion/. target/criterion_prev/
+          fi
+
       - name: Run benchmarks
-        run: cargo bench --bench storage_perf -- --noplot
+        run: cargo bench --bench benchmarks -- --noplot --save-baseline main
         continue-on-error: true
+
+      - name: Check benchmark regressions (10% threshold)
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+          import os
+          import sys
+
+          threshold = 1.10
+          prev_root = "target/criterion_prev"
+          curr_root = "target/criterion"
+
+          if not os.path.isdir(prev_root):
+              print("benchmark_regression: no previous baseline; skipping")
+              sys.exit(0)
+
+          prev_files = glob.glob(os.path.join(prev_root, "**", "main", "estimates.json"), recursive=True)
+          if not prev_files:
+              print("benchmark_regression: no baseline estimates; skipping")
+              sys.exit(0)
+
+          regressions = []
+          for prev_path in prev_files:
+              rel = os.path.relpath(prev_path, prev_root)
+              curr_path = os.path.join(curr_root, rel)
+              if not os.path.exists(curr_path):
+                  continue
+              with open(prev_path, "r", encoding="utf-8") as fh:
+                  prev = json.load(fh)
+              with open(curr_path, "r", encoding="utf-8") as fh:
+                  curr = json.load(fh)
+              prev_mean = prev.get("mean", {}).get("point_estimate", 0.0)
+              curr_mean = curr.get("mean", {}).get("point_estimate", 0.0)
+              if prev_mean <= 0:
+                  continue
+              ratio = curr_mean / prev_mean
+              if ratio > threshold:
+                  regressions.append((rel, prev_mean, curr_mean, ratio))
+
+          if regressions:
+              print("benchmark_regression: failures (mean > 10% slower)")
+              for rel, prev_mean, curr_mean, ratio in regressions:
+                  print(f"  {rel}: prev={prev_mean:.2f} curr={curr_mean:.2f} ratio={ratio:.2f}")
+              sys.exit(1)
+
+          print("benchmark_regression: ok")
+          PY
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4

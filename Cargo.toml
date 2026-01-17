@@ -66,7 +66,8 @@ insta = { version = "1.38", features = ["json", "yaml"] }
 proptest = "1.6"
 
 [[bench]]
-name = "storage_perf"
+name = "benchmarks"
+path = "benches/storage_perf.rs"
 harness = false
 
 [profile.release]

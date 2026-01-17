@@ -25,7 +25,9 @@ use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolic
 use chrono::Utc;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::io::Cursor;
+use std::sync::Once;
 use tempfile::TempDir;
+use tracing::info;
 
 /// Create a test issue with the given index.
 fn create_test_issue(i: usize) -> Issue {
@@ -80,6 +82,13 @@ fn create_test_issue(i: usize) -> Issue {
     }
 }
 
+fn init_bench_logging() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = beads_rust::logging::init_logging(0, false, None);
+    });
+}
+
 /// Set up a database with a given number of issues.
 fn setup_db_with_issues(count: usize) -> (TempDir, SqliteStorage) {
     let dir = TempDir::new().expect("Failed to create temp dir");
@@ -131,6 +140,8 @@ fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteS
 
 /// Benchmark single issue creation.
 fn bench_create_single(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/create");
     let mut group = c.benchmark_group("storage/create");
 
     group.bench_function("single", |b| {
@@ -149,13 +160,17 @@ fn bench_create_single(c: &mut Criterion) {
     });
 
     group.finish();
+    info!("bench_group_end: storage/create");
 }
 
 /// Benchmark batch issue creation.
 fn bench_create_batch(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/create_batch");
     let mut group = c.benchmark_group("storage/create_batch");
 
     for size in [10, 100, 500] {
+        info!("bench_case: storage/create_batch size={size}");
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter_with_setup(
@@ -178,10 +193,13 @@ fn bench_create_batch(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: storage/create_batch");
 }
 
 /// Benchmark updating an issue.
 fn bench_update_issue(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/update");
     let mut group = c.benchmark_group("storage/update");
 
     // Pre-populate database with issues
@@ -226,11 +244,50 @@ fn bench_update_issue(c: &mut Criterion) {
     });
 
     group.finish();
+    info!("bench_group_end: storage/update");
+    drop(dir);
+}
+
+/// Benchmark closing an issue with a reason.
+fn bench_close_issue_with_reason(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/close");
+    let mut group = c.benchmark_group("storage/close");
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("bench.db");
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+    for i in 0..100 {
+        let issue = create_test_issue(i);
+        storage.create_issue(&issue, "benchmark").unwrap();
+    }
+
+    let mut counter = 0usize;
+    group.bench_function("with_reason", |b| {
+        b.iter(|| {
+            let id = format!("bench-{:06}", counter % 100);
+            let update = IssueUpdate {
+                status: Some(Status::Closed),
+                closed_at: Some(Some(Utc::now())),
+                close_reason: Some(Some("benchmark close".to_string())),
+                closed_by_session: Some(Some("bench-session".to_string())),
+                ..IssueUpdate::default()
+            };
+            let _ = storage.update_issue(black_box(&id), black_box(&update), "benchmark");
+            counter += 1;
+        });
+    });
+
+    group.finish();
+    info!("bench_group_end: storage/close");
     drop(dir);
 }
 
 /// Benchmark deleting an issue (soft delete / tombstone).
 fn bench_delete_issue(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/delete");
     let mut group = c.benchmark_group("storage/delete");
 
     group.bench_function("single", |b| {
@@ -255,6 +312,7 @@ fn bench_delete_issue(c: &mut Criterion) {
     });
 
     group.finish();
+    info!("bench_group_end: storage/delete");
 }
 
 // =============================================================================
@@ -263,9 +321,12 @@ fn bench_delete_issue(c: &mut Criterion) {
 
 /// Benchmark listing issues.
 fn bench_list_issues(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/list");
     let mut group = c.benchmark_group("storage/list");
 
     for size in [100, 500, 1000, 2000, 5000] {
+        info!("bench_case: storage/list size={size}");
         let (_dir, storage) = setup_db_with_issues(size);
 
         group.throughput(Throughput::Elements(size as u64));
@@ -279,13 +340,43 @@ fn bench_list_issues(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: storage/list");
+}
+
+/// Benchmark listing issues with filters applied.
+fn bench_list_issues_filtered(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/list_filtered");
+    let mut group = c.benchmark_group("storage/list_filtered");
+
+    let (_dir, storage) = setup_db_with_issues(1000);
+    let filters = ListFilters {
+        statuses: Some(vec![Status::Open]),
+        priorities: Some(vec![Priority::HIGH, Priority::MEDIUM]),
+        types: Some(vec![IssueType::Task, IssueType::Bug]),
+        labels: Some(vec!["label-1".to_string()]),
+        ..ListFilters::default()
+    };
+
+    group.bench_function("filtered", |b| {
+        b.iter(|| {
+            let issues = storage.list_issues(black_box(&filters)).unwrap();
+            black_box(issues)
+        });
+    });
+
+    group.finish();
+    info!("bench_group_end: storage/list_filtered");
 }
 
 /// Benchmark ready query with dependencies.
 fn bench_ready_query(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/ready");
     let mut group = c.benchmark_group("storage/ready");
 
     for (issues, deps) in [(100, 200), (500, 1000), (1000, 2000)] {
+        info!("bench_case: storage/ready issues={issues} deps={deps}");
         let (_dir, storage) = setup_db_with_deps(issues, deps);
         let label = format!("{issues}i_{deps}d");
 
@@ -305,13 +396,17 @@ fn bench_ready_query(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: storage/ready");
 }
 
 /// Benchmark blocked issues query.
 fn bench_blocked_query(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/blocked");
     let mut group = c.benchmark_group("storage/blocked");
 
     for (issues, deps) in [(100, 200), (500, 1000)] {
+        info!("bench_case: storage/blocked issues={issues} deps={deps}");
         let (_dir, storage) = setup_db_with_deps(issues, deps);
         let label = format!("{issues}i_{deps}d");
 
@@ -328,6 +423,7 @@ fn bench_blocked_query(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: storage/blocked");
 }
 
 // =============================================================================
@@ -336,9 +432,12 @@ fn bench_blocked_query(c: &mut Criterion) {
 
 /// Benchmark JSONL export.
 fn bench_export(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: sync/export");
     let mut group = c.benchmark_group("sync/export");
 
     for size in [100, 500, 1000, 2000, 5000] {
+        info!("bench_case: sync/export size={size}");
         let (_dir, storage) = setup_db_with_issues(size);
 
         group.throughput(Throughput::Elements(size as u64));
@@ -352,13 +451,17 @@ fn bench_export(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: sync/export");
 }
 
 /// Benchmark JSONL import.
 fn bench_import(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: sync/import");
     let mut group = c.benchmark_group("sync/import");
 
     for size in [100, 500, 1000, 2000, 5000] {
+        info!("bench_case: sync/import size={size}");
         // Create source data
         let (_src_dir, src_storage) = setup_db_with_issues(size);
         let mut buffer = Cursor::new(Vec::new());
@@ -389,6 +492,76 @@ fn bench_import(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: sync/import");
+}
+
+/// Benchmark dirty tracking mark (updates that mark issues dirty).
+fn bench_dirty_tracking_mark(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: sync/dirty_mark");
+    let mut group = c.benchmark_group("sync/dirty_mark");
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("bench.db");
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+    for i in 0..100 {
+        let issue = create_test_issue(i);
+        storage.create_issue(&issue, "benchmark").unwrap();
+    }
+
+    let mut counter = 0usize;
+    group.bench_function("mark_100", |b| {
+        b.iter(|| {
+            let id = format!("bench-{:06}", counter % 100);
+            let update = IssueUpdate {
+                notes: Some(Some(format!("dirty-note-{counter}"))),
+                ..IssueUpdate::default()
+            };
+            let _ = storage.update_issue(black_box(&id), black_box(&update), "benchmark");
+            counter += 1;
+        });
+    });
+
+    group.finish();
+    info!("bench_group_end: sync/dirty_mark");
+    drop(dir);
+}
+
+/// Benchmark dirty tracking query (fetch dirty IDs).
+fn bench_dirty_tracking_query(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: sync/dirty_query");
+    let mut group = c.benchmark_group("sync/dirty_query");
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("bench.db");
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+    for i in 0..100 {
+        let issue = create_test_issue(i);
+        storage.create_issue(&issue, "benchmark").unwrap();
+    }
+
+    for i in 0..100 {
+        let id = format!("bench-{i:06}");
+        let update = IssueUpdate {
+            notes: Some(Some(format!("dirty-note-{i}"))),
+            ..IssueUpdate::default()
+        };
+        let _ = storage.update_issue(&id, &update, "benchmark");
+    }
+
+    group.bench_function("dirty_ids_100", |b| {
+        b.iter(|| {
+            let ids = storage.get_dirty_issue_ids().unwrap();
+            black_box(ids)
+        });
+    });
+
+    group.finish();
+    info!("bench_group_end: sync/dirty_query");
+    drop(dir);
 }
 
 // =============================================================================
@@ -397,6 +570,8 @@ fn bench_import(c: &mut Criterion) {
 
 /// Benchmark adding dependencies.
 fn bench_add_dependency(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/add_dep");
     let mut group = c.benchmark_group("storage/add_dep");
 
     group.bench_function("single", |b| {
@@ -429,10 +604,13 @@ fn bench_add_dependency(c: &mut Criterion) {
     });
 
     group.finish();
+    info!("bench_group_end: storage/add_dep");
 }
 
 /// Benchmark cycle detection.
 fn bench_cycle_detection(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/cycle_detection");
     let mut group = c.benchmark_group("storage/cycle_detection");
 
     // Create a database with complex dependency graph
@@ -480,6 +658,7 @@ fn bench_cycle_detection(c: &mut Criterion) {
     });
 
     group.finish();
+    info!("bench_group_end: storage/cycle_detection");
     drop(dir);
 }
 
@@ -492,6 +671,8 @@ fn bench_generate_id(c: &mut Criterion) {
     use beads_rust::util::id::{IdConfig, IdGenerator};
     use std::collections::HashSet;
 
+    init_bench_logging();
+    info!("bench_group_start: id/generate");
     let mut group = c.benchmark_group("id/generate");
 
     group.bench_function("single", |b| {
@@ -526,15 +707,53 @@ fn bench_generate_id(c: &mut Criterion) {
     });
 
     group.finish();
+    info!("bench_group_end: id/generate");
+}
+
+/// Benchmark ID prefix resolution against 100 known IDs.
+fn bench_resolve_id_prefix(c: &mut Criterion) {
+    use beads_rust::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+    use std::collections::HashSet;
+
+    init_bench_logging();
+    info!("bench_group_start: id/resolve_prefix");
+    let mut group = c.benchmark_group("id/resolve_prefix");
+
+    let all_ids: Vec<String> = (0..100).map(|i| format!("bd-{i:06}")).collect();
+    let id_set: HashSet<String> = all_ids.iter().cloned().collect();
+    let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+    let mut counter = 0usize;
+
+    group.bench_function("prefix_100", |b| {
+        b.iter(|| {
+            let full_id = &all_ids[counter % all_ids.len()];
+            let partial = full_id
+                .split_once('-')
+                .map_or(full_id.as_str(), |(_, hash)| hash);
+            let resolution = resolver.resolve(
+                black_box(partial),
+                |id| id_set.contains(id),
+                |hash| find_matching_ids(&all_ids, hash),
+            );
+            counter += 1;
+            black_box(resolution)
+        });
+    });
+
+    group.finish();
+    info!("bench_group_end: id/resolve_prefix");
 }
 
 /// Benchmark ID hash computation.
 fn bench_id_hash(c: &mut Criterion) {
     use beads_rust::util::id::compute_id_hash;
 
+    init_bench_logging();
+    info!("bench_group_start: id/hash");
     let mut group = c.benchmark_group("id/hash");
 
     for len in [4, 6, 8, 12] {
+        info!("bench_case: id/hash length={len}");
         group.bench_with_input(BenchmarkId::new("length", len), &len, |b, &len| {
             let input = "Benchmark issue title for hashing performance test";
             b.iter(|| {
@@ -545,12 +764,15 @@ fn bench_id_hash(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: id/hash");
 }
 
 /// Benchmark content hashing.
 fn bench_content_hash(c: &mut Criterion) {
     use beads_rust::util::content_hash;
 
+    init_bench_logging();
+    info!("bench_group_start: id/content_hash");
     let mut group = c.benchmark_group("id/content_hash");
 
     // Single issue hash
@@ -564,6 +786,7 @@ fn bench_content_hash(c: &mut Criterion) {
 
     // Batch hashing
     for size in [10, 100, 500] {
+        info!("bench_case: id/content_hash batch_size={size}");
         let issues: Vec<_> = (0..size).map(create_test_issue).collect();
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::new("batch", size), &issues, |b, issues| {
@@ -575,6 +798,7 @@ fn bench_content_hash(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: id/content_hash");
 }
 
 // =============================================================================
@@ -583,9 +807,12 @@ fn bench_content_hash(c: &mut Criterion) {
 
 /// Benchmark search operations.
 fn bench_search(c: &mut Criterion) {
+    init_bench_logging();
+    info!("bench_group_start: storage/search");
     let mut group = c.benchmark_group("storage/search");
 
     for size in [100, 500, 1000] {
+        info!("bench_case: storage/search size={size}");
         let (_dir, storage) = setup_db_with_issues(size);
         let filters = ListFilters::default();
 
@@ -617,6 +844,7 @@ fn bench_search(c: &mut Criterion) {
     }
 
     group.finish();
+    info!("bench_group_end: storage/search");
 }
 
 // =============================================================================
@@ -628,8 +856,10 @@ criterion_group!(
     bench_create_single,
     bench_create_batch,
     bench_update_issue,
+    bench_close_issue_with_reason,
     bench_delete_issue,
     bench_list_issues,
+    bench_list_issues_filtered,
     bench_ready_query,
     bench_blocked_query,
     bench_add_dependency,
@@ -637,11 +867,18 @@ criterion_group!(
     bench_search,
 );
 
-criterion_group!(sync_benches, bench_export, bench_import,);
+criterion_group!(
+    sync_benches,
+    bench_export,
+    bench_import,
+    bench_dirty_tracking_mark,
+    bench_dirty_tracking_query,
+);
 
 criterion_group!(
     id_benches,
     bench_generate_id,
+    bench_resolve_id_prefix,
     bench_id_hash,
     bench_content_hash,
 );
