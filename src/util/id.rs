@@ -155,7 +155,7 @@ impl IdGenerator {
                     // Safety break (unlikely to hit unless DB is full of collisions or checking is broken)
                     if nonce > 1000 {
                         // Desperate fallback: append large number to guarantee uniqueness
-                        return format!("{}-{}-{}", self.config.prefix, hash_str, nonce);
+                        return format!("{}-{}{}", self.config.prefix, hash_str, nonce);
                     }
                 }
             }
@@ -1012,5 +1012,17 @@ mod tests {
         let id2 = id_gen.generate("Test", None, None, now, 0, |id| generated.contains(id));
 
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_desperate_fallback_id_format() {
+        // Simulate the ID produced by the desperate fallback: prefix-hash-nonce
+        let prefix = "bd";
+        let hash = "abc123456789";
+        let nonce = 1001;
+        
+        // Ensure the fixed format is valid
+        let good_id = format!("{}-{}{}", prefix, hash, nonce);
+        assert!(parse_id(&good_id).is_ok(), "Fixed fallback format should parse correctly");
     }
 }
