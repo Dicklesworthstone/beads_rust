@@ -196,11 +196,13 @@ fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
 
 /// Parse git log output and extract issue ID references.
 ///
-/// Looks for patterns like `(bd-abc123)` or `(prefix-abc.1)` in commit messages.
+/// Looks for patterns like `(bd-abc123)` or `bd-abc123` in commit messages.
 fn parse_git_log(log_output: &str, prefix: &str) -> Result<Vec<(String, String, String)>> {
-    // Pattern matches (prefix-id) including hierarchical IDs like bd-abc.1
-    // The prefix can be any word characters, ID is alphanumeric with optional .N suffix
-    let pattern = format!(r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)", regex::escape(prefix));
+    // Pattern matches prefix-id including hierarchical IDs like bd-abc.1
+    // We use word boundaries \b to avoid matching suffix/prefix (e.g. abd-123 or bd-123a)
+    // although matching bd-123a is technically valid if 123a is the hash.
+    // The previous regex forced parens: r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)"
+    let pattern = format!(r"\b({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\b", regex::escape(prefix));
     let re = Regex::new(&pattern)
         .map_err(|e| crate::error::BeadsError::Config(format!("Invalid regex pattern: {e}")))?;
 
@@ -248,8 +250,8 @@ mod tests {
     fn test_parse_git_log_extracts_issue_ids() {
         let log = r"abc1234 Fix bug (bd-abc)
 def5678 Another commit
-ghi9012 Implement feature (bd-xyz123)
-jkl3456 Multi-ref (bd-foo) and (bd-bar)";
+ghi9012 Implement feature bd-xyz123
+jkl3456 Multi-ref (bd-foo) and bd-bar";
 
         let refs = parse_git_log(log, "bd").unwrap();
 

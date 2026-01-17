@@ -64,12 +64,17 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
         ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
     }
 
+    // Batch count dependencies/dependents
+    let issue_ids: Vec<String> = ready_issues.iter().map(|i| i.id.clone()).collect();
+    let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
+    let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
+
     // Convert to IssueWithCounts
     let issues_with_counts: Vec<IssueWithCounts> = ready_issues
         .into_iter()
         .map(|issue| {
-            let dependency_count = storage.count_dependencies(&issue.id).unwrap_or(0);
-            let dependent_count = storage.count_dependents(&issue.id).unwrap_or(0);
+            let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
+            let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
             IssueWithCounts {
                 issue,
                 dependency_count,
