@@ -29,9 +29,8 @@ fn test_dep_tree_diamond_dependency_visibility() {
     // C depends on D (C -> D)
     // Dependency direction: Child depends on Parent.
     // "dep add X Y" means X depends on Y.
-    // "dep tree" walks DEPENDENTS (what depends on X).
-    // So if we tree D, we should see B and C (because they depend on D).
-    // And A depends on B/C, so A should appear under B and C.
+    // "dep tree" walks dependencies (what X depends on).
+    // So if we tree A, we should see B and C, and D should appear under both.
 
     // We can use titles to refer to them if we use `br list`.
     // Or just `br create A -q` to get ID.
@@ -58,14 +57,14 @@ fn test_dep_tree_diamond_dependency_visibility() {
     run_br(&workspace, ["dep", "add", &id_b, &id_d], "B->D");
     run_br(&workspace, ["dep", "add", &id_c, &id_d], "C->D");
 
-    // Run tree on D (the root blocker)
-    let tree = run_br(&workspace, ["dep", "tree", &id_d], "tree").stdout;
+    // Run tree on A (the root dependency)
+    let tree = run_br(&workspace, ["dep", "tree", &id_a], "tree").stdout;
     println!("Tree Output:\n{tree}");
 
     // Check if A appears twice (diamond convergence point)
     assert_eq!(
-        tree.match_indices(&id_a).count(),
+        tree.match_indices(&id_d).count(),
         2,
-        "Diamond dependency node A should appear twice in tree view"
+        "Diamond dependency node D should appear twice in tree view"
     );
 }
