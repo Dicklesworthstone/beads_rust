@@ -2460,3 +2460,468 @@ fn conformance_sync_roundtrip() {
 
     info!("conformance_sync_roundtrip passed");
 }
+
+// ============================================================================
+// CRUD COMMAND EXPANSION TESTS
+// ============================================================================
+
+// --- init tests ---
+
+#[test]
+fn conformance_init_reinit() {
+    common::init_test_logging();
+    info!("Starting conformance_init_reinit test");
+
+    let workspace = ConformanceWorkspace::new();
+
+    // First init
+    workspace.init_both();
+
+    // Second init (re-init) - should be idempotent or error gracefully
+    let br_reinit = workspace.run_br(["init"], "reinit");
+    let bd_reinit = workspace.run_bd(["init"], "reinit");
+
+    // Both should have matching behavior (either both succeed or both fail)
+    assert_eq!(
+        br_reinit.status.success(),
+        bd_reinit.status.success(),
+        "reinit behavior differs: br success={}, bd success={}",
+        br_reinit.status.success(),
+        bd_reinit.status.success()
+    );
+
+    // .beads directory should still exist
+    assert!(
+        workspace.br_root.join(".beads").exists(),
+        "br .beads disappeared after reinit"
+    );
+    assert!(
+        workspace.bd_root.join(".beads").exists(),
+        "bd .beads disappeared after reinit"
+    );
+
+    info!("conformance_init_reinit passed");
+}
+
+#[test]
+fn conformance_init_existing_db() {
+    common::init_test_logging();
+    info!("Starting conformance_init_existing_db test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create some data
+    workspace.run_br(["create", "Test issue"], "create");
+    workspace.run_bd(["create", "Test issue"], "create");
+
+    // Try init again - should preserve data
+    workspace.run_br(["init"], "init_again");
+    workspace.run_bd(["init"], "init_again");
+
+    // Data should still exist
+    let br_list = workspace.run_br(["list", "--json"], "list_after");
+    let bd_list = workspace.run_bd(["list", "--json"], "list_after");
+
+    let br_json = extract_json_payload(&br_list.stdout);
+    let bd_json = extract_json_payload(&bd_list.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
+    let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
+
+    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+
+    assert_eq!(br_len, bd_len, "issue counts differ after reinit");
+
+    info!("conformance_init_existing_db passed");
+}
+
+#[test]
+fn conformance_init_creates_beads_dir() {
+    common::init_test_logging();
+    info!("Starting conformance_init_creates_beads_dir test");
+
+    let workspace = ConformanceWorkspace::new();
+
+    // Verify .beads doesn't exist yet
+    assert!(!workspace.br_root.join(".beads").exists());
+    assert!(!workspace.bd_root.join(".beads").exists());
+
+    workspace.init_both();
+
+    // .beads/issues.db should exist for br
+    assert!(
+        workspace.br_root.join(".beads").join("issues.db").exists(),
+        "br did not create .beads/issues.db"
+    );
+    // .beads/issues.db should exist for bd
+    assert!(
+        workspace.bd_root.join(".beads").join("issues.db").exists(),
+        "bd did not create .beads/issues.db"
+    );
+
+    info!("conformance_init_creates_beads_dir passed");
+}
+
+#[test]
+fn conformance_init_json_output() {
+    common::init_test_logging();
+    info!("Starting conformance_init_json_output test");
+
+    let workspace = ConformanceWorkspace::new();
+
+    let br_init = workspace.run_br(["init", "--json"], "init_json");
+    let bd_init = workspace.run_bd(["init", "--json"], "init_json");
+
+    assert!(
+        br_init.status.success(),
+        "br init --json failed: {}",
+        br_init.stderr
+    );
+    assert!(
+        bd_init.status.success(),
+        "bd init --json failed: {}",
+        bd_init.stderr
+    );
+
+    // Both should produce valid JSON or exit successfully
+    let br_json = extract_json_payload(&br_init.stdout);
+    let bd_json = extract_json_payload(&bd_init.stdout);
+
+    // If both produce JSON, they should have similar structure
+    if !br_json.is_empty() && !bd_json.is_empty() {
+        let br_val: Result<Value, _> = serde_json::from_str(&br_json);
+        let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
+
+        assert_eq!(
+            br_val.is_ok(),
+            bd_val.is_ok(),
+            "JSON validity differs: br valid={}, bd valid={}",
+            br_val.is_ok(),
+            bd_val.is_ok()
+        );
+    }
+
+    info!("conformance_init_json_output passed");
+}
+
+// --- create tests ---
+
+#[test]
+fn conformance_create_all_types() {
+    common::init_test_logging();
+    info!("Starting conformance_create_all_types test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let types = ["bug", "feature", "task", "epic", "chore", "docs", "question"];
+
+    for issue_type in types {
+        let title = format!("Test {} issue", issue_type);
+        let br_create = workspace.run_br(
+            ["create", &title, "--type", issue_type, "--json"],
+            &format!("create_{}", issue_type),
+        );
+        let bd_create = workspace.run_bd(
+            ["create", &title, "--type", issue_type, "--json"],
+            &format!("create_{}", issue_type),
+        );
+
+        assert!(
+            br_create.status.success(),
+            "br create --type {} failed: {}",
+            issue_type,
+            br_create.stderr
+        );
+        assert!(
+            bd_create.status.success(),
+            "bd create --type {} failed: {}",
+            issue_type,
+            bd_create.stderr
+        );
+
+        let br_json = extract_json_payload(&br_create.stdout);
+        let bd_json = extract_json_payload(&bd_create.stdout);
+
+        let result = compare_json(
+            &br_json,
+            &bd_json,
+            &CompareMode::ContainsFields(vec!["issue_type".to_string()]),
+        );
+        assert!(
+            result.is_ok(),
+            "type {} comparison failed: {:?}",
+            issue_type,
+            result.err()
+        );
+    }
+
+    info!("conformance_create_all_types passed");
+}
+
+#[test]
+fn conformance_create_all_priorities() {
+    common::init_test_logging();
+    info!("Starting conformance_create_all_priorities test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    for priority in 0..=4 {
+        let title = format!("Priority {} issue", priority);
+        let priority_str = priority.to_string();
+        let br_create = workspace.run_br(
+            ["create", &title, "--priority", &priority_str, "--json"],
+            &format!("create_p{}", priority),
+        );
+        let bd_create = workspace.run_bd(
+            ["create", &title, "--priority", &priority_str, "--json"],
+            &format!("create_p{}", priority),
+        );
+
+        assert!(
+            br_create.status.success(),
+            "br create --priority {} failed: {}",
+            priority,
+            br_create.stderr
+        );
+        assert!(
+            bd_create.status.success(),
+            "bd create --priority {} failed: {}",
+            priority,
+            bd_create.stderr
+        );
+
+        let br_json = extract_json_payload(&br_create.stdout);
+        let bd_json = extract_json_payload(&bd_create.stdout);
+
+        let br_val: Value = serde_json::from_str(&br_json).expect("parse br");
+        let bd_val: Value = serde_json::from_str(&bd_json).expect("parse bd");
+
+        let br_p = br_val["priority"].as_i64().or_else(|| br_val[0]["priority"].as_i64());
+        let bd_p = bd_val["priority"].as_i64().or_else(|| bd_val[0]["priority"].as_i64());
+
+        assert_eq!(
+            br_p, bd_p,
+            "priority {} mismatch: br={:?}, bd={:?}",
+            priority, br_p, bd_p
+        );
+    }
+
+    info!("conformance_create_all_priorities passed");
+}
+
+#[test]
+fn conformance_create_with_assignee() {
+    common::init_test_logging();
+    info!("Starting conformance_create_with_assignee test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_create = workspace.run_br(
+        ["create", "Assigned issue", "--assignee", "alice", "--json"],
+        "create_assigned",
+    );
+    let bd_create = workspace.run_bd(
+        ["create", "Assigned issue", "--assignee", "alice", "--json"],
+        "create_assigned",
+    );
+
+    assert!(
+        br_create.status.success(),
+        "br create failed: {}",
+        br_create.stderr
+    );
+    assert!(
+        bd_create.status.success(),
+        "bd create failed: {}",
+        bd_create.stderr
+    );
+
+    let br_json = extract_json_payload(&br_create.stdout);
+    let bd_json = extract_json_payload(&bd_create.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("parse");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("parse");
+
+    let br_assignee = br_val["assignee"]
+        .as_str()
+        .or_else(|| br_val[0]["assignee"].as_str());
+    let bd_assignee = bd_val["assignee"]
+        .as_str()
+        .or_else(|| bd_val[0]["assignee"].as_str());
+
+    assert_eq!(
+        br_assignee, bd_assignee,
+        "assignee mismatch: br={:?}, bd={:?}",
+        br_assignee, bd_assignee
+    );
+
+    info!("conformance_create_with_assignee passed");
+}
+
+#[test]
+fn conformance_create_with_description() {
+    common::init_test_logging();
+    info!("Starting conformance_create_with_description test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let desc = "This is a detailed description\nwith multiple lines.";
+    let br_create = workspace.run_br(
+        ["create", "Issue with desc", "--description", desc, "--json"],
+        "create_desc",
+    );
+    let bd_create = workspace.run_bd(
+        ["create", "Issue with desc", "--description", desc, "--json"],
+        "create_desc",
+    );
+
+    assert!(
+        br_create.status.success(),
+        "br create failed: {}",
+        br_create.stderr
+    );
+    assert!(
+        bd_create.status.success(),
+        "bd create failed: {}",
+        bd_create.stderr
+    );
+
+    let br_json = extract_json_payload(&br_create.stdout);
+    let bd_json = extract_json_payload(&bd_create.stdout);
+
+    let br_val: Value = serde_json::from_str(&br_json).expect("parse");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("parse");
+
+    let br_desc = br_val["description"]
+        .as_str()
+        .or_else(|| br_val[0]["description"].as_str());
+    let bd_desc = bd_val["description"]
+        .as_str()
+        .or_else(|| bd_val[0]["description"].as_str());
+
+    assert_eq!(
+        br_desc, bd_desc,
+        "description mismatch: br={:?}, bd={:?}",
+        br_desc, bd_desc
+    );
+
+    info!("conformance_create_with_description passed");
+}
+
+#[test]
+fn conformance_create_unicode_title() {
+    common::init_test_logging();
+    info!("Starting conformance_create_unicode_title test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let unicode_titles = [
+        "日本語のタイトル",          // Japanese
+        "Emoji test 🎉🚀💻",         // Emoji
+        "مرحبا بالعالم",              // Arabic (RTL)
+        "Ñoño español",              // Spanish with ñ
+        "Über Größe",                // German umlauts
+    ];
+
+    for title in unicode_titles {
+        let br_create = workspace.run_br(["create", title, "--json"], "create_unicode");
+        let bd_create = workspace.run_bd(["create", title, "--json"], "create_unicode");
+
+        assert!(
+            br_create.status.success(),
+            "br create unicode failed for '{}': {}",
+            title,
+            br_create.stderr
+        );
+        assert!(
+            bd_create.status.success(),
+            "bd create unicode failed for '{}': {}",
+            title,
+            bd_create.stderr
+        );
+
+        let br_json = extract_json_payload(&br_create.stdout);
+        let bd_json = extract_json_payload(&bd_create.stdout);
+
+        let br_val: Value = serde_json::from_str(&br_json).expect("parse");
+        let bd_val: Value = serde_json::from_str(&bd_json).expect("parse");
+
+        let br_title = br_val["title"]
+            .as_str()
+            .or_else(|| br_val[0]["title"].as_str());
+        let bd_title = bd_val["title"]
+            .as_str()
+            .or_else(|| bd_val[0]["title"].as_str());
+
+        assert_eq!(
+            br_title, bd_title,
+            "unicode title mismatch for '{}': br={:?}, bd={:?}",
+            title, br_title, bd_title
+        );
+    }
+
+    info!("conformance_create_unicode_title passed");
+}
+
+#[test]
+fn conformance_create_special_chars() {
+    common::init_test_logging();
+    info!("Starting conformance_create_special_chars test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Test special characters that might break parsing
+    let special_titles = [
+        "Title with 'single quotes'",
+        "Title with \"double quotes\"",
+        "Title with \\backslashes\\",
+        "Title with <angle> & ampersand",
+    ];
+
+    for title in special_titles {
+        let br_create = workspace.run_br(["create", title, "--json"], "create_special");
+        let bd_create = workspace.run_bd(["create", title, "--json"], "create_special");
+
+        assert!(
+            br_create.status.success(),
+            "br create special failed for '{}': {}",
+            title,
+            br_create.stderr
+        );
+        assert!(
+            bd_create.status.success(),
+            "bd create special failed for '{}': {}",
+            title,
+            bd_create.stderr
+        );
+
+        let br_json = extract_json_payload(&br_create.stdout);
+        let bd_json = extract_json_payload(&bd_create.stdout);
+
+        let br_val: Value = serde_json::from_str(&br_json).expect("parse");
+        let bd_val: Value = serde_json::from_str(&bd_json).expect("parse");
+
+        let br_title = br_val["title"]
+            .as_str()
+            .or_else(|| br_val[0]["title"].as_str());
+        let bd_title = bd_val["title"]
+            .as_str()
+            .or_else(|| bd_val[0]["title"].as_str());
+
+        assert_eq!(
+            br_title, bd_title,
+            "special char title mismatch for '{}': br={:?}, bd={:?}",
+            title, br_title, bd_title
+        );
+    }
+
+    info!("conformance_create_special_chars passed");
+}

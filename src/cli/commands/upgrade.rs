@@ -177,7 +177,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
         } else {
             println!("\n\u{2713} Already up to date");
         }
-        return Ok(());
+        return Ok(())
     }
 
     if !json {
@@ -264,7 +264,7 @@ fn version_newer(new: &str, current: &str) -> bool {
         match n.cmp(c) {
             std::cmp::Ordering::Greater => return true,
             std::cmp::Ordering::Less => return false,
-            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Equal => {} // Continue to next part
         }
     }
 

@@ -465,6 +465,32 @@ fn would_create_cycle_no_cycle() {
 }
 
 #[test]
+fn would_create_cycle_mixed_types() {
+    let mut storage = test_db();
+
+    let a = fixtures::issue("mixed-a");
+    let b = fixtures::issue("mixed-b");
+
+    storage.create_issue(&a, "tester").unwrap();
+    storage.create_issue(&b, "tester").unwrap();
+
+    // A -> related -> B
+    storage
+        .add_dependency(&a.id, &b.id, DependencyType::Related.as_str(), "tester")
+        .unwrap();
+
+    // Would B -> blocks -> A create a BLOCKING cycle?
+    // Path B -> ... -> A? No, because A->B is 'related' (non-blocking).
+    // So blocking_only=true should return false.
+    let blocking_cycle = storage.would_create_cycle(&b.id, &a.id, true).unwrap();
+    assert!(!blocking_cycle, "Should not detect blocking cycle through related dependency");
+
+    // blocking_only=false should detect it (graph reachability)
+    let any_cycle = storage.would_create_cycle(&b.id, &a.id, false).unwrap();
+    assert!(any_cycle, "Should detect general graph cycle");
+}
+
+#[test]
 fn detect_all_cycles_finds_cycles() {
     let mut storage = test_db();
 

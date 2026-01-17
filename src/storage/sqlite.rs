@@ -1185,10 +1185,36 @@ impl SqliteStorage {
             }
         }
 
+        // Query each external project's database to find satisfied capabilities
+        let mut satisfied: HashMap<String, HashSet<String>> = HashMap::new();
+        for (project, caps) in &project_caps {
+            let Some(db_path) = external_db_paths.get(project) else {
+                tracing::warn!(
+                    project = %project,
+                    "External project not configured; treating dependencies as unsatisfied"
+                );
+                continue;
+            };
+
+            match query_external_project_capabilities(db_path, caps) {
+                Ok(found) => {
+                    satisfied.insert(project.clone(), found);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        project = %project,
+                        path = %db_path.display(),
+                        error = %err,
+                        "Failed to query external project; treating dependencies as unsatisfied"
+                    );
+                }
+            }
+        }
+
         let mut statuses = HashMap::new();
         for dep_id in external_ids {
             let is_satisfied = parsed.get(&dep_id).is_some_and(|(project, capability)| {
-                project_caps
+                satisfied
                     .get(project)
                     .is_some_and(|caps| caps.contains(capability))
             });
@@ -3952,7 +3978,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "external_db_paths unused in resolve_external_dependency_statuses - regression"]
     fn test_external_dependency_blocks_and_propagates_to_children() {
         let temp = TempDir::new().unwrap();
         let external_root = temp.path().join("extproj");
@@ -3969,6 +3994,10 @@ mod tests {
         storage.create_issue(&parent, "tester").unwrap();
         storage.create_issue(&child, "tester").unwrap();
         // Parent (bd-p1) depends on external capability
+        storage
+            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
+            .unwrap();
+        // Child (bd-c1) depends on parent (bd-p1) via parent-child
         storage
             .add_dependency("bd-c1", "bd-p1", "parent-child", "tester")
             .unwrap();

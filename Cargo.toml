@@ -50,6 +50,7 @@ regex = "1.11"
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "0.39", features = ["rustls"], default-features = false, optional = true }
+semver = { version = "1.0", optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "1.0", features = ["build", "cargo", "rustc"] }
@@ -78,7 +79,7 @@ opt-level = 1
 
 [features]
 default = ["self_update"]
-self_update = ["dep:self_update"]
+self_update = ["dep:self_update", "dep:semver"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -160,6 +160,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "self_update",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
