@@ -200,48 +200,67 @@ fn git_user_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::init_test_logging;
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use tracing::info;
 
     #[test]
     fn test_resolve_author_with_override() {
+        init_test_logging();
+        info!("test_resolve_author_with_override: starting");
         // When author override is provided, it should be used
         let result = resolve_author(Some("custom_author"), Some("actor_name"));
         assert_eq!(result, "custom_author");
+        info!("test_resolve_author_with_override: assertions passed");
     }
 
     #[test]
     fn test_resolve_author_empty_override_uses_actor() {
+        init_test_logging();
+        info!("test_resolve_author_empty_override_uses_actor: starting");
         // Empty override should fall through to actor
         let result = resolve_author(Some(""), Some("actor_name"));
         assert_eq!(result, "actor_name");
+        info!("test_resolve_author_empty_override_uses_actor: assertions passed");
     }
 
     #[test]
     fn test_resolve_author_whitespace_override_uses_actor() {
+        init_test_logging();
+        info!("test_resolve_author_whitespace_override_uses_actor: starting");
         // Whitespace-only override should fall through to actor
         let result = resolve_author(Some("   "), Some("actor_name"));
         assert_eq!(result, "actor_name");
+        info!("test_resolve_author_whitespace_override_uses_actor: assertions passed");
     }
 
     #[test]
     fn test_resolve_author_no_override_uses_actor() {
+        init_test_logging();
+        info!("test_resolve_author_no_override_uses_actor: starting");
         // No override should use actor
         let result = resolve_author(None, Some("actor_name"));
         assert_eq!(result, "actor_name");
+        info!("test_resolve_author_no_override_uses_actor: assertions passed");
     }
 
     #[test]
     fn test_resolve_author_empty_actor_falls_through() {
+        init_test_logging();
+        info!("test_resolve_author_empty_actor_falls_through: starting");
         // Empty actor should fall through to env/git/USER/unknown
         // Since we can't easily control env, just test that it doesn't panic
         // and returns something non-empty
         let result = resolve_author(None, Some(""));
         assert!(!result.is_empty());
+        info!("test_resolve_author_empty_actor_falls_through: assertions passed");
     }
 
     #[test]
     fn test_read_comment_text_from_message_flag() {
+        init_test_logging();
+        info!("test_read_comment_text_from_message_flag: starting");
         let args = CommentAddArgs {
             id: "test-id".to_string(),
             text: vec![],
@@ -251,10 +270,13 @@ mod tests {
         };
         let result = read_comment_text(&args).unwrap();
         assert_eq!(result, "message flag content");
+        info!("test_read_comment_text_from_message_flag: assertions passed");
     }
 
     #[test]
     fn test_read_comment_text_from_positional_args() {
+        init_test_logging();
+        info!("test_read_comment_text_from_positional_args: starting");
         let args = CommentAddArgs {
             id: "test-id".to_string(),
             text: vec!["hello".to_string(), "world".to_string()],
@@ -264,10 +286,13 @@ mod tests {
         };
         let result = read_comment_text(&args).unwrap();
         assert_eq!(result, "hello world");
+        info!("test_read_comment_text_from_positional_args: assertions passed");
     }
 
     #[test]
     fn test_read_comment_text_from_file() {
+        init_test_logging();
+        info!("test_read_comment_text_from_file: starting");
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "Comment from file").unwrap();
         file.flush().unwrap();
@@ -281,10 +306,13 @@ mod tests {
         };
         let result = read_comment_text(&args).unwrap();
         assert!(result.contains("Comment from file"));
+        info!("test_read_comment_text_from_file: assertions passed");
     }
 
     #[test]
     fn test_read_comment_text_file_takes_precedence() {
+        init_test_logging();
+        info!("test_read_comment_text_file_takes_precedence: starting");
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "File content").unwrap();
         file.flush().unwrap();
@@ -299,10 +327,13 @@ mod tests {
         let result = read_comment_text(&args).unwrap();
         // File should take precedence
         assert!(result.contains("File content"));
+        info!("test_read_comment_text_file_takes_precedence: assertions passed");
     }
 
     #[test]
     fn test_read_comment_text_no_input_fails() {
+        init_test_logging();
+        info!("test_read_comment_text_no_input_fails: starting");
         let args = CommentAddArgs {
             id: "test-id".to_string(),
             text: vec![],
@@ -312,5 +343,6 @@ mod tests {
         };
         let result = read_comment_text(&args);
         assert!(result.is_err());
+        info!("test_read_comment_text_no_input_fails: assertions passed");
     }
 }
