@@ -353,59 +353,59 @@ pub fn insert_restored_event(
 ///
 /// Returns an error if the database query fails.
 pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
-    let query = if limit > 0 {
-        format!(
-            r"
+    let events = if limit > 0 {
+        let query = r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
-            LIMIT {limit}
-            "
-        )
+            LIMIT ?2
+            ";
+        let mut stmt = conn.prepare(query)?;
+        let rows = stmt.query_map(params![issue_id, limit], |row| event_from_row(row))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        r"
+        let query = r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
-            "
-        .to_string()
+            ";
+        let mut stmt = conn.prepare(query)?;
+        let rows = stmt.query_map(params![issue_id], |row| event_from_row(row))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    let mut stmt = conn.prepare(&query)?;
-    let events = stmt
-        .query_map(params![issue_id], |row| {
-            let id: i64 = row.get(0)?;
-            let issue_id: String = row.get(1)?;
-            let event_type_str: String = row.get(2)?;
-            let actor: String = row.get(3)?;
-            let old_value: Option<String> = row.get(4)?;
-            let new_value: Option<String> = row.get(5)?;
-            let comment: Option<String> = row.get(6)?;
-            let created_at_str: String = row.get(7)?;
-
-            // Parse event type
-            let event_type = parse_event_type(&event_type_str);
-
-            // Parse timestamp
-            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
-
-            Ok(Event {
-                id,
-                issue_id,
-                event_type,
-                actor,
-                old_value,
-                new_value,
-                comment,
-                created_at,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-
     Ok(events)
+}
+
+fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+    let id: i64 = row.get(0)?;
+    let issue_id: String = row.get(1)?;
+    let event_type_str: String = row.get(2)?;
+    let actor: String = row.get(3)?;
+    let old_value: Option<String> = row.get(4)?;
+    let new_value: Option<String> = row.get(5)?;
+    let comment: Option<String> = row.get(6)?;
+    let created_at_str: String = row.get(7)?;
+
+    // Parse event type
+    let event_type = parse_event_type(&event_type_str);
+
+    // Parse timestamp
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+
+    Ok(Event {
+        id,
+        issue_id,
+        event_type,
+        actor,
+        old_value,
+        new_value,
+        comment,
+        created_at,
+    })
 }
 
 /// Get all events across all issues, ordered by `created_at` DESC.
@@ -416,52 +416,26 @@ pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec
 ///
 /// Returns an error if the database query fails.
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
-    let query = if limit > 0 {
-        format!(
-            r"
+    let events = if limit > 0 {
+        let query = r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
-            LIMIT {limit}
-            "
-        )
+            LIMIT ?1
+            ";
+        let mut stmt = conn.prepare(query)?;
+        let rows = stmt.query_map(params![limit], |row| event_from_row(row))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        r"
+        let query = r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
-            "
-        .to_string()
+            ";
+        let mut stmt = conn.prepare(query)?;
+        let rows = stmt.query_map([], |row| event_from_row(row))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-
-    let mut stmt = conn.prepare(&query)?;
-    let events = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let issue_id: String = row.get(1)?;
-            let event_type_str: String = row.get(2)?;
-            let actor: String = row.get(3)?;
-            let old_value: Option<String> = row.get(4)?;
-            let new_value: Option<String> = row.get(5)?;
-            let comment: Option<String> = row.get(6)?;
-            let created_at_str: String = row.get(7)?;
-
-            let event_type = parse_event_type(&event_type_str);
-            let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
-
-            Ok(Event {
-                id,
-                issue_id,
-                event_type,
-                actor,
-                old_value,
-                new_value,
-                comment,
-                created_at,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(events)
 }
