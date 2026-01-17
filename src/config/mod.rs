@@ -19,6 +19,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use tracing::warn;
 
 /// Default database filename used when metadata is missing.
 const DEFAULT_DB_FILENAME: &str = "beads.db";
@@ -575,6 +576,90 @@ pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
         .map_or_else(|| Ok(IssueType::Task), |value| IssueType::from_str(value))
 }
 
+/// Resolve external project mappings from config.
+///
+/// Supports `external_projects.<name>` or `external-projects.<name>` keys.
+/// Relative paths are resolved against the project root (parent of `.beads`).
+#[must_use]
+pub fn external_projects_from_layer(
+    layer: &ConfigLayer,
+    beads_dir: &Path,
+) -> HashMap<String, PathBuf> {
+    let base_dir = beads_dir.parent().unwrap_or(beads_dir);
+    let mut map = HashMap::new();
+    let iter = layer.runtime.iter().chain(layer.startup.iter());
+
+    for (key, value) in iter {
+        let key_lower = key.to_lowercase();
+        let is_external = key_lower.starts_with("external_projects.")
+            || key_lower.starts_with("external-projects.");
+        if !is_external {
+            continue;
+        }
+
+        let project = key.split_once('.').map(|(_, rest)| rest);
+        let Some(project) = project.filter(|p| !p.trim().is_empty()) else {
+            continue;
+        };
+
+        let path = PathBuf::from(value.trim());
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        };
+        map.insert(project.trim().to_string(), resolved);
+    }
+
+    map
+}
+
+/// Resolve external project DB paths from config.
+///
+/// Projects are expected to be either a `.beads` directory or a project root
+/// containing `.beads/`.
+#[must_use]
+pub fn external_project_db_paths(
+    layer: &ConfigLayer,
+    beads_dir: &Path,
+) -> HashMap<String, PathBuf> {
+    let projects = external_projects_from_layer(layer, beads_dir);
+    let mut db_paths = HashMap::new();
+
+    for (name, path) in projects {
+        let beads_path = if path.file_name().is_some_and(|name| name == ".beads") {
+            path.clone()
+        } else {
+            path.join(".beads")
+        };
+
+        if !beads_path.is_dir() {
+            warn!(
+                project = %name,
+                path = %beads_path.display(),
+                "External project .beads directory not found"
+            );
+            continue;
+        }
+
+        match ConfigPaths::resolve(&beads_path, None) {
+            Ok(paths) => {
+                db_paths.insert(name, paths.db_path);
+            }
+            Err(err) => {
+                warn!(
+                    project = %name,
+                    path = %beads_path.display(),
+                    error = %err,
+                    "Failed to resolve external project DB path"
+                );
+            }
+        }
+    }
+
+    db_paths
+}
+
 /// Resolve actor from a merged config layer.
 #[must_use]
 pub fn actor_from_layer(layer: &ConfigLayer) -> Option<String> {
@@ -610,6 +695,7 @@ pub fn is_startup_key(key: &str) -> bool {
         || normalized.starts_with("validation.")
         || normalized.starts_with("directory.")
         || normalized.starts_with("sync.")
+        || normalized.starts_with("external-projects.")
     {
         return true;
     }

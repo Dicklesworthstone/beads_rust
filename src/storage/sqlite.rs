@@ -6,10 +6,10 @@ use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, 
 use crate::storage::events::get_events;
 use crate::storage::schema::apply_schema;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// SQLite-based storage backend.
@@ -435,12 +435,19 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the issue doesn't exist or the update fails.
-    pub fn delete_issue(&mut self, id: &str, actor: &str, reason: &str) -> Result<Issue> {
+    pub fn delete_issue(
+        &mut self,
+        id: &str,
+        actor: &str,
+        reason: &str,
+        deleted_at: Option<DateTime<Utc>>,
+    ) -> Result<Issue> {
         let issue = self
             .get_issue(id)?
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })?;
 
         let original_type = issue.issue_type.as_str().to_string();
+        let timestamp = deleted_at.unwrap_or_else(Utc::now);
 
         self.mutate("delete_issue", actor, |tx, ctx| {
             tx.execute(
@@ -453,7 +460,7 @@ impl SqliteStorage {
                     updated_at = ?
                  WHERE id = ?",
                 rusqlite::params![
-                    Utc::now().to_rfc3339(),
+                    timestamp.to_rfc3339(),
                     actor,
                     reason,
                     original_type,
@@ -925,6 +932,7 @@ impl SqliteStorage {
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
                   WHERE d.type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')
+                    AND d.depends_on_id NOT LIKE 'external:%'
                     AND (
                       -- The blocker is in a blocking state
                       i.status IN ('open', 'in_progress', 'blocked', 'deferred')
@@ -1073,6 +1081,180 @@ impl SqliteStorage {
         }
 
         Ok(blocked_issues)
+    }
+
+    /// Resolve external dependency satisfaction for dependencies of this project.
+    ///
+    /// Returns a map of external dependency IDs to whether they are satisfied.
+    /// Missing projects or query failures are treated as unsatisfied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying local dependencies fails.
+    pub fn resolve_external_dependency_statuses(
+        &self,
+        external_db_paths: &HashMap<String, PathBuf>,
+        blocking_only: bool,
+    ) -> Result<HashMap<String, bool>> {
+        let external_ids = self.list_external_dependency_ids(blocking_only)?;
+        if external_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut project_caps: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut parsed: HashMap<String, (String, String)> = HashMap::new();
+        for dep_id in &external_ids {
+            if let Some((project, capability)) = parse_external_dependency(dep_id) {
+                project_caps
+                    .entry(project.clone())
+                    .or_default()
+                    .insert(capability.clone());
+                parsed.insert(dep_id.clone(), (project, capability));
+            }
+        }
+
+        let mut satisfied: HashMap<String, HashSet<String>> = HashMap::new();
+        for (project, caps) in project_caps {
+            let Some(db_path) = external_db_paths.get(&project) else {
+                tracing::warn!(
+                    project = %project,
+                    "External project not configured; treating dependencies as unsatisfied"
+                );
+                continue;
+            };
+
+            match query_external_project_capabilities(db_path, &caps) {
+                Ok(found) => {
+                    satisfied.insert(project, found);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        project = %project,
+                        path = %db_path.display(),
+                        error = %err,
+                        "Failed to query external project; treating dependencies as unsatisfied"
+                    );
+                }
+            }
+        }
+
+        let mut statuses = HashMap::new();
+        for dep_id in external_ids {
+            let is_satisfied = parsed.get(&dep_id).is_some_and(|(project, capability)| {
+                satisfied
+                    .get(project)
+                    .is_some_and(|caps| caps.contains(capability))
+            });
+            statuses.insert(dep_id, is_satisfied);
+        }
+
+        Ok(statuses)
+    }
+
+    /// Compute blockers caused by unsatisfied external dependencies.
+    ///
+    /// This excludes external dependencies from the blocked cache and evaluates
+    /// them at query time, including parent-child propagation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dependency queries fail.
+    pub fn external_blockers(
+        &self,
+        external_statuses: &HashMap<String, bool>,
+    ) -> Result<HashMap<String, Vec<String>>> {
+        let mut blockers: HashMap<String, HashSet<String>> = HashMap::new();
+
+        // Direct external blockers (blocking dependency types only).
+        let mut stmt = self.conn.prepare(
+            "SELECT issue_id, depends_on_id
+             FROM dependencies
+             WHERE depends_on_id LIKE 'external:%'
+               AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows {
+            let (issue_id, depends_on_id) = row?;
+            let satisfied = external_statuses
+                .get(&depends_on_id)
+                .copied()
+                .unwrap_or(false);
+            if !satisfied {
+                blockers
+                    .entry(issue_id)
+                    .or_default()
+                    .insert(format!("{depends_on_id}:blocked"));
+            }
+        }
+
+        // Propagate external blocking through parent-child relationships.
+        let mut parent_stmt = self.conn.prepare(
+            "SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'parent-child'",
+        )?;
+        let edges = parent_stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if !edges.is_empty() && !blockers.is_empty() {
+            let mut children_by_parent: HashMap<String, Vec<String>> = HashMap::new();
+            for (child, parent) in &edges {
+                children_by_parent
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(child.clone());
+            }
+
+            let mut queue: Vec<String> = blockers.keys().cloned().collect();
+            let mut seen: HashSet<String> = HashSet::new();
+
+            while let Some(parent_id) = queue.pop() {
+                if !seen.insert(parent_id.clone()) {
+                    continue;
+                }
+                if let Some(children) = children_by_parent.get(&parent_id) {
+                    for child in children {
+                        let entry = blockers.entry(child.clone()).or_default();
+                        let marker = format!("{parent_id}:parent-blocked");
+                        if entry.insert(marker) {
+                            queue.push(child.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(blockers
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect())
+    }
+
+    fn list_external_dependency_ids(&self, blocking_only: bool) -> Result<HashSet<String>> {
+        let mut ids = HashSet::new();
+        let sql = if blocking_only {
+            "SELECT DISTINCT depends_on_id
+             FROM dependencies
+             WHERE depends_on_id LIKE 'external:%'
+               AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
+        } else {
+            "SELECT DISTINCT depends_on_id
+             FROM dependencies
+             WHERE depends_on_id LIKE 'external:%'"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            ids.insert(row?);
+        }
+
+        Ok(ids)
     }
 
     /// Check if an issue ID already exists.
@@ -2333,6 +2515,64 @@ fn parse_issue_type(s: Option<&str>) -> IssueType {
     s.and_then(|s| s.parse().ok()).unwrap_or_default()
 }
 
+fn parse_external_dependency(dep_id: &str) -> Option<(String, String)> {
+    let mut parts = dep_id.splitn(3, ':');
+    let prefix = parts.next()?;
+    if prefix != "external" {
+        return None;
+    }
+    let project = parts.next()?.to_string();
+    let capability = parts.next()?.to_string();
+    if project.is_empty() || capability.is_empty() {
+        return None;
+    }
+    Some((project, capability))
+}
+
+fn query_external_project_capabilities(
+    db_path: &Path,
+    capabilities: &HashSet<String>,
+) -> Result<HashSet<String>> {
+    const SQLITE_VAR_LIMIT: usize = 900;
+
+    if capabilities.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let labels: Vec<String> = capabilities
+        .iter()
+        .map(|cap| format!("provides:{cap}"))
+        .collect();
+
+    let mut satisfied = HashSet::new();
+
+    for chunk in labels.chunks(SQLITE_VAR_LIMIT) {
+        let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+        let sql = format!(
+            "SELECT DISTINCT l.label
+             FROM labels l
+             INNER JOIN issues i ON i.id = l.issue_id
+             WHERE i.status IN ('closed', 'tombstone') AND l.label IN ({})",
+            placeholders.join(",")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = chunk
+            .iter()
+            .map(|label| label as &dyn rusqlite::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let label = row?;
+            if let Some(cap) = label.strip_prefix("provides:") {
+                satisfied.insert(cap.to_string());
+            }
+        }
+    }
+
+    Ok(satisfied)
+}
+
 fn parse_datetime(s: &str) -> DateTime<Utc> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return dt.with_timezone(&Utc);
@@ -2879,6 +3119,8 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{DateTime, TimeZone, Utc};
+    use std::fs;
+    use tempfile::TempDir;
 
     fn make_issue(
         id: &str,
@@ -3332,6 +3574,92 @@ mod tests {
     }
 
     #[test]
+    fn test_external_dependency_satisfied_not_blocking() {
+        let temp = TempDir::new().unwrap();
+        let external_root = temp.path().join("extproj");
+        let beads_dir = external_root.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut external_storage = SqliteStorage::open(&db_path).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 2, 0, 0, 0).unwrap();
+        let provider = make_issue("ext-1", "Provider", Status::Closed, 2, None, t1, None);
+        external_storage.create_issue(&provider, "tester").unwrap();
+        external_storage
+            .add_label("ext-1", "provides:capability", "tester")
+            .unwrap();
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue("bd-1", "Needs cap", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_dependency("bd-1", "external:extproj:capability", "blocks", "tester")
+            .unwrap();
+
+        let mut external_db_paths = HashMap::new();
+        external_db_paths.insert("extproj".to_string(), db_path);
+
+        let statuses = storage
+            .resolve_external_dependency_statuses(&external_db_paths, true)
+            .unwrap();
+        assert_eq!(statuses.get("external:extproj:capability"), Some(&true));
+
+        let blockers = storage.external_blockers(&statuses).unwrap();
+        assert!(!blockers.contains_key("bd-1"));
+    }
+
+    #[test]
+    fn test_external_dependency_blocks_and_propagates_to_children() {
+        let temp = TempDir::new().unwrap();
+        let external_root = temp.path().join("extproj");
+        let beads_dir = external_root.join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let _external_storage = SqliteStorage::open(&db_path).unwrap();
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
+        let parent = make_issue("bd-parent", "Parent", Status::Open, 2, None, t1, None);
+        let child = make_issue("bd-child", "Child", Status::Open, 2, None, t1, None);
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-parent",
+                "external:extproj:capability",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        storage
+            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .unwrap();
+
+        let mut external_db_paths = HashMap::new();
+        external_db_paths.insert("extproj".to_string(), db_path);
+
+        let statuses = storage
+            .resolve_external_dependency_statuses(&external_db_paths, true)
+            .unwrap();
+        assert_eq!(statuses.get("external:extproj:capability"), Some(&false));
+
+        let blockers = storage.external_blockers(&statuses).unwrap();
+        let parent_blockers = blockers.get("bd-parent").expect("parent blockers");
+        assert!(
+            parent_blockers
+                .iter()
+                .any(|b| b.starts_with("external:extproj:capability"))
+        );
+        let child_blockers = blockers.get("bd-child").expect("child blockers");
+        assert!(
+            child_blockers
+                .iter()
+                .any(|b| b == "bd-parent:parent-blocked")
+        );
+    }
+
+    #[test]
     fn test_update_issue_changes_fields() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
@@ -3367,7 +3695,7 @@ mod tests {
         storage.create_issue(&issue, "tester").unwrap();
 
         let deleted = storage
-            .delete_issue("bd-delete-1", "tester", "cleanup")
+            .delete_issue("bd-delete-1", "tester", "cleanup", None)
             .unwrap();
         assert_eq!(deleted.status, Status::Tombstone);
         assert_eq!(deleted.delete_reason.as_deref(), Some("cleanup"));
@@ -3515,6 +3843,7 @@ mod tests {
     #[test]
     fn test_add_comment_round_trip() {
         let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
 
         let issue = Issue {
             id: "bd-comment".to_string(),
@@ -3522,8 +3851,8 @@ mod tests {
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: t1,
+            updated_at: t1,
             content_hash: None,
             description: None,
             design: None,
@@ -3574,6 +3903,7 @@ mod tests {
     #[test]
     fn test_add_comment_marks_dirty() {
         let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
 
         let issue = Issue {
             id: "bd-comment-dirty".to_string(),
@@ -3581,8 +3911,8 @@ mod tests {
             status: Status::Open,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
+            created_at: t1,
+            updated_at: t1,
             content_hash: None,
             description: None,
             design: None,

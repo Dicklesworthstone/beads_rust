@@ -3,7 +3,9 @@
 //! Lists blocked issues from the `blocked_issues_cache`.
 
 use crate::cli::BlockedArgs;
-use crate::config::{CliOverrides, discover_beads_dir, open_storage};
+use crate::config::{
+    CliOverrides, discover_beads_dir, external_project_db_paths, load_config, open_storage,
+};
 use crate::error::{BeadsError, Result};
 use crate::format::BlockedIssue;
 
@@ -24,6 +26,9 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
     let (storage, _paths) =
         open_storage(&beads_dir, overrides.db.as_ref(), overrides.lock_timeout)?;
 
+    let config_layer = load_config(&beads_dir, Some(&storage), overrides)?;
+    let external_db_paths = external_project_db_paths(&config_layer, &beads_dir);
+
     // Get blocked issues from cache
     let blocked_raw = storage.get_blocked_issues()?;
 
@@ -42,6 +47,42 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
             issue,
         })
         .collect();
+
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+    let external_blockers = storage.external_blockers(&external_statuses)?;
+
+    if !external_blockers.is_empty() {
+        let mut by_id: std::collections::HashMap<String, usize> = blocked_issues
+            .iter()
+            .enumerate()
+            .map(|(idx, bi)| (bi.issue.id.clone(), idx))
+            .collect();
+
+        for (issue_id, blockers) in external_blockers {
+            if let Some(idx) = by_id.get(&issue_id).copied() {
+                let entry = &mut blocked_issues[idx];
+                entry.blocked_by.extend(blockers);
+                entry.blocked_by.sort();
+                entry.blocked_by.dedup();
+                entry.blocked_by_count = entry.blocked_by.len();
+                continue;
+            }
+
+            if let Ok(Some(issue)) = storage.get_issue(&issue_id) {
+                if issue.status.is_terminal() {
+                    continue;
+                }
+                let blocked_by_count = blockers.len();
+                blocked_issues.push(BlockedIssue {
+                    blocked_by_count,
+                    blocked_by: blockers,
+                    issue,
+                });
+                by_id.insert(issue_id, blocked_issues.len() - 1);
+            }
+        }
+    }
 
     // Apply filters
     filter_by_type(&mut blocked_issues, &args.type_);
@@ -154,7 +195,7 @@ fn print_text_output(
             println!("   Blocked by:");
             for blocker_ref in &bi.blocked_by {
                 // blocker_ref format is "id:status", extract just the id for lookup
-                let blocker_id = blocker_ref.split(':').next().unwrap_or(blocker_ref);
+                let blocker_id = blocker_id_from_ref(blocker_ref);
                 if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
                     println!(
                         "     \u{2022} {}: {} [P{}] [{}]",
@@ -176,6 +217,13 @@ fn print_text_output(
         }
         println!();
     }
+}
+
+fn blocker_id_from_ref(blocker_ref: &str) -> &str {
+    // Split from the right to preserve external IDs containing ':'
+    blocker_ref
+        .rsplit_once(':')
+        .map_or(blocker_ref, |(prefix, _)| prefix)
 }
 
 #[cfg(test)]

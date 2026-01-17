@@ -22,6 +22,9 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let (storage, _paths) = config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
 
+    let config_layer = config::load_config(&beads_dir, Some(&storage), cli)?;
+    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+
     let filters = ReadyFilters {
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
@@ -44,6 +47,14 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
 
     // Get ready issues from storage (blocked cache only)
     let ready_issues = storage.get_ready_issues(&filters, sort_policy)?;
+
+    let mut ready_issues = ready_issues;
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(&external_db_paths, true)?;
+    let external_blockers = storage.external_blockers(&external_statuses)?;
+    if !external_blockers.is_empty() {
+        ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
+    }
 
     // Convert to IssueWithCounts
     let issues_with_counts: Vec<IssueWithCounts> = ready_issues

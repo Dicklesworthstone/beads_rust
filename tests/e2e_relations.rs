@@ -4,6 +4,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
+use std::fs;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -189,6 +190,115 @@ fn e2e_dep_add_list_blocked_remove() {
     assert!(
         !blocked_json.iter().any(|item| item["id"] == blocked_id),
         "blocked issue still present after dep remove"
+    );
+}
+
+#[test]
+fn e2e_dep_tree_external_nodes() {
+    let workspace = BrWorkspace::new();
+    let external = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_main");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let init_ext = run_br(&external, ["init"], "init_external");
+    assert!(
+        init_ext.status.success(),
+        "external init failed: {}",
+        init_ext.stderr
+    );
+
+    let config_path = workspace.root.join(".beads/config.yaml");
+    let external_path = external.root.display();
+    let config = format!("external_projects:\n  extproj: \"{external_path}\"\n");
+    fs::write(&config_path, config).expect("write config");
+
+    let issue = run_br(&workspace, ["create", "Main issue"], "create_main_issue");
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let issue_id = parse_created_id(&issue.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &issue_id, "external:extproj:auth"],
+        "dep_add_external",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let tree_before = run_br(
+        &workspace,
+        ["dep", "tree", &issue_id, "--json"],
+        "dep_tree_before",
+    );
+    assert!(
+        tree_before.status.success(),
+        "dep tree before failed: {}",
+        tree_before.stderr
+    );
+    let tree_payload = extract_json_payload(&tree_before.stdout);
+    let nodes: Vec<Value> = serde_json::from_str(&tree_payload).expect("tree json");
+    let external_node = nodes
+        .iter()
+        .find(|node| node["id"] == "external:extproj:auth")
+        .expect("external node");
+    assert_eq!(external_node["status"], "blocked");
+    assert!(
+        external_node["title"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with('⏳'),
+        "external node should show pending marker"
+    );
+
+    let provider = run_br(&external, ["create", "Provide auth"], "ext_create");
+    assert!(
+        provider.status.success(),
+        "external create failed: {}",
+        provider.stderr
+    );
+    let provider_id = parse_created_id(&provider.stdout);
+    let label = run_br(
+        &external,
+        ["update", &provider_id, "--add-label", "provides:auth"],
+        "ext_label",
+    );
+    assert!(
+        label.status.success(),
+        "external label failed: {}",
+        label.stderr
+    );
+    let close = run_br(&external, ["close", &provider_id], "ext_close");
+    assert!(
+        close.status.success(),
+        "external close failed: {}",
+        close.stderr
+    );
+
+    let tree_after = run_br(
+        &workspace,
+        ["dep", "tree", &issue_id, "--json"],
+        "dep_tree_after",
+    );
+    assert!(
+        tree_after.status.success(),
+        "dep tree after failed: {}",
+        tree_after.stderr
+    );
+    let tree_payload = extract_json_payload(&tree_after.stdout);
+    let nodes: Vec<Value> = serde_json::from_str(&tree_payload).expect("tree json");
+    let external_node = nodes
+        .iter()
+        .find(|node| node["id"] == "external:extproj:auth")
+        .expect("external node");
+    assert_eq!(external_node["status"], "closed");
+    assert!(
+        external_node["title"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with('✓'),
+        "external node should show satisfied marker"
     );
 }
 

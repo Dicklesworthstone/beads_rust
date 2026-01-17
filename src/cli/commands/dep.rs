@@ -9,7 +9,8 @@ use crate::model::DependencyType;
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use serde::Serialize;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// Execute the dep command.
 ///
@@ -28,13 +29,24 @@ pub fn execute(command: &DepCommands, json: bool, cli: &config::CliOverrides) ->
 
     let actor = config::resolve_actor(&config_layer);
 
+    let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
+
     match command {
         DepCommands::Add(args) => dep_add(args, &mut storage, &resolver, &all_ids, &actor, json),
         DepCommands::Remove(args) => {
             dep_remove(args, &mut storage, &resolver, &all_ids, &actor, json)
         }
-        DepCommands::List(args) => dep_list(args, &storage, &resolver, &all_ids, json),
-        DepCommands::Tree(args) => dep_tree(args, &storage, &resolver, &all_ids, json),
+        DepCommands::List(args) => {
+            dep_list(args, &storage, &resolver, &all_ids, &external_db_paths, json)
+        }
+        DepCommands::Tree(args) => dep_tree(
+            args,
+            &storage,
+            &resolver,
+            &all_ids,
+            &external_db_paths,
+            json,
+        ),
         DepCommands::Cycles(args) => dep_cycles(args, &storage, json),
     }
 }
@@ -187,6 +199,7 @@ fn dep_list(
     storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
+    external_db_paths: &HashMap<String, PathBuf>,
     json: bool,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
@@ -233,6 +246,12 @@ fn dep_list(
         }
     }
 
+    if !items.is_empty() && !external_db_paths.is_empty() {
+        let external_statuses =
+            storage.resolve_external_dependency_statuses(external_db_paths, false)?;
+        apply_external_dep_list_metadata(&mut items, &external_statuses);
+    }
+
     if json {
         println!("{}", serde_json::to_string_pretty(&items)?);
         return Ok(());
@@ -274,11 +293,46 @@ fn dep_list(
     Ok(())
 }
 
+fn apply_external_dep_list_metadata(
+    items: &mut [DepListItem],
+    external_statuses: &HashMap<String, bool>,
+) {
+    for item in items {
+        let external_id = if item.depends_on_id.starts_with("external:") {
+            Some(item.depends_on_id.as_str())
+        } else if item.issue_id.starts_with("external:") {
+            Some(item.issue_id.as_str())
+        } else {
+            None
+        };
+
+        let Some(external_id) = external_id else {
+            continue;
+        };
+
+        let satisfied = external_statuses.get(external_id).copied().unwrap_or(false);
+        item.status = if satisfied {
+            "closed".to_string()
+        } else {
+            "blocked".to_string()
+        };
+
+        if item.title.is_empty() {
+            let prefix = if satisfied { "✓" } else { "⏳" };
+            item.title = parse_external_dep_id(external_id)
+                .map(|(project, capability)| format!("{prefix} {project}:{capability}"))
+                .unwrap_or_else(|| format!("{prefix} {external_id}"));
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn dep_tree(
     args: &DepTreeArgs,
     storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
+    external_db_paths: &HashMap<String, PathBuf>,
     json: bool,
 ) -> Result<()> {
     let root_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
@@ -297,6 +351,9 @@ fn dep_tree(
         path: Vec<String>,
     }
 
+    let external_statuses =
+        storage.resolve_external_dependency_statuses(external_db_paths, false)?;
+
     let mut nodes = Vec::new();
 
     let mut queue = vec![QueueItem {
@@ -314,6 +371,8 @@ fn dep_tree(
 
         let issue = if item.id == root_id {
             Some(root_issue.clone())
+        } else if item.id.starts_with("external:") {
+            None
         } else {
             storage.get_issue(&item.id)?
         };
@@ -324,8 +383,18 @@ fn dep_tree(
                 issue.priority.0,
                 issue.status.as_str().to_string(),
             )
+        } else if item.id.starts_with("external:") {
+            let satisfied = external_statuses.get(&item.id).copied().unwrap_or(false);
+            let status = if satisfied { "closed" } else { "blocked" };
+            let prefix = if satisfied { "✓" } else { "⏳" };
+            let title = if let Some((project, capability)) = parse_external_dep_id(&item.id) {
+                format!("{prefix} {project}:{capability}")
+            } else {
+                format!("{prefix} {}", item.id)
+            };
+            (title, 2, status.to_string())
         } else {
-            // External or missing issue
+            // Missing issue
             (item.id.clone(), 2, "unknown".to_string())
         };
 
@@ -342,24 +411,24 @@ fn dep_tree(
         });
 
         // Don't expand if at max depth
-        if item.depth < args.max_depth {
+        if item.depth < args.max_depth && !item.id.starts_with("external:") {
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
-            // Get dependents (issues that depend on this one)
-            let mut dependents = storage.get_dependents(&item.id)?;
+            // Get dependencies (issues that this one depends on)
+            let mut dependencies = storage.get_dependencies(&item.id)?;
 
             // Get full issue details for sorting
             // This is slightly inefficient (N queries), but necessary for sorting by priority.
-            // Optimization: fetch all at once or accept ID sort. 
+            // Optimization: fetch all at once or accept ID sort.
             // For now, let's sort by ID to be deterministic, or fetch details.
             // The original code sorted the FINAL list.
             // To maintain DFS order with sorted siblings, we must sort here.
-            
+
             // Let's just sort by ID for stability and speed, priority sorting would require fetching issues.
-            dependents.sort();
+            dependencies.sort();
             // Push in reverse order so first item pops first
-            for dep_id in dependents.into_iter().rev() {
+            for dep_id in dependencies.into_iter().rev() {
                 // No global visited check here
                 queue.push(QueueItem {
                     id: dep_id,
@@ -398,6 +467,20 @@ fn dep_tree(
     }
 
     Ok(())
+}
+
+fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
+    let mut parts = dep_id.splitn(3, ':');
+    let prefix = parts.next()?;
+    if prefix != "external" {
+        return None;
+    }
+    let project = parts.next()?.to_string();
+    let capability = parts.next()?.to_string();
+    if project.is_empty() || capability.is_empty() {
+        return None;
+    }
+    Some((project, capability))
 }
 
 fn dep_cycles(_args: &DepCyclesArgs, storage: &SqliteStorage, json: bool) -> Result<()> {

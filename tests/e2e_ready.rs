@@ -2,6 +2,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
+use std::fs;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -147,6 +148,119 @@ fn ready_cli_filters_by_assignee() {
             .map(|i| i["id"].as_str().unwrap())
             .any(|id| id == ids[4].as_str())
     ); // Backlog Item
+}
+
+#[test]
+fn ready_respects_external_dependencies() {
+    let workspace = BrWorkspace::new();
+    let external = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_main");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let init_ext = run_br(&external, ["init"], "init_external");
+    assert!(
+        init_ext.status.success(),
+        "external init failed: {}",
+        init_ext.stderr
+    );
+
+    let config_path = workspace.root.join(".beads/config.yaml");
+    let external_path = external.root.display();
+    let config = format!("external_projects:\n  extproj: \"{external_path}\"\n");
+    fs::write(&config_path, config).expect("write config");
+
+    let issue = run_br(&workspace, ["create", "Main issue"], "create_main_issue");
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let issue_id = parse_created_id(&issue.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &issue_id, "external:extproj:auth"],
+        "dep_add_external",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    let ready_before = run_br(&workspace, ["ready", "--json"], "ready_before");
+    assert!(
+        ready_before.status.success(),
+        "ready before failed: {}",
+        ready_before.stderr
+    );
+    let ready_payload = extract_json_payload(&ready_before.stdout);
+    let ready_json: Vec<Value> = serde_json::from_str(&ready_payload).expect("ready json");
+    assert!(
+        !ready_json.iter().any(|item| item["id"] == issue_id),
+        "issue should be blocked by external dependency"
+    );
+
+    let blocked_before = run_br(&workspace, ["blocked", "--json"], "blocked_before");
+    assert!(
+        blocked_before.status.success(),
+        "blocked before failed: {}",
+        blocked_before.stderr
+    );
+    let blocked_payload = extract_json_payload(&blocked_before.stdout);
+    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
+    assert!(
+        blocked_json.iter().any(|item| item["id"] == issue_id),
+        "blocked list should include external-blocked issue"
+    );
+
+    let provider = run_br(&external, ["create", "Provide auth"], "ext_create");
+    assert!(
+        provider.status.success(),
+        "external create failed: {}",
+        provider.stderr
+    );
+    let provider_id = parse_created_id(&provider.stdout);
+
+    let label = run_br(
+        &external,
+        ["update", &provider_id, "--add-label", "provides:auth"],
+        "ext_label",
+    );
+    assert!(
+        label.status.success(),
+        "external label failed: {}",
+        label.stderr
+    );
+
+    let close = run_br(&external, ["close", &provider_id], "ext_close");
+    assert!(
+        close.status.success(),
+        "external close failed: {}",
+        close.stderr
+    );
+
+    let ready_after = run_br(&workspace, ["ready", "--json"], "ready_after");
+    assert!(
+        ready_after.status.success(),
+        "ready after failed: {}",
+        ready_after.stderr
+    );
+    let ready_payload = extract_json_payload(&ready_after.stdout);
+    let ready_json: Vec<Value> = serde_json::from_str(&ready_payload).expect("ready json");
+    assert!(
+        ready_json.iter().any(|item| item["id"] == issue_id),
+        "issue should be ready once external dependency is satisfied"
+    );
+
+    let blocked_after = run_br(&workspace, ["blocked", "--json"], "blocked_after");
+    assert!(
+        blocked_after.status.success(),
+        "blocked after failed: {}",
+        blocked_after.stderr
+    );
+    let blocked_payload = extract_json_payload(&blocked_after.stdout);
+    let blocked_json: Vec<Value> = serde_json::from_str(&blocked_payload).expect("blocked json");
+    assert!(
+        !blocked_json.iter().any(|item| item["id"] == issue_id),
+        "blocked list should clear after external dependency is satisfied"
+    );
 }
 
 #[test]
