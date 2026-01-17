@@ -8,15 +8,15 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::sync::history::HistoryConfig;
 use crate::sync::{
-    ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy, ImportConfig,
-    METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, OrphanMode,
-    compute_jsonl_hash, count_issues_in_jsonl, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, import_from_jsonl, require_safe_sync_overwrite_path,
-    ConflictResolution, MergeContext, load_base_snapshot, save_base_snapshot, three_way_merge,
-    read_issues_from_jsonl,
+    ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
+    ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, count_issues_in_jsonl,
+    export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl, import_from_jsonl,
+    load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
+    save_base_snapshot, three_way_merge,
 };
 use serde::Serialize;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
@@ -108,7 +108,8 @@ pub fn execute(args: &SyncArgs, json: bool, cli: &config::CliOverrides) -> Resul
     if mode_count > 1 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
-            reason: "Must specify exactly one of --flush-only, --import-only, or --merge".to_string(),
+            reason: "Must specify exactly one of --flush-only, --import-only, or --merge"
+                .to_string(),
         });
     }
 
@@ -806,7 +807,7 @@ fn execute_merge(
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
     // TODO: support configurable conflict strategy via CLI args if needed
-    let strategy = ConflictResolution::PreferNewer; 
+    let strategy = ConflictResolution::PreferNewer;
     let tombstones = None;
 
     let report = three_way_merge(&context, strategy, tombstones);
@@ -844,12 +845,16 @@ fn execute_merge(
         storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
         storage.sync_comments_for_import(&issue.id, &issue.comments)?;
     }
-    
+
     // Rebuild cache
     storage.rebuild_blocked_cache(true)?;
 
     // Save Base Snapshot
-    let new_base: HashMap<_, _> = report.kept.iter().map(|i| (i.id.clone(), i.clone())).collect();
+    let new_base: HashMap<_, _> = report
+        .kept
+        .iter()
+        .map(|i| (i.id.clone(), i.clone()))
+        .collect();
     save_base_snapshot(&new_base, beads_dir)?;
 
     // Force Export to update JSONL (ensure sync)
@@ -864,10 +869,10 @@ fn execute_merge(
         show_progress,
         history: HistoryConfig::default(),
     };
-    
+
     let (export_result, _) = export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
     finalize_export(storage, &export_result, Some(&export_result.issue_hashes))?;
-    
+
     // Output success message
     if json {
         let output = serde_json::json!({

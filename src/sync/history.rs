@@ -275,14 +275,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         let history_dir = beads_dir.join(".br_history");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        // Create dummy jsonl
-        let jsonl_path = beads_dir.join("issues.jsonl");
-        File::create(&jsonl_path)
-            .unwrap()
-            .write_all(b"test")
-            .unwrap();
+        fs::create_dir_all(&history_dir).unwrap();
 
         let config = HistoryConfig {
             enabled: true,
@@ -290,26 +283,39 @@ mod tests {
             max_age_days: 30,
         };
 
-        // Create 3 backups (should rotate)
-        backup_before_export(&beads_dir, &config).unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(2)); // Ensure >1s for timestamp resolution
+        // Manually create 3 backup files with distinct timestamps
+        // Use very recent dates to avoid age pruning
+        let now = Utc::now();
+        let t1 = (now - chrono::Duration::hours(3)).format("%Y%m%d_%H%M%S");
+        let t2 = (now - chrono::Duration::hours(2)).format("%Y%m%d_%H%M%S");
+        let t3 = (now - chrono::Duration::hours(1)).format("%Y%m%d_%H%M%S");
+        
+        let file1 = format!("issues.{t1}.jsonl");
+        let file2 = format!("issues.{t2}.jsonl");
+        let file3 = format!("issues.{t3}.jsonl");
 
-        // Modify file to force new backup
-        File::create(&jsonl_path)
-            .unwrap()
-            .write_all(b"test2")
-            .unwrap();
-        backup_before_export(&beads_dir, &config).unwrap();
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        let files = [&file1, &file2, &file3];
 
-        File::create(&jsonl_path)
-            .unwrap()
-            .write_all(b"test3")
-            .unwrap();
-        backup_before_export(&beads_dir, &config).unwrap();
+        for name in &files {
+            File::create(history_dir.join(name)).unwrap();
+        }
 
+        // Verify initial state
         let backups = list_backups(&history_dir).unwrap();
-        assert_eq!(backups.len(), 2);
+        assert_eq!(backups.len(), 3);
+
+        // Run rotation
+        rotate_history(&history_dir, &config).unwrap();
+
+        // Should keep only max_count (2) newest files
+        let remaining = list_backups(&history_dir).unwrap();
+        assert_eq!(remaining.len(), 2);
+        
+        // Ensure the oldest one was deleted
+        assert!(!remaining.iter().any(|b| b.path.to_string_lossy().contains(&t1.to_string())));
+        // Ensure newer ones kept
+        assert!(remaining.iter().any(|b| b.path.to_string_lossy().contains(&t2.to_string())));
+        assert!(remaining.iter().any(|b| b.path.to_string_lossy().contains(&t3.to_string())));
     }
 
     #[test]

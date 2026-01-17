@@ -1,0 +1,7 @@
+---
+source: tests/snapshots/cli_output.rs
+expression: normalize_output(&output.stdout)
+---
+Labels for ID-REDACTED:
+  backend
+  urgent

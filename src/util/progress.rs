@@ -44,12 +44,10 @@ pub fn create_progress_bar(total: u64, message: &str, show: bool) -> ProgressBar
 
     if show {
         let style = ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-            )
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("=>-");
-        
+
         pb.set_style(style);
         pb.set_message(message.to_string());
     } else {
@@ -82,7 +80,7 @@ pub fn create_spinner(message: &str, show: bool) -> ProgressBar {
         let style = ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_spinner());
-            
+
         pb.set_style(style);
         pb.set_message(message.to_string());
         pb.enable_steady_tick(Duration::from_millis(100));

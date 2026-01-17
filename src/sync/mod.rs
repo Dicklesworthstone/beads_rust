@@ -2520,9 +2520,7 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
 /// # Errors
 ///
 /// Returns an error if the file exists but cannot be read or parsed.
-pub fn load_base_snapshot(
-    jsonl_dir: &Path,
-) -> Result<std::collections::HashMap<String, Issue>> {
+pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<String, Issue>> {
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
     let mut base = std::collections::HashMap::new();
 
@@ -3710,12 +3708,7 @@ mod tests {
         let result = preflight_import(&jsonl_path, &config).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(
-            result
-                .failures()
-                .iter()
-                .any(|c| c.name == "file_readable")
-        );
+        assert!(result.failures().iter().any(|c| c.name == "file_readable"));
     }
 
     #[test]
@@ -3978,9 +3971,7 @@ mod tests {
             Some(&external),
             ConflictResolution::PreferNewer,
         );
-        assert!(
-            matches!(result, MergeResult::KeepWithNote(issue, _) if issue.title == "Modified")
-        );
+        assert!(matches!(result, MergeResult::KeepWithNote(issue, _) if issue.title == "Modified"));
     }
 
     #[test]

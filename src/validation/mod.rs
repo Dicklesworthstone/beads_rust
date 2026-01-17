@@ -686,9 +686,9 @@ mod tests {
         assert!(is_valid_id_format("bd-1"));
         // 9 char hash is now allowed (max 25)
         assert!(is_valid_id_format("bd-abc123456"));
-        
+
         assert!(!is_valid_id_format("bd_abc"));
-        
+
         // Too long (26 chars)
         assert!(!is_valid_id_format("bd-abc12345678901234567890123456"));
     }

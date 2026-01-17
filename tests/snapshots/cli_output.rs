@@ -123,3 +123,89 @@ fn snapshot_version_output() {
     let output = run_br(&workspace, ["version"], "version");
     assert_snapshot!("version_output", normalize_output(&output.stdout));
 }
+
+#[test]
+fn snapshot_reopen_output() {
+    let workspace = init_workspace();
+    let id = create_issue(&workspace, "Issue to reopen", "create_for_reopen");
+
+    // Close the issue first
+    let close = run_br(&workspace, ["close", &id], "close_for_reopen");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    // Now reopen it
+    let output = run_br(&workspace, ["reopen", &id], "reopen");
+    assert!(output.status.success(), "reopen failed: {}", output.stderr);
+    assert_snapshot!("reopen_output", normalize_output(&output.stdout));
+}
+
+#[test]
+fn snapshot_search_output() {
+    let workspace = init_workspace();
+
+    // Create issues with searchable content
+    create_issue(&workspace, "Authentication bug in login", "create_search1");
+    create_issue(&workspace, "Payment processing feature", "create_search2");
+    create_issue(&workspace, "User login flow improvement", "create_search3");
+
+    // Search for "login"
+    let output = run_br(&workspace, ["search", "login"], "search_login");
+    assert!(output.status.success(), "search failed: {}", output.stderr);
+    assert_snapshot!("search_output", normalize_output(&output.stdout));
+}
+
+#[test]
+fn snapshot_count_output() {
+    let workspace = init_workspace();
+
+    // Create issues with different statuses and types
+    let id1 = create_issue(&workspace, "Bug one", "create_count1");
+    let id2 = create_issue(&workspace, "Bug two", "create_count2");
+    let id3 = create_issue(&workspace, "Feature one", "create_count3");
+
+    // Update types and close one
+    let _ = run_br(
+        &workspace,
+        ["update", &id1, "--type", "bug"],
+        "update_count1",
+    );
+    let _ = run_br(
+        &workspace,
+        ["update", &id2, "--type", "bug"],
+        "update_count2",
+    );
+    let _ = run_br(
+        &workspace,
+        ["update", &id3, "--type", "feature"],
+        "update_count3",
+    );
+    let _ = run_br(&workspace, ["close", &id2], "close_count2");
+
+    let output = run_br(&workspace, ["count"], "count_text");
+    assert!(output.status.success(), "count failed: {}", output.stderr);
+    assert_snapshot!("count_output", normalize_output(&output.stdout));
+}
+
+#[test]
+fn snapshot_label_add_list_output() {
+    let workspace = init_workspace();
+
+    // Create an issue and add labels
+    let id = create_issue(&workspace, "Issue with labels", "create_label");
+
+    // Add labels
+    let add1 = run_br(&workspace, ["label", "add", &id, "urgent"], "label_add1");
+    assert!(add1.status.success(), "label add failed: {}", add1.stderr);
+
+    let add2 = run_br(&workspace, ["label", "add", &id, "backend"], "label_add2");
+    assert!(add2.status.success(), "label add failed: {}", add2.stderr);
+
+    // List labels
+    let output = run_br(&workspace, ["label", "list", &id], "label_list");
+    assert!(
+        output.status.success(),
+        "label list failed: {}",
+        output.stderr
+    );
+    assert_snapshot!("label_list_output", normalize_output(&output.stdout));
+}

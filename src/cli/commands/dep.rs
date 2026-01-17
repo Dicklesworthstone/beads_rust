@@ -108,11 +108,9 @@ fn dep_add(
 
     // Parse and validate dependency type
     let dep_type_str = &args.dep_type;
-    let dep_type: DependencyType = dep_type_str.parse().map_err(|_| {
-        BeadsError::Validation {
-            field: "type".to_string(),
-            reason: format!("Invalid dependency type: {dep_type_str}"),
-        }
+    let dep_type: DependencyType = dep_type_str.parse().map_err(|_| BeadsError::Validation {
+        field: "type".to_string(),
+        reason: format!("Invalid dependency type: {dep_type_str}"),
     })?;
 
     // Disallow accidental custom types from typos

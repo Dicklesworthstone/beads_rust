@@ -2215,7 +2215,9 @@ impl SqliteStorage {
         let mut map: HashMap<String, Vec<Comment>> = HashMap::new();
         for row in rows {
             let comment = row?;
-            map.entry(comment.issue_id.clone()).or_default().push(comment);
+            map.entry(comment.issue_id.clone())
+                .or_default()
+                .push(comment);
         }
         Ok(map)
     }
@@ -3583,7 +3585,15 @@ mod tests {
         let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
         let t3 = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
 
-        let issue1 = make_issue("bd-l1", "Open assigned", Status::Open, 2, None, t1, None);
+        let issue1 = make_issue(
+            "bd-l1",
+            "Open assigned",
+            Status::Open,
+            2,
+            Some("alice"),
+            t1,
+            None,
+        );
         let issue2 = make_issue(
             "bd-l2",
             "In progress",
@@ -3664,7 +3674,7 @@ mod tests {
         );
         let pinned = make_issue("bd-r4", "Pinned", Status::Open, 2, None, base, None);
         let ephemeral = make_issue("bd-r5", "Ephemeral", Status::Open, 2, None, base, None);
-        let wisp = make_issue("bd-w1", "Wisp", Status::Open, 2, None, base, None);
+        let wisp = make_issue("bd-wisp-1", "Wisp", Status::Open, 2, None, base, None);
 
         for issue in [
             ready,
@@ -3683,10 +3693,7 @@ mod tests {
             .unwrap();
         storage
             .conn
-            .execute(
-                "UPDATE issues SET ephemeral = 1 WHERE id = ?",
-                ["bd-r5"],
-            )
+            .execute("UPDATE issues SET ephemeral = 1 WHERE id = ?", ["bd-r5"])
             .unwrap();
 
         let filters = ReadyFilters {
@@ -3709,7 +3716,7 @@ mod tests {
         assert!(!ids.contains(&"bd-r2"));
         assert!(!ids.contains(&"bd-r4"));
         assert!(!ids.contains(&"bd-r5"));
-        assert!(!ids.contains(&"bd-w1"));
+        assert!(!ids.contains(&"bd-wisp-1"));
     }
 
     #[test]
@@ -3718,13 +3725,14 @@ mod tests {
         let t1 = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2025, 3, 2, 0, 0, 0).unwrap();
 
-        let blocker = make_issue("bd-rb", "Blocker", Status::Open, 1, None, t1, None);
-        let blocked = make_issue("bd-rb", "Blocked", Status::Open, 2, None, t2, None);
+        let blocker = make_issue("bd-blocker", "Blocker", Status::Open, 1, None, t1, None);
+        let blocked = make_issue("bd-blocked", "Blocked", Status::Open, 2, None, t2, None);
         storage.create_issue(&blocker, "tester").unwrap();
         storage.create_issue(&blocked, "tester").unwrap();
 
+        // bd-blocked depends on bd-blocker (bd-blocker blocks bd-blocked)
         storage
-            .add_dependency("bd-rb", "bd-rb", "blocks", "tester")
+            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
             .unwrap();
 
         let filters = ReadyFilters {
@@ -3742,8 +3750,10 @@ mod tests {
             .get_ready_issues(&filters, ReadySortPolicy::Oldest)
             .unwrap();
         let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
-        assert!(ids.contains(&"bd-rb"));
-        assert!(!ids.contains(&"bd-rb"));
+        // blocker is ready (not blocked by anything)
+        assert!(ids.contains(&"bd-blocker"));
+        // blocked is NOT ready (blocked by blocker)
+        assert!(!ids.contains(&"bd-blocked"));
     }
 
     #[test]
@@ -3799,16 +3809,14 @@ mod tests {
         let child = make_issue("bd-c1", "Child", Status::Open, 2, None, t1, None);
         storage.create_issue(&parent, "tester").unwrap();
         storage.create_issue(&child, "tester").unwrap();
+        // Parent (bd-p1) depends on external capability
         storage
-            .add_dependency(
-                "bd-c1",
-                "external:extproj:capability",
-                "blocks",
-                "tester",
-            )
+            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
             .unwrap();
+        // Child (bd-c1) depends on parent (bd-p1) via parent-child
+        // In the code's semantics: issue_id=child, depends_on_id=parent
         storage
-            .add_dependency("bd-p1", "bd-c1", "parent-child", "tester")
+            .add_dependency("bd-c1", "bd-p1", "parent-child", "tester")
             .unwrap();
 
         let mut external_db_paths = HashMap::new();
@@ -3827,11 +3835,7 @@ mod tests {
                 .any(|b| b.starts_with("external:extproj:capability"))
         );
         let child_blockers = blockers.get("bd-c1").expect("child blockers");
-        assert!(
-            child_blockers
-                .iter()
-                .any(|b| b == "bd-p1:parent-blocked")
-        );
+        assert!(child_blockers.iter().any(|b| b == "bd-p1:parent-blocked"));
     }
 
     #[test]
@@ -3851,9 +3855,7 @@ mod tests {
             ..IssueUpdate::default()
         };
 
-        let updated = storage
-            .update_issue("bd-u1", &updates, "tester")
-            .unwrap();
+        let updated = storage.update_issue("bd-u1", &updates, "tester").unwrap();
         assert_eq!(updated.title, "Updated title");
         assert_eq!(updated.status, Status::InProgress);
         assert_eq!(updated.priority, Priority::HIGH);
@@ -3971,9 +3973,7 @@ mod tests {
             .add_dependency("bd-cy2", "bd-cy3", "blocks", "tester")
             .unwrap();
 
-        let creates_cycle = storage
-            .would_create_cycle("bd-cy3", "bd-cy1")
-            .unwrap();
+        let creates_cycle = storage.would_create_cycle("bd-cy3", "bd-cy1").unwrap();
         assert!(creates_cycle);
     }
 
@@ -4466,14 +4466,20 @@ mod tests {
 
         let result = storage.get_issue("nonexistent-id").unwrap();
 
-        assert!(result.is_none(), "Getting non-existent issue should return None");
+        assert!(
+            result.is_none(),
+            "Getting non-existent issue should return None"
+        );
     }
 
     #[test]
     fn test_open_nonexistent_parent_fails() {
         let result = SqliteStorage::open(Path::new("/nonexistent/path/to/db.db"));
 
-        assert!(result.is_err(), "Opening DB in non-existent directory should fail");
+        assert!(
+            result.is_err(),
+            "Opening DB in non-existent directory should fail"
+        );
     }
 
     #[test]
@@ -4506,9 +4512,33 @@ mod tests {
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
 
         // Create issues with different titles
-        let issue1 = make_issue("bd-t1", "Fix authentication bug", Status::Open, 2, None, t1, None);
-        let issue2 = make_issue("bd-t2", "Add user registration", Status::Open, 2, None, t1, None);
-        let issue3 = make_issue("bd-t3", "Update documentation", Status::Open, 2, None, t1, None);
+        let issue1 = make_issue(
+            "bd-t1",
+            "Fix authentication bug",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue2 = make_issue(
+            "bd-t2",
+            "Add user registration",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue3 = make_issue(
+            "bd-t3",
+            "Update documentation",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
 
         storage.create_issue(&issue1, "tester").unwrap();
         storage.create_issue(&issue2, "tester").unwrap();
@@ -4531,9 +4561,33 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
 
-        let issue1 = make_issue("bd-s1", "Fix authentication bug", Status::Open, 2, None, t1, None);
-        let issue2 = make_issue("bd-s2", "Add user registration", Status::Open, 2, None, t1, None);
-        let issue3 = make_issue("bd-s3", "Update documentation", Status::Open, 2, None, t1, None);
+        let issue1 = make_issue(
+            "bd-s1",
+            "Fix authentication bug",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue2 = make_issue(
+            "bd-s2",
+            "Add user registration",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue3 = make_issue(
+            "bd-s3",
+            "Update documentation",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
 
         storage.create_issue(&issue1, "tester").unwrap();
         storage.create_issue(&issue2, "tester").unwrap();
@@ -4542,7 +4596,11 @@ mod tests {
         let filters = ListFilters::default();
         let results = storage.search_issues("authentication", &filters).unwrap();
 
-        assert_eq!(results.len(), 1, "Should find one issue matching 'authentication'");
+        assert_eq!(
+            results.len(),
+            1,
+            "Should find one issue matching 'authentication'"
+        );
         assert_eq!(results[0].id, "bd-s1");
     }
 }

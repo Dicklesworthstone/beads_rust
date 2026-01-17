@@ -17,8 +17,10 @@
 //! but **only the first non-empty line** is captured; subsequent lines are ignored.
 
 use crate::error::{BeadsError, Result};
+use crate::model::DependencyType;
 use std::fs;
 use std::path::Path;
+use std::str::FromStr;
 
 /// A parsed issue from the markdown file.
 #[derive(Debug, Default, Clone)]
@@ -275,10 +277,18 @@ fn split_list_content(content: &str) -> Vec<String> {
 /// Returns the dependency type if valid, or None if invalid.
 #[must_use]
 pub fn validate_dependency_type(dep_type: &str) -> Option<&str> {
-    match dep_type.to_lowercase().as_str() {
-        "blocks" | "blocked-by" | "parent-child" | "related" | "duplicates" => Some(dep_type),
-        _ => None,
+    // Check against standard types
+    if let Ok(dt) = DependencyType::from_str(dep_type) {
+        if let DependencyType::Custom(_) = dt {
+            // Check for legacy/alias support not in standard enum
+            if dep_type.eq_ignore_ascii_case("blocked-by") {
+                return Some(dep_type);
+            }
+            return None;
+        }
+        return Some(dep_type);
     }
+    None
 }
 
 /// Parse a dependency string into (type, id).

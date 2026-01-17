@@ -36,7 +36,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     // We open storage even for dry-run to check ID collisions.
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    
+
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
         default_priority: config::default_priority_from_layer(&layer)?,
@@ -53,9 +53,12 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
         if args.dry_run {
             println!("{}", serde_json::to_string_pretty(&issue)?);
         } else {
-            let full_issue = storage_ctx.storage
+            let full_issue = storage_ctx
+                .storage
                 .get_issue_for_export(&issue.id)?
-                .ok_or_else(|| BeadsError::IssueNotFound { id: issue.id.clone() })?;
+                .ok_or_else(|| BeadsError::IssueNotFound {
+                    id: issue.id.clone(),
+                })?;
             println!("{}", serde_json::to_string_pretty(&full_issue)?);
         }
     } else if args.dry_run {
@@ -81,12 +84,12 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
 }
 
 /// Core logic for creating an issue.
-/// 
+///
 /// Handles ID generation, validation, and storage insertion.
 /// Returns the constructed Issue.
-/// 
+///
 /// # Errors
-/// 
+///
 /// Returns error if:
 /// - Title is empty
 /// - ID generation fails
@@ -236,11 +239,9 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
         }
 
         // Strict dependency type validation
-        let dep_type: DependencyType = type_str.parse().map_err(|_| {
-            BeadsError::Validation {
-                field: "deps".to_string(),
-                reason: format!("Invalid dependency type: {type_str}"),
-            }
+        let dep_type: DependencyType = type_str.parse().map_err(|_| BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!("Invalid dependency type: {type_str}"),
         })?;
 
         // Disallow accidental custom types from typos
@@ -318,7 +319,7 @@ fn add_relations(
             thread_id: None,
         });
     }
-    
+
     Ok(())
 }
 
@@ -379,7 +380,7 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
             updated_at: now,
             assignee: parsed.assignee,
             owner: args.owner.clone(),
-            estimated_minutes: args.estimate, 
+            estimated_minutes: args.estimate,
             due_at: parse_optional_date(args.due.as_deref())?,
             defer_until: parse_optional_date(args.defer.as_deref())?,
             external_ref: args.external_ref.clone(),
@@ -470,8 +471,8 @@ fn parse_optional_date(s: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Datelike;
     use crate::util::id::IdConfig;
+    use chrono::Datelike;
 
     // Helper to create basic args
     fn default_args() -> CreateArgs {
@@ -527,7 +528,7 @@ mod tests {
         assert_eq!(issue.priority, Priority::MEDIUM);
         assert_eq!(issue.issue_type, IssueType::Task);
         assert!(issue.id.starts_with("bd-"));
-        
+
         // Verify persisted
         let loaded = storage.get_issue(&issue.id).expect("get issue");
         assert!(loaded.is_some());
@@ -580,44 +581,44 @@ mod tests {
     fn test_create_issue_with_labels_and_deps() {
         let mut storage = setup_memory_storage();
         let config = default_config();
-        
+
         // Create dependency target first
         let target_args = CreateArgs {
-             title: Some("Target".to_string()),
-             ..default_args()
+            title: Some("Target".to_string()),
+            ..default_args()
         };
         let target = create_issue_impl(&mut storage, &target_args, &config).expect("create target");
-        
+
         // Create issue with label and dep
         let mut args = default_args();
         args.labels = vec!["backend".to_string()];
         args.deps = vec![target.id.clone()];
-        
+
         let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
-        
+
         // Verify labels
         let labels = storage.get_labels(&issue.id).expect("get labels");
         assert!(labels.contains(&"backend".to_string()));
-        
+
         // Verify deps
         let deps = storage.get_dependencies(&issue.id).expect("get deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], target.id);
     }
-    
+
     #[test]
     fn test_create_parent_dependency() {
         let mut storage = setup_memory_storage();
         let config = default_config();
-        
+
         // Parent
         let parent = create_issue_impl(&mut storage, &default_args(), &config).expect("parent");
-        
+
         // Child
         let mut args = default_args();
         args.parent = Some(parent.id.clone());
         let child = create_issue_impl(&mut storage, &args, &config).expect("child");
-        
+
         let deps = storage.get_dependencies(&child.id).expect("get deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], parent.id);
@@ -630,8 +631,12 @@ mod tests {
         args.type_ = Some("invalid_type".to_string());
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create should succeed with custom type");
-        assert_eq!(issue.issue_type, IssueType::Custom("invalid_type".to_string()));
+        let issue = create_issue_impl(&mut storage, &args, &config)
+            .expect("create should succeed with custom type");
+        assert_eq!(
+            issue.issue_type,
+            IssueType::Custom("invalid_type".to_string())
+        );
     }
 
     // =========================================================================

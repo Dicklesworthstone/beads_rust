@@ -51,6 +51,13 @@ pub fn normalize_output(output: &str) -> String {
         .replace_all(&normalized, "(main@GIT_HASH)")
         .to_string();
 
+    // Normalize line numbers in log messages e.g. src/storage/sqlite.rs:1077: → src/storage/sqlite.rs:LINE:
+    // This prevents snapshot failures when code is modified and line numbers shift
+    let line_num_re = Regex::new(r"\.rs:\d+:").expect("line number regex");
+    normalized = line_num_re
+        .replace_all(&normalized, ".rs:LINE:")
+        .to_string();
+
     normalized
 }
 

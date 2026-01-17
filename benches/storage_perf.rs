@@ -458,10 +458,8 @@ fn bench_cycle_detection(c: &mut Criterion) {
     group.bench_function("would_create_cycle_true", |b| {
         b.iter(|| {
             // This would create a cycle: 0 -> 99 when 99 -> ... -> 0 exists
-            let result = storage.would_create_cycle(
-                black_box("bench-000000"),
-                black_box("bench-000099"),
-            );
+            let result =
+                storage.would_create_cycle(black_box("bench-000000"), black_box("bench-000099"));
             black_box(result)
         });
     });
@@ -469,10 +467,8 @@ fn bench_cycle_detection(c: &mut Criterion) {
     group.bench_function("would_create_cycle_false", |b| {
         b.iter(|| {
             // This wouldn't create a cycle: checking a non-existent edge
-            let result = storage.would_create_cycle(
-                black_box("bench-000099"),
-                black_box("bench-000000"),
-            );
+            let result =
+                storage.would_create_cycle(black_box("bench-000099"), black_box("bench-000000"));
             black_box(result)
         });
     });

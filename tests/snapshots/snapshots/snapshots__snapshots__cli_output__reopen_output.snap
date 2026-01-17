@@ -1,0 +1,6 @@
+---
+source: tests/snapshots/cli_output.rs
+assertion_line: 139
+expression: normalize_output(&output.stdout)
+---
+✓ Reopened ID-REDACTED: Issue to reopen

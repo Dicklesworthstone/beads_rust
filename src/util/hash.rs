@@ -68,31 +68,55 @@ pub fn content_hash_from_parts(
     pinned: bool,
     is_template: bool,
 ) -> String {
-    let mut hasher = Sha256::new();
+    let mut writer = HashFieldWriter::new();
 
-    let mut add_field = |value: &str| {
-        if value.contains('\0') {
-            hasher.update(value.replace('\0', " ").as_bytes());
-        } else {
-            hasher.update(value.as_bytes());
+    writer.field(title);
+    writer.field_opt(description);
+    writer.field_opt(design);
+    writer.field_opt(acceptance_criteria);
+    writer.field_opt(notes);
+    writer.field(status.as_str());
+    writer.field(&format!("P{}", priority.0));
+    writer.field(issue_type.as_str());
+    writer.field_opt(assignee);
+    writer.field_opt(external_ref);
+    writer.field_bool(pinned);
+    writer.field_bool(is_template);
+
+    writer.finalize()
+}
+
+struct HashFieldWriter {
+    hasher: Sha256,
+}
+
+impl HashFieldWriter {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
         }
-        hasher.update(b"\x00");
-    };
+    }
 
-    add_field(title);
-    add_field(description.unwrap_or(""));
-    add_field(design.unwrap_or(""));
-    add_field(acceptance_criteria.unwrap_or(""));
-    add_field(notes.unwrap_or(""));
-    add_field(status.as_str());
-    add_field(&format!("P{}", priority.0));
-    add_field(issue_type.as_str());
-    add_field(assignee.unwrap_or(""));
-    add_field(external_ref.unwrap_or(""));
-    add_field(if pinned { "true" } else { "false" });
-    add_field(if is_template { "true" } else { "false" });
+    fn field(&mut self, value: &str) {
+        if value.contains('\0') {
+            self.hasher.update(value.replace('\0', " ").as_bytes());
+        } else {
+            self.hasher.update(value.as_bytes());
+        }
+        self.hasher.update(b"\x00");
+    }
 
-    format!("{:x}", hasher.finalize())
+    fn field_opt(&mut self, value: Option<&str>) {
+        self.field(value.unwrap_or(""));
+    }
+
+    fn field_bool(&mut self, value: bool) {
+        self.field(if value { "true" } else { "false" });
+    }
+
+    fn finalize(self) -> String {
+        format!("{:x}", self.hasher.finalize())
+    }
 }
 
 #[cfg(test)]

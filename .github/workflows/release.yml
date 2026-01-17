@@ -1,0 +1,225 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            name: linux_amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            name: linux_arm64
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            name: darwin_amd64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            name: darwin_arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            name: windows_amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Configure linker (Linux ARM64)
+        if: matrix.cross
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          VERGEN_GIT_SHA: ${{ github.sha }}
+          VERGEN_GIT_BRANCH: ${{ github.ref_name }}
+
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czvf ../../../br-${{ github.ref_name }}-${{ matrix.name }}.tar.gz br
+          cd ../../..
+
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Compress-Archive -Path br.exe -DestinationPath ../../../br-${{ github.ref_name }}-${{ matrix.name }}.zip
+          cd ../../..
+
+      - name: Generate checksum (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          sha256sum br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} > br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+
+      - name: Generate checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path "br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}" -Algorithm SHA256).Hash.ToLower()
+          "$hash  br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}" | Out-File -FilePath "br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256" -Encoding utf8 -NoNewline
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: br-${{ matrix.name }}
+          path: |
+            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
+            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+
+  create-release:
+    name: Create Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Generate combined checksums
+        run: |
+          cd artifacts
+          cat *.sha256 > checksums.sha256
+          cat checksums.sha256
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+          else
+            echo "No previous tag found, generating changelog from start"
+            COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD~20..HEAD 2>/dev/null || git log --pretty=format:"- %s (%h)")
+          fi
+
+          # Create changelog file
+          cat << EOF > CHANGELOG.md
+          ## What's Changed
+
+          $COMMITS
+
+          ## Installation
+
+          ### Quick Install (Recommended)
+
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/beads_rust/main/install.sh | bash
+          \`\`\`
+
+          ### Cargo Install
+
+          \`\`\`bash
+          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag ${{ github.ref_name }}
+          \`\`\`
+
+          ### Manual Download
+
+          Download the appropriate binary for your platform from the assets below.
+
+          **Verify checksum:**
+
+          \`\`\`bash
+          # Download checksums.sha256 and your binary
+          sha256sum -c checksums.sha256 --ignore-missing
+          \`\`\`
+
+          ## Full Changelog
+
+          See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
+          EOF
+
+          cat CHANGELOG.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: br ${{ github.ref_name }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            artifacts/br-${{ github.ref_name }}-*.tar.gz
+            artifacts/br-${{ github.ref_name }}-*.zip
+            artifacts/br-${{ github.ref_name }}-*.sha256
+            artifacts/checksums.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-crates-io:
+    name: Publish to crates.io
+    needs: create-release
+    runs-on: ubuntu-latest
+    if: "!contains(github.ref_name, '-')"  # Skip pre-releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Publish to crates.io
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}
+        continue-on-error: true  # Don't fail release if crates.io publish fails

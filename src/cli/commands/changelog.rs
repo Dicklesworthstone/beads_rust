@@ -169,3 +169,42 @@ fn git_ref_date(reference: &str) -> Result<DateTime<Utc>> {
         .with_timezone(&Utc);
     Ok(dt)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone};
+
+    #[test]
+    fn test_resolve_since_rfc3339() {
+        let args = ChangelogArgs {
+            since: Some("2023-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        };
+        let (dt, label) = resolve_since(&args).unwrap();
+        assert_eq!(dt.unwrap(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap());
+        assert_eq!(label, "2023-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn test_resolve_since_relative() {
+        let args = ChangelogArgs {
+            since: Some("-1d".to_string()),
+            ..Default::default()
+        };
+        let (dt, _) = resolve_since(&args).unwrap();
+        let expected = Utc::now() - Duration::days(1);
+        let actual = dt.unwrap();
+        // Allow small delta
+        assert!(actual < Utc::now());
+        assert!(actual > expected - Duration::seconds(5));
+    }
+
+    #[test]
+    fn test_resolve_since_none() {
+        let args = ChangelogArgs::default();
+        let (dt, label) = resolve_since(&args).unwrap();
+        assert!(dt.is_none());
+        assert_eq!(label, "all");
+    }
+}

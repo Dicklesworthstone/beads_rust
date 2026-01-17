@@ -10,7 +10,6 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, Serializer};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
@@ -474,31 +473,11 @@ impl Issue {
     /// Includes: title, description, design, `acceptance_criteria`, notes,
     /// status, priority, `issue_type`, assignee, `external_ref`, pinned, `is_template`.
     /// Excludes: id, timestamps, relations, tombstones.
+    ///
+    /// Delegates to [`crate::util::hash::content_hash`] for the canonical implementation.
     #[must_use]
     pub fn compute_content_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-
-        // Helper to update with null separator
-        let mut update = |s: &str| {
-            hasher.update(s.as_bytes());
-            hasher.update([0]);
-        };
-
-        update(&self.title);
-        update(self.description.as_deref().unwrap_or(""));
-        update(self.design.as_deref().unwrap_or(""));
-        update(self.acceptance_criteria.as_deref().unwrap_or(""));
-        update(self.notes.as_deref().unwrap_or(""));
-        update(self.status.as_str());
-        update(&self.priority.0.to_string());
-        update(self.issue_type.as_str());
-        update(self.assignee.as_deref().unwrap_or(""));
-        update(self.external_ref.as_deref().unwrap_or(""));
-        update(if self.pinned { "true" } else { "false" });
-        // Last one doesn't strictly need a separator if it's the end, but for consistency/extensibility:
-        hasher.update((if self.is_template { "true" } else { "false" }).as_bytes());
-
-        format!("{:x}", hasher.finalize())
+        crate::util::content_hash(self)
     }
 
     /// Check if this issue is a tombstone that has exceeded its TTL.
