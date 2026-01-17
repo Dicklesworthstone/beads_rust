@@ -214,3 +214,94 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         lock_timeout: cli.lock_timeout,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn make_create_args() -> beads_rust::cli::CreateArgs {
+        beads_rust::cli::CreateArgs {
+            title: Some("test-title".to_string()),
+            title_flag: None,
+            type_: None,
+            priority: None,
+            description: None,
+            assignee: None,
+            owner: None,
+            labels: Vec::new(),
+            parent: None,
+            deps: Vec::new(),
+            estimate: None,
+            due: None,
+            defer: None,
+            external_ref: None,
+            ephemeral: false,
+            dry_run: false,
+            silent: false,
+            file: None,
+        }
+    }
+
+    #[test]
+    fn parse_global_flags_and_command() {
+        let cli = Cli::parse_from(["br", "--json", "-vv", "list"]);
+        assert!(cli.json);
+        assert_eq!(cli.verbose, 2);
+        assert!(!cli.quiet);
+        assert!(matches!(cli.command, Commands::List(_)));
+    }
+
+    #[test]
+    fn parse_create_title_positional() {
+        let cli = Cli::parse_from(["br", "create", "FixBug"]);
+        match cli.command {
+            Commands::Create(args) => {
+                assert_eq!(args.title.as_deref(), Some("FixBug"));
+            }
+            other => panic!("expected create command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_overrides_maps_flags() {
+        let cli = Cli::parse_from([
+            "br",
+            "--json",
+            "--no-color",
+            "--no-auto-flush",
+            "--lock-timeout",
+            "2500",
+            "list",
+        ]);
+        let overrides = build_cli_overrides(&cli);
+        assert_eq!(overrides.json, Some(true));
+        assert_eq!(overrides.display_color, Some(false));
+        assert_eq!(overrides.no_auto_flush, Some(true));
+        assert_eq!(overrides.lock_timeout, Some(2500));
+    }
+
+    #[test]
+    fn help_includes_core_commands() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("create"));
+        assert!(help.contains("list"));
+        assert!(help.contains("sync"));
+        assert!(help.contains("ready"));
+    }
+
+    #[test]
+    fn version_includes_name_and_version() {
+        let version = Cli::command().render_version().to_string();
+        assert!(version.contains("br"));
+        assert!(version.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn is_mutating_command_detects_mutations() {
+        let create_cmd = Commands::Create(make_create_args());
+        let list_cmd = Commands::List(beads_rust::cli::ListArgs::default());
+        assert!(is_mutating_command(&create_cmd));
+        assert!(!is_mutating_command(&list_cmd));
+    }
+}

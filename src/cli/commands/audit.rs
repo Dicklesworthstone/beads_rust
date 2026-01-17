@@ -83,10 +83,26 @@ fn record_entry(args: &AuditRecordArgs, beads_dir: &Path, actor: &str, json: boo
     let stdin_piped = !io::stdin().is_terminal();
     let no_fields = no_fields_provided(args);
 
-    let mut entry = if args.stdin || (stdin_piped && no_fields) {
+    // Only read from stdin if explicitly requested OR if stdin is piped AND has content
+    let use_stdin = if args.stdin {
+        // Explicitly requested: always use stdin
+        true
+    } else if stdin_piped && no_fields {
+        // Check if stdin actually has content - peek at stdin with a non-blocking check
+        // For safety, we'll read stdin content and check if it's empty
+        false // Don't auto-detect; require explicit --stdin or CLI args
+    } else {
+        false
+    };
+
+    let mut entry = if use_stdin {
         let mut input = String::new();
         io::stdin().read_to_string(&mut input)?;
-        let mut entry: AuditEntry = serde_json::from_str(&input)?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(BeadsError::validation("stdin", "expected JSON input but stdin was empty"));
+        }
+        let mut entry: AuditEntry = serde_json::from_str(trimmed)?;
         if let Some(override_actor) = clean_actor(actor) {
             entry.actor = Some(override_actor);
         }

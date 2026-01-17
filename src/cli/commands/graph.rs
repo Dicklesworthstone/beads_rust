@@ -221,21 +221,26 @@ fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut blocking_edges: Vec<(String, String)> = Vec::new();
 
+    // Optimize: fetch all dependencies once
+    let all_dependencies = storage.get_all_dependency_records()?;
+
     for issue in &issues {
         adj.entry(issue.id.clone()).or_default();
 
-        // Get dependencies (what this issue depends on)
-        let deps = storage.get_dependencies(&issue.id)?;
-        for dep_id in deps {
-            // Only include edges within our issue set
-            if issue_set.contains(&dep_id) {
-                adj.entry(issue.id.clone())
-                    .or_default()
-                    .push(dep_id.clone());
-                adj.entry(dep_id.clone())
-                    .or_default()
-                    .push(issue.id.clone());
-                blocking_edges.push((issue.id.clone(), dep_id));
+        // Get dependencies from bulk map
+        if let Some(deps) = all_dependencies.get(&issue.id) {
+            for dep in deps {
+                let dep_id = &dep.depends_on_id;
+                // Only include edges within our issue set
+                if issue_set.contains(dep_id) {
+                    adj.entry(issue.id.clone())
+                        .or_default()
+                        .push(dep_id.clone());
+                    adj.entry(dep_id.clone())
+                        .or_default()
+                        .push(issue.id.clone());
+                    blocking_edges.push((issue.id.clone(), dep_id.clone()));
+                }
             }
         }
     }
@@ -272,7 +277,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
         // Calculate depths using longest path from roots
         // Roots are issues with no unsatisfied dependencies within the component
         let component_set: HashSet<&String> = component_nodes.iter().collect();
-        let mut depths = calculate_depths(storage, &component_nodes, &component_set)?;
+        let mut depths = calculate_depths(&all_dependencies, &component_nodes, &component_set);
 
         // Build component output
         let mut nodes: Vec<GraphNode> = Vec::new();
@@ -374,21 +379,25 @@ fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
 /// Roots are issues with no dependencies within the component.
 /// Depth is the longest path from any root to the node.
 fn calculate_depths(
-    storage: &SqliteStorage,
+    all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
     component_set: &HashSet<&String>,
-) -> Result<HashMap<String, usize>> {
+) -> HashMap<String, usize> {
     let mut depths: HashMap<String, usize> = HashMap::new();
 
     // Get dependencies for each node (filtered to component)
     let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
     for node_id in nodes {
-        let deps = storage.get_dependencies(node_id)?;
-        let filtered: Vec<String> = deps
-            .into_iter()
-            .filter(|d| component_set.contains(d))
-            .collect();
-        deps_map.insert(node_id.clone(), filtered);
+        if let Some(deps) = all_dependencies.get(node_id) {
+            let filtered: Vec<String> = deps
+                .iter()
+                .map(|d| d.depends_on_id.clone())
+                .filter(|d| component_set.contains(d))
+                .collect();
+            deps_map.insert(node_id.clone(), filtered);
+        } else {
+            deps_map.insert(node_id.clone(), Vec::new());
+        }
     }
 
     // Find roots (nodes with no dependencies in component)
@@ -425,7 +434,7 @@ fn calculate_depths(
         depths.entry(node_id.clone()).or_insert(0);
     }
 
-    Ok(depths)
+    depths
 }
 
 fn resolve_issue_id(

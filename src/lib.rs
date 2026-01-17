@@ -46,3 +46,29 @@ pub fn run() -> Result<()> {
     // This function can be used for library-level integration tests or embedding.
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_returns_ok() {
+        assert!(run().is_ok());
+    }
+
+    #[test]
+    fn structured_error_exit_code_matches_issue_errors() {
+        let err = BeadsError::IssueNotFound {
+            id: "bd-xyz".to_string(),
+        };
+        let structured = StructuredError::from_error(&err);
+        assert_eq!(structured.code, ErrorCode::IssueNotFound);
+        assert_eq!(structured.code.exit_code(), 3);
+    }
+
+    #[cfg(feature = "self_update")]
+    #[test]
+    fn upgrade_module_is_available_when_feature_enabled() {
+        let _ = crate::cli::commands::upgrade::execute;
+    }
+}

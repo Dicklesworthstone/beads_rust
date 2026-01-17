@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -12,6 +12,35 @@ fn parse_created_id(stdout: &str) -> String {
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("");
     id_part.trim().to_string()
+}
+
+fn create_issue_with_description(
+    workspace: &BrWorkspace,
+    title: &str,
+    issue_type: Option<&str>,
+    description: Option<&str>,
+    label: &str,
+) -> String {
+    let mut args = vec!["create".to_string(), title.to_string()];
+    if let Some(kind) = issue_type {
+        args.push("--type".to_string());
+        args.push(kind.to_string());
+    }
+    if let Some(text) = description {
+        args.push("--description".to_string());
+        args.push(text.to_string());
+    }
+    let create = run_br(workspace, args, label);
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    parse_created_id(&create.stdout)
+}
+
+fn run_lint_json(workspace: &BrWorkspace, mut args: Vec<String>, label: &str) -> Value {
+    args.push("--json".to_string());
+    let lint = run_br(workspace, args, label);
+    assert!(lint.status.success(), "lint json failed: {}", lint.stderr);
+    let payload = extract_json_payload(&lint.stdout);
+    serde_json::from_str(&payload).expect("parse lint json")
 }
 
 #[test]
@@ -235,6 +264,210 @@ fn e2e_ambiguous_id() {
 
     let show = run_br(&workspace, ["show", &ambiguous_input], "show_ambiguous");
     assert!(!show.status.success(), "ambiguous id should fail");
+}
+
+#[test]
+fn e2e_lint_before_init_fails() {
+    let workspace = BrWorkspace::new();
+    let lint = run_br(&workspace, ["lint"], "lint_before_init");
+    assert!(!lint.status.success());
+}
+
+#[test]
+fn e2e_lint_clean_output_when_no_warnings() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_clean_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let description = "## Acceptance Criteria\n- done";
+    create_issue_with_description(
+        &workspace,
+        "Task with criteria",
+        Some("task"),
+        Some(description),
+        "lint_clean_create",
+    );
+
+    let lint = run_br(&workspace, ["lint"], "lint_clean_run");
+    assert!(lint.status.success(), "lint should succeed: {}", lint.stderr);
+    assert!(lint.stdout.contains("No template warnings found"));
+}
+
+#[test]
+fn e2e_lint_bug_missing_sections_json() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_bug_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    create_issue_with_description(
+        &workspace,
+        "Bug with missing sections",
+        Some("bug"),
+        Some("Bug report"),
+        "lint_bug_create",
+    );
+
+    let json = run_lint_json(&workspace, vec!["lint".to_string()], "lint_bug_json");
+    assert_eq!(json["total"].as_u64(), Some(2));
+    assert_eq!(json["issues"].as_u64(), Some(1));
+    let missing = json["results"][0]["missing"]
+        .as_array()
+        .expect("missing array");
+    let missing_text: Vec<String> = missing
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    assert!(missing_text.contains(&"## Steps to Reproduce".to_string()));
+    assert!(missing_text.contains(&"## Acceptance Criteria".to_string()));
+}
+
+#[test]
+fn e2e_lint_multiple_issues_aggregate_warnings() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_multi_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    create_issue_with_description(
+        &workspace,
+        "Bug missing sections",
+        Some("bug"),
+        Some("Bug report"),
+        "lint_multi_bug",
+    );
+    create_issue_with_description(
+        &workspace,
+        "Task missing criteria",
+        Some("task"),
+        Some("Task description"),
+        "lint_multi_task",
+    );
+
+    let json = run_lint_json(&workspace, vec!["lint".to_string()], "lint_multi_json");
+    assert_eq!(json["issues"].as_u64(), Some(2));
+    assert_eq!(json["total"].as_u64(), Some(3));
+}
+
+#[test]
+fn e2e_lint_text_output_exit_code() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_text_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    create_issue_with_description(
+        &workspace,
+        "Bug missing sections",
+        Some("bug"),
+        Some("Bug report"),
+        "lint_text_bug",
+    );
+
+    let lint = run_br(&workspace, ["lint"], "lint_text_run");
+    assert!(!lint.status.success());
+    assert!(lint.stdout.contains("Template warnings"));
+}
+
+#[test]
+fn e2e_lint_status_all_includes_closed() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_closed_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let id = create_issue_with_description(
+        &workspace,
+        "Closed bug",
+        Some("bug"),
+        Some("Bug report"),
+        "lint_closed_bug",
+    );
+
+    let close = run_br(&workspace, ["close", &id, "--reason", "done"], "lint_closed_close");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let json = run_lint_json(
+        &workspace,
+        vec!["lint".to_string(), "--status".to_string(), "all".to_string()],
+        "lint_closed_json",
+    );
+    assert_eq!(json["issues"].as_u64(), Some(1));
+}
+
+#[test]
+fn e2e_lint_type_filter_limits_results() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_type_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    create_issue_with_description(
+        &workspace,
+        "Bug missing sections",
+        Some("bug"),
+        Some("Bug report"),
+        "lint_type_bug",
+    );
+    create_issue_with_description(
+        &workspace,
+        "Task with criteria",
+        Some("task"),
+        Some("## Acceptance Criteria\n- done"),
+        "lint_type_task",
+    );
+
+    let json = run_lint_json(
+        &workspace,
+        vec!["lint".to_string(), "--type".to_string(), "bug".to_string()],
+        "lint_type_json",
+    );
+    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["results"][0]["type"].as_str(), Some("bug"));
+}
+
+#[test]
+fn e2e_lint_ids_only_lints_selected() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_ids_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let bug_id = create_issue_with_description(
+        &workspace,
+        "Bug missing sections",
+        Some("bug"),
+        Some("Bug report"),
+        "lint_ids_bug",
+    );
+    create_issue_with_description(
+        &workspace,
+        "Task missing criteria",
+        Some("task"),
+        Some("Task description"),
+        "lint_ids_task",
+    );
+
+    let json = run_lint_json(
+        &workspace,
+        vec!["lint".to_string(), bug_id.clone()],
+        "lint_ids_json",
+    );
+    assert_eq!(json["issues"].as_u64(), Some(1));
+    assert_eq!(json["results"][0]["id"].as_str(), Some(bug_id.as_str()));
+}
+
+#[test]
+fn e2e_lint_skips_types_without_required_sections() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "lint_skip_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    create_issue_with_description(
+        &workspace,
+        "Chore without requirements",
+        Some("chore"),
+        Some("No requirements"),
+        "lint_skip_chore",
+    );
+
+    let json = run_lint_json(&workspace, vec!["lint".to_string()], "lint_skip_json");
+    assert_eq!(json["issues"].as_u64(), Some(0));
+    assert_eq!(json["total"].as_u64(), Some(0));
 }
 
 // === Structured JSON Error Output Tests ===

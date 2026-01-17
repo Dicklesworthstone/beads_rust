@@ -80,12 +80,10 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
             // Fetch relations for all issues
             let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
             let labels_map = storage.get_labels_for_issues(&issue_ids)?;
-            // Note: get_all_dependency_records might be overkill, maybe just count?
-            // IssueWithCounts structure uses Issue, which has Vec<Dependency>.
-            // If we want full dependencies in JSON, we should populate them.
-            // But currently the code only counts them.
-            // However, issue.labels is Vec<String>.
-            // Let's populate labels at least, as requested by test.
+            
+            // Use batch counting
+            let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
+            let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
 
             // Convert to IssueWithCounts only for JSON
             let issues_with_counts: Vec<IssueWithCounts> = issues
@@ -95,13 +93,8 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
                         issue.labels = labels.clone();
                     }
 
-                    let dependency_count = storage.count_dependencies(&issue.id).unwrap_or(0);
-                    let dependent_count = storage.count_dependents(&issue.id).unwrap_or(0);
-
-                    // If we wanted full deps:
-                    // issue.dependencies = storage.get_dependencies_with_metadata(&issue.id).unwrap_or_default()...
-                    // But Dependency struct is different from IssueWithDependencyMetadata.
-                    // For now, just labels as that's what failed.
+                    let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
+                    let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
 
                     IssueWithCounts {
                         issue,

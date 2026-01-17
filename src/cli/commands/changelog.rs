@@ -182,7 +182,10 @@ mod tests {
             ..Default::default()
         };
         let (dt, label) = resolve_since(&args).unwrap();
-        assert_eq!(dt.unwrap(), Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap());
+        assert_eq!(
+            dt.unwrap(),
+            Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap()
+        );
         assert_eq!(label, "2023-01-01T00:00:00+00:00");
     }
 

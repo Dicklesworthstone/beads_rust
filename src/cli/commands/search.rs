@@ -60,11 +60,15 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
         issues
     };
 
+    let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+    let dep_counts = storage.count_dependencies_for_issues(&issue_ids)?;
+    let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
+
     let mut issues_with_counts: Vec<IssueWithCounts> = issues
         .into_iter()
         .map(|issue| {
-            let dependency_count = storage.count_dependencies(&issue.id).unwrap_or(0);
-            let dependent_count = storage.count_dependents(&issue.id).unwrap_or(0);
+            let dependency_count = dep_counts.get(&issue.id).copied().unwrap_or(0);
+            let dependent_count = dependent_counts.get(&issue.id).copied().unwrap_or(0);
             IssueWithCounts {
                 issue,
                 dependency_count,
@@ -300,7 +304,7 @@ fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> 
         "priority" => issues.sort_by_key(|iwc| iwc.issue.priority),
         "created_at" => issues.sort_by_key(|iwc| iwc.issue.created_at),
         "updated_at" => issues.sort_by_key(|iwc| iwc.issue.updated_at),
-        "title" => issues.sort_by(|a, b| a.issue.title.cmp(&b.issue.title)),
+        "title" => issues.sort_by(|a, b| a.issue.title.to_lowercase().cmp(&b.issue.title.to_lowercase())),
         _ => {
             return Err(BeadsError::Validation {
                 field: "sort".to_string(),

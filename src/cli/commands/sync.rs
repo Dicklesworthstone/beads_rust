@@ -789,8 +789,25 @@ fn execute_merge(
     debug!(base_count = base.len(), "Loaded base snapshot");
 
     // 2. Load Left State (local DB)
+    let mut left_issues = storage.get_all_issues_for_export()?;
+    let all_deps = storage.get_all_dependency_records()?;
+    let all_labels = storage.get_all_labels()?;
+    let all_comments = storage.get_all_comments()?;
+
+    for issue in &mut left_issues {
+        if let Some(deps) = all_deps.get(&issue.id) {
+            issue.dependencies = deps.clone();
+        }
+        if let Some(labels) = all_labels.get(&issue.id) {
+            issue.labels = labels.clone();
+        }
+        if let Some(comments) = all_comments.get(&issue.id) {
+            issue.comments = comments.clone();
+        }
+    }
+
     let mut left = HashMap::new();
-    for issue in storage.get_all_issues_for_export()? {
+    for issue in left_issues {
         left.insert(issue.id.clone(), issue);
     }
     debug!(left_count = left.len(), "Loaded local state (DB)");

@@ -301,21 +301,15 @@ fn label_rename(
 ) -> Result<()> {
     validate_label(&args.new_name)?;
 
-    let all_labels = storage.get_all_labels()?;
+    info!(
+        old = %args.old_name,
+        new = %args.new_name,
+        "Renaming label"
+    );
 
-    // Find all issues with the old label
-    let affected_issues: Vec<String> = all_labels
-        .iter()
-        .filter_map(|(issue_id, labels)| {
-            if labels.contains(&args.old_name) {
-                Some(issue_id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let count = storage.rename_label(&args.old_name, &args.new_name, actor)?;
 
-    if affected_issues.is_empty() {
+    if count == 0 {
         if json {
             let result = RenameResult {
                 old_name: args.old_name.clone(),
@@ -329,24 +323,11 @@ fn label_rename(
         return Ok(());
     }
 
-    info!(
-        old = %args.old_name,
-        new = %args.new_name,
-        count = affected_issues.len(),
-        "Renaming label"
-    );
-
-    // Rename: remove old, add new for each affected issue
-    for issue_id in &affected_issues {
-        storage.remove_label(issue_id, &args.old_name, actor)?;
-        storage.add_label(issue_id, &args.new_name, actor)?;
-    }
-
     if json {
         let result = RenameResult {
             old_name: args.old_name.clone(),
             new_name: args.new_name.clone(),
-            affected_issues: affected_issues.len(),
+            affected_issues: count,
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -354,8 +335,8 @@ fn label_rename(
             "\u{2713} Renamed label '{}' to '{}' on {} issue{}",
             args.old_name,
             args.new_name,
-            affected_issues.len(),
-            if affected_issues.len() == 1 { "" } else { "s" }
+            count,
+            if count == 1 { "" } else { "s" }
         );
     }
 

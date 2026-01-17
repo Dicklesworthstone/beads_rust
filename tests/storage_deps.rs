@@ -409,7 +409,7 @@ fn would_create_cycle_detects_simple_cycle() {
         .unwrap();
 
     // Would B depending on A create a cycle? Yes!
-    let would_cycle = storage.would_create_cycle(&b.id, &a.id).unwrap();
+    let would_cycle = storage.would_create_cycle(&b.id, &a.id, true).unwrap();
     assert!(would_cycle);
 }
 
@@ -434,7 +434,7 @@ fn would_create_cycle_transitive_detection() {
         .unwrap();
 
     // Would C depending on A create a cycle? Yes!
-    let would_cycle = storage.would_create_cycle(&c.id, &a.id).unwrap();
+    let would_cycle = storage.would_create_cycle(&c.id, &a.id, true).unwrap();
     assert!(would_cycle);
 }
 
@@ -456,11 +456,11 @@ fn would_create_cycle_no_cycle() {
         .unwrap();
 
     // Would A depending on C create a cycle? No (C is unconnected)
-    let would_cycle = storage.would_create_cycle(&a.id, &c.id).unwrap();
+    let would_cycle = storage.would_create_cycle(&a.id, &c.id, true).unwrap();
     assert!(!would_cycle);
 
     // Would C depending on B create a cycle? No
-    let would_cycle = storage.would_create_cycle(&c.id, &b.id).unwrap();
+    let would_cycle = storage.would_create_cycle(&c.id, &b.id, true).unwrap();
     assert!(!would_cycle);
 }
 
@@ -602,7 +602,7 @@ fn deep_hierarchy_five_levels() {
     assert!(storage.get_dependencies(&level5.id).unwrap().is_empty());
 
     // Would l5 -> l0 create a cycle? Yes!
-    let would_cycle = storage.would_create_cycle(&level5.id, &level0.id).unwrap();
+    let would_cycle = storage.would_create_cycle(&level5.id, &level0.id, true).unwrap();
     assert!(would_cycle);
 }
 
@@ -713,7 +713,7 @@ fn diamond_pattern_dependencies() {
     assert!(d_dependents.contains(&c.id));
 
     // Would D -> A create a cycle? Yes (through either path)
-    let would_cycle = storage.would_create_cycle(&d.id, &a.id).unwrap();
+    let would_cycle = storage.would_create_cycle(&d.id, &a.id, true).unwrap();
     assert!(would_cycle);
 
     // No cycles currently exist

@@ -289,14 +289,14 @@ mod tests {
         let t1 = (now - chrono::Duration::hours(3)).format("%Y%m%d_%H%M%S");
         let t2 = (now - chrono::Duration::hours(2)).format("%Y%m%d_%H%M%S");
         let t3 = (now - chrono::Duration::hours(1)).format("%Y%m%d_%H%M%S");
-        
+
         let file1 = format!("issues.{t1}.jsonl");
         let file2 = format!("issues.{t2}.jsonl");
         let file3 = format!("issues.{t3}.jsonl");
 
-        let files = [&file1, &file2, &file3];
+        let test_files = [&file1, &file2, &file3];
 
-        for name in &files {
+        for name in &test_files {
             File::create(history_dir.join(name)).unwrap();
         }
 
@@ -310,12 +310,24 @@ mod tests {
         // Should keep only max_count (2) newest files
         let remaining = list_backups(&history_dir).unwrap();
         assert_eq!(remaining.len(), 2);
-        
+
         // Ensure the oldest one was deleted
-        assert!(!remaining.iter().any(|b| b.path.to_string_lossy().contains(&t1.to_string())));
+        assert!(
+            !remaining
+                .iter()
+                .any(|b| b.path.to_string_lossy().contains(&t1.to_string()))
+        );
         // Ensure newer ones kept
-        assert!(remaining.iter().any(|b| b.path.to_string_lossy().contains(&t2.to_string())));
-        assert!(remaining.iter().any(|b| b.path.to_string_lossy().contains(&t3.to_string())));
+        assert!(
+            remaining
+                .iter()
+                .any(|b| b.path.to_string_lossy().contains(&t2.to_string()))
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|b| b.path.to_string_lossy().contains(&t3.to_string()))
+        );
     }
 
     #[test]

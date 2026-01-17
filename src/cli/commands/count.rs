@@ -144,14 +144,16 @@ fn group_counts(
             }
         }
         CountBy::Label => {
+            let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+            let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+
             for issue in issues {
-                let labels = storage.get_labels(&issue.id)?;
-                if labels.is_empty() {
-                    *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
-                } else {
+                if let Some(labels) = labels_map.get(&issue.id) {
                     for label in labels {
-                        *counts.entry(label).or_insert(0) += 1;
+                        *counts.entry(label.clone()).or_insert(0) += 1;
                     }
+                } else {
+                    *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
                 }
             }
         }

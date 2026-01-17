@@ -137,7 +137,7 @@ fn dep_add(
     // Cycle check for blocking types only
     if dep_type.is_blocking()
         && !depends_on_id.starts_with("external:")
-        && storage.would_create_cycle(&issue_id, &depends_on_id)?
+        && storage.would_create_cycle(&issue_id, &depends_on_id, true)?
     {
         return Err(BeadsError::DependencyCycle {
             path: format!("{issue_id} -> {depends_on_id}"),
@@ -727,7 +727,7 @@ mod tests {
             .unwrap();
 
         // bd-002 depends on bd-001 would create a cycle
-        let would_cycle = storage.would_create_cycle("bd-002", "bd-001").unwrap();
+        let would_cycle = storage.would_create_cycle("bd-002", "bd-001", true).unwrap();
         assert!(would_cycle);
     }
 
@@ -751,11 +751,11 @@ mod tests {
             .unwrap();
 
         // bd-003 -> bd-001 would create a cycle
-        let would_cycle = storage.would_create_cycle("bd-003", "bd-001").unwrap();
+        let would_cycle = storage.would_create_cycle("bd-003", "bd-001", true).unwrap();
         assert!(would_cycle);
 
         // bd-003 -> bd-002 would also create a cycle
-        let would_cycle = storage.would_create_cycle("bd-003", "bd-002").unwrap();
+        let would_cycle = storage.would_create_cycle("bd-003", "bd-002", true).unwrap();
         assert!(would_cycle);
     }
 
@@ -776,7 +776,7 @@ mod tests {
             .unwrap();
 
         // bd-003 -> bd-002 should NOT be a cycle
-        let would_cycle = storage.would_create_cycle("bd-003", "bd-002").unwrap();
+        let would_cycle = storage.would_create_cycle("bd-003", "bd-002", true).unwrap();
         assert!(!would_cycle);
     }
 
