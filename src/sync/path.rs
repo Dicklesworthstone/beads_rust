@@ -217,18 +217,19 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         return git_check;
     }
 
-    // Check for obvious traversal attempts in the raw path
-    let path_str = path.to_string_lossy();
-    if path_str.contains("..") {
-        let result = PathValidation::TraversalAttempt {
-            path: path.to_path_buf(),
-        };
-        warn!(
-            path = %path.display(),
-            reason = %result.rejection_reason().unwrap_or_default(),
-            "Path validation rejected"
-        );
-        return result;
+    // Check for traversal attempts by inspecting components
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            let result = PathValidation::TraversalAttempt {
+                path: path.to_path_buf(),
+            };
+            warn!(
+                path = %path.display(),
+                reason = %result.rejection_reason().unwrap_or_default(),
+                "Path validation rejected"
+            );
+            return result;
+        }
     }
 
     // Canonicalize the beads directory
