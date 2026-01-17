@@ -444,6 +444,27 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
                     format!("issue {id} cannot depend on itself"),
                 ));
             }
+
+            // Strict dependency type validation
+            let dep_type: DependencyType =
+                type_str.parse().map_err(|_| BeadsError::Validation {
+                    field: "deps".to_string(),
+                    reason: format!("Invalid dependency type: {type_str}"),
+                })?;
+
+            // Disallow accidental custom types from typos
+            if let DependencyType::Custom(_) = dep_type {
+                return Err(BeadsError::Validation {
+                    field: "deps".to_string(),
+                    reason: format!(
+                        "Unknown dependency type: '{type_str}'. \
+                         Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
+                         related, discovered-from, replies-to, relates-to, duplicates, \
+                         supersedes, caused-by"
+                    ),
+                });
+            }
+
             storage.add_dependency(&id, dep_id, type_str, &actor)?;
         }
 

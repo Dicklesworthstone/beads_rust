@@ -1980,6 +1980,67 @@ pub fn import_from_jsonl(
                 )));
             }
 
+            // Fix: Rename issues with wrong prefix if requested
+            if config.rename_on_import && !mismatches.is_empty() {
+                use crate::util::id::{IdConfig, IdGenerator};
+
+                // Collect details to avoid borrowing issues during generation
+                let to_rename: Vec<_> = issues
+                    .iter()
+                    .filter(|i| mismatches.contains(&i.id))
+                    .map(|i| {
+                        (
+                            i.id.clone(),
+                            i.title.clone(),
+                            i.description.clone(),
+                            i.created_by.clone(),
+                            i.created_at,
+                        )
+                    })
+                    .collect();
+
+                let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+                let mut renames = std::collections::HashMap::new();
+
+                for (old_id, title, desc, creator, created_at) in to_rename {
+                    let new_id = generator.generate(
+                        &title,
+                        desc.as_deref(),
+                        creator.as_deref(),
+                        created_at,
+                        issues.len(),
+                        |candidate| {
+                            storage.id_exists(candidate).unwrap_or(false)
+                                || issues.iter().any(|i| i.id == candidate)
+                                || renames.values().any(|v| *v == candidate)
+                        },
+                    );
+                    renames.insert(old_id, new_id);
+                }
+
+                // Apply renames
+                for issue in &mut issues {
+                    if let Some(new_id) = renames.get(&issue.id) {
+                        // Preserve old ID in external_ref if empty
+                        if issue.external_ref.is_none() {
+                            issue.external_ref = Some(issue.id.clone());
+                        }
+                        issue.id = new_id.clone();
+                        // Recompute content hash since ID/external_ref changed
+                        issue.content_hash = Some(content_hash(issue));
+                    }
+                    // Update dependencies
+                    for dep in &mut issue.dependencies {
+                        if let Some(new_target) = renames.get(&dep.depends_on_id) {
+                            dep.depends_on_id = new_target.clone();
+                        }
+                        if let Some(new_source) = renames.get(&dep.issue_id) {
+                            dep.issue_id = new_source.clone();
+                        }
+                    }
+                }
+            }
+
             // Fix: Filter out tombstones with wrong prefix that were "silently dropped" above.
             // If we are here and rename_on_import is false, then all remaining mismatches MUST be tombstones
             // (otherwise we would have errored above). We drop them now.

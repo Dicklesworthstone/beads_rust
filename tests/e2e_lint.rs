@@ -540,7 +540,7 @@ fn e2e_lint_nonexistent_id_error() {
 
 #[test]
 fn e2e_lint_unknown_type_filter_no_matches() {
-    // Unknown --type value is treated as a custom type (no matches)
+    // Unknown --type value is rejected (bd conformance: only task, bug, feature, epic, chore)
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
 
@@ -552,16 +552,17 @@ fn e2e_lint_unknown_type_filter_no_matches() {
         ["lint", "--type", "unknown_custom_type"],
         "lint_unknown_type",
     );
-    // Unknown types are valid (treated as custom types), just match no issues
+    // For bd conformance, CLI rejects unknown types (they may exist in imported data
+    // but cannot be specified via CLI). See src/model/mod.rs FromStr for IssueType.
     assert!(
-        lint.status.success(),
-        "unknown type should succeed (custom types are valid), got stderr: {}",
-        lint.stderr
+        !lint.status.success(),
+        "unknown type should fail for bd conformance, got stdout: {}",
+        lint.stdout
     );
     assert!(
-        lint.stdout.contains("0 issues checked"),
-        "should check 0 issues for unknown type, got: {}",
-        lint.stdout
+        lint.stderr.contains("INVALID_TYPE") || lint.stderr.contains("Invalid issue type"),
+        "should report invalid type error, got stderr: {}",
+        lint.stderr
     );
 }
 

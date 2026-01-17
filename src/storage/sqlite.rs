@@ -586,6 +586,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
+    #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -646,6 +647,27 @@ impl SqliteStorage {
 
         if !filters.include_templates {
             sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(ref labels) = filters.labels {
+            for label in labels {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(Box::new(label.clone()));
+            }
+        }
+
+        if let Some(ref labels_or) = filters.labels_or {
+            if !labels_or.is_empty() {
+                let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+                let _ = write!(
+                    sql,
+                    " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
+                    placeholders.join(",")
+                );
+                for l in labels_or {
+                    params.push(Box::new(l.clone()));
+                }
+            }
         }
 
         if let Some(ref title_contains) = filters.title_contains {
@@ -783,6 +805,27 @@ impl SqliteStorage {
 
         if !filters.include_templates {
             sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
+        }
+
+        if let Some(ref labels) = filters.labels {
+            for label in labels {
+                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+                params.push(Box::new(label.clone()));
+            }
+        }
+
+        if let Some(ref labels_or) = filters.labels_or {
+            if !labels_or.is_empty() {
+                let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
+                let _ = write!(
+                    sql,
+                    " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
+                    placeholders.join(",")
+                );
+                for l in labels_or {
+                    params.push(Box::new(l.clone()));
+                }
+            }
         }
 
         if let Some(ref title_contains) = filters.title_contains {

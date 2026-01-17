@@ -156,6 +156,9 @@ fn compute_summary(
     // This differs from the ready/blocked commands which use the full blocked cache.
     let blocked_by_blocks = storage.get_blocked_by_blocks_deps_only()?;
 
+    // Get full blocked cache for accurate Ready count (must match `br ready` behavior)
+    let all_blocked_ids = storage.get_blocked_ids()?;
+
     for issue in issues {
         match issue.status {
             Status::Open => open += 1,
@@ -185,14 +188,13 @@ fn compute_summary(
         }
     }
 
-    // Ready count: simplified bd semantics - status=open (not in_progress), no open blockers.
-    // This differs from the ready command which uses the full blocked cache.
+    // Ready count: status=open (not in_progress), no blockers (full definition).
     let now = Utc::now();
     let ready = issues
         .iter()
         .filter(|i| {
             i.status == Status::Open
-                && !blocked_by_blocks.contains(&i.id)
+                && !all_blocked_ids.contains(&i.id)
                 && !i.ephemeral
                 && !i.pinned
                 && i.defer_until.is_none_or(|d| d <= now)

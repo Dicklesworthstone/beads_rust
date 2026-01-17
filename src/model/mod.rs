@@ -18,6 +18,15 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Serialize Option<i32> as 0 when None (for bd conformance - bd expects integer, not null)
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+fn serialize_compaction_level<S>(value: &Option<i32>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_i32(value.unwrap_or(0))
+}
+
 /// Issue lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -440,7 +449,9 @@ pub struct Issue {
     pub original_type: Option<String>,
 
     // Compaction (legacy/compat)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Note: Always serialize compaction_level as integer (0 when None) for bd conformance
+    // bd's Go sql scanner cannot handle NULL for integer columns
+    #[serde(default, serialize_with = "serialize_compaction_level")]
     pub compaction_level: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted_at: Option<DateTime<Utc>>,
