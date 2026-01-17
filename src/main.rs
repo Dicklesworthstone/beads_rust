@@ -64,7 +64,7 @@ fn main() {
         Commands::Stats(args) | Commands::Status(args) => {
             commands::stats::execute(&args, cli.json || args.robot, &overrides)
         }
-        Commands::Config(args) => commands::config::execute(&args, cli.json, &overrides),
+        Commands::Config { command } => commands::config::execute(&command, cli.json, &overrides),
         Commands::History(args) => commands::history::execute(args, &overrides),
         Commands::Defer(args) => {
             let update_args = beads_rust::cli::UpdateArgs {

@@ -9,7 +9,7 @@
 
 #![allow(clippy::default_trait_access)]
 
-use crate::cli::ConfigArgs;
+use crate::cli::ConfigCommands;
 use crate::config::{
     CliOverrides, ConfigLayer, discover_beads_dir, id_config_from_layer, load_config,
     load_project_config, load_user_config, resolve_actor,
@@ -27,42 +27,21 @@ use std::process::Command;
 /// # Errors
 ///
 /// Returns an error if config cannot be loaded or operations fail.
-pub fn execute(args: &ConfigArgs, json_mode: bool, overrides: &CliOverrides) -> Result<()> {
-    // Handle path display first (doesn't need beads dir)
-    if args.path {
-        return show_paths(json_mode);
+pub fn execute(command: &ConfigCommands, json_mode: bool, overrides: &CliOverrides) -> Result<()> {
+    match command {
+        ConfigCommands::Path => show_paths(json_mode),
+        ConfigCommands::Edit => edit_config(),
+        ConfigCommands::List { project, user } => {
+            let beads_dir = discover_beads_dir(None).ok();
+            show_config(beads_dir.as_ref(), overrides, *project, *user, json_mode)
+        }
+        ConfigCommands::Set { kv } => set_config_value(kv, json_mode),
+        ConfigCommands::Delete { key } => delete_config_value(key, json_mode, overrides),
+        ConfigCommands::Get { key } => {
+            let beads_dir = discover_beads_dir(None).ok();
+            get_config_value(key, beads_dir.as_ref(), overrides, json_mode)
+        }
     }
-
-    // Handle edit (doesn't need beads dir)
-    if args.edit {
-        return edit_config();
-    }
-
-    // Handle list (doesn't need beads dir)
-    if args.list {
-        return list_options(json_mode);
-    }
-
-    // Handle set (modifies user config)
-    if let Some(ref kv) = args.set {
-        return set_config_value(kv, json_mode);
-    }
-
-    // Handle delete (removes from DB config only)
-    if let Some(ref key) = args.delete {
-        return delete_config_value(key, json_mode, overrides);
-    }
-
-    // Try to discover beads dir for merged config
-    let beads_dir = discover_beads_dir(None).ok();
-
-    // Handle get specific key
-    if let Some(ref key) = args.get {
-        return get_config_value(key, beads_dir.as_ref(), overrides, json_mode);
-    }
-
-    // Show merged config (or subset)
-    show_config(beads_dir.as_ref(), overrides, args, json_mode)
 }
 
 /// Show config file paths.
@@ -390,10 +369,11 @@ fn delete_nested(value: &mut serde_yaml::Value, path: &[&str]) -> bool {
 fn show_config(
     beads_dir: Option<&PathBuf>,
     overrides: &CliOverrides,
-    args: &ConfigArgs,
+    project_only: bool,
+    user_only: bool,
     json_mode: bool,
 ) -> Result<()> {
-    if args.project {
+    if project_only {
         // Show only project config
         if let Some(dir) = beads_dir {
             let layer = load_project_config(dir)?;
@@ -407,7 +387,7 @@ fn show_config(
         return Ok(());
     }
 
-    if args.user {
+    if user_only {
         // Show only user config
         let layer = load_user_config()?;
         return output_layer(&layer, "user", json_mode);

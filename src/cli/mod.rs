@@ -159,7 +159,10 @@ pub enum Commands {
     Undefer(UndeferArgs),
 
     /// Configuration management
-    Config(ConfigArgs),
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
 
     /// Sync database with JSONL file (export or import)
     ///
@@ -1158,41 +1161,43 @@ pub struct SyncArgs {
     pub robot: bool,
 }
 
-/// Arguments for the config command.
-#[derive(Args, Debug, Clone, Default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct ConfigArgs {
-    /// List all available config options with descriptions
-    #[arg(long, short = 'l')]
-    pub list: bool,
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfigCommands {
+    /// List all available config options
+    List {
+        /// Show only project config
+        #[arg(long)]
+        project: bool,
 
-    /// Get a specific config value by key
-    #[arg(long, short = 'g', value_name = "KEY")]
-    pub get: Option<String>,
+        /// Show only user config
+        #[arg(long)]
+        user: bool,
+    },
 
-    /// Set a config value in user config (format: key=value)
-    #[arg(long, short = 's', value_name = "KEY=VALUE")]
-    pub set: Option<String>,
+    /// Get a specific config value
+    Get {
+        /// Config key
+        key: String,
+    },
 
-    /// Delete a config value from the database (DB keys only, not YAML)
-    #[arg(long, short = 'd', visible_alias = "unset", value_name = "KEY")]
-    pub delete: Option<String>,
+    /// Set a config value
+    Set {
+        /// Config key=value pair
+        kv: String,
+    },
+
+    /// Delete a config value
+    #[command(visible_alias = "unset")]
+    Delete {
+        /// Config key
+        key: String,
+    },
 
     /// Open user config file in $EDITOR
-    #[arg(long, short = 'e')]
-    pub edit: bool,
+    Edit,
 
     /// Show config file paths
-    #[arg(long, short = 'p')]
-    pub path: bool,
-
-    /// Show only project config (from .beads/config.yaml)
-    #[arg(long)]
-    pub project: bool,
-
-    /// Show only user config (from ~/.config/bd/config.yaml)
-    #[arg(long)]
-    pub user: bool,
+    Path,
 }
 
 /// Arguments for the stats command.
