@@ -6,6 +6,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::model::{Issue, IssueType, Priority, Status};
+use chrono::{DateTime, Utc};
 
 /// Trait for types that can produce a deterministic content hash.
 pub trait ContentHashable {
@@ -45,7 +46,12 @@ pub fn content_hash(issue: &Issue) -> String {
         &issue.priority,
         &issue.issue_type,
         issue.assignee.as_deref(),
+        issue.owner.as_deref(),
+        issue.estimated_minutes,
+        issue.due_at,
+        issue.defer_until,
         issue.external_ref.as_deref(),
+        issue.close_reason.as_deref(),
         issue.pinned,
         issue.is_template,
     )
@@ -64,7 +70,12 @@ pub fn content_hash_from_parts(
     priority: &Priority,
     issue_type: &IssueType,
     assignee: Option<&str>,
+    owner: Option<&str>,
+    estimated_minutes: Option<i32>,
+    due_at: Option<DateTime<Utc>>,
+    defer_until: Option<DateTime<Utc>>,
     external_ref: Option<&str>,
+    close_reason: Option<&str>,
     pinned: bool,
     is_template: bool,
 ) -> String {
@@ -79,7 +90,12 @@ pub fn content_hash_from_parts(
     writer.field(&format!("P{}", priority.0));
     writer.field(issue_type.as_str());
     writer.field_opt(assignee);
+    writer.field_opt(owner);
+    writer.field_i32_opt(estimated_minutes);
+    writer.field_date_opt(due_at);
+    writer.field_date_opt(defer_until);
     writer.field_opt(external_ref);
+    writer.field_opt(close_reason);
     writer.field_bool(pinned);
     writer.field_bool(is_template);
 
@@ -108,6 +124,22 @@ impl HashFieldWriter {
 
     fn field_opt(&mut self, value: Option<&str>) {
         self.field(value.unwrap_or(""));
+    }
+
+    fn field_i32_opt(&mut self, value: Option<i32>) {
+        if let Some(v) = value {
+            self.field(&v.to_string());
+        } else {
+            self.field("");
+        }
+    }
+
+    fn field_date_opt(&mut self, value: Option<DateTime<Utc>>) {
+        if let Some(d) = value {
+            self.field(&d.to_rfc3339());
+        } else {
+            self.field("");
+        }
     }
 
     fn field_bool(&mut self, value: bool) {
@@ -230,7 +262,12 @@ mod tests {
             &issue.priority,
             &issue.issue_type,
             issue.assignee.as_deref(),
+            issue.owner.as_deref(),
+            issue.estimated_minutes,
+            issue.due_at,
+            issue.defer_until,
             issue.external_ref.as_deref(),
+            issue.close_reason.as_deref(),
             issue.pinned,
             issue.is_template,
         );

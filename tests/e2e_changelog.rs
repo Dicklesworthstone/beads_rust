@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::cli::{extract_json_payload, run_br, BrWorkspace};
+use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::thread::sleep;
 use std::time::Duration;
@@ -137,7 +137,14 @@ fn changelog_sorts_by_priority() {
     // Create bugs with different priorities
     let create1 = run_br(
         &workspace,
-        ["create", "Low priority bug", "--type", "bug", "--priority", "3"],
+        [
+            "create",
+            "Low priority bug",
+            "--type",
+            "bug",
+            "--priority",
+            "3",
+        ],
         "c1",
     );
     let id1 = parse_created_id(&create1.stdout);
@@ -145,7 +152,14 @@ fn changelog_sorts_by_priority() {
 
     let create2 = run_br(
         &workspace,
-        ["create", "High priority bug", "--type", "bug", "--priority", "1"],
+        [
+            "create",
+            "High priority bug",
+            "--type",
+            "bug",
+            "--priority",
+            "1",
+        ],
         "c2",
     );
     let id2 = parse_created_id(&create2.stdout);
@@ -251,7 +265,11 @@ fn changelog_since_date() {
 
     // Use --since with yesterday to include the issue
     // Note: Use --since=-1d format to avoid clap treating -1d as a flag
-    let changelog = run_br(&workspace, ["changelog", "--since=-1d", "--json"], "changelog");
+    let changelog = run_br(
+        &workspace,
+        ["changelog", "--since=-1d", "--json"],
+        "changelog",
+    );
     assert!(
         changelog.status.success(),
         "changelog failed: {}",

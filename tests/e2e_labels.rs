@@ -51,7 +51,10 @@ fn e2e_label_add_single_verify_show() {
     let labels = &show_json[0]["labels"];
     assert!(labels.is_array(), "labels should be array");
     let label_arr: Vec<String> = serde_json::from_value(labels.clone()).unwrap();
-    assert!(label_arr.contains(&"bug".to_string()), "label not found in show");
+    assert!(
+        label_arr.contains(&"bug".to_string()),
+        "label not found in show"
+    );
 
     // Verify via label list
     let list = run_br(&workspace, ["label", "list", &id], "label_list");
@@ -89,8 +92,14 @@ fn e2e_label_add_multiple_to_same_issue() {
     let labels_payload = extract_json_payload(&list.stdout);
     let labels: Vec<String> = serde_json::from_str(&labels_payload).expect("labels json");
     assert!(labels.contains(&"bug".to_string()), "missing bug label");
-    assert!(labels.contains(&"urgent".to_string()), "missing urgent label");
-    assert!(labels.contains(&"frontend".to_string()), "missing frontend label");
+    assert!(
+        labels.contains(&"urgent".to_string()),
+        "missing urgent label"
+    );
+    assert!(
+        labels.contains(&"frontend".to_string()),
+        "missing frontend label"
+    );
 }
 
 /// Test 3: Remove label, verify removed
@@ -121,12 +130,22 @@ fn e2e_label_remove_verify() {
     );
 
     // Verify removed
-    let list = run_br(&workspace, ["label", "list", &id, "--json"], "list_after_remove");
+    let list = run_br(
+        &workspace,
+        ["label", "list", &id, "--json"],
+        "list_after_remove",
+    );
     assert!(list.status.success(), "list failed: {}", list.stderr);
     let labels_payload = extract_json_payload(&list.stdout);
     let labels: Vec<String> = serde_json::from_str(&labels_payload).expect("labels json");
-    assert!(!labels.contains(&"bug".to_string()), "bug label should be removed");
-    assert!(labels.contains(&"urgent".to_string()), "urgent label should remain");
+    assert!(
+        !labels.contains(&"bug".to_string()),
+        "bug label should be removed"
+    );
+    assert!(
+        labels.contains(&"urgent".to_string()),
+        "urgent label should remain"
+    );
 }
 
 /// Test 4: List all labels across issues
@@ -139,22 +158,38 @@ fn e2e_label_list_all() {
 
     // Create multiple issues with different labels
     let create1 = run_br(&workspace, ["create", "Issue 1"], "create1");
-    assert!(create1.status.success(), "create1 failed: {}", create1.stderr);
+    assert!(
+        create1.status.success(),
+        "create1 failed: {}",
+        create1.stderr
+    );
     let id1 = parse_created_id(&create1.stdout);
 
     let create2 = run_br(&workspace, ["create", "Issue 2"], "create2");
-    assert!(create2.status.success(), "create2 failed: {}", create2.stderr);
+    assert!(
+        create2.status.success(),
+        "create2 failed: {}",
+        create2.stderr
+    );
     let id2 = parse_created_id(&create2.stdout);
 
     // Add labels
     run_br(&workspace, ["label", "add", &id1, "bug"], "add_bug1");
     run_br(&workspace, ["label", "add", &id1, "urgent"], "add_urgent1");
-    run_br(&workspace, ["label", "add", &id2, "feature"], "add_feature2");
+    run_br(
+        &workspace,
+        ["label", "add", &id2, "feature"],
+        "add_feature2",
+    );
     run_br(&workspace, ["label", "add", &id2, "urgent"], "add_urgent2");
 
     // List all unique labels
     let list_all = run_br(&workspace, ["label", "list-all", "--json"], "list_all");
-    assert!(list_all.status.success(), "list-all failed: {}", list_all.stderr);
+    assert!(
+        list_all.status.success(),
+        "list-all failed: {}",
+        list_all.stderr
+    );
     let all_payload = extract_json_payload(&list_all.stdout);
     let label_counts: Vec<Value> = serde_json::from_str(&all_payload).expect("list-all json");
 
@@ -195,7 +230,11 @@ fn e2e_label_add_same_to_multiple_issues() {
 
     // Verify via list-all
     let list_all = run_br(&workspace, ["label", "list-all", "--json"], "list_all");
-    assert!(list_all.status.success(), "list-all failed: {}", list_all.stderr);
+    assert!(
+        list_all.status.success(),
+        "list-all failed: {}",
+        list_all.stderr
+    );
     let all_payload = extract_json_payload(&list_all.stdout);
     let label_counts: Vec<Value> = serde_json::from_str(&all_payload).expect("list-all json");
 
@@ -219,7 +258,11 @@ fn e2e_label_add_nonexistent_issue_error() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // Try to add label to non-existent issue
-    let add = run_br(&workspace, ["label", "add", "nonexistent-id", "bug"], "add_nonexistent");
+    let add = run_br(
+        &workspace,
+        ["label", "add", "nonexistent-id", "bug"],
+        "add_nonexistent",
+    );
     assert!(
         !add.status.success(),
         "should fail for nonexistent issue, stdout: {}, stderr: {}",
@@ -241,7 +284,11 @@ fn e2e_label_remove_nonexistent_noop() {
     let id = parse_created_id(&create.stdout);
 
     // Remove label that doesn't exist - should succeed (no-op)
-    let remove = run_br(&workspace, ["label", "remove", &id, "nonexistent-label"], "remove_nonexistent");
+    let remove = run_br(
+        &workspace,
+        ["label", "remove", &id, "nonexistent-label"],
+        "remove_nonexistent",
+    );
     assert!(
         remove.status.success(),
         "remove of nonexistent label should succeed as no-op: {}",
@@ -308,14 +355,38 @@ fn e2e_label_special_characters() {
     let id = parse_created_id(&create.stdout);
 
     // Labels with allowed special characters
-    let add_dash = run_br(&workspace, ["label", "add", &id, "high-priority"], "add_dash");
-    assert!(add_dash.status.success(), "dash label failed: {}", add_dash.stderr);
+    let add_dash = run_br(
+        &workspace,
+        ["label", "add", &id, "high-priority"],
+        "add_dash",
+    );
+    assert!(
+        add_dash.status.success(),
+        "dash label failed: {}",
+        add_dash.stderr
+    );
 
-    let add_underscore = run_br(&workspace, ["label", "add", &id, "needs_review"], "add_underscore");
-    assert!(add_underscore.status.success(), "underscore label failed: {}", add_underscore.stderr);
+    let add_underscore = run_br(
+        &workspace,
+        ["label", "add", &id, "needs_review"],
+        "add_underscore",
+    );
+    assert!(
+        add_underscore.status.success(),
+        "underscore label failed: {}",
+        add_underscore.stderr
+    );
 
-    let add_colon = run_br(&workspace, ["label", "add", &id, "team:backend"], "add_colon");
-    assert!(add_colon.status.success(), "colon label failed: {}", add_colon.stderr);
+    let add_colon = run_br(
+        &workspace,
+        ["label", "add", &id, "team:backend"],
+        "add_colon",
+    );
+    assert!(
+        add_colon.status.success(),
+        "colon label failed: {}",
+        add_colon.stderr
+    );
 
     // Verify all present
     let list = run_br(&workspace, ["label", "list", &id, "--json"], "list");
@@ -366,18 +437,32 @@ fn e2e_label_case_sensitivity() {
 
     // Add both lowercase and uppercase versions
     let add_lower = run_br(&workspace, ["label", "add", &id, "bug"], "add_lower");
-    assert!(add_lower.status.success(), "add lowercase failed: {}", add_lower.stderr);
+    assert!(
+        add_lower.status.success(),
+        "add lowercase failed: {}",
+        add_lower.stderr
+    );
 
     let add_upper = run_br(&workspace, ["label", "add", &id, "BUG"], "add_upper");
-    assert!(add_upper.status.success(), "add uppercase failed: {}", add_upper.stderr);
+    assert!(
+        add_upper.status.success(),
+        "add uppercase failed: {}",
+        add_upper.stderr
+    );
 
     // Both should exist (case-sensitive)
     let list = run_br(&workspace, ["label", "list", &id, "--json"], "list");
     assert!(list.status.success(), "list failed: {}", list.stderr);
     let labels_payload = extract_json_payload(&list.stdout);
     let labels: Vec<String> = serde_json::from_str(&labels_payload).expect("labels json");
-    assert!(labels.contains(&"bug".to_string()), "lowercase bug not found");
-    assert!(labels.contains(&"BUG".to_string()), "uppercase BUG not found");
+    assert!(
+        labels.contains(&"bug".to_string()),
+        "lowercase bug not found"
+    );
+    assert!(
+        labels.contains(&"BUG".to_string()),
+        "uppercase BUG not found"
+    );
     assert_eq!(labels.len(), 2, "should have exactly 2 labels");
 }
 
@@ -398,7 +483,11 @@ fn e2e_label_on_closed_issue() {
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     // Add label to closed issue - should work
-    let add = run_br(&workspace, ["label", "add", &id, "archived"], "add_to_closed");
+    let add = run_br(
+        &workspace,
+        ["label", "add", &id, "archived"],
+        "add_to_closed",
+    );
     assert!(
         add.status.success(),
         "adding label to closed issue should work: {}",
@@ -410,7 +499,10 @@ fn e2e_label_on_closed_issue() {
     assert!(list.status.success(), "list failed: {}", list.stderr);
     let labels_payload = extract_json_payload(&list.stdout);
     let labels: Vec<String> = serde_json::from_str(&labels_payload).expect("labels json");
-    assert!(labels.contains(&"archived".to_string()), "label not added to closed issue");
+    assert!(
+        labels.contains(&"archived".to_string()),
+        "label not added to closed issue"
+    );
 }
 
 // =============================================================================
@@ -430,7 +522,11 @@ fn e2e_label_add_json_output() {
     let id = parse_created_id(&create.stdout);
 
     // Add with JSON output
-    let add = run_br(&workspace, ["label", "add", &id, "json-test", "--json"], "add_json");
+    let add = run_br(
+        &workspace,
+        ["label", "add", &id, "json-test", "--json"],
+        "add_json",
+    );
     assert!(add.status.success(), "add failed: {}", add.stderr);
 
     let payload = extract_json_payload(&add.stdout);
@@ -485,7 +581,11 @@ fn e2e_label_rename() {
     run_br(&workspace, ["label", "add", &id2, "old-name"], "add2");
 
     // Rename label
-    let rename = run_br(&workspace, ["label", "rename", "old-name", "new-name", "--json"], "rename");
+    let rename = run_br(
+        &workspace,
+        ["label", "rename", "old-name", "new-name", "--json"],
+        "rename",
+    );
     assert!(rename.status.success(), "rename failed: {}", rename.stderr);
     let rename_payload = extract_json_payload(&rename.stdout);
     let rename_result: Value = serde_json::from_str(&rename_payload).expect("rename json");
@@ -497,8 +597,14 @@ fn e2e_label_rename() {
     let list1 = run_br(&workspace, ["label", "list", &id1, "--json"], "list1");
     let labels1_payload = extract_json_payload(&list1.stdout);
     let labels1: Vec<String> = serde_json::from_str(&labels1_payload).expect("labels1 json");
-    assert!(!labels1.contains(&"old-name".to_string()), "old-name should be gone");
-    assert!(labels1.contains(&"new-name".to_string()), "new-name should exist");
+    assert!(
+        !labels1.contains(&"old-name".to_string()),
+        "old-name should be gone"
+    );
+    assert!(
+        labels1.contains(&"new-name".to_string()),
+        "new-name should exist"
+    );
 }
 
 /// Test label persistence in JSONL export
@@ -534,5 +640,8 @@ fn e2e_label_persistence_jsonl() {
     let labels = &issue_json["labels"];
     assert!(labels.is_array(), "labels should be array in jsonl");
     let label_arr: Vec<String> = serde_json::from_value(labels.clone()).unwrap();
-    assert!(label_arr.contains(&"persisted".to_string()), "label not persisted in jsonl");
+    assert!(
+        label_arr.contains(&"persisted".to_string()),
+        "label not persisted in jsonl"
+    );
 }

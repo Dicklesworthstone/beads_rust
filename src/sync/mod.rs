@@ -1979,6 +1979,13 @@ pub fn import_from_jsonl(
                         .join(", ")
                 )));
             }
+
+            // Fix: Filter out tombstones with wrong prefix that were "silently dropped" above.
+            // If we are here and rename_on_import is false, then all remaining mismatches MUST be tombstones
+            // (otherwise we would have errored above). We drop them now.
+            if !config.rename_on_import {
+                issues.retain(|issue| issue.id.starts_with(prefix));
+            }
         }
     }
 

@@ -308,7 +308,12 @@ fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> 
         "priority" => issues.sort_by_key(|iwc| iwc.issue.priority),
         "created_at" => issues.sort_by_key(|iwc| iwc.issue.created_at),
         "updated_at" => issues.sort_by_key(|iwc| iwc.issue.updated_at),
-        "title" => issues.sort_by(|a, b| a.issue.title.to_lowercase().cmp(&b.issue.title.to_lowercase())),
+        "title" => issues.sort_by(|a, b| {
+            a.issue
+                .title
+                .to_lowercase()
+                .cmp(&b.issue.title.to_lowercase())
+        }),
         _ => {
             return Err(BeadsError::Validation {
                 field: "sort".to_string(),

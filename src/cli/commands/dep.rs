@@ -727,7 +727,9 @@ mod tests {
             .unwrap();
 
         // bd-002 depends on bd-001 would create a cycle
-        let would_cycle = storage.would_create_cycle("bd-002", "bd-001", true).unwrap();
+        let would_cycle = storage
+            .would_create_cycle("bd-002", "bd-001", true)
+            .unwrap();
         assert!(would_cycle);
     }
 
@@ -751,11 +753,15 @@ mod tests {
             .unwrap();
 
         // bd-003 -> bd-001 would create a cycle
-        let would_cycle = storage.would_create_cycle("bd-003", "bd-001", true).unwrap();
+        let would_cycle = storage
+            .would_create_cycle("bd-003", "bd-001", true)
+            .unwrap();
         assert!(would_cycle);
 
         // bd-003 -> bd-002 would also create a cycle
-        let would_cycle = storage.would_create_cycle("bd-003", "bd-002", true).unwrap();
+        let would_cycle = storage
+            .would_create_cycle("bd-003", "bd-002", true)
+            .unwrap();
         assert!(would_cycle);
     }
 
@@ -776,7 +782,9 @@ mod tests {
             .unwrap();
 
         // bd-003 -> bd-002 should NOT be a cycle
-        let would_cycle = storage.would_create_cycle("bd-003", "bd-002", true).unwrap();
+        let would_cycle = storage
+            .would_create_cycle("bd-003", "bd-002", true)
+            .unwrap();
         assert!(!would_cycle);
     }
 

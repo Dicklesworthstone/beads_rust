@@ -80,7 +80,7 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
             // Fetch relations for all issues
             let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
             let labels_map = storage.get_labels_for_issues(&issue_ids)?;
-            
+
             // Use batch counting
             let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
             let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;

@@ -1,0 +1,40 @@
+# Tarpaulin configuration for beads_rust code coverage
+# See: https://github.com/xd009642/tarpaulin
+# Run with: cargo tarpaulin
+# Or with custom config: cargo tarpaulin --config tarpaulin.toml
+
+[default]
+# General settings
+timeout = "600s"
+verbose = true
+ignore-tests = true
+follow-exec = true
+
+# Output formats: HTML for human review, Lcov for CI, JSON for parsing
+out = ["Html", "Lcov", "Json"]
+output-dir = "coverage"
+
+# Thread settings
+jobs = 4
+
+# Exclude test-only modules from coverage calculation
+# Use exclude-files for file patterns
+exclude-files = ["tests/*", "benches/*"]
+
+# Skip clean build (faster iterations during development)
+skip-clean = true
+
+# Run tests in debug mode (default, more accurate coverage)
+release = false
+
+# Minimum coverage threshold - fail if below this percentage
+# Start conservative, increase as coverage improves
+fail-under = 50.0
+
+# Run-type to filter what tests are run
+# Options: Tests, Doctests, Benchmarks, Examples
+run-types = ["Tests", "Doctests"]
+
+[report]
+# Coverage report configuration
+print = true

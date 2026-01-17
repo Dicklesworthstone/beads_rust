@@ -49,7 +49,7 @@ impl DeleteResult {
 /// - Has dependents without --force or --cascade
 /// - Database operation fails
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &DeleteArgs, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(args: &DeleteArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
     // 1. Collect IDs from args and/or file
     let mut ids: Vec<String> = args.ids.clone();
 
@@ -172,6 +172,12 @@ pub fn execute(args: &DeleteArgs, cli: &config::CliOverrides) -> Result<()> {
     result.deleted_count = result.deleted.len();
 
     // 9. Output
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        storage_ctx.flush_no_db_if_dirty()?;
+        return Ok(());
+    }
+
     result.deleted.sort();
     println!("Deleted {} issue(s):", result.deleted_count);
     for id in &result.deleted {

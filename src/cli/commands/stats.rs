@@ -405,8 +405,11 @@ fn compute_recent_activity(beads_dir: &Path, hours: u32) -> Option<RecentActivit
         if let Some(stderr) = child.stderr {
             use std::io::Read;
             let mut err_msg = String::new();
-            if std::io::BufReader::new(stderr).read_to_string(&mut err_msg).is_ok() {
-                 debug!(stderr = %err_msg, "Git log failed");
+            if std::io::BufReader::new(stderr)
+                .read_to_string(&mut err_msg)
+                .is_ok()
+            {
+                debug!(stderr = %err_msg, "Git log failed");
             }
         }
         return None;

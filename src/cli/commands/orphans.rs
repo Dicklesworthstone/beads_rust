@@ -218,7 +218,7 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
 
     for line in reader.lines() {
         let line = line.map_err(|e| crate::error::BeadsError::Config(format!("IO error: {e}")))?;
-        
+
         // Each line is: <short_hash> <message>
         let parts: Vec<&str> = line.splitn(2, ' ').collect();
         if parts.len() < 2 {

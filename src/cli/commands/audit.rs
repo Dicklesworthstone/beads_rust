@@ -100,7 +100,10 @@ fn record_entry(args: &AuditRecordArgs, beads_dir: &Path, actor: &str, json: boo
         io::stdin().read_to_string(&mut input)?;
         let trimmed = input.trim();
         if trimmed.is_empty() {
-            return Err(BeadsError::validation("stdin", "expected JSON input but stdin was empty"));
+            return Err(BeadsError::validation(
+                "stdin",
+                "expected JSON input but stdin was empty",
+            ));
         }
         let mut entry: AuditEntry = serde_json::from_str(trimmed)?;
         if let Some(override_actor) = clean_actor(actor) {

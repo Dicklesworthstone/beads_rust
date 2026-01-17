@@ -177,7 +177,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
         } else {
             println!("\n\u{2713} Already up to date");
         }
-        return Ok(())
+        return Ok(());
     }
 
     if !json {

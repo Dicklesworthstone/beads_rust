@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::cli::{extract_json_payload, run_br, BrWorkspace};
+use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -51,7 +51,11 @@ fn q_with_type_flag() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let quick = run_br(&workspace, ["q", "Bug report", "--type", "bug"], "quick_type");
+    let quick = run_br(
+        &workspace,
+        ["q", "Bug report", "--type", "bug"],
+        "quick_type",
+    );
     assert!(
         quick.status.success(),
         "q with --type failed: {}",
@@ -82,11 +86,7 @@ fn q_with_priority_flag() {
         ["q", "High priority issue", "-p", "1"],
         "quick_priority",
     );
-    assert!(
-        quick.status.success(),
-        "q with -p failed: {}",
-        quick.stderr
-    );
+    assert!(quick.status.success(), "q with -p failed: {}", quick.stderr);
 
     let id = quick.stdout.trim();
 
@@ -144,7 +144,10 @@ fn q_with_all_flags() {
         .as_array()
         .expect("labels should be array");
     let label_names: Vec<&str> = labels.iter().filter_map(|l| l.as_str()).collect();
-    assert!(label_names.contains(&"urgent"), "should have 'urgent' label");
+    assert!(
+        label_names.contains(&"urgent"),
+        "should have 'urgent' label"
+    );
     assert!(
         label_names.contains(&"regression"),
         "should have 'regression' label"
@@ -439,11 +442,7 @@ fn q_multiple_creates_unique_ids() {
             ["q", &format!("Rapid issue {i}")],
             &format!("quick_{i}"),
         );
-        assert!(
-            quick.status.success(),
-            "q #{i} failed: {}",
-            quick.stderr
-        );
+        assert!(quick.status.success(), "q #{i} failed: {}", quick.stderr);
 
         let id = quick.stdout.trim().to_string();
         assert!(!id.is_empty(), "ID #{i} should not be empty");
@@ -595,7 +594,11 @@ fn q_status_is_always_open() {
     let ids: Vec<String> = vec![
         run_br(&workspace, ["q", "Issue 1", "-t", "bug"], "q1"),
         run_br(&workspace, ["q", "Issue 2", "-p", "0"], "q2"),
-        run_br(&workspace, ["q", "Issue 3", "-t", "feature", "-p", "1"], "q3"),
+        run_br(
+            &workspace,
+            ["q", "Issue 3", "-t", "feature", "-p", "1"],
+            "q3",
+        ),
     ]
     .into_iter()
     .filter(|r| r.status.success())

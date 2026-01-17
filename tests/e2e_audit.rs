@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::cli::{extract_json_payload, run_br, BrWorkspace};
+use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -312,7 +312,11 @@ fn e2e_audit_label_json_output() {
         ["audit", "label", parent_id, "--label", "good", "--json"],
         "label_json",
     );
-    assert!(label.status.success(), "label json failed: {}", label.stderr);
+    assert!(
+        label.status.success(),
+        "label json failed: {}",
+        label.stderr
+    );
 
     let payload = extract_json_payload(&label.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse label json");
@@ -571,11 +575,7 @@ fn e2e_audit_unique_ids() {
         sorted.dedup();
         sorted.len()
     };
-    assert_eq!(
-        unique_count,
-        ids.len(),
-        "all IDs should be unique: {ids:?}"
-    );
+    assert_eq!(unique_count, ids.len(), "all IDs should be unique: {ids:?}");
 }
 
 #[test]
