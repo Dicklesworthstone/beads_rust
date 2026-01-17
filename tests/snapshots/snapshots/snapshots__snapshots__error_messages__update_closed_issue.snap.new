@@ -1,0 +1,10 @@
+---
+source: tests/snapshots/error_messages.rs
+assertion_line: 89
+expression: "normalize_output(&format!(\"{}{}\", output.stdout, output.stderr))"
+---
+Updated ID-REDACTED: Will close
+  status: closed → in_progress
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::storage::sqlite: src/storage/sqlite.rs:1077: Rebuilt blocked issues cache blocked_count=0
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:1643: ID-REDACTED: exporting dirty issues dirty_count=1
+YYYY-MM-DDTHH:MM:SS  INFO beads_rust::sync: src/sync/mod.rs:1664: ID-REDACTED complete exported=1

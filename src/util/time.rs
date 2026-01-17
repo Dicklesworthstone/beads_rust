@@ -41,11 +41,13 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
         return Ok(local_dt.with_timezone(&Utc));
     }
 
-    // Try relative duration (+1h, +2d, +1w, +30m)
-    if let Some(rest) = s.strip_prefix('+') {
+    // Try relative duration (+1h, +2d, +1w, +30m, -7d)
+    if let Some(rest) = s.strip_prefix(['+', '-'].as_ref()) {
+        let is_negative = s.starts_with('-');
         if let Some(unit_char) = rest.chars().last() {
             let amount_str = &rest[..rest.len() - unit_char.len_utf8()];
             if let Ok(amount) = amount_str.parse::<i64>() {
+                let amount = if is_negative { -amount } else { amount };
                 let duration = match unit_char {
                     'm' => Duration::minutes(amount),
                     'h' => Duration::hours(amount),
@@ -88,7 +90,7 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
         }
         _ => Err(BeadsError::validation(
             field_name,
-            "invalid time format (try: +1h, +2d, tomorrow, next-week, or 2025-01-15)",
+            "invalid time format (try: +1h, -7d, tomorrow, next-week, or 2025-01-15)",
         )),
     }
 }
@@ -104,7 +106,7 @@ pub fn parse_flexible_timestamp(s: &str, field_name: &str) -> Result<DateTime<Ut
 pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
     let s = s.trim();
 
-    // Try relative duration (+1h, +2d, +1w, +30m, -7d)
+    // Try relative duration (+1h, -2d, +1w, -30m)
     if let Some(rest) = s.strip_prefix(['+', '-'].as_ref()) {
         let is_negative = s.starts_with('-');
         if let Some(unit_char) = rest.chars().last() {

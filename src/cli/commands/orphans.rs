@@ -4,6 +4,7 @@
 //! that are still `open/in_progress` but referenced in commits.
 
 use crate::cli::OrphansArgs;
+use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::Result;
 use crate::model::Status;
@@ -145,17 +146,17 @@ pub fn execute(args: &OrphansArgs, json: bool, cli: &config::CliOverrides) -> Re
             if io::stdin().read_line(&mut input).is_ok() {
                 let input = input.trim().to_lowercase();
                 if input == "y" || input == "yes" {
-                    // Close the issue using br close command
-                    let status = Command::new("br")
-                        .args(["close", &orphan.issue_id, "--reason", "Implemented"])
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => {
-                            println!("  Closed {}", orphan.issue_id);
-                        }
-                        _ => {
-                            eprintln!("  Failed to close {}", orphan.issue_id);
-                        }
+                    // Close the issue directly using internal API
+                    let close_args = CloseArgs {
+                        ids: vec![orphan.issue_id.clone()],
+                        reason: Some("Implemented (detected by orphans scan)".to_string()),
+                        force: false,
+                        session: None,
+                        suggest_next: false,
+                    };
+                    
+                    if let Err(e) = close::execute_with_args(&close_args, false, cli) {
+                        eprintln!("  Failed to close {}: {}", orphan.issue_id, e);
                     }
                 } else {
                     println!("  Skipped {}", orphan.issue_id);
