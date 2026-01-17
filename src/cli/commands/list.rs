@@ -409,10 +409,7 @@ mod tests {
         init_logging();
         info!("test_validate_priority_range_rejects_out_of_range: starting");
         let err = validate_priority_range(&[9]).unwrap_err();
-        match err {
-            BeadsError::InvalidPriority { priority } => assert_eq!(priority, 9),
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(matches!(err, BeadsError::InvalidPriority { priority: 9 }));
         info!("test_validate_priority_range_rejects_out_of_range: assertions passed");
     }
 }
