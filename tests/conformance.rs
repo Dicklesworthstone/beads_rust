@@ -1557,6 +1557,49 @@ fn conformance_ready_with_deps() {
 }
 
 #[test]
+fn conformance_ready_limit() {
+    common::init_test_logging();
+    info!("Starting conformance_ready_limit test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    // Create multiple ready issues
+    for i in 0..3 {
+        let title = format!("Ready issue {}", i);
+        workspace.run_br(["create", &title], &format!("ready_limit_br_{i}"));
+        workspace.run_bd(["create", &title], &format!("ready_limit_bd_{i}"));
+    }
+
+    let br_ready = workspace.run_br(["ready", "--json", "--limit", "1"], "ready_limit");
+    let bd_ready = workspace.run_bd(["ready", "--json", "--limit", "1"], "ready_limit");
+
+    assert!(
+        br_ready.status.success(),
+        "br ready failed: {}",
+        br_ready.stderr
+    );
+    assert!(
+        bd_ready.status.success(),
+        "bd ready failed: {}",
+        bd_ready.stderr
+    );
+
+    let br_val: Value = serde_json::from_str(&extract_json_payload(&br_ready.stdout))
+        .unwrap_or(Value::Array(vec![]));
+    let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
+        .unwrap_or(Value::Array(vec![]));
+
+    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+
+    assert_eq!(br_len, 1, "br ready should honor limit");
+    assert_eq!(bd_len, 1, "bd ready should honor limit");
+
+    info!("conformance_ready_limit passed");
+}
+
+#[test]
 fn conformance_blocked_empty() {
     common::init_test_logging();
     info!("Starting conformance_blocked_empty test");
@@ -1677,6 +1720,92 @@ fn conformance_blocked_with_deps() {
     );
 
     info!("conformance_blocked_with_deps passed");
+}
+
+#[test]
+fn conformance_blocked_shows_blockers() {
+    common::init_test_logging();
+    info!("Starting conformance_blocked_shows_blockers test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_blocker = workspace.run_br(["create", "Blocker issue", "--json"], "create_blocker");
+    let bd_blocker = workspace.run_bd(["create", "Blocker issue", "--json"], "create_blocker");
+    let br_blocked = workspace.run_br(["create", "Blocked issue", "--json"], "create_blocked");
+    let bd_blocked = workspace.run_bd(["create", "Blocked issue", "--json"], "create_blocked");
+
+    let br_blocker_id = serde_json::from_str::<Value>(&extract_json_payload(&br_blocker.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br blocker id");
+    let bd_blocker_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_blocker.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd blocker id");
+    let br_blocked_id = serde_json::from_str::<Value>(&extract_json_payload(&br_blocked.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("br blocked id");
+    let bd_blocked_id = serde_json::from_str::<Value>(&extract_json_payload(&bd_blocked.stdout))
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .expect("bd blocked id");
+
+    let br_dep = workspace.run_br(["dep", "add", &br_blocked_id, &br_blocker_id], "dep_add");
+    let bd_dep = workspace.run_bd(["dep", "add", &bd_blocked_id, &bd_blocker_id], "dep_add");
+    assert!(br_dep.status.success(), "br dep add failed: {}", br_dep.stderr);
+    assert!(bd_dep.status.success(), "bd dep add failed: {}", bd_dep.stderr);
+
+    let br_blocked_out = workspace.run_br(["blocked", "--json"], "blocked_show_blockers");
+    let bd_blocked_out = workspace.run_bd(["blocked", "--json"], "blocked_show_blockers");
+
+    assert!(
+        br_blocked_out.status.success(),
+        "br blocked failed: {}",
+        br_blocked_out.stderr
+    );
+    assert!(
+        bd_blocked_out.status.success(),
+        "bd blocked failed: {}",
+        bd_blocked_out.stderr
+    );
+
+    let br_val: Value =
+        serde_json::from_str(&extract_json_payload(&br_blocked_out.stdout)).unwrap_or_default();
+    let bd_val: Value =
+        serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout)).unwrap_or_default();
+
+    fn has_blocker(val: &Value, blocked_id: &str, blocker_id: &str) -> bool {
+        let Some(arr) = val.as_array() else {
+            return false;
+        };
+        for item in arr {
+            if item.get("id").and_then(|v| v.as_str()) != Some(blocked_id) {
+                continue;
+            }
+            if let Some(blocked_by) = item.get("blocked_by").and_then(|v| v.as_array()) {
+                return blocked_by.iter().any(|entry| {
+                    entry
+                        .as_str()
+                        .map(|s| s.split(':').next().unwrap_or(s) == blocker_id)
+                        .unwrap_or(false)
+                });
+            }
+        }
+        false
+    }
+
+    assert!(
+        has_blocker(&br_val, &br_blocked_id, &br_blocker_id),
+        "br blocked should list blocker"
+    );
+    assert!(
+        has_blocker(&bd_val, &bd_blocked_id, &bd_blocker_id),
+        "bd blocked should list blocker"
+    );
+
+    info!("conformance_blocked_shows_blockers passed");
 }
 
 #[test]
