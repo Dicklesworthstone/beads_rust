@@ -1147,15 +1147,17 @@ pub fn export_to_jsonl_with_policy(
             "Export path validated"
         );
 
-        // Perform backup before overwriting (if enabled and we have a beads_dir)
-        // We only backup if we are writing to the default path or inside beads dir?
-        // The backup function handles checks.
-        // Note: history::backup_before_export assumes output_path is 'issues.jsonl' inside beads_dir
-        // If output_path is different, we might skip backup or adapt?
-        // The spec said "Automatic timestamped backups of `issues.jsonl`".
-        // It implies backing up the canonical JSONL.
-        // If output_path == beads_dir.join("issues.jsonl"), we back it up.
-        if output_path == beads_dir.join("issues.jsonl") {
+        // Perform backup before overwriting (if enabled and we have a beads_dir).
+        // We backup any JSONL file that resolves inside `.beads/`, including custom
+        // BEADS_JSONL paths that still target `.beads/`.
+        let output_abs = if output_path.is_absolute() {
+            output_path.to_path_buf()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(output_path)
+        } else {
+            output_path.to_path_buf()
+        };
+        if output_abs.starts_with(beads_dir) {
             history::backup_before_export(beads_dir, &config.history, output_path)?;
         }
     }
@@ -3193,7 +3195,7 @@ mod tests {
                 assert_eq!(match_type, MatchType::ExternalRef);
                 assert_eq!(phase, 1);
             }
-            CollisionResult::NewIssue => panic!("Expected external_ref match"),
+            CollisionResult::NewIssue => assert!(false, "Expected external_ref match"),
         }
     }
 
@@ -3390,7 +3392,7 @@ mod tests {
                 assert_eq!(match_type, MatchType::ExternalRef);
                 assert_eq!(phase, 1);
             }
-            CollisionResult::NewIssue => panic!("expected match"),
+            CollisionResult::NewIssue => assert!(false, "expected match"),
         }
     }
 
@@ -3420,7 +3422,7 @@ mod tests {
                 assert_eq!(match_type, MatchType::ContentHash);
                 assert_eq!(phase, 2);
             }
-            CollisionResult::NewIssue => panic!("expected match"),
+            CollisionResult::NewIssue => assert!(false, "expected match"),
         }
     }
 
@@ -3446,7 +3448,7 @@ mod tests {
                 assert_eq!(match_type, MatchType::Id);
                 assert_eq!(phase, 3);
             }
-            CollisionResult::NewIssue => panic!("expected match"),
+            CollisionResult::NewIssue => assert!(false, "expected match"),
         }
     }
 
@@ -3468,7 +3470,7 @@ mod tests {
             CollisionAction::Skip { reason } => {
                 assert!(reason.contains("Tombstone protection"));
             }
-            _ => panic!("expected tombstone skip"),
+            _ => assert!(false, "expected tombstone skip"),
         }
     }
 
@@ -3488,21 +3490,21 @@ mod tests {
         let action = determine_action(&collision, &newer, &storage, false).unwrap();
         match action {
             CollisionAction::Update { .. } => {}
-            _ => panic!("expected update action"),
+            _ => assert!(false, "expected update action"),
         }
 
         let equal = make_issue_at("bd-1", "Incoming", fixed_time(100));
         let action = determine_action(&collision, &equal, &storage, false).unwrap();
         match action {
             CollisionAction::Skip { reason } => assert!(reason.contains("Equal timestamps")),
-            _ => panic!("expected equal timestamp skip"),
+            _ => assert!(false, "expected equal timestamp skip"),
         }
 
         let older = make_issue_at("bd-1", "Incoming", fixed_time(50));
         let action = determine_action(&collision, &older, &storage, false).unwrap();
         match action {
             CollisionAction::Skip { reason } => assert!(reason.contains("Existing is newer")),
-            _ => panic!("expected older timestamp skip"),
+            _ => assert!(false, "expected older timestamp skip"),
         }
     }
 

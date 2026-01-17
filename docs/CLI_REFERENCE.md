@@ -761,6 +761,9 @@ br history <COMMAND>
 | `list` | List backups |
 | `restore <BACKUP>` | Restore from backup |
 
+**Notes:**
+- Backups are created during `br sync --flush-only` when overwriting a JSONL file inside `.beads/`, including custom `BEADS_JSONL` paths that still target `.beads/`.
+
 ---
 
 ### changelog

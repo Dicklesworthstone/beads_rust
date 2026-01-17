@@ -312,7 +312,7 @@ pub fn export_to_jsonl(
 1. Path validation (must be in `.beads/`)
 2. Atomic writes (temp file + rename)
 3. Content hashing (detect corruption)
-4. History backups (optional)
+4. History backups (optional, created when overwriting JSONL inside `.beads/`)
 
 ### Import Process
 
