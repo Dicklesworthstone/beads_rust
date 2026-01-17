@@ -1,6 +1,7 @@
 use crate::cli::StaleArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::StaleIssue;
 use crate::model::{Issue, Status};
 use crate::storage::ListFilters;
 use chrono::{DateTime, Duration, Utc};
@@ -36,7 +37,9 @@ pub fn execute(args: &StaleArgs, json: bool, cli: &config::CliOverrides) -> Resu
     let stale = filter_stale_issues(issues, now, args.days);
 
     if json {
-        let payload = serde_json::to_string(&stale)?;
+        // Convert to StaleIssue for bd-compatible JSON output
+        let stale_output: Vec<StaleIssue> = stale.iter().map(StaleIssue::from).collect();
+        let payload = serde_json::to_string(&stale_output)?;
         println!("{payload}");
         return Ok(());
     }

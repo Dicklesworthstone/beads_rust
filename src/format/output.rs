@@ -1,5 +1,33 @@
-use crate::model::{Comment, Event, Issue, Priority, Status};
+use crate::model::{Comment, Event, Issue, IssueType, Priority, Status};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Minimal issue output for stale command (bd parity).
+/// Contains only the fields that bd's stale command outputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleIssue {
+    pub created_at: DateTime<Utc>,
+    pub id: String,
+    pub issue_type: IssueType,
+    pub priority: Priority,
+    pub status: Status,
+    pub title: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&Issue> for StaleIssue {
+    fn from(issue: &Issue) -> Self {
+        Self {
+            created_at: issue.created_at,
+            id: issue.id.clone(),
+            issue_type: issue.issue_type.clone(),
+            priority: issue.priority,
+            status: issue.status.clone(),
+            title: issue.title.clone(),
+            updated_at: issue.updated_at,
+        }
+    }
+}
 
 /// Issue with counts for list/search views.
 #[derive(Debug, Clone, Serialize, Deserialize)]
