@@ -329,8 +329,9 @@ fn q_empty_title_fails() {
 }
 
 #[test]
-fn q_with_custom_type_succeeds() {
-    // Custom issue types should be accepted (IssueType::Custom variant)
+fn q_with_custom_type_fails() {
+    // Custom/unknown issue types should be rejected for bd conformance
+    // bd only accepts: task, bug, feature, epic, chore
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -342,24 +343,16 @@ fn q_with_custom_type_succeeds() {
         "quick_custom_type",
     );
     assert!(
-        quick.status.success(),
-        "q with custom type should succeed: {}",
-        quick.stderr
+        !quick.status.success(),
+        "q with custom type should fail for bd conformance"
     );
 
-    let id = quick.stdout.trim();
-
-    // Verify the custom type was stored correctly
-    let show = run_br(&workspace, ["show", id, "--json"], "show");
-    assert!(show.status.success(), "show failed: {}", show.stderr);
-
-    let payload = extract_json_payload(&show.stdout);
-    let json: Vec<Value> = serde_json::from_str(&payload).expect("parse json");
-
-    // The type should be preserved as the custom value
-    assert_eq!(
-        json[0]["issue_type"], "my_custom_type",
-        "custom issue type should be preserved"
+    // Error should mention invalid type
+    assert!(
+        quick.stderr.to_lowercase().contains("invalid")
+            || quick.stderr.to_lowercase().contains("type"),
+        "error should mention invalid type: {}",
+        quick.stderr
     );
 }
 

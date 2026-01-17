@@ -10523,14 +10523,8 @@ fn conformance_defer_basic() {
     let bd_id = extract_issue_id(&extract_json_payload(&bd_create.stdout));
 
     // Defer with --until
-    let br_defer = workspace.run_br(
-        ["defer", &br_id, "--until", "+1d", "--json"],
-        "defer_basic",
-    );
-    let bd_defer = workspace.run_bd(
-        ["defer", &bd_id, "--until", "+1d", "--json"],
-        "defer_basic",
-    );
+    let br_defer = workspace.run_br(["defer", &br_id, "--until", "+1d", "--json"], "defer_basic");
+    let bd_defer = workspace.run_bd(["defer", &bd_id, "--until", "+1d", "--json"], "defer_basic");
 
     assert!(
         br_defer.status.success(),
@@ -10653,7 +10647,7 @@ fn conformance_undefer_restores_ready() {
 }
 
 // ============================================================================
-// HISTORY COMMAND TESTS
+// HISTORY COMMAND TESTS (br-only feature)
 // ============================================================================
 
 #[test]
@@ -10664,18 +10658,13 @@ fn conformance_history_list_empty() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // history is br-only, just verify br works
     let br_hist = workspace.run_br(["history", "list", "--json"], "history_list_empty");
-    let bd_hist = workspace.run_bd(["history", "list", "--json"], "history_list_empty");
 
     assert!(
         br_hist.status.success(),
         "br history list failed: {}",
         br_hist.stderr
-    );
-    assert!(
-        bd_hist.status.success(),
-        "bd history list failed: {}",
-        bd_hist.stderr
     );
 
     info!("conformance_history_list_empty passed");
@@ -10691,22 +10680,15 @@ fn conformance_history_list_after_sync() {
 
     // Create issue and sync to create history
     workspace.run_br(["create", "History test"], "create");
-    workspace.run_bd(["create", "History test"], "create");
     workspace.run_br(["sync", "--flush-only"], "sync");
-    workspace.run_bd(["sync", "--flush-only"], "sync");
 
+    // history is br-only
     let br_hist = workspace.run_br(["history", "list", "--json"], "history_list");
-    let bd_hist = workspace.run_bd(["history", "list", "--json"], "history_list");
 
     assert!(
         br_hist.status.success(),
         "br history list failed: {}",
         br_hist.stderr
-    );
-    assert!(
-        bd_hist.status.success(),
-        "bd history list failed: {}",
-        bd_hist.stderr
     );
 
     info!("conformance_history_list_after_sync passed");
@@ -10720,17 +10702,13 @@ fn conformance_history_json_shape() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // history is br-only
     let br_hist = workspace.run_br(["history", "list", "--json"], "history_json");
-    let bd_hist = workspace.run_bd(["history", "list", "--json"], "history_json");
 
     let br_json = extract_json_payload(&br_hist.stdout);
-    let bd_json = extract_json_payload(&bd_hist.stdout);
-
     let br_val: Result<Value, _> = serde_json::from_str(&br_json);
-    let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
 
     assert!(br_val.is_ok(), "br history list should produce valid JSON");
-    assert!(bd_val.is_ok(), "bd history list should produce valid JSON");
 
     info!("conformance_history_json_shape passed");
 }
@@ -10816,7 +10794,7 @@ fn conformance_orphans_json_shape() {
 }
 
 // ============================================================================
-// CHANGELOG COMMAND TESTS
+// CHANGELOG COMMAND TESTS (br-only feature)
 // ============================================================================
 
 #[test]
@@ -10827,18 +10805,13 @@ fn conformance_changelog_empty() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // changelog is br-only
     let br_changelog = workspace.run_br(["changelog", "--json"], "changelog_empty");
-    let bd_changelog = workspace.run_bd(["changelog", "--json"], "changelog_empty");
 
     assert!(
         br_changelog.status.success(),
         "br changelog failed: {}",
         br_changelog.stderr
-    );
-    assert!(
-        bd_changelog.status.success(),
-        "bd changelog failed: {}",
-        bd_changelog.stderr
     );
 
     info!("conformance_changelog_empty passed");
@@ -10852,28 +10825,18 @@ fn conformance_changelog_with_closed() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Create and close issues
+    // Create and close issues (using br only for changelog test)
     let br_create = workspace.run_br(["create", "Changelog entry", "--json"], "create");
-    let bd_create = workspace.run_bd(["create", "Changelog entry", "--json"], "create");
-
     let br_id = extract_issue_id(&extract_json_payload(&br_create.stdout));
-    let bd_id = extract_issue_id(&extract_json_payload(&bd_create.stdout));
-
     workspace.run_br(["close", &br_id], "close");
-    workspace.run_bd(["close", &bd_id], "close");
 
+    // changelog is br-only
     let br_changelog = workspace.run_br(["changelog", "--json"], "changelog_with_closed");
-    let bd_changelog = workspace.run_bd(["changelog", "--json"], "changelog_with_closed");
 
     assert!(
         br_changelog.status.success(),
         "br changelog failed: {}",
         br_changelog.stderr
-    );
-    assert!(
-        bd_changelog.status.success(),
-        "bd changelog failed: {}",
-        bd_changelog.stderr
     );
 
     info!("conformance_changelog_with_closed passed");
@@ -10887,23 +10850,19 @@ fn conformance_changelog_json_shape() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // changelog is br-only
     let br_changelog = workspace.run_br(["changelog", "--json"], "changelog_json");
-    let bd_changelog = workspace.run_bd(["changelog", "--json"], "changelog_json");
 
     let br_json = extract_json_payload(&br_changelog.stdout);
-    let bd_json = extract_json_payload(&bd_changelog.stdout);
-
     let br_val: Result<Value, _> = serde_json::from_str(&br_json);
-    let bd_val: Result<Value, _> = serde_json::from_str(&bd_json);
 
     assert!(br_val.is_ok(), "br changelog should produce valid JSON");
-    assert!(bd_val.is_ok(), "bd changelog should produce valid JSON");
 
     info!("conformance_changelog_json_shape passed");
 }
 
 // ============================================================================
-// QUERY COMMAND TESTS
+// QUERY COMMAND TESTS (br-only feature)
 // ============================================================================
 
 #[test]
@@ -10914,18 +10873,13 @@ fn conformance_query_list_empty() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // query is br-only
     let br_query = workspace.run_br(["query", "list", "--json"], "query_list_empty");
-    let bd_query = workspace.run_bd(["query", "list", "--json"], "query_list_empty");
 
     assert!(
         br_query.status.success(),
         "br query list failed: {}",
         br_query.stderr
-    );
-    assert!(
-        bd_query.status.success(),
-        "bd query list failed: {}",
-        bd_query.stderr
     );
 
     info!("conformance_query_list_empty passed");
@@ -10939,13 +10893,18 @@ fn conformance_query_save_and_list() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Save a query
+    // query is br-only
     let br_save = workspace.run_br(
-        ["query", "save", "high-priority", "--status", "open", "--priority", "1", "--json"],
-        "query_save",
-    );
-    let bd_save = workspace.run_bd(
-        ["query", "save", "high-priority", "--status", "open", "--priority", "1", "--json"],
+        [
+            "query",
+            "save",
+            "high-priority",
+            "--status",
+            "open",
+            "--priority",
+            "1",
+            "--json",
+        ],
         "query_save",
     );
 
@@ -10954,18 +10913,10 @@ fn conformance_query_save_and_list() {
         "br query save failed: {}",
         br_save.stderr
     );
-    assert!(
-        bd_save.status.success(),
-        "bd query save failed: {}",
-        bd_save.stderr
-    );
 
     // List queries
     let br_list = workspace.run_br(["query", "list", "--json"], "query_list");
-    let bd_list = workspace.run_bd(["query", "list", "--json"], "query_list");
-
     assert!(br_list.status.success(), "br query list failed");
-    assert!(bd_list.status.success(), "bd query list failed");
 
     info!("conformance_query_save_and_list passed");
 }
@@ -10978,34 +10929,22 @@ fn conformance_query_run() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Create some issues
+    // Create some issues (br only for query tests)
     workspace.run_br(["create", "High pri", "-p", "1"], "create_high");
-    workspace.run_bd(["create", "High pri", "-p", "1"], "create_high");
     workspace.run_br(["create", "Low pri", "-p", "3"], "create_low");
-    workspace.run_bd(["create", "Low pri", "-p", "3"], "create_low");
 
-    // Save and run query
+    // query is br-only
     workspace.run_br(
-        ["query", "save", "high-only", "--priority", "1"],
-        "query_save",
-    );
-    workspace.run_bd(
         ["query", "save", "high-only", "--priority", "1"],
         "query_save",
     );
 
     let br_run = workspace.run_br(["query", "run", "high-only", "--json"], "query_run");
-    let bd_run = workspace.run_bd(["query", "run", "high-only", "--json"], "query_run");
 
     assert!(
         br_run.status.success(),
         "br query run failed: {}",
         br_run.stderr
-    );
-    assert!(
-        bd_run.status.success(),
-        "bd query run failed: {}",
-        bd_run.stderr
     );
 
     info!("conformance_query_run passed");
@@ -11019,28 +10958,18 @@ fn conformance_query_delete() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    // Save then delete
+    // query is br-only
     workspace.run_br(
-        ["query", "save", "to-delete", "--status", "open"],
-        "query_save",
-    );
-    workspace.run_bd(
         ["query", "save", "to-delete", "--status", "open"],
         "query_save",
     );
 
     let br_delete = workspace.run_br(["query", "delete", "to-delete", "--json"], "query_delete");
-    let bd_delete = workspace.run_bd(["query", "delete", "to-delete", "--json"], "query_delete");
 
     assert!(
         br_delete.status.success(),
         "br query delete failed: {}",
         br_delete.stderr
-    );
-    assert!(
-        bd_delete.status.success(),
-        "bd query delete failed: {}",
-        bd_delete.stderr
     );
 
     info!("conformance_query_delete passed");
@@ -11048,6 +10977,7 @@ fn conformance_query_delete() {
 
 // ============================================================================
 // COMPLETIONS COMMAND TESTS
+// Note: br uses "completions", bd uses "completion" (singular)
 // ============================================================================
 
 #[test]
@@ -11058,8 +10988,9 @@ fn conformance_completions_bash() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // br uses "completions", bd uses "completion"
     let br_comp = workspace.run_br(["completions", "bash"], "completions_bash");
-    let bd_comp = workspace.run_bd(["completions", "bash"], "completions_bash");
+    let bd_comp = workspace.run_bd(["completion", "bash"], "completion_bash");
 
     assert!(
         br_comp.status.success(),
@@ -11068,7 +10999,7 @@ fn conformance_completions_bash() {
     );
     assert!(
         bd_comp.status.success(),
-        "bd completions bash failed: {}",
+        "bd completion bash failed: {}",
         bd_comp.stderr
     );
 
@@ -11079,7 +11010,7 @@ fn conformance_completions_bash() {
     );
     assert!(
         !bd_comp.stdout.is_empty(),
-        "bd completions should produce output"
+        "bd completion should produce output"
     );
 
     info!("conformance_completions_bash passed");
@@ -11093,8 +11024,9 @@ fn conformance_completions_zsh() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // br uses "completions", bd uses "completion"
     let br_comp = workspace.run_br(["completions", "zsh"], "completions_zsh");
-    let bd_comp = workspace.run_bd(["completions", "zsh"], "completions_zsh");
+    let bd_comp = workspace.run_bd(["completion", "zsh"], "completion_zsh");
 
     assert!(
         br_comp.status.success(),
@@ -11103,7 +11035,7 @@ fn conformance_completions_zsh() {
     );
     assert!(
         bd_comp.status.success(),
-        "bd completions zsh failed: {}",
+        "bd completion zsh failed: {}",
         bd_comp.stderr
     );
 
@@ -11118,8 +11050,9 @@ fn conformance_completions_fish() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
+    // br uses "completions", bd uses "completion"
     let br_comp = workspace.run_br(["completions", "fish"], "completions_fish");
-    let bd_comp = workspace.run_bd(["completions", "fish"], "completions_fish");
+    let bd_comp = workspace.run_bd(["completion", "fish"], "completion_fish");
 
     assert!(
         br_comp.status.success(),
@@ -11128,7 +11061,7 @@ fn conformance_completions_fish() {
     );
     assert!(
         bd_comp.status.success(),
-        "bd completions fish failed: {}",
+        "bd completion fish failed: {}",
         bd_comp.stderr
     );
 
