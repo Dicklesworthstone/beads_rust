@@ -87,7 +87,7 @@ fn main() {
     }
 
     // Auto-flush after successful mutating commands (unless --no-auto-flush)
-    if is_mutating && !cli.no_auto_flush {
+    if is_mutating && !cli.no_auto_flush && !cli.no_db {
         run_auto_flush(&overrides);
     }
 }
