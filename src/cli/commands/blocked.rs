@@ -230,8 +230,10 @@ fn blocker_id_from_ref(blocker_ref: &str) -> &str {
 mod tests {
     use super::*;
     use crate::cli::BlockedArgs;
+    use crate::logging::init_test_logging;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{TimeZone, Utc};
+    use tracing::info;
 
     fn make_issue(id: &str, title: &str, priority: i32, issue_type: IssueType) -> Issue {
         Issue {
@@ -291,6 +293,8 @@ mod tests {
 
     #[test]
     fn test_blocked_args_defaults() {
+        init_test_logging();
+        info!("test_blocked_args_defaults: starting");
         // Note: Default::default() gives 0 for limit; clap sets 50 at parse time
         let args = BlockedArgs::default();
         assert_eq!(args.limit, 0); // Rust Default, not clap default
@@ -299,10 +303,13 @@ mod tests {
         assert!(args.priority.is_empty());
         assert!(args.label.is_empty());
         assert!(!args.robot);
+        info!("test_blocked_args_defaults: assertions passed");
     }
 
     #[test]
     fn test_sort_by_priority_then_blocker_count() {
+        init_test_logging();
+        info!("test_sort_by_priority_then_blocker_count: starting");
         let mut issues = vec![
             make_blocked_issue("a", "P2 few blockers", 2, 1),
             make_blocked_issue("b", "P1 few blockers", 1, 1),
@@ -317,10 +324,13 @@ mod tests {
         assert_eq!(issues[1].issue.id, "c"); // P1, 5 blockers
         assert_eq!(issues[2].issue.id, "b"); // P1, 1 blocker
         assert_eq!(issues[3].issue.id, "a"); // P2
+        info!("test_sort_by_priority_then_blocker_count: assertions passed");
     }
 
     #[test]
     fn test_filter_by_type_empty_keeps_all() {
+        init_test_logging();
+        info!("test_filter_by_type_empty_keeps_all: starting");
         let mut issues = vec![
             BlockedIssue {
                 issue: make_issue("a", "Bug", 2, IssueType::Bug),
@@ -336,10 +346,13 @@ mod tests {
 
         filter_by_type(&mut issues, &[]);
         assert_eq!(issues.len(), 2);
+        info!("test_filter_by_type_empty_keeps_all: assertions passed");
     }
 
     #[test]
     fn test_filter_by_type_filters_correctly() {
+        init_test_logging();
+        info!("test_filter_by_type_filters_correctly: starting");
         let mut issues = vec![
             BlockedIssue {
                 issue: make_issue("a", "Bug", 2, IssueType::Bug),
@@ -361,10 +374,13 @@ mod tests {
         filter_by_type(&mut issues, &["bug".to_string()]);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue.id, "a");
+        info!("test_filter_by_type_filters_correctly: assertions passed");
     }
 
     #[test]
     fn test_filter_by_type_case_insensitive() {
+        init_test_logging();
+        info!("test_filter_by_type_case_insensitive: starting");
         let mut issues = vec![BlockedIssue {
             issue: make_issue("a", "Bug", 2, IssueType::Bug),
             blocked_by_count: 1,
@@ -382,10 +398,13 @@ mod tests {
 
         filter_by_type(&mut issues2, &["Bug".to_string()]);
         assert_eq!(issues2.len(), 1);
+        info!("test_filter_by_type_case_insensitive: assertions passed");
     }
 
     #[test]
     fn test_filter_by_type_multiple_types() {
+        init_test_logging();
+        info!("test_filter_by_type_multiple_types: starting");
         let mut issues = vec![
             BlockedIssue {
                 issue: make_issue("a", "Bug", 2, IssueType::Bug),
@@ -409,10 +428,13 @@ mod tests {
         let ids: Vec<_> = issues.iter().map(|i| i.issue.id.as_str()).collect();
         assert!(ids.contains(&"a"));
         assert!(ids.contains(&"c"));
+        info!("test_filter_by_type_multiple_types: assertions passed");
     }
 
     #[test]
     fn test_filter_by_priority_empty_keeps_all() {
+        init_test_logging();
+        info!("test_filter_by_priority_empty_keeps_all: starting");
         let mut issues = vec![
             make_blocked_issue("a", "P0", 0, 1),
             make_blocked_issue("b", "P2", 2, 1),
@@ -421,10 +443,13 @@ mod tests {
 
         filter_by_priority(&mut issues, &[]);
         assert_eq!(issues.len(), 3);
+        info!("test_filter_by_priority_empty_keeps_all: assertions passed");
     }
 
     #[test]
     fn test_filter_by_priority_single() {
+        init_test_logging();
+        info!("test_filter_by_priority_single: starting");
         let mut issues = vec![
             make_blocked_issue("a", "P0", 0, 1),
             make_blocked_issue("b", "P2", 2, 1),
@@ -434,10 +459,13 @@ mod tests {
         filter_by_priority(&mut issues, &[2]);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue.id, "b");
+        info!("test_filter_by_priority_single: assertions passed");
     }
 
     #[test]
     fn test_filter_by_priority_multiple() {
+        init_test_logging();
+        info!("test_filter_by_priority_multiple: starting");
         let mut issues = vec![
             make_blocked_issue("a", "P0", 0, 1),
             make_blocked_issue("b", "P2", 2, 1),
@@ -449,5 +477,6 @@ mod tests {
         let ids: Vec<_> = issues.iter().map(|i| i.issue.id.as_str()).collect();
         assert!(ids.contains(&"a"));
         assert!(ids.contains(&"c"));
+        info!("test_filter_by_priority_multiple: assertions passed");
     }
 }
