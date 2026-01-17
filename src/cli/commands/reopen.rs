@@ -133,15 +133,6 @@ pub fn execute(args: &ReopenArgs, json: bool, cli: &config::CliOverrides) -> Res
         });
     }
 
-    // Rebuild blocked cache since reopened issues may become blockers
-    if !reopened_issues.is_empty() {
-        tracing::info!(
-            "Rebuilding blocked cache after reopening {} issues",
-            reopened_issues.len()
-        );
-        storage.rebuild_blocked_cache(true)?;
-    }
-
     // Output
     if use_json {
         let result = ReopenResult {

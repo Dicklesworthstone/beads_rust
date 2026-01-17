@@ -240,7 +240,8 @@ pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverride
     // Handle suggest-next: find issues that became unblocked
     let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
         // Rebuild blocked cache to reflect the closure
-        storage.rebuild_blocked_cache(true)?;
+        // Note: storage.update_issue already triggered a transactional cache rebuild if status changed.
+        // We just need to fetch the new state.
 
         // Find issues that were blocked before but aren't now
         let blocked_after: Vec<String> = storage
@@ -267,14 +268,6 @@ pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverride
             }
         }
         unblocked
-    } else if !closed_issues.is_empty() {
-        // Rebuild blocked cache even if not suggest-next
-        tracing::info!(
-            "Rebuilding blocked cache after closing {} issues",
-            closed_issues.len()
-        );
-        storage.rebuild_blocked_cache(true)?;
-        Vec::new()
     } else {
         Vec::new()
     };
