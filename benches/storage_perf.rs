@@ -458,8 +458,11 @@ fn bench_cycle_detection(c: &mut Criterion) {
     group.bench_function("would_create_cycle_true", |b| {
         b.iter(|| {
             // This would create a cycle: 0 -> 99 when 99 -> ... -> 0 exists
-            let result =
-                storage.would_create_cycle(black_box("bench-000000"), black_box("bench-000099"), true);
+            let result = storage.would_create_cycle(
+                black_box("bench-000000"),
+                black_box("bench-000099"),
+                true,
+            );
             black_box(result)
         });
     });
@@ -467,14 +470,161 @@ fn bench_cycle_detection(c: &mut Criterion) {
     group.bench_function("would_create_cycle_false", |b| {
         b.iter(|| {
             // This wouldn't create a cycle: checking a non-existent edge
-            let result =
-                storage.would_create_cycle(black_box("bench-000099"), black_box("bench-000000"), true);
+            let result = storage.would_create_cycle(
+                black_box("bench-000099"),
+                black_box("bench-000000"),
+                true,
+            );
             black_box(result)
         });
     });
 
     group.finish();
     drop(dir);
+}
+
+// =============================================================================
+// ID Operation Benchmarks
+// =============================================================================
+
+/// Benchmark ID generation.
+fn bench_generate_id(c: &mut Criterion) {
+    use beads_rust::util::id::{IdGenerator, IdConfig};
+    use std::collections::HashSet;
+
+    let mut group = c.benchmark_group("id/generate");
+
+    group.bench_function("single", |b| {
+        let generator = IdGenerator::new(IdConfig::with_prefix("bench"));
+        let now = Utc::now();
+        let mut counter = 0usize;
+
+        b.iter(|| {
+            let title = format!("Benchmark issue {counter}");
+            let id = generator.generate(
+                black_box(&title),
+                None,
+                None,
+                now,
+                counter,
+                |_| false,
+            );
+            counter += 1;
+            black_box(id)
+        });
+    });
+
+    // Benchmark with collision checking
+    group.bench_function("with_collision_check", |b| {
+        let generator = IdGenerator::new(IdConfig::with_prefix("bench"));
+        let now = Utc::now();
+        let mut existing: HashSet<String> = HashSet::new();
+        let mut counter = 0usize;
+
+        b.iter(|| {
+            let title = format!("Benchmark issue {counter}");
+            let id = generator.generate(
+                black_box(&title),
+                None,
+                None,
+                now,
+                counter,
+                |id| existing.contains(id),
+            );
+            existing.insert(id.clone());
+            counter += 1;
+            black_box(id)
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark ID hash computation.
+fn bench_id_hash(c: &mut Criterion) {
+    use beads_rust::util::id::compute_id_hash;
+
+    let mut group = c.benchmark_group("id/hash");
+
+    for len in [4, 6, 8, 12] {
+        group.bench_with_input(BenchmarkId::new("length", len), &len, |b, &len| {
+            let input = "Benchmark issue title for hashing performance test";
+            b.iter(|| {
+                let hash = compute_id_hash(black_box(input), len);
+                black_box(hash)
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark content hashing.
+fn bench_content_hash(c: &mut Criterion) {
+    use beads_rust::util::content_hash;
+
+    let mut group = c.benchmark_group("id/content_hash");
+
+    // Single issue hash
+    group.bench_function("single", |b| {
+        let issue = create_test_issue(0);
+        b.iter(|| {
+            let hash = content_hash(black_box(&issue));
+            black_box(hash)
+        });
+    });
+
+    // Batch hashing
+    for size in [10, 100, 500] {
+        let issues: Vec<_> = (0..size).map(create_test_issue).collect();
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_with_input(BenchmarkId::new("batch", size), &issues, |b, issues| {
+            b.iter(|| {
+                let hashes: Vec<_> = issues.iter().map(|i| content_hash(i)).collect();
+                black_box(hashes)
+            });
+        });
+    }
+
+    group.finish();
+}
+
+// =============================================================================
+// Search Operation Benchmarks
+// =============================================================================
+
+/// Benchmark search operations.
+fn bench_search(c: &mut Criterion) {
+    let mut group = c.benchmark_group("storage/search");
+
+    for size in [100, 500, 1000] {
+        let (_dir, storage) = setup_db_with_issues(size);
+        let filters = ListFilters::default();
+
+        group.bench_with_input(
+            BenchmarkId::new("title_match", size),
+            &storage,
+            |b, storage| {
+                b.iter(|| {
+                    let results = storage.search_issues(black_box("Benchmark"), &filters).unwrap();
+                    black_box(results)
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("description_match", size),
+            &storage,
+            |b, storage| {
+                b.iter(|| {
+                    let results = storage.search_issues(black_box("Description"), &filters).unwrap();
+                    black_box(results)
+                });
+            },
+        );
+    }
+
+    group.finish();
 }
 
 // =============================================================================
@@ -492,8 +642,11 @@ criterion_group!(
     bench_blocked_query,
     bench_add_dependency,
     bench_cycle_detection,
+    bench_search,
 );
 
 criterion_group!(sync_benches, bench_export, bench_import,);
 
-criterion_main!(storage_benches, sync_benches);
+criterion_group!(id_benches, bench_generate_id, bench_id_hash, bench_content_hash,);
+
+criterion_main!(storage_benches, sync_benches, id_benches);

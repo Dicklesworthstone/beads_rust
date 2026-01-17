@@ -62,6 +62,7 @@ predicates = "3.1"
 criterion = { version = "0.5", features = ["html_reports"] }
 walkdir = "2.4"
 insta = { version = "1.38", features = ["json", "yaml"] }
+proptest = "1.6"
 
 [[bench]]
 name = "storage_perf"

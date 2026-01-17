@@ -289,7 +289,11 @@ fn e2e_lint_clean_output_when_no_warnings() {
     );
 
     let lint = run_br(&workspace, ["lint"], "lint_clean_run");
-    assert!(lint.status.success(), "lint should succeed: {}", lint.stderr);
+    assert!(
+        lint.status.success(),
+        "lint should succeed: {}",
+        lint.stderr
+    );
     assert!(lint.stdout.contains("No template warnings found"));
 }
 
@@ -380,12 +384,20 @@ fn e2e_lint_status_all_includes_closed() {
         "lint_closed_bug",
     );
 
-    let close = run_br(&workspace, ["close", &id, "--reason", "done"], "lint_closed_close");
+    let close = run_br(
+        &workspace,
+        ["close", &id, "--reason", "done"],
+        "lint_closed_close",
+    );
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     let json = run_lint_json(
         &workspace,
-        vec!["lint".to_string(), "--status".to_string(), "all".to_string()],
+        vec![
+            "lint".to_string(),
+            "--status".to_string(),
+            "all".to_string(),
+        ],
         "lint_closed_json",
     );
     assert_eq!(json["issues"].as_u64(), Some(1));

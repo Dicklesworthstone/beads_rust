@@ -129,38 +129,6 @@ fn edit_config() -> Result<()> {
     Ok(())
 }
 
-/// List all available config options.
-fn list_options(json_mode: bool) -> Result<()> {
-    let options = get_config_options();
-
-    if json_mode {
-        let output: Vec<_> = options
-            .iter()
-            .map(|(key, desc, default)| {
-                json!({
-                    "key": key,
-                    "description": desc,
-                    "default": default,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!("Available configuration options:");
-        println!();
-        for (key, description, default) in options {
-            println!("  {key}");
-            println!("    {description}");
-            if let Some(def) = default {
-                println!("    Default: {def}");
-            }
-            println!();
-        }
-    }
-
-    Ok(())
-}
-
 /// Get a specific config value.
 fn get_config_value(
     key: &str,
@@ -312,7 +280,7 @@ fn delete_config_value(key: &str, json_mode: bool, overrides: &CliOverrides) -> 
             let contents = fs::read_to_string(&config_path)?;
             let mut config: serde_yaml::Value = serde_yaml::from_str(&contents)
                 .unwrap_or(serde_yaml::Value::Mapping(serde_yaml::Mapping::default()));
-            
+
             if delete_from_yaml(&mut config, key) {
                 let yaml_str = serde_yaml::to_string(&config)?;
                 fs::write(&config_path, yaml_str)?;
@@ -349,15 +317,17 @@ fn delete_from_yaml(value: &mut serde_yaml::Value, key: &str) -> bool {
 }
 
 fn delete_nested(value: &mut serde_yaml::Value, path: &[&str]) -> bool {
-    if path.is_empty() { return false; }
-    
+    if path.is_empty() {
+        return false;
+    }
+
     if let serde_yaml::Value::Mapping(map) = value {
         let key = serde_yaml::Value::String(path[0].to_string());
-        
+
         if path.len() == 1 {
             return map.remove(&key).is_some();
         }
-        
+
         if let Some(child) = map.get_mut(&key) {
             return delete_nested(child, &path[1..]);
         }
@@ -530,114 +500,9 @@ fn get_legacy_user_config_path() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".beads").join("config.yaml"))
 }
 
-/// Get list of config options with descriptions.
-fn get_config_options() -> Vec<(&'static str, &'static str, Option<&'static str>)> {
-    vec![
-        // ID generation
-        (
-            "issue_prefix",
-            "Prefix for issue IDs (e.g., 'bd' for bd-abc123). Alias: prefix",
-            Some("bd"),
-        ),
-        (
-            "default_priority",
-            "Default priority for new issues (0-4)",
-            Some("2"),
-        ),
-        (
-            "default_type",
-            "Default issue type for new issues",
-            Some("task"),
-        ),
-        (
-            "min_hash_length",
-            "Minimum characters in issue ID hash",
-            Some("3"),
-        ),
-        (
-            "max_hash_length",
-            "Maximum characters in issue ID hash",
-            Some("8"),
-        ),
-        (
-            "max_collision_prob",
-            "Maximum collision probability before extending hash",
-            Some("0.25"),
-        ),
-        // Actor
-        (
-            "actor",
-            "Default actor name for audit trail (falls back to $USER)",
-            None,
-        ),
-        // Paths
-        ("db", "Override database path", None),
-        // Behavior flags
-        (
-            "no-db",
-            "Operate in JSONL-only mode (no database)",
-            Some("false"),
-        ),
-        (
-            "no-auto-flush",
-            "Disable automatic JSONL export after mutations",
-            Some("false"),
-        ),
-        (
-            "no-auto-import",
-            "Disable automatic JSONL import check on startup",
-            Some("false"),
-        ),
-        (
-            "no-daemon",
-            "Force direct mode (no daemon) - effectively no-op in br",
-            Some("false"),
-        ),
-        (
-            "lock-timeout",
-            "SQLite busy timeout in milliseconds",
-            Some("30000"),
-        ),
-        (
-            "display.color",
-            "Enable colored output (true/false). Default is auto based on terminal.",
-            None,
-        ),
-        (
-            "flush-debounce",
-            "Auto-flush debounce interval in milliseconds",
-            Some("500"),
-        ),
-        (
-            "remote-sync-interval",
-            "Remote sync interval in milliseconds (legacy bd; no-op in br v1)",
-            None,
-        ),
-        // Git/sync (startup only)
-        ("git.branch", "Git branch for sync operations", None),
-        ("sync.branch", "Sync branch (alias for git.branch)", None),
-        // Identity
-        (
-            "identity",
-            "Identity string for multi-user environments",
-            None,
-        ),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_get_config_options_returns_options() {
-        let options = get_config_options();
-        assert!(!options.is_empty());
-
-        // Check that issue_prefix is in the list
-        let has_prefix = options.iter().any(|(k, _, _)| *k == "issue_prefix");
-        assert!(has_prefix);
-    }
 
     #[test]
     fn test_user_config_path_format() {

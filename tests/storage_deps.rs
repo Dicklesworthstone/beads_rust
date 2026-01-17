@@ -483,7 +483,10 @@ fn would_create_cycle_mixed_types() {
     // Path B -> ... -> A? No, because A->B is 'related' (non-blocking).
     // So blocking_only=true should return false.
     let blocking_cycle = storage.would_create_cycle(&b.id, &a.id, true).unwrap();
-    assert!(!blocking_cycle, "Should not detect blocking cycle through related dependency");
+    assert!(
+        !blocking_cycle,
+        "Should not detect blocking cycle through related dependency"
+    );
 
     // blocking_only=false should detect it (graph reachability)
     let any_cycle = storage.would_create_cycle(&b.id, &a.id, false).unwrap();
@@ -628,7 +631,9 @@ fn deep_hierarchy_five_levels() {
     assert!(storage.get_dependencies(&level5.id).unwrap().is_empty());
 
     // Would l5 -> l0 create a cycle? Yes!
-    let would_cycle = storage.would_create_cycle(&level5.id, &level0.id, true).unwrap();
+    let would_cycle = storage
+        .would_create_cycle(&level5.id, &level0.id, true)
+        .unwrap();
     assert!(would_cycle);
 }
 

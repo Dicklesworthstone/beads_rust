@@ -31,7 +31,7 @@ fn main() {
         } => commands::init::execute(prefix, force, None),
         Commands::Create(args) => commands::create::execute(&args, &overrides),
         Commands::Update(args) => commands::update::execute(&args, &overrides),
-        Commands::Delete(args) => commands::delete::execute(&args, &overrides),
+        Commands::Delete(args) => commands::delete::execute(&args, cli.json, &overrides),
         Commands::List(args) => commands::list::execute(&args, cli.json, &overrides),
         Commands::Comments(args) => commands::comments::execute(&args, cli.json, &overrides),
         Commands::Search(args) => commands::search::execute(&args, cli.json, &overrides),

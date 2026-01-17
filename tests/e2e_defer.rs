@@ -162,14 +162,23 @@ fn defer_json_output() {
     let payload = extract_json_payload(&defer.stdout);
     let result: Value = serde_json::from_str(&payload).expect("valid json");
 
-    assert!(result.get("deferred").is_some(), "should have deferred field");
+    assert!(
+        result.get("deferred").is_some(),
+        "should have deferred field"
+    );
     let deferred = result["deferred"].as_array().unwrap();
     assert!(!deferred.is_empty());
 
     let first = &deferred[0];
     assert!(first.get("id").is_some(), "deferred item should have id");
-    assert!(first.get("title").is_some(), "deferred item should have title");
-    assert!(first.get("status").is_some(), "deferred item should have status");
+    assert!(
+        first.get("title").is_some(),
+        "deferred item should have title"
+    );
+    assert!(
+        first.get("status").is_some(),
+        "deferred item should have status"
+    );
     assert_eq!(first["status"].as_str().unwrap(), "deferred");
 }
 
@@ -215,10 +224,7 @@ fn defer_until_relative() {
 
     assert_eq!(result["deferred"].as_array().unwrap().len(), 1);
     let defer_until = result["deferred"][0]["defer_until"].as_str().unwrap();
-    assert!(
-        !defer_until.is_empty(),
-        "defer_until should be set for +2h"
-    );
+    assert!(!defer_until.is_empty(), "defer_until should be set for +2h");
 }
 
 #[test]
@@ -277,8 +283,7 @@ fn defer_until_past_allows() {
     );
     assert!(
         defer.status.success(),
-        "defer with past date should succeed: {}",
-        defer.stderr
+        "defer with past date should succeed: {}", defer.stderr
     );
 
     let payload = extract_json_payload(&defer.stdout);
@@ -319,7 +324,10 @@ fn undefer_sets_status_open() {
     assert!(defer.status.success());
 
     let undefer = run_br(&workspace, ["undefer", &id], "undefer");
-    assert!(undefer.status.success(), "undefer failed: {}", undefer.stderr);
+    assert!(
+        undefer.status.success(),
+        "undefer failed: {}", undefer.stderr
+    );
 
     let show = run_br(&workspace, ["show", &id, "--json"], "show");
     let payload = extract_json_payload(&show.stdout);
@@ -336,11 +344,7 @@ fn undefer_sets_status_open() {
 fn undefer_clears_defer_until() {
     let (workspace, id) = setup_workspace_with_issue();
 
-    let defer = run_br(
-        &workspace,
-        ["defer", &id, "--until", "+1d"],
-        "defer_first",
-    );
+    let defer = run_br(&workspace, ["defer", &id, "--until", "+1d"], "defer_first");
     assert!(defer.status.success());
 
     let undefer = run_br(&workspace, ["undefer", &id, "--json"], "undefer");
@@ -442,7 +446,10 @@ fn defer_already_deferred_updates_time() {
 
     // Should have deferred with new time, or skipped as already deferred
     let deferred_count = result["deferred"].as_array().map_or(0, Vec::len);
-    let skipped_count = result.get("skipped").and_then(|s| s.as_array()).map_or(0, Vec::len);
+    let skipped_count = result
+        .get("skipped")
+        .and_then(|s| s.as_array())
+        .map_or(0, Vec::len);
 
     assert!(
         deferred_count > 0 || skipped_count > 0,
@@ -544,10 +551,7 @@ fn deferred_not_in_ready() {
     let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
 
     // Deferred issue should NOT appear in ready list
-    let ready_ids: Vec<&str> = issues
-        .iter()
-        .filter_map(|i| i["id"].as_str())
-        .collect();
+    let ready_ids: Vec<&str> = issues.iter().filter_map(|i| i["id"].as_str()).collect();
 
     assert!(
         !ready_ids.contains(&ids[0].as_str()),
@@ -575,13 +579,11 @@ fn deferred_not_blocked() {
     let issues: Vec<Value> = serde_json::from_str(&payload).unwrap_or_else(|_| vec![]);
 
     // Deferred issue should NOT appear in blocked list (deferred != blocked)
-    let blocked_ids: Vec<&str> = issues
-        .iter()
-        .filter_map(|i| i["id"].as_str())
-        .collect();
-
     assert!(
-        !blocked_ids.contains(&id.as_str()),
+        !issues
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .any(|x| x == id.as_str()),
         "deferred issue should not appear in blocked list"
     );
 }
@@ -596,12 +598,14 @@ fn undefer_appears_in_ready() {
 
     let ready_before = run_br(&workspace, ["ready", "--json"], "ready_before");
     let payload_before = extract_json_payload(&ready_before.stdout);
-    let issues_before: Vec<Value> = serde_json::from_str(&payload_before).unwrap_or_else(|_| vec![]);
-    let ready_ids_before: Vec<&str> = issues_before
-        .iter()
-        .filter_map(|i| i["id"].as_str())
-        .collect();
-    assert!(!ready_ids_before.contains(&id.as_str()));
+    let issues_before: Vec<Value> =
+        serde_json::from_str(&payload_before).unwrap_or_else(|_| vec![]);
+    assert!(
+        !issues_before
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .any(|x| x == id.as_str())
+    );
 
     // Undefer
     let undefer = run_br(&workspace, ["undefer", &id], "undefer");
@@ -613,13 +617,11 @@ fn undefer_appears_in_ready() {
     let payload_after = extract_json_payload(&ready_after.stdout);
     let issues_after: Vec<Value> = serde_json::from_str(&payload_after).expect("valid json");
 
-    let ready_ids_after: Vec<&str> = issues_after
-        .iter()
-        .filter_map(|i| i["id"].as_str())
-        .collect();
-
     assert!(
-        ready_ids_after.contains(&id.as_str()),
+        issues_after
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .any(|x| x == id.as_str()),
         "undeferred issue should appear in ready list"
     );
 }

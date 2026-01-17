@@ -96,7 +96,11 @@ fn e2e_orphans_no_orphans_empty_list() {
 
     // Run orphans - should be empty
     let orphans = run_br(&workspace, ["orphans"], "orphans_empty");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
     assert!(
         orphans.stdout.contains("No orphan issues found"),
         "expected empty orphans message, got: {}",
@@ -114,7 +118,11 @@ fn e2e_orphans_detects_open_issue_in_commit() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // Create an issue
-    let create = run_br(&workspace, ["create", "Feature to implement"], "create_issue");
+    let create = run_br(
+        &workspace,
+        ["create", "Feature to implement"],
+        "create_issue",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let issue_id = parse_created_id(&create.stdout);
 
@@ -124,7 +132,11 @@ fn e2e_orphans_detects_open_issue_in_commit() {
 
     // Run orphans - should detect the open issue
     let orphans = run_br(&workspace, ["orphans"], "orphans_detect");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
     assert!(
         orphans.stdout.contains(&issue_id),
         "expected issue {} in output, got: {}",
@@ -158,7 +170,11 @@ fn e2e_orphans_detects_issue_without_parens() {
 
     // Run orphans - should detect the issue
     let orphans = run_br(&workspace, ["orphans"], "orphans_no_parens");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
     assert!(
         orphans.stdout.contains(&issue_id),
         "expected issue {} in output, got: {}",
@@ -187,7 +203,11 @@ fn e2e_orphans_json_output_structure() {
 
     // Run orphans with --json
     let orphans = run_br(&workspace, ["orphans", "--json"], "orphans_json");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
@@ -238,7 +258,11 @@ fn e2e_orphans_excludes_closed_issues() {
 
     // Run orphans - should NOT include closed issue
     let orphans = run_br(&workspace, ["orphans", "--json"], "orphans_closed");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
@@ -273,7 +297,11 @@ fn e2e_orphans_includes_in_progress_issues() {
 
     // Run orphans - should include in_progress issue
     let orphans = run_br(&workspace, ["orphans", "--json"], "orphans_in_progress");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
@@ -295,7 +323,11 @@ fn e2e_orphans_before_init_returns_empty() {
 
     // Run orphans - should return empty, not error
     let orphans = run_br(&workspace, ["orphans"], "orphans_no_init");
-    assert!(orphans.status.success(), "orphans should succeed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans should succeed: {}",
+        orphans.stderr
+    );
     assert!(
         orphans.stdout.contains("No orphan issues found"),
         "expected empty message, got: {}",
@@ -317,7 +349,11 @@ fn e2e_orphans_not_git_repo_returns_empty() {
 
     // Run orphans - should return empty (no git repo)
     let orphans = run_br(&workspace, ["orphans"], "orphans_no_git");
-    assert!(orphans.status.success(), "orphans should succeed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans should succeed: {}",
+        orphans.stderr
+    );
     assert!(
         orphans.stdout.contains("No orphan issues found"),
         "expected empty message, got: {}",
@@ -353,11 +389,19 @@ fn e2e_orphans_multiple_issues_multiple_commits() {
 
     // Make commits referencing all three
     git_commit(&workspace, &format!("Implement ({id1})"), "commit_1");
-    git_commit(&workspace, &format!("Fix ({id2}) and ({id3})"), "commit_2_3");
+    git_commit(
+        &workspace,
+        &format!("Fix ({id2}) and ({id3})"),
+        "commit_2_3",
+    );
 
     // Run orphans - should detect only id1 and id2 (id3 is closed)
     let orphans = run_br(&workspace, ["orphans", "--json"], "orphans_multi");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
@@ -365,13 +409,13 @@ fn e2e_orphans_multiple_issues_multiple_commits() {
 
     assert_eq!(arr.len(), 2, "expected 2 orphans (not closed one)");
 
-    let ids: Vec<&str> = arr
-        .iter()
-        .filter_map(|o| o["issue_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = arr.iter().filter_map(|o| o["issue_id"].as_str()).collect();
     assert!(ids.contains(&id1.as_str()), "missing id1");
     assert!(ids.contains(&id2.as_str()), "missing id2");
-    assert!(!ids.contains(&id3.as_str()), "should not include closed id3");
+    assert!(
+        !ids.contains(&id3.as_str()),
+        "should not include closed id3"
+    );
 }
 
 #[test]
@@ -393,7 +437,11 @@ fn e2e_orphans_robot_flag_json_output() {
 
     // Run orphans with --robot (should produce JSON like --json)
     let orphans = run_br(&workspace, ["orphans", "--robot"], "orphans_robot");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
@@ -413,7 +461,11 @@ fn e2e_orphans_empty_json_array_when_no_orphans() {
 
     // Run orphans with --json
     let orphans = run_br(&workspace, ["orphans", "--json"], "orphans_empty_json");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
@@ -441,7 +493,11 @@ fn e2e_orphans_details_flag_shows_commit_info() {
 
     // Run orphans with --details
     let orphans = run_br(&workspace, ["orphans", "--details"], "orphans_details");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     // Should show commit info
     assert!(
@@ -477,7 +533,11 @@ fn e2e_orphans_issue_referenced_multiple_times() {
 
     // Run orphans - issue should appear only once
     let orphans = run_br(&workspace, ["orphans", "--json"], "orphans_multi_ref");
-    assert!(orphans.status.success(), "orphans failed: {}", orphans.stderr);
+    assert!(
+        orphans.status.success(),
+        "orphans failed: {}",
+        orphans.stderr
+    );
 
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");

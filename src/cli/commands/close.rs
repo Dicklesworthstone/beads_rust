@@ -213,10 +213,11 @@ pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverride
 
         // Build update
         let now = Utc::now();
+        let close_reason = args.reason.clone().unwrap_or_else(|| "done".to_string());
         let update = IssueUpdate {
             status: Some(Status::Closed),
             closed_at: Some(Some(now)),
-            close_reason: Some(Some(args.reason.clone().unwrap_or_else(|| "done".to_string()))),
+            close_reason: Some(Some(close_reason.clone())),
             closed_by_session: args.session.clone().map(Some),
             ..Default::default()
         };
@@ -233,7 +234,7 @@ pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverride
             title: issue.title.clone(),
             status: "closed".to_string(),
             closed_at: now.to_rfc3339(),
-            close_reason: args.reason.clone(),
+            close_reason: Some(close_reason),
         });
     }
 

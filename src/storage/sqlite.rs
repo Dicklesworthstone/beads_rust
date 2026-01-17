@@ -302,10 +302,7 @@ impl SqliteStorage {
             }
             if let Some(ref val) = updates.design {
                 issue.design.clone_from(val);
-                add_update(
-                    "design",
-                    Box::new(val.as_deref().unwrap_or("").to_string()),
-                );
+                add_update("design", Box::new(val.as_deref().unwrap_or("").to_string()));
             }
             if let Some(ref val) = updates.acceptance_criteria {
                 issue.acceptance_criteria.clone_from(val);
@@ -316,10 +313,7 @@ impl SqliteStorage {
             }
             if let Some(ref val) = updates.notes {
                 issue.notes.clone_from(val);
-                add_update(
-                    "notes",
-                    Box::new(val.as_deref().unwrap_or("").to_string()),
-                );
+                add_update("notes", Box::new(val.as_deref().unwrap_or("").to_string()));
             }
 
             // Status
@@ -378,10 +372,7 @@ impl SqliteStorage {
             // Simple Option fields - use empty string instead of NULL for bd compatibility
             if let Some(ref val) = updates.owner {
                 issue.owner.clone_from(val);
-                add_update(
-                    "owner",
-                    Box::new(val.as_deref().unwrap_or("").to_string()),
-                );
+                add_update("owner", Box::new(val.as_deref().unwrap_or("").to_string()));
             }
             if let Some(ref val) = updates.estimated_minutes {
                 issue.estimated_minutes = *val;
@@ -2270,9 +2261,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_all_config(&self) -> Result<HashMap<String, String>> {
         let mut stmt = self.conn.prepare("SELECT key, value FROM config")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut map = HashMap::new();
         for row in rows {
@@ -2823,9 +2812,9 @@ pub struct ListFilters {
     pub labels: Option<Vec<String>>,
     /// Filter by labels (OR logic)
     pub labels_or: Option<Vec<String>>,
-    /// Filter by updated_at <= timestamp
+    /// Filter by `updated_at` <= timestamp
     pub updated_before: Option<DateTime<Utc>>,
-    /// Filter by updated_at >= timestamp
+    /// Filter by `updated_at` >= timestamp
     pub updated_after: Option<DateTime<Utc>>,
 }
 
@@ -3537,7 +3526,7 @@ impl SqliteStorage {
 mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 
@@ -3703,15 +3692,7 @@ mod tests {
             t2,
             None,
         );
-        let issue3 = make_issue(
-            "bd-l3",
-            "Closed",
-            Status::Closed,
-            0,
-            None,
-            t3,
-            None,
-        );
+        let issue3 = make_issue("bd-l3", "Closed", Status::Closed, 0, None, t3, None);
 
         storage.create_issue(&issue1, "tester").unwrap();
         storage.create_issue(&issue2, "tester").unwrap();
@@ -3730,6 +3711,9 @@ mod tests {
             sort: None,
             reverse: false,
             labels: None,
+            labels_or: None,
+            updated_before: None,
+            updated_after: None,
         };
 
         let issues = storage.list_issues(&filters).unwrap();
@@ -3919,6 +3903,9 @@ mod tests {
         storage.create_issue(&child, "tester").unwrap();
         // Parent (bd-p1) depends on external capability
         storage
+            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
+            .unwrap();
+        storage
             .add_dependency("bd-c1", "bd-p1", "parent-child", "tester")
             .unwrap();
 
@@ -4076,7 +4063,9 @@ mod tests {
             .add_dependency("bd-cy2", "bd-cy3", "blocks", "tester")
             .unwrap();
 
-        let creates_cycle = storage.would_create_cycle("bd-cy3", "bd-cy1", true).unwrap();
+        let creates_cycle = storage
+            .would_create_cycle("bd-cy3", "bd-cy1", true)
+            .unwrap();
         assert!(creates_cycle);
     }
 
@@ -4463,27 +4452,11 @@ mod tests {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
 
-        let issue = make_issue(
-            "bd-dup-1",
-            "First issue",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
+        let issue = make_issue("bd-dup-1", "First issue", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue, "tester").unwrap();
 
         // Try to create another issue with the same ID
-        let dup = make_issue(
-            "bd-dup-1",
-            "Duplicate",
-            Status::Open,
-            2,
-            None,
-            t1,
-            None,
-        );
+        let dup = make_issue("bd-dup-1", "Duplicate", Status::Open, 2, None, t1, None);
         let result = storage.create_issue(&dup, "tester");
 
         assert!(result.is_err(), "Creating duplicate ID should fail");
@@ -4640,15 +4613,7 @@ mod tests {
         let old = now - chrono::Duration::days(10);
         let older = now - chrono::Duration::days(20);
 
-        let issue1 = make_issue(
-            "bd-old",
-            "Old issue",
-            Status::Open,
-            2,
-            None,
-            old,
-            None,
-        );
+        let issue1 = make_issue("bd-old", "Old issue", Status::Open, 2, None, old, None);
         let issue2 = make_issue(
             "bd-older",
             "Older issue",
@@ -4658,15 +4623,7 @@ mod tests {
             older,
             None,
         );
-        let issue3 = make_issue(
-            "bd-new",
-            "New issue",
-            Status::Open,
-            2,
-            None,
-            now,
-            None,
-        );
+        let issue3 = make_issue("bd-new", "New issue", Status::Open, 2, None, now, None);
 
         storage.create_issue(&issue1, "tester").unwrap();
         storage.create_issue(&issue2, "tester").unwrap();
@@ -4674,9 +4631,11 @@ mod tests {
 
         // Filter updated_before 'old' (inclusive? SQL uses <=)
         // If we use 'old', issue1 matches. issue2 matches. issue3 does not.
-        let mut filters = ListFilters::default();
-        filters.updated_before = Some(old);
-        
+        let mut filters = ListFilters {
+            updated_before: Some(old),
+            ..Default::default()
+        };
+
         let issues = storage.list_issues(&filters).unwrap();
         // Should contain bd-old and bd-older
         assert_eq!(issues.len(), 2);
