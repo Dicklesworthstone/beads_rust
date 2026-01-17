@@ -25,18 +25,37 @@ fn test_config_set_shadowed_by_project_config() {
     if !get1.status.success() {
         println!("get1 failed: {}", get1.stderr);
     }
-    assert!(get1.stdout.contains("PROJECT"), "Expected PROJECT, got stdout='{}', stderr='{}'", get1.stdout, get1.stderr);
+    assert!(
+        get1.stdout.contains("PROJECT"),
+        "Expected PROJECT, got stdout='{}', stderr='{}'",
+        get1.stdout,
+        get1.stderr
+    );
 
     // 4. Set prefix=USER (this currently writes to ~/.config/bd/config.yaml)
     // We need to set HOME env var to our temp home
     let env_vars = vec![("HOME", home_dir.to_str().unwrap())];
-    let set = run_br_with_env(&workspace, ["config", "set", "issue_prefix=USER"], env_vars.clone(), "set");
+    let set = run_br_with_env(
+        &workspace,
+        ["config", "set", "issue_prefix=USER"],
+        env_vars.clone(),
+        "set",
+    );
     assert!(set.status.success());
 
     // 5. Verify get returns USER (Expectation: CLI set should win or update project config)
     // But currently it writes to User config, which is LOWER priority than Project.
-    let get2 = run_br_with_env(&workspace, ["config", "get", "issue_prefix"], env_vars, "get2");
-    
+    let get2 = run_br_with_env(
+        &workspace,
+        ["config", "get", "issue_prefix"],
+        env_vars,
+        "get2",
+    );
+
     // This assertion will FAIL if the bug exists (it will return PROJECT)
-    assert!(get2.stdout.contains("USER"), "Expected USER, got: {}", get2.stdout);
+    assert!(
+        get2.stdout.contains("USER"),
+        "Expected USER, got: {}",
+        get2.stdout
+    );
 }

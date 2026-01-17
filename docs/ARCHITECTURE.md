@@ -176,19 +176,19 @@ br sync --flush-only
 ┌───────────────────────────┐
 │  1. Path Validation       │  Verify target is in .beads/
 ├───────────────────────────┤
-│  2. Get dirty issue IDs   │  SELECT from dirty_issues
+│  2. Create history backup │  Optional timestamped copy (if overwriting)
 ├───────────────────────────┤
-│  3. Load all issues       │  Full export (deterministic)
+│  3. Get dirty issue IDs   │  SELECT from dirty_issues
 ├───────────────────────────┤
-│  4. Write to temp file    │  Atomic write pattern
+│  4. Load all issues       │  Full export (deterministic)
 ├───────────────────────────┤
-│  5. Compute content hash  │  SHA-256 of content
+│  5. Write to temp file    │  Atomic write pattern
 ├───────────────────────────┤
-│  6. Atomic rename         │  temp -> issues.jsonl
+│  6. Compute content hash  │  SHA-256 of content
 ├───────────────────────────┤
-│  7. Clear dirty flags     │  DELETE from dirty_issues
+│  7. Atomic rename         │  temp -> issues.jsonl
 ├───────────────────────────┤
-│  8. Create history backup │  Optional timestamped copy
+│  8. Clear dirty flags     │  DELETE from dirty_issues
 └───────────────────────────┘
 ```
 
