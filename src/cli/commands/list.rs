@@ -8,7 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{IssueType, Priority, Status};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::HashSet;
@@ -48,6 +48,9 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
         None
     };
 
+    // Validate sort key before query
+    validate_sort_key(args.sort.as_deref())?;
+
     // Query issues
     let issues = storage.list_issues(&filters)?;
     let mut issues = if client_filters {
@@ -56,11 +59,6 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
         issues
     };
 
-    // Sort and limit on Issue (before expensive counts)
-    apply_sort(&mut issues, args.sort.as_deref())?;
-    if args.reverse {
-        issues.reverse();
-    }
     if let Some(limit) = limit {
         if limit > 0 && issues.len() > limit {
             issues.truncate(limit);
@@ -324,25 +322,18 @@ fn apply_client_filters(
     Ok(filtered)
 }
 
-fn apply_sort(issues: &mut [Issue], sort: Option<&str>) -> Result<()> {
+fn validate_sort_key(sort: Option<&str>) -> Result<()> {
     let Some(sort_key) = sort else {
         return Ok(());
     };
 
     match sort_key {
-        "priority" => issues.sort_by_key(|issue| issue.priority),
-        "created_at" => issues.sort_by_key(|issue| issue.created_at),
-        "updated_at" => issues.sort_by_key(|issue| issue.updated_at),
-        "title" => issues.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
-        _ => {
-            return Err(BeadsError::Validation {
-                field: "sort".to_string(),
-                reason: format!("invalid sort field '{sort_key}'"),
-            });
-        }
+        "priority" | "created_at" | "updated_at" | "title" => Ok(()),
+        _ => Err(BeadsError::Validation {
+            field: "sort".to_string(),
+            reason: format!("invalid sort field '{sort_key}'"),
+        }),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
