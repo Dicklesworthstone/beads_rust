@@ -117,6 +117,24 @@ impl SqliteStorage {
         Ok(Self { conn })
     }
 
+    /// Execute a function within a transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction fails or the closure returns an error.
+    pub fn transaction<F, R>(&mut self, f: F) -> Result<R>
+    where
+        F: FnOnce(&Transaction) -> Result<R>,
+    {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        
+        let result = f(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// # Errors
@@ -3006,6 +3024,11 @@ impl SqliteStorage {
     /// Returns an error if the database operation fails.
     #[allow(clippy::too_many_lines)]
     pub fn upsert_issue_for_import(&mut self, issue: &Issue) -> Result<bool> {
+        Self::upsert_issue_in_tx(&self.conn, issue)
+    }
+
+    /// Upsert an issue within a transaction (or connection).
+    pub fn upsert_issue_in_tx(conn: &Connection, issue: &Issue) -> Result<bool> {
         let status_str = issue.status.as_str();
         let issue_type_str = issue.issue_type.as_str();
         let created_at_str = issue.created_at.to_rfc3339();
@@ -3016,7 +3039,7 @@ impl SqliteStorage {
         let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
         let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
 
-        let rows = self.conn.execute(
+        let rows = conn.execute(
             r"INSERT OR REPLACE INTO issues (
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -3062,9 +3085,9 @@ impl SqliteStorage {
                 issue.compacted_at_commit,
                 issue.original_size,
                 issue.sender,
-                issue.ephemeral,
-                issue.pinned,
-                issue.is_template,
+                i32::from(issue.ephemeral),
+                i32::from(issue.pinned),
+                i32::from(issue.is_template),
             ],
         )?;
 
@@ -3077,13 +3100,17 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_labels_for_import(&mut self, issue_id: &str, labels: &[String]) -> Result<()> {
+        Self::sync_labels_in_tx(&self.conn, issue_id, labels)
+    }
+
+    /// Sync labels within a transaction.
+    pub fn sync_labels_in_tx(conn: &Connection, issue_id: &str, labels: &[String]) -> Result<()> {
         // Remove existing labels
-        self.conn
-            .execute("DELETE FROM labels WHERE issue_id = ?", [issue_id])?;
+        conn.execute("DELETE FROM labels WHERE issue_id = ?", [issue_id])?;
 
         // Add new labels
         for label in labels {
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
                 rusqlite::params![issue_id, label],
             )?;
@@ -3102,13 +3129,21 @@ impl SqliteStorage {
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
     ) -> Result<()> {
+        Self::sync_dependencies_in_tx(&self.conn, issue_id, dependencies)
+    }
+
+    /// Sync dependencies within a transaction.
+    pub fn sync_dependencies_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
         // Remove existing dependencies where this issue is the dependent
-        self.conn
-            .execute("DELETE FROM dependencies WHERE issue_id = ?", [issue_id])?;
+        conn.execute("DELETE FROM dependencies WHERE issue_id = ?", [issue_id])?;
 
         // Add new dependencies
         for dep in dependencies {
-            self.conn.execute(
+            conn.execute(
                 "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
                  VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'import')",
                 rusqlite::params![issue_id, dep.depends_on_id, dep.dep_type.as_str()],
@@ -3128,13 +3163,21 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
+        Self::sync_comments_in_tx(&self.conn, issue_id, comments)
+    }
+
+    /// Sync comments within a transaction.
+    pub fn sync_comments_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
         // Remove existing comments
-        self.conn
-            .execute("DELETE FROM comments WHERE issue_id = ?", [issue_id])?;
+        conn.execute("DELETE FROM comments WHERE issue_id = ?", [issue_id])?;
 
         // Add new comments
         for comment in comments {
-            self.conn.execute(
+            conn.execute(
                 "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
                 rusqlite::params![
                     issue_id,
