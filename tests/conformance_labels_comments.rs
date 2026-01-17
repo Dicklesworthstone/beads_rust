@@ -7,11 +7,15 @@
 mod common;
 
 use assert_cmd::Command;
+use chrono::Utc;
 use common::cli::extract_json_payload;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 use tracing::info;
@@ -79,6 +83,272 @@ impl ConformanceWorkspace {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LogConfig {
+    json_logs: bool,
+    junit: bool,
+    summary: bool,
+    failure_context: bool,
+}
+
+impl LogConfig {
+    fn from_env() -> Self {
+        Self {
+            json_logs: env_flag("CONFORMANCE_JSON_LOGS"),
+            junit: env_flag("CONFORMANCE_JUNIT_XML"),
+            summary: env_flag("CONFORMANCE_SUMMARY"),
+            failure_context: env_flag("CONFORMANCE_FAILURE_CONTEXT"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct RunLogEntry {
+    timestamp: String,
+    label: String,
+    binary: String,
+    args: Vec<String>,
+    cwd: String,
+    status_code: i32,
+    success: bool,
+    duration_ms: u128,
+    stdout_len: usize,
+    stderr_len: usize,
+    log_path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct SummaryStats {
+    runs: u64,
+    failures: u64,
+    total_ms: u128,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct SummaryReport {
+    generated_at: String,
+    total_runs: u64,
+    total_failures: u64,
+    by_binary: std::collections::HashMap<String, SummaryStats>,
+    by_label: std::collections::HashMap<String, SummaryStats>,
+    comparisons: std::collections::HashMap<String, ComparisonStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct ComparisonStats {
+    br_runs: u64,
+    bd_runs: u64,
+    br_total_ms: u128,
+    bd_total_ms: u128,
+    speedup_bd_over_br: Option<f64>,
+}
+
+static LOG_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn log_mutex() -> &'static Mutex<()> {
+    LOG_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn collect_dir_listing(path: &PathBuf) -> Vec<String> {
+    let mut entries = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(path) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_dir() {
+                    entries.push(format!("{name}/"));
+                } else {
+                    entries.push(format!("{name} ({:?} bytes)", meta.len()));
+                }
+            } else {
+                entries.push(name);
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+fn append_run_entry(log_dir: &PathBuf, entry: &RunLogEntry) {
+    let log_path = log_dir.join("conformance_runs.jsonl");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .expect("open conformance_runs.jsonl");
+    let json = serde_json::to_string(entry).expect("serialize run entry");
+    writeln!(file, "{json}").expect("append run entry");
+}
+
+fn read_run_entries(log_dir: &PathBuf) -> Vec<RunLogEntry> {
+    let log_path = log_dir.join("conformance_runs.jsonl");
+    let Ok(contents) = fs::read_to_string(&log_path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RunLogEntry>(line).ok())
+        .collect()
+}
+
+fn update_summary(log_dir: &PathBuf, entries: &[RunLogEntry]) {
+    let mut report = SummaryReport::default();
+    report.generated_at = chrono::Utc::now().to_rfc3339();
+
+    for entry in entries {
+        report.total_runs += 1;
+        if !entry.success {
+            report.total_failures += 1;
+        }
+
+        let by_binary = report
+            .by_binary
+            .entry(entry.binary.clone())
+            .or_insert_with(SummaryStats::default);
+        by_binary.runs += 1;
+        if !entry.success {
+            by_binary.failures += 1;
+        }
+        by_binary.total_ms = by_binary.total_ms.saturating_add(entry.duration_ms);
+
+        let by_label = report
+            .by_label
+            .entry(entry.label.clone())
+            .or_insert_with(SummaryStats::default);
+        by_label.runs += 1;
+        if !entry.success {
+            by_label.failures += 1;
+        }
+        by_label.total_ms = by_label.total_ms.saturating_add(entry.duration_ms);
+
+        let comparison = report
+            .comparisons
+            .entry(entry.label.clone())
+            .or_insert_with(ComparisonStats::default);
+        if entry.binary == "br" {
+            comparison.br_runs += 1;
+            comparison.br_total_ms = comparison.br_total_ms.saturating_add(entry.duration_ms);
+        } else if entry.binary == "bd" {
+            comparison.bd_runs += 1;
+            comparison.bd_total_ms = comparison.bd_total_ms.saturating_add(entry.duration_ms);
+        }
+    }
+
+    for comparison in report.comparisons.values_mut() {
+        if comparison.br_total_ms > 0 && comparison.bd_total_ms > 0 {
+            comparison.speedup_bd_over_br =
+                Some(comparison.bd_total_ms as f64 / comparison.br_total_ms as f64);
+        }
+    }
+
+    let summary_path = log_dir.join("conformance_summary.json");
+    let json = serde_json::to_string_pretty(&report).expect("serialize summary");
+    fs::write(summary_path, json).expect("write summary");
+}
+
+fn xml_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn write_junit(log_dir: &PathBuf, entries: &[RunLogEntry]) {
+    let total = entries.len();
+    let failures = entries.iter().filter(|e| !e.success).count();
+    let mut xml = String::new();
+    xml.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push('\n');
+    xml.push_str(&format!(
+        r#"<testsuite name="conformance_runs" tests="{total}" failures="{failures}">"#
+    ));
+    xml.push('\n');
+
+    for entry in entries {
+        let name = xml_escape(&format!("{}:{}", entry.binary, entry.label));
+        let classname = xml_escape(&entry.binary);
+        let time_secs = entry.duration_ms as f64 / 1000.0;
+        xml.push_str(&format!(
+            r#"  <testcase classname="{classname}" name="{name}" time="{time_secs:.3}">"#
+        ));
+        if !entry.success {
+            let msg = xml_escape(&format!(
+                "exit={}; log={}",
+                entry.status_code, entry.log_path
+            ));
+            xml.push_str(&format!(r#"<failure message="{msg}"/>"#));
+        }
+        xml.push_str("</testcase>\n");
+    }
+
+    xml.push_str("</testsuite>\n");
+    let junit_path = log_dir.join("conformance_junit.xml");
+    fs::write(junit_path, xml).expect("write junit xml");
+}
+
+fn write_failure_context(
+    log_dir: &PathBuf,
+    entry: &RunLogEntry,
+    stdout: &str,
+    stderr: &str,
+    cwd: &PathBuf,
+) {
+    let beads_dir = cwd.join(".beads");
+    let context = serde_json::json!({
+        "timestamp": entry.timestamp,
+        "label": entry.label,
+        "binary": entry.binary,
+        "args": entry.args,
+        "cwd": entry.cwd,
+        "status_code": entry.status_code,
+        "success": entry.success,
+        "duration_ms": entry.duration_ms,
+        "stdout_len": entry.stdout_len,
+        "stderr_len": entry.stderr_len,
+        "stdout_preview": stdout.chars().take(2000).collect::<String>(),
+        "stderr_preview": stderr.chars().take(2000).collect::<String>(),
+        "beads_dir": beads_dir.display().to_string(),
+        "beads_entries": collect_dir_listing(&beads_dir),
+        "recent_runs": read_run_entries(log_dir).into_iter().rev().take(5).collect::<Vec<_>>(),
+    });
+    let path = log_dir.join(format!("{}.failure.json", entry.label));
+    let json = serde_json::to_string_pretty(&context).expect("serialize failure context");
+    fs::write(path, json).expect("write failure context");
+}
+
+fn record_run(log_dir: &PathBuf, entry: RunLogEntry, stdout: &str, stderr: &str, cwd: &PathBuf) {
+    let config = LogConfig::from_env();
+    if !(config.json_logs || config.junit || config.summary || config.failure_context) {
+        return;
+    }
+
+    let _guard = log_mutex().lock().expect("lock test log mutex");
+    append_run_entry(log_dir, &entry);
+    let entries = read_run_entries(log_dir);
+
+    if config.summary {
+        update_summary(log_dir, &entries);
+    }
+    if config.junit {
+        write_junit(log_dir, &entries);
+    }
+    if config.failure_context && !entry.success {
+        write_failure_context(log_dir, &entry, stdout, stderr, cwd);
+    }
+}
+
 fn run_br_cmd<I, S>(cwd: &PathBuf, log_dir: &PathBuf, args: I, label: &str) -> CmdOutput
 where
     I: IntoIterator<Item = S>,
@@ -141,6 +411,24 @@ where
     );
     fs::write(&log_path, log_body).expect("write log");
 
+    let entry = RunLogEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        label: label.to_string(),
+        binary: binary.to_string(),
+        args: cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect(),
+        cwd: cwd.display().to_string(),
+        status_code: output.status.code().unwrap_or(-1),
+        success: output.status.success(),
+        duration_ms: duration.as_millis(),
+        stdout_len: stdout.len(),
+        stderr_len: stderr.len(),
+        log_path: log_path.display().to_string(),
+    };
+    record_run(log_dir, entry, &stdout, &stderr, cwd);
+
     CmdOutput {
         stdout,
         stderr,
@@ -170,6 +458,24 @@ fn run_and_log(mut cmd: Command, cwd: &PathBuf, log_dir: &PathBuf, label: &str) 
         stderr
     );
     fs::write(&log_path, log_body).expect("write log");
+
+    let entry = RunLogEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        label: label.to_string(),
+        binary: "br".to_string(),
+        args: cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect(),
+        cwd: cwd.display().to_string(),
+        status_code: output.status.code().unwrap_or(-1),
+        success: output.status.success(),
+        duration_ms: duration.as_millis(),
+        stdout_len: stdout.len(),
+        stderr_len: stderr.len(),
+        log_path: log_path.display().to_string(),
+    };
+    record_run(log_dir, entry, &stdout, &stderr, cwd);
 
     CmdOutput {
         stdout,
