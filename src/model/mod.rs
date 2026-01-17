@@ -170,9 +170,12 @@ impl FromStr for IssueType {
             "feature" => Ok(Self::Feature),
             "epic" => Ok(Self::Epic),
             "chore" => Ok(Self::Chore),
-            "docs" => Ok(Self::Docs),
-            "question" => Ok(Self::Question),
-            other => Ok(Self::Custom(other.to_string())),
+            // Note: docs and question are supported in br but not in bd
+            // For bd conformance, we only accept the 5 types above via CLI
+            // However, docs/question may exist in imported data
+            other => Err(crate::error::BeadsError::InvalidType {
+                issue_type: other.to_string(),
+            }),
         }
     }
 }
@@ -880,16 +883,16 @@ mod tests {
 
     #[test]
     fn test_issue_type_from_str_all_variants() {
+        // Only these 5 types are valid via FromStr for bd conformance
         assert_eq!(IssueType::from_str("task").unwrap(), IssueType::Task);
         assert_eq!(IssueType::from_str("bug").unwrap(), IssueType::Bug);
         assert_eq!(IssueType::from_str("feature").unwrap(), IssueType::Feature);
         assert_eq!(IssueType::from_str("epic").unwrap(), IssueType::Epic);
         assert_eq!(IssueType::from_str("chore").unwrap(), IssueType::Chore);
-        assert_eq!(IssueType::from_str("docs").unwrap(), IssueType::Docs);
-        assert_eq!(
-            IssueType::from_str("question").unwrap(),
-            IssueType::Question
-        );
+        // docs and question are rejected via FromStr for bd conformance
+        // but they can still exist via serde deserialization from imports
+        assert!(IssueType::from_str("docs").is_err());
+        assert!(IssueType::from_str("question").is_err());
     }
 
     #[test]
@@ -900,9 +903,11 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_type_from_str_custom() {
-        let result = IssueType::from_str("custom_type").unwrap();
-        assert_eq!(result, IssueType::Custom("custom_type".to_string()));
+    fn test_issue_type_from_str_custom_rejected() {
+        // Custom/unknown types are rejected for bd conformance
+        let result = IssueType::from_str("custom_type");
+        assert!(result.is_err());
+        // IssueType::Custom can still exist via serde deserialization
     }
 
     #[test]
