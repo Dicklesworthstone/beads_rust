@@ -73,12 +73,15 @@ impl KnownDataset {
     }
 
     pub fn source_path(self) -> PathBuf {
-        PathBuf::from(match self {
-            Self::BeadsRust => "/data/projects/beads_rust",
-            Self::BeadsViewer => "/data/projects/beads_viewer",
-            Self::CodingAgentSessionSearch => "/data/projects/coding_agent_session_search",
-            Self::BrennerBot => "/data/projects/brenner_bot",
-        })
+        match self {
+            // Use CARGO_MANIFEST_DIR for BeadsRust since we're running from within the repo
+            Self::BeadsRust => PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+            Self::BeadsViewer => PathBuf::from("/data/projects/beads_viewer"),
+            Self::CodingAgentSessionSearch => {
+                PathBuf::from("/data/projects/coding_agent_session_search")
+            }
+            Self::BrennerBot => PathBuf::from("/data/projects/brenner_bot"),
+        }
     }
 
     pub fn beads_dir(self) -> PathBuf {
