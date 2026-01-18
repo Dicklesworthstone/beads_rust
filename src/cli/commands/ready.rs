@@ -5,7 +5,7 @@
 use crate::cli::{ReadyArgs, SortPolicy};
 use crate::config;
 use crate::error::Result;
-use crate::format::{IssueWithCounts, format_priority_badge, terminal_width, truncate_title};
+use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
 use crate::model::{IssueType, Priority};
 use crate::storage::{ReadyFilters, ReadySortPolicy};
 use std::io::IsTerminal;
@@ -69,50 +69,29 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
         ready_issues.truncate(args.limit);
     }
 
-    // Batch count dependencies/dependents
-    let issue_ids: Vec<String> = ready_issues.iter().map(|i| i.id.clone()).collect();
-    let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
-    let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
-
-    // Convert to IssueWithCounts
-    let issues_with_counts: Vec<IssueWithCounts> = ready_issues
-        .into_iter()
-        .map(|issue| {
-            let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
-            let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
-            IssueWithCounts {
-                issue,
-                dependency_count,
-                dependent_count,
-            }
-        })
-        .collect();
-
-    info!(count = issues_with_counts.len(), "Found ready issues");
-    for issue in issues_with_counts.iter().take(5) {
-        trace!(id = %issue.issue.id, priority = issue.issue.priority.0, "Ready issue");
+    info!(count = ready_issues.len(), "Found ready issues");
+    for issue in ready_issues.iter().take(5) {
+        trace!(id = %issue.id, priority = issue.priority.0, "Ready issue");
     }
 
     // Output
     let use_json = json || args.robot;
     if use_json {
-        let json_output = serde_json::to_string_pretty(&issues_with_counts)?;
+        // Use ReadyIssue for bd parity (excludes compaction_level, original_size, dependency_count, dependent_count)
+        let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
+        let json_output = serde_json::to_string_pretty(&ready_output)?;
         println!("{json_output}");
-    } else if issues_with_counts.is_empty() {
+    } else if ready_issues.is_empty() {
         println!("No issues ready to work on.");
     } else {
         println!(
             "Ready to work ({} issue{}):\n",
-            issues_with_counts.len(),
-            if issues_with_counts.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
+            ready_issues.len(),
+            if ready_issues.len() == 1 { "" } else { "s" }
         );
-        for (i, iwc) in issues_with_counts.iter().enumerate() {
-            let assignee = iwc.issue.assignee.as_deref().unwrap_or("unassigned");
-            let line = format_ready_line(i + 1, &iwc.issue, assignee, use_color, max_width);
+        for (i, issue) in ready_issues.iter().enumerate() {
+            let assignee = issue.assignee.as_deref().unwrap_or("unassigned");
+            let line = format_ready_line(i + 1, issue, assignee, use_color, max_width);
             println!("{line}");
         }
     }

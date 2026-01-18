@@ -7,7 +7,7 @@ use crate::config::{
     CliOverrides, discover_beads_dir, external_project_db_paths, load_config, open_storage_with_cli,
 };
 use crate::error::{BeadsError, Result};
-use crate::format::BlockedIssue;
+use crate::format::{BlockedIssue, BlockedIssueOutput};
 
 /// Execute the blocked command.
 ///
@@ -114,8 +114,29 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
 
     // Output
     if json {
-        let output = serde_json::to_string_pretty(&blocked_issues).map_err(BeadsError::Json)?;
-        println!("{output}");
+        // Use BlockedIssueOutput for bd parity (excludes compaction_level, original_size)
+        // Also strip status suffix from blocked_by entries (bd uses bare IDs)
+        let output: Vec<BlockedIssueOutput> = blocked_issues
+            .iter()
+            .map(|bi| BlockedIssueOutput {
+                blocked_by: bi
+                    .blocked_by
+                    .iter()
+                    .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
+                    .collect(),
+                blocked_by_count: bi.blocked_by_count,
+                created_at: bi.issue.created_at,
+                created_by: bi.issue.created_by.clone(),
+                id: bi.issue.id.clone(),
+                issue_type: bi.issue.issue_type.clone(),
+                priority: bi.issue.priority,
+                status: bi.issue.status.clone(),
+                title: bi.issue.title.clone(),
+                updated_at: bi.issue.updated_at,
+            })
+            .collect();
+        let json_str = serde_json::to_string_pretty(&output).map_err(BeadsError::Json)?;
+        println!("{json_str}");
     } else {
         print_text_output(&blocked_issues, args.detailed, storage);
     }
