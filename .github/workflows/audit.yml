@@ -7,6 +7,7 @@ on:
       - '**/Cargo.lock'
   schedule:
     - cron: '0 0 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: security-audit-${{ github.ref }}
@@ -16,10 +17,14 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
+permissions:
+  contents: read
+
 jobs:
   audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

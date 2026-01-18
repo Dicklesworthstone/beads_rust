@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same branch
 concurrency:
@@ -14,13 +15,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Faster builds with sparse registry protocol
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+permissions:
+  contents: read
 
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -30,19 +34,8 @@ jobs:
           toolchain: nightly
           components: rustfmt, clippy
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-check-
-            ${{ runner.os }}-cargo-
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -59,6 +52,7 @@ jobs:
   security:
     name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -77,6 +71,7 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: check
     steps:
       - uses: actions/checkout@v4
@@ -86,19 +81,8 @@ jobs:
         with:
           toolchain: nightly
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
-            ${{ runner.os }}-cargo-
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Run all tests (all features)
         run: cargo test --all-features -- --nocapture
@@ -114,6 +98,7 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -124,19 +109,8 @@ jobs:
           toolchain: nightly
           components: llvm-tools-preview
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-cov-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-cov-
-            ${{ runner.os }}-cargo-
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -154,21 +128,34 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     needs: check
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux x64 (glibc)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
+            name: linux-x64
+          # Linux ARM64 (native runner - 10x faster than QEMU)
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            name: linux-arm64
+          # macOS Apple Silicon (native)
           - os: macos-14
             target: aarch64-apple-darwin
+            name: macos-arm64
+          # macOS Intel
+          - os: macos-13
+            target: x86_64-apple-darwin
+            name: macos-x64
+          # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            name: windows-x64
     steps:
       - uses: actions/checkout@v4
 
@@ -178,19 +165,10 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-build-
-            ${{ runner.os }}-${{ matrix.target }}-cargo-
+          key: ${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -207,19 +185,20 @@ jobs:
         if: runner.os != 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: br-${{ matrix.target }}
+          name: br-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/br
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: br-${{ matrix.target }}
+          name: br-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/br.exe
 
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: check
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
@@ -230,19 +209,8 @@ jobs:
         with:
           toolchain: nightly
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-bench-
-            ${{ runner.os }}-cargo-
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Restore criterion baseline cache
         uses: actions/cache/restore@v4
@@ -262,16 +230,16 @@ jobs:
       - name: Run benchmarks
         run: |
           set -euo pipefail
-          if find target/criterion -path "*/main/estimates.json" -type f | grep -q .; then
-            cargo bench --bench storage_perf -- --noplot --baseline main --save-baseline main
+          if find target/criterion -path "*/main/estimates.json" -type f 2>/dev/null | grep -q .; then
+            cargo bench --bench benchmarks -- --noplot --baseline main --save-baseline main
           else
-            cargo bench --bench storage_perf -- --noplot --save-baseline main
+            cargo bench --bench benchmarks -- --noplot --save-baseline main
           fi
         continue-on-error: true
 
       - name: Check benchmark regressions (10% threshold)
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import glob
           import json
           import os
@@ -335,6 +303,7 @@ jobs:
   version-audit:
     name: Version Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: build
     steps:
       - uses: actions/checkout@v4
@@ -342,7 +311,7 @@ jobs:
       - name: Download Linux artifact
         uses: actions/download-artifact@v4
         with:
-          name: br-x86_64-unknown-linux-gnu
+          name: br-linux-x64
           path: ./bin
 
       - name: Make binary executable
@@ -355,7 +324,6 @@ jobs:
           echo ""
           echo "=== Checking for build info ==="
           VERSION_OUTPUT=$(./bin/br --version 2>&1 || true)
-          # Verify it contains expected version info
           if echo "$VERSION_OUTPUT" | grep -q "br\|beads"; then
             echo "Version info present"
           else

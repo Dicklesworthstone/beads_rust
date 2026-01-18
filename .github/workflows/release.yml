@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0)'
+        required: true
+        type: string
 
 # Ensure only one release runs at a time
 concurrency:
@@ -23,6 +29,7 @@ jobs:
   preflight:
     name: Pre-flight Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -31,6 +38,9 @@ jobs:
         with:
           toolchain: nightly
           components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
 
       - name: Verify formatting
         run: cargo fmt --all -- --check
@@ -52,35 +62,41 @@ jobs:
           echo "Version check passed: $CARGO_VERSION"
 
   build-release:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     needs: preflight
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Linux x64 (glibc)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             name: linux_amd64
+          # Linux x64 (musl, static)
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
             name: linux_amd64_musl
             musl: true
+          # Linux ARM64 (native runner - 10x faster than cross-compilation)
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
             archive: tar.gz
             name: linux_arm64
-            cross: true
+          # macOS Intel
           - target: x86_64-apple-darwin
             os: macos-13
             archive: tar.gz
             name: darwin_amd64
+          # macOS Apple Silicon (native)
           - target: aarch64-apple-darwin
             os: macos-14
             archive: tar.gz
             name: darwin_arm64
+          # Windows x64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
@@ -97,37 +113,16 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.cross
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - name: Install musl tools (Linux musl)
         if: matrix.musl
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - name: Configure linker (Linux ARM64)
-        if: matrix.cross
-        run: |
-          mkdir -p .cargo
-          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
-
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-release-
+          key: release-${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -136,7 +131,7 @@ jobs:
           VERGEN_GIT_BRANCH: ${{ github.ref_name }}
 
       - name: Verify binary runs (Unix, native)
-        if: runner.os != 'Windows' && !matrix.cross && !matrix.musl
+        if: runner.os != 'Windows' && !matrix.musl
         run: ./target/${{ matrix.target }}/release/br --version
 
       - name: Verify binary runs (Windows)
@@ -187,6 +182,7 @@ jobs:
     name: Create Release
     needs: build-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -286,7 +282,7 @@ jobs:
           cat CHANGELOG.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: br ${{ github.ref_name }}
           body_path: CHANGELOG.md
@@ -304,6 +300,7 @@ jobs:
     name: Publish to crates.io
     needs: create-release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: "!contains(github.ref_name, '-')"  # Skip pre-releases
     steps:
       - uses: actions/checkout@v4
