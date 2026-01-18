@@ -13,6 +13,12 @@
 // | Export (10k)        | < 500ms   | Export 10k issues to JSONL       |
 // | Import (10k)        | < 1s      | Import 10k issues from JSONL     |
 
+#![allow(
+    clippy::significant_drop_tightening,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
 use chrono::Utc;
