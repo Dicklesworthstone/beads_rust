@@ -207,6 +207,26 @@ impl NormalizationRules {
                                 }
                             }
                         }
+                    } else if self.normalize_paths && self.path_fields.contains(key) {
+                        // Normalize path separators (Windows backslash to Unix forward slash)
+                        if let Some(s) = val.as_str() {
+                            if s.contains('\\') {
+                                let normalized = s.replace('\\', "/");
+                                if self.log_normalization {
+                                    log.push(format!("Normalized path: {field_path}"));
+                                }
+                                *val = Value::String(normalized);
+                            }
+                        }
+                        // Also apply line ending normalization if enabled
+                        if self.normalize_line_endings {
+                            if let Some(s) = val.as_str() {
+                                if s.contains("\r\n") {
+                                    let normalized = s.replace("\r\n", "\n");
+                                    *val = Value::String(normalized);
+                                }
+                            }
+                        }
                     } else {
                         self.normalize_value(val, &field_path, log);
                     }
@@ -223,6 +243,16 @@ impl NormalizationRules {
                             .unwrap_or_default()
                             .cmp(&serde_json::to_string(b).unwrap_or_default())
                     });
+                }
+            }
+            Value::String(s) => {
+                // Normalize line endings for all string values
+                if self.normalize_line_endings && s.contains("\r\n") {
+                    let normalized = s.replace("\r\n", "\n");
+                    if self.log_normalization {
+                        log.push(format!("Normalized line endings: {path}"));
+                    }
+                    *s = normalized;
                 }
             }
             _ => {}
@@ -2456,5 +2486,137 @@ mod tests {
 
         assert!(scenario.has_all_tags(&["quick".to_string(), "crud".to_string()]));
         assert!(!scenario.has_all_tags(&["quick".to_string(), "slow".to_string()]));
+    }
+
+    // ========================================================================
+    // Cross-platform normalization tests (beads_rust-lsht)
+    // ========================================================================
+
+    #[test]
+    fn test_path_separator_normalization() {
+        let rules = NormalizationRules::cross_platform();
+        let mut value = serde_json::json!({
+            "path": "C:\\Users\\test\\project\\.beads",
+            "file_path": "src\\main.rs",
+            "db_path": "data\\beads.db",
+            "title": "Not a path with \\ backslash"
+        });
+
+        let log = rules.apply(&mut value);
+
+        // Path fields should have backslashes converted to forward slashes
+        assert_eq!(value["path"], "C:/Users/test/project/.beads");
+        assert_eq!(value["file_path"], "src/main.rs");
+        assert_eq!(value["db_path"], "data/beads.db");
+        // Non-path fields should not be modified
+        assert_eq!(value["title"], "Not a path with \\ backslash");
+        // Should log the normalizations
+        assert!(log.iter().any(|l| l.contains("Normalized path")));
+    }
+
+    #[test]
+    fn test_path_normalization_no_backslashes() {
+        let rules = NormalizationRules::cross_platform();
+        let mut value = serde_json::json!({
+            "path": "/home/user/project/.beads",
+            "file_path": "src/main.rs"
+        });
+
+        let log = rules.apply(&mut value);
+
+        // Already Unix-style paths should remain unchanged
+        assert_eq!(value["path"], "/home/user/project/.beads");
+        assert_eq!(value["file_path"], "src/main.rs");
+        // No path normalization should be logged
+        assert!(!log.iter().any(|l| l.contains("Normalized path")));
+    }
+
+    #[test]
+    fn test_line_ending_normalization() {
+        let rules = NormalizationRules::cross_platform();
+        let mut value = serde_json::json!({
+            "description": "Line 1\r\nLine 2\r\nLine 3",
+            "notes": "Single line no CRLF"
+        });
+
+        let log = rules.apply(&mut value);
+
+        // CRLF should be converted to LF
+        assert_eq!(value["description"], "Line 1\nLine 2\nLine 3");
+        // Single line should remain unchanged
+        assert_eq!(value["notes"], "Single line no CRLF");
+        // Should log line ending normalization
+        assert!(log.iter().any(|l| l.contains("Normalized line endings")));
+    }
+
+    #[test]
+    fn test_line_ending_normalization_nested() {
+        let rules = NormalizationRules::cross_platform();
+        let mut value = serde_json::json!({
+            "issues": [
+                {"description": "First\r\nitem"},
+                {"description": "Second\r\nitem"}
+            ]
+        });
+
+        let log = rules.apply(&mut value);
+
+        // Nested strings should also have CRLF normalized
+        assert_eq!(value["issues"][0]["description"], "First\nitem");
+        assert_eq!(value["issues"][1]["description"], "Second\nitem");
+        assert!(!log.is_empty());
+    }
+
+    #[test]
+    fn test_cross_platform_constructor() {
+        let rules = NormalizationRules::cross_platform();
+
+        assert!(rules.normalize_paths);
+        assert!(rules.normalize_line_endings);
+        assert!(rules.log_normalization);
+        assert!(rules.path_fields.contains("path"));
+        assert!(rules.path_fields.contains("file_path"));
+        assert!(rules.path_fields.contains("db_path"));
+        assert!(rules.path_fields.contains("workspace_root"));
+        // Should not have timestamp masking
+        assert!(rules.mask_fields.is_empty());
+        assert!(!rules.normalize_ids);
+    }
+
+    #[test]
+    fn test_conformance_default_includes_cross_platform() {
+        let rules = NormalizationRules::conformance_default();
+
+        // conformance_default should include cross-platform normalization
+        assert!(rules.normalize_paths);
+        assert!(rules.normalize_line_endings);
+        assert!(rules.path_fields.contains("path"));
+        // Plus the regular conformance features
+        assert!(rules.mask_fields.contains("created_at"));
+        assert!(rules.normalize_ids);
+    }
+
+    #[test]
+    fn test_path_field_with_line_endings() {
+        // Path fields should also have line endings normalized
+        let rules = NormalizationRules::cross_platform();
+        let mut value = serde_json::json!({
+            "path": "C:\\Users\\test\r\n\\project"
+        });
+
+        rules.apply(&mut value);
+
+        // Both backslashes and CRLF should be normalized
+        assert_eq!(value["path"], "C:/Users/test\n/project");
+    }
+
+    #[test]
+    fn test_strict_no_cross_platform() {
+        let rules = NormalizationRules::strict();
+
+        // strict() should not have cross-platform normalization
+        assert!(!rules.normalize_paths);
+        assert!(!rules.normalize_line_endings);
+        assert!(rules.path_fields.is_empty());
     }
 }

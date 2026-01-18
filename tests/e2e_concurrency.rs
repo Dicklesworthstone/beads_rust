@@ -81,7 +81,7 @@ fn extract_json_payload(stdout: &str) -> String {
     stdout.trim().to_string()
 }
 
-/// Test that concurrent write operations respect SQLite locking.
+/// Test that concurrent write operations respect `SQLite` locking.
 ///
 /// This test:
 /// 1. Starts two threads that attempt to create issues simultaneously

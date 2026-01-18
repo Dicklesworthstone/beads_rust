@@ -46,7 +46,7 @@ pub struct DiscoveredBinaries {
 
 impl DiscoveredBinaries {
     /// Check if bd is available for conformance testing.
-    pub fn bd_available(&self) -> bool {
+    pub const fn bd_available(&self) -> bool {
         self.bd.is_some()
     }
 
@@ -64,7 +64,7 @@ impl DiscoveredBinaries {
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "br": self.br.to_json(),
-            "bd": self.bd.as_ref().map(|b| b.to_json()),
+            "bd": self.bd.as_ref().map(BinaryVersion::to_json),
             "conformance_ready": self.bd_available(),
         })
     }
@@ -84,7 +84,7 @@ fn discover_br() -> Result<BinaryVersion, String> {
     // Try cargo-built binary
     let cargo_bin = assert_cmd::cargo::cargo_bin!("br");
     if cargo_bin.exists() {
-        return probe_binary("br", &cargo_bin);
+        return probe_binary("br", cargo_bin);
     }
 
     // Try release binary
@@ -237,8 +237,7 @@ fn parse_plain_version(output: &str) -> String {
         if word
             .chars()
             .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
+            .is_some_and(|c| c.is_ascii_digit())
         {
             // Include digits, dots, hyphens, and alphanumeric suffixes (e.g., "0.1.0-dev")
             let version: String = word
@@ -257,16 +256,14 @@ fn parse_plain_version(output: &str) -> String {
 /// Find binary in PATH.
 fn which(name: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .filter_map(|dir| {
-                let path = dir.join(name);
-                if path.exists() && path.is_file() {
-                    Some(path)
-                } else {
-                    None
-                }
-            })
-            .next()
+        std::env::split_paths(&paths).find_map(|dir| {
+            let path = dir.join(name);
+            if path.exists() && path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        })
     })
 }
 

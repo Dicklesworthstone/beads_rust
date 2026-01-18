@@ -1,6 +1,6 @@
 //! E2E tests for environment variable overrides and path handling.
 //!
-//! Tests BEADS_DIR, BEADS_JSONL, BD_ACTOR, and no-db mode interactions.
+//! Tests `BEADS_DIR`, `BEADS_JSONL`, `BD_ACTOR`, and no-db mode interactions.
 //! Part of beads_rust-9ks6.
 
 mod common;
@@ -146,8 +146,12 @@ fn e2e_beads_jsonl_external_path() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Create an issue
-    let create = run_br(&workspace, ["create", "External JSONL test"], "create");
+    // Create an issue with --no-auto-flush to keep it dirty
+    let create = run_br(
+        &workspace,
+        ["create", "External JSONL test", "--no-auto-flush"],
+        "create",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
 
     // Create an external JSONL location within the temp directory
@@ -156,12 +160,12 @@ fn e2e_beads_jsonl_external_path() {
     fs::create_dir_all(&external_dir).expect("create external dir");
     let external_jsonl = external_dir.join("custom.jsonl");
 
-    // Set BEADS_JSONL to external path and sync with --allow-external-jsonl
+    // Set BEADS_JSONL to external path and sync with --allow-external-jsonl --force
     let env_vars = vec![("BEADS_JSONL", external_jsonl.to_str().unwrap())];
 
     let sync = run_br_with_env(
         &workspace,
-        ["sync", "--flush-only", "--allow-external-jsonl"],
+        ["sync", "--flush-only", "--allow-external-jsonl", "--force"],
         env_vars.clone(),
         "sync_external",
     );
@@ -316,9 +320,10 @@ fn e2e_actor_flag_overrides_env() {
     let comment = run_br_with_env(
         &workspace,
         [
-            "comment",
+            "comments",
+            "add",
             id,
-            "--body",
+            "--message",
             "Test comment",
             "--author",
             "flag-author",
@@ -401,26 +406,26 @@ fn e2e_no_db_with_beads_jsonl() {
     let _log = common::test_log("e2e_no_db_with_beads_jsonl");
     let workspace = BrWorkspace::new();
 
-    // Create a standalone JSONL file
-    let standalone_jsonl = workspace.temp_dir.path().join("standalone.jsonl");
-    let issue_json = r#"{"id":"bd-standalone1","title":"Standalone JSONL","status":"open","issue_type":"task","priority":2,"labels":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","ephemeral":false,"pinned":false,"is_template":false,"dependencies":[],"comments":[]}"#;
-    fs::write(&standalone_jsonl, format!("{}\n", issue_json)).expect("write jsonl");
-
-    // Also need a minimal .beads directory for br to work
+    // Create .beads directory
     let beads_dir = workspace.temp_dir.path().join(".beads");
     fs::create_dir_all(&beads_dir).expect("create .beads");
 
-    // Use BEADS_JSONL to point to standalone file
+    // Create JSONL file INSIDE .beads (path validation requires this)
+    let custom_jsonl = beads_dir.join("custom.jsonl");
+    let issue_json = r#"{"id":"bd-custom1","title":"Custom JSONL Location","status":"open","issue_type":"task","priority":2,"labels":[],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","ephemeral":false,"pinned":false,"is_template":false,"dependencies":[],"comments":[]}"#;
+    fs::write(&custom_jsonl, format!("{}\n", issue_json)).expect("write jsonl");
+
+    // Use BEADS_JSONL to point to the custom location within .beads
     let env_vars = vec![
         ("BEADS_DIR", beads_dir.to_str().unwrap()),
-        ("BEADS_JSONL", standalone_jsonl.to_str().unwrap()),
+        ("BEADS_JSONL", custom_jsonl.to_str().unwrap()),
     ];
 
     let list = run_br_with_env(
         &workspace,
         ["--no-db", "list", "--json"],
         env_vars,
-        "list_standalone_jsonl",
+        "list_custom_jsonl",
     );
     assert!(
         list.status.success(),
@@ -433,7 +438,7 @@ fn e2e_no_db_with_beads_jsonl() {
     assert!(
         list_json
             .iter()
-            .any(|item| item["title"] == "Standalone JSONL"),
+            .any(|item| item["title"] == "Custom JSONL Location"),
         "issue from BEADS_JSONL should be visible"
     );
 }

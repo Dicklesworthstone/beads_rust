@@ -127,12 +127,12 @@ impl Default for ArtifactValidator {
 }
 
 impl ArtifactValidator {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { strict: true }
     }
 
     /// Enable/disable strict mode (fails on warnings)
-    pub fn strict(mut self, strict: bool) -> Self {
+    pub const fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
     }
@@ -145,7 +145,7 @@ impl ArtifactValidator {
                 return ValidationResult::ok().with_error(ValidationError {
                     line: None,
                     field: None,
-                    message: format!("Failed to read file: {}", e),
+                    message: format!("Failed to read file: {e}"),
                 });
             }
         };
@@ -176,7 +176,7 @@ impl ArtifactValidator {
                     result = result.with_error(ValidationError {
                         line: Some(line_num),
                         field: None,
-                        message: format!("Invalid JSON: {}", e),
+                        message: format!("Invalid JSON: {e}"),
                     });
                 }
             }
@@ -186,6 +186,7 @@ impl ArtifactValidator {
     }
 
     /// Validate a single event
+    #[allow(clippy::unused_self)]
     fn validate_event(&self, event: &RunEvent, line_num: usize) -> ValidationResult {
         let mut result = ValidationResult::ok();
 
@@ -250,7 +251,7 @@ impl ArtifactValidator {
                 result = result.with_error(ValidationError {
                     line: Some(line_num),
                     field: Some("*_path".to_string()),
-                    message: format!("Path traversal detected: {}", path),
+                    message: format!("Path traversal detected: {path}"),
                 });
             }
         }
@@ -266,7 +267,7 @@ impl ArtifactValidator {
                 return ValidationResult::ok().with_error(ValidationError {
                     line: None,
                     field: None,
-                    message: format!("Failed to read file: {}", e),
+                    message: format!("Failed to read file: {e}"),
                 });
             }
         };
@@ -275,6 +276,7 @@ impl ArtifactValidator {
     }
 
     /// Validate snapshot content
+    #[allow(clippy::unused_self)]
     pub fn validate_snapshot_content(&self, content: &str) -> ValidationResult {
         let mut result = ValidationResult::ok();
 
@@ -284,7 +286,7 @@ impl ArtifactValidator {
                 return result.with_error(ValidationError {
                     line: None,
                     field: None,
-                    message: format!("Invalid JSON array: {}", e),
+                    message: format!("Invalid JSON array: {e}"),
                 });
             }
         };
@@ -339,7 +341,7 @@ impl ArtifactValidator {
                 return ValidationResult::ok().with_error(ValidationError {
                     line: None,
                     field: None,
-                    message: format!("Failed to read file: {}", e),
+                    message: format!("Failed to read file: {e}"),
                 });
             }
         };
@@ -348,6 +350,7 @@ impl ArtifactValidator {
     }
 
     /// Validate summary content
+    #[allow(clippy::unused_self)]
     pub fn validate_summary_content(&self, content: &str) -> ValidationResult {
         let mut result = ValidationResult::ok();
 
@@ -357,7 +360,7 @@ impl ArtifactValidator {
                 return result.with_error(ValidationError {
                     line: None,
                     field: None,
-                    message: format!("Invalid JSON: {}", e),
+                    message: format!("Invalid JSON: {e}"),
                 });
             }
         };
@@ -412,7 +415,7 @@ impl ArtifactValidator {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "json") {
+                if path.extension().is_some_and(|e| e == "json") {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name.contains("snapshot") {
                         result = result.merge(self.validate_snapshot_file(&path));
