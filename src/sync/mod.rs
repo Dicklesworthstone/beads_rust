@@ -1590,8 +1590,10 @@ pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<S
     let (jsonl_newer, db_newer) = if jsonl_exists {
         let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
 
+        // JSONL is newer if it was modified after last import
+        // If metadata is missing or invalid, assume JSONL is newer (safe default)
         let mtime_newer = last_import_time.as_ref().is_none_or(|import_time| {
-            chrono::DateTime::parse_from_rfc3339(import_time).is_ok_and(|import_ts| {
+            chrono::DateTime::parse_from_rfc3339(import_time).map_or(true, |import_ts| {
                 let import_sys_time = std::time::SystemTime::from(import_ts);
                 jsonl_mtime > import_sys_time
             })

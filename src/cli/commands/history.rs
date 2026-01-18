@@ -29,7 +29,7 @@ pub fn execute(args: HistoryArgs, _cli: &config::CliOverrides) -> Result<()> {
 
 /// List available backups.
 fn list_backups(history_dir: &Path) -> Result<()> {
-    let backups = history::list_backups(history_dir)?;
+    let backups = history::list_backups(history_dir, None)?;
 
     if backups.is_empty() {
         println!("No backups found in {}", history_dir.display());
