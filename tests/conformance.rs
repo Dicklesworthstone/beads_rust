@@ -23,7 +23,7 @@ use tempfile::TempDir;
 use tracing::info;
 
 /// Check if the `bd` (Go beads) binary is available on the system.
-fn bd_available() -> bool {
+pub fn bd_available() -> bool {
     std::process::Command::new("bd")
         .arg("version")
         .output()

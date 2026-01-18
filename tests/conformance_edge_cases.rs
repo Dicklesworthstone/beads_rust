@@ -23,7 +23,17 @@ use tracing::info;
 #[path = "conformance.rs"]
 mod conformance;
 
-use conformance::{CompareMode, ConformanceWorkspace, compare_json};
+use conformance::{CompareMode, ConformanceWorkspace, compare_json, bd_available};
+
+/// Skip test if bd binary is not available (used in CI where only br is built)
+macro_rules! skip_if_no_bd {
+    () => {
+        if !bd_available() {
+            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+            return;
+        }
+    };
+}
 
 // ============================================================================
 // INPUT VALIDATION TESTS (10 tests)
@@ -32,6 +42,7 @@ use conformance::{CompareMode, ConformanceWorkspace, compare_json};
 /// Test: Very long title (1000+ characters)
 #[test]
 fn conformance_title_very_long() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_title_very_long: BEGIN");
 
@@ -75,6 +86,7 @@ fn conformance_title_very_long() {
 /// Test: Empty title should be rejected
 #[test]
 fn conformance_title_empty() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_title_empty: BEGIN");
 
@@ -101,6 +113,7 @@ fn conformance_title_empty() {
 /// Test: SQL injection attempt in title
 #[test]
 fn conformance_sql_injection_title() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_sql_injection_title: BEGIN");
 
@@ -153,6 +166,7 @@ fn conformance_sql_injection_title() {
 /// Test: SQL injection attempt in description
 #[test]
 fn conformance_sql_injection_desc() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_sql_injection_desc: BEGIN");
 
@@ -201,6 +215,7 @@ fn conformance_sql_injection_desc() {
 /// Test: Priority boundary 0 (critical)
 #[test]
 fn conformance_priority_boundary_0() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_priority_boundary_0: BEGIN");
 
@@ -247,6 +262,7 @@ fn conformance_priority_boundary_0() {
 /// Test: Priority boundary 4 (backlog)
 #[test]
 fn conformance_priority_boundary_4() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_priority_boundary_4: BEGIN");
 
@@ -293,6 +309,7 @@ fn conformance_priority_boundary_4() {
 /// Test: Priority 5 should be rejected (invalid)
 #[test]
 fn conformance_priority_invalid_5() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_priority_invalid_5: BEGIN");
 
@@ -336,6 +353,7 @@ fn conformance_priority_invalid_5() {
 /// Test: Negative priority should be rejected
 #[test]
 fn conformance_priority_invalid_neg() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_priority_invalid_neg: BEGIN");
 
@@ -373,6 +391,7 @@ fn conformance_priority_invalid_neg() {
 /// Test: Invalid ID format handling
 #[test]
 fn conformance_id_format_validation() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_id_format_validation: BEGIN");
 
@@ -418,6 +437,7 @@ fn conformance_id_format_validation() {
 /// Test: Unicode in title and description
 #[test]
 fn conformance_unicode_handling() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_unicode_handling: BEGIN");
 
@@ -471,6 +491,7 @@ fn conformance_unicode_handling() {
 /// Test: 50 rapid sequential creates
 #[test]
 fn conformance_rapid_creates_50() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_rapid_creates_50: BEGIN");
 
@@ -536,6 +557,7 @@ fn conformance_rapid_creates_50() {
 /// Test: 100 rapid status updates
 #[test]
 fn conformance_rapid_updates_100() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_rapid_updates_100: BEGIN");
 
@@ -597,6 +619,7 @@ fn conformance_rapid_updates_100() {
 /// Test: Large dependency graph (100 nodes)
 #[test]
 fn conformance_large_dep_graph_100() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_large_dep_graph_100: BEGIN");
 
@@ -695,6 +718,7 @@ fn conformance_large_dep_graph_100() {
 /// Test: 10-level deep dependency chain
 #[test]
 fn conformance_deep_deps_10_levels() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_deep_deps_10_levels: BEGIN");
 
@@ -767,6 +791,7 @@ fn conformance_deep_deps_10_levels() {
 /// Test: Many labels per issue (20 labels)
 #[test]
 fn conformance_many_labels_20() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_many_labels_20: BEGIN");
 
@@ -860,6 +885,7 @@ fn conformance_many_labels_20() {
 /// Test: Many comments per issue (20 comments)
 #[test]
 fn conformance_many_comments_20() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_many_comments_20: BEGIN");
 
@@ -940,6 +966,7 @@ fn conformance_many_comments_20() {
 /// Test: Concurrent list operations
 #[test]
 fn conformance_concurrent_reads() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_concurrent_reads: BEGIN");
 
@@ -976,6 +1003,7 @@ fn conformance_concurrent_reads() {
 #[test]
 #[ignore] // This test takes a while, run with --ignored
 fn conformance_workspace_max_issues() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_workspace_max_issues: BEGIN");
 
@@ -1050,6 +1078,7 @@ fn conformance_workspace_max_issues() {
 /// Test: Graceful handling of missing .beads directory
 #[test]
 fn conformance_missing_beads_dir() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_missing_beads_dir: BEGIN");
 
@@ -1076,6 +1105,7 @@ fn conformance_missing_beads_dir() {
 /// Test: Invalid JSONL import rejection
 #[test]
 fn conformance_invalid_jsonl_import() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_invalid_jsonl_import: BEGIN");
 
@@ -1120,6 +1150,7 @@ fn conformance_invalid_jsonl_import() {
 /// Test: UTF-8 BOM handling in JSONL
 #[test]
 fn conformance_utf8_bom_handling() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_utf8_bom_handling: BEGIN");
 
@@ -1163,6 +1194,7 @@ fn conformance_utf8_bom_handling() {
 /// Test: Schema version check
 #[test]
 fn conformance_schema_version() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_schema_version: BEGIN");
 
@@ -1197,6 +1229,7 @@ fn conformance_schema_version() {
 /// Test: Double-init handling
 #[test]
 fn conformance_double_init() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_double_init: BEGIN");
 
@@ -1230,6 +1263,7 @@ fn conformance_double_init() {
 /// Test: Sync after delete operations
 #[test]
 fn conformance_sync_after_delete() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_sync_after_delete: BEGIN");
 
@@ -1281,6 +1315,7 @@ fn conformance_sync_after_delete() {
 /// Test: UTF-8 file encoding consistency
 #[test]
 fn conformance_encoding_utf8() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_encoding_utf8: BEGIN");
 
@@ -1314,6 +1349,7 @@ fn conformance_encoding_utf8() {
 /// Test: Line ending handling (CRLF vs LF)
 #[test]
 fn conformance_line_endings() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_line_endings: BEGIN");
 
@@ -1367,6 +1403,7 @@ fn conformance_line_endings() {
 /// Test: Special characters that could be path separators
 #[test]
 fn conformance_path_separators_in_content() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_path_separators_in_content: BEGIN");
 
@@ -1396,6 +1433,7 @@ fn conformance_path_separators_in_content() {
 /// Test: Null bytes handling (should be rejected or sanitized)
 #[test]
 fn conformance_null_bytes() {
+    skip_if_no_bd!();
     common::init_test_logging();
     info!("conformance_null_bytes: BEGIN");
 

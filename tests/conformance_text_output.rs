@@ -12,6 +12,24 @@ use common::harness::ConformanceWorkspace;
 use regex::Regex;
 use std::sync::LazyLock;
 
+/// Check if the `bd` (Go beads) binary is available on the system.
+fn bd_available() -> bool {
+    std::process::Command::new("bd")
+        .arg("version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Skip test if bd binary is not available (used in CI where only br is built)
+macro_rules! skip_if_no_bd {
+    () => {
+        if !bd_available() {
+            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+            return;
+        }
+    };
+}
+
 // ============================================================================
 // Text Normalization for Conformance
 // ============================================================================
@@ -193,6 +211,7 @@ fn extract_id_from_create(stdout: &str) -> String {
 /// Test: `list` command with empty database
 #[test]
 fn conformance_text_list_empty() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "list_empty");
@@ -222,6 +241,7 @@ fn conformance_text_list_empty() {
 /// Test: `list` command with issues
 #[test]
 fn conformance_text_list_with_issues() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "list_with_issues");
@@ -256,6 +276,7 @@ fn conformance_text_list_with_issues() {
 /// Test: `show` command
 #[test]
 fn conformance_text_show() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "show");
@@ -289,6 +310,7 @@ fn conformance_text_show() {
 /// Test: `ready` command with empty database
 #[test]
 fn conformance_text_ready_empty() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "ready_empty");
@@ -314,6 +336,7 @@ fn conformance_text_ready_empty() {
 /// Test: `ready` command with issues
 #[test]
 fn conformance_text_ready_with_issues() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "ready_with_issues");
@@ -365,6 +388,7 @@ fn conformance_text_ready_with_issues() {
 /// Test: `blocked` command with empty database
 #[test]
 fn conformance_text_blocked_empty() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "blocked_empty");
@@ -398,6 +422,7 @@ fn conformance_text_blocked_empty() {
 /// Test: `blocked` command with blocked issues
 #[test]
 fn conformance_text_blocked_with_issues() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "blocked_with_issues");
@@ -438,6 +463,7 @@ fn conformance_text_blocked_with_issues() {
 /// Test: `stats` command (alias for status)
 #[test]
 fn conformance_text_stats_empty() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "stats_empty");
@@ -464,6 +490,7 @@ fn conformance_text_stats_empty() {
 /// Test: `stats` command with issues
 #[test]
 fn conformance_text_stats_with_issues() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "stats_with_issues");
@@ -503,6 +530,7 @@ fn conformance_text_stats_with_issues() {
 /// Test: `orphans` command with empty database
 #[test]
 fn conformance_text_orphans_empty() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "orphans_empty");
@@ -532,6 +560,7 @@ fn conformance_text_orphans_empty() {
 /// Test: `list` with status filter
 #[test]
 fn conformance_text_list_status_filter() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "list_status_filter");
@@ -577,6 +606,7 @@ fn conformance_text_list_status_filter() {
 /// Test: `list` with type filter
 #[test]
 fn conformance_text_list_type_filter() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "list_type_filter");
@@ -617,6 +647,7 @@ fn conformance_text_list_type_filter() {
 /// Test: `list` with priority filter
 #[test]
 fn conformance_text_list_priority_filter() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "list_priority_filter");
@@ -673,6 +704,7 @@ fn conformance_text_list_priority_filter() {
 /// appropriate error messages.
 #[test]
 fn conformance_text_show_not_found() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "show_not_found");
@@ -703,6 +735,7 @@ fn conformance_text_show_not_found() {
 /// Test: `ready` with limit
 #[test]
 fn conformance_text_ready_with_limit() {
+    skip_if_no_bd!();
     common::init_test_logging();
 
     let mut workspace = ConformanceWorkspace::new("conformance_text", "ready_with_limit");
