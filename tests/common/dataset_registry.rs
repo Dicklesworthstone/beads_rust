@@ -927,7 +927,7 @@ mod tests {
         assert!(!isolated.beads_dir.exists());
     }
 
-    /// Helper to check if beads_rust dataset is available (has beads.db)
+    /// Helper to check if `beads_rust` dataset is available (has `beads.db`)
     fn beads_rust_available() -> bool {
         DatasetRegistry::new().is_available(KnownDataset::BeadsRust)
     }
