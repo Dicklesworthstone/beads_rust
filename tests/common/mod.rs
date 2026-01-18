@@ -8,8 +8,12 @@ use tracing::info;
 
 pub mod assertions;
 pub mod cli;
+pub mod dataset_registry;
 pub mod fixtures;
+pub mod harness;
 pub mod scenarios;
+
+pub use dataset_registry::{DatasetMetadata, DatasetRegistry, IsolatedDataset, KnownDataset};
 
 static INIT: Once = Once::new();
 
