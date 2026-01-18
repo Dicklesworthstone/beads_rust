@@ -33,6 +33,8 @@ Commands:
   config       Configuration management
   sync         Sync database with JSONL file (export or import)
   doctor       Run ID-REDACTED diagnostics
+  info         Show diagnostic metadata about the workspace
+  where        Show the active .beads directory
   version      Show version information
   upgrade      Upgrade br to the latest version
   completions  Generate shell completions

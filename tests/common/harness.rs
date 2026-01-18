@@ -479,7 +479,7 @@ impl ArtifactLogger {
         self.append_event(&event);
     }
 
-    pub fn log_snapshot(&mut self, label: &str, workspace_root: &Path) {
+    pub fn log_snapshot(&self, label: &str, workspace_root: &Path) {
         if !self.config.enabled || !self.config.capture_snapshots {
             return;
         }
@@ -1675,7 +1675,7 @@ mod tests {
         logger.log_command(
             "sample",
             "br",
-            &vec!["--version".to_string()],
+            &["--version".to_string()],
             Path::new("."),
             &result,
         );
