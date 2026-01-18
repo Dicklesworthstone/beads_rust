@@ -29,7 +29,7 @@ pub struct DatasetMetadata {
     pub source_commit: Option<String>,
     /// Whether the source was an override (custom path) vs known dataset
     pub is_override: bool,
-    /// Override reason/description (if is_override is true)
+    /// Override reason/description (if `is_override` is true)
     pub override_reason: Option<String>,
 }
 
@@ -63,7 +63,7 @@ pub enum KnownDataset {
 }
 
 impl KnownDataset {
-    pub fn name(&self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::BeadsRust => "beads_rust",
             Self::BeadsViewer => "beads_viewer",
@@ -72,7 +72,7 @@ impl KnownDataset {
         }
     }
 
-    pub fn source_path(&self) -> PathBuf {
+    pub fn source_path(self) -> PathBuf {
         PathBuf::from(match self {
             Self::BeadsRust => "/data/projects/beads_rust",
             Self::BeadsViewer => "/data/projects/beads_viewer",
@@ -81,11 +81,11 @@ impl KnownDataset {
         })
     }
 
-    pub fn beads_dir(&self) -> PathBuf {
+    pub fn beads_dir(self) -> PathBuf {
         self.source_path().join(".beads")
     }
 
-    pub fn all() -> &'static [KnownDataset] {
+    pub const fn all() -> &'static [Self] {
         &[
             Self::BeadsRust,
             Self::BeadsViewer,
@@ -110,7 +110,7 @@ impl DatasetRegistry {
         };
 
         for dataset in KnownDataset::all() {
-            if let Ok(metadata) = registry.scan_dataset(*dataset) {
+            if let Ok(metadata) = Self::scan_dataset(*dataset) {
                 registry
                     .source_hashes
                     .insert(dataset.name().to_string(), metadata.content_hash.clone());
@@ -139,7 +139,7 @@ impl DatasetRegistry {
     }
 
     /// Scan a dataset and compute its metadata.
-    fn scan_dataset(&self, dataset: KnownDataset) -> std::io::Result<DatasetMetadata> {
+    fn scan_dataset(dataset: KnownDataset) -> std::io::Result<DatasetMetadata> {
         let beads_dir = dataset.beads_dir();
         if !beads_dir.exists() {
             return Err(std::io::Error::new(
@@ -713,7 +713,7 @@ impl DatasetIntegrityGuard {
     }
 
     /// Check if both before and after verifications were performed.
-    pub fn fully_verified(&self) -> bool {
+    pub const fn fully_verified(&self) -> bool {
         self.verified_before && self.verified_after
     }
 
@@ -808,8 +808,7 @@ impl DatasetProvenance {
 
     /// Write provenance to a summary.json file.
     pub fn write_to_file(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(&self.to_json())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(&self.to_json()).map_err(std::io::Error::other)?;
         fs::write(path, json)
     }
 }
@@ -846,10 +845,7 @@ where
 
     // Fail fast if source is already corrupted
     if !before_result.passed {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            before_result.message,
-        ));
+        return Err(std::io::Error::other(before_result.message));
     }
 
     // Create isolated dataset
@@ -1060,7 +1056,7 @@ mod tests {
             override_reason: None,
         };
 
-        let provenance = DatasetProvenance::from_metadata(metadata.clone());
+        let provenance = DatasetProvenance::from_metadata(metadata);
         assert_eq!(provenance.metadata.name, "test");
         assert!(provenance.integrity_before.is_none());
         assert!(provenance.integrity_after.is_none());

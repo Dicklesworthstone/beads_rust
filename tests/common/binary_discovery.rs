@@ -234,11 +234,7 @@ fn parse_plain_version(output: &str) -> String {
 
     // Try to extract version number
     for word in output.split_whitespace() {
-        if word
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit())
-        {
+        if word.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             // Include digits, dots, hyphens, and alphanumeric suffixes (e.g., "0.1.0-dev")
             let version: String = word
                 .chars()
@@ -289,8 +285,7 @@ pub fn check_bd_version(version: &BinaryVersion) -> Result<(), String> {
     // Simple version comparison (works for semver)
     if compare_versions(current, MIN_BD_VERSION).is_lt() {
         return Err(format!(
-            "bd version {} is below minimum required version {}. Please upgrade bd.",
-            current, MIN_BD_VERSION
+            "bd version {current} is below minimum required version {MIN_BD_VERSION}. Please upgrade bd."
         ));
     }
 
@@ -318,7 +313,7 @@ mod tests {
     #[test]
     fn test_discover_br() {
         let result = discover_br();
-        assert!(result.is_ok(), "br should be discoverable: {:?}", result);
+        assert!(result.is_ok(), "br should be discoverable: {result:?}");
 
         let version = result.unwrap();
         assert_eq!(version.binary, "br");
@@ -328,7 +323,7 @@ mod tests {
     #[test]
     fn test_discover_binaries() {
         let result = discover_binaries();
-        assert!(result.is_ok(), "Binary discovery failed: {:?}", result);
+        assert!(result.is_ok(), "Binary discovery failed: {result:?}");
 
         let binaries = result.unwrap();
         assert_eq!(binaries.br.binary, "br");

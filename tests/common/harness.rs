@@ -30,6 +30,7 @@ fn artifact_mutex() -> &'static Mutex<()> {
 }
 
 /// Result of running a command
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct CommandResult {
     pub stdout: String,
@@ -109,6 +110,7 @@ pub struct FileEntry {
 }
 
 /// Configuration for artifact logging
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct ArtifactConfig {
     pub enabled: bool,
@@ -121,12 +123,12 @@ pub struct ArtifactConfig {
 impl Default for ArtifactConfig {
     fn default() -> Self {
         Self {
-            enabled: std::env::var("HARNESS_ARTIFACTS").map_or(false, |v| v == "1"),
+            enabled: std::env::var("HARNESS_ARTIFACTS").is_ok_and(|v| v == "1"),
             capture_stdout: true,
             capture_stderr: true,
             capture_snapshots: true,
             preserve_on_success: std::env::var("HARNESS_PRESERVE_SUCCESS")
-                .map_or(false, |v| v == "1"),
+                .is_ok_and(|v| v == "1"),
         }
     }
 }
@@ -222,7 +224,7 @@ impl Default for RunnerPolicy {
                 300,
             )),
             // Serial by default for safety
-            parallelism_mode: if std::env::var("HARNESS_PARALLEL").map_or(false, |v| v == "1") {
+            parallelism_mode: if std::env::var("HARNESS_PARALLEL").is_ok_and(|v| v == "1") {
                 ParallelismMode::Parallel
             } else {
                 ParallelismMode::Serial
@@ -235,9 +237,9 @@ impl Default for RunnerPolicy {
                     .unwrap_or(4),
             ),
             guardrails: ResourceGuardrails::default(),
-            fail_fast: std::env::var("HARNESS_FAIL_FAST").map_or(false, |v| v == "1"),
+            fail_fast: std::env::var("HARNESS_FAIL_FAST").is_ok_and(|v| v == "1"),
             retry_count: parse_env_u32("HARNESS_RETRY_COUNT", 0),
-            skip_slow: std::env::var("HARNESS_SKIP_SLOW").map_or(false, |v| v == "1"),
+            skip_slow: std::env::var("HARNESS_SKIP_SLOW").is_ok_and(|v| v == "1"),
         }
     }
 }
@@ -290,32 +292,32 @@ impl RunnerPolicy {
     }
 
     /// Builder: set command timeout
-    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_command_timeout(mut self, timeout: Duration) -> Self {
         self.command_timeout = timeout;
         self
     }
 
     /// Builder: set scenario timeout
-    pub fn with_scenario_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_scenario_timeout(mut self, timeout: Duration) -> Self {
         self.scenario_timeout = timeout;
         self
     }
 
     /// Builder: set parallelism mode
-    pub fn with_parallelism(mut self, mode: ParallelismMode, workers: usize) -> Self {
+    pub const fn with_parallelism(mut self, mode: ParallelismMode, workers: usize) -> Self {
         self.parallelism_mode = mode;
         self.max_parallel_workers = workers;
         self
     }
 
     /// Builder: set fail fast
-    pub fn with_fail_fast(mut self, fail_fast: bool) -> Self {
+    pub const fn with_fail_fast(mut self, fail_fast: bool) -> Self {
         self.fail_fast = fail_fast;
         self
     }
 
     /// Builder: set retry count
-    pub fn with_retry(mut self, count: u32) -> Self {
+    pub const fn with_retry(mut self, count: u32) -> Self {
         self.retry_count = count;
         self
     }
@@ -904,7 +906,7 @@ impl TestWorkspace {
     }
 
     /// Take a snapshot of the current file tree
-    pub fn snapshot(&mut self, label: &str) {
+    pub fn snapshot(&self, label: &str) {
         self.logger.log_snapshot(label, &self.root);
     }
 
