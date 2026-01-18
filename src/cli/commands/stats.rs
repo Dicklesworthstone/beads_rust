@@ -404,6 +404,23 @@ fn print_text_output(output: &Statistics) {
         println!("  Epics ready to close:   {}", s.epics_eligible_for_closure);
     }
 
+    // Extended section (matches bd format)
+    if s.average_lead_time_hours.is_some() || s.tombstone_issues > 0 {
+        println!("\nExtended:");
+        if let Some(avg_hours) = s.average_lead_time_hours {
+            // Format like bd: "N.N hours" or "N days" for large values
+            let formatted = if avg_hours >= 24.0 {
+                format!("{:.1} days", avg_hours / 24.0)
+            } else {
+                format!("{:.1} hours", avg_hours)
+            };
+            println!("  Avg Lead Time:          {formatted}");
+        }
+        if s.tombstone_issues > 0 {
+            println!("  Deleted:                {} (tombstones)", s.tombstone_issues);
+        }
+    }
+
     for breakdown in &output.breakdowns {
         println!("\nBy {}:", breakdown.dimension);
         for entry in &breakdown.counts {
