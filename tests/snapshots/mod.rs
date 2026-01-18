@@ -51,8 +51,13 @@ static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
-static VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\((main|master)@[a-f0-9]+\)").expect("version regex"));
+static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\((main|master|HEAD)@[a-f0-9]+\)").expect("version regex")
+});
+static OWNER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
+static VERSION_NUM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 static PATH_SEP_RE: LazyLock<Regex> =
@@ -103,6 +108,10 @@ pub struct TextNormConfig {
     pub mask_temp_paths: bool,
     /// Mask duration values (for timing-sensitive output)
     pub mask_durations: bool,
+    /// Mask owner/username in output (e.g., "Owner: user" → "Owner: USERNAME")
+    pub mask_usernames: bool,
+    /// Mask version numbers (e.g., "version 0.1.7" → "version X.Y.Z")
+    pub mask_version_numbers: bool,
 }
 
 impl TextNormConfig {
@@ -124,6 +133,8 @@ impl TextNormConfig {
             mask_home_paths: true,
             mask_temp_paths: true,
             mask_durations: false, // Keep durations by default
+            mask_usernames: true,
+            mask_version_numbers: true,
         }
     }
 
@@ -417,7 +428,23 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("durations".to_string());
     }
 
-    // 12. Strip trailing whitespace (per line)
+    // 12. Mask owner/usernames
+    if config.mask_usernames && OWNER_RE.is_match(&normalized) {
+        normalized = OWNER_RE
+            .replace_all(&normalized, "Owner: USERNAME")
+            .to_string();
+        log.push("usernames".to_string());
+    }
+
+    // 13. Mask version numbers
+    if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
+        normalized = VERSION_NUM_RE
+            .replace_all(&normalized, "version X.Y.Z")
+            .to_string();
+        log.push("version_numbers".to_string());
+    }
+
+    // 14. Strip trailing whitespace (per line)
     if config.strip_trailing_whitespace {
         let lines: Vec<&str> = normalized.lines().collect();
         let trimmed: Vec<String> = lines
@@ -431,7 +458,7 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         }
     }
 
-    // 13. Collapse multiple blank lines
+    // 15. Collapse multiple blank lines
     if config.collapse_blank_lines && MULTIPLE_BLANK_RE.is_match(&normalized) {
         normalized = MULTIPLE_BLANK_RE
             .replace_all(&normalized, "\n\n")
