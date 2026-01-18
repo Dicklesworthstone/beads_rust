@@ -329,3 +329,33 @@ jobs:
           else
             echo "Warning: Version output may be missing expected info"
           fi
+
+  e2e-quick:
+    name: Quick E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run quick E2E tests
+        run: scripts/e2e.sh
+        env:
+          NO_COLOR: 1
+          HARNESS_ARTIFACTS: 1
+
+      - name: Upload E2E summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-quick-summary
+          path: target/test-artifacts/e2e_quick_summary.json
+          if-no-files-found: ignore
