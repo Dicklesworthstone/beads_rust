@@ -1729,7 +1729,7 @@ mod tests {
             preserve_on_success: true,
         };
 
-        let mut logger = ArtifactLogger::new(&suite, test).with_config(config);
+        let logger = ArtifactLogger::new(&suite, test).with_config(config);
 
         let temp_dir = TempDir::new().expect("temp dir");
         fs::write(temp_dir.path().join("file.txt"), "content").expect("write file");
