@@ -135,7 +135,7 @@ fn e2e_queries_ready_stale_count_search() {
         ready_text.stderr
     );
     assert!(
-        ready_text.stdout.contains("Ready to work"),
+        ready_text.stdout.contains("Ready work"),
         "ready text missing header"
     );
 
@@ -172,7 +172,7 @@ fn e2e_queries_ready_stale_count_search() {
         blocked_text.stderr
     );
     assert!(
-        blocked_text.stdout.contains("Blocked Issues"),
+        blocked_text.stdout.contains("Blocked issues"),
         "blocked text missing header"
     );
 
@@ -309,11 +309,11 @@ fn e2e_stats_command() {
         stats_text.stderr
     );
     assert!(
-        stats_text.stdout.contains("Project Statistics"),
+        stats_text.stdout.contains("Issue Database Status"),
         "stats text missing header"
     );
     assert!(
-        stats_text.stdout.contains("Total issues:"),
+        stats_text.stdout.contains("Total Issues:"),
         "stats text missing total"
     );
     assert!(
