@@ -29,6 +29,25 @@ use tracing::info;
 // BENCHMARK INFRASTRUCTURE
 // ============================================================================
 
+/// Check if the `bd` (Go beads) binary is available on the system.
+/// Returns true if `bd version` runs successfully, false otherwise.
+fn bd_available() -> bool {
+    std::process::Command::new("bd")
+        .arg("version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Skip test if bd binary is not available (used in CI where only br is built)
+macro_rules! skip_if_no_bd {
+    () => {
+        if !bd_available() {
+            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+            return;
+        }
+    };
+}
+
 /// Output from running a command
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -1084,6 +1103,7 @@ fn benchmark_dataset_full() {
 /// Quick benchmark on beads_rust only for CI
 #[test]
 fn benchmark_dataset_quick() {
+    skip_if_no_bd!();
     init_test_logging();
 
     info!("benchmark_dataset_quick: starting");
@@ -1116,6 +1136,7 @@ fn benchmark_dataset_quick() {
 /// Test that dataset benchmark infrastructure works
 #[test]
 fn benchmark_dataset_infrastructure_works() {
+    skip_if_no_bd!();
     init_test_logging();
 
     info!("benchmark_dataset_infrastructure_works: testing DatasetBenchmarkWorkspace");
