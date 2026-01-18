@@ -13,12 +13,17 @@ pub mod cli;
 pub mod dataset_registry;
 pub mod fixtures;
 pub mod harness;
+pub mod scenario_filter;
 pub mod scenarios;
 
 pub use artifact_validator::ArtifactValidator;
 pub use binary_discovery::{discover_binaries, BinaryVersion, DiscoveredBinaries};
-pub use dataset_registry::{DatasetMetadata, DatasetRegistry, IsolatedDataset, KnownDataset};
+pub use dataset_registry::{
+    DatasetIntegrityGuard, DatasetMetadata, DatasetOverride, DatasetProvenance, DatasetRegistry,
+    IntegrityCheckResult, IsolatedDataset, KnownDataset, isolated_from_override, run_with_integrity,
+};
 pub use harness::{ParallelismMode, ResourceGuardrails, RunnerPolicy};
+pub use scenario_filter::{FilterResult, ScenarioFilter};
 pub use scenarios::{
     CompareMode, ExecutionMode, Invariants, NormalizationRules, Scenario, ScenarioCommand,
     ScenarioResult, ScenarioRunner, ScenarioSetup,
