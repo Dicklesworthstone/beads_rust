@@ -44,7 +44,7 @@ feature
     assert!(output.status.success());
     assert!(output.stdout.contains("First Issue"));
     assert!(output.stdout.contains("Second Issue"));
-    assert!(output.stdout.contains("[P1]")); // Priority 1
+    assert!(output.stdout.contains("P1]")); // Priority 1 (format: [● P1])
 
     // Verify labels on First Issue using JSON output
     let output = run_br(&workspace, ["list", "--json"], "list_json");
