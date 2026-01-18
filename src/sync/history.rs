@@ -143,10 +143,7 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, file_stem: &str) -
 /// # Errors
 ///
 /// Returns an error if the directory cannot be read.
-pub fn list_backups(
-    history_dir: &Path,
-    filter_prefix: Option<&str>,
-) -> Result<Vec<BackupEntry>> {
+pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<Vec<BackupEntry>> {
     if !history_dir.exists() {
         return Ok(Vec::new());
     }

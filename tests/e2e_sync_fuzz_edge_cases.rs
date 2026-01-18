@@ -513,7 +513,11 @@ fn edge_case_huge_line() {
 
     // Verify no partial/corrupted state by checking we can still list issues
     // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
-    let list = run_br(&workspace, ["list", "--no-auto-import", "--allow-stale"], "list_after_huge");
+    let list = run_br(
+        &workspace,
+        ["list", "--no-auto-import", "--allow-stale"],
+        "list_after_huge",
+    );
     // If import succeeded, list should work; if it failed, list should show old data
     assert!(
         list.status.success(),
@@ -717,7 +721,11 @@ fn edge_case_deeply_nested_json() {
 
     // The important thing is no crash/panic
     // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
-    let list = run_br(&workspace, ["list", "--no-auto-import", "--allow-stale"], "list_after_nested");
+    let list = run_br(
+        &workspace,
+        ["list", "--no-auto-import", "--allow-stale"],
+        "list_after_nested",
+    );
     assert!(
         list.status.success(),
         "System should remain stable after deeply nested JSON test"
@@ -753,7 +761,11 @@ fn edge_case_no_partial_writes_on_failure() {
 
     // Check final state
     // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
-    let list_after = run_br(&workspace, ["list", "--json", "--no-auto-import", "--allow-stale"], "list_after");
+    let list_after = run_br(
+        &workspace,
+        ["list", "--json", "--no-auto-import", "--allow-stale"],
+        "list_after",
+    );
     let count_after = list_after.stdout.matches("\"id\"").count();
 
     // Log for postmortem
@@ -783,7 +795,11 @@ fn edge_case_no_partial_writes_on_failure() {
 
     // At minimum, the system should be in a consistent state
     // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
-    let list_final = run_br(&workspace, ["list", "--no-auto-import", "--allow-stale"], "list_final");
+    let list_final = run_br(
+        &workspace,
+        ["list", "--no-auto-import", "--allow-stale"],
+        "list_final",
+    );
     assert!(
         list_final.status.success(),
         "System should remain in consistent state after failed import"

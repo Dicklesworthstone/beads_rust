@@ -57,7 +57,9 @@ pub struct ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (&self.line, &self.field) {
-            (Some(line), Some(field)) => write!(f, "Line {}, field '{}': {}", line, field, self.message),
+            (Some(line), Some(field)) => {
+                write!(f, "Line {}, field '{}': {}", line, field, self.message)
+            }
             (Some(line), None) => write!(f, "Line {}: {}", line, self.message),
             (None, Some(field)) => write!(f, "Field '{}': {}", field, self.message),
             (None, None) => write!(f, "{}", self.message),
@@ -441,7 +443,12 @@ mod tests {
         let content = r#"{"timestamp":"not-a-date","event_type":"command","label":"init","binary":"br","args":[],"cwd":"/tmp","exit_code":0,"success":true,"duration_ms":0,"stdout_len":0,"stderr_len":0}"#;
         let result = validator.validate_events_content(content);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.field.as_deref() == Some("timestamp")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field.as_deref() == Some("timestamp"))
+        );
     }
 
     #[test]
@@ -450,7 +457,12 @@ mod tests {
         let content = r#"{"timestamp":"2026-01-17T12:34:56.000Z","event_type":"invalid","label":"test","binary":"br","args":[],"cwd":"/tmp","exit_code":0,"success":true,"duration_ms":0,"stdout_len":0,"stderr_len":0}"#;
         let result = validator.validate_events_content(content);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.field.as_deref() == Some("event_type")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field.as_deref() == Some("event_type"))
+        );
     }
 
     #[test]
@@ -459,7 +471,12 @@ mod tests {
         let content = r#"{"timestamp":"2026-01-17T12:34:56.000Z","event_type":"command","label":"test","binary":"br","args":[],"cwd":"/tmp","exit_code":0,"success":true,"duration_ms":0,"stdout_len":0,"stderr_len":0,"stdout_path":"../etc/passwd"}"#;
         let result = validator.validate_events_content(content);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.message.contains("traversal")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("traversal"))
+        );
     }
 
     #[test]
@@ -484,6 +501,11 @@ mod tests {
         let content = r#"{"suite":"","test":"test","passed":true,"run_count":1,"timestamp":"2026-01-17T12:34:56.000Z"}"#;
         let result = validator.validate_summary_content(content);
         assert!(!result.valid);
-        assert!(result.errors.iter().any(|e| e.field.as_deref() == Some("suite")));
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.field.as_deref() == Some("suite"))
+        );
     }
 }

@@ -23,7 +23,7 @@ struct BrResult {
     stdout: String,
     stderr: String,
     success: bool,
-    duration: Duration,
+    _duration: Duration,
 }
 
 /// Run br command in a specific directory.
@@ -47,7 +47,7 @@ where
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         success: output.status.success(),
-        duration,
+        _duration: duration,
     }
 }
 

@@ -55,7 +55,8 @@ impl DiscoveredBinaries {
         self.bd.as_ref().ok_or_else(|| {
             "bd (Go beads) binary not found. Conformance tests require bd to be installed.\n\
              Install from: https://github.com/steveyegge/beads\n\
-             Or set BD_BINARY env var to the path.".to_string()
+             Or set BD_BINARY env var to the path."
+                .to_string()
         })
     }
 
@@ -81,7 +82,7 @@ fn discover_br() -> Result<BinaryVersion, String> {
     }
 
     // Try cargo-built binary
-    let cargo_bin = assert_cmd::cargo::cargo_bin("br");
+    let cargo_bin = assert_cmd::cargo::cargo_bin!("br");
     if cargo_bin.exists() {
         return probe_binary("br", &cargo_bin);
     }
@@ -124,7 +125,7 @@ fn discover_bd() -> Option<BinaryVersion> {
         PathBuf::from("/usr/local/bin/bd"),
         PathBuf::from("/usr/bin/bd"),
     ];
-    
+
     if !home.as_os_str().is_empty() {
         common_paths.push(home.join(".local/bin/bd"));
         common_paths.push(home.join("go/bin/bd"));
@@ -190,7 +191,10 @@ fn probe_binary(name: &str, path: &Path) -> Result<BinaryVersion, String> {
         });
     }
 
-    Err(format!("Binary at {} does not respond to version commands", path.display()))
+    Err(format!(
+        "Binary at {} does not respond to version commands",
+        path.display()
+    ))
 }
 
 /// Run a version command and capture output.
@@ -230,9 +234,15 @@ fn parse_plain_version(output: &str) -> String {
 
     // Try to extract version number
     for word in output.split_whitespace() {
-        if word.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if word
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             // Include digits, dots, hyphens, and alphanumeric suffixes (e.g., "0.1.0-dev")
-            let version: String = word.chars()
+            let version: String = word
+                .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
                 .collect();
             if !version.is_empty() {
@@ -246,19 +256,18 @@ fn parse_plain_version(output: &str) -> String {
 
 /// Find binary in PATH.
 fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths)
-                .filter_map(|dir| {
-                    let path = dir.join(name);
-                    if path.exists() && path.is_file() {
-                        Some(path)
-                    } else {
-                        None
-                    }
-                })
-                .next()
-        })
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .filter_map(|dir| {
+                let path = dir.join(name);
+                if path.exists() && path.is_file() {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .next()
+    })
 }
 
 /// Discover both br and bd binaries.
@@ -274,7 +283,7 @@ pub fn discover_binaries() -> Result<DiscoveredBinaries, String> {
 /// Check if bd version meets minimum requirements for conformance.
 pub fn check_bd_version(version: &BinaryVersion) -> Result<(), String> {
     let current = &version.version;
-    
+
     // Skip check for development/unknown versions
     if current == "unknown" || current.contains("dev") {
         return Ok(());
@@ -298,10 +307,10 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
             .filter_map(|p| p.parse().ok())
             .collect()
     };
-    
+
     let av = parse(a);
     let bv = parse(b);
-    
+
     av.cmp(&bv)
 }
 
@@ -313,7 +322,7 @@ mod tests {
     fn test_discover_br() {
         let result = discover_br();
         assert!(result.is_ok(), "br should be discoverable: {:?}", result);
-        
+
         let version = result.unwrap();
         assert_eq!(version.binary, "br");
         assert!(version.path.exists());
@@ -323,10 +332,10 @@ mod tests {
     fn test_discover_binaries() {
         let result = discover_binaries();
         assert!(result.is_ok(), "Binary discovery failed: {:?}", result);
-        
+
         let binaries = result.unwrap();
         assert_eq!(binaries.br.binary, "br");
-        
+
         // bd may or may not be available
         if binaries.bd_available() {
             let bd = binaries.bd.as_ref().unwrap();
@@ -355,7 +364,7 @@ mod tests {
     fn test_discovered_binaries_json() {
         let binaries = discover_binaries().expect("discovery failed");
         let json = binaries.to_json();
-        
+
         assert!(json.get("br").is_some());
         assert!(json.get("conformance_ready").is_some());
     }

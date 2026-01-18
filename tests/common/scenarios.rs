@@ -9,13 +9,12 @@
 //! - beads_rust-ir0t: Scenario DSL + normalization rules for conformance
 //! - beads_rust-ag35: EPIC: Exhaustive E2E + Conformance + Benchmark Harness
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::similar_names)]
 
 use super::dataset_registry::{IsolatedDataset, KnownDataset};
 use super::harness::{
     CommandResult, ConformanceWorkspace as HarnessConformanceWorkspace, TestWorkspace,
 };
-use super::*;
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,10 +75,16 @@ pub struct NormalizationRules {
     pub normalize_ids: bool,
     /// Log when normalization is applied
     pub log_normalization: bool,
+    /// Normalize path separators (Windows backslash to Unix forward slash)
+    pub normalize_paths: bool,
+    /// Normalize line endings (CRLF to LF)
+    pub normalize_line_endings: bool,
+    /// Fields that contain file paths and should have separators normalized
+    pub path_fields: HashSet<String>,
 }
 
 impl NormalizationRules {
-    /// Default normalization for conformance (timestamps + IDs).
+    /// Default normalization for conformance (timestamps + IDs + cross-platform).
     pub fn conformance_default() -> Self {
         let mask_fields = [
             "created_at",
@@ -94,6 +99,20 @@ impl NormalizationRules {
         .map(String::from)
         .collect();
 
+        let path_fields = [
+            "path",
+            "file_path",
+            "source_path",
+            "db_path",
+            "jsonl_path",
+            "log_path",
+            "workspace_root",
+            "beads_dir",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
         Self {
             mask_fields,
             remove_fields: HashSet::new(),
@@ -101,6 +120,9 @@ impl NormalizationRules {
             sort_arrays: true,
             normalize_ids: true,
             log_normalization: true,
+            normalize_paths: true,
+            normalize_line_endings: true,
+            path_fields,
         }
     }
 
@@ -108,6 +130,31 @@ impl NormalizationRules {
     pub fn strict() -> Self {
         Self {
             sort_arrays: true,
+            log_normalization: true,
+            ..Default::default()
+        }
+    }
+
+    /// Cross-platform normalization only (paths + line endings).
+    pub fn cross_platform() -> Self {
+        let path_fields = [
+            "path",
+            "file_path",
+            "source_path",
+            "db_path",
+            "jsonl_path",
+            "log_path",
+            "workspace_root",
+            "beads_dir",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        Self {
+            normalize_paths: true,
+            normalize_line_endings: true,
+            path_fields,
             log_normalization: true,
             ..Default::default()
         }
@@ -498,8 +545,6 @@ pub fn measure_peak_rss(_pid: u32) -> Option<u64> {
 
 /// Measure IO sizes (database and JSONL files) in a workspace.
 pub fn measure_io_sizes(workspace_root: &std::path::Path) -> (Option<u64>, Option<u64>) {
-    use std::fs;
-
     let beads_dir = workspace_root.join(".beads");
 
     // Database size

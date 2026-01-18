@@ -5,6 +5,8 @@
 //! - `CommandRunner`: Execute br/bd with env isolation, capture all outputs
 //! - `ArtifactLogger`: JSONL event log, stdout/stderr capture, file tree snapshots
 
+#![allow(clippy::similar_names)]
+
 use assert_cmd::Command;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -18,7 +20,7 @@ use tempfile::TempDir;
 use walkdir::WalkDir;
 
 fn br_binary_path() -> PathBuf {
-    assert_cmd::cargo::cargo_bin("br")
+    assert_cmd::cargo::cargo_bin!("br").to_path_buf()
 }
 
 /// Global mutex for artifact logging to prevent interleaving
@@ -123,7 +125,8 @@ impl Default for ArtifactConfig {
             capture_stdout: true,
             capture_stderr: true,
             capture_snapshots: true,
-            preserve_on_success: std::env::var("HARNESS_PRESERVE_SUCCESS").map_or(false, |v| v == "1"),
+            preserve_on_success: std::env::var("HARNESS_PRESERVE_SUCCESS")
+                .map_or(false, |v| v == "1"),
         }
     }
 }
@@ -167,9 +170,15 @@ impl Default for ResourceGuardrails {
             max_stdout_bytes: parse_env_usize("HARNESS_MAX_STDOUT_BYTES", 1024 * 1024),
             max_stderr_bytes: parse_env_usize("HARNESS_MAX_STDERR_BYTES", 1024 * 1024),
             // 10MB per artifact file
-            max_artifact_file_bytes: parse_env_usize("HARNESS_MAX_ARTIFACT_BYTES", 10 * 1024 * 1024),
+            max_artifact_file_bytes: parse_env_usize(
+                "HARNESS_MAX_ARTIFACT_BYTES",
+                10 * 1024 * 1024,
+            ),
             // 100MB total per test
-            max_artifact_dir_bytes: parse_env_usize("HARNESS_MAX_ARTIFACT_DIR_BYTES", 100 * 1024 * 1024),
+            max_artifact_dir_bytes: parse_env_usize(
+                "HARNESS_MAX_ARTIFACT_DIR_BYTES",
+                100 * 1024 * 1024,
+            ),
             // 7 days retention by default
             artifact_retention_days: parse_env_u32("HARNESS_ARTIFACT_RETENTION_DAYS", 7),
             // 10000 log lines max
@@ -206,13 +215,12 @@ impl Default for RunnerPolicy {
     fn default() -> Self {
         Self {
             // 30 second command timeout by default
-            command_timeout: Duration::from_secs(
-                parse_env_u64("HARNESS_COMMAND_TIMEOUT_SECS", 30)
-            ),
+            command_timeout: Duration::from_secs(parse_env_u64("HARNESS_COMMAND_TIMEOUT_SECS", 30)),
             // 5 minute scenario timeout by default
-            scenario_timeout: Duration::from_secs(
-                parse_env_u64("HARNESS_SCENARIO_TIMEOUT_SECS", 300)
-            ),
+            scenario_timeout: Duration::from_secs(parse_env_u64(
+                "HARNESS_SCENARIO_TIMEOUT_SECS",
+                300,
+            )),
             // Serial by default for safety
             parallelism_mode: if std::env::var("HARNESS_PARALLEL").map_or(false, |v| v == "1") {
                 ParallelismMode::Parallel
@@ -224,7 +232,7 @@ impl Default for RunnerPolicy {
                 "HARNESS_PARALLEL_WORKERS",
                 std::thread::available_parallelism()
                     .map(|p| p.get().min(8))
-                    .unwrap_or(4)
+                    .unwrap_or(4),
             ),
             guardrails: ResourceGuardrails::default(),
             fail_fast: std::env::var("HARNESS_FAIL_FAST").map_or(false, |v| v == "1"),
@@ -266,9 +274,9 @@ impl RunnerPolicy {
     /// Create a benchmark policy with no timeouts
     pub fn benchmark() -> Self {
         Self {
-            command_timeout: Duration::from_secs(3600), // 1 hour
+            command_timeout: Duration::from_secs(3600),  // 1 hour
             scenario_timeout: Duration::from_secs(7200), // 2 hours
-            parallelism_mode: ParallelismMode::Serial, // Serial for accurate timing
+            parallelism_mode: ParallelismMode::Serial,   // Serial for accurate timing
             max_parallel_workers: 1,
             guardrails: ResourceGuardrails {
                 max_stdout_bytes: 100 * 1024 * 1024, // 100MB
@@ -395,13 +403,13 @@ impl ArtifactLogger {
             .join(suite)
             .join(test);
         let config = ArtifactConfig::default();
-        
+
         if config.enabled {
             fs::create_dir_all(&artifact_dir).ok();
         }
-        
+
         let events_path = artifact_dir.join("events.jsonl");
-        
+
         Self {
             suite: suite.to_string(),
             test: test.to_string(),
@@ -478,7 +486,7 @@ impl ArtifactLogger {
 
         let snapshot_path = self.artifact_dir.join(format!("{}.snapshot.json", label));
         let entries = collect_file_tree(workspace_root);
-        
+
         if let Ok(json) = serde_json::to_string_pretty(&entries) {
             fs::write(&snapshot_path, json).ok();
         }
@@ -505,7 +513,7 @@ impl ArtifactLogger {
 
     fn append_event(&self, event: &RunEvent) {
         let _guard = artifact_mutex().lock().expect("artifact mutex");
-        
+
         if let Ok(file) = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -551,7 +559,10 @@ impl ArtifactLogger {
             for entry in fs::read_dir(&self.artifact_dir).into_iter().flatten() {
                 if let Ok(entry) = entry {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "stdout" || e == "stderr") {
+                    if path
+                        .extension()
+                        .map_or(false, |e| e == "stdout" || e == "stderr")
+                    {
                         fs::remove_file(path).ok();
                     }
                 }
@@ -563,7 +574,7 @@ impl ArtifactLogger {
 /// Collect file tree entries for a directory
 fn collect_file_tree(root: &Path) -> Vec<FileEntry> {
     let mut entries = Vec::new();
-    
+
     for entry in WalkDir::new(root)
         .max_depth(5)
         .into_iter()
@@ -575,7 +586,7 @@ fn collect_file_tree(root: &Path) -> Vec<FileEntry> {
             if rel_str.is_empty() {
                 continue;
             }
-            
+
             let metadata = entry.metadata().ok();
             entries.push(FileEntry {
                 path: rel_str,
@@ -584,7 +595,7 @@ fn collect_file_tree(root: &Path) -> Vec<FileEntry> {
             });
         }
     }
-    
+
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     entries
 }
@@ -605,7 +616,7 @@ impl TestWorkspace {
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let logger = ArtifactLogger::new(suite, test);
-        
+
         Self {
             temp_dir,
             root,
@@ -623,19 +634,19 @@ impl TestWorkspace {
                 .current_dir(&self.root)
                 .output()
                 .expect("git init");
-            
+
             std::process::Command::new("git")
                 .args(["config", "user.email", "test@test.local"])
                 .current_dir(&self.root)
                 .output()
                 .ok();
-            
+
             std::process::Command::new("git")
                 .args(["config", "user.name", "Test"])
                 .current_dir(&self.root)
                 .output()
                 .ok();
-            
+
             self.git_initialized = true;
         }
         self
@@ -709,7 +720,13 @@ impl TestWorkspace {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.run_binary_full(binary, args, std::iter::empty::<(String, String)>(), None, label)
+        self.run_binary_full(
+            binary,
+            args,
+            std::iter::empty::<(String, String)>(),
+            None,
+            label,
+        )
     }
 
     fn run_binary_env<I, S, E, K, V>(
@@ -767,13 +784,13 @@ impl TestWorkspace {
         let bin_path = br_binary_path();
         let mut cmd = Command::new(&bin_path);
         cmd.current_dir(&self.root);
-        
+
         let args_vec: Vec<String> = args
             .into_iter()
             .map(|a| a.as_ref().to_string_lossy().to_string())
             .collect();
         cmd.args(&args_vec);
-        
+
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
         cmd.env("RUST_LOG", "beads_rust=debug");
@@ -797,7 +814,14 @@ impl TestWorkspace {
 
         let log_content = format!(
             "label: {}\nbinary: {}\nargs: {:?}\ncwd: {}\nexit_code: {}\nduration: {:?}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}",
-            label, binary, args_vec, self.root.display(), exit_code, duration, stdout, stderr
+            label,
+            binary,
+            args_vec,
+            self.root.display(),
+            exit_code,
+            duration,
+            stdout,
+            stderr
         );
         fs::write(&log_path, &log_content).ok();
 
@@ -813,7 +837,8 @@ impl TestWorkspace {
             timed_out: false,
         };
 
-        self.logger.log_command(label, binary, &args_vec, &self.root, &result);
+        self.logger
+            .log_command(label, binary, &args_vec, &self.root, &result);
 
         result
     }
@@ -849,7 +874,14 @@ impl TestWorkspace {
 
         let log_content = format!(
             "label: {}\nbinary: {}\nargs: {:?}\ncwd: {}\nexit_code: {}\nduration: {:?}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}",
-            label, binary, args_vec, self.root.display(), exit_code, duration, stdout, stderr
+            label,
+            binary,
+            args_vec,
+            self.root.display(),
+            exit_code,
+            duration,
+            stdout,
+            stderr
         );
         fs::write(&log_path, &log_content).ok();
 
@@ -865,7 +897,8 @@ impl TestWorkspace {
             timed_out: false,
         };
 
-        self.logger.log_command(label, binary, &args_vec, &self.root, &result);
+        self.logger
+            .log_command(label, binary, &args_vec, &self.root, &result);
 
         result
     }
@@ -960,7 +993,12 @@ impl ConformanceWorkspace {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.run_in_workspace("br", &self.br_workspace.clone(), args, &format!("br_{}", label))
+        self.run_in_workspace(
+            "br",
+            &self.br_workspace.clone(),
+            args,
+            &format!("br_{}", label),
+        )
     }
 
     /// Run bd command
@@ -969,7 +1007,12 @@ impl ConformanceWorkspace {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.run_in_workspace_system("bd", &self.bd_workspace.clone(), args, &format!("bd_{}", label))
+        self.run_in_workspace_system(
+            "bd",
+            &self.bd_workspace.clone(),
+            args,
+            &format!("bd_{}", label),
+        )
     }
 
     /// Run br command with environment variables
@@ -1107,13 +1150,13 @@ impl ConformanceWorkspace {
         let bin_path = br_binary_path();
         let mut cmd = Command::new(&bin_path);
         cmd.current_dir(cwd);
-        
+
         let args_vec: Vec<String> = args
             .into_iter()
             .map(|a| a.as_ref().to_string_lossy().to_string())
             .collect();
         cmd.args(&args_vec);
-        
+
         cmd.env("NO_COLOR", "1");
         cmd.env("RUST_LOG", "beads_rust=debug");
         cmd.env("RUST_BACKTRACE", "1");
@@ -1130,7 +1173,14 @@ impl ConformanceWorkspace {
         let log_path = self.log_dir.join(format!("{}.log", label));
         let log_content = format!(
             "label: {}\nbinary: {}\nargs: {:?}\ncwd: {}\nexit_code: {}\nduration: {:?}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}",
-            label, binary, args_vec, cwd.display(), exit_code, duration, stdout, stderr
+            label,
+            binary,
+            args_vec,
+            cwd.display(),
+            exit_code,
+            duration,
+            stdout,
+            stderr
         );
         fs::write(&log_path, &log_content).ok();
 
@@ -1146,7 +1196,8 @@ impl ConformanceWorkspace {
             timed_out: false,
         };
 
-        self.logger.log_command(label, binary, &args_vec, cwd, &result);
+        self.logger
+            .log_command(label, binary, &args_vec, cwd, &result);
 
         result
     }
@@ -1199,7 +1250,14 @@ impl ConformanceWorkspace {
         let log_path = self.log_dir.join(format!("{}.log", label));
         let log_content = format!(
             "label: {}\nbinary: {}\nargs: {:?}\ncwd: {}\nexit_code: {}\nduration: {:?}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}",
-            label, binary, args_vec, cwd.display(), exit_code, duration, stdout, stderr
+            label,
+            binary,
+            args_vec,
+            cwd.display(),
+            exit_code,
+            duration,
+            stdout,
+            stderr
         );
         fs::write(&log_path, &log_content).ok();
 
@@ -1215,7 +1273,8 @@ impl ConformanceWorkspace {
             timed_out: false,
         };
 
-        self.logger.log_command(label, binary, &args_vec, cwd, &result);
+        self.logger
+            .log_command(label, binary, &args_vec, cwd, &result);
 
         result
     }
@@ -1255,7 +1314,14 @@ impl ConformanceWorkspace {
         let log_path = self.log_dir.join(format!("{}.log", label));
         let log_content = format!(
             "label: {}\nbinary: {}\nargs: {:?}\ncwd: {}\nexit_code: {}\nduration: {:?}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}",
-            label, binary, args_vec, cwd.display(), exit_code, duration, stdout, stderr
+            label,
+            binary,
+            args_vec,
+            cwd.display(),
+            exit_code,
+            duration,
+            stdout,
+            stderr
         );
         fs::write(&log_path, &log_content).ok();
 
@@ -1271,7 +1337,8 @@ impl ConformanceWorkspace {
             timed_out: false,
         };
 
-        self.logger.log_command(label, binary, &args_vec, cwd, &result);
+        self.logger
+            .log_command(label, binary, &args_vec, cwd, &result);
 
         result
     }
@@ -1314,7 +1381,14 @@ impl ConformanceWorkspace {
             let log_path = self.log_dir.join(format!("{}.log", label));
             let log_content = format!(
                 "label: {}\nbinary: {}\nargs: {:?}\ncwd: {}\nexit_code: {}\nduration: {:?}\n\n--- stdout ---\n{}\n\n--- stderr ---\n{}",
-                label, binary, args_vec, cwd.display(), exit_code, duration, stdout, stderr
+                label,
+                binary,
+                args_vec,
+                cwd.display(),
+                exit_code,
+                duration,
+                stdout,
+                stderr
             );
             fs::write(&log_path, &log_content).ok();
 
@@ -1330,7 +1404,8 @@ impl ConformanceWorkspace {
                 timed_out: false,
             };
 
-            self.logger.log_command(label, binary, &args_vec, cwd, &result);
+            self.logger
+                .log_command(label, binary, &args_vec, cwd, &result);
 
             result
         };
@@ -1365,7 +1440,13 @@ pub fn extract_json_payload(stdout: &str) -> String {
     for (idx, line) in stdout.lines().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('[') || trimmed.starts_with('{') {
-            return stdout.lines().skip(idx).collect::<Vec<_>>().join("\n").trim().to_string();
+            return stdout
+                .lines()
+                .skip(idx)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
         }
     }
     stdout.trim().to_string()
@@ -1565,7 +1646,9 @@ mod tests {
     fn test_artifact_logger_writes_and_cleans() {
         let suite = format!("harness_logger_{}", std::process::id());
         let test = "writes_and_cleans";
-        let artifact_dir = PathBuf::from("target/test-artifacts").join(&suite).join(test);
+        let artifact_dir = PathBuf::from("target/test-artifacts")
+            .join(&suite)
+            .join(test);
 
         let config = ArtifactConfig {
             enabled: true,
@@ -1632,7 +1715,9 @@ mod tests {
     fn test_artifact_logger_snapshot_writes_event() {
         let suite = format!("harness_logger_snapshot_{}", std::process::id());
         let test = "snapshot_event";
-        let artifact_dir = PathBuf::from("target/test-artifacts").join(&suite).join(test);
+        let artifact_dir = PathBuf::from("target/test-artifacts")
+            .join(&suite)
+            .join(test);
 
         let config = ArtifactConfig {
             enabled: true,
@@ -1674,12 +1759,8 @@ mod tests {
         result.assert_success();
 
         let payload = extract_json_payload(&result.stdout);
-        let value: serde_json::Value =
-            serde_json::from_str(&payload).expect("parse where json");
-        let path = value
-            .get("path")
-            .and_then(|p| p.as_str())
-            .unwrap_or("");
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("parse where json");
+        let path = value.get("path").and_then(|p| p.as_str()).unwrap_or("");
 
         let expected = beads_dir.canonicalize().unwrap_or(beads_dir);
         assert_eq!(path, expected.to_string_lossy());

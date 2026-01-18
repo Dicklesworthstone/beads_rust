@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 use beads_rust::storage::SqliteStorage;
 use std::sync::Once;

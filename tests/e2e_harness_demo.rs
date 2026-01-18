@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::harness::{parse_created_id, extract_json_payload, TestWorkspace};
+use common::harness::{TestWorkspace, extract_json_payload, parse_created_id};
 
 #[test]
 fn harness_full_workflow() {
@@ -21,7 +21,14 @@ fn harness_full_workflow() {
 
     // Create an issue
     let create = ws.run_br(
-        ["create", "Test harness issue", "--type", "task", "--priority", "2"],
+        [
+            "create",
+            "Test harness issue",
+            "--type",
+            "task",
+            "--priority",
+            "2",
+        ],
         "create_issue",
     );
     create.assert_success();
@@ -33,7 +40,7 @@ fn harness_full_workflow() {
     // List issues in JSON mode
     let list = ws.run_br(["list", "--json"], "list_json");
     list.assert_success();
-    
+
     let payload = extract_json_payload(&list.stdout);
     let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("parse list json");
     assert!(!issues.is_empty(), "no issues found");
@@ -43,10 +50,7 @@ fn harness_full_workflow() {
     );
 
     // Update the issue
-    let update = ws.run_br(
-        ["update", &id, "--status", "in_progress"],
-        "update_status",
-    );
+    let update = ws.run_br(["update", &id, "--status", "in_progress"], "update_status");
     update.assert_success();
 
     // Show the issue
@@ -72,7 +76,7 @@ fn harness_captures_failure() {
     // Try an invalid command (show nonexistent issue)
     let show = ws.run_br(["show", "nonexistent-id"], "show_invalid");
     show.assert_failure();
-    
+
     // Verify error was captured
     assert!(
         !show.stderr.is_empty() || !show.stdout.is_empty(),
@@ -112,7 +116,7 @@ fn harness_stdin_input() {
     // Create an issue first
     let create = ws.run_br(["create", "Issue for comment"], "create");
     create.assert_success();
-    
+
     let id = parse_created_id(&create.stdout);
     assert!(!id.is_empty(), "missing created id");
 

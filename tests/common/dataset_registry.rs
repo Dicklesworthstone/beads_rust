@@ -111,11 +111,12 @@ impl DatasetRegistry {
 
         for dataset in KnownDataset::all() {
             if let Ok(metadata) = registry.scan_dataset(*dataset) {
-                registry.source_hashes.insert(
-                    dataset.name().to_string(),
-                    metadata.content_hash.clone(),
-                );
-                registry.datasets.insert(dataset.name().to_string(), metadata);
+                registry
+                    .source_hashes
+                    .insert(dataset.name().to_string(), metadata.content_hash.clone());
+                registry
+                    .datasets
+                    .insert(dataset.name().to_string(), metadata);
             }
         }
 
@@ -143,7 +144,11 @@ impl DatasetRegistry {
         if !beads_dir.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("Dataset {} not found at {}", dataset.name(), beads_dir.display()),
+                format!(
+                    "Dataset {} not found at {}",
+                    dataset.name(),
+                    beads_dir.display()
+                ),
             ));
         }
 
@@ -479,14 +484,19 @@ impl DatasetOverride {
 ///
 /// This allows tests to use arbitrary `.beads` directories instead of
 /// the known datasets. The override is logged for traceability.
-pub fn isolated_from_override(override_config: &DatasetOverride) -> std::io::Result<IsolatedDataset> {
+pub fn isolated_from_override(
+    override_config: &DatasetOverride,
+) -> std::io::Result<IsolatedDataset> {
     let source_path = &override_config.path;
     let source_beads_dir = source_path.join(".beads");
 
     if !source_beads_dir.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("Override dataset not found at {}", source_beads_dir.display()),
+            format!(
+                "Override dataset not found at {}",
+                source_beads_dir.display()
+            ),
         ));
     }
 
@@ -667,8 +677,7 @@ impl DatasetIntegrityGuard {
     /// Verify current state matches original.
     fn verify_current(&self, phase: &str) -> IntegrityCheckResult {
         let beads_dir = self.source_path.join(".beads");
-        let current_hash = hash_beads_directory(&beads_dir)
-            .unwrap_or_else(|_| "ERROR".to_string());
+        let current_hash = hash_beads_directory(&beads_dir).unwrap_or_else(|_| "ERROR".to_string());
 
         let passed = current_hash == self.original_hash;
         let message = if passed {
@@ -681,10 +690,7 @@ impl DatasetIntegrityGuard {
         } else {
             format!(
                 "[{}] SOURCE DATASET '{}' WAS MUTATED! Original: {}, Current: {}",
-                phase,
-                self.dataset_name,
-                self.original_hash,
-                current_hash
+                phase, self.dataset_name, self.original_hash, current_hash
             )
         };
 
@@ -827,7 +833,10 @@ impl DatasetProvenance {
 /// })?;
 /// provenance.integrity_after.unwrap().assert_ok();
 /// ```
-pub fn run_with_integrity<F, T>(dataset: KnownDataset, test_fn: F) -> std::io::Result<(T, DatasetProvenance)>
+pub fn run_with_integrity<F, T>(
+    dataset: KnownDataset,
+    test_fn: F,
+) -> std::io::Result<(T, DatasetProvenance)>
 where
     F: FnOnce(&IsolatedDataset) -> std::io::Result<T>,
 {
@@ -876,8 +885,8 @@ mod tests {
 
     #[test]
     fn test_isolated_dataset_copy() {
-        let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
-            .expect("should copy beads_rust");
+        let isolated =
+            IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("should copy beads_rust");
 
         // Verify the copy was created
         assert!(isolated.beads_dir.exists());
@@ -916,8 +925,8 @@ mod tests {
 
     #[test]
     fn test_integrity_guard_creation() {
-        let guard = DatasetIntegrityGuard::new(KnownDataset::BeadsRust)
-            .expect("should create guard");
+        let guard =
+            DatasetIntegrityGuard::new(KnownDataset::BeadsRust).expect("should create guard");
 
         assert_eq!(guard.dataset_name(), "beads_rust");
         assert!(!guard.original_hash().is_empty());
@@ -926,8 +935,8 @@ mod tests {
 
     #[test]
     fn test_integrity_guard_verify_before() {
-        let mut guard = DatasetIntegrityGuard::new(KnownDataset::BeadsRust)
-            .expect("should create guard");
+        let mut guard =
+            DatasetIntegrityGuard::new(KnownDataset::BeadsRust).expect("should create guard");
 
         let result = guard.verify_before();
         assert!(result.passed, "Before check failed: {}", result.message);
@@ -936,8 +945,8 @@ mod tests {
 
     #[test]
     fn test_integrity_guard_verify_after() {
-        let mut guard = DatasetIntegrityGuard::new(KnownDataset::BeadsRust)
-            .expect("should create guard");
+        let mut guard =
+            DatasetIntegrityGuard::new(KnownDataset::BeadsRust).expect("should create guard");
 
         // Verify both before and after
         let before = guard.verify_before();
@@ -952,8 +961,8 @@ mod tests {
 
     #[test]
     fn test_integrity_guard_to_json() {
-        let mut guard = DatasetIntegrityGuard::new(KnownDataset::BeadsRust)
-            .expect("should create guard");
+        let mut guard =
+            DatasetIntegrityGuard::new(KnownDataset::BeadsRust).expect("should create guard");
 
         guard.verify_before();
         guard.verify_after();
@@ -995,8 +1004,7 @@ mod tests {
 
     #[test]
     fn test_dataset_override_with_name() {
-        let override_cfg = DatasetOverride::new("/some/path", "test")
-            .with_name("custom_name");
+        let override_cfg = DatasetOverride::new("/some/path", "test").with_name("custom_name");
 
         assert_eq!(override_cfg.name, Some("custom_name".to_string()));
     }
@@ -1010,8 +1018,8 @@ mod tests {
         )
         .with_name("override_test");
 
-        let isolated = isolated_from_override(&override_cfg)
-            .expect("should create isolated from override");
+        let isolated =
+            isolated_from_override(&override_cfg).expect("should create isolated from override");
 
         // Verify metadata reflects override
         assert_eq!(isolated.metadata.name, "override_test");
@@ -1079,8 +1087,14 @@ mod tests {
             .with_context("test_name", "my_test")
             .with_context("scenario", "basic");
 
-        assert_eq!(provenance.context.get("test_name"), Some(&"my_test".to_string()));
-        assert_eq!(provenance.context.get("scenario"), Some(&"basic".to_string()));
+        assert_eq!(
+            provenance.context.get("test_name"),
+            Some(&"my_test".to_string())
+        );
+        assert_eq!(
+            provenance.context.get("scenario"),
+            Some(&"basic".to_string())
+        );
     }
 
     #[test]
@@ -1149,8 +1163,8 @@ mod tests {
 
     #[test]
     fn test_metadata_includes_source_commit() {
-        let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
-            .expect("should copy beads_rust");
+        let isolated =
+            IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("should copy beads_rust");
 
         // beads_rust should have a git repo, so source_commit should be set
         assert!(
@@ -1161,8 +1175,8 @@ mod tests {
 
     #[test]
     fn test_metadata_to_json_includes_new_fields() {
-        let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
-            .expect("should copy beads_rust");
+        let isolated =
+            IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("should copy beads_rust");
 
         let json = isolated.metadata.to_json();
 
