@@ -34,3 +34,9 @@ a.out
 # Temp directories and crash reports
 temp_test*/
 rustc-ice-*.txt
+
+# Large source images (webp versions are committed)
+*.png
+
+# Claude Code temp files
+claude-upgrade-progress.json
