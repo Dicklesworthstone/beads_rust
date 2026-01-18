@@ -1081,8 +1081,12 @@ impl SqliteStorage {
 
         // Find all issues that are blocked by a dependency
         // An issue is blocked if:
-        // 1. It has a blocking-type dependency (blocks, parent-child, conditional-blocks, waits-for)
+        // 1. It has a blocking-type dependency (blocks, conditional-blocks, waits-for)
         // 2. The blocker issue has a blocking status (anything NOT closed/tombstone)
+        //
+        // Note: parent-child is NOT included here. A child is not blocked just because
+        // its parent epic is open. However, if the parent is blocked by something else,
+        // that blocking propagates to children (handled in the transitive section below).
         //
         // For conditional-blocks, we also need to check if the blocker closed with failure
         // but for simplicity in this initial implementation, we treat it like blocks.
@@ -1092,7 +1096,7 @@ impl SqliteStorage {
                          COALESCE(GROUP_CONCAT(d.depends_on_id || ':' || COALESCE(i.status, 'unknown'), ','), '')
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')
+                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
                     AND d.depends_on_id NOT LIKE 'external:%'
                     AND (
                       -- The blocker is in a blocking state (anything not terminal)
