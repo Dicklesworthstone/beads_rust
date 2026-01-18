@@ -248,7 +248,8 @@ fn output_empty(json: bool) {
     if json {
         println!("[]");
     } else {
-        println!("No orphan issues found");
+        // Match bd format
+        println!("✓ No orphaned issues found");
     }
 }
 

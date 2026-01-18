@@ -127,6 +127,7 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
                 blocked_by_count: bi.blocked_by_count,
                 created_at: bi.issue.created_at,
                 created_by: bi.issue.created_by.clone(),
+                description: bi.issue.description.clone(),
                 id: bi.issue.id.clone(),
                 issue_type: bi.issue.issue_type.clone(),
                 priority: bi.issue.priority,
@@ -188,7 +189,8 @@ fn print_text_output(
     storage: &crate::storage::SqliteStorage,
 ) {
     if blocked_issues.is_empty() {
-        println!("No blocked issues.");
+        // Match bd format
+        println!("✨ No blocked issues");
         return;
     }
 

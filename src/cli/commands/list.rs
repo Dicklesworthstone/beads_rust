@@ -108,14 +108,10 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
             print!("{csv_output}");
         }
         OutputFormat::Text => {
-            if issues.is_empty() {
-                println!("No issues found.");
-            } else {
-                for issue in &issues {
-                    let line = format_issue_line_with(issue, format_options);
-                    println!("{line}");
-                }
-                println!("\n{} issue(s)", issues.len());
+            // Note: bd outputs nothing when no issues found, matching that for conformance
+            for issue in &issues {
+                let line = format_issue_line_with(issue, format_options);
+                println!("{line}");
             }
         }
     }

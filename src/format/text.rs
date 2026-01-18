@@ -124,9 +124,11 @@ pub fn format_priority_label(priority: &Priority, use_color: bool) -> String {
 }
 
 /// Format priority badge with optional color.
+///
+/// Matches bd format: `[● P2]` (bullet before priority number).
 #[must_use]
 pub fn format_priority_badge(priority: &Priority, use_color: bool) -> String {
-    format!("[{}]", format_priority_label(priority, use_color))
+    format!("[● {}]", format_priority_label(priority, use_color))
 }
 
 /// Format issue type as a bracketed badge.
@@ -217,13 +219,16 @@ fn visible_len(text: &str) -> usize {
 
 /// Format a single-line issue summary with options.
 ///
-/// Format: `{icon} {id} [{priority}] [{type}] {title}`
+/// Format: `{icon} {id} [● {priority}] [{type}] - {title}`
+/// (matches bd text output format)
 #[must_use]
 pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> String {
     let status_icon_plain = format_status_icon(&issue.status);
-    let priority_badge_plain = format!("[{}]", format_priority(&issue.priority));
+    // Account for the bullet in priority badge: [● P2]
+    let priority_badge_plain = format!("[● {}]", format_priority(&issue.priority));
     let type_badge_plain = format_type_badge(&issue.issue_type);
 
+    // Add 3 for " - " separator between type badge and title
     let prefix_len = visible_len(status_icon_plain)
         + 1
         + visible_len(&issue.id)
@@ -231,7 +236,7 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
         + visible_len(&priority_badge_plain)
         + 1
         + visible_len(&type_badge_plain)
-        + 1;
+        + 3; // " - " separator
 
     let title = options.max_width.map_or_else(
         || issue.title.clone(),
@@ -243,7 +248,7 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
     let type_badge = format_type_badge_colored(&issue.issue_type, options.use_color);
 
     format!(
-        "{status_icon} {} {priority_badge} {type_badge} {title}",
+        "{status_icon} {} {priority_badge} {type_badge} - {title}",
         issue.id
     )
 }
@@ -347,7 +352,8 @@ mod tests {
     fn test_format_issue_line_open() {
         let issue = make_test_issue();
         let line = format_issue_line(&issue);
-        assert_eq!(line, "○ bd-test [P2] [task] Test title");
+        // Format matches bd: {icon} {id} [● {priority}] [{type}] - {title}
+        assert_eq!(line, "○ bd-test [● P2] [task] - Test title");
     }
 
     #[test]
@@ -373,7 +379,7 @@ mod tests {
         issue.priority = Priority::HIGH;
         issue.title = "Critical bug".to_string();
         let line = format_issue_line(&issue);
-        assert!(line.contains("[P1]"));
+        assert!(line.contains("[● P1]"));
         assert!(line.contains("[bug]"));
         assert!(line.contains("Critical bug"));
     }
@@ -384,7 +390,7 @@ mod tests {
         issue.issue_type = IssueType::Epic;
         issue.priority = Priority::CRITICAL;
         let line = format_issue_line(&issue);
-        assert!(line.contains("[P0]"));
+        assert!(line.contains("[● P0]"));
         assert!(line.contains("[epic]"));
     }
 

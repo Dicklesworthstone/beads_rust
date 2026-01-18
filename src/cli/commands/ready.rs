@@ -82,16 +82,17 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
         let json_output = serde_json::to_string_pretty(&ready_output)?;
         println!("{json_output}");
     } else if ready_issues.is_empty() {
-        println!("No issues ready to work on.");
+        // Match bd empty output format
+        println!("✨ No open issues");
     } else {
+        // Match bd header format: 📋 Ready work (N issues with no blockers):
         println!(
-            "Ready to work ({} issue{}):\n",
+            "📋 Ready work ({} issue{} with no blockers):\n",
             ready_issues.len(),
             if ready_issues.len() == 1 { "" } else { "s" }
         );
         for (i, issue) in ready_issues.iter().enumerate() {
-            let assignee = issue.assignee.as_deref().unwrap_or("unassigned");
-            let line = format_ready_line(i + 1, issue, assignee, use_color, max_width);
+            let line = format_ready_line(i + 1, issue, use_color, max_width);
             println!("{line}");
         }
     }
@@ -102,25 +103,25 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
 fn format_ready_line(
     index: usize,
     issue: &crate::model::Issue,
-    assignee: &str,
     use_color: bool,
     max_width: Option<usize>,
 ) -> String {
-    let priority_badge_plain = format!("[{}]", crate::format::format_priority(&issue.priority));
-    let prefix_plain = format!("{index}. {priority_badge_plain} {} ", issue.id);
-    let suffix_plain = format!(" ({assignee})");
+    // Match bd format: {index}. [● P{n}] [{type}] {id}: {title}
+    let priority_badge_plain = format!("[● {}]", crate::format::format_priority(&issue.priority));
+    let type_badge_plain = format!("[{}]", issue.issue_type.as_str());
+    let prefix_plain = format!("{index}. {priority_badge_plain} {type_badge_plain} {}: ", issue.id);
     let title = max_width.map_or_else(
         || issue.title.clone(),
         |width| {
-            let max_title =
-                width.saturating_sub(prefix_plain.chars().count() + suffix_plain.chars().count());
+            let max_title = width.saturating_sub(prefix_plain.chars().count());
             truncate_title(&issue.title, max_title)
         },
     );
 
     let priority_badge = format_priority_badge(&issue.priority, use_color);
+    let type_badge = crate::format::format_type_badge_colored(&issue.issue_type, use_color);
     format!(
-        "{index}. {priority_badge} {} {title}{suffix_plain}",
+        "{index}. {priority_badge} {type_badge} {}: {title}",
         issue.id
     )
 }

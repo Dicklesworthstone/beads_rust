@@ -377,29 +377,31 @@ fn compute_recent_activity(beads_dir: &Path, hours: u32) -> Option<RecentActivit
 
 /// Print text output for stats.
 fn print_text_output(output: &Statistics) {
-    println!("Project Statistics");
-    println!("==================\n");
+    // Match bd format: 📊 Issue Database Status
+    println!("📊 Issue Database Status\n");
 
     let s = &output.summary;
     println!("Summary:");
-    println!("  Total issues:     {}", s.total_issues);
-    println!("  Open:             {}", s.open_issues);
-    println!("  In Progress:      {}", s.in_progress_issues);
-    println!("  Closed:           {}", s.closed_issues);
-    println!("  Blocked:          {}", s.blocked_issues);
-    println!("  Deferred:         {}", s.deferred_issues);
-    println!("  Ready:            {}", s.ready_issues);
+    // Match bd alignment (right-aligned numbers, 18-char label width)
+    println!("  Total Issues:           {}", s.total_issues);
+    println!("  Open:                   {}", s.open_issues);
+    println!("  In Progress:            {}", s.in_progress_issues);
+    println!("  Blocked:                {}", s.blocked_issues);
+    println!("  Closed:                 {}", s.closed_issues);
+    println!("  Ready to Work:          {}", s.ready_issues);
+
+    // Optional fields (only show if non-zero)
+    if s.deferred_issues > 0 {
+        println!("  Deferred:               {}", s.deferred_issues);
+    }
     if s.tombstone_issues > 0 {
-        println!("  Tombstones:       {}", s.tombstone_issues);
+        println!("  Tombstones:             {}", s.tombstone_issues);
     }
     if s.pinned_issues > 0 {
-        println!("  Pinned:           {}", s.pinned_issues);
+        println!("  Pinned:                 {}", s.pinned_issues);
     }
     if s.epics_eligible_for_closure > 0 {
-        println!("  Epics ready to close: {}", s.epics_eligible_for_closure);
-    }
-    if let Some(avg) = s.average_lead_time_hours {
-        println!("  Avg lead time:    {avg:.1}h");
+        println!("  Epics ready to close:   {}", s.epics_eligible_for_closure);
     }
 
     for breakdown in &output.breakdowns {
@@ -411,13 +413,16 @@ fn print_text_output(output: &Statistics) {
 
     if let Some(activity) = &output.recent_activity {
         println!("\nRecent Activity (last {} hours):", activity.hours_tracked);
-        println!("  Commits:         {}", activity.commit_count);
-        println!("  Total Changes:   {}", activity.total_changes);
-        println!("  Issues Created:  {}", activity.issues_created);
-        println!("  Issues Closed:   {}", activity.issues_closed);
-        println!("  Issues Reopened: {}", activity.issues_reopened);
-        println!("  Issues Updated:  {}", activity.issues_updated);
+        println!("  Commits:                {}", activity.commit_count);
+        println!("  Total Changes:          {}", activity.total_changes);
+        println!("  Issues Created:         {}", activity.issues_created);
+        println!("  Issues Closed:          {}", activity.issues_closed);
+        println!("  Issues Reopened:        {}", activity.issues_reopened);
+        println!("  Issues Updated:         {}", activity.issues_updated);
     }
+
+    // Match bd footer
+    println!("\nFor more details, use 'bd list' to see individual issues.");
 }
 
 #[cfg(test)]

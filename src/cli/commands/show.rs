@@ -2,7 +2,7 @@
 
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{format_priority_badge, format_status_label};
+use crate::format::{format_priority_label, format_status_icon_colored};
 use crate::util::id::{IdResolver, ResolverConfig};
 use std::fmt::Write as FmtWrite;
 
@@ -54,9 +54,11 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
         let output = serde_json::to_string_pretty(&details_list)?;
         println!("{output}");
     } else {
-        for details in details_list {
-            print_issue_details(&details, use_color);
-            println!("----------------------------------------");
+        for (i, details) in details_list.iter().enumerate() {
+            if i > 0 {
+                println!(); // Separate multiple issues
+            }
+            print_issue_details(details, use_color);
         }
     }
 
@@ -71,12 +73,35 @@ fn print_issue_details(details: &crate::format::IssueDetails, use_color: bool) {
 fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) -> String {
     let mut output = String::new();
     let issue = &details.issue;
-    let priority_badge = format_priority_badge(&issue.priority, use_color);
-    let status_label = format_status_label(&issue.status, use_color);
+    let status_icon = format_status_icon_colored(&issue.status, use_color);
+    let priority_label = format_priority_label(&issue.priority, use_color);
+    let status_upper = issue.status.as_str().to_uppercase();
+
+    // Match bd format: {status_icon} {id} · {title}   [● {priority} · {STATUS}]
     let _ = writeln!(
         output,
-        "{} {} {priority_badge} [{}]",
-        issue.id, issue.title, status_label
+        "{} {} · {}   [● {} · {}]",
+        status_icon, issue.id, issue.title, priority_label, status_upper
+    );
+
+    // Owner/Type line: Owner: {owner} · Type: {type}
+    let owner = issue
+        .owner
+        .clone()
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
+    let _ = writeln!(
+        output,
+        "Owner: {} · Type: {}",
+        owner,
+        issue.issue_type.as_str()
+    );
+
+    // Created/Updated line
+    let _ = writeln!(
+        output,
+        "Created: {} · Updated: {}",
+        issue.created_at.format("%Y-%m-%d"),
+        issue.updated_at.format("%Y-%m-%d")
     );
 
     if let Some(assignee) = &issue.assignee {
