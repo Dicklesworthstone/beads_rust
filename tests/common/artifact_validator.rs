@@ -1,7 +1,7 @@
 //! Artifact Log Validator
 //!
 //! Validates JSONL event logs, snapshot files, and summaries against the
-//! documented schema in docs/ARTIFACT_LOG_SCHEMA.md.
+//! documented schema in `docs/ARTIFACT_LOG_SCHEMA.md`.
 //!
 //! Task: beads_rust-r23m
 
@@ -19,7 +19,7 @@ pub struct ValidationResult {
 }
 
 impl ValidationResult {
-    pub fn ok() -> Self {
+    pub const fn ok() -> Self {
         Self {
             valid: true,
             errors: vec![],
@@ -75,7 +75,7 @@ pub enum EventType {
     Snapshot,
 }
 
-/// JSONL event entry - matches harness::RunEvent
+/// JSONL event entry - matches `harness::RunEvent`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub timestamp: String,
