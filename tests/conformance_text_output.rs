@@ -162,13 +162,28 @@ impl TextComparisonResult {
 /// Extract issue ID from create output
 fn extract_id_from_create(stdout: &str) -> String {
     // br output: "Created bd-abc123: Title"
-    // bd output: "Created bd-abc123: Title"
-    let line = stdout.lines().next().unwrap_or("");
-    line.strip_prefix("Created ")
-        .and_then(|rest| rest.split(':').next())
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    // bd output: "✓ Created issue: bd_workspace-xxx"
+    //            "  Title: ..."
+    for line in stdout.lines() {
+        let line = line.trim();
+        // Handle br format: "Created ID: Title"
+        if let Some(rest) = line.strip_prefix("Created ") {
+            if let Some(id) = rest.split(':').next() {
+                let id = id.trim();
+                if !id.is_empty() && !id.starts_with("issue") {
+                    return id.to_string();
+                }
+            }
+        }
+        // Handle bd format: "✓ Created issue: ID" or "Created issue: ID"
+        if let Some(rest) = line.strip_prefix("✓ Created issue: ") {
+            return rest.trim().to_string();
+        }
+        if let Some(rest) = line.strip_prefix("Created issue: ") {
+            return rest.trim().to_string();
+        }
+    }
+    String::new()
 }
 
 // ============================================================================
