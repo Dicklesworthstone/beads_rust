@@ -1247,4 +1247,158 @@ mod tests {
         let mode = ParallelismMode::default();
         assert_eq!(mode, ParallelismMode::Serial);
     }
+
+    #[test]
+    fn test_collect_file_tree_deterministic_order() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let root = temp_dir.path();
+
+        fs::create_dir_all(root.join("b_dir")).expect("create b_dir");
+        fs::create_dir_all(root.join("a_dir")).expect("create a_dir");
+        fs::write(root.join("b_dir/file_b.txt"), "b").expect("write file_b");
+        fs::write(root.join("a_dir/file_a.txt"), "a").expect("write file_a");
+
+        let entries = collect_file_tree(root);
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+
+        assert!(paths.contains(&"a_dir".to_string()));
+        assert!(paths.contains(&"a_dir/file_a.txt".to_string()));
+        assert!(paths.contains(&"b_dir".to_string()));
+        assert!(paths.contains(&"b_dir/file_b.txt".to_string()));
+
+        for window in paths.windows(2) {
+            assert!(
+                window[0] <= window[1],
+                "paths not sorted: {} > {}",
+                window[0],
+                window[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_artifact_logger_writes_and_cleans() {
+        let suite = format!("harness_logger_{}", std::process::id());
+        let test = "writes_and_cleans";
+        let artifact_dir = PathBuf::from("target/test-artifacts").join(&suite).join(test);
+
+        let config = ArtifactConfig {
+            enabled: true,
+            capture_stdout: true,
+            capture_stderr: true,
+            capture_snapshots: false,
+            preserve_on_success: false,
+        };
+
+        let mut logger = ArtifactLogger::new(&suite, test).with_config(config);
+
+        let result = CommandResult {
+            stdout: "stdout data".to_string(),
+            stderr: "stderr data".to_string(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_millis(5),
+            log_path: PathBuf::from("dummy.log"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+
+        logger.log_command(
+            "sample",
+            "br",
+            &vec!["--version".to_string()],
+            Path::new("."),
+            &result,
+        );
+
+        let events_path = artifact_dir.join("events.jsonl");
+        assert!(events_path.exists(), "events.jsonl not written");
+        let events = fs::read_to_string(&events_path).expect("read events.jsonl");
+        assert!(events.contains("\"event_type\":\"command\""));
+
+        let has_stdout = fs::read_dir(&artifact_dir)
+            .expect("read artifact dir")
+            .flatten()
+            .any(|entry| entry.path().extension().map_or(false, |e| e == "stdout"));
+        let has_stderr = fs::read_dir(&artifact_dir)
+            .expect("read artifact dir")
+            .flatten()
+            .any(|entry| entry.path().extension().map_or(false, |e| e == "stderr"));
+        assert!(has_stdout, "stdout artifact missing");
+        assert!(has_stderr, "stderr artifact missing");
+
+        logger.write_summary(true);
+        assert!(artifact_dir.join("summary.json").exists());
+
+        let has_stdout = fs::read_dir(&artifact_dir)
+            .expect("read artifact dir")
+            .flatten()
+            .any(|entry| entry.path().extension().map_or(false, |e| e == "stdout"));
+        let has_stderr = fs::read_dir(&artifact_dir)
+            .expect("read artifact dir")
+            .flatten()
+            .any(|entry| entry.path().extension().map_or(false, |e| e == "stderr"));
+        assert!(!has_stdout, "stdout artifacts not cleaned on success");
+        assert!(!has_stderr, "stderr artifacts not cleaned on success");
+    }
+
+    #[test]
+    fn test_artifact_logger_snapshot_writes_event() {
+        let suite = format!("harness_logger_snapshot_{}", std::process::id());
+        let test = "snapshot_event";
+        let artifact_dir = PathBuf::from("target/test-artifacts").join(&suite).join(test);
+
+        let config = ArtifactConfig {
+            enabled: true,
+            capture_stdout: false,
+            capture_stderr: false,
+            capture_snapshots: true,
+            preserve_on_success: true,
+        };
+
+        let mut logger = ArtifactLogger::new(&suite, test).with_config(config);
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        fs::write(temp_dir.path().join("file.txt"), "content").expect("write file");
+
+        logger.log_snapshot("snapshot", temp_dir.path());
+
+        let snapshot_path = artifact_dir.join("snapshot.snapshot.json");
+        assert!(snapshot_path.exists(), "snapshot file missing");
+
+        let events_path = artifact_dir.join("events.jsonl");
+        let events = fs::read_to_string(&events_path).expect("read events.jsonl");
+        assert!(events.contains("\"event_type\":\"snapshot\""));
+    }
+
+    #[test]
+    fn test_run_br_env_uses_override() {
+        let mut ws = TestWorkspace::new("harness", "run_br_env_override");
+        let init = ws.init_br();
+        init.assert_success();
+
+        let beads_dir = ws.beads_dir.clone();
+        let override_value = beads_dir.to_string_lossy().to_string();
+
+        let result = ws.run_br_env(
+            ["where", "--json"],
+            [("BEADS_DIR", override_value)],
+            "where_env",
+        );
+        result.assert_success();
+
+        let payload = extract_json_payload(&result.stdout);
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("parse where json");
+        let path = value
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
+
+        let expected = beads_dir.canonicalize().unwrap_or(beads_dir);
+        assert_eq!(path, expected.to_string_lossy());
+
+        ws.finish(true);
+    }
 }

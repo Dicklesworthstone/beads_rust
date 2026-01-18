@@ -158,11 +158,7 @@ fn filter_by_priority(issues: &mut Vec<BlockedIssue>, priorities: &[String]) {
         return;
     }
 
-    issues.retain(|bi| {
-        parsed
-            .iter()
-            .any(|&p| p == bi.issue.priority)
-    });
+    issues.retain(|bi| parsed.contains(&bi.issue.priority));
 }
 
 fn print_text_output(
