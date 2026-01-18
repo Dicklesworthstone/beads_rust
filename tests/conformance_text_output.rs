@@ -62,9 +62,7 @@ fn normalize_text_for_conformance(text: &str) -> String {
     normalized = ID_RE.replace_all(&normalized, "ISSUE_ID").to_string();
 
     // 4. Mask full timestamps
-    normalized = TS_FULL_RE
-        .replace_all(&normalized, "TIMESTAMP")
-        .to_string();
+    normalized = TS_FULL_RE.replace_all(&normalized, "TIMESTAMP").to_string();
 
     // 5. Mask dates
     normalized = DATE_RE.replace_all(&normalized, "DATE").to_string();
@@ -94,7 +92,9 @@ fn normalize_text_for_conformance(text: &str) -> String {
     normalized = trimmed.join("\n");
 
     // 11. Collapse multiple blank lines
-    normalized = MULTIPLE_BLANK_RE.replace_all(&normalized, "\n\n").to_string();
+    normalized = MULTIPLE_BLANK_RE
+        .replace_all(&normalized, "\n\n")
+        .to_string();
 
     // 12. Trim leading/trailing whitespace from the entire output
     normalized = normalized.trim().to_string();
@@ -198,9 +198,7 @@ fn conformance_text_list_empty() {
     assert!(
         result.matches,
         "Text output mismatch for 'list' (empty):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -234,9 +232,7 @@ fn conformance_text_list_with_issues() {
     assert!(
         result.matches,
         "Text output mismatch for 'list' (with issues):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -269,9 +265,7 @@ fn conformance_text_show() {
     assert!(
         result.matches,
         "Text output mismatch for 'show':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -296,9 +290,7 @@ fn conformance_text_ready_empty() {
     assert!(
         result.matches,
         "Text output mismatch for 'ready' (empty):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -313,12 +305,30 @@ fn conformance_text_ready_with_issues() {
     workspace.init_both();
 
     // Create issues with different priorities
-    workspace.run_br(["create", "High priority task", "--priority", "1"], "create1");
-    workspace.run_bd(["create", "High priority task", "--priority", "1"], "create1");
-    workspace.run_br(["create", "Medium priority task", "--priority", "2"], "create2");
-    workspace.run_bd(["create", "Medium priority task", "--priority", "2"], "create2");
-    workspace.run_br(["create", "Low priority task", "--priority", "3"], "create3");
-    workspace.run_bd(["create", "Low priority task", "--priority", "3"], "create3");
+    workspace.run_br(
+        ["create", "High priority task", "--priority", "1"],
+        "create1",
+    );
+    workspace.run_bd(
+        ["create", "High priority task", "--priority", "1"],
+        "create1",
+    );
+    workspace.run_br(
+        ["create", "Medium priority task", "--priority", "2"],
+        "create2",
+    );
+    workspace.run_bd(
+        ["create", "Medium priority task", "--priority", "2"],
+        "create2",
+    );
+    workspace.run_br(
+        ["create", "Low priority task", "--priority", "3"],
+        "create3",
+    );
+    workspace.run_bd(
+        ["create", "Low priority task", "--priority", "3"],
+        "create3",
+    );
 
     let br_ready = workspace.run_br(["ready"], "ready");
     let bd_ready = workspace.run_bd(["ready"], "ready");
@@ -331,9 +341,7 @@ fn conformance_text_ready_with_issues() {
     assert!(
         result.matches,
         "Text output mismatch for 'ready' (with issues):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -350,17 +358,23 @@ fn conformance_text_blocked_empty() {
     let br_blocked = workspace.run_br(["blocked"], "blocked");
     let bd_blocked = workspace.run_bd(["blocked"], "blocked");
 
-    assert!(br_blocked.success, "br blocked failed: {}", br_blocked.stderr);
-    assert!(bd_blocked.success, "bd blocked failed: {}", bd_blocked.stderr);
+    assert!(
+        br_blocked.success,
+        "br blocked failed: {}",
+        br_blocked.stderr
+    );
+    assert!(
+        bd_blocked.success,
+        "bd blocked failed: {}",
+        bd_blocked.stderr
+    );
 
     let result = TextComparisonResult::compare(&br_blocked.stdout, &bd_blocked.stdout);
 
     assert!(
         result.matches,
         "Text output mismatch for 'blocked' (empty):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -400,9 +414,7 @@ fn conformance_text_blocked_with_issues() {
     assert!(
         result.matches,
         "Text output mismatch for 'blocked' (with issues):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -428,9 +440,7 @@ fn conformance_text_stats_empty() {
     assert!(
         result.matches,
         "Text output mismatch for 'stats' (empty):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -469,9 +479,7 @@ fn conformance_text_stats_with_issues() {
     assert!(
         result.matches,
         "Text output mismatch for 'stats' (with issues):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -490,11 +498,9 @@ fn conformance_text_orphans_empty() {
 
     // Exit code behavior should match
     assert_eq!(
-        br_orphans.success,
-        bd_orphans.success,
+        br_orphans.success, bd_orphans.success,
         "Exit code mismatch for 'orphans' (empty): br={}, bd={}",
-        br_orphans.exit_code,
-        bd_orphans.exit_code
+        br_orphans.exit_code, bd_orphans.exit_code
     );
 
     let result = TextComparisonResult::compare(&br_orphans.stdout, &bd_orphans.stdout);
@@ -502,9 +508,7 @@ fn conformance_text_orphans_empty() {
     assert!(
         result.matches,
         "Text output mismatch for 'orphans' (empty):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -533,17 +537,23 @@ fn conformance_text_list_status_filter() {
     let br_list = workspace.run_br(["list", "--status", "open"], "list_open");
     let bd_list = workspace.run_bd(["list", "--status", "open"], "list_open");
 
-    assert!(br_list.success, "br list --status failed: {}", br_list.stderr);
-    assert!(bd_list.success, "bd list --status failed: {}", bd_list.stderr);
+    assert!(
+        br_list.success,
+        "br list --status failed: {}",
+        br_list.stderr
+    );
+    assert!(
+        bd_list.success,
+        "bd list --status failed: {}",
+        bd_list.stderr
+    );
 
     let result = TextComparisonResult::compare(&br_list.stdout, &bd_list.stdout);
 
     assert!(
         result.matches,
         "Text output mismatch for 'list --status open':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -560,8 +570,14 @@ fn conformance_text_list_type_filter() {
     // Create issues with different types
     workspace.run_br(["create", "Bug report", "--type", "bug"], "create_bug");
     workspace.run_bd(["create", "Bug report", "--type", "bug"], "create_bug");
-    workspace.run_br(["create", "Feature request", "--type", "feature"], "create_feature");
-    workspace.run_bd(["create", "Feature request", "--type", "feature"], "create_feature");
+    workspace.run_br(
+        ["create", "Feature request", "--type", "feature"],
+        "create_feature",
+    );
+    workspace.run_bd(
+        ["create", "Feature request", "--type", "feature"],
+        "create_feature",
+    );
     workspace.run_br(["create", "Regular task", "--type", "task"], "create_task");
     workspace.run_bd(["create", "Regular task", "--type", "task"], "create_task");
 
@@ -577,9 +593,7 @@ fn conformance_text_list_type_filter() {
     assert!(
         result.matches,
         "Text output mismatch for 'list --type bug':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -598,24 +612,36 @@ fn conformance_text_list_priority_filter() {
     workspace.run_bd(["create", "Critical issue", "--priority", "0"], "create_p0");
     workspace.run_br(["create", "High priority", "--priority", "1"], "create_p1");
     workspace.run_bd(["create", "High priority", "--priority", "1"], "create_p1");
-    workspace.run_br(["create", "Medium priority", "--priority", "2"], "create_p2");
-    workspace.run_bd(["create", "Medium priority", "--priority", "2"], "create_p2");
+    workspace.run_br(
+        ["create", "Medium priority", "--priority", "2"],
+        "create_p2",
+    );
+    workspace.run_bd(
+        ["create", "Medium priority", "--priority", "2"],
+        "create_p2",
+    );
 
     // List only critical (P0) issues
     let br_list = workspace.run_br(["list", "--priority", "0"], "list_p0");
     let bd_list = workspace.run_bd(["list", "--priority", "0"], "list_p0");
 
-    assert!(br_list.success, "br list --priority failed: {}", br_list.stderr);
-    assert!(bd_list.success, "bd list --priority failed: {}", bd_list.stderr);
+    assert!(
+        br_list.success,
+        "br list --priority failed: {}",
+        br_list.stderr
+    );
+    assert!(
+        bd_list.success,
+        "bd list --priority failed: {}",
+        bd_list.stderr
+    );
 
     let result = TextComparisonResult::compare(&br_list.stdout, &bd_list.stdout);
 
     assert!(
         result.matches,
         "Text output mismatch for 'list --priority 0':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
@@ -634,15 +660,13 @@ fn conformance_text_show_not_found() {
 
     // Both should fail consistently
     assert_eq!(
-        br_show.success,
-        bd_show.success,
+        br_show.success, bd_show.success,
         "Exit code mismatch for 'show' (not found): br={}, bd={}",
-        br_show.exit_code,
-        bd_show.exit_code
+        br_show.exit_code, bd_show.exit_code
     );
 
-    // Compare stderr for error message parity
-    let result = TextComparisonResult::compare(&br_show.stderr, &bd_show.stderr);
+    // Compare stderr for error message parity (not asserted, just compared for debugging)
+    let _result = TextComparisonResult::compare(&br_show.stderr, &bd_show.stderr);
 
     // Note: Error messages may differ, so we just verify both fail
     if !br_show.success && !bd_show.success {
@@ -671,17 +695,23 @@ fn conformance_text_ready_with_limit() {
     let br_ready = workspace.run_br(["ready", "--limit", "2"], "ready");
     let bd_ready = workspace.run_bd(["ready", "--limit", "2"], "ready");
 
-    assert!(br_ready.success, "br ready --limit failed: {}", br_ready.stderr);
-    assert!(bd_ready.success, "bd ready --limit failed: {}", bd_ready.stderr);
+    assert!(
+        br_ready.success,
+        "br ready --limit failed: {}",
+        br_ready.stderr
+    );
+    assert!(
+        bd_ready.success,
+        "bd ready --limit failed: {}",
+        bd_ready.stderr
+    );
 
     let result = TextComparisonResult::compare(&br_ready.stdout, &bd_ready.stdout);
 
     assert!(
         result.matches,
         "Text output mismatch for 'ready --limit 2':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary,
-        result.br_normalized,
-        result.bd_normalized
+        result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
     workspace.finish(true);
