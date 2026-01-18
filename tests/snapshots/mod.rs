@@ -1,14 +1,14 @@
-#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::module_name_repetitions, clippy::trivial_regex, dead_code)]
 
 #[path = "../common/mod.rs"]
 mod common;
 
 use common::cli::{BrWorkspace, run_br};
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt;
+use std::fmt::{self, Write};
+use std::sync::LazyLock;
 
 pub fn init_workspace() -> BrWorkspace {
     let workspace = BrWorkspace::new();
@@ -41,36 +41,40 @@ fn parse_created_id(stdout: &str) -> String {
 // enable cross-platform snapshot testing.
 
 // Pre-compiled regex patterns for performance
-static ANSI_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("ansi regex"));
-static ID_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b").expect("id regex"));
-static TS_FULL_RE: Lazy<Regex> = Lazy::new(|| {
+static ANSI_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("ansi regex"));
+static ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b").expect("id regex"));
+static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
         .expect("full timestamp regex")
 });
-static DATE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
-static VERSION_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\((main|master)@[a-f0-9]+\)").expect("version regex"));
-static LINE_NUM_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
-static PATH_SEP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\\").expect("path separator regex"));
-static TRAILING_WS_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"[ \t]+$").expect("trailing whitespace regex"));
-static MULTIPLE_BLANK_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\n{3,}").expect("multiple blank lines regex"));
-static HOME_PATH_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"/home/[a-zA-Z0-9_-]+").expect("home path regex"));
-static USERS_PATH_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"/Users/[a-zA-Z0-9_-]+").expect("users path regex"));
-static TMP_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+static DATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
+static VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\((main|master)@[a-f0-9]+\)").expect("version regex"));
+static LINE_NUM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
+static PATH_SEP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\").expect("path separator regex"));
+static TRAILING_WS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[ \t]+$").expect("trailing whitespace regex"));
+static MULTIPLE_BLANK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\n{3,}").expect("multiple blank lines regex"));
+static HOME_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/home/[a-zA-Z0-9_-]+").expect("home path regex"));
+static USERS_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"/Users/[a-zA-Z0-9_-]+").expect("users path regex"));
+static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"/tmp/\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+").expect("tmp path regex")
 });
-static DURATION_MS_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\d+(\.\d+)?\s*(ms|µs|ns|s)").expect("duration regex"));
+static DURATION_MS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*(ms|µs|ns|s)").expect("duration regex"));
 
 /// Configuration for text normalization.
 ///
 /// Controls which normalization rules are applied during snapshot comparison.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct TextNormConfig {
     /// Strip ANSI color/formatting escape sequences
@@ -105,7 +109,7 @@ impl TextNormConfig {
     /// Standard configuration for golden text snapshots.
     ///
     /// Applies all normalizations needed for deterministic cross-platform output.
-    pub fn golden() -> Self {
+    pub const fn golden() -> Self {
         Self {
             strip_ansi: true,
             redact_ids: true,
@@ -138,7 +142,7 @@ impl TextNormConfig {
     /// Configuration for timing-sensitive snapshots.
     ///
     /// Masks durations in addition to standard normalization.
-    pub fn with_duration_masking() -> Self {
+    pub const fn with_duration_masking() -> Self {
         Self {
             mask_durations: true,
             ..Self::golden()
@@ -286,12 +290,12 @@ impl TextDiff {
         }
 
         let mut output = String::new();
-        output.push_str(&format!("✗ {}\n\n", self.summary));
+        let _ = write!(output, "✗ {}\n\n", self.summary);
 
         if !self.missing_lines.is_empty() {
             output.push_str("Missing lines (expected but not found):\n");
             for line in &self.missing_lines {
-                output.push_str(&format!("  - {line}\n"));
+                let _ = writeln!(output, "  - {line}");
             }
             output.push('\n');
         }
@@ -299,7 +303,7 @@ impl TextDiff {
         if !self.extra_lines.is_empty() {
             output.push_str("Extra lines (found but not expected):\n");
             for line in &self.extra_lines {
-                output.push_str(&format!("  + {line}\n"));
+                let _ = writeln!(output, "  + {line}");
             }
             output.push('\n');
         }
@@ -307,8 +311,8 @@ impl TextDiff {
         if !self.different_lines.is_empty() {
             output.push_str("Different lines:\n");
             for (exp, act) in &self.different_lines {
-                output.push_str(&format!("  expected: {exp}\n"));
-                output.push_str(&format!("  actual:   {act}\n"));
+                let _ = writeln!(output, "  expected: {exp}");
+                let _ = writeln!(output, "  actual:   {act}");
                 output.push('\n');
             }
         }
@@ -438,7 +442,7 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
     (normalized, log)
 }
 
-/// Legacy normalize_output function for backward compatibility.
+/// Legacy `normalize_output` function for backward compatibility.
 ///
 /// Uses golden configuration for full normalization.
 pub fn normalize_output(output: &str) -> String {
@@ -472,10 +476,27 @@ pub fn normalize_json(json: &Value) -> Value {
                     "id" | "issue_id" | "depends_on_id" | "blocks_id" => {
                         Value::String("ISSUE_ID".to_string())
                     }
-                    "created_at" | "updated_at" | "closed_at" | "due_at" | "defer_until" => {
+                    "created_at" | "updated_at" | "closed_at" | "due_at" | "defer_until"
+                    | "deleted_at" | "marked_at" | "exported_at" => {
                         Value::String("TIMESTAMP".to_string())
                     }
                     "content_hash" => Value::String("HASH".to_string()),
+                    // Normalize actor/user fields that vary by system
+                    "created_by" | "assignee" | "owner" | "author" | "deleted_by"
+                    | "closed_by_session" | "actor" => {
+                        // Only normalize if the value is a non-empty string
+                        if let Value::String(s) = value {
+                            if s.is_empty() {
+                                Value::String(String::new())
+                            } else {
+                                Value::String("ACTOR".to_string())
+                            }
+                        } else if value.is_null() {
+                            Value::Null
+                        } else {
+                            normalize_json(value)
+                        }
+                    }
                     // Handle blocked_by array which contains ID:status strings
                     "blocked_by" | "blocks" | "depends_on" => {
                         if let Value::Array(items) = value {
@@ -663,8 +684,16 @@ mod golden_snapshot_tests {
         let snapshot = TextSnapshot::golden(input);
 
         assert!(snapshot.was_normalized());
-        assert!(snapshot.normalizations_applied.contains(&"ansi_codes".to_string()));
-        assert!(snapshot.normalizations_applied.contains(&"issue_ids".to_string()));
+        assert!(
+            snapshot
+                .normalizations_applied
+                .contains(&"ansi_codes".to_string())
+        );
+        assert!(
+            snapshot
+                .normalizations_applied
+                .contains(&"issue_ids".to_string())
+        );
 
         let json = snapshot.to_json();
         assert!(json["was_normalized"].as_bool().unwrap());
