@@ -114,12 +114,12 @@ impl SchemaWorkspace {
 
 fn run_binary(binary: &str, cwd: &PathBuf, args: &[&str]) -> CmdOutput {
     let cmd_path = if binary == "br" {
-        // Use cargo-built binary
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(manifest_dir)
-            .join("target")
-            .join("release")
-            .join("br")
+        // Use cargo-built binary, respecting CARGO_TARGET_DIR if set
+        let target_dir = std::env::var("CARGO_TARGET_DIR").ok().map(PathBuf::from).unwrap_or_else(|| {
+            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(manifest_dir).join("target")
+        });
+        target_dir.join("release").join("br")
     } else {
         // Use system bd
         PathBuf::from(binary)

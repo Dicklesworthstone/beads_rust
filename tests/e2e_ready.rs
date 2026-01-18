@@ -679,10 +679,10 @@ fn ready_cli_text_output_format() {
     let result = run_br(&workspace, ["ready"], "ready_text");
     assert!(result.status.success(), "ready failed: {}", result.stderr);
 
-    // Should have the header
-    assert!(result.stdout.contains("Ready to work"));
-    // Should show priority prefix
-    assert!(result.stdout.contains("[P"));
+    // Should have the header (matches bd format)
+    assert!(result.stdout.contains("Ready work"));
+    // Should show priority badge (matches bd format: [● P2])
+    assert!(result.stdout.contains("[●"));
 }
 
 #[test]
@@ -696,7 +696,8 @@ fn ready_cli_empty_result_message() {
     let result = run_br(&workspace, ["ready"], "ready_empty");
     assert!(result.status.success(), "ready failed: {}", result.stderr);
 
-    assert!(result.stdout.contains("No issues ready to work on"));
+    // Matches bd format: "✨ No open issues"
+    assert!(result.stdout.contains("No open issues"));
 }
 
 #[test]
