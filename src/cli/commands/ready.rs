@@ -38,7 +38,7 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
         unassigned: args.unassigned,
         labels_and: args.label.clone(),
         labels_or: args.label_any.clone(),
-        types: parse_types(&args.type_),
+        types: parse_types(&args.type_)?,
         priorities: parse_priorities(&args.priority)?,
         include_deferred: args.include_deferred,
         // Fetch all candidates to allow post-filtering of external blockers
@@ -130,16 +130,17 @@ fn format_ready_line(
 }
 
 /// Parse type filter strings to `IssueType` enums.
-fn parse_types(types: &[String]) -> Option<Vec<IssueType>> {
+fn parse_types(types: &[String]) -> Result<Option<Vec<IssueType>>> {
     if types.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let parsed: Vec<IssueType> = types.iter().filter_map(|t| t.parse().ok()).collect();
-    if parsed.is_empty() {
-        None
-    } else {
-        Some(parsed)
-    }
+
+    let parsed = types
+        .iter()
+        .map(|t| t.parse())
+        .collect::<Result<Vec<IssueType>>>()?;
+
+    Ok(Some(parsed))
 }
 
 /// Parse priority filter strings to Priority values.
@@ -169,9 +170,9 @@ mod tests {
     fn test_parse_types() {
         init_logging();
         info!("test_parse_types: starting");
-        let t = parse_types(&["bug".to_string(), "feature".to_string()]);
-        assert!(t.is_some());
-        let t = t.unwrap();
+        let t = parse_types(&["bug".to_string(), "feature".to_string()])
+            .expect("parse types")
+            .expect("types");
         assert_eq!(t.len(), 2);
         info!("test_parse_types: assertions passed");
     }

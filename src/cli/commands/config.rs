@@ -216,41 +216,14 @@ fn set_config_value(kv: &str, json_mode: bool) -> Result<()> {
     };
 
     // Set the value
-    if let serde_yaml::Value::Mapping(ref mut map) = config {
+    {
         // Handle nested keys (e.g., "display.color")
         let parts: Vec<&str> = key.split('.').collect();
-        if parts.len() == 1 {
-            map.insert(
-                serde_yaml::Value::String(key.to_string()),
-                serde_yaml::Value::String(value.to_string()),
-            );
-        } else {
-            // For nested keys, we need to navigate/create the structure
-            let mut current = &mut config;
-            for (i, part) in parts.iter().enumerate() {
-                if i == parts.len() - 1 {
-                    // Last part - set the value
-                    if let serde_yaml::Value::Mapping(m) = current {
-                        m.insert(
-                            serde_yaml::Value::String(part.to_string()),
-                            serde_yaml::Value::String(value.to_string()),
-                        );
-                    }
-                } else {
-                    // Navigate or create nested mapping
-                    if let serde_yaml::Value::Mapping(m) = current {
-                        let key = serde_yaml::Value::String(part.to_string());
-                        if !m.contains_key(&key) {
-                            m.insert(
-                                key.clone(),
-                                serde_yaml::Value::Mapping(serde_yaml::Mapping::default()),
-                            );
-                        }
-                        current = m.get_mut(&key).unwrap();
-                    }
-                }
-            }
-        }
+        set_yaml_value(
+            &mut config,
+            &parts,
+            serde_yaml::Value::String(value.to_string()),
+        );
     }
 
     // Write back
@@ -270,6 +243,36 @@ fn set_config_value(kv: &str, json_mode: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn set_yaml_value(config: &mut serde_yaml::Value, parts: &[&str], value: serde_yaml::Value) {
+    if parts.is_empty() {
+        return;
+    }
+
+    if !matches!(config, serde_yaml::Value::Mapping(_)) {
+        *config = serde_yaml::Value::Mapping(serde_yaml::Mapping::default());
+    }
+
+    if parts.len() == 1 {
+        if let serde_yaml::Value::Mapping(map) = config {
+            map.insert(serde_yaml::Value::String(parts[0].to_string()), value);
+        }
+        return;
+    }
+
+    if let serde_yaml::Value::Mapping(map) = config {
+        let key = serde_yaml::Value::String(parts[0].to_string());
+        let entry = map
+            .entry(key)
+            .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::default()));
+
+        if !matches!(entry, serde_yaml::Value::Mapping(_)) {
+            *entry = serde_yaml::Value::Mapping(serde_yaml::Mapping::default());
+        }
+
+        set_yaml_value(entry, &parts[1..], value);
+    }
 }
 
 /// Delete a config value from the database, project config, and user config.
@@ -570,5 +573,54 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "display");
         assert_eq!(parts[1], "color");
+    }
+
+    #[test]
+    fn test_set_yaml_value_overwrites_scalar_root() {
+        let mut config = serde_yaml::Value::String("legacy".to_string());
+        let parts = ["display"];
+        set_yaml_value(
+            &mut config,
+            &parts,
+            serde_yaml::Value::String("true".to_string()),
+        );
+
+        let serde_yaml::Value::Mapping(map) = config else {
+            panic!("expected mapping root");
+        };
+        let key = serde_yaml::Value::String("display".to_string());
+        assert_eq!(
+            map.get(&key),
+            Some(&serde_yaml::Value::String("true".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_set_yaml_value_overwrites_scalar_child() {
+        let mut map = serde_yaml::Mapping::default();
+        map.insert(
+            serde_yaml::Value::String("display".to_string()),
+            serde_yaml::Value::String("legacy".to_string()),
+        );
+        let mut config = serde_yaml::Value::Mapping(map);
+        let parts = ["display", "color"];
+        set_yaml_value(
+            &mut config,
+            &parts,
+            serde_yaml::Value::String("blue".to_string()),
+        );
+
+        let serde_yaml::Value::Mapping(root) = config else {
+            panic!("expected mapping root");
+        };
+        let display_key = serde_yaml::Value::String("display".to_string());
+        let Some(serde_yaml::Value::Mapping(display_map)) = root.get(&display_key) else {
+            panic!("expected display mapping");
+        };
+        let color_key = serde_yaml::Value::String("color".to_string());
+        assert_eq!(
+            display_map.get(&color_key),
+            Some(&serde_yaml::Value::String("blue".to_string()))
+        );
     }
 }

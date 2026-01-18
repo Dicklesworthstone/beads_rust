@@ -79,14 +79,11 @@ fn diff_backup(beads_dir: &Path, history_dir: &Path, filename: &str) -> Result<(
     // Or better, use `bv --robot-diff` if possible? No, br should be standalone.
 
     // Let's shell out to `diff -u` for now as it's standard on linux/mac.
-    // If it fails, we fallback or error.
+    // Avoid GNU-only flags (like --color) to keep this portable.
     let status = std::process::Command::new("diff")
-        .args([
-            "-u",
-            "--color=always",
-            current_path.to_str().unwrap(),
-            backup_path.to_str().unwrap(),
-        ])
+        .arg("-u")
+        .arg(&current_path)
+        .arg(&backup_path)
         .status();
 
     if let Ok(s) = status {

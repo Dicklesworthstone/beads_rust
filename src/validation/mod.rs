@@ -16,7 +16,7 @@ use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, Issue, Priority};
 use std::path::Path;
 
-const MAX_ID_PREFIX_LEN: usize = 10;
+const MAX_ID_PREFIX_LEN: usize = 64;
 const MAX_ID_HASH_LEN: usize = 40;
 const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
 
@@ -255,13 +255,10 @@ impl CommentValidator {
 
 #[must_use]
 pub fn is_valid_id_format(id: &str) -> bool {
-    let mut parts = id.splitn(2, '-');
-    let Some(prefix) = parts.next() else {
+    let Some(parsed) = crate::util::id::split_prefix_remainder(id) else {
         return false;
     };
-    let Some(hash) = parts.next() else {
-        return false;
-    };
+    let (prefix, hash) = parsed;
 
     if prefix.is_empty() || prefix.len() > MAX_ID_PREFIX_LEN {
         return false;
@@ -269,7 +266,7 @@ pub fn is_valid_id_format(id: &str) -> bool {
 
     if !prefix
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
     {
         return false;
     }

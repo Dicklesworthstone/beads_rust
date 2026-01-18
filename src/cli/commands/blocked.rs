@@ -8,6 +8,8 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::format::{BlockedIssue, BlockedIssueOutput};
+use crate::model::{IssueType, Priority};
+use std::str::FromStr;
 
 /// Execute the blocked command.
 ///
@@ -83,15 +85,12 @@ pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Resu
     }
 
     // Apply filters
-    filter_by_type(&mut blocked_issues, &args.type_);
-    filter_by_priority(&mut blocked_issues, &args.priority);
+    filter_by_type(&mut blocked_issues, &args.type_)?;
+    filter_by_priority(&mut blocked_issues, &args.priority)?;
 
     // Filter by labels (AND logic) - need to fetch labels from storage
     if !args.label.is_empty() {
-        blocked_issues.retain(|bi| {
-            let issue_labels = storage.get_labels(&bi.issue.id).unwrap_or_default();
-            args.label.iter().all(|l| issue_labels.contains(l))
-        });
+        filter_by_labels(&mut blocked_issues, storage, &args.label)?;
     }
 
     // Sort by priority (ascending), then by blocker count (descending)
@@ -156,31 +155,49 @@ fn sort_blocked_issues(issues: &mut [BlockedIssue]) {
 }
 
 /// Filter blocked issues by issue type (case-insensitive).
-fn filter_by_type(issues: &mut Vec<BlockedIssue>, types: &[String]) {
+fn filter_by_type(issues: &mut Vec<BlockedIssue>, types: &[String]) -> Result<()> {
     if types.is_empty() {
-        return;
+        return Ok(());
     }
-    issues.retain(|bi| {
-        let issue_type_str = bi.issue.issue_type.to_string().to_lowercase();
-        types.iter().any(|t| t.to_lowercase() == issue_type_str)
-    });
+
+    let parsed = types
+        .iter()
+        .map(|t| IssueType::from_str(t))
+        .collect::<Result<Vec<IssueType>>>()?;
+
+    issues.retain(|bi| parsed.contains(&bi.issue.issue_type));
+    Ok(())
 }
 
 /// Filter blocked issues by priority.
-fn filter_by_priority(issues: &mut Vec<BlockedIssue>, priorities: &[String]) {
+fn filter_by_priority(issues: &mut Vec<BlockedIssue>, priorities: &[String]) -> Result<()> {
     if priorities.is_empty() {
-        return;
+        return Ok(());
     }
-    let parsed: Vec<crate::model::Priority> = priorities
-        .iter()
-        .filter_map(|p| std::str::FromStr::from_str(p).ok())
-        .collect();
 
-    if parsed.is_empty() {
-        return;
-    }
+    let parsed = priorities
+        .iter()
+        .map(|p| Priority::from_str(p))
+        .collect::<Result<Vec<Priority>>>()?;
 
     issues.retain(|bi| parsed.contains(&bi.issue.priority));
+    Ok(())
+}
+
+fn filter_by_labels(
+    issues: &mut Vec<BlockedIssue>,
+    storage: &crate::storage::SqliteStorage,
+    labels: &[String],
+) -> Result<()> {
+    let mut filtered = Vec::with_capacity(issues.len());
+    for issue in issues.drain(..) {
+        let issue_labels = storage.get_labels(&issue.issue.id)?;
+        if labels.iter().all(|l| issue_labels.contains(l)) {
+            filtered.push(issue);
+        }
+    }
+    *issues = filtered;
+    Ok(())
 }
 
 fn print_text_output(
@@ -360,7 +377,7 @@ mod tests {
             },
         ];
 
-        filter_by_type(&mut issues, &[]);
+        filter_by_type(&mut issues, &[]).expect("filter types");
         assert_eq!(issues.len(), 2);
         info!("test_filter_by_type_empty_keeps_all: assertions passed");
     }
@@ -387,7 +404,7 @@ mod tests {
             },
         ];
 
-        filter_by_type(&mut issues, &["bug".to_string()]);
+        filter_by_type(&mut issues, &["bug".to_string()]).expect("filter types");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue.id, "a");
         info!("test_filter_by_type_filters_correctly: assertions passed");
@@ -403,7 +420,7 @@ mod tests {
             blocked_by: vec!["x".to_string()],
         }];
 
-        filter_by_type(&mut issues, &["BUG".to_string()]);
+        filter_by_type(&mut issues, &["BUG".to_string()]).expect("filter types");
         assert_eq!(issues.len(), 1);
 
         let mut issues2 = vec![BlockedIssue {
@@ -412,7 +429,7 @@ mod tests {
             blocked_by: vec!["x".to_string()],
         }];
 
-        filter_by_type(&mut issues2, &["Bug".to_string()]);
+        filter_by_type(&mut issues2, &["Bug".to_string()]).expect("filter types");
         assert_eq!(issues2.len(), 1);
         info!("test_filter_by_type_case_insensitive: assertions passed");
     }
@@ -439,7 +456,8 @@ mod tests {
             },
         ];
 
-        filter_by_type(&mut issues, &["bug".to_string(), "feature".to_string()]);
+        filter_by_type(&mut issues, &["bug".to_string(), "feature".to_string()])
+            .expect("filter types");
         assert_eq!(issues.len(), 2);
         let ids: Vec<_> = issues.iter().map(|i| i.issue.id.as_str()).collect();
         assert!(ids.contains(&"a"));
@@ -457,7 +475,7 @@ mod tests {
             make_blocked_issue("c", "P4", 4, 1),
         ];
 
-        filter_by_priority(&mut issues, &[]);
+        filter_by_priority(&mut issues, &[]).expect("filter priorities");
         assert_eq!(issues.len(), 3);
         info!("test_filter_by_priority_empty_keeps_all: assertions passed");
     }
@@ -472,7 +490,7 @@ mod tests {
             make_blocked_issue("c", "P4", 4, 1),
         ];
 
-        filter_by_priority(&mut issues, &["2".to_string()]);
+        filter_by_priority(&mut issues, &["2".to_string()]).expect("filter priorities");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].issue.id, "b");
         info!("test_filter_by_priority_single: assertions passed");
@@ -488,7 +506,8 @@ mod tests {
             make_blocked_issue("c", "P4", 4, 1),
         ];
 
-        filter_by_priority(&mut issues, &["0".to_string(), "4".to_string()]);
+        filter_by_priority(&mut issues, &["0".to_string(), "4".to_string()])
+            .expect("filter priorities");
         assert_eq!(issues.len(), 2);
         let ids: Vec<_> = issues.iter().map(|i| i.issue.id.as_str()).collect();
         assert!(ids.contains(&"a"));
