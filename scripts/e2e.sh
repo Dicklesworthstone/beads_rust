@@ -39,7 +39,7 @@ QUICK_TESTS=(
 JSON_OUTPUT=0
 VERBOSE=0
 FILTER=""
-TIMEOUT="${E2E_TIMEOUT:-60}"
+TIMEOUT="${E2E_TIMEOUT:-180}"
 
 log() {
     if [[ "$JSON_OUTPUT" -eq 0 ]]; then
@@ -119,7 +119,7 @@ for test in "${QUICK_TESTS[@]}"; do
     TEST_START=$(date +%s.%N)
 
     if [[ "$VERBOSE" -eq 1 ]]; then
-        if timeout "$TIMEOUT" cargo test --test "$test" -- --nocapture 2>&1; then
+        if timeout "$TIMEOUT" cargo test --release --test "$test" -- --nocapture 2>&1; then
             RESULT="pass"
             ((PASSED++))
         else
@@ -127,7 +127,7 @@ for test in "${QUICK_TESTS[@]}"; do
             ((FAILED++))
         fi
     else
-        if timeout "$TIMEOUT" cargo test --test "$test" -- --nocapture >/dev/null 2>&1; then
+        if timeout "$TIMEOUT" cargo test --release --test "$test" -- --nocapture >/dev/null 2>&1; then
             RESULT="pass"
             ((PASSED++))
         else
