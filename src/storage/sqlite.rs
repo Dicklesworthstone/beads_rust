@@ -711,6 +711,8 @@ impl SqliteStorage {
                     sql.push_str(" ORDER BY priority ASC, created_at DESC");
                 }
             }
+        } else if filters.reverse {
+            sql.push_str(" ORDER BY priority DESC, created_at ASC");
         } else {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
@@ -1055,7 +1057,7 @@ impl SqliteStorage {
     /// blocking-type dependency on an issue that is not closed/tombstone.
     ///
     /// Blocking dependency types: blocks, parent-child, conditional-blocks, waits-for
-    /// Blocking statuses: open, `in_progress`, blocked, deferred
+    /// Blocking statuses: any non-terminal status (not closed/tombstone)
     ///
     /// # Errors
     ///
@@ -1090,7 +1092,7 @@ impl SqliteStorage {
                          COALESCE(GROUP_CONCAT(d.depends_on_id || ':' || COALESCE(i.status, 'unknown'), ','), '')
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                  WHERE d.type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')
                     AND d.depends_on_id NOT LIKE 'external:%'
                     AND (
                       -- The blocker is in a blocking state (anything not terminal)
@@ -4601,6 +4603,31 @@ mod tests {
 
         assert_eq!(issues.len(), 1, "Should find one issue with 'bug' in title");
         assert_eq!(issues[0].id, "bd-s1");
+    }
+
+    #[test]
+    fn test_list_issues_reverse_default_sort() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-a", "A", Status::Open, 1, None, t1, None);
+        let issue_b = make_issue("bd-b", "B", Status::Open, 1, None, t2, None);
+        let issue_c = make_issue("bd-c", "C", Status::Open, 2, None, t1, None);
+
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage.create_issue(&issue_c, "tester").unwrap();
+
+        let filters = ListFilters {
+            reverse: true,
+            ..ListFilters::default()
+        };
+
+        let issues = storage.list_issues(&filters).unwrap();
+        let ids: Vec<_> = issues.iter().map(|i| i.id.as_str()).collect();
+
+        assert_eq!(ids, vec!["bd-c", "bd-a", "bd-b"]);
     }
 
     #[test]

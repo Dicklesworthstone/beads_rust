@@ -228,6 +228,28 @@ mod tests {
     }
 
     #[test]
+    fn test_content_hash_includes_created_by() {
+        let mut issue = make_test_issue();
+        let hash1 = content_hash(&issue);
+
+        issue.created_by = Some("tester@example.com".to_string());
+        let hash2 = content_hash(&issue);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_content_hash_includes_source_system() {
+        let mut issue = make_test_issue();
+        let hash1 = content_hash(&issue);
+
+        issue.source_system = Some("imported".to_string());
+        let hash2 = content_hash(&issue);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
     fn test_content_hash_from_parts() {
         let issue = make_test_issue();
         let direct = content_hash(&issue);

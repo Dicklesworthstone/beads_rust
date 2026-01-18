@@ -280,17 +280,23 @@ pub fn is_valid_id_format(id: &str) -> bool {
     }
 
     // Allow dots for hierarchical/child IDs (e.g., "bd-abc.1", "bd-abc.1.2")
-    // Format: hash[.child_num]* where child_num is numeric
-    if !hash
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.')
+    // Format: base_hash[.child_num]* where child_num is numeric
+    let mut segments = hash.split('.');
+    let Some(base_hash) = segments.next() else {
+        return false;
+    };
+    if base_hash.is_empty()
+        || !base_hash
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
         return false;
     }
 
-    // Dots must be followed by at least one character (no trailing/leading/double dots)
-    if hash.starts_with('.') || hash.ends_with('.') || hash.contains("..") {
-        return false;
+    for segment in segments {
+        if segment.is_empty() || !segment.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
     }
 
     true
@@ -703,6 +709,8 @@ mod tests {
         assert!(is_valid_id_format("bd-abc123456"));
 
         assert!(!is_valid_id_format("bd_abc"));
+        assert!(!is_valid_id_format("bd-abc.def"));
+        assert!(!is_valid_id_format("bd-abc.1a"));
 
         // 26 char hash is now valid (within max 40)
         assert!(is_valid_id_format("bd-abc12345678901234567890123456"));

@@ -395,6 +395,7 @@ fn calculate_depths(
         if let Some(deps) = all_dependencies.get(node_id) {
             let filtered: Vec<String> = deps
                 .iter()
+                .filter(|d| d.dep_type.affects_ready_work())
                 .map(|d| d.depends_on_id.clone())
                 .filter(|d| component_set.contains(d))
                 .collect();
