@@ -266,7 +266,6 @@ fn bench_update_issue(c: &mut Criterion) {
     });
 
     group.finish();
-    drop(group);
     log_group_end(group_name);
     drop(dir);
 }
@@ -307,7 +306,6 @@ fn bench_close_issue_with_reason(c: &mut Criterion) {
     });
 
     group.finish();
-    drop(group);
     log_group_end(group_name);
     drop(dir);
 }
@@ -579,7 +577,6 @@ fn bench_dirty_tracking_mark(c: &mut Criterion) {
     });
 
     group.finish();
-    drop(group);
     log_group_end(group_name);
     drop(dir);
 }
@@ -620,7 +617,6 @@ fn bench_dirty_tracking_query(c: &mut Criterion) {
     });
 
     group.finish();
-    drop(group);
     log_group_end(group_name);
     drop(dir);
 }
@@ -730,7 +726,6 @@ fn bench_cycle_detection(c: &mut Criterion) {
     });
 
     group.finish();
-    drop(group);
     log_group_end(group_name);
     drop(dir);
 }
