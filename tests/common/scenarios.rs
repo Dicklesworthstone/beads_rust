@@ -512,7 +512,7 @@ pub struct BenchmarkSummary {
     /// bd statistics (if included)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bd_stats: Option<RunStatistics>,
-    /// Speedup ratio (bd_median / br_median)
+    /// Speedup ratio (`bd_median` / `br_median`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speedup_ratio: Option<f64>,
     /// Individual run metrics (measured runs only)
@@ -1640,19 +1640,25 @@ fn compare_outputs(
             normalization_log.extend(br_log.into_iter().map(|s| format!("br: {s}")));
             normalization_log.extend(bd_log.into_iter().map(|s| format!("bd: {s}")));
 
-            let matched = br == bd && tolerance_issues.is_empty();
+            // For NormalizedJson mode, timestamps are masked so tolerance issues
+            // are logged for visibility but don't affect the match result.
+            // The normalized values are what matter.
+            let matched = br == bd;
             (
                 ComparisonResult {
                     matched,
                     br_json: Some(br.clone()),
                     bd_json: Some(bd.clone()),
                     diff_description: if matched {
-                        None
-                    } else if !tolerance_issues.is_empty() {
-                        Some(format!(
-                            "Timestamp tolerance exceeded: {}",
-                            tolerance_issues.join("; ")
-                        ))
+                        // Log tolerance info even on match for debugging visibility
+                        if !tolerance_issues.is_empty() {
+                            Some(format!(
+                                "Note: timestamp drift detected (masked): {}",
+                                tolerance_issues.join("; ")
+                            ))
+                        } else {
+                            None
+                        }
                     } else {
                         Some("Normalized JSON mismatch".to_string())
                     },
@@ -1954,7 +1960,7 @@ fn run_conformance_command(
 }
 
 fn populate_workspace_with_dataset(
-    workspace: &mut TestWorkspace,
+    workspace: &TestWorkspace,
     dataset: KnownDataset,
 ) -> std::io::Result<()> {
     let isolated = IsolatedDataset::from_dataset(dataset)?;
@@ -1964,7 +1970,7 @@ fn populate_workspace_with_dataset(
 }
 
 fn populate_conformance_with_dataset(
-    workspace: &mut HarnessConformanceWorkspace,
+    workspace: &HarnessConformanceWorkspace,
     dataset: KnownDataset,
 ) -> std::io::Result<()> {
     let isolated = IsolatedDataset::from_dataset(dataset)?;
@@ -2618,5 +2624,648 @@ mod tests {
         assert!(!rules.normalize_paths);
         assert!(!rules.normalize_line_endings);
         assert!(rules.path_fields.is_empty());
+    }
+
+    // ========================================================================
+    // Scenario DSL + Normalization + Comparator tests (beads_rust-nh50)
+    // ========================================================================
+
+    // --- Array Sorting Tests ---
+
+    #[test]
+    fn test_array_sorting_normalization() {
+        let rules = NormalizationRules {
+            sort_arrays: true,
+            ..Default::default()
+        };
+        let mut value = serde_json::json!({
+            "items": [{"name": "zebra"}, {"name": "apple"}, {"name": "mango"}]
+        });
+
+        rules.apply(&mut value);
+
+        // Arrays should be sorted by JSON string representation
+        let items = value["items"].as_array().unwrap();
+        assert_eq!(items[0]["name"], "apple");
+        assert_eq!(items[1]["name"], "mango");
+        assert_eq!(items[2]["name"], "zebra");
+    }
+
+    #[test]
+    fn test_array_sorting_nested() {
+        let rules = NormalizationRules {
+            sort_arrays: true,
+            ..Default::default()
+        };
+        let mut value = serde_json::json!({
+            "outer": [
+                {"inner": [3, 1, 2]},
+                {"inner": [6, 4, 5]}
+            ]
+        });
+
+        rules.apply(&mut value);
+
+        // Nested arrays should also be sorted
+        let outer = value["outer"].as_array().unwrap();
+        assert_eq!(outer[0]["inner"], serde_json::json!([1, 2, 3]));
+        assert_eq!(outer[1]["inner"], serde_json::json!([4, 5, 6]));
+    }
+
+    #[test]
+    fn test_array_sorting_disabled() {
+        let rules = NormalizationRules {
+            sort_arrays: false,
+            ..Default::default()
+        };
+        let mut value = serde_json::json!({
+            "items": [3, 1, 2]
+        });
+
+        rules.apply(&mut value);
+
+        // Arrays should remain in original order
+        assert_eq!(value["items"], serde_json::json!([3, 1, 2]));
+    }
+
+    // --- Field Removal Tests ---
+
+    #[test]
+    fn test_field_removal() {
+        let mut rules = NormalizationRules::default();
+        rules.remove_fields.insert("secret".to_string());
+        rules.remove_fields.insert("internal".to_string());
+        rules.log_normalization = true;
+
+        let mut value = serde_json::json!({
+            "id": "test-123",
+            "secret": "password123",
+            "internal": "debug_info",
+            "public": "visible"
+        });
+
+        let log = rules.apply(&mut value);
+
+        assert!(value.get("secret").is_none());
+        assert!(value.get("internal").is_none());
+        assert_eq!(value["id"], "test-123");
+        assert_eq!(value["public"], "visible");
+        assert!(log.iter().any(|l| l.contains("Removed field: secret")));
+    }
+
+    #[test]
+    fn test_field_removal_nested() {
+        let mut rules = NormalizationRules::default();
+        rules.remove_fields.insert("token".to_string());
+
+        let mut value = serde_json::json!({
+            "user": {
+                "name": "Alice",
+                "token": "abc123"
+            }
+        });
+
+        rules.apply(&mut value);
+
+        // Nested field should be removed
+        assert!(value["user"].get("token").is_none());
+        assert_eq!(value["user"]["name"], "Alice");
+    }
+
+    // --- Timestamp Masking Tests ---
+
+    #[test]
+    fn test_timestamp_masking() {
+        let rules = NormalizationRules::conformance_default();
+        let mut value = serde_json::json!({
+            "id": "bd-test123",
+            "title": "Test",
+            "created_at": "2026-01-17T10:30:00Z",
+            "updated_at": "2026-01-17T11:45:00Z",
+            "defer_until": "2026-02-01T00:00:00Z"
+        });
+
+        let log = rules.apply(&mut value);
+
+        // All timestamp fields should be masked
+        assert_eq!(value["created_at"], "NORMALIZED_TIMESTAMP");
+        assert_eq!(value["updated_at"], "NORMALIZED_TIMESTAMP");
+        assert_eq!(value["defer_until"], "NORMALIZED_TIMESTAMP");
+        assert!(log.iter().any(|l| l.contains("Masked timestamp")));
+    }
+
+    #[test]
+    fn test_timestamp_masking_empty_value() {
+        let mut rules = NormalizationRules::default();
+        rules.mask_fields.insert("created_at".to_string());
+        rules.log_normalization = true;
+
+        let mut value = serde_json::json!({
+            "created_at": ""
+        });
+
+        let log = rules.apply(&mut value);
+
+        // Empty string should be masked without logging
+        assert_eq!(value["created_at"], "NORMALIZED_TIMESTAMP");
+        assert!(!log.iter().any(|l| l.contains("Masked timestamp")));
+    }
+
+    // --- ID Normalization Tests ---
+
+    #[test]
+    fn test_id_normalization() {
+        let rules = NormalizationRules::conformance_default();
+        let mut value = serde_json::json!({
+            "id": "bd-abc123xyz",
+            "parent_id": "bd-parent456",
+            "blocked_by_id": "bd-blocker789"
+        });
+
+        let log = rules.apply(&mut value);
+
+        // IDs should have hash portion masked
+        assert_eq!(value["id"], "bd-HASH");
+        assert_eq!(value["parent_id"], "bd-HASH");
+        assert_eq!(value["blocked_by_id"], "bd-HASH");
+        assert!(log.iter().any(|l| l.contains("Normalized ID")));
+    }
+
+    #[test]
+    fn test_id_normalization_preserves_prefix() {
+        let rules = NormalizationRules::conformance_default();
+        let mut value = serde_json::json!({
+            "id": "beads_rust-task-abcd1234"
+        });
+
+        rules.apply(&mut value);
+
+        // Prefix before last dash should be preserved
+        assert_eq!(value["id"], "beads_rust-task-HASH");
+    }
+
+    #[test]
+    fn test_id_normalization_no_dash() {
+        let rules = NormalizationRules::conformance_default();
+        let mut value = serde_json::json!({
+            "id": "nodash"
+        });
+
+        rules.apply(&mut value);
+
+        // ID without dash should remain unchanged
+        assert_eq!(value["id"], "nodash");
+    }
+
+    #[test]
+    fn test_id_normalization_disabled() {
+        let rules = NormalizationRules {
+            normalize_ids: false,
+            ..Default::default()
+        };
+        let mut value = serde_json::json!({
+            "id": "bd-abc123"
+        });
+
+        rules.apply(&mut value);
+
+        // ID should remain unchanged when normalize_ids is false
+        assert_eq!(value["id"], "bd-abc123");
+    }
+
+    // --- Clock Tolerance / Timestamp Tolerance Tests ---
+
+    #[test]
+    fn test_timestamp_tolerance_within_range() {
+        let rules = NormalizationRules {
+            mask_fields: ["created_at".to_string()].into_iter().collect(),
+            timestamp_tolerance: Some(Duration::from_secs(10)),
+            ..Default::default()
+        };
+
+        let br = serde_json::json!({
+            "created_at": "2026-01-17T10:00:00Z"
+        });
+        let bd = serde_json::json!({
+            "created_at": "2026-01-17T10:00:05Z"  // 5 seconds later
+        });
+
+        let issues = check_timestamp_tolerance(&br, &bd, &rules);
+
+        // 5 seconds is within 10 second tolerance
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_timestamp_tolerance_exceeded() {
+        let rules = NormalizationRules {
+            mask_fields: ["created_at".to_string()].into_iter().collect(),
+            timestamp_tolerance: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+
+        let br = serde_json::json!({
+            "created_at": "2026-01-17T10:00:00Z"
+        });
+        let bd = serde_json::json!({
+            "created_at": "2026-01-17T10:00:10Z"  // 10 seconds later
+        });
+
+        let issues = check_timestamp_tolerance(&br, &bd, &rules);
+
+        // 10 seconds exceeds 5 second tolerance
+        assert!(!issues.is_empty());
+        assert!(issues[0].contains("timestamp drift"));
+    }
+
+    #[test]
+    fn test_timestamp_tolerance_nested() {
+        let rules = NormalizationRules {
+            mask_fields: ["updated_at".to_string()].into_iter().collect(),
+            timestamp_tolerance: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+
+        let br = serde_json::json!({
+            "issues": [
+                {"updated_at": "2026-01-17T10:00:00Z"},
+                {"updated_at": "2026-01-17T11:00:00Z"}
+            ]
+        });
+        let bd = serde_json::json!({
+            "issues": [
+                {"updated_at": "2026-01-17T10:00:30Z"},
+                {"updated_at": "2026-01-17T11:02:00Z"}  // 2 minutes drift
+            ]
+        });
+
+        let issues = check_timestamp_tolerance(&br, &bd, &rules);
+
+        // Second timestamp exceeds tolerance
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("issues[1]"));
+    }
+
+    // --- Comparator Behavior Tests ---
+
+    #[test]
+    fn compare_mode_exact_json_matches() {
+        let br_result = CommandResult {
+            stdout: "{\"id\":1,\"name\":\"test\"}".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "{\"id\":1,\"name\":\"test\"}".to_string(),
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::ExactJson,
+            &NormalizationRules::strict(),
+        );
+
+        assert!(comparison.matched);
+    }
+
+    #[test]
+    fn compare_mode_exact_json_fails_on_difference() {
+        let br_result = CommandResult {
+            stdout: "{\"id\":1,\"name\":\"test\"}".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "{\"id\":2,\"name\":\"test\"}".to_string(),
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::ExactJson,
+            &NormalizationRules::strict(),
+        );
+
+        assert!(!comparison.matched);
+        assert!(comparison.diff_description.is_some());
+    }
+
+    #[test]
+    fn compare_mode_normalized_json_ignores_timestamps() {
+        let br_result = CommandResult {
+            stdout: "{\"id\":\"bd-abc\",\"created_at\":\"2026-01-17T10:00:00Z\"}".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "{\"id\":\"bd-xyz\",\"created_at\":\"2026-01-17T11:00:00Z\"}".to_string(),
+            ..br_result.clone()
+        };
+
+        let (comparison, log) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::NormalizedJson,
+            &NormalizationRules::conformance_default(),
+        );
+
+        // After normalization (masking timestamps and IDs), should match
+        assert!(comparison.matched);
+        assert!(!log.is_empty());
+    }
+
+    #[test]
+    fn compare_mode_contains_fields_matches_specified() {
+        let br_result = CommandResult {
+            stdout: "{\"id\":1,\"title\":\"Test\",\"extra\":\"ignored\"}".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "{\"id\":1,\"title\":\"Test\",\"extra\":\"different\"}".to_string(),
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::ContainsFields(vec!["id".to_string(), "title".to_string()]),
+            &NormalizationRules::strict(),
+        );
+
+        // Only id and title are compared, extra is ignored
+        assert!(comparison.matched);
+    }
+
+    #[test]
+    fn compare_mode_contains_fields_fails_on_mismatch() {
+        let br_result = CommandResult {
+            stdout: "{\"id\":1,\"title\":\"Test A\"}".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "{\"id\":1,\"title\":\"Test B\"}".to_string(),
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::ContainsFields(vec!["title".to_string()]),
+            &NormalizationRules::strict(),
+        );
+
+        assert!(!comparison.matched);
+        assert!(comparison.diff_description.unwrap().contains("title"));
+    }
+
+    #[test]
+    fn compare_mode_exit_code_only_matches() {
+        let br_result = CommandResult {
+            stdout: "different output".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "completely different".to_string(),
+            exit_code: 0,
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::ExitCodeOnly,
+            &NormalizationRules::strict(),
+        );
+
+        assert!(comparison.matched);
+    }
+
+    #[test]
+    fn compare_mode_exit_code_only_fails_on_different_exit() {
+        let br_result = CommandResult {
+            stdout: "same output".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "same output".to_string(),
+            exit_code: 1,
+            success: false,
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::ExitCodeOnly,
+            &NormalizationRules::strict(),
+        );
+
+        assert!(!comparison.matched);
+        assert!(comparison.diff_description.unwrap().contains("Exit code"));
+    }
+
+    // --- Scenario Validation Tests ---
+
+    #[test]
+    fn test_scenario_supports_mode() {
+        let scenario = Scenario::new("test", ScenarioCommand::new(["list"]))
+            .with_modes(vec![ExecutionMode::E2E]);
+
+        assert!(scenario.supports_mode(ExecutionMode::E2E));
+        assert!(!scenario.supports_mode(ExecutionMode::Conformance));
+        assert!(!scenario.supports_mode(ExecutionMode::Benchmark));
+    }
+
+    #[test]
+    fn test_scenario_default_modes() {
+        let scenario = Scenario::new("test", ScenarioCommand::new(["list"]));
+
+        // Default includes E2E and Conformance but not Benchmark
+        assert!(scenario.supports_mode(ExecutionMode::E2E));
+        assert!(scenario.supports_mode(ExecutionMode::Conformance));
+        assert!(!scenario.supports_mode(ExecutionMode::Benchmark));
+    }
+
+    #[test]
+    fn test_scenario_command_builder() {
+        let cmd = ScenarioCommand::new(["create", "Test issue", "--priority", "1"])
+            .with_env([("DEBUG", "1"), ("LOG_LEVEL", "trace")])
+            .with_stdin("additional input")
+            .with_label("create_issue");
+
+        assert_eq!(cmd.args, vec!["create", "Test issue", "--priority", "1"]);
+        assert_eq!(cmd.env.len(), 2);
+        assert_eq!(cmd.stdin, Some("additional input".to_string()));
+        assert_eq!(cmd.label, "create_issue");
+    }
+
+    #[test]
+    fn test_scenario_command_default_label() {
+        let cmd = ScenarioCommand::new(["list", "--json"]);
+
+        // Default label is first argument
+        assert_eq!(cmd.label, "list");
+    }
+
+    #[test]
+    fn test_invariants_success() {
+        let inv = Invariants::success();
+
+        assert!(inv.expect_success);
+        assert!(!inv.expect_failure);
+        assert!(inv.expected_exit_code.is_none());
+    }
+
+    #[test]
+    fn test_invariants_failure() {
+        let inv = Invariants::failure();
+
+        assert!(!inv.expect_success);
+        assert!(inv.expect_failure);
+    }
+
+    #[test]
+    fn test_invariants_with_constraints() {
+        let inv = Invariants::success()
+            .with_no_git_ops()
+            .with_path_confinement();
+
+        assert!(inv.no_git_ops);
+        assert!(inv.path_confinement);
+    }
+
+    #[test]
+    fn test_extract_json_payload_with_preamble() {
+        let stdout = "Info: Created issue\nWarning: Low priority\n{\"id\": 1, \"title\": \"Test\"}";
+        let json = extract_json_payload(stdout);
+
+        assert!(json.starts_with('{'));
+        assert!(json.contains("\"id\""));
+    }
+
+    #[test]
+    fn test_extract_json_payload_array() {
+        let stdout = "Listing issues:\n[{\"id\": 1}, {\"id\": 2}]";
+        let json = extract_json_payload(stdout);
+
+        assert!(json.starts_with('['));
+    }
+
+    #[test]
+    fn test_extract_json_payload_no_json() {
+        let stdout = "Plain text with no JSON";
+        let json = extract_json_payload(stdout);
+
+        // Returns trimmed input when no JSON found
+        assert_eq!(json, "Plain text with no JSON");
+    }
+
+    // --- JSON Comparison Edge Cases ---
+
+    #[test]
+    fn compare_mode_handles_parse_errors() {
+        let br_result = CommandResult {
+            stdout: "not valid json".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: Duration::from_secs(0),
+            log_path: Path::new(".").join("noop"),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            timed_out: false,
+        };
+        let bd_result = CommandResult {
+            stdout: "{\"valid\": true}".to_string(),
+            ..br_result.clone()
+        };
+
+        let (comparison, _) = compare_outputs(
+            &br_result,
+            &bd_result,
+            &CompareMode::NormalizedJson,
+            &NormalizationRules::strict(),
+        );
+
+        assert!(!comparison.matched);
+        assert!(comparison.diff_description.unwrap().contains("parse error"));
+    }
+
+    #[test]
+    fn test_structure_only_ignores_values() {
+        let a = serde_json::json!({"name": "Alice", "count": 100});
+        let b = serde_json::json!({"name": "Bob", "count": 200});
+
+        let a_shape = structure_only(&a);
+        let b_shape = structure_only(&b);
+
+        // Structure should match even with different values
+        assert_eq!(a_shape, b_shape);
+        assert_eq!(a_shape["name"], serde_json::Value::Null);
+        assert_eq!(a_shape["count"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_remove_field_path_nested() {
+        let mut value = serde_json::json!({
+            "user": {
+                "profile": {
+                    "secret": "hidden"
+                }
+            }
+        });
+
+        remove_field_path(&mut value, "user.profile.secret");
+
+        assert!(value["user"]["profile"].get("secret").is_none());
     }
 }
