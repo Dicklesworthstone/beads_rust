@@ -194,43 +194,36 @@ fn print_text_output(
         return;
     }
 
-    println!("Blocked Issues ({} total):\n", blocked_issues.len());
+    // Match bd format: 🚫 Blocked issues (N):
+    println!("\n🚫 Blocked issues ({}):\n", blocked_issues.len());
 
-    for (i, bi) in blocked_issues.iter().enumerate() {
+    for bi in blocked_issues {
         let priority = bi.issue.priority.0;
-        println!(
-            "{}. [{}] P{} {}",
-            i + 1,
-            bi.issue.id,
-            priority,
-            bi.issue.title
-        );
+        // Match bd format: [● P2] ID: Title
+        println!("[● P{}] {}: {}", priority, bi.issue.id, bi.issue.title);
 
         if verbose {
-            println!("   Blocked by:");
+            println!("  Blocked by:");
             for blocker_ref in &bi.blocked_by {
                 // blocker_ref format is "id:status", extract just the id for lookup
                 let blocker_id = blocker_id_from_ref(blocker_ref);
                 if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
                     println!(
-                        "     \u{2022} {}: {} [P{}] [{}]",
+                        "    • {}: {} [P{}] [{}]",
                         blocker_id, blocker.title, blocker.priority.0, blocker.status
                     );
                 } else {
-                    println!("     \u{2022} {blocker_ref} (not found)");
+                    println!("    • {blocker_ref} (not found)");
                 }
             }
         } else {
+            // Match bd format: Blocked by N open dependencies: [id1, id2]
+            // Note: bd uses "dependencies" even for count=1 (grammatically incorrect but we match for conformance)
             let count = bi.blocked_by.len();
-            let issue_word = if count == 1 { "issue" } else { "issues" };
-            println!(
-                "   Blocked by: {} ({} {})",
-                bi.blocked_by.join(", "),
-                count,
-                issue_word
-            );
+            // Extract just the IDs from blocker refs (strip :status suffix)
+            let ids: Vec<&str> = bi.blocked_by.iter().map(|r| blocker_id_from_ref(r)).collect();
+            println!("  Blocked by {} open dependencies: [{}]", count, ids.join(", "));
         }
-        println!();
     }
 }
 
