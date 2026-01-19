@@ -23,6 +23,7 @@ fn parse_created_id(stdout: &str) -> String {
 /// Test 1: Add single label, verify via show
 #[test]
 fn e2e_label_add_single_verify_show() {
+    let _log = common::test_log("e2e_label_add_single_verify_show");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -65,6 +66,7 @@ fn e2e_label_add_single_verify_show() {
 /// Test 2: Add multiple labels to same issue
 #[test]
 fn e2e_label_add_multiple_to_same_issue() {
+    let _log = common::test_log("e2e_label_add_multiple_to_same_issue");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -105,6 +107,7 @@ fn e2e_label_add_multiple_to_same_issue() {
 /// Test 3: Remove label, verify removed
 #[test]
 fn e2e_label_remove_verify() {
+    let _log = common::test_log("e2e_label_remove_verify");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -151,6 +154,7 @@ fn e2e_label_remove_verify() {
 /// Test 4: List all labels across issues
 #[test]
 fn e2e_label_list_all() {
+    let _log = common::test_log("e2e_label_list_all");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -207,6 +211,7 @@ fn e2e_label_list_all() {
 /// Test 5: Add same label to multiple issues
 #[test]
 fn e2e_label_add_same_to_multiple_issues() {
+    let _log = common::test_log("e2e_label_add_same_to_multiple_issues");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -252,6 +257,7 @@ fn e2e_label_add_same_to_multiple_issues() {
 /// Test 6: Add label to non-existent issue → error
 #[test]
 fn e2e_label_add_nonexistent_issue_error() {
+    let _log = common::test_log("e2e_label_add_nonexistent_issue_error");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -274,6 +280,7 @@ fn e2e_label_add_nonexistent_issue_error() {
 /// Test 7: Remove non-existent label → no-op (not error)
 #[test]
 fn e2e_label_remove_nonexistent_noop() {
+    let _log = common::test_log("e2e_label_remove_nonexistent_noop");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -304,6 +311,7 @@ fn e2e_label_remove_nonexistent_noop() {
 /// Test 8: Invalid label format → error
 #[test]
 fn e2e_label_invalid_format_error() {
+    let _log = common::test_log("e2e_label_invalid_format_error");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -345,6 +353,7 @@ fn e2e_label_invalid_format_error() {
 /// Test 9: Label with special characters (allowed: dash, underscore, colon)
 #[test]
 fn e2e_label_special_characters() {
+    let _log = common::test_log("e2e_label_special_characters");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -401,6 +410,7 @@ fn e2e_label_special_characters() {
 /// Test 10: Very long label name
 #[test]
 fn e2e_label_very_long_name() {
+    let _log = common::test_log("e2e_label_very_long_name");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -426,6 +436,7 @@ fn e2e_label_very_long_name() {
 /// Test 11: Case sensitivity (bug vs BUG are different labels)
 #[test]
 fn e2e_label_case_sensitivity() {
+    let _log = common::test_log("e2e_label_case_sensitivity");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -469,6 +480,7 @@ fn e2e_label_case_sensitivity() {
 /// Test 12: Label on closed issue
 #[test]
 fn e2e_label_on_closed_issue() {
+    let _log = common::test_log("e2e_label_on_closed_issue");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -512,6 +524,7 @@ fn e2e_label_on_closed_issue() {
 /// Test JSON output mode for label add
 #[test]
 fn e2e_label_add_json_output() {
+    let _log = common::test_log("e2e_label_add_json_output");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -539,6 +552,7 @@ fn e2e_label_add_json_output() {
 /// Test adding duplicate label (should report "exists")
 #[test]
 fn e2e_label_add_duplicate() {
+    let _log = common::test_log("e2e_label_add_duplicate");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -566,6 +580,7 @@ fn e2e_label_add_duplicate() {
 /// Test label rename across multiple issues
 #[test]
 fn e2e_label_rename() {
+    let _log = common::test_log("e2e_label_rename");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -610,6 +625,7 @@ fn e2e_label_rename() {
 /// Test label persistence in JSONL export
 #[test]
 fn e2e_label_persistence_jsonl() {
+    let _log = common::test_log("e2e_label_persistence_jsonl");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");

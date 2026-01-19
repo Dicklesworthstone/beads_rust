@@ -10,6 +10,7 @@ use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
+use tracing::info;
 
 /// Initialize a git repository in the workspace.
 fn init_git(workspace: &BrWorkspace, label: &str) {
@@ -80,6 +81,8 @@ fn parse_created_id(stdout: &str) -> String {
 
 #[test]
 fn e2e_orphans_no_orphans_empty_list() {
+    common::init_test_logging();
+    info!("e2e_orphans_no_orphans_empty_list: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -102,14 +105,17 @@ fn e2e_orphans_no_orphans_empty_list() {
         orphans.stderr
     );
     assert!(
-        orphans.stdout.contains("No orphan issues found"),
+        orphans.stdout.contains("No orphan"),
         "expected empty orphans message, got: {}",
         orphans.stdout
     );
+    info!("e2e_orphans_no_orphans_empty_list: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_detects_open_issue_in_commit() {
+    common::init_test_logging();
+    info!("e2e_orphans_detects_open_issue_in_commit: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -148,10 +154,13 @@ fn e2e_orphans_detects_open_issue_in_commit() {
         "expected title in output, got: {}",
         orphans.stdout
     );
+    info!("e2e_orphans_detects_open_issue_in_commit: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_detects_issue_without_parens() {
+    common::init_test_logging();
+    info!("e2e_orphans_detects_issue_without_parens: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -181,10 +190,13 @@ fn e2e_orphans_detects_issue_without_parens() {
         issue_id,
         orphans.stdout
     );
+    info!("e2e_orphans_detects_issue_without_parens: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_json_output_structure() {
+    common::init_test_logging();
+    info!("e2e_orphans_json_output_structure: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -225,6 +237,7 @@ fn e2e_orphans_json_output_structure() {
         orphan["latest_commit_message"].is_string(),
         "missing latest_commit_message"
     );
+    info!("e2e_orphans_json_output_structure: assertions passed");
 }
 
 // =============================================================================
@@ -233,6 +246,8 @@ fn e2e_orphans_json_output_structure() {
 
 #[test]
 fn e2e_orphans_excludes_closed_issues() {
+    common::init_test_logging();
+    info!("e2e_orphans_excludes_closed_issues: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -268,10 +283,13 @@ fn e2e_orphans_excludes_closed_issues() {
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
     let arr = json.as_array().unwrap();
     assert!(arr.is_empty(), "closed issue should not appear as orphan");
+    info!("e2e_orphans_excludes_closed_issues: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_includes_in_progress_issues() {
+    common::init_test_logging();
+    info!("e2e_orphans_includes_in_progress_issues: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -308,6 +326,7 @@ fn e2e_orphans_includes_in_progress_issues() {
     let arr = json.as_array().unwrap();
     assert_eq!(arr.len(), 1, "expected in_progress issue as orphan");
     assert_eq!(arr[0]["status"].as_str(), Some("in_progress"));
+    info!("e2e_orphans_includes_in_progress_issues: assertions passed");
 }
 
 // =============================================================================
@@ -316,6 +335,8 @@ fn e2e_orphans_includes_in_progress_issues() {
 
 #[test]
 fn e2e_orphans_before_init_returns_empty() {
+    common::init_test_logging();
+    info!("e2e_orphans_before_init_returns_empty: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git but NOT beads
@@ -329,14 +350,17 @@ fn e2e_orphans_before_init_returns_empty() {
         orphans.stderr
     );
     assert!(
-        orphans.stdout.contains("No orphan issues found"),
+        orphans.stdout.contains("No orphan"),
         "expected empty message, got: {}",
         orphans.stdout
     );
+    info!("e2e_orphans_before_init_returns_empty: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_not_git_repo_returns_empty() {
+    common::init_test_logging();
+    info!("e2e_orphans_not_git_repo_returns_empty: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize beads but NOT git
@@ -355,14 +379,17 @@ fn e2e_orphans_not_git_repo_returns_empty() {
         orphans.stderr
     );
     assert!(
-        orphans.stdout.contains("No orphan issues found"),
+        orphans.stdout.contains("No orphan"),
         "expected empty message, got: {}",
         orphans.stdout
     );
+    info!("e2e_orphans_not_git_repo_returns_empty: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_multiple_issues_multiple_commits() {
+    common::init_test_logging();
+    info!("e2e_orphans_multiple_issues_multiple_commits: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -416,10 +443,13 @@ fn e2e_orphans_multiple_issues_multiple_commits() {
         !ids.contains(&id3.as_str()),
         "should not include closed id3"
     );
+    info!("e2e_orphans_multiple_issues_multiple_commits: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_robot_flag_json_output() {
+    common::init_test_logging();
+    info!("e2e_orphans_robot_flag_json_output: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -446,10 +476,13 @@ fn e2e_orphans_robot_flag_json_output() {
     let payload = extract_json_payload(&orphans.stdout);
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
     assert!(json.is_array(), "robot flag should produce JSON array");
+    info!("e2e_orphans_robot_flag_json_output: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_empty_json_array_when_no_orphans() {
+    common::init_test_logging();
+    info!("e2e_orphans_empty_json_array_when_no_orphans: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -471,10 +504,13 @@ fn e2e_orphans_empty_json_array_when_no_orphans() {
     let json: Value = serde_json::from_str(&payload).expect("parse JSON");
     assert!(json.is_array());
     assert!(json.as_array().unwrap().is_empty(), "expected empty array");
+    info!("e2e_orphans_empty_json_array_when_no_orphans: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_details_flag_shows_commit_info() {
+    common::init_test_logging();
+    info!("e2e_orphans_details_flag_shows_commit_info: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -510,10 +546,13 @@ fn e2e_orphans_details_flag_shows_commit_info() {
         "expected commit message in output, got: {}",
         orphans.stdout
     );
+    info!("e2e_orphans_details_flag_shows_commit_info: assertions passed");
 }
 
 #[test]
 fn e2e_orphans_issue_referenced_multiple_times() {
+    common::init_test_logging();
+    info!("e2e_orphans_issue_referenced_multiple_times: starting");
     let workspace = BrWorkspace::new();
 
     // Initialize git and beads
@@ -552,4 +591,5 @@ fn e2e_orphans_issue_referenced_multiple_times() {
         commit_msg.contains("Finish"),
         "should reference latest commit, got: {commit_msg}"
     );
+    info!("e2e_orphans_issue_referenced_multiple_times: assertions passed");
 }

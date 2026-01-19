@@ -101,10 +101,13 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides) -> Result<()> {
         comments: vec![],
     };
 
+    // Resolve actor and set created_by
+    let actor = config::resolve_actor(&layer);
+    issue.created_by = Some(actor.clone());
+
     // Compute content hash
     issue.content_hash = Some(issue.compute_content_hash());
 
-    let actor = config::resolve_actor(&layer);
     storage.create_issue(&issue, &actor)?;
 
     let labels = split_labels(&args.labels);
