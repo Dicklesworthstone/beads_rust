@@ -13,6 +13,7 @@ pub mod cli;
 pub mod dataset_registry;
 pub mod fixtures;
 pub mod harness;
+pub mod json_baseline;
 pub mod report_indexer;
 pub mod scenarios;
 

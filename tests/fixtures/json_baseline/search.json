@@ -1,0 +1,16 @@
+[
+  {
+    "id": "bd-2h0",
+    "title": "Test task with priority 1",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "created_at": "2026-01-19T22:12:48.936907133Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-19T22:12:49.022237331Z",
+    "compaction_level": 0,
+    "original_size": 0,
+    "dependency_count": 0,
+    "dependent_count": 1
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "created_at": "2026-01-19T22:12:48.936907133Z",
+    "created_by": "ubuntu",
+    "id": "bd-2h0",
+    "issue_type": "task",
+    "priority": 1,
+    "status": "open",
+    "title": "Test task with priority 1",
+    "updated_at": "2026-01-19T22:12:49.022237331Z"
+  },
+  {
+    "created_at": "2026-01-19T22:12:48.953548907Z",
+    "created_by": "ubuntu",
+    "id": "bd-1xz",
+    "issue_type": "chore",
+    "priority": 3,
+    "status": "open",
+    "title": "Chore: update dependencies",
+    "updated_at": "2026-01-19T22:12:48.953548907Z"
+  }
+]

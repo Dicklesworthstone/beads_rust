@@ -1,0 +1,10 @@
+[
+  {
+    "issue_id": "bd-2cr",
+    "depends_on_id": "bd-2h0",
+    "type": "blocks",
+    "title": "Test task with priority 1",
+    "status": "open",
+    "priority": 1
+  }
+]

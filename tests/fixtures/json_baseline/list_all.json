@@ -1,0 +1,85 @@
+[
+  {
+    "id": "bd-2cr",
+    "title": "Critical bug in authentication",
+    "description": "Users cannot login with valid credentials",
+    "status": "open",
+    "priority": 0,
+    "issue_type": "bug",
+    "created_at": "2026-01-19T22:12:48.942352085Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-19T22:12:49.050007668Z",
+    "compaction_level": 0,
+    "original_size": 0,
+    "labels": [
+      "auth"
+    ],
+    "dependency_count": 1,
+    "dependent_count": 1
+  },
+  {
+    "id": "bd-2h0",
+    "title": "Test task with priority 1",
+    "status": "open",
+    "priority": 1,
+    "issue_type": "task",
+    "created_at": "2026-01-19T22:12:48.936907133Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-19T22:12:49.022237331Z",
+    "compaction_level": 0,
+    "original_size": 0,
+    "labels": [
+      "critical"
+    ],
+    "dependency_count": 0,
+    "dependent_count": 1
+  },
+  {
+    "id": "bd-2ja",
+    "title": "New feature: dark mode",
+    "description": "Add dark mode support to the application",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "feature",
+    "created_at": "2026-01-19T22:12:48.947742183Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-19T22:12:49.031608121Z",
+    "compaction_level": 0,
+    "original_size": 0,
+    "labels": [
+      "ux"
+    ],
+    "dependency_count": 1,
+    "dependent_count": 0
+  },
+  {
+    "id": "bd-1xz",
+    "title": "Chore: update dependencies",
+    "status": "open",
+    "priority": 3,
+    "issue_type": "chore",
+    "created_at": "2026-01-19T22:12:48.953548907Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-19T22:12:48.953548907Z",
+    "compaction_level": 0,
+    "original_size": 0,
+    "dependency_count": 0,
+    "dependent_count": 0
+  },
+  {
+    "id": "bd-448",
+    "title": "Low priority documentation",
+    "status": "closed",
+    "priority": 4,
+    "issue_type": "task",
+    "created_at": "2026-01-19T22:12:48.959270510Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-19T22:12:49.055990193Z",
+    "closed_at": "2026-01-19T22:12:49.055951160Z",
+    "close_reason": "Completed documentation updates",
+    "compaction_level": 0,
+    "original_size": 0,
+    "dependency_count": 0,
+    "dependent_count": 0
+  }
+]
