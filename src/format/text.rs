@@ -158,8 +158,14 @@ pub fn format_type_badge_colored(issue_type: &IssueType, use_color: bool) -> Str
 }
 
 /// Determine terminal width from environment (falls back to 80).
+///
+/// Checks in order:
+/// 1. `COLUMNS` environment variable
+/// 2. Terminal size via crossterm
+/// 3. Falls back to 80
 #[must_use]
 pub fn terminal_width() -> usize {
+    // Try COLUMNS first
     if let Ok(columns) = std::env::var("COLUMNS") {
         if let Ok(value) = columns.trim().parse::<usize>() {
             if value > 0 {
@@ -167,6 +173,14 @@ pub fn terminal_width() -> usize {
             }
         }
     }
+
+    // Try crossterm for actual terminal size
+    if let Ok((cols, _)) = crossterm::terminal::size() {
+        if cols > 0 {
+            return cols as usize;
+        }
+    }
+
     80
 }
 
