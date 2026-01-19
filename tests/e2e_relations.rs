@@ -5,6 +5,7 @@ mod common;
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
+use tracing::info;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -17,6 +18,8 @@ fn parse_created_id(stdout: &str) -> String {
 
 #[test]
 fn e2e_relations_labels_comments() {
+    common::init_test_logging();
+    info!("e2e_relations_labels_comments: starting");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -104,10 +107,13 @@ fn e2e_relations_labels_comments() {
     let comments_json: Vec<Value> = serde_json::from_str(&comments_payload).expect("comments json");
     assert_eq!(comments_json.len(), 1);
     assert_eq!(comments_json[0]["text"], "First comment");
+    info!("e2e_relations_labels_comments: assertions passed");
 }
 
 #[test]
 fn e2e_dep_add_list_blocked_remove() {
+    common::init_test_logging();
+    info!("e2e_dep_add_list_blocked_remove: starting");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -191,10 +197,14 @@ fn e2e_dep_add_list_blocked_remove() {
         !blocked_json.iter().any(|item| item["id"] == blocked_id),
         "blocked issue still present after dep remove"
     );
+    info!("e2e_dep_add_list_blocked_remove: assertions passed");
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_dep_tree_external_nodes() {
+    common::init_test_logging();
+    info!("e2e_dep_tree_external_nodes: starting");
     let workspace = BrWorkspace::new();
     let external = BrWorkspace::new();
 
@@ -302,10 +312,14 @@ fn e2e_dep_tree_external_nodes() {
             .starts_with('✓'),
         "external node should show satisfied marker"
     );
+    info!("e2e_dep_tree_external_nodes: assertions passed");
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_dep_list_external_nodes() {
+    common::init_test_logging();
+    info!("e2e_dep_list_external_nodes: starting");
     let workspace = BrWorkspace::new();
     let external = BrWorkspace::new();
 
@@ -413,10 +427,13 @@ fn e2e_dep_list_external_nodes() {
             .starts_with('✓'),
         "external dep should show satisfied marker"
     );
+    info!("e2e_dep_list_external_nodes: assertions passed");
 }
 
 #[test]
 fn e2e_close_suggest_next_unblocks() {
+    common::init_test_logging();
+    info!("e2e_close_suggest_next_unblocks: starting");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -466,10 +483,13 @@ fn e2e_close_suggest_next_unblocks() {
         unblocked.iter().any(|item| item["id"] == blocked_id),
         "blocked issue not reported as unblocked"
     );
+    info!("e2e_close_suggest_next_unblocks: assertions passed");
 }
 
 #[test]
 fn e2e_close_blocked_requires_force() {
+    common::init_test_logging();
+    info!("e2e_close_blocked_requires_force: starting");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -514,14 +534,20 @@ fn e2e_close_blocked_requires_force() {
     );
     let payload = extract_json_payload(&close_skip.stdout);
     let close_json: Value = serde_json::from_str(&payload).expect("close json");
-    let skipped = close_json["skipped"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let closed = close_json.as_array().cloned().unwrap_or_default();
     assert!(
-        skipped.iter().any(|item| item["id"] == blocked_id),
-        "blocked issue not skipped"
+        closed.is_empty(),
+        "blocked issue should not close without --force"
     );
+
+    let show = run_br(
+        &workspace,
+        ["show", &blocked_id, "--json"],
+        "show_blocked_after_skip",
+    );
+    let payload = extract_json_payload(&show.stdout);
+    let issues: Value = serde_json::from_str(&payload).expect("show json");
+    assert_eq!(issues[0]["status"].as_str().unwrap(), "open");
 
     let close_force = run_br(
         &workspace,
@@ -535,9 +561,10 @@ fn e2e_close_blocked_requires_force() {
     );
     let payload = extract_json_payload(&close_force.stdout);
     let close_json: Value = serde_json::from_str(&payload).expect("close json");
-    let closed = close_json["closed"].as_array().cloned().unwrap_or_default();
+    let closed = close_json.as_array().cloned().unwrap_or_default();
     assert!(
         closed.iter().any(|item| item["id"] == blocked_id),
         "blocked issue not closed with --force"
     );
+    info!("e2e_close_blocked_requires_force: assertions passed");
 }

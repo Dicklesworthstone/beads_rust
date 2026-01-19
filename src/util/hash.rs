@@ -6,7 +6,6 @@
 use sha2::{Digest, Sha256};
 
 use crate::model::{Issue, IssueType, Priority, Status};
-use chrono::{DateTime, Utc};
 
 /// Trait for types that can produce a deterministic content hash.
 pub trait ContentHashable {
@@ -25,7 +24,8 @@ impl ContentHashable for Issue {
 /// Fields included (stable order with null separators):
 /// - title, description, design, `acceptance_criteria`, notes
 /// - status, priority, `issue_type`
-/// - assignee, `external_ref`
+/// - assignee, owner, `created_by`
+/// - `external_ref`, `source_system`
 /// - pinned, `is_template`
 ///
 /// Fields excluded:
@@ -33,7 +33,9 @@ impl ContentHashable for Issue {
 /// - labels, dependencies, comments, events (separate entities)
 /// - timestamps (`created_at`, `updated_at`, `closed_at`, etc.)
 /// - tombstone fields (`deleted_at`, `deleted_by`, `delete_reason`)
-/// - owner, `created_by` (metadata, not content)
+/// - `estimated_minutes`, `due_at`, `defer_until`
+/// - `close_reason`, `closed_by_session`
+/// - `deleted_at`, `deleted_by`, `delete_reason`
 #[must_use]
 pub fn content_hash(issue: &Issue) -> String {
     content_hash_from_parts(
@@ -47,11 +49,9 @@ pub fn content_hash(issue: &Issue) -> String {
         &issue.issue_type,
         issue.assignee.as_deref(),
         issue.owner.as_deref(),
-        issue.estimated_minutes,
-        issue.due_at,
-        issue.defer_until,
+        issue.created_by.as_deref(),
         issue.external_ref.as_deref(),
-        issue.close_reason.as_deref(),
+        issue.source_system.as_deref(),
         issue.pinned,
         issue.is_template,
     )
@@ -71,11 +71,9 @@ pub fn content_hash_from_parts(
     issue_type: &IssueType,
     assignee: Option<&str>,
     owner: Option<&str>,
-    estimated_minutes: Option<i32>,
-    due_at: Option<DateTime<Utc>>,
-    defer_until: Option<DateTime<Utc>>,
+    created_by: Option<&str>,
     external_ref: Option<&str>,
-    close_reason: Option<&str>,
+    source_system: Option<&str>,
     pinned: bool,
     is_template: bool,
 ) -> String {
@@ -91,11 +89,9 @@ pub fn content_hash_from_parts(
     writer.field(issue_type.as_str());
     writer.field_opt(assignee);
     writer.field_opt(owner);
-    writer.field_i32_opt(estimated_minutes);
-    writer.field_date_opt(due_at);
-    writer.field_date_opt(defer_until);
+    writer.field_opt(created_by);
     writer.field_opt(external_ref);
-    writer.field_opt(close_reason);
+    writer.field_opt(source_system);
     writer.field_bool(pinned);
     writer.field_bool(is_template);
 
@@ -126,22 +122,6 @@ impl HashFieldWriter {
         self.field(value.unwrap_or(""));
     }
 
-    fn field_i32_opt(&mut self, value: Option<i32>) {
-        if let Some(v) = value {
-            self.field(&v.to_string());
-        } else {
-            self.field("");
-        }
-    }
-
-    fn field_date_opt(&mut self, value: Option<DateTime<Utc>>) {
-        if let Some(d) = value {
-            self.field(&d.to_rfc3339());
-        } else {
-            self.field("");
-        }
-    }
-
     fn field_bool(&mut self, value: bool) {
         self.field(if value { "true" } else { "false" });
     }
@@ -154,7 +134,6 @@ impl HashFieldWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn make_test_issue() -> Issue {
         Issue {
@@ -171,9 +150,9 @@ mod tests {
             assignee: None,
             owner: None,
             estimated_minutes: None,
-            created_at: Utc::now(),
+            created_at: chrono::Utc::now(),
             created_by: None,
-            updated_at: Utc::now(),
+            updated_at: chrono::Utc::now(),
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
@@ -231,7 +210,7 @@ mod tests {
         let mut issue = make_test_issue();
         let hash1 = content_hash(&issue);
 
-        issue.updated_at = Utc::now();
+        issue.updated_at = chrono::Utc::now();
         let hash2 = content_hash(&issue);
 
         assert_eq!(hash1, hash2);
@@ -243,6 +222,28 @@ mod tests {
         let hash1 = content_hash(&issue);
 
         issue.pinned = true;
+        let hash2 = content_hash(&issue);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_content_hash_includes_created_by() {
+        let mut issue = make_test_issue();
+        let hash1 = content_hash(&issue);
+
+        issue.created_by = Some("tester@example.com".to_string());
+        let hash2 = content_hash(&issue);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_content_hash_includes_source_system() {
+        let mut issue = make_test_issue();
+        let hash1 = content_hash(&issue);
+
+        issue.source_system = Some("imported".to_string());
         let hash2 = content_hash(&issue);
 
         assert_ne!(hash1, hash2);
@@ -263,11 +264,9 @@ mod tests {
             &issue.issue_type,
             issue.assignee.as_deref(),
             issue.owner.as_deref(),
-            issue.estimated_minutes,
-            issue.due_at,
-            issue.defer_until,
+            issue.created_by.as_deref(),
             issue.external_ref.as_deref(),
-            issue.close_reason.as_deref(),
+            issue.source_system.as_deref(),
             issue.pinned,
             issue.is_template,
         );

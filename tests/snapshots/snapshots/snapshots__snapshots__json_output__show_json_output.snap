@@ -4,26 +4,12 @@ expression: normalize_json(&json)
 ---
 [
   {
-    "comments": [],
     "compaction_level": 0,
     "created_at": "TIMESTAMP",
-    "dependencies": [],
-    "dependents": [],
-    "events": [
-      {
-        "actor": "ubuntu",
-        "comment": "Created issue: Detailed issue",
-        "created_at": "TIMESTAMP",
-        "event_type": "created",
-        "id": "ISSUE_ID",
-        "issue_id": "ISSUE_ID"
-      }
-    ],
+    "created_by": "ACTOR",
     "id": "ISSUE_ID",
     "issue_type": "task",
-    "labels": [],
     "original_size": 0,
-    "parent": null,
     "priority": 2,
     "status": "open",
     "title": "Detailed issue",
