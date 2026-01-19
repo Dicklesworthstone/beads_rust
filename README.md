@@ -1,7 +1,7 @@
 # br - Beads Rust
 
 <div align="center">
-  <img src="br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
+  <img src="br_illustration.png" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
 </div>
 
 <div align="center">
