@@ -24,7 +24,6 @@ fn parse_created_id(stdout: &str) -> String {
 /// Test 1: Add single comment, verify in list
 #[test]
 fn e2e_comments_add_single_and_list() {
-    let _log = common::test_log("e2e_comments_add_single_and_list");
     let workspace = BrWorkspace::new();
 
     // Initialize workspace
@@ -61,7 +60,6 @@ fn e2e_comments_add_single_and_list() {
 /// Test 2: Add multiple comments, verify order (newest last)
 #[test]
 fn e2e_comments_add_multiple_verify_order() {
-    let _log = common::test_log("e2e_comments_add_multiple_verify_order");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -124,7 +122,6 @@ fn e2e_comments_add_multiple_verify_order() {
 /// Test 3: List comments with --json, validate structure
 #[test]
 fn e2e_comments_list_json_structure() {
-    let _log = common::test_log("e2e_comments_list_json_structure");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -175,7 +172,6 @@ fn e2e_comments_list_json_structure() {
 /// Test 4: Add comment to issue with existing comments
 #[test]
 fn e2e_comments_add_to_existing() {
-    let _log = common::test_log("e2e_comments_add_to_existing");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -227,7 +223,6 @@ fn e2e_comments_add_to_existing() {
 /// Test 5: Add comment to non-existent issue → error
 #[test]
 fn e2e_comments_add_nonexistent_issue() {
-    let _log = common::test_log("e2e_comments_add_nonexistent_issue");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -255,7 +250,6 @@ fn e2e_comments_add_nonexistent_issue() {
 /// Test 6: Add empty comment → error or rejection
 #[test]
 fn e2e_comments_add_empty() {
-    let _log = common::test_log("e2e_comments_add_empty");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -301,7 +295,6 @@ fn e2e_comments_add_empty() {
 /// Test 7: List comments on issue with no comments → empty list
 #[test]
 fn e2e_comments_list_empty() {
-    let _log = common::test_log("e2e_comments_list_empty");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -331,7 +324,6 @@ fn e2e_comments_list_empty() {
 /// Test 8: Comment with special characters (quotes, newlines, unicode)
 #[test]
 fn e2e_comments_special_characters() {
-    let _log = common::test_log("e2e_comments_special_characters");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -378,7 +370,6 @@ fn e2e_comments_special_characters() {
 /// Test 9: Very long comment (near limits)
 #[test]
 fn e2e_comments_long_text() {
-    let _log = common::test_log("e2e_comments_long_text");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -416,7 +407,6 @@ fn e2e_comments_long_text() {
 /// Test 10: Comment on closed issue (should work)
 #[test]
 fn e2e_comments_on_closed_issue() {
-    let _log = common::test_log("e2e_comments_on_closed_issue");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -463,7 +453,6 @@ fn e2e_comments_on_closed_issue() {
 /// Test: Comments add with --json output
 #[test]
 fn e2e_comments_add_json_output() {
-    let _log = common::test_log("e2e_comments_add_json_output");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -495,7 +484,6 @@ fn e2e_comments_add_json_output() {
 /// Test: Comments shorthand (br comments <id> = br comments list <id>)
 #[test]
 fn e2e_comments_shorthand() {
-    let _log = common::test_log("e2e_comments_shorthand");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -529,7 +517,6 @@ fn e2e_comments_shorthand() {
 /// Test: Comments are preserved in JSONL sync
 #[test]
 fn e2e_comments_sync_roundtrip() {
-    let _log = common::test_log("e2e_comments_sync_roundtrip");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");

@@ -1,7 +1,8 @@
 ---
 source: tests/snapshots/cli_output.rs
+assertion_line: 154
 expression: normalize_output(&output.stdout)
 ---
 Found 2 issue(s) matching 'login'
-○ ID-REDACTED [● P2] [task] - User login flow improvement
-○ ID-REDACTED [● P2] [task] - Authentication bug in login
+○ ID-REDACTED [P2] [task] User login flow improvement
+○ ID-REDACTED [P2] [task] Authentication bug in login

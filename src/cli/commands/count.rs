@@ -170,11 +170,6 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::Utc;
-    use tracing::info;
-
-    fn init_logging() {
-        crate::logging::init_test_logging();
-    }
 
     fn make_issue(id: &str, status: Status, priority: Priority, issue_type: IssueType) -> Issue {
         Issue {
@@ -221,8 +216,6 @@ mod tests {
 
     #[test]
     fn test_group_counts_status() {
-        init_logging();
-        info!("test_group_counts_status: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
         let issue1 = make_issue("bd-1", Status::Open, Priority::MEDIUM, IssueType::Task);
         let issue2 = make_issue("bd-2", Status::InProgress, Priority::HIGH, IssueType::Bug);
@@ -245,13 +238,10 @@ mod tests {
 
         assert_eq!(map.get("open"), Some(&1));
         assert_eq!(map.get("in_progress"), Some(&1));
-        info!("test_group_counts_status: assertions passed");
     }
 
     #[test]
     fn test_group_counts_label_includes_unlabeled() {
-        init_logging();
-        info!("test_group_counts_label_includes_unlabeled: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
         let issue1 = make_issue("bd-1", Status::Open, Priority::MEDIUM, IssueType::Task);
         let issue2 = make_issue("bd-2", Status::Open, Priority::LOW, IssueType::Task);
@@ -275,6 +265,5 @@ mod tests {
 
         assert_eq!(map.get("backend"), Some(&1));
         assert_eq!(map.get("(no labels)"), Some(&1));
-        info!("test_group_counts_label_includes_unlabeled: assertions passed");
     }
 }

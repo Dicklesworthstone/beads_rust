@@ -2,6 +2,5 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
-○ ID-REDACTED · Test issue with description   [● P2 · OPEN]
-Owner: USERNAME · Type: task
-Created: YYYY-MM-DD · Updated: YYYY-MM-DD
+ID-REDACTED Test issue with description [P2] [open]
+----------------------------------------

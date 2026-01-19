@@ -2,4 +2,4 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
-
+No issues found.

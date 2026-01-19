@@ -7,7 +7,7 @@
 //!
 //! Events are local DB only - never exported to JSONL.
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, Transaction, params};
 
 use crate::error::Result;
@@ -395,8 +395,9 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
     // Parse event type
     let event_type = parse_event_type(&event_type_str);
 
-    // Parse timestamp (support RFC3339 and SQLite default format)
-    let created_at = parse_event_timestamp(&created_at_str);
+    // Parse timestamp
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
     Ok(Event {
         id,
@@ -408,18 +409,6 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         comment,
         created_at,
     })
-}
-
-fn parse_event_timestamp(value: &str) -> DateTime<Utc> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
-        return dt.with_timezone(&Utc);
-    }
-
-    if let Ok(naive) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-        return Utc.from_utc_datetime(&naive);
-    }
-
-    Utc::now()
 }
 
 /// Get all events across all issues, ordered by `created_at` DESC.

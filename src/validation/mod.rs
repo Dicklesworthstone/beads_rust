@@ -16,10 +16,6 @@ use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, Issue, Priority};
 use std::path::Path;
 
-const MAX_ID_PREFIX_LEN: usize = 64;
-const MAX_ID_HASH_LEN: usize = 40;
-const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
-
 /// Validates issue fields and invariants.
 pub struct IssueValidator;
 
@@ -32,15 +28,12 @@ impl IssueValidator {
     pub fn validate(issue: &Issue) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
 
-        // ID: Required, max length, prefix-hash format.
+        // ID: Required, max 50 chars, prefix-hash format.
         if issue.id.trim().is_empty() {
             errors.push(ValidationError::new("id", "cannot be empty"));
         }
-        if issue.id.len() > MAX_ID_LENGTH {
-            errors.push(ValidationError::new(
-                "id",
-                format!("exceeds {MAX_ID_LENGTH} characters"),
-            ));
+        if issue.id.len() > 50 {
+            errors.push(ValidationError::new("id", "exceeds 50 characters"));
         }
         if !issue.id.is_empty() && !is_valid_id_format(&issue.id) {
             errors.push(ValidationError::new(
@@ -255,45 +248,34 @@ impl CommentValidator {
 
 #[must_use]
 pub fn is_valid_id_format(id: &str) -> bool {
-    let Some(parsed) = crate::util::id::split_prefix_remainder(id) else {
+    let mut parts = id.splitn(2, '-');
+    let Some(prefix) = parts.next() else {
         return false;
     };
-    let (prefix, hash) = parsed;
+    let Some(hash) = parts.next() else {
+        return false;
+    };
 
-    if prefix.is_empty() || prefix.len() > MAX_ID_PREFIX_LEN {
+    if prefix.is_empty() || prefix.len() > 10 {
         return false;
     }
 
     if !prefix
         .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     {
         return false;
     }
 
-    // Allow longer hashes for hierarchical IDs (e.g., "0v1.1.1.1")
-    if hash.is_empty() || hash.len() > MAX_ID_HASH_LEN {
+    if hash.is_empty() || hash.len() > 25 {
         return false;
     }
 
-    // Allow dots for hierarchical/child IDs (e.g., "bd-abc.1", "bd-abc.1.2")
-    // Format: base_hash[.child_num]* where child_num is numeric
-    let mut segments = hash.split('.');
-    let Some(base_hash) = segments.next() else {
-        return false;
-    };
-    if base_hash.is_empty()
-        || !base_hash
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    if !hash
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
         return false;
-    }
-
-    for segment in segments {
-        if segment.is_empty() || !segment.chars().all(|c| c.is_ascii_digit()) {
-            return false;
-        }
     }
 
     true
@@ -702,20 +684,13 @@ mod tests {
         assert!(!is_valid_id_format("bd-ABC"));
         // 1 char hash is now allowed (min 1)
         assert!(is_valid_id_format("bd-1"));
-        // 9 char hash is allowed (max 40 for hierarchical IDs)
+        // 9 char hash is now allowed (max 25)
         assert!(is_valid_id_format("bd-abc123456"));
 
         assert!(!is_valid_id_format("bd_abc"));
-        assert!(!is_valid_id_format("bd-abc.def"));
-        assert!(!is_valid_id_format("bd-abc.1a"));
 
-        // 26 char hash is now valid (within max 40)
-        assert!(is_valid_id_format("bd-abc12345678901234567890123456"));
-
-        // Too long (41 chars) - exceeds max 40
-        assert!(!is_valid_id_format(
-            "bd-abc123456789012345678901234567890123456789"
-        ));
+        // Too long (26 chars)
+        assert!(!is_valid_id_format("bd-abc12345678901234567890123456"));
     }
 
     #[test]

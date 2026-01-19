@@ -332,115 +332,81 @@ fn parse_date(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logging::init_test_logging;
     use crate::model::Priority;
     use chrono::{Datelike, Timelike};
-    use tracing::info;
 
     #[test]
     fn test_optional_string_field_with_value() {
-        init_test_logging();
-        info!("test_optional_string_field_with_value: starting");
         let result = optional_string_field(Some("test"));
         assert_eq!(result, Some(Some("test".to_string())));
-        info!("test_optional_string_field_with_value: assertions passed");
     }
 
     #[test]
     fn test_optional_string_field_with_empty() {
-        init_test_logging();
-        info!("test_optional_string_field_with_empty: starting");
         let result = optional_string_field(Some(""));
         assert_eq!(result, Some(None));
-        info!("test_optional_string_field_with_empty: assertions passed");
     }
 
     #[test]
     fn test_optional_string_field_with_none() {
-        init_test_logging();
-        info!("test_optional_string_field_with_none: starting");
         let result = optional_string_field(None);
         assert_eq!(result, None);
-        info!("test_optional_string_field_with_none: assertions passed");
     }
 
     #[test]
     fn test_optional_date_field_with_valid() {
-        init_test_logging();
-        info!("test_optional_date_field_with_valid: starting");
         let result = optional_date_field(Some("2024-01-15T12:00:00Z")).unwrap();
         assert!(result.is_some());
         let date = result.unwrap().unwrap();
         assert_eq!(date.year(), 2024);
         assert_eq!(date.month(), 1);
         assert_eq!(date.day(), 15);
-        info!("test_optional_date_field_with_valid: assertions passed");
     }
 
     #[test]
     fn test_optional_date_field_with_empty() {
-        init_test_logging();
-        info!("test_optional_date_field_with_empty: starting");
         let result = optional_date_field(Some("")).unwrap();
         assert_eq!(result, Some(None));
-        info!("test_optional_date_field_with_empty: assertions passed");
     }
 
     #[test]
     fn test_optional_date_field_with_none() {
-        init_test_logging();
-        info!("test_optional_date_field_with_none: starting");
         let result = optional_date_field(None).unwrap();
         assert_eq!(result, None);
-        info!("test_optional_date_field_with_none: assertions passed");
     }
 
     #[test]
     fn test_optional_date_field_invalid_format() {
-        init_test_logging();
-        info!("test_optional_date_field_invalid_format: starting");
         let result = optional_date_field(Some("not-a-date"));
         assert!(result.is_err());
-        info!("test_optional_date_field_invalid_format: assertions passed");
     }
 
     #[test]
     fn test_parse_date_valid_rfc3339() {
-        init_test_logging();
-        info!("test_parse_date_valid_rfc3339: starting");
         let result = parse_date("2024-06-15T10:30:00+00:00").unwrap();
         assert_eq!(result.year(), 2024);
         assert_eq!(result.month(), 6);
         assert_eq!(result.day(), 15);
-        info!("test_parse_date_valid_rfc3339: assertions passed");
     }
 
     #[test]
     fn test_parse_date_with_timezone() {
-        init_test_logging();
-        info!("test_parse_date_with_timezone: starting");
         let result = parse_date("2024-12-25T08:00:00-05:00").unwrap();
         // Should be converted to UTC
         assert_eq!(result.year(), 2024);
         assert_eq!(result.month(), 12);
         assert_eq!(result.day(), 25);
         assert_eq!(result.hour(), 13); // 8:00 EST = 13:00 UTC
-        info!("test_parse_date_with_timezone: assertions passed");
     }
 
     #[test]
     fn test_parse_date_invalid() {
-        init_test_logging();
-        info!("test_parse_date_invalid: starting");
         let result = parse_date("invalid");
         assert!(result.is_err());
-        info!("test_parse_date_invalid: assertions passed");
     }
 
     #[test]
     fn test_parse_date_partial_date() {
-        init_test_logging();
-        info!("test_parse_date_partial_date: starting");
         // Partial dates without time should now succeed
         let result = parse_date("2024-01-15");
         assert!(result.is_ok());
@@ -448,13 +414,10 @@ mod tests {
         assert_eq!(date.year(), 2024);
         assert_eq!(date.month(), 1);
         assert_eq!(date.day(), 15);
-        info!("test_parse_date_partial_date: assertions passed");
     }
 
     #[test]
     fn test_build_update_with_claim() {
-        init_test_logging();
-        info!("test_build_update_with_claim: starting");
         let args = UpdateArgs {
             claim: true,
             ..Default::default()
@@ -462,13 +425,10 @@ mod tests {
         let update = build_update(&args, "test_actor").unwrap();
         assert_eq!(update.status, Some(Status::InProgress));
         assert_eq!(update.assignee, Some(Some("test_actor".to_string())));
-        info!("test_build_update_with_claim: assertions passed");
     }
 
     #[test]
     fn test_build_update_with_status() {
-        init_test_logging();
-        info!("test_build_update_with_status: starting");
         let args = UpdateArgs {
             status: Some("closed".to_string()),
             ..Default::default()
@@ -477,29 +437,22 @@ mod tests {
         assert_eq!(update.status, Some(Status::Closed));
         // closed_at should be set
         assert!(update.closed_at.is_some());
-        info!("test_build_update_with_status: assertions passed");
     }
 
     #[test]
     fn test_build_update_with_priority() {
-        init_test_logging();
-        info!("test_build_update_with_priority: starting");
         let args = UpdateArgs {
             priority: Some("1".to_string()),
             ..Default::default()
         };
         let update = build_update(&args, "test_actor").unwrap();
         assert_eq!(update.priority, Some(Priority(1)));
-        info!("test_build_update_with_priority: assertions passed");
     }
 
     #[test]
     fn test_build_update_empty() {
-        init_test_logging();
-        info!("test_build_update_empty: starting");
         let args = UpdateArgs::default();
         let update = build_update(&args, "test_actor").unwrap();
         assert!(update.is_empty());
-        info!("test_build_update_empty: assertions passed");
     }
 }

@@ -20,24 +20,6 @@ use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 use tracing::info;
 
-/// Check if the `bd` (Go beads) binary is available on the system.
-fn bd_available() -> bool {
-    std::process::Command::new("bd")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Skip test if bd binary is not available (used in CI where only br is built)
-macro_rules! skip_if_no_bd {
-    () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
-            return;
-        }
-    };
-}
-
 /// Output from running a command
 #[derive(Debug)]
 pub struct CmdOutput {
@@ -523,7 +505,6 @@ fn extract_id_from_json(output: &str) -> String {
 
 #[test]
 fn conformance_label_add_single() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_add_single test");
 
@@ -584,7 +565,6 @@ fn conformance_label_add_single() {
 
 #[test]
 fn conformance_label_add_multiple() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_add_multiple test");
 
@@ -637,7 +617,6 @@ fn conformance_label_add_multiple() {
 
 #[test]
 fn conformance_label_remove() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_remove test");
 
@@ -700,7 +679,6 @@ fn conformance_label_remove() {
 
 #[test]
 fn conformance_label_list() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_list test");
 
@@ -751,7 +729,6 @@ fn conformance_label_list() {
 
 #[test]
 fn conformance_label_list_all() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_list_all test");
 
@@ -813,7 +790,6 @@ fn conformance_label_list_all() {
 
 #[test]
 fn conformance_label_special_chars() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_special_chars test");
 
@@ -858,7 +834,6 @@ fn conformance_label_special_chars() {
 
 #[test]
 fn conformance_label_unicode() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_unicode test");
 
@@ -912,7 +887,6 @@ fn conformance_label_unicode() {
 
 #[test]
 fn conformance_label_duplicate() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_duplicate test");
 
@@ -951,7 +925,6 @@ fn conformance_label_duplicate() {
 
 #[test]
 fn conformance_label_remove_nonexistent() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_remove_nonexistent test");
 
@@ -992,7 +965,6 @@ fn conformance_label_remove_nonexistent() {
 
 #[test]
 fn conformance_label_json_shape() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_json_shape test");
 
@@ -1039,7 +1011,6 @@ fn conformance_label_json_shape() {
 
 #[test]
 fn conformance_label_filter_issues() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_filter_issues test");
 
@@ -1099,7 +1070,6 @@ fn conformance_label_filter_issues() {
 
 #[test]
 fn conformance_label_case_sensitivity() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_label_case_sensitivity test");
 
@@ -1152,7 +1122,6 @@ fn conformance_label_case_sensitivity() {
 
 #[test]
 fn conformance_comments_add() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_add test");
 
@@ -1210,7 +1179,6 @@ fn conformance_comments_add() {
 
 #[test]
 fn conformance_comments_list() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_list test");
 
@@ -1262,7 +1230,6 @@ fn conformance_comments_list() {
 
 #[test]
 fn conformance_comments_empty() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_empty test");
 
@@ -1313,7 +1280,6 @@ fn conformance_comments_empty() {
 
 #[test]
 fn conformance_comments_multiple() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_multiple test");
 
@@ -1358,7 +1324,6 @@ fn conformance_comments_multiple() {
 
 #[test]
 fn conformance_comments_markdown() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_markdown test");
 
@@ -1408,7 +1373,6 @@ fn conformance_comments_markdown() {
 
 #[test]
 fn conformance_comments_unicode() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_unicode test");
 
@@ -1457,7 +1421,6 @@ fn conformance_comments_unicode() {
 
 #[test]
 fn conformance_comments_json_shape() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_json_shape test");
 
@@ -1510,7 +1473,6 @@ fn conformance_comments_json_shape() {
 
 #[test]
 fn conformance_comments_issue_not_found() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_issue_not_found test");
 
@@ -1544,7 +1506,6 @@ fn conformance_comments_issue_not_found() {
 
 #[test]
 fn conformance_comments_ordering() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_ordering test");
 
@@ -1601,7 +1562,6 @@ fn conformance_comments_ordering() {
 
 #[test]
 fn conformance_comments_author() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_author test");
 
@@ -1678,7 +1638,6 @@ fn conformance_comments_author() {
 
 #[test]
 fn conformance_comments_timestamps() {
-    skip_if_no_bd!();
     common::init_test_logging();
     info!("Starting conformance_comments_timestamps test");
 

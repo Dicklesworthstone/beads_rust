@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -30,25 +30,6 @@ use tracing::info;
 // ============================================================================
 // BENCHMARK INFRASTRUCTURE (adapted from conformance.rs)
 // ============================================================================
-
-/// Check if the `bd` (Go beads) binary is available on the system.
-/// Returns true if `bd version` runs successfully, false otherwise.
-fn bd_available() -> bool {
-    std::process::Command::new("bd")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Skip test if bd binary is not available (used in CI where only br is built)
-macro_rules! skip_if_no_bd {
-    () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
-            return;
-        }
-    };
-}
 
 /// Output from running a command
 #[derive(Debug, Clone)]
@@ -708,7 +689,6 @@ pub struct BenchmarkReport {
     pub timestamp: String,
     pub config: BenchmarkConfigJson,
     pub comparisons: Vec<BenchmarkComparison>,
-    pub memory: Vec<MemoryComparison>,
     pub summary: BenchmarkSummary,
 }
 
@@ -729,11 +709,7 @@ pub struct BenchmarkSummary {
 }
 
 impl BenchmarkReport {
-    pub fn new(
-        config: &BenchmarkConfig,
-        comparisons: Vec<BenchmarkComparison>,
-        memory: Vec<MemoryComparison>,
-    ) -> Self {
+    pub fn new(config: &BenchmarkConfig, comparisons: Vec<BenchmarkComparison>) -> Self {
         let total = comparisons.len();
         let br_faster = comparisons
             .iter()
@@ -764,7 +740,6 @@ impl BenchmarkReport {
                 outlier_threshold: config.outlier_threshold,
             },
             comparisons,
-            memory,
             summary: BenchmarkSummary {
                 total_benchmarks: total,
                 br_faster_count: br_faster,
@@ -789,26 +764,6 @@ impl BenchmarkReport {
 
         for comparison in &self.comparisons {
             comparison.print();
-        }
-
-        if !self.memory.is_empty() {
-            println!("\n========================================");
-            println!("MEMORY USAGE (MAX RSS)");
-            println!("========================================");
-            for entry in &self.memory {
-                println!("\n=== {} ===", entry.name);
-                println!("Description: {}", entry.description);
-                let br_rss = entry
-                    .br
-                    .max_rss_kb
-                    .map_or("n/a".to_string(), |rss| format!("{rss} KB"));
-                let bd_rss = entry
-                    .bd
-                    .max_rss_kb
-                    .map_or("n/a".to_string(), |rss| format!("{rss} KB"));
-                println!("br max RSS: {br_rss}");
-                println!("bd max RSS: {bd_rss}");
-            }
         }
 
         println!("\n========================================");
@@ -843,148 +798,6 @@ impl BenchmarkReport {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
-}
-
-// ========================================================================
-// MEMORY USAGE COMPARISON
-// ========================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryStats {
-    pub max_rss_kb: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryComparison {
-    pub name: String,
-    pub description: String,
-    pub br: MemoryStats,
-    pub bd: MemoryStats,
-}
-
-fn parse_max_rss_kb(stderr: &str) -> Option<u64> {
-    for line in stderr.lines() {
-        if let Some(rest) = line.strip_prefix("Maximum resident set size (kbytes):") {
-            return rest.trim().parse::<u64>().ok();
-        }
-    }
-    None
-}
-
-fn time_binary_with_rss<P: AsRef<Path>>(
-    program: P,
-    cwd: &PathBuf,
-    args: &[&str],
-) -> Option<MemoryStats> {
-    let time_path = Path::new("/usr/bin/time");
-    if !time_path.exists() {
-        info!("memory_benchmark: /usr/bin/time not found; skipping");
-        return None;
-    }
-
-    let output = std::process::Command::new(time_path)
-        .arg("-v")
-        .arg(program.as_ref())
-        .args(args)
-        .current_dir(cwd)
-        .env("NO_COLOR", "1")
-        .env("HOME", cwd)
-        .output()
-        .expect("run /usr/bin/time");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let max_rss_kb = parse_max_rss_kb(&stderr);
-
-    Some(MemoryStats { max_rss_kb })
-}
-
-fn benchmark_memory_usage_1000() -> Option<MemoryComparison> {
-    info!("benchmark_memory_usage_1000: starting");
-
-    let workspace = BenchmarkWorkspace::new();
-    populate_workspace(&workspace, 1000);
-
-    let br_bin = assert_cmd::cargo::cargo_bin!("br");
-    let br_stats = time_binary_with_rss(&br_bin, &workspace.br_root, &["list", "--json"])
-        .unwrap_or(MemoryStats { max_rss_kb: None });
-
-    let bd_stats = time_binary_with_rss("bd", &workspace.bd_root, &["list", "--json"])
-        .unwrap_or(MemoryStats { max_rss_kb: None });
-
-    if br_stats.max_rss_kb.is_none() && bd_stats.max_rss_kb.is_none() {
-        info!("benchmark_memory_usage_1000: no RSS data available");
-        return None;
-    }
-
-    Some(MemoryComparison {
-        name: "memory_list_1000".to_string(),
-        description: "Max RSS for list --json with 1000 issues".to_string(),
-        br: br_stats,
-        bd: bd_stats,
-    })
-}
-
-fn benchmark_memory_sync_flush_1000() -> Option<MemoryComparison> {
-    info!("benchmark_memory_sync_flush_1000: starting");
-
-    let workspace = BenchmarkWorkspace::new();
-    populate_workspace(&workspace, 1000);
-
-    let br_bin = assert_cmd::cargo::cargo_bin!("br");
-    let br_stats = time_binary_with_rss(&br_bin, &workspace.br_root, &["sync", "--flush-only"])
-        .unwrap_or(MemoryStats { max_rss_kb: None });
-
-    let bd_stats = time_binary_with_rss("bd", &workspace.bd_root, &["sync", "--flush-only"])
-        .unwrap_or(MemoryStats { max_rss_kb: None });
-
-    if br_stats.max_rss_kb.is_none() && bd_stats.max_rss_kb.is_none() {
-        info!("benchmark_memory_sync_flush_1000: no RSS data available");
-        return None;
-    }
-
-    Some(MemoryComparison {
-        name: "memory_sync_flush_1000".to_string(),
-        description: "Max RSS for sync --flush-only with 1000 issues".to_string(),
-        br: br_stats,
-        bd: bd_stats,
-    })
-}
-
-fn benchmark_memory_sync_import_1000() -> Option<MemoryComparison> {
-    info!("benchmark_memory_sync_import_1000: starting");
-
-    let jsonl_data = generate_import_jsonl(1000);
-
-    let br_workspace = BenchmarkWorkspace::new();
-    let br_init = br_workspace.run_br(["init"], "init");
-    assert!(br_init.success, "br init failed: {}", br_init.stderr);
-    let br_jsonl_path = br_workspace.br_root.join(".beads").join("issues.jsonl");
-    fs::write(&br_jsonl_path, &jsonl_data).expect("write br issues.jsonl");
-
-    let bd_workspace = BenchmarkWorkspace::new();
-    let bd_init = bd_workspace.run_bd(["init"], "init");
-    assert!(bd_init.success, "bd init failed: {}", bd_init.stderr);
-    let bd_jsonl_path = bd_workspace.bd_root.join(".beads").join("issues.jsonl");
-    fs::write(&bd_jsonl_path, &jsonl_data).expect("write bd issues.jsonl");
-
-    let br_bin = assert_cmd::cargo::cargo_bin!("br");
-    let br_stats = time_binary_with_rss(&br_bin, &br_workspace.br_root, &["sync", "--import-only"])
-        .unwrap_or(MemoryStats { max_rss_kb: None });
-
-    let bd_stats = time_binary_with_rss("bd", &bd_workspace.bd_root, &["sync", "--import-only"])
-        .unwrap_or(MemoryStats { max_rss_kb: None });
-
-    if br_stats.max_rss_kb.is_none() && bd_stats.max_rss_kb.is_none() {
-        info!("benchmark_memory_sync_import_1000: no RSS data available");
-        return None;
-    }
-
-    Some(MemoryComparison {
-        name: "memory_sync_import_1000".to_string(),
-        description: "Max RSS for sync --import-only with 1000 issues".to_string(),
-        br: br_stats,
-        bd: bd_stats,
-    })
 }
 
 // ============================================================================
@@ -1107,25 +920,6 @@ fn populate_workspace(workspace: &BenchmarkWorkspace, count: usize) {
     }
 }
 
-/// Generate JSONL data for import benchmarks using br as the source of truth.
-fn generate_import_jsonl(count: usize) -> Vec<u8> {
-    let workspace = BenchmarkWorkspace::new();
-    let init = workspace.run_br(["init"], "init");
-    assert!(init.success, "br init failed: {}", init.stderr);
-
-    for i in 0..count {
-        let title = format!("Import seed issue {}", i);
-        let create = workspace.run_br(["create", &title, "--json"], "create");
-        assert!(create.success, "br create failed: {}", create.stderr);
-    }
-
-    let flush = workspace.run_br(["sync", "--flush-only"], "sync_flush");
-    assert!(flush.success, "br sync flush failed: {}", flush.stderr);
-
-    let jsonl_path = workspace.br_root.join(".beads").join("issues.jsonl");
-    fs::read(&jsonl_path).expect("read issues.jsonl for import seed")
-}
-
 /// Benchmark: list with 10 issues
 fn benchmark_list_10(config: &BenchmarkConfig) -> BenchmarkComparison {
     info!("benchmark_list_10: starting");
@@ -1162,25 +956,6 @@ fn benchmark_list_100(config: &BenchmarkConfig) -> BenchmarkComparison {
     );
 
     BenchmarkComparison::new("list_100", "List 100 issues", br_stats, bd_stats)
-}
-
-/// Benchmark: list with 1000 issues
-fn benchmark_list_1000(config: &BenchmarkConfig) -> BenchmarkComparison {
-    info!("benchmark_list_1000: starting");
-
-    let workspace = BenchmarkWorkspace::new();
-    populate_workspace(&workspace, 1000);
-
-    let br_stats = run_benchmark(config, || workspace.time_br(["list", "--json"]));
-
-    let bd_stats = run_benchmark(config, || workspace.time_bd(["list", "--json"]));
-
-    info!(
-        "benchmark_list_1000: br_mean={:.2}ms bd_mean={:.2}ms",
-        br_stats.mean_ms, bd_stats.mean_ms
-    );
-
-    BenchmarkComparison::new("list_1000", "List 1000 issues", br_stats, bd_stats)
 }
 
 /// Benchmark: list with status filter
@@ -1273,51 +1048,6 @@ fn benchmark_sync_flush(config: &BenchmarkConfig) -> BenchmarkComparison {
     )
 }
 
-/// Benchmark: sync --import-only (import from JSONL)
-fn benchmark_sync_import(config: &BenchmarkConfig) -> BenchmarkComparison {
-    info!("benchmark_sync_import: starting");
-
-    let jsonl_data = generate_import_jsonl(50);
-
-    let br_stats = run_benchmark(config, || {
-        let workspace = BenchmarkWorkspace::new();
-        let init = workspace.run_br(["init"], "init");
-        assert!(init.success, "br init failed: {}", init.stderr);
-
-        let jsonl_path = workspace.br_root.join(".beads").join("issues.jsonl");
-        fs::write(&jsonl_path, &jsonl_data).expect("write br issues.jsonl");
-
-        let result = workspace.run_br(["sync", "--import-only"], "sync_import");
-        assert!(result.success, "br sync import failed: {}", result.stderr);
-        result.duration
-    });
-
-    let bd_stats = run_benchmark(config, || {
-        let workspace = BenchmarkWorkspace::new();
-        let init = workspace.run_bd(["init"], "init");
-        assert!(init.success, "bd init failed: {}", init.stderr);
-
-        let jsonl_path = workspace.bd_root.join(".beads").join("issues.jsonl");
-        fs::write(&jsonl_path, &jsonl_data).expect("write bd issues.jsonl");
-
-        let result = workspace.run_bd(["sync", "--import-only"], "sync_import");
-        assert!(result.success, "bd sync import failed: {}", result.stderr);
-        result.duration
-    });
-
-    info!(
-        "benchmark_sync_import: br_mean={:.2}ms bd_mean={:.2}ms",
-        br_stats.mean_ms, bd_stats.mean_ms
-    );
-
-    BenchmarkComparison::new(
-        "sync_import",
-        "Sync import from JSONL (50 issues)",
-        br_stats,
-        bd_stats,
-    )
-}
-
 /// Benchmark: stats command
 fn benchmark_stats(config: &BenchmarkConfig) -> BenchmarkComparison {
     info!("benchmark_stats: starting");
@@ -1365,55 +1095,38 @@ fn benchmark_comparison_full() {
     let mut comparisons = Vec::new();
 
     // Command latency benchmarks
-    println!("[1/12] Running init benchmark...");
+    println!("[1/10] Running init benchmark...");
     comparisons.push(benchmark_init(&config));
 
-    println!("[2/12] Running create_single benchmark...");
+    println!("[2/10] Running create_single benchmark...");
     comparisons.push(benchmark_create_single(&config));
 
-    println!("[3/12] Running create_batch_100 benchmark (this takes a while)...");
+    println!("[3/10] Running create_batch_100 benchmark (this takes a while)...");
     comparisons.push(benchmark_create_batch_100(&config));
 
-    println!("[4/12] Running list_10 benchmark...");
+    println!("[4/10] Running list_10 benchmark...");
     comparisons.push(benchmark_list_10(&config));
 
-    println!("[5/12] Running list_100 benchmark...");
+    println!("[5/10] Running list_100 benchmark...");
     comparisons.push(benchmark_list_100(&config));
 
-    println!("[6/12] Running list_1000 benchmark...");
-    comparisons.push(benchmark_list_1000(&config));
-
-    println!("[7/12] Running list_filtered benchmark...");
+    println!("[6/10] Running list_filtered benchmark...");
     comparisons.push(benchmark_list_filtered(&config));
 
-    println!("[8/12] Running search benchmark...");
+    println!("[7/10] Running search benchmark...");
     comparisons.push(benchmark_search(&config));
 
-    println!("[9/12] Running ready benchmark...");
+    println!("[8/10] Running ready benchmark...");
     comparisons.push(benchmark_ready(&config));
 
-    println!("[10/12] Running sync_flush benchmark...");
+    println!("[9/10] Running sync_flush benchmark...");
     comparisons.push(benchmark_sync_flush(&config));
 
-    println!("[11/12] Running sync_import benchmark...");
-    comparisons.push(benchmark_sync_import(&config));
-
-    println!("[12/12] Running stats benchmark...");
+    println!("[10/10] Running stats benchmark...");
     comparisons.push(benchmark_stats(&config));
 
-    let mut memory = Vec::new();
-    if let Some(entry) = benchmark_memory_usage_1000() {
-        memory.push(entry);
-    }
-    if let Some(entry) = benchmark_memory_sync_flush_1000() {
-        memory.push(entry);
-    }
-    if let Some(entry) = benchmark_memory_sync_import_1000() {
-        memory.push(entry);
-    }
-
     // Generate report
-    let report = BenchmarkReport::new(&config, comparisons, memory);
+    let report = BenchmarkReport::new(&config, comparisons);
 
     // Print summary
     report.print_summary();
@@ -1441,7 +1154,6 @@ fn benchmark_comparison_full() {
 /// Quick benchmark test (fewer runs, smaller datasets) for CI
 #[test]
 fn benchmark_comparison_quick() {
-    skip_if_no_bd!();
     init_test_logging();
 
     info!("benchmark_comparison_quick: starting");
@@ -1483,7 +1195,6 @@ fn benchmark_comparison_quick() {
 /// Test that benchmark infrastructure works correctly
 #[test]
 fn benchmark_infrastructure_works() {
-    skip_if_no_bd!();
     init_test_logging();
 
     info!("benchmark_infrastructure_works: testing BenchmarkWorkspace");

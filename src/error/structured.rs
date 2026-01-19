@@ -418,7 +418,7 @@ impl StructuredError {
         let hint = if let Some(detected) = detect_type_intent(provided) {
             Some(format!("Did you mean --type {detected}?"))
         } else {
-            Some("Valid types: task, bug, feature, epic, chore".to_string())
+            Some("Valid types: task, bug, feature, epic, chore, docs, question".to_string())
         };
 
         let context = json!({
@@ -665,11 +665,13 @@ static VALID_STATUSES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Valid issue type values (matching bd conformance).
+/// Valid issue type values.
 static VALID_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    ["task", "bug", "feature", "epic", "chore"]
-        .into_iter()
-        .collect()
+    [
+        "task", "bug", "feature", "epic", "chore", "docs", "question",
+    ]
+    .into_iter()
+    .collect()
 });
 
 /// Status synonyms for intent detection.

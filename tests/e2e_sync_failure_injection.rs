@@ -130,7 +130,6 @@ fn compute_file_hash(path: &Path) -> Option<String> {
 #[test]
 #[cfg(unix)]
 fn export_failure_readonly_dir_preserves_original() {
-    let _log = common::test_log("export_failure_readonly_dir_preserves_original");
     let mut artifacts = FailureTestArtifacts::new("export_readonly_dir");
 
     // Setup: Create storage with issues
@@ -201,7 +200,6 @@ fn export_failure_readonly_dir_preserves_original() {
 #[test]
 #[cfg(unix)]
 fn export_failure_temp_file_preserves_original() {
-    let _log = common::test_log("export_failure_temp_file_preserves_original");
     let mut artifacts = FailureTestArtifacts::new("export_temp_file_failure");
 
     // Setup storage
@@ -251,7 +249,6 @@ fn export_failure_temp_file_preserves_original() {
 /// Test: Import from non-existent file fails without DB changes.
 #[test]
 fn import_failure_missing_file_no_db_changes() {
-    let _log = common::test_log("import_failure_missing_file_no_db_changes");
     let mut artifacts = FailureTestArtifacts::new("import_missing_file");
 
     // Setup storage with existing issue
@@ -291,7 +288,6 @@ fn import_failure_missing_file_no_db_changes() {
 /// Test: Import with malformed JSON fails early, DB unchanged.
 #[test]
 fn import_failure_malformed_json_no_db_changes() {
-    let _log = common::test_log("import_failure_malformed_json_no_db_changes");
     let mut artifacts = FailureTestArtifacts::new("import_malformed_json");
 
     // Setup storage
@@ -341,7 +337,6 @@ fn import_failure_malformed_json_no_db_changes() {
 /// Test: Import with conflict markers fails before any DB changes.
 #[test]
 fn import_failure_conflict_markers_no_db_changes() {
-    let _log = common::test_log("import_failure_conflict_markers_no_db_changes");
     let mut artifacts = FailureTestArtifacts::new("import_conflict_markers");
 
     // Setup
@@ -384,7 +379,6 @@ fn import_failure_conflict_markers_no_db_changes() {
 /// Test: Import with prefix mismatch fails before DB changes.
 #[test]
 fn import_failure_prefix_mismatch_no_db_changes() {
-    let _log = common::test_log("import_failure_prefix_mismatch_no_db_changes");
     let mut artifacts = FailureTestArtifacts::new("import_prefix_mismatch");
 
     // Setup
@@ -431,7 +425,6 @@ fn import_failure_prefix_mismatch_no_db_changes() {
 #[test]
 #[cfg(unix)]
 fn cli_export_readonly_preserves_state() {
-    let _log = common::test_log("cli_export_readonly_preserves_state");
     let mut artifacts = FailureTestArtifacts::new("cli_export_readonly");
 
     let workspace = BrWorkspace::new();
@@ -506,7 +499,6 @@ fn cli_export_readonly_preserves_state() {
 /// Test: CLI import with malformed JSONL fails without DB corruption.
 #[test]
 fn cli_import_malformed_preserves_db() {
-    let _log = common::test_log("cli_import_malformed_preserves_db");
     let mut artifacts = FailureTestArtifacts::new("cli_import_malformed");
 
     let workspace = BrWorkspace::new();
@@ -557,12 +549,8 @@ fn cli_import_malformed_preserves_db() {
         "Import should fail on malformed JSON"
     );
 
-    // List after - DB should still have original issue (use --no-auto-import --allow-stale to ignore corrupt/newer JSONL)
-    let list2_run = run_br(
-        &workspace,
-        ["list", "--json", "--no-auto-import", "--allow-stale"],
-        "list_after",
-    );
+    // List after - DB should still have original issue
+    let list2_run = run_br(&workspace, ["list", "--json"], "list_after");
     artifacts.log("list_after", &list2_run.stdout);
     artifacts.log("list_after_stderr", &list2_run.stderr);
 
@@ -580,7 +568,6 @@ fn cli_import_malformed_preserves_db() {
 #[test]
 #[cfg(unix)]
 fn export_preserves_large_existing_jsonl() {
-    let _log = common::test_log("export_preserves_large_existing_jsonl");
     let mut artifacts = FailureTestArtifacts::new("export_large_jsonl");
 
     // Setup storage
@@ -643,7 +630,6 @@ fn export_preserves_large_existing_jsonl() {
 /// Test: Verify atomic rename behavior - temp file cleaned up on success.
 #[test]
 fn export_cleans_up_temp_file_on_success() {
-    let _log = common::test_log("export_cleans_up_temp_file_on_success");
     let mut artifacts = FailureTestArtifacts::new("export_temp_cleanup");
 
     // Setup
@@ -682,7 +668,6 @@ fn export_cleans_up_temp_file_on_success() {
 #[test]
 #[cfg(unix)]
 fn multiple_export_failures_no_accumulation() {
-    let _log = common::test_log("multiple_export_failures_no_accumulation");
     let mut artifacts = FailureTestArtifacts::new("multiple_failures");
 
     // Setup

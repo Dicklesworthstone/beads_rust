@@ -255,11 +255,6 @@ mod tests {
     use chrono::Utc;
     use std::io::Write;
     use tempfile::NamedTempFile;
-    use tracing::info;
-
-    fn init_logging() {
-        crate::logging::init_test_logging();
-    }
 
     fn create_test_issue(id: &str, title: &str) -> Issue {
         Issue {
@@ -306,8 +301,6 @@ mod tests {
 
     #[test]
     fn test_read_ids_from_file() {
-        init_logging();
-        info!("test_read_ids_from_file: starting");
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "bd-1").unwrap();
         writeln!(file, "# comment").unwrap();
@@ -318,13 +311,10 @@ mod tests {
 
         let ids = read_ids_from_file(file.path()).unwrap();
         assert_eq!(ids, vec!["bd-1", "bd-2", "bd-3"]);
-        info!("test_read_ids_from_file: assertions passed");
     }
 
     #[test]
     fn test_delete_creates_tombstone() {
-        init_logging();
-        info!("test_delete_creates_tombstone: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
         let issue = create_test_issue("bd-del1", "Test Delete");
         storage.create_issue(&issue, "tester").unwrap();
@@ -342,23 +332,17 @@ mod tests {
         assert_eq!(deleted.deleted_by.as_deref(), Some("tester"));
         assert_eq!(deleted.delete_reason.as_deref(), Some("test deletion"));
         assert_eq!(deleted.original_type.as_deref(), Some("task"));
-        info!("test_delete_creates_tombstone: assertions passed");
     }
 
     #[test]
     fn test_delete_nonexistent_fails() {
-        init_logging();
-        info!("test_delete_nonexistent_fails: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
         let result = storage.delete_issue("bd-nope", "tester", "reason", None);
         assert!(result.is_err());
-        info!("test_delete_nonexistent_fails: assertions passed");
     }
 
     #[test]
     fn test_cascade_dependents_collection() {
-        init_logging();
-        info!("test_cascade_dependents_collection: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         // Create issues: A -> B -> C (C depends on B, B depends on A)
@@ -390,6 +374,5 @@ mod tests {
         assert!(cascade.contains("bd-b"));
         assert!(cascade.contains("bd-c"));
         assert!(!cascade.contains("bd-a")); // Initial ID not included
-        info!("test_cascade_dependents_collection: assertions passed");
     }
 }

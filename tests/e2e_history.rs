@@ -85,7 +85,6 @@ fn list_backup_files(workspace: &BrWorkspace) -> Vec<String> {
 
 #[test]
 fn e2e_history_list_empty_initially() {
-    let _log = common::test_log("e2e_history_list_empty_initially");
     let workspace = BrWorkspace::new();
 
     // Initialize workspace
@@ -110,7 +109,6 @@ fn e2e_history_list_empty_initially() {
 
 #[test]
 fn e2e_history_list_after_sync_creates_backup() {
-    let _log = common::test_log("e2e_history_list_after_sync_creates_backup");
     // Setup workspace with initial JSONL file
     let workspace = setup_workspace_with_jsonl();
 
@@ -137,7 +135,6 @@ fn e2e_history_list_after_sync_creates_backup() {
 
 #[test]
 fn e2e_history_list_shows_backup_details() {
-    let _log = common::test_log("e2e_history_list_shows_backup_details");
     let workspace = setup_workspace_with_jsonl();
 
     // Create another issue and sync to trigger backup
@@ -159,7 +156,6 @@ fn e2e_history_list_shows_backup_details() {
 
 #[test]
 fn e2e_history_multiple_backups_chronological_order() {
-    let _log = common::test_log("e2e_history_multiple_backups_chronological_order");
     let workspace = setup_workspace_with_jsonl();
 
     // Create more issues to generate multiple backups
@@ -193,7 +189,6 @@ fn e2e_history_multiple_backups_chronological_order() {
 
 #[test]
 fn e2e_history_restore_backup() {
-    let _log = common::test_log("e2e_history_restore_backup");
     let workspace = setup_workspace_with_jsonl();
 
     // Create another issue to trigger backup
@@ -228,7 +223,6 @@ fn e2e_history_restore_backup() {
 
 #[test]
 fn e2e_history_diff_shows_differences() {
-    let _log = common::test_log("e2e_history_diff_shows_differences");
     let workspace = setup_workspace_with_jsonl();
 
     // Create issue to trigger backup
@@ -263,7 +257,6 @@ fn e2e_history_diff_shows_differences() {
 
 #[test]
 fn e2e_history_prune_keeps_recent() {
-    let _log = common::test_log("e2e_history_prune_keeps_recent");
     let workspace = setup_workspace_with_jsonl();
 
     // Create multiple backups
@@ -307,7 +300,6 @@ fn e2e_history_prune_keeps_recent() {
 
 #[test]
 fn e2e_history_list_before_init_fails() {
-    let _log = common::test_log("e2e_history_list_before_init_fails");
     let workspace = BrWorkspace::new();
 
     // Try to list history without init
@@ -328,7 +320,6 @@ fn e2e_history_list_before_init_fails() {
 
 #[test]
 fn e2e_history_restore_nonexistent_backup_fails() {
-    let _log = common::test_log("e2e_history_restore_nonexistent_backup_fails");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -355,7 +346,6 @@ fn e2e_history_restore_nonexistent_backup_fails() {
 
 #[test]
 fn e2e_history_restore_without_force_fails_when_exists() {
-    let _log = common::test_log("e2e_history_restore_without_force_fails_when_exists");
     let workspace = setup_workspace_with_jsonl();
 
     // Create another issue to trigger backup
@@ -387,7 +377,6 @@ fn e2e_history_restore_without_force_fails_when_exists() {
 
 #[test]
 fn e2e_history_diff_nonexistent_backup_fails() {
-    let _log = common::test_log("e2e_history_diff_nonexistent_backup_fails");
     let workspace = setup_workspace_with_jsonl();
 
     // Try to diff a non-existent backup
@@ -413,7 +402,6 @@ fn e2e_history_diff_nonexistent_backup_fails() {
 
 #[test]
 fn e2e_history_backup_deduplication() {
-    let _log = common::test_log("e2e_history_backup_deduplication");
     let workspace = setup_workspace_with_jsonl();
 
     // Create issue to trigger first backup
@@ -436,7 +424,6 @@ fn e2e_history_backup_deduplication() {
 
 #[test]
 fn e2e_history_with_many_issues() {
-    let _log = common::test_log("e2e_history_with_many_issues");
     let workspace = setup_workspace_with_jsonl();
 
     // Create many issues
@@ -474,7 +461,6 @@ fn e2e_history_with_many_issues() {
 
 #[test]
 fn e2e_history_default_command_is_list() {
-    let _log = common::test_log("e2e_history_default_command_is_list");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -499,7 +485,6 @@ fn e2e_history_default_command_is_list() {
 
 #[test]
 fn e2e_history_prune_with_older_than() {
-    let _log = common::test_log("e2e_history_prune_with_older_than");
     let workspace = setup_workspace_with_jsonl();
 
     // Create issue to trigger backup

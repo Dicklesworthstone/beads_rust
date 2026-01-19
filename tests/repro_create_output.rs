@@ -2,7 +2,7 @@ use assert_cmd::prelude::*;
 use std::process::Command;
 
 #[test]
-fn test_create_json_output_is_single_object() {
+fn test_create_json_output_includes_labels_and_deps() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();
 
@@ -15,28 +15,57 @@ fn test_create_json_output_is_single_object() {
         .assert()
         .success();
 
-    // Create issue
+    // Create blocking issue first
     let output = Command::new(bin)
         .current_dir(path)
         .arg("create")
-        .arg("Single Object Check")
+        .arg("Blocker")
         .arg("--json")
         .output()
-        .expect("create issue");
+        .expect("create blocker");
 
-    assert!(output.status.success());
-
-    // Parse JSON
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("valid json");
-
-    // Verify it is an object, NOT an array
     assert!(
-        json.is_object(),
-        "Output should be a JSON object, got: {json:?}"
+        output.status.success(),
+        "Failed to create blocking issue: {output:?}"
     );
-    assert!(!json.is_array(), "Output should NOT be a JSON array");
 
-    // Verify expected fields
-    assert!(json.get("id").is_some());
-    assert!(json.get("title").is_some());
+    let blocker_json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let blocker_id = blocker_json["id"].as_str().unwrap();
+
+    // Create issue with label and dep
+    let output = Command::new(bin)
+        .current_dir(path)
+        .arg("create")
+        .arg("My Issue")
+        .arg("--labels")
+        .arg("bug")
+        .arg("--deps")
+        .arg(blocker_id)
+        .arg("--json")
+        .output()
+        .expect("Failed to run create issue");
+
+    assert!(
+        output.status.success(),
+        "Failed to create issue with label and dep: {output:?}"
+    );
+
+    let issue_json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    // Verify fields
+    let labels = issue_json["labels"]
+        .as_array()
+        .expect("labels should be an array");
+    let deps = issue_json["dependencies"]
+        .as_array()
+        .expect("dependencies should be an array");
+
+    assert!(
+        labels.iter().any(|l| l.as_str() == Some("bug")),
+        "Labels should contain 'bug'"
+    );
+    assert!(
+        deps.iter()
+            .any(|d| d["depends_on_id"].as_str() == Some(blocker_id)),
+        "Dependencies should contain blocker ID"
+    );
 }

@@ -2,5 +2,5 @@
 source: tests/snapshots/jsonl_format.rs
 expression: normalized
 ---
-{"compaction_level":0,"created_at":"TIMESTAMP","created_by":"ACTOR","id":"ISSUE_ID","issue_type":"task","original_size":0,"priority":2,"status":"open","title":"JSONL issue one","updated_at":"TIMESTAMP"}
-{"compaction_level":0,"created_at":"TIMESTAMP","created_by":"ACTOR","id":"ISSUE_ID","issue_type":"task","original_size":0,"priority":2,"status":"open","title":"JSONL issue two","updated_at":"TIMESTAMP"}
+{"compaction_level":0,"created_at":"TIMESTAMP","id":"ISSUE_ID","issue_type":"task","original_size":0,"priority":2,"status":"open","title":"JSONL issue one","updated_at":"TIMESTAMP"}
+{"compaction_level":0,"created_at":"TIMESTAMP","id":"ISSUE_ID","issue_type":"task","original_size":0,"priority":2,"status":"open","title":"JSONL issue two","updated_at":"TIMESTAMP"}

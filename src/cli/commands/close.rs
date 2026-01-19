@@ -276,7 +276,6 @@ pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverride
     // Output
     if json {
         if args.suggest_next {
-            // suggest_next is br-only, use wrapped format
             let result = CloseWithSuggestResult {
                 closed: closed_issues,
                 skipped: skipped_issues,
@@ -285,8 +284,11 @@ pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverride
             let output = serde_json::to_string_pretty(&result).map_err(BeadsError::Json)?;
             println!("{output}");
         } else {
-            // bd conformance: output bare array of closed issues
-            let output = serde_json::to_string_pretty(&closed_issues).map_err(BeadsError::Json)?;
+            let result = CloseResult {
+                closed: closed_issues,
+                skipped: skipped_issues,
+            };
+            let output = serde_json::to_string_pretty(&result).map_err(BeadsError::Json)?;
             println!("{output}");
         }
     } else {

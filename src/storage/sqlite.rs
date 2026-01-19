@@ -586,7 +586,6 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    #[allow(clippy::too_many_lines)]
     pub fn list_issues(&self, filters: &ListFilters) -> Result<Vec<Issue>> {
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
@@ -649,27 +648,6 @@ impl SqliteStorage {
             sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
         }
 
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(Box::new(label.clone()));
-            }
-        }
-
-        if let Some(ref labels_or) = filters.labels_or {
-            if !labels_or.is_empty() {
-                let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-                let _ = write!(
-                    sql,
-                    " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-                    placeholders.join(",")
-                );
-                for l in labels_or {
-                    params.push(Box::new(l.clone()));
-                }
-            }
-        }
-
         if let Some(ref title_contains) = filters.title_contains {
             sql.push_str(" AND title LIKE ?");
             params.push(Box::new(format!("%{title_contains}%")));
@@ -695,11 +673,9 @@ impl SqliteStorage {
                     let _ = write!(sql, " ORDER BY priority {order}, created_at DESC");
                 }
                 "created_at" | "created" => {
-                    let order = if filters.reverse { "ASC" } else { "DESC" };
                     let _ = write!(sql, " ORDER BY created_at {order}");
                 }
                 "updated_at" | "updated" => {
-                    let order = if filters.reverse { "ASC" } else { "DESC" };
                     let _ = write!(sql, " ORDER BY updated_at {order}");
                 }
                 "title" => {
@@ -711,8 +687,6 @@ impl SqliteStorage {
                     sql.push_str(" ORDER BY priority ASC, created_at DESC");
                 }
             }
-        } else if filters.reverse {
-            sql.push_str(" ORDER BY priority DESC, created_at ASC");
         } else {
             sql.push_str(" ORDER BY priority ASC, created_at DESC");
         }
@@ -809,27 +783,6 @@ impl SqliteStorage {
 
         if !filters.include_templates {
             sql.push_str(" AND (is_template = 0 OR is_template IS NULL)");
-        }
-
-        if let Some(ref labels) = filters.labels {
-            for label in labels {
-                sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
-                params.push(Box::new(label.clone()));
-            }
-        }
-
-        if let Some(ref labels_or) = filters.labels_or {
-            if !labels_or.is_empty() {
-                let placeholders: Vec<String> = labels_or.iter().map(|_| "?".to_string()).collect();
-                let _ = write!(
-                    sql,
-                    " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
-                    placeholders.join(",")
-                );
-                for l in labels_or {
-                    params.push(Box::new(l.clone()));
-                }
-            }
         }
 
         if let Some(ref title_contains) = filters.title_contains {
@@ -1057,7 +1010,7 @@ impl SqliteStorage {
     /// blocking-type dependency on an issue that is not closed/tombstone.
     ///
     /// Blocking dependency types: blocks, parent-child, conditional-blocks, waits-for
-    /// Blocking statuses: any non-terminal status (not closed/tombstone)
+    /// Blocking statuses: open, `in_progress`, blocked, deferred
     ///
     /// # Errors
     ///
@@ -1081,12 +1034,8 @@ impl SqliteStorage {
 
         // Find all issues that are blocked by a dependency
         // An issue is blocked if:
-        // 1. It has a blocking-type dependency (blocks, conditional-blocks, waits-for)
-        // 2. The blocker issue has a blocking status (anything NOT closed/tombstone)
-        //
-        // Note: parent-child is NOT included here. A child is not blocked just because
-        // its parent epic is open. However, if the parent is blocked by something else,
-        // that blocking propagates to children (handled in the transitive section below).
+        // 1. It has a blocking-type dependency (blocks, parent-child, conditional-blocks, waits-for)
+        // 2. The blocker issue has a blocking status (open, in_progress, blocked, deferred)
         //
         // For conditional-blocks, we also need to check if the blocker closed with failure
         // but for simplicity in this initial implementation, we treat it like blocks.
@@ -1096,11 +1045,11 @@ impl SqliteStorage {
                          COALESCE(GROUP_CONCAT(d.depends_on_id || ':' || COALESCE(i.status, 'unknown'), ','), '')
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                  WHERE d.type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')
                     AND d.depends_on_id NOT LIKE 'external:%'
                     AND (
-                      -- The blocker is in a blocking state (anything not terminal)
-                      i.status NOT IN ('closed', 'tombstone')
+                      -- The blocker is in a blocking state
+                      i.status IN ('open', 'in_progress', 'blocked', 'deferred')
                       -- Or it's an external dependency (not in our DB)
                       OR i.id IS NULL
                     )
@@ -4607,31 +4556,6 @@ mod tests {
 
         assert_eq!(issues.len(), 1, "Should find one issue with 'bug' in title");
         assert_eq!(issues[0].id, "bd-s1");
-    }
-
-    #[test]
-    fn test_list_issues_reverse_default_sort() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
-        let t2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
-
-        let issue_a = make_issue("bd-a", "A", Status::Open, 1, None, t1, None);
-        let issue_b = make_issue("bd-b", "B", Status::Open, 1, None, t2, None);
-        let issue_c = make_issue("bd-c", "C", Status::Open, 2, None, t1, None);
-
-        storage.create_issue(&issue_a, "tester").unwrap();
-        storage.create_issue(&issue_b, "tester").unwrap();
-        storage.create_issue(&issue_c, "tester").unwrap();
-
-        let filters = ListFilters {
-            reverse: true,
-            ..ListFilters::default()
-        };
-
-        let issues = storage.list_issues(&filters).unwrap();
-        let ids: Vec<_> = issues.iter().map(|i| i.id.as_str()).collect();
-
-        assert_eq!(ids, vec!["bd-c", "bd-a", "bd-b"]);
     }
 
     #[test]

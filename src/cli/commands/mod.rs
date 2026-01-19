@@ -1,4 +1,3 @@
-pub mod agents;
 pub mod audit;
 pub mod blocked;
 pub mod changelog;
@@ -15,7 +14,6 @@ pub mod doctor;
 pub mod epic;
 pub mod graph;
 pub mod history;
-pub mod info;
 pub mod init;
 pub mod label;
 pub mod lint;
@@ -32,7 +30,6 @@ pub mod stats;
 pub mod sync;
 pub mod update;
 pub mod version;
-pub mod r#where;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
