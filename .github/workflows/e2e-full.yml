@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 45
     if: inputs.suite == 'all' || inputs.suite == 'e2e-full' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -64,7 +64,7 @@ jobs:
 
       - name: Upload E2E summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-full-summary
           path: target/test-artifacts/e2e_full_summary.json
@@ -72,7 +72,7 @@ jobs:
 
       - name: Upload E2E artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: e2e-full-artifacts
           path: target/test-artifacts/
@@ -84,7 +84,7 @@ jobs:
     timeout-minutes: 60
     if: inputs.suite == 'all' || inputs.suite == 'benchmarks' || github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -95,7 +95,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Restore criterion baseline
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: target/criterion/
           key: ${{ runner.os }}-criterion-full-${{ github.run_id }}
@@ -115,7 +115,7 @@ jobs:
 
       - name: Upload benchmark summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: benchmark-full-summary
           path: target/test-artifacts/benchmark_summary.json
@@ -123,7 +123,7 @@ jobs:
 
       - name: Upload criterion reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: criterion-reports
           path: target/criterion/
@@ -131,7 +131,7 @@ jobs:
 
       - name: Save criterion baseline
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: target/criterion/
           key: ${{ runner.os }}-criterion-full-${{ github.run_id }}
