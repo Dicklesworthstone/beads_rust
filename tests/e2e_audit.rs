@@ -13,7 +13,6 @@ use serde_json::Value;
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use tracing::info;
 
 /// Read and parse the interactions.jsonl file.
 fn read_interactions(workspace: &BrWorkspace) -> Vec<Value> {
@@ -35,8 +34,6 @@ fn read_interactions(workspace: &BrWorkspace) -> Vec<Value> {
 
 #[test]
 fn e2e_audit_record_single_event() {
-    common::init_test_logging();
-    info!("e2e_audit_record_single_event: start");
     let workspace = BrWorkspace::new();
 
     // Initialize workspace
@@ -64,13 +61,10 @@ fn e2e_audit_record_single_event() {
     assert_eq!(entries.len(), 1, "should have exactly one entry");
     assert_eq!(entries[0]["id"], id);
     assert_eq!(entries[0]["kind"], "llm_call");
-    info!("e2e_audit_record_single_event: done");
 }
 
 #[test]
 fn e2e_audit_record_multiple_events_preserve_order() {
-    common::init_test_logging();
-    info!("e2e_audit_record_multiple_events_preserve_order: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -110,13 +104,10 @@ fn e2e_audit_record_multiple_events_preserve_order() {
     assert_eq!(entries[0]["kind"], "llm_call");
     assert_eq!(entries[1]["kind"], "tool_call");
     assert_eq!(entries[2]["kind"], "user_action");
-    info!("e2e_audit_record_multiple_events_preserve_order: done");
 }
 
 #[test]
 fn e2e_audit_record_with_all_optional_fields() {
-    common::init_test_logging();
-    info!("e2e_audit_record_with_all_optional_fields: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -158,13 +149,10 @@ fn e2e_audit_record_with_all_optional_fields() {
     assert_eq!(entries[0]["response"], "The answer is 4.");
     // Empty string should not be stored
     assert!(entries[0]["error"].is_null());
-    info!("e2e_audit_record_with_all_optional_fields: done");
 }
 
 #[test]
 fn e2e_audit_record_tool_call_fields() {
-    common::init_test_logging();
-    info!("e2e_audit_record_tool_call_fields: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -196,13 +184,10 @@ fn e2e_audit_record_tool_call_fields() {
     assert_eq!(entries[0]["kind"], "tool_call");
     assert_eq!(entries[0]["tool_name"], "read_file");
     assert_eq!(entries[0]["exit_code"], 0);
-    info!("e2e_audit_record_tool_call_fields: done");
 }
 
 #[test]
 fn e2e_audit_record_json_output() {
-    common::init_test_logging();
-    info!("e2e_audit_record_json_output: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -225,13 +210,10 @@ fn e2e_audit_record_json_output() {
     let json: Value = serde_json::from_str(&payload).expect("parse json output");
     assert!(json["id"].is_string(), "id should be string");
     assert_eq!(json["kind"], "llm_call");
-    info!("e2e_audit_record_json_output: done");
 }
 
 #[test]
 fn e2e_audit_label_existing_entry() {
-    common::init_test_logging();
-    info!("e2e_audit_label_existing_entry: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -267,13 +249,10 @@ fn e2e_audit_label_existing_entry() {
     let label_entry = entries.iter().find(|e| e["kind"] == "label").unwrap();
     assert_eq!(label_entry["parent_id"], parent_id);
     assert_eq!(label_entry["label"], "good");
-    info!("e2e_audit_label_existing_entry: done");
 }
 
 #[test]
 fn e2e_audit_label_with_reason() {
-    common::init_test_logging();
-    info!("e2e_audit_label_with_reason: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -311,13 +290,10 @@ fn e2e_audit_label_with_reason() {
     let label_entry = entries.iter().find(|e| e["kind"] == "label").unwrap();
     assert_eq!(label_entry["label"], "bad");
     assert_eq!(label_entry["reason"], "Hallucinated information");
-    info!("e2e_audit_label_with_reason: done");
 }
 
 #[test]
 fn e2e_audit_label_json_output() {
-    common::init_test_logging();
-    info!("e2e_audit_label_json_output: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -347,7 +323,6 @@ fn e2e_audit_label_json_output() {
     assert!(json["id"].is_string());
     assert_eq!(json["parent_id"], parent_id);
     assert_eq!(json["label"], "good");
-    info!("e2e_audit_label_json_output: done");
 }
 
 // =============================================================================
@@ -356,8 +331,6 @@ fn e2e_audit_label_json_output() {
 
 #[test]
 fn e2e_audit_record_before_init_fails() {
-    common::init_test_logging();
-    info!("e2e_audit_record_before_init_fails: start");
     let workspace = BrWorkspace::new();
 
     // Try to record without init
@@ -377,13 +350,10 @@ fn e2e_audit_record_before_init_fails() {
         "error should mention initialization: {}",
         record.stderr
     );
-    info!("e2e_audit_record_before_init_fails: done");
 }
 
 #[test]
 fn e2e_audit_record_without_kind_fails() {
-    common::init_test_logging();
-    info!("e2e_audit_record_without_kind_fails: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -401,13 +371,10 @@ fn e2e_audit_record_without_kind_fails() {
         combined.contains("kind") || combined.contains("required"),
         "error should mention kind is required: {combined}"
     );
-    info!("e2e_audit_record_without_kind_fails: done");
 }
 
 #[test]
 fn e2e_audit_label_without_label_fails() {
-    common::init_test_logging();
-    info!("e2e_audit_label_without_label_fails: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -433,7 +400,6 @@ fn e2e_audit_label_without_label_fails() {
         combined.contains("label") || combined.contains("required"),
         "error should mention label is required: {combined}"
     );
-    info!("e2e_audit_label_without_label_fails: done");
 }
 
 // =============================================================================
@@ -442,8 +408,6 @@ fn e2e_audit_label_without_label_fails() {
 
 #[test]
 fn e2e_audit_record_very_long_text() {
-    common::init_test_logging();
-    info!("e2e_audit_record_very_long_text: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -477,13 +441,10 @@ fn e2e_audit_record_very_long_text() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["prompt"].as_str().unwrap().len(), 10_000);
     assert_eq!(entries[0]["response"].as_str().unwrap().len(), 10_000);
-    info!("e2e_audit_record_very_long_text: done");
 }
 
 #[test]
 fn e2e_audit_record_special_characters() {
-    common::init_test_logging();
-    info!("e2e_audit_record_special_characters: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -513,13 +474,10 @@ fn e2e_audit_record_special_characters() {
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["prompt"], special_prompt);
-    info!("e2e_audit_record_special_characters: done");
 }
 
 #[test]
 fn e2e_audit_record_via_stdin() {
-    common::init_test_logging();
-    info!("e2e_audit_record_via_stdin: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -559,13 +517,10 @@ fn e2e_audit_record_via_stdin() {
     assert_eq!(entries[0]["kind"], "llm_call");
     assert_eq!(entries[0]["model"], "gpt-4");
     assert_eq!(entries[0]["prompt"], "stdin test");
-    info!("e2e_audit_record_via_stdin: done");
 }
 
 #[test]
 fn e2e_audit_record_created_at_auto_set() {
-    common::init_test_logging();
-    info!("e2e_audit_record_created_at_auto_set: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -592,13 +547,10 @@ fn e2e_audit_record_created_at_auto_set() {
         created_at.contains('T') && created_at.contains('Z'),
         "created_at should be ISO 8601: {created_at}"
     );
-    info!("e2e_audit_record_created_at_auto_set: done");
 }
 
 #[test]
 fn e2e_audit_unique_ids() {
-    common::init_test_logging();
-    info!("e2e_audit_unique_ids: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -624,13 +576,10 @@ fn e2e_audit_unique_ids() {
         sorted.len()
     };
     assert_eq!(unique_count, ids.len(), "all IDs should be unique: {ids:?}");
-    info!("e2e_audit_unique_ids: done");
 }
 
 #[test]
 fn e2e_audit_interactions_file_created() {
-    common::init_test_logging();
-    info!("e2e_audit_interactions_file_created: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -653,13 +602,10 @@ fn e2e_audit_interactions_file_created() {
         path.exists(),
         "interactions.jsonl should exist after first record"
     );
-    info!("e2e_audit_interactions_file_created: done");
 }
 
 #[test]
 fn e2e_audit_with_actor_override() {
-    common::init_test_logging();
-    info!("e2e_audit_with_actor_override: start");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -687,5 +633,4 @@ fn e2e_audit_with_actor_override() {
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["actor"], "test-agent");
-    info!("e2e_audit_with_actor_override: done");
 }

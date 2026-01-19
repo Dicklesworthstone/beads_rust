@@ -237,60 +237,12 @@ pub fn child_id(parent_id: &str, child_number: u32) -> String {
     format!("{parent_id}.{child_number}")
 }
 
-fn is_numeric_segment(segment: &str) -> bool {
-    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit())
-}
-
-fn is_likely_hash_segment(segment: &str) -> bool {
-    if segment.len() < 3 {
-        return false;
-    }
-
-    // 3-char hashes accept all base36; 4+ must include a digit to avoid word collisions.
-    let mut has_digit = segment.len() == 3;
-    for c in segment.chars() {
-        if c.is_ascii_digit() {
-            has_digit = true;
-            continue;
-        }
-        if !(c.is_ascii_lowercase() || c.is_ascii_uppercase()) {
-            return false;
-        }
-    }
-
-    has_digit
-}
-
-fn issue_id_separator(id: &str) -> Option<usize> {
-    let last_dash = id.rfind('-')?;
-    let suffix = &id[last_dash + 1..];
-    let base = suffix.split('.').next().unwrap_or("");
-
-    if is_numeric_segment(base) || is_likely_hash_segment(base) {
-        return Some(last_dash);
-    }
-
-    id.find('-')
-}
-
-pub(crate) fn split_prefix_remainder(id: &str) -> Option<(&str, &str)> {
-    let dash_pos = issue_id_separator(id)?;
-    let (prefix, remainder_with_dash) = id.split_at(dash_pos);
-    let remainder = remainder_with_dash.strip_prefix('-')?;
-    if prefix.is_empty() || remainder.is_empty() {
-        return None;
-    }
-    Some((prefix, remainder))
-}
-
 /// Check if an ID is a child ID (contains a dot after the hash).
 #[must_use]
 pub fn is_child_id(id: &str) -> bool {
     // Only check after the prefix-hash part
-    split_prefix_remainder(id).map_or_else(
-        || id.contains('.'),
-        |(_, remainder)| remainder.contains('.'),
-    )
+    id.find('-')
+        .map_or_else(|| id.contains('.'), |pos| id[pos + 1..].contains('.'))
 }
 
 /// Get the depth of a hierarchical ID.
@@ -299,9 +251,9 @@ pub fn is_child_id(id: &str) -> bool {
 #[must_use]
 pub fn id_depth(id: &str) -> usize {
     // Count dots after the prefix-hash part
-    split_prefix_remainder(id).map_or_else(
+    id.find('-').map_or_else(
         || id.matches('.').count(),
-        |(_, remainder)| remainder.matches('.').count(),
+        |pos| id[pos + 1..].matches('.').count(),
     )
 }
 
@@ -405,10 +357,17 @@ fn format_child_path(path: &[u32]) -> String {
 ///
 /// Returns `InvalidId` if the ID format is invalid.
 pub fn parse_id(id: &str) -> Result<ParsedId> {
-    // Find the prefix-hash separator (supports hyphenated prefixes)
-    let Some((prefix, remainder)) = split_prefix_remainder(id) else {
+    // Find the prefix-hash separator
+    let Some(dash_pos) = id.find('-') else {
         return Err(BeadsError::InvalidId { id: id.to_string() });
     };
+
+    let prefix = &id[..dash_pos];
+    let remainder = &id[dash_pos + 1..];
+
+    if prefix.is_empty() || remainder.is_empty() {
+        return Err(BeadsError::InvalidId { id: id.to_string() });
+    }
 
     // Split remainder by '.' to get hash and child path
     let parts: Vec<&str> = remainder.split('.').collect();
@@ -637,8 +596,9 @@ impl IdResolver {
         // Step 3: Substring match on hash portion
         if self.config.allow_substring_match {
             // Extract the potential hash portion (after dash, or entire input if no dash)
-            let hash_pattern = split_prefix_remainder(&normalized)
-                .map_or(normalized.as_str(), |(_, remainder)| remainder);
+            let hash_pattern = normalized
+                .find('-')
+                .map_or(normalized.as_str(), |pos| &normalized[pos + 1..]);
 
             if !hash_pattern.is_empty() {
                 let matches = substring_match_fn(hash_pattern);
@@ -706,8 +666,10 @@ pub fn find_matching_ids(all_ids: &[String], hash_substring: &str) -> Vec<String
         .iter()
         .filter(|id| {
             // Extract hash portion (after the first dash)
-            split_prefix_remainder(id).is_some_and(|(_, remainder)| {
-                let base_hash = remainder.split('.').next().unwrap_or(remainder);
+            id.find('-').is_some_and(|pos| {
+                let hash_part = &id[pos + 1..];
+                // Also handle hierarchical IDs by getting the base hash (before any dots)
+                let base_hash = hash_part.split('.').next().unwrap_or(hash_part);
                 base_hash.contains(hash_substring)
             })
         })
@@ -922,19 +884,6 @@ mod tests {
         assert!(parsed.child_path.is_empty());
         assert!(parsed.is_root());
         assert_eq!(parsed.depth(), 0);
-    }
-
-    #[test]
-    fn test_parse_id_hyphenated_prefix() {
-        let parsed = parse_id("bead-me-up-3e9").unwrap();
-        assert_eq!(parsed.prefix, "bead-me-up");
-        assert_eq!(parsed.hash, "3e9");
-        assert!(parsed.child_path.is_empty());
-
-        let child = parse_id("document-intelligence-0sa.2").unwrap();
-        assert_eq!(child.prefix, "document-intelligence");
-        assert_eq!(child.hash, "0sa");
-        assert_eq!(child.child_path, vec![2]);
     }
 
     #[test]

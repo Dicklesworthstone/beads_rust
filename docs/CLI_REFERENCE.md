@@ -725,26 +725,6 @@ Checks database integrity, schema compatibility, and configuration.
 
 ---
 
-### info
-
-Show workspace diagnostics and metadata.
-
-```bash
-br info [--schema] [--whats-new] [--thanks]
-```
-
----
-
-### where
-
-Show the active `.beads` directory (after redirects, if any).
-
-```bash
-br where
-```
-
----
-
 ### version
 
 Show version information.
@@ -780,9 +760,6 @@ br history <COMMAND>
 |---------|-------------|
 | `list` | List backups |
 | `restore <BACKUP>` | Restore from backup |
-
-**Notes:**
-- Backups are created during `br sync --flush-only` when overwriting a JSONL file inside `.beads/`, including custom `BEADS_JSONL` paths that still target `.beads/`.
 
 ---
 

@@ -80,16 +80,9 @@ last-touched
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tracing::info;
-
-    fn init_logging() {
-        crate::logging::init_test_logging();
-    }
 
     #[test]
     fn test_init_creates_beads_directory() {
-        init_logging();
-        info!("test_init_creates_beads_directory: starting");
         let temp_dir = TempDir::new().unwrap();
         let result = execute(None, false, Some(temp_dir.path()));
 
@@ -99,13 +92,10 @@ mod tests {
         assert!(temp_dir.path().join(".beads/metadata.json").exists());
         assert!(temp_dir.path().join(".beads/config.yaml").exists());
         assert!(temp_dir.path().join(".beads/.gitignore").exists());
-        info!("test_init_creates_beads_directory: assertions passed");
     }
 
     #[test]
     fn test_init_with_prefix() {
-        init_logging();
-        info!("test_init_with_prefix: starting");
         let temp_dir = TempDir::new().unwrap();
         let result = execute(Some("test".to_string()), false, Some(temp_dir.path()));
 
@@ -116,13 +106,10 @@ mod tests {
         let storage = SqliteStorage::open(&db_path).unwrap();
         let prefix = storage.get_config("issue_prefix").unwrap();
         assert_eq!(prefix, Some("test".to_string()));
-        info!("test_init_with_prefix: assertions passed");
     }
 
     #[test]
     fn test_init_fails_if_already_initialized() {
-        init_logging();
-        info!("test_init_fails_if_already_initialized: starting");
         let temp_dir = TempDir::new().unwrap();
 
         // First init should succeed
@@ -137,13 +124,10 @@ mod tests {
             result2.unwrap_err(),
             BeadsError::AlreadyInitialized { .. }
         ));
-        info!("test_init_fails_if_already_initialized: assertions passed");
     }
 
     #[test]
     fn test_init_force_overwrites_existing() {
-        init_logging();
-        info!("test_init_force_overwrites_existing: starting");
         let temp_dir = TempDir::new().unwrap();
 
         // First init
@@ -159,13 +143,10 @@ mod tests {
         let storage = SqliteStorage::open(&db_path).unwrap();
         let prefix = storage.get_config("issue_prefix").unwrap();
         assert_eq!(prefix, Some("second".to_string()));
-        info!("test_init_force_overwrites_existing: assertions passed");
     }
 
     #[test]
     fn test_metadata_json_content() {
-        init_logging();
-        info!("test_metadata_json_content: starting");
         let temp_dir = TempDir::new().unwrap();
         execute(None, false, Some(temp_dir.path())).unwrap();
 
@@ -175,13 +156,10 @@ mod tests {
 
         assert_eq!(parsed["database"], "beads.db");
         assert_eq!(parsed["jsonl_export"], "issues.jsonl");
-        info!("test_metadata_json_content: assertions passed");
     }
 
     #[test]
     fn test_gitignore_excludes_db_files() {
-        init_logging();
-        info!("test_gitignore_excludes_db_files: starting");
         let temp_dir = TempDir::new().unwrap();
         execute(None, false, Some(temp_dir.path())).unwrap();
 
@@ -192,6 +170,5 @@ mod tests {
         assert!(content.contains("*.db-wal"));
         assert!(content.contains("*.db-shm"));
         assert!(content.contains("*.lock"));
-        info!("test_gitignore_excludes_db_files: assertions passed");
     }
 }

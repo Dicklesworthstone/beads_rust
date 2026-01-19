@@ -1147,18 +1147,16 @@ pub fn export_to_jsonl_with_policy(
             "Export path validated"
         );
 
-        // Perform backup before overwriting (if enabled and we have a beads_dir).
-        // We backup any JSONL file that resolves inside `.beads/`, including custom
-        // BEADS_JSONL paths that still target `.beads/`.
-        let output_abs = if output_path.is_absolute() {
-            output_path.to_path_buf()
-        } else if let Ok(cwd) = std::env::current_dir() {
-            cwd.join(output_path)
-        } else {
-            output_path.to_path_buf()
-        };
-        if output_abs.starts_with(beads_dir) {
-            history::backup_before_export(beads_dir, &config.history, output_path)?;
+        // Perform backup before overwriting (if enabled and we have a beads_dir)
+        // We only backup if we are writing to the default path or inside beads dir?
+        // The backup function handles checks.
+        // Note: history::backup_before_export assumes output_path is 'issues.jsonl' inside beads_dir
+        // If output_path is different, we might skip backup or adapt?
+        // The spec said "Automatic timestamped backups of `issues.jsonl`".
+        // It implies backing up the canonical JSONL.
+        // If output_path == beads_dir.join("issues.jsonl"), we back it up.
+        if output_path == beads_dir.join("issues.jsonl") {
+            history::backup_before_export(beads_dir, &config.history)?;
         }
     }
 
@@ -1565,128 +1563,6 @@ pub const METADATA_JSONL_CONTENT_HASH: &str = "jsonl_content_hash";
 pub const METADATA_LAST_EXPORT_TIME: &str = "last_export_time";
 /// Metadata key for the last import time.
 pub const METADATA_LAST_IMPORT_TIME: &str = "last_import_time";
-
-/// Result of a staleness check between JSONL and DB.
-#[derive(Debug, Clone, Copy)]
-pub struct StalenessCheck {
-    pub jsonl_exists: bool,
-    pub jsonl_newer: bool,
-    pub db_newer: bool,
-}
-
-/// Compute staleness based on JSONL mtime + content hash and DB dirty state.
-///
-/// Uses Lstat (`symlink_metadata`) for JSONL mtime to match classic bd behavior.
-///
-/// # Errors
-///
-/// Returns an error if reading dirty state, metadata, JSONL mtime, or hashing fails.
-pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
-    let dirty_count = storage.get_dirty_issue_ids()?.len();
-    let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
-    let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
-    let jsonl_exists = jsonl_path.exists();
-
-    let (jsonl_newer, db_newer) = if jsonl_exists {
-        let jsonl_mtime = fs::symlink_metadata(jsonl_path)?.modified()?;
-
-        // JSONL is newer if it was modified after last import
-        // If metadata is missing or invalid, assume JSONL is newer (safe default)
-        let mtime_newer = last_import_time.as_ref().is_none_or(|import_time| {
-            chrono::DateTime::parse_from_rfc3339(import_time).map_or(true, |import_ts| {
-                let import_sys_time = std::time::SystemTime::from(import_ts);
-                jsonl_mtime > import_sys_time
-            })
-        });
-
-        let jsonl_newer = if mtime_newer {
-            jsonl_content_hash.as_ref().is_none_or(|stored_hash| {
-                compute_jsonl_hash(jsonl_path)
-                    .map_or(true, |current_hash| &current_hash != stored_hash)
-            })
-        } else {
-            false
-        };
-
-        (jsonl_newer, dirty_count > 0)
-    } else {
-        (false, dirty_count > 0)
-    };
-
-    Ok(StalenessCheck {
-        jsonl_exists,
-        jsonl_newer,
-        db_newer,
-    })
-}
-
-/// Result of an auto-import attempt.
-#[derive(Debug, Default)]
-pub struct AutoImportResult {
-    /// Whether an import was attempted.
-    pub attempted: bool,
-    /// Number of issues imported (created or updated).
-    pub imported_count: usize,
-}
-
-/// Auto-import JSONL if it is newer than the DB.
-///
-/// Honors `--no-auto-import` and `--allow-stale` behavior.
-///
-/// # Errors
-///
-/// Returns an error if staleness checks, metadata reads, or import steps fail.
-pub fn auto_import_if_stale(
-    storage: &mut SqliteStorage,
-    beads_dir: &Path,
-    jsonl_path: &Path,
-    expected_prefix: Option<&str>,
-    allow_stale: bool,
-    no_auto_import: bool,
-) -> Result<AutoImportResult> {
-    let staleness = compute_staleness(storage, jsonl_path)?;
-    if !staleness.jsonl_newer {
-        return Ok(AutoImportResult::default());
-    }
-
-    if allow_stale {
-        tracing::warn!(
-            jsonl_path = %jsonl_path.display(),
-            "JSONL is newer than DB; skipping auto-import due to --allow-stale"
-        );
-        return Ok(AutoImportResult::default());
-    }
-
-    if no_auto_import {
-        return Err(BeadsError::Config(
-            "JSONL is newer than the database (auto-import disabled).\n\
-             Hint: run `br sync --import-only` or rerun without --no-auto-import.\n\
-             To proceed without importing, use --allow-stale."
-                .to_string(),
-        ));
-    }
-
-    let import_config = ImportConfig {
-        skip_prefix_validation: true,
-        beads_dir: Some(beads_dir.to_path_buf()),
-        allow_external_jsonl: false,
-        show_progress: false,
-        ..Default::default()
-    };
-
-    let result = import_from_jsonl(storage, jsonl_path, &import_config, expected_prefix)?;
-
-    tracing::info!(
-        imported_count = result.imported_count,
-        jsonl_path = %jsonl_path.display(),
-        "Auto-import completed"
-    );
-
-    Ok(AutoImportResult {
-        attempted: true,
-        imported_count: result.imported_count,
-    })
-}
 
 /// Finalize an export by updating metadata, clearing dirty flags, and recording export hashes.
 ///
@@ -2104,67 +1980,6 @@ pub fn import_from_jsonl(
                 )));
             }
 
-            // Fix: Rename issues with wrong prefix if requested
-            if config.rename_on_import && !mismatches.is_empty() {
-                use crate::util::id::{IdConfig, IdGenerator};
-
-                // Collect details to avoid borrowing issues during generation
-                let to_rename: Vec<_> = issues
-                    .iter()
-                    .filter(|i| mismatches.contains(&i.id))
-                    .map(|i| {
-                        (
-                            i.id.clone(),
-                            i.title.clone(),
-                            i.description.clone(),
-                            i.created_by.clone(),
-                            i.created_at,
-                        )
-                    })
-                    .collect();
-
-                let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
-                let mut renames = std::collections::HashMap::new();
-
-                for (old_id, title, desc, creator, created_at) in to_rename {
-                    let new_id = generator.generate(
-                        &title,
-                        desc.as_deref(),
-                        creator.as_deref(),
-                        created_at,
-                        issues.len(),
-                        |candidate| {
-                            storage.id_exists(candidate).unwrap_or(false)
-                                || issues.iter().any(|i| i.id == candidate)
-                                || renames.values().any(|v| *v == candidate)
-                        },
-                    );
-                    renames.insert(old_id, new_id);
-                }
-
-                // Apply renames
-                for issue in &mut issues {
-                    if let Some(new_id) = renames.get(&issue.id) {
-                        // Preserve old ID in external_ref if empty
-                        if issue.external_ref.is_none() {
-                            issue.external_ref = Some(issue.id.clone());
-                        }
-                        issue.id = new_id.clone();
-                        // Recompute content hash since ID/external_ref changed
-                        issue.content_hash = Some(content_hash(issue));
-                    }
-                    // Update dependencies
-                    for dep in &mut issue.dependencies {
-                        if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                            dep.depends_on_id = new_target.clone();
-                        }
-                        if let Some(new_source) = renames.get(&dep.issue_id) {
-                            dep.issue_id = new_source.clone();
-                        }
-                    }
-                }
-            }
-
             // Fix: Filter out tombstones with wrong prefix that were "silently dropped" above.
             // If we are here and rename_on_import is false, then all remaining mismatches MUST be tombstones
             // (otherwise we would have errored above). We drop them now.
@@ -2177,15 +1992,16 @@ pub fn import_from_jsonl(
     // Clear export hashes before importing new data.
     storage.clear_all_export_hashes()?;
 
-    // Phase 1: Scan and Resolve IDs
+    // Track external refs to detect duplicates
     let mut seen_external_refs: HashSet<String> = HashSet::new();
-    let mut renames: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut import_ops = Vec::new();
     let mut new_export_hashes = Vec::new();
 
-    let progress =
-        create_progress_bar(issues.len() as u64, "Scanning issues", config.show_progress);
-
+    // Process issues
+    let progress = create_progress_bar(
+        issues.len() as u64,
+        "Importing issues",
+        config.show_progress,
+    );
     for issue in &issues {
         // Skip ephemerals during import (they shouldn't be in JSONL anyway)
         if issue.ephemeral {
@@ -2222,53 +2038,18 @@ pub fn import_from_jsonl(
         // Determine action
         let action = determine_action(&collision, &effective_issue, storage, config.force_upsert)?;
 
-        // Determine target ID and record mapping
-        let target_id = match &collision {
+        // Collect hash for export_hashes table
+        // We record the incoming hash so that if the DB matches it, we know we are synced.
+        // If DB differs (e.g. newer local version), it will be flagged as dirty/changed later.
+        // We must use the correct ID (existing ID if matched).
+        let final_id = match &collision {
             CollisionResult::Match { existing_id, .. } => existing_id.clone(),
             CollisionResult::NewIssue => effective_issue.id.clone(),
         };
+        new_export_hashes.push((final_id, computed_hash.clone()));
 
-        if target_id != effective_issue.id {
-            renames.insert(effective_issue.id.clone(), target_id.clone());
-        }
-
-        // Collect hash for export_hashes table
-        new_export_hashes.push((target_id, computed_hash));
-
-        import_ops.push((effective_issue, action));
-        progress.inc(1);
-    }
-    progress.finish_with_message("Scan complete");
-
-    // Phase 2: Remap Dependencies
-    if !renames.is_empty() {
-        for (issue, _) in &mut import_ops {
-            // Update issue ID if it was remapped (e.g. collision with existing issue)
-            if let Some(new_id) = renames.get(&issue.id) {
-                issue.id = new_id.clone();
-            }
-
-            // Remap dependencies to point to the resolved IDs
-            for dep in &mut issue.dependencies {
-                if let Some(new_target) = renames.get(&dep.depends_on_id) {
-                    dep.depends_on_id = new_target.clone();
-                }
-                if let Some(new_source) = renames.get(&dep.issue_id) {
-                    dep.issue_id = new_source.clone();
-                }
-            }
-        }
-    }
-
-    // Phase 3: Execute Actions
-    let progress = create_progress_bar(
-        import_ops.len() as u64,
-        "Importing issues",
-        config.show_progress,
-    );
-
-    for (issue, action) in import_ops {
-        process_import_action(storage, &action, &issue, &mut result)?;
+        // Process the action
+        process_import_action(storage, &action, &effective_issue, &mut result)?;
         progress.inc(1);
     }
     progress.finish_with_message("Import complete");
@@ -2285,6 +2066,7 @@ pub fn import_from_jsonl(
     storage.set_metadata(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
     let jsonl_hash = compute_jsonl_hash(input_path)?;
     storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
+
     Ok(result)
 }
 
@@ -3307,19 +3089,17 @@ mod tests {
         let result = detect_collision(&incoming, &storage, &hash).unwrap();
 
         // Should match by external_ref (phase 1)
-        assert!(
-            matches!(result, CollisionResult::Match { .. }),
-            "Expected external_ref match"
-        );
-        if let CollisionResult::Match {
-            existing_id,
-            match_type,
-            phase,
-        } = result
-        {
-            assert_eq!(existing_id, "test-001");
-            assert_eq!(match_type, MatchType::ExternalRef);
-            assert_eq!(phase, 1);
+        match result {
+            CollisionResult::Match {
+                existing_id,
+                match_type,
+                phase,
+            } => {
+                assert_eq!(existing_id, "test-001");
+                assert_eq!(match_type, MatchType::ExternalRef);
+                assert_eq!(phase, 1);
+            }
+            CollisionResult::NewIssue => panic!("Expected external_ref match"),
         }
     }
 
@@ -3506,19 +3286,17 @@ mod tests {
         let computed_hash = crate::util::content_hash(&incoming);
 
         let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
-        assert!(
-            matches!(collision, CollisionResult::Match { .. }),
-            "expected match"
-        );
-        if let CollisionResult::Match {
-            existing_id,
-            match_type,
-            phase,
-        } = collision
-        {
-            assert_eq!(existing_id, "bd-ext");
-            assert_eq!(match_type, MatchType::ExternalRef);
-            assert_eq!(phase, 1);
+        match collision {
+            CollisionResult::Match {
+                existing_id,
+                match_type,
+                phase,
+            } => {
+                assert_eq!(existing_id, "bd-ext");
+                assert_eq!(match_type, MatchType::ExternalRef);
+                assert_eq!(phase, 1);
+            }
+            CollisionResult::NewIssue => panic!("expected match"),
         }
     }
 
@@ -3538,19 +3316,17 @@ mod tests {
         let computed_hash = crate::util::content_hash(&incoming);
 
         let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
-        assert!(
-            matches!(collision, CollisionResult::Match { .. }),
-            "expected match"
-        );
-        if let CollisionResult::Match {
-            existing_id,
-            match_type,
-            phase,
-        } = collision
-        {
-            assert_eq!(existing_id, "bd-hash");
-            assert_eq!(match_type, MatchType::ContentHash);
-            assert_eq!(phase, 2);
+        match collision {
+            CollisionResult::Match {
+                existing_id,
+                match_type,
+                phase,
+            } => {
+                assert_eq!(existing_id, "bd-hash");
+                assert_eq!(match_type, MatchType::ContentHash);
+                assert_eq!(phase, 2);
+            }
+            CollisionResult::NewIssue => panic!("expected match"),
         }
     }
 
@@ -3566,19 +3342,17 @@ mod tests {
         let computed_hash = crate::util::content_hash(&incoming);
         let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
 
-        assert!(
-            matches!(collision, CollisionResult::Match { .. }),
-            "expected match"
-        );
-        if let CollisionResult::Match {
-            existing_id,
-            match_type,
-            phase,
-        } = collision
-        {
-            assert_eq!(existing_id, "bd-1");
-            assert_eq!(match_type, MatchType::Id);
-            assert_eq!(phase, 3);
+        match collision {
+            CollisionResult::Match {
+                existing_id,
+                match_type,
+                phase,
+            } => {
+                assert_eq!(existing_id, "bd-1");
+                assert_eq!(match_type, MatchType::Id);
+                assert_eq!(phase, 3);
+            }
+            CollisionResult::NewIssue => panic!("expected match"),
         }
     }
 
@@ -3596,12 +3370,11 @@ mod tests {
             phase: 3,
         };
         let action = determine_action(&collision, &incoming, &storage, false).unwrap();
-        assert!(
-            matches!(action, CollisionAction::Skip { .. }),
-            "expected tombstone skip"
-        );
-        if let CollisionAction::Skip { reason } = action {
-            assert!(reason.contains("Tombstone protection"));
+        match action {
+            CollisionAction::Skip { reason } => {
+                assert!(reason.contains("Tombstone protection"));
+            }
+            _ => panic!("expected tombstone skip"),
         }
     }
 
@@ -3619,29 +3392,23 @@ mod tests {
 
         let newer = make_issue_at("bd-1", "Incoming", fixed_time(200));
         let action = determine_action(&collision, &newer, &storage, false).unwrap();
-        assert!(
-            matches!(action, CollisionAction::Update { .. }),
-            "expected update action"
-        );
+        match action {
+            CollisionAction::Update { .. } => {}
+            _ => panic!("expected update action"),
+        }
 
         let equal = make_issue_at("bd-1", "Incoming", fixed_time(100));
         let action = determine_action(&collision, &equal, &storage, false).unwrap();
-        assert!(
-            matches!(action, CollisionAction::Skip { .. }),
-            "expected equal timestamp skip"
-        );
-        if let CollisionAction::Skip { reason } = action {
-            assert!(reason.contains("Equal timestamps"));
+        match action {
+            CollisionAction::Skip { reason } => assert!(reason.contains("Equal timestamps")),
+            _ => panic!("expected equal timestamp skip"),
         }
 
         let older = make_issue_at("bd-1", "Incoming", fixed_time(50));
         let action = determine_action(&collision, &older, &storage, false).unwrap();
-        assert!(
-            matches!(action, CollisionAction::Skip { .. }),
-            "expected older timestamp skip"
-        );
-        if let CollisionAction::Skip { reason } = action {
-            assert!(reason.contains("Existing is newer"));
+        match action {
+            CollisionAction::Skip { reason } => assert!(reason.contains("Existing is newer")),
+            _ => panic!("expected older timestamp skip"),
         }
     }
 

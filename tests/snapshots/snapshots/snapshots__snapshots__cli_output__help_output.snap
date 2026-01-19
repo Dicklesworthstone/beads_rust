@@ -33,8 +33,6 @@ Commands:
   config       Configuration management
   sync         Sync database with JSONL file (export or import)
   doctor       Run ID-REDACTED diagnostics
-  info         Show diagnostic metadata about the workspace
-  where        Show the active .beads directory
   version      Show version information
   upgrade      Upgrade br to the latest version
   completions  Generate shell completions
@@ -44,7 +42,6 @@ Commands:
   changelog    Generate changelog from closed issues
   query        Manage saved queries
   graph        Visualize dependency graph
-  agents       Manage AGENTS.md workflow instructions
   help         Print this message or the help of the given subcommand(s)
 
 Options:

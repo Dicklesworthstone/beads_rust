@@ -18,7 +18,6 @@ fn parse_created_id(stdout: &str) -> String {
 
 #[test]
 fn e2e_epic_status_shows_progress() {
-    let _log = common::test_log("e2e_epic_status_shows_progress");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -116,7 +115,6 @@ fn e2e_epic_status_shows_progress() {
 
 #[test]
 fn e2e_epic_status_eligible_when_all_children_closed() {
-    let _log = common::test_log("e2e_epic_status_eligible_when_all_children_closed");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -183,7 +181,6 @@ fn e2e_epic_status_eligible_when_all_children_closed() {
 
 #[test]
 fn e2e_epic_close_eligible_closes_epics() {
-    let _log = common::test_log("e2e_epic_close_eligible_closes_epics");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -263,7 +260,6 @@ fn e2e_epic_close_eligible_closes_epics() {
 
 #[test]
 fn e2e_epic_close_eligible_dry_run() {
-    let _log = common::test_log("e2e_epic_close_eligible_dry_run");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -330,7 +326,6 @@ fn e2e_epic_close_eligible_dry_run() {
 
 #[test]
 fn e2e_epic_status_eligible_only_filter() {
-    let _log = common::test_log("e2e_epic_status_eligible_only_filter");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -414,7 +409,6 @@ fn e2e_epic_status_eligible_only_filter() {
 
 #[test]
 fn e2e_epic_childless_epic_not_eligible() {
-    let _log = common::test_log("e2e_epic_childless_epic_not_eligible");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -462,7 +456,6 @@ fn e2e_epic_childless_epic_not_eligible() {
 
 #[test]
 fn e2e_epic_nested_epics() {
-    let _log = common::test_log("e2e_epic_nested_epics");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -565,7 +558,6 @@ fn e2e_epic_nested_epics() {
 
 #[test]
 fn e2e_epic_no_epics_message() {
-    let _log = common::test_log("e2e_epic_no_epics_message");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -602,7 +594,6 @@ fn e2e_epic_no_epics_message() {
 
 #[test]
 fn e2e_epic_close_eligible_no_eligible_message() {
-    let _log = common::test_log("e2e_epic_close_eligible_no_eligible_message");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -648,7 +639,6 @@ fn e2e_epic_close_eligible_no_eligible_message() {
 
 #[test]
 fn e2e_epic_multiple_children_partial_progress() {
-    let _log = common::test_log("e2e_epic_multiple_children_partial_progress");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -740,7 +730,6 @@ fn e2e_epic_multiple_children_partial_progress() {
 
 #[test]
 fn e2e_epic_closed_epic_not_shown() {
-    let _log = common::test_log("e2e_epic_closed_epic_not_shown");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -773,7 +762,6 @@ fn e2e_epic_closed_epic_not_shown() {
 fn e2e_epic_deleted_child_removes_dependency() {
     // When a child task is deleted, its dependencies are also removed.
     // This means the epic loses that child entirely (not just counts it as closed).
-    let _log = common::test_log("e2e_epic_deleted_child_removes_dependency");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");

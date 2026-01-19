@@ -3,14 +3,13 @@
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::ReadyIssue;
-use crate::model::{Issue, Status};
+use crate::model::Status;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use crate::util::time::parse_flexible_timestamp;
 use serde::Serialize;
 
-/// Result of deferring a single issue (for text output).
+/// Result of deferring a single issue.
 #[derive(Debug, Serialize)]
 pub struct DeferredIssue {
     pub id: String,
@@ -25,6 +24,22 @@ pub struct DeferredIssue {
 pub struct SkippedIssue {
     pub id: String,
     pub reason: String,
+}
+
+/// JSON output for defer command.
+#[derive(Debug, Serialize)]
+pub struct DeferResult {
+    pub deferred: Vec<DeferredIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedIssue>,
+}
+
+/// JSON output for undefer command.
+#[derive(Debug, Serialize)]
+pub struct UndeferResult {
+    pub undeferred: Vec<DeferredIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedIssue>,
 }
 
 /// Execute the defer command.
@@ -69,7 +84,6 @@ pub fn execute_defer(args: &DeferArgs, json: bool, cli: &config::CliOverrides) -
     )?;
 
     let mut deferred_issues: Vec<DeferredIssue> = Vec::new();
-    let mut deferred_full: Vec<Issue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
 
     for resolved in &resolved_ids {
@@ -119,11 +133,6 @@ pub fn execute_defer(args: &DeferArgs, json: bool, cli: &config::CliOverrides) -
         // Update last touched
         crate::util::set_last_touched_id(&beads_dir, id);
 
-        // Get updated issue for JSON output
-        if let Some(updated) = storage.get_issue(id)? {
-            deferred_full.push(updated);
-        }
-
         deferred_issues.push(DeferredIssue {
             id: id.clone(),
             title: issue.title.clone(),
@@ -134,9 +143,11 @@ pub fn execute_defer(args: &DeferArgs, json: bool, cli: &config::CliOverrides) -
 
     // Output
     if use_json {
-        // bd outputs a bare array of updated issues
-        let json_output: Vec<ReadyIssue> = deferred_full.iter().map(ReadyIssue::from).collect();
-        let output = serde_json::to_string_pretty(&json_output).map_err(BeadsError::Json)?;
+        let result = DeferResult {
+            deferred: deferred_issues,
+            skipped: skipped_issues,
+        };
+        let output = serde_json::to_string_pretty(&result).map_err(BeadsError::Json)?;
         println!("{output}");
     } else {
         for deferred in &deferred_issues {
@@ -194,7 +205,6 @@ pub fn execute_undefer(args: &UndeferArgs, json: bool, cli: &config::CliOverride
     )?;
 
     let mut undeferred_issues: Vec<DeferredIssue> = Vec::new();
-    let mut undeferred_full: Vec<Issue> = Vec::new();
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
 
     for resolved in &resolved_ids {
@@ -210,8 +220,8 @@ pub fn execute_undefer(args: &UndeferArgs, json: bool, cli: &config::CliOverride
             continue;
         };
 
-        // Check if actually deferred (status or date)
-        if issue.status != Status::Deferred && issue.defer_until.is_none() {
+        // Check if actually deferred
+        if issue.status != Status::Deferred {
             tracing::debug!(id = %id, status = ?issue.status, "Issue is not deferred");
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
@@ -234,11 +244,6 @@ pub fn execute_undefer(args: &UndeferArgs, json: bool, cli: &config::CliOverride
         // Update last touched
         crate::util::set_last_touched_id(&beads_dir, id);
 
-        // Get updated issue for JSON output
-        if let Some(updated) = storage.get_issue(id)? {
-            undeferred_full.push(updated);
-        }
-
         undeferred_issues.push(DeferredIssue {
             id: id.clone(),
             title: issue.title.clone(),
@@ -258,9 +263,11 @@ pub fn execute_undefer(args: &UndeferArgs, json: bool, cli: &config::CliOverride
 
     // Output
     if use_json {
-        // bd outputs a bare array of updated issues
-        let json_output: Vec<ReadyIssue> = undeferred_full.iter().map(ReadyIssue::from).collect();
-        let output = serde_json::to_string_pretty(&json_output).map_err(BeadsError::Json)?;
+        let result = UndeferResult {
+            undeferred: undeferred_issues,
+            skipped: skipped_issues,
+        };
+        let output = serde_json::to_string_pretty(&result).map_err(BeadsError::Json)?;
         println!("{output}");
     } else {
         for undeferred in &undeferred_issues {

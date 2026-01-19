@@ -1,104 +1,5 @@
-use crate::model::{Comment, Event, Issue, IssueType, Priority, Status};
-use chrono::{DateTime, Utc};
+use crate::model::{Comment, Event, Issue, Priority, Status};
 use serde::{Deserialize, Serialize};
-
-/// Minimal issue output for stale command (bd parity).
-/// Contains only the fields that bd's stale command outputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaleIssue {
-    pub created_at: DateTime<Utc>,
-    pub id: String,
-    pub issue_type: IssueType,
-    pub priority: Priority,
-    pub status: Status,
-    pub title: String,
-    pub updated_at: DateTime<Utc>,
-}
-
-/// Minimal issue output for ready command (bd parity).
-///
-/// Contains only the fields that bd's ready command outputs.
-/// Does NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadyIssue {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub acceptance_criteria: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub assignee: Option<String>,
-    pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_by: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_minutes: Option<i32>,
-    pub id: String,
-    pub issue_type: IssueType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
-    pub priority: Priority,
-    pub status: Status,
-    pub title: String,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl From<&Issue> for ReadyIssue {
-    fn from(issue: &Issue) -> Self {
-        Self {
-            acceptance_criteria: issue.acceptance_criteria.clone(),
-            assignee: issue.assignee.clone(),
-            created_at: issue.created_at,
-            created_by: issue.created_by.clone(),
-            description: issue.description.clone(),
-            estimated_minutes: issue.estimated_minutes,
-            id: issue.id.clone(),
-            issue_type: issue.issue_type.clone(),
-            notes: issue.notes.clone(),
-            owner: issue.owner.clone(),
-            priority: issue.priority,
-            status: issue.status.clone(),
-            title: issue.title.clone(),
-            updated_at: issue.updated_at,
-        }
-    }
-}
-
-/// Minimal issue output for blocked command (bd parity).
-///
-/// Contains only the fields that bd's blocked command outputs, plus `blocked_by` info.
-/// Does NOT include: `compaction_level`, `original_size`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockedIssueOutput {
-    pub blocked_by: Vec<String>,
-    pub blocked_by_count: usize,
-    pub created_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_by: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub id: String,
-    pub issue_type: IssueType,
-    pub priority: Priority,
-    pub status: Status,
-    pub title: String,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl From<&Issue> for StaleIssue {
-    fn from(issue: &Issue) -> Self {
-        Self {
-            created_at: issue.created_at,
-            id: issue.id.clone(),
-            issue_type: issue.issue_type.clone(),
-            priority: issue.priority,
-            status: issue.status.clone(),
-            title: issue.title.clone(),
-            updated_at: issue.updated_at,
-        }
-    }
-}
 
 /// Issue with counts for list/search views.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,17 +15,11 @@ pub struct IssueWithCounts {
 pub struct IssueDetails {
     #[serde(flatten)]
     pub issue: Issue,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<IssueWithDependencyMetadata>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependents: Vec<IssueWithDependencyMetadata>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<Event>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
 }
 
@@ -156,57 +51,11 @@ pub struct TreeNode {
     pub truncated: bool,
 }
 
-/// Summary statistics for the project.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatsSummary {
-    pub total_issues: usize,
-    pub open_issues: usize,
-    pub in_progress_issues: usize,
-    pub closed_issues: usize,
-    pub blocked_issues: usize,
-    pub deferred_issues: usize,
-    pub ready_issues: usize,
-    pub tombstone_issues: usize,
-    pub pinned_issues: usize,
-    pub epics_eligible_for_closure: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub average_lead_time_hours: Option<f64>,
-}
-
-/// Breakdown statistics by a dimension.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Breakdown {
-    pub dimension: String,
-    pub counts: Vec<BreakdownEntry>,
-}
-
-/// A single entry in a breakdown.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BreakdownEntry {
-    pub key: String,
-    pub count: usize,
-}
-
-/// Recent activity statistics from git history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecentActivity {
-    pub hours_tracked: u32,
-    pub commit_count: usize,
-    pub issues_created: usize,
-    pub issues_closed: usize,
-    pub issues_updated: usize,
-    pub issues_reopened: usize,
-    pub total_changes: usize,
-}
-
-/// Aggregate statistics output.
+/// Aggregate statistics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Statistics {
-    pub summary: StatsSummary,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub breakdowns: Vec<Breakdown>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recent_activity: Option<RecentActivity>,
+    // TODO: Define stats structure
+    pub total: usize,
 }
 
 #[cfg(test)]

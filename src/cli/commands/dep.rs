@@ -540,11 +540,9 @@ fn resolve_issue_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logging::init_test_logging;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
-    use tracing::info;
 
     fn make_test_issue(id: &str, title: &str) -> Issue {
         Issue {
@@ -591,8 +589,6 @@ mod tests {
 
     #[test]
     fn test_dependency_type_parsing() {
-        init_test_logging();
-        info!("test_dependency_type_parsing: starting");
         assert_eq!(
             "blocks".parse::<DependencyType>().unwrap(),
             DependencyType::Blocks
@@ -609,24 +605,18 @@ mod tests {
             "duplicates".parse::<DependencyType>().unwrap(),
             DependencyType::Duplicates
         );
-        info!("test_dependency_type_parsing: assertions passed");
     }
 
     #[test]
     fn test_blocking_dependency_types() {
-        init_test_logging();
-        info!("test_blocking_dependency_types: starting");
         assert!(DependencyType::Blocks.is_blocking());
         assert!(DependencyType::ParentChild.is_blocking());
         assert!(!DependencyType::Related.is_blocking());
         assert!(!DependencyType::Duplicates.is_blocking());
-        info!("test_blocking_dependency_types: assertions passed");
     }
 
     #[test]
     fn test_add_dependency() {
-        init_test_logging();
-        info!("test_add_dependency: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -645,13 +635,10 @@ mod tests {
             .add_dependency("bd-001", "bd-002", "blocks", "tester")
             .unwrap();
         assert!(!added_again);
-        info!("test_add_dependency: assertions passed");
     }
 
     #[test]
     fn test_remove_dependency() {
-        init_test_logging();
-        info!("test_remove_dependency: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -673,13 +660,10 @@ mod tests {
             .remove_dependency("bd-001", "bd-002", "tester")
             .unwrap();
         assert!(!removed_again);
-        info!("test_remove_dependency: assertions passed");
     }
 
     #[test]
     fn test_get_dependencies() {
-        init_test_logging();
-        info!("test_get_dependencies: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -701,13 +685,10 @@ mod tests {
         assert_eq!(deps.len(), 2);
         assert!(deps.contains(&"bd-002".to_string()));
         assert!(deps.contains(&"bd-003".to_string()));
-        info!("test_get_dependencies: assertions passed");
     }
 
     #[test]
     fn test_get_dependents() {
-        init_test_logging();
-        info!("test_get_dependents: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -729,13 +710,10 @@ mod tests {
         assert_eq!(dependents.len(), 2);
         assert!(dependents.contains(&"bd-002".to_string()));
         assert!(dependents.contains(&"bd-003".to_string()));
-        info!("test_get_dependents: assertions passed");
     }
 
     #[test]
     fn test_cycle_detection_simple() {
-        init_test_logging();
-        info!("test_cycle_detection_simple: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -753,13 +731,10 @@ mod tests {
             .would_create_cycle("bd-002", "bd-001", true)
             .unwrap();
         assert!(would_cycle);
-        info!("test_cycle_detection_simple: assertions passed");
     }
 
     #[test]
     fn test_cycle_detection_transitive() {
-        init_test_logging();
-        info!("test_cycle_detection_transitive: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -788,13 +763,10 @@ mod tests {
             .would_create_cycle("bd-003", "bd-002", true)
             .unwrap();
         assert!(would_cycle);
-        info!("test_cycle_detection_transitive: assertions passed");
     }
 
     #[test]
     fn test_no_false_positive_cycle() {
-        init_test_logging();
-        info!("test_no_false_positive_cycle: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
         let issue1 = make_test_issue("bd-001", "Issue 1");
@@ -814,13 +786,10 @@ mod tests {
             .would_create_cycle("bd-003", "bd-002", true)
             .unwrap();
         assert!(!would_cycle);
-        info!("test_no_false_positive_cycle: assertions passed");
     }
 
     #[test]
     fn test_dep_action_result_json() {
-        init_test_logging();
-        info!("test_dep_action_result_json: starting");
         let result = DepActionResult {
             status: "ok".to_string(),
             issue_id: "bd-001".to_string(),
@@ -833,13 +802,10 @@ mod tests {
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"issue_id\":\"bd-001\""));
         assert!(json.contains("\"type\":\"blocks\"")); // Note: renamed field
-        info!("test_dep_action_result_json: assertions passed");
     }
 
     #[test]
     fn test_dep_list_item_json() {
-        init_test_logging();
-        info!("test_dep_list_item_json: starting");
         let item = DepListItem {
             issue_id: "bd-001".to_string(),
             depends_on_id: "bd-002".to_string(),
@@ -852,13 +818,10 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         assert!(json.contains("\"type\":\"blocks\"")); // Renamed field
         assert!(json.contains("\"priority\":2"));
-        info!("test_dep_list_item_json: assertions passed");
     }
 
     #[test]
     fn test_cycles_result_json() {
-        init_test_logging();
-        info!("test_cycles_result_json: starting");
         let result = CyclesResult {
             cycles: vec![
                 vec!["bd-001".to_string(), "bd-002".to_string()],
@@ -874,34 +837,25 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"count\":2"));
         assert!(json.contains("bd-001"));
-        info!("test_cycles_result_json: assertions passed");
     }
 
     #[test]
     fn test_external_dependency_prefix_check() {
-        init_test_logging();
-        info!("test_external_dependency_prefix_check: starting");
         let external = "external:jira-123";
         assert!(external.starts_with("external:"));
 
         let normal = "bd-001";
         assert!(!normal.starts_with("external:"));
-        info!("test_external_dependency_prefix_check: assertions passed");
     }
 
     #[test]
     fn test_dep_direction_default() {
-        init_test_logging();
-        info!("test_dep_direction_default: starting");
         let direction = DepDirection::default();
         assert_eq!(direction, DepDirection::Down);
-        info!("test_dep_direction_default: assertions passed");
     }
 
     #[test]
     fn test_apply_external_dep_list_metadata_sets_status_and_title() {
-        init_test_logging();
-        info!("test_apply_external_dep_list_metadata_sets_status_and_title: starting");
         let mut items = vec![
             DepListItem {
                 issue_id: "bd-001".to_string(),
@@ -931,13 +885,10 @@ mod tests {
         assert_eq!(items[0].title, "✓ proj:cap");
         assert_eq!(items[1].status, "blocked");
         assert_eq!(items[1].title, "⏳ proj:cap2");
-        info!("test_apply_external_dep_list_metadata_sets_status_and_title: assertions passed");
     }
 
     #[test]
     fn test_apply_external_dep_list_metadata_preserves_title() {
-        init_test_logging();
-        info!("test_apply_external_dep_list_metadata_preserves_title: starting");
         let mut items = vec![DepListItem {
             issue_id: "bd-001".to_string(),
             depends_on_id: "external:proj:cap".to_string(),
@@ -954,13 +905,10 @@ mod tests {
 
         assert_eq!(items[0].status, "blocked");
         assert_eq!(items[0].title, "Already set");
-        info!("test_apply_external_dep_list_metadata_preserves_title: assertions passed");
     }
 
     #[test]
     fn test_apply_external_dep_list_metadata_external_issue_id() {
-        init_test_logging();
-        info!("test_apply_external_dep_list_metadata_external_issue_id: starting");
         let mut items = vec![DepListItem {
             issue_id: "external:proj:cap".to_string(),
             depends_on_id: "bd-001".to_string(),
@@ -977,16 +925,12 @@ mod tests {
 
         assert_eq!(items[0].status, "closed");
         assert_eq!(items[0].title, "✓ proj:cap");
-        info!("test_apply_external_dep_list_metadata_external_issue_id: assertions passed");
     }
 
     #[test]
     fn test_dep_direction_variants() {
-        init_test_logging();
-        info!("test_dep_direction_variants: starting");
         assert!(matches!(DepDirection::Down, DepDirection::Down));
         assert!(matches!(DepDirection::Up, DepDirection::Up));
         assert!(matches!(DepDirection::Both, DepDirection::Both));
-        info!("test_dep_direction_variants: assertions passed");
     }
 }

@@ -75,7 +75,8 @@ impl RoutingResult {
 /// Returns `None` if the ID has no hyphen.
 #[must_use]
 pub fn extract_prefix(issue_id: &str) -> Option<String> {
-    crate::util::id::split_prefix_remainder(issue_id).map(|(prefix, _)| format!("{prefix}-"))
+    let hyphen_idx = issue_id.find('-')?;
+    Some(issue_id[..=hyphen_idx].to_string())
 }
 
 /// Find the town root by walking up looking for `mayor/town.json`.
@@ -335,14 +336,6 @@ mod tests {
     fn extract_prefix_basic() {
         assert_eq!(extract_prefix("bd-abc123"), Some("bd-".to_string()));
         assert_eq!(extract_prefix("fe-xyz"), Some("fe-".to_string()));
-        assert_eq!(
-            extract_prefix("bead-me-up-3e9"),
-            Some("bead-me-up-".to_string())
-        );
-        assert_eq!(
-            extract_prefix("document-intelligence-0sa"),
-            Some("document-intelligence-".to_string())
-        );
         assert_eq!(extract_prefix("no-hyphen-here"), Some("no-".to_string()));
         assert_eq!(extract_prefix("nohyphen"), None);
         assert_eq!(extract_prefix(""), None);

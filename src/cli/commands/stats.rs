@@ -6,15 +6,68 @@
 use crate::cli::StatsArgs;
 use crate::config;
 use crate::error::Result;
-use crate::format::{Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary};
 use crate::model::{IssueType, Status};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use tracing::{debug, info};
+
+/// Summary statistics for the project.
+#[derive(Serialize, Debug)]
+pub struct StatsSummary {
+    pub total_issues: usize,
+    pub open_issues: usize,
+    pub in_progress_issues: usize,
+    pub closed_issues: usize,
+    pub blocked_issues: usize,
+    pub deferred_issues: usize,
+    pub ready_issues: usize,
+    pub tombstone_issues: usize,
+    pub pinned_issues: usize,
+    pub epics_eligible_for_closure: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_lead_time_hours: Option<f64>,
+}
+
+/// Breakdown statistics by a dimension.
+#[derive(Serialize, Debug)]
+pub struct Breakdown {
+    pub dimension: String,
+    pub counts: Vec<BreakdownEntry>,
+}
+
+/// A single entry in a breakdown.
+#[derive(Serialize, Debug)]
+pub struct BreakdownEntry {
+    pub key: String,
+    pub count: usize,
+}
+
+/// Recent activity statistics from git history.
+#[derive(Serialize, Debug)]
+pub struct RecentActivity {
+    pub hours_tracked: u32,
+    pub commit_count: usize,
+    pub issues_created: usize,
+    pub issues_closed: usize,
+    pub issues_updated: usize,
+    pub issues_reopened: usize,
+    pub total_changes: usize,
+}
+
+/// Complete stats output structure.
+#[derive(Serialize, Debug)]
+pub struct StatsOutput {
+    pub summary: StatsSummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub breakdowns: Vec<Breakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_activity: Option<RecentActivity>,
+}
 
 /// Execute the stats command.
 ///
@@ -65,7 +118,7 @@ pub fn execute(args: &StatsArgs, json: bool, cli: &config::CliOverrides) -> Resu
         compute_recent_activity(&beads_dir, args.activity_hours)
     };
 
-    let output = Statistics {
+    let output = StatsOutput {
         summary,
         breakdowns,
         recent_activity,
@@ -103,9 +156,6 @@ fn compute_summary(
     // This differs from the ready/blocked commands which use the full blocked cache.
     let blocked_by_blocks = storage.get_blocked_by_blocks_deps_only()?;
 
-    // Get full blocked cache for accurate Ready count (must match `br ready` behavior)
-    let all_blocked_ids = storage.get_blocked_ids()?;
-
     for issue in issues {
         match issue.status {
             Status::Open => open += 1,
@@ -135,13 +185,14 @@ fn compute_summary(
         }
     }
 
-    // Ready count: status=open (not in_progress), no blockers (full definition).
+    // Ready count: simplified bd semantics - status=open (not in_progress), no open blockers.
+    // This differs from the ready command which uses the full blocked cache.
     let now = Utc::now();
     let ready = issues
         .iter()
         .filter(|i| {
             i.status == Status::Open
-                && !all_blocked_ids.contains(&i.id)
+                && !blocked_by_blocks.contains(&i.id)
                 && !i.ephemeral
                 && !i.pinned
                 && i.defer_until.is_none_or(|d| d <= now)
@@ -376,53 +427,30 @@ fn compute_recent_activity(beads_dir: &Path, hours: u32) -> Option<RecentActivit
 }
 
 /// Print text output for stats.
-fn print_text_output(output: &Statistics) {
-    // Match bd format: 📊 Issue Database Status
-    println!("📊 Issue Database Status\n");
+fn print_text_output(output: &StatsOutput) {
+    println!("Project Statistics");
+    println!("==================\n");
 
     let s = &output.summary;
     println!("Summary:");
-    // Match bd alignment (right-aligned numbers, 18-char label width)
-    println!("  Total Issues:           {}", s.total_issues);
-    println!("  Open:                   {}", s.open_issues);
-    println!("  In Progress:            {}", s.in_progress_issues);
-    println!("  Blocked:                {}", s.blocked_issues);
-    println!("  Closed:                 {}", s.closed_issues);
-    println!("  Ready to Work:          {}", s.ready_issues);
-
-    // Optional fields (only show if non-zero)
-    if s.deferred_issues > 0 {
-        println!("  Deferred:               {}", s.deferred_issues);
-    }
+    println!("  Total issues:     {}", s.total_issues);
+    println!("  Open:             {}", s.open_issues);
+    println!("  In Progress:      {}", s.in_progress_issues);
+    println!("  Closed:           {}", s.closed_issues);
+    println!("  Blocked:          {}", s.blocked_issues);
+    println!("  Deferred:         {}", s.deferred_issues);
+    println!("  Ready:            {}", s.ready_issues);
     if s.tombstone_issues > 0 {
-        println!("  Tombstones:             {}", s.tombstone_issues);
+        println!("  Tombstones:       {}", s.tombstone_issues);
     }
     if s.pinned_issues > 0 {
-        println!("  Pinned:                 {}", s.pinned_issues);
+        println!("  Pinned:           {}", s.pinned_issues);
     }
     if s.epics_eligible_for_closure > 0 {
-        println!("  Epics ready to close:   {}", s.epics_eligible_for_closure);
+        println!("  Epics ready to close: {}", s.epics_eligible_for_closure);
     }
-
-    // Extended section (matches bd format)
-    if s.average_lead_time_hours.is_some() || s.tombstone_issues > 0 {
-        println!("\nExtended:");
-        if let Some(avg_hours) = s.average_lead_time_hours {
-            // Format like bd: "N.N hours" or "N days" for large values
-            let formatted = if avg_hours >= 24.0 {
-                let avg_days = avg_hours / 24.0;
-                format!("{avg_days:.1} days")
-            } else {
-                format!("{avg_hours:.1} hours")
-            };
-            println!("  Avg Lead Time:          {formatted}");
-        }
-        if s.tombstone_issues > 0 {
-            println!(
-                "  Deleted:                {} (tombstones)",
-                s.tombstone_issues
-            );
-        }
+    if let Some(avg) = s.average_lead_time_hours {
+        println!("  Avg lead time:    {avg:.1}h");
     }
 
     for breakdown in &output.breakdowns {
@@ -434,16 +462,13 @@ fn print_text_output(output: &Statistics) {
 
     if let Some(activity) = &output.recent_activity {
         println!("\nRecent Activity (last {} hours):", activity.hours_tracked);
-        println!("  Commits:                {}", activity.commit_count);
-        println!("  Total Changes:          {}", activity.total_changes);
-        println!("  Issues Created:         {}", activity.issues_created);
-        println!("  Issues Closed:          {}", activity.issues_closed);
-        println!("  Issues Reopened:        {}", activity.issues_reopened);
-        println!("  Issues Updated:         {}", activity.issues_updated);
+        println!("  Commits:         {}", activity.commit_count);
+        println!("  Total Changes:   {}", activity.total_changes);
+        println!("  Issues Created:  {}", activity.issues_created);
+        println!("  Issues Closed:   {}", activity.issues_closed);
+        println!("  Issues Reopened: {}", activity.issues_reopened);
+        println!("  Issues Updated:  {}", activity.issues_updated);
     }
-
-    // Match bd footer
-    println!("\nFor more details, use 'bd list' to see individual issues.");
 }
 
 #[cfg(test)]
