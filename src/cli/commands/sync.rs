@@ -789,29 +789,36 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
     let reader = BufReader::new(file);
 
     for line in reader.lines() {
-        let line = line.ok()?;
+        // Skip lines that fail to read (IO errors)
+        let Ok(line) = line else {
+            continue;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
 
-        // Parse as JSON to get the issue ID
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-                // Skip tombstones (deleted issues)
-                if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
-                    if status == "tombstone" {
-                        continue;
-                    }
-                }
+        // Parse as JSON to get the issue ID (skip malformed lines)
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
 
-                // Extract prefix (part before first hyphen)
-                if let Some(hyphen_pos) = id.find('-') {
-                    let prefix = &id[..hyphen_pos];
-                    if !prefix.is_empty() {
-                        return Some(prefix.to_string());
-                    }
-                }
+        let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        // Skip tombstones (deleted issues)
+        if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+            if status == "tombstone" {
+                continue;
+            }
+        }
+
+        // Extract prefix (part before first hyphen)
+        if let Some(hyphen_pos) = id.find('-') {
+            let prefix = &id[..hyphen_pos];
+            if !prefix.is_empty() {
+                return Some(prefix.to_string());
             }
         }
     }
