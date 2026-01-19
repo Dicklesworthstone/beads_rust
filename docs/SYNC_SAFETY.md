@@ -87,10 +87,14 @@ By default, sync operates on `.beads/issues.jsonl`. To use a different path:
 ```bash
 # Set via environment variable
 export BEADS_JSONL=/path/to/issues.jsonl
-br sync --flush-only
+br sync --flush-only --allow-external-jsonl
 ```
 
-**Future enhancement**: An `--allow-external-jsonl` flag will be required for paths outside `.beads/`.
+Paths outside `.beads/` require the explicit `--allow-external-jsonl` opt-in.
+
+**Backups:** When exporting to a JSONL file that lives inside `.beads/` (including custom
+`BEADS_JSONL` paths that still target `.beads/`), br creates timestamped backups in
+`.beads/.br_history/` before overwriting.
 
 **Safety notes:**
 - External paths bypass the default confinement

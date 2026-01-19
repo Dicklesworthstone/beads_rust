@@ -65,6 +65,7 @@ fn create_issue_with_description(
 
 #[test]
 fn e2e_lint_clean_workspace_no_issues() {
+    let _log = common::test_log("e2e_lint_clean_workspace_no_issues");
     // Lint on empty workspace (no issues) should pass with no warnings
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -80,6 +81,7 @@ fn e2e_lint_clean_workspace_no_issues() {
 
 #[test]
 fn e2e_lint_clean_workspace_json_empty_results() {
+    let _log = common::test_log("e2e_lint_clean_workspace_json_empty_results");
     // JSON output on empty workspace should have empty results array
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -100,6 +102,7 @@ fn e2e_lint_clean_workspace_json_empty_results() {
 
 #[test]
 fn e2e_lint_issue_with_all_required_sections_passes() {
+    let _log = common::test_log("e2e_lint_issue_with_all_required_sections_passes");
     // Bug with all required sections should not trigger warnings
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -123,6 +126,7 @@ fn e2e_lint_issue_with_all_required_sections_passes() {
 
 #[test]
 fn e2e_lint_bug_missing_steps_to_reproduce() {
+    let _log = common::test_log("e2e_lint_bug_missing_steps_to_reproduce");
     // Bug without "Steps to Reproduce" should warn
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -157,6 +161,7 @@ fn e2e_lint_bug_missing_steps_to_reproduce() {
 
 #[test]
 fn e2e_lint_bug_missing_acceptance_criteria() {
+    let _log = common::test_log("e2e_lint_bug_missing_acceptance_criteria");
     // Bug without "Acceptance Criteria" should warn
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -185,6 +190,7 @@ fn e2e_lint_bug_missing_acceptance_criteria() {
 
 #[test]
 fn e2e_lint_bug_missing_all_sections() {
+    let _log = common::test_log("e2e_lint_bug_missing_all_sections");
     // Bug without any required sections should have 2 warnings
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -210,6 +216,7 @@ fn e2e_lint_bug_missing_all_sections() {
 
 #[test]
 fn e2e_lint_task_missing_acceptance_criteria() {
+    let _log = common::test_log("e2e_lint_task_missing_acceptance_criteria");
     // Task without "Acceptance Criteria" should warn
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -238,6 +245,7 @@ fn e2e_lint_task_missing_acceptance_criteria() {
 
 #[test]
 fn e2e_lint_epic_missing_success_criteria() {
+    let _log = common::test_log("e2e_lint_epic_missing_success_criteria");
     // Epic without "Success Criteria" should warn
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -266,6 +274,7 @@ fn e2e_lint_epic_missing_success_criteria() {
 
 #[test]
 fn e2e_lint_chore_no_required_sections() {
+    let _log = common::test_log("e2e_lint_chore_no_required_sections");
     // Chore type has no required sections, should never warn
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -287,6 +296,7 @@ fn e2e_lint_chore_no_required_sections() {
 
 #[test]
 fn e2e_lint_filter_by_type_bug() {
+    let _log = common::test_log("e2e_lint_filter_by_type_bug");
     // --type bug should only lint bug issues
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -320,6 +330,7 @@ fn e2e_lint_filter_by_type_bug() {
 
 #[test]
 fn e2e_lint_filter_by_status_all() {
+    let _log = common::test_log("e2e_lint_filter_by_status_all");
     // --status all should include closed issues
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -368,6 +379,7 @@ fn e2e_lint_filter_by_status_all() {
 
 #[test]
 fn e2e_lint_specific_issue_id() {
+    let _log = common::test_log("e2e_lint_specific_issue_id");
     // Lint specific issue by ID
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -401,6 +413,7 @@ fn e2e_lint_specific_issue_id() {
 
 #[test]
 fn e2e_lint_json_output_structure() {
+    let _log = common::test_log("e2e_lint_json_output_structure");
     // Verify JSON output has correct structure
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -441,6 +454,7 @@ fn e2e_lint_json_output_structure() {
 
 #[test]
 fn e2e_lint_json_exit_code_always_zero() {
+    let _log = common::test_log("e2e_lint_json_exit_code_always_zero");
     // In JSON mode, exit code should always be 0 (even with warnings)
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -462,6 +476,7 @@ fn e2e_lint_json_exit_code_always_zero() {
 
 #[test]
 fn e2e_lint_text_output_warnings() {
+    let _log = common::test_log("e2e_lint_text_output_warnings");
     // Text mode with warnings should show formatted output
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -484,6 +499,7 @@ fn e2e_lint_text_output_warnings() {
 
 #[test]
 fn e2e_lint_text_exit_code_nonzero_with_warnings() {
+    let _log = common::test_log("e2e_lint_text_exit_code_nonzero_with_warnings");
     // In text mode, exit code should be 1 when there are warnings
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -503,6 +519,7 @@ fn e2e_lint_text_exit_code_nonzero_with_warnings() {
 
 #[test]
 fn e2e_lint_before_init_fails() {
+    let _log = common::test_log("e2e_lint_before_init_fails");
     // Lint without init should fail
     let workspace = BrWorkspace::new();
     // Do NOT init
@@ -520,6 +537,7 @@ fn e2e_lint_before_init_fails() {
 
 #[test]
 fn e2e_lint_nonexistent_id_error() {
+    let _log = common::test_log("e2e_lint_nonexistent_id_error");
     // Lint with nonexistent ID should handle gracefully
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -540,7 +558,8 @@ fn e2e_lint_nonexistent_id_error() {
 
 #[test]
 fn e2e_lint_unknown_type_filter_no_matches() {
-    // Unknown --type value is treated as a custom type (no matches)
+    let _log = common::test_log("e2e_lint_unknown_type_filter_no_matches");
+    // Unknown --type value is rejected (bd conformance: only task, bug, feature, epic, chore)
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
 
@@ -552,16 +571,17 @@ fn e2e_lint_unknown_type_filter_no_matches() {
         ["lint", "--type", "unknown_custom_type"],
         "lint_unknown_type",
     );
-    // Unknown types are valid (treated as custom types), just match no issues
+    // For bd conformance, CLI rejects unknown types (they may exist in imported data
+    // but cannot be specified via CLI). See src/model/mod.rs FromStr for IssueType.
     assert!(
-        lint.status.success(),
-        "unknown type should succeed (custom types are valid), got stderr: {}",
-        lint.stderr
+        !lint.status.success(),
+        "unknown type should fail for bd conformance, got stdout: {}",
+        lint.stdout
     );
     assert!(
-        lint.stdout.contains("0 issues checked"),
-        "should check 0 issues for unknown type, got: {}",
-        lint.stdout
+        lint.stderr.contains("INVALID_TYPE") || lint.stderr.contains("Invalid issue type"),
+        "should report invalid type error, got stderr: {}",
+        lint.stderr
     );
 }
 
@@ -571,6 +591,7 @@ fn e2e_lint_unknown_type_filter_no_matches() {
 
 #[test]
 fn e2e_lint_case_insensitive_section_matching() {
+    let _log = common::test_log("e2e_lint_case_insensitive_section_matching");
     // Section headings should match case-insensitively
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);
@@ -594,6 +615,7 @@ fn e2e_lint_case_insensitive_section_matching() {
 
 #[test]
 fn e2e_lint_multiple_issues_with_warnings() {
+    let _log = common::test_log("e2e_lint_multiple_issues_with_warnings");
     // Multiple issues with warnings should all be reported
     let workspace = BrWorkspace::new();
     init_workspace(&workspace);

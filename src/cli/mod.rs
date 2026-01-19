@@ -205,6 +205,12 @@ EXAMPLES:
     /// Run read-only diagnostics
     Doctor,
 
+    /// Show diagnostic metadata about the workspace
+    Info(InfoArgs),
+
+    /// Show the active .beads directory
+    Where,
+
     /// Show version information
     Version,
 
@@ -236,6 +242,9 @@ EXAMPLES:
 
     /// Visualize dependency graph
     Graph(GraphArgs),
+
+    /// Manage AGENTS.md workflow instructions
+    Agents(AgentsArgs),
 }
 
 /// Arguments for the completions command.
@@ -267,7 +276,7 @@ pub enum ShellType {
     Elvish,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Default)]
 pub struct CreateArgs {
     /// Issue title
     pub title: Option<String>,
@@ -477,6 +486,22 @@ pub struct DeleteArgs {
     pub dry_run: bool,
 }
 
+/// Arguments for the info command.
+#[derive(Args, Debug, Default, Clone)]
+pub struct InfoArgs {
+    /// Include schema details
+    #[arg(long)]
+    pub schema: bool,
+
+    /// Show recent changes and exit
+    #[arg(long = "whats-new", conflicts_with = "thanks")]
+    pub whats_new: bool,
+
+    /// Show acknowledgements and exit
+    #[arg(long, conflicts_with = "whats_new")]
+    pub thanks: bool,
+}
+
 /// Output format for list command.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum OutputFormat {
@@ -523,7 +548,7 @@ pub struct ListArgs {
 
     /// Filter by priority (can be repeated)
     #[arg(long, short = 'p')]
-    pub priority: Vec<u8>,
+    pub priority: Vec<String>,
 
     /// Filter by minimum priority (0=critical, 4=backlog)
     #[arg(long)]
@@ -607,6 +632,7 @@ pub enum DepCommands {
     /// Add a dependency: <issue> depends on <depends-on>
     Add(DepAddArgs),
     /// Remove a dependency
+    #[command(visible_alias = "rm")]
     Remove(DepRemoveArgs),
     /// List dependencies of an issue
     List(DepListArgs),
@@ -1029,7 +1055,7 @@ pub struct BlockedArgs {
 
     /// Filter by priority (can be repeated, 0-4)
     #[arg(long, short = 'p')]
-    pub priority: Vec<u8>,
+    pub priority: Vec<String>,
 
     /// Filter by label (AND logic, can be repeated)
     #[arg(long, short = 'l')]
@@ -1387,4 +1413,33 @@ pub struct GraphArgs {
     /// One line per issue (compact output)
     #[arg(long)]
     pub compact: bool,
+}
+
+/// Arguments for the agents command.
+#[derive(Args, Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct AgentsArgs {
+    /// Add beads workflow instructions to AGENTS.md
+    #[arg(long)]
+    pub add: bool,
+
+    /// Remove beads workflow instructions from AGENTS.md
+    #[arg(long)]
+    pub remove: bool,
+
+    /// Update beads workflow instructions to latest version
+    #[arg(long)]
+    pub update: bool,
+
+    /// Check status only (default behavior)
+    #[arg(long)]
+    pub check: bool,
+
+    /// Preview changes without modifying files
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip confirmation prompts
+    #[arg(long, short = 'f')]
+    pub force: bool,
 }

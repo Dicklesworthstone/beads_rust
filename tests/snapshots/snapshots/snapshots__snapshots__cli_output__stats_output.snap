@@ -2,15 +2,17 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
-Project Statistics
-==================
+📊 Issue Database Status
 
 Summary:
-  Total issues:     3
-  Open:             2
-  In Progress:      0
-  Closed:           1
-  Blocked:          1
-  Deferred:         0
-  Ready:            1
-  Avg lead time:    0.0h
+  Total Issues:           3
+  Open:                   2
+  In Progress:            0
+  Blocked:                1
+  Closed:                 1
+  Ready to Work:          1
+
+Extended:
+  Avg Lead Time:          0.0 hours
+
+For more details, use 'bd list' to see individual issues.

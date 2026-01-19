@@ -1,5 +1,6 @@
-# Build artifacts
-/target/
+# Build artifacts (all target directories)
+target/
+target*/
 
 # Cargo lock for library crates (keep for binary crates)
 # Cargo.lock
@@ -18,12 +19,24 @@ Thumbs.db
 /legacy_beads/
 
 
-# Added by cargo
-
-/target
+# Added by cargo (covered by target*/ above)
 
 # bv (beads viewer) local config and caches
 .bv/
 
 # Coverage reports
 /coverage/
+
+# Local agent/session artifacts
+SESSION_STATUS.md
+a.out
+
+# Temp directories and crash reports
+temp_test*/
+rustc-ice-*.txt
+
+# Large source images (webp versions are committed)
+*.png
+
+# Claude Code temp files
+claude-upgrade-progress.json
