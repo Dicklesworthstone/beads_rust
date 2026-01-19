@@ -4,7 +4,7 @@
 //! 1. CLI overrides
 //! 2. Environment variables
 //! 3. Project config (.beads/config.yaml)
-//! 4. User config (~/.config/beads/config.yaml; falls back to ~/.config/bd/config.yaml)
+//! 4. User config (~/.config/bd/config.yaml)
 //! 5. Legacy user config (~/.beads/config.yaml)
 //! 6. DB config table
 //! 7. Defaults
@@ -632,7 +632,7 @@ pub fn load_project_config(beads_dir: &Path) -> Result<ConfigLayer> {
     ConfigLayer::from_yaml(&beads_dir.join("config.yaml"))
 }
 
-/// Load user config (~/.config/beads/config.yaml), falling back to ~/.config/bd/config.yaml.
+/// Load user config (~/.config/bd/config.yaml).
 ///
 /// # Errors
 ///
@@ -641,13 +641,11 @@ pub fn load_user_config() -> Result<ConfigLayer> {
     let Ok(home) = env::var("HOME") else {
         return Ok(ConfigLayer::default());
     };
-    let config_root = Path::new(&home).join(".config");
-    let beads_path = config_root.join("beads").join("config.yaml");
-    if beads_path.exists() {
-        return ConfigLayer::from_yaml(&beads_path);
-    }
-    let legacy_path = config_root.join("bd").join("config.yaml");
-    ConfigLayer::from_yaml(&legacy_path)
+    let path = Path::new(&home)
+        .join(".config")
+        .join("bd")
+        .join("config.yaml");
+    ConfigLayer::from_yaml(&path)
 }
 
 /// Load legacy user config (~/.beads/config.yaml).

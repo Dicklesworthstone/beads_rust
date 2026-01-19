@@ -8,7 +8,6 @@
 
 use crate::model::{Issue, IssueType, Priority, Status};
 use colored::Colorize;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Status icon characters.
 pub mod icons {
@@ -124,11 +123,9 @@ pub fn format_priority_label(priority: &Priority, use_color: bool) -> String {
 }
 
 /// Format priority badge with optional color.
-///
-/// Matches bd format: `[● P2]` (bullet before priority number).
 #[must_use]
 pub fn format_priority_badge(priority: &Priority, use_color: bool) -> String {
-    format!("[● {}]", format_priority_label(priority, use_color))
+    format!("[{}]", format_priority_label(priority, use_color))
 }
 
 /// Format issue type as a bracketed badge.
@@ -170,65 +167,40 @@ pub fn terminal_width() -> usize {
     80
 }
 
-/// Truncate a title to fit within `max_len` visible columns.
-///
-/// Handles wide characters (emojis, CJK) correctly using `unicode-width`.
+/// Truncate a title to fit within `max_len` visible characters.
 #[must_use]
 pub fn truncate_title(title: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
     }
 
-    let width = UnicodeWidthStr::width(title);
-    if width <= max_len {
+    let title_len = title.chars().count();
+    if title_len <= max_len {
         return title.to_string();
     }
 
     if max_len <= 3 {
-        let mut w = 0;
-        let mut s = String::new();
-        for c in title.chars() {
-            let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-            if w + cw > max_len {
-                break;
-            }
-            w += cw;
-            s.push(c);
-        }
-        return s;
+        return title.chars().take(max_len).collect();
     }
 
-    let target_len = max_len - 3;
-    let mut w = 0;
-    let mut s = String::new();
-    for c in title.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if w + cw > target_len {
-            break;
-        }
-        w += cw;
-        s.push(c);
-    }
-    s.push_str("...");
-    s
+    let mut trimmed: String = title.chars().take(max_len - 3).collect();
+    trimmed.push_str("...");
+    trimmed
 }
 
 fn visible_len(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    text.chars().count()
 }
 
 /// Format a single-line issue summary with options.
 ///
-/// Format: `{icon} {id} [● {priority}] [{type}] - {title}`
-/// (matches bd text output format)
+/// Format: `{icon} {id} [{priority}] [{type}] {title}`
 #[must_use]
 pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> String {
     let status_icon_plain = format_status_icon(&issue.status);
-    // Account for the bullet in priority badge: [● P2]
-    let priority_badge_plain = format!("[● {}]", format_priority(&issue.priority));
+    let priority_badge_plain = format!("[{}]", format_priority(&issue.priority));
     let type_badge_plain = format_type_badge(&issue.issue_type);
 
-    // Add 3 for " - " separator between type badge and title
     let prefix_len = visible_len(status_icon_plain)
         + 1
         + visible_len(&issue.id)
@@ -236,7 +208,7 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
         + visible_len(&priority_badge_plain)
         + 1
         + visible_len(&type_badge_plain)
-        + 3; // " - " separator
+        + 1;
 
     let title = options.max_width.map_or_else(
         || issue.title.clone(),
@@ -248,7 +220,7 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
     let type_badge = format_type_badge_colored(&issue.issue_type, options.use_color);
 
     format!(
-        "{status_icon} {} {priority_badge} {type_badge} - {title}",
+        "{status_icon} {} {priority_badge} {type_badge} {title}",
         issue.id
     )
 }
@@ -352,8 +324,7 @@ mod tests {
     fn test_format_issue_line_open() {
         let issue = make_test_issue();
         let line = format_issue_line(&issue);
-        // Format matches bd: {icon} {id} [● {priority}] [{type}] - {title}
-        assert_eq!(line, "○ bd-test [● P2] [task] - Test title");
+        assert_eq!(line, "○ bd-test [P2] [task] Test title");
     }
 
     #[test]
@@ -379,7 +350,7 @@ mod tests {
         issue.priority = Priority::HIGH;
         issue.title = "Critical bug".to_string();
         let line = format_issue_line(&issue);
-        assert!(line.contains("[● P1]"));
+        assert!(line.contains("[P1]"));
         assert!(line.contains("[bug]"));
         assert!(line.contains("Critical bug"));
     }
@@ -390,7 +361,7 @@ mod tests {
         issue.issue_type = IssueType::Epic;
         issue.priority = Priority::CRITICAL;
         let line = format_issue_line(&issue);
-        assert!(line.contains("[● P0]"));
+        assert!(line.contains("[P0]"));
         assert!(line.contains("[epic]"));
     }
 

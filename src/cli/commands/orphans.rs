@@ -183,7 +183,7 @@ fn is_git_repo() -> bool {
 /// The list is ordered from most recent to oldest commit.
 fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
     let mut child = Command::new("git")
-        .args(["log", "--oneline", "HEAD"])
+        .args(["log", "--oneline", "--all"])
         .stdout(Stdio::piped())
         .spawn()?;
 
@@ -248,8 +248,7 @@ fn output_empty(json: bool) {
     if json {
         println!("[]");
     } else {
-        // Match bd format
-        println!("✓ No orphaned issues found");
+        println!("No orphan issues found");
     }
 }
 

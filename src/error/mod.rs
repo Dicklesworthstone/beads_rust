@@ -233,7 +233,9 @@ impl BeadsError {
             Self::InvalidStatus { .. } => {
                 Some("Valid statuses: open, in_progress, blocked, deferred, closed")
             }
-            Self::InvalidType { .. } => Some("Valid types: task, bug, feature, epic, chore"),
+            Self::InvalidType { .. } => {
+                Some("Valid types: task, bug, feature, epic, chore, docs, question")
+            }
             _ => None,
         }
     }

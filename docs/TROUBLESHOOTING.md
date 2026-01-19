@@ -708,35 +708,6 @@ RUST_LOG=beads_rust::storage=debug br list
 RUST_LOG=debug br list --json 2>debug.log 1>issues.json
 ```
 
-### Test Harness Logging (Conformance/Benchmark)
-
-Conformance and benchmark tests can emit structured logs for CI parsing.
-
-Enable with environment variables:
-
-```bash
-# JSONL event log of each br/bd run
-CONFORMANCE_JSON_LOGS=1
-
-# Summary report with br/bd timing ratios
-CONFORMANCE_SUMMARY=1
-
-# JUnit XML output for CI systems
-CONFORMANCE_JUNIT_XML=1
-
-# Failure context dump (stdout/stderr previews + .beads listing)
-CONFORMANCE_FAILURE_CONTEXT=1
-```
-
-Outputs are written under the test workspace `logs/` directory:
-
-```
-conformance_runs.jsonl
-conformance_summary.json
-conformance_junit.xml
-<label>.failure.json  (only on failure)
-```
-
 ---
 
 ## Performance Issues

@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::storage::SqliteStorage;
 use crate::util::id::IdGenerator;
-use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
+use crate::util::markdown_import::parse_markdown_file;
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
@@ -27,18 +27,6 @@ pub struct CreateConfig {
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     if let Some(ref file_path) = args.file {
-        if args.title.is_some() || args.title_flag.is_some() {
-            return Err(BeadsError::validation(
-                "file",
-                "cannot be combined with title arguments",
-            ));
-        }
-        if args.dry_run {
-            return Err(BeadsError::validation(
-                "dry_run",
-                "--dry-run is not supported with --file",
-            ));
-        }
         return execute_import(file_path, args, cli);
     }
 
@@ -175,7 +163,7 @@ pub fn create_issue_impl(
         design: None,
         acceptance_criteria: None,
         notes: None,
-        created_by: Some(config.actor.clone()),
+        created_by: None,
         closed_at: None,
         close_reason: None,
         closed_by_session: None,
@@ -339,9 +327,6 @@ fn add_relations(
 fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
     let parsed_issues = parse_markdown_file(path)?;
     if parsed_issues.is_empty() {
-        if cli.json.unwrap_or(false) {
-            println!("[]");
-        }
         return Ok(());
     }
 
@@ -354,27 +339,17 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
     let now = Utc::now();
-    let json_mode = cli.json.unwrap_or(false);
-    let due_at = parse_optional_date(args.due.as_deref())?;
-    let defer_until = parse_optional_date(args.defer.as_deref())?;
 
     let storage = &mut storage_ctx.storage;
     let id_gen = IdGenerator::new(id_config);
 
     // Track created IDs for output
     let mut created_ids = Vec::new();
-    let mut created_issues = Vec::new();
 
     for parsed in parsed_issues {
-        let title = parsed.title.trim().to_string();
-        if title.is_empty() {
-            eprintln!("✗ Failed to create issue: title cannot be empty");
-            continue;
-        }
-
         let count = storage.count_issues()?;
         let id = id_gen.generate(
-            &title,
+            &parsed.title,
             parsed.description.as_deref(),
             None,
             now,
@@ -383,32 +358,20 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
         );
 
         let priority = if let Some(ref p) = parsed.priority {
-            match Priority::from_str(p) {
-                Ok(value) => value,
-                Err(err) => {
-                    eprintln!("✗ Failed to create {title}: {err}");
-                    continue;
-                }
-            }
+            Priority::from_str(p)?
         } else {
             default_priority
         };
 
         let issue_type = if let Some(ref t) = parsed.issue_type {
-            match IssueType::from_str(t) {
-                Ok(value) => value,
-                Err(err) => {
-                    eprintln!("✗ Failed to create {title}: {err}");
-                    continue;
-                }
-            }
+            IssueType::from_str(t)?
         } else {
             default_issue_type.clone()
         };
 
         let mut issue = Issue {
             id: id.clone(),
-            title: title.clone(),
+            title: parsed.title,
             description: parsed.description,
             status: Status::Open,
             priority,
@@ -418,8 +381,8 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
             assignee: parsed.assignee,
             owner: args.owner.clone(),
             estimated_minutes: args.estimate,
-            due_at,
-            defer_until,
+            due_at: parse_optional_date(args.due.as_deref())?,
+            defer_until: parse_optional_date(args.defer.as_deref())?,
             external_ref: args.external_ref.clone(),
             ephemeral: args.ephemeral,
             design: parsed.design,
@@ -448,81 +411,49 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
         };
 
         issue.content_hash = Some(issue.compute_content_hash());
-        if let Err(err) =
-            IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)
-        {
-            eprintln!("✗ Failed to create {title}: {err}");
+        IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+
+        if args.dry_run {
+            println!("Dry run: would create issue {}", issue.id);
             continue;
         }
 
-        if let Err(err) = storage.create_issue(&issue, &actor) {
-            eprintln!("✗ Failed to create {title}: {err}");
-            continue;
-        }
+        storage.create_issue(&issue, &actor)?;
 
         let mut labels = parsed.labels;
         labels.extend(args.labels.clone());
         for label in labels {
-            let label = label.trim().to_string();
-            if label.is_empty() {
-                continue;
-            }
-            if let Err(err) = LabelValidator::validate(&label) {
-                eprintln!(
-                    "warning: skipping invalid label '{label}' for issue {id}: {}",
-                    err.message
-                );
-                continue;
-            }
-            if let Err(err) = storage.add_label(&id, &label, &actor) {
-                eprintln!("warning: failed to add label '{label}' for issue {id}: {err}");
+            if !label.trim().is_empty() {
+                LabelValidator::validate(&label)
+                    .map_err(|e| BeadsError::validation("label", e.message))?;
+                storage.add_label(&id, &label, &actor)?;
             }
         }
 
         let mut deps = parsed.dependencies;
         deps.extend(args.deps.clone());
         for dep_str in deps {
-            let (mut type_str, dep_id, valid) = parse_dependency(&dep_str);
-            if !valid {
-                eprintln!("warning: skipping invalid dependency type '{type_str}' for issue {id}");
-                continue;
-            }
-            if type_str.eq_ignore_ascii_case("blocked-by") {
-                type_str = "blocks".to_string();
-            }
-            if dep_id == id {
-                eprintln!("warning: skipping self-dependency for issue {id}");
-                continue;
-            }
-            if let Err(err) = storage.add_dependency(&id, &dep_id, &type_str, &actor) {
-                eprintln!(
-                    "warning: failed to add dependency '{type_str}:{dep_id}' for issue {id}: {err}"
-                );
-            }
-        }
-
-        if json_mode {
-            if let Some(full_issue) = storage.get_issue_for_export(&id)? {
-                created_issues.push(full_issue);
+            let (type_str, dep_id) = if let Some((t, i)) = dep_str.split_once(':') {
+                (t, i)
             } else {
-                eprintln!("warning: could not load created issue {id} for JSON output");
+                ("blocks", dep_str.as_str())
+            };
+            if dep_id == id {
+                return Err(BeadsError::validation(
+                    "deps",
+                    format!("issue {id} cannot depend on itself"),
+                ));
             }
+            storage.add_dependency(&id, dep_id, type_str, &actor)?;
         }
 
-        created_ids.push((id, title));
+        created_ids.push(id);
     }
 
-    if json_mode {
-        let json_output = serde_json::to_string_pretty(&created_issues)?;
-        println!("{json_output}");
-    } else if !created_ids.is_empty() {
-        println!(
-            "✓ Created {} issues from {}:",
-            created_ids.len(),
-            path.display()
-        );
-        for (id, title) in created_ids {
-            println!("  ✓ {id}: {title}");
+    if !created_ids.is_empty() && !args.dry_run {
+        println!("Created {} issues:", created_ids.len());
+        for id in created_ids {
+            println!("  {id}");
         }
     }
 
@@ -540,10 +471,8 @@ fn parse_optional_date(s: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logging::init_test_logging;
     use crate::util::id::IdConfig;
     use chrono::Datelike;
-    use tracing::info;
 
     // Helper to create basic args
     fn default_args() -> CreateArgs {
@@ -589,8 +518,6 @@ mod tests {
 
     #[test]
     fn test_create_issue_basic_success() {
-        init_test_logging();
-        info!("test_create_issue_basic_success: starting");
         let mut storage = setup_memory_storage();
         let args = default_args();
         let config = default_config();
@@ -606,13 +533,10 @@ mod tests {
         let loaded = storage.get_issue(&issue.id).expect("get issue");
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().title, "Test Issue");
-        info!("test_create_issue_basic_success: assertions passed");
     }
 
     #[test]
     fn test_create_issue_validation_empty_title() {
-        init_test_logging();
-        info!("test_create_issue_validation_empty_title: starting");
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.title = None;
@@ -620,13 +544,10 @@ mod tests {
 
         let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "title"));
-        info!("test_create_issue_validation_empty_title: assertions passed");
     }
 
     #[test]
     fn test_create_issue_dry_run_no_writes() {
-        init_test_logging();
-        info!("test_create_issue_dry_run_no_writes: starting");
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.dry_run = true;
@@ -638,13 +559,10 @@ mod tests {
         assert_eq!(issue.title, "Test Issue");
         let loaded = storage.get_issue(&issue.id).expect("get issue");
         assert!(loaded.is_none(), "dry run should not persist issue");
-        info!("test_create_issue_dry_run_no_writes: assertions passed");
     }
 
     #[test]
     fn test_create_issue_with_overrides() {
-        init_test_logging();
-        info!("test_create_issue_with_overrides: starting");
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.priority = Some("0".to_string());
@@ -657,13 +575,10 @@ mod tests {
         assert_eq!(issue.priority, Priority::CRITICAL);
         assert_eq!(issue.issue_type, IssueType::Bug);
         assert_eq!(issue.description, Some("Desc".to_string()));
-        info!("test_create_issue_with_overrides: assertions passed");
     }
 
     #[test]
     fn test_create_issue_with_labels_and_deps() {
-        init_test_logging();
-        info!("test_create_issue_with_labels_and_deps: starting");
         let mut storage = setup_memory_storage();
         let config = default_config();
 
@@ -689,13 +604,10 @@ mod tests {
         let deps = storage.get_dependencies(&issue.id).expect("get deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], target.id);
-        info!("test_create_issue_with_labels_and_deps: assertions passed");
     }
 
     #[test]
     fn test_create_parent_dependency() {
-        init_test_logging();
-        info!("test_create_parent_dependency: starting");
         let mut storage = setup_memory_storage();
         let config = default_config();
 
@@ -710,22 +622,21 @@ mod tests {
         let deps = storage.get_dependencies(&child.id).expect("get deps");
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], parent.id);
-        info!("test_create_parent_dependency: assertions passed");
     }
 
     #[test]
-    fn test_create_issue_invalid_type_rejected() {
-        init_test_logging();
-        info!("test_create_issue_invalid_type_rejected: starting");
-        // Custom/unknown types are rejected for bd conformance
+    fn test_create_issue_custom_type() {
         let mut storage = setup_memory_storage();
         let mut args = default_args();
         args.type_ = Some("invalid_type".to_string());
         let config = default_config();
 
-        let result = create_issue_impl(&mut storage, &args, &config);
-        assert!(result.is_err(), "create should fail with invalid type");
-        info!("test_create_issue_invalid_type_rejected: assertions passed");
+        let issue = create_issue_impl(&mut storage, &args, &config)
+            .expect("create should succeed with custom type");
+        assert_eq!(
+            issue.issue_type,
+            IssueType::Custom("invalid_type".to_string())
+        );
     }
 
     // =========================================================================
@@ -734,28 +645,20 @@ mod tests {
 
     #[test]
     fn test_parse_optional_date_none() {
-        init_test_logging();
-        info!("test_parse_optional_date_none: starting");
         let result = parse_optional_date(None);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-        info!("test_parse_optional_date_none: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_empty_string() {
-        init_test_logging();
-        info!("test_parse_optional_date_empty_string: starting");
         let result = parse_optional_date(Some(""));
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-        info!("test_parse_optional_date_empty_string: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_iso8601() {
-        init_test_logging();
-        info!("test_parse_optional_date_iso8601: starting");
         let result = parse_optional_date(Some("2026-01-17T10:00:00Z"));
         assert!(result.is_ok());
         let date = result.unwrap();
@@ -764,13 +667,10 @@ mod tests {
         assert_eq!(dt.year(), 2026);
         assert_eq!(dt.month(), 1);
         assert_eq!(dt.day(), 17);
-        info!("test_parse_optional_date_iso8601: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_simple_date() {
-        init_test_logging();
-        info!("test_parse_optional_date_simple_date: starting");
         let result = parse_optional_date(Some("2026-12-31"));
         assert!(result.is_ok());
         let date = result.unwrap();
@@ -779,37 +679,27 @@ mod tests {
         assert_eq!(dt.year(), 2026);
         assert_eq!(dt.month(), 12);
         assert_eq!(dt.day(), 31);
-        info!("test_parse_optional_date_simple_date: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_with_timezone() {
-        init_test_logging();
-        info!("test_parse_optional_date_with_timezone: starting");
         let result = parse_optional_date(Some("2026-06-15T14:30:00+05:30"));
         assert!(result.is_ok());
         let date = result.unwrap();
         assert!(date.is_some());
-        info!("test_parse_optional_date_with_timezone: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_invalid_format() {
-        init_test_logging();
-        info!("test_parse_optional_date_invalid_format: starting");
         let result = parse_optional_date(Some("not-a-date"));
         assert!(result.is_err());
-        info!("test_parse_optional_date_invalid_format: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_partial_date() {
-        init_test_logging();
-        info!("test_parse_optional_date_partial_date: starting");
         // Flexible parser may accept various formats
         let result = parse_optional_date(Some("2026-01"));
         let _ = result;
-        info!("test_parse_optional_date_partial_date: assertions passed");
     }
 
     // =========================================================================
@@ -818,8 +708,6 @@ mod tests {
 
     #[test]
     fn test_parse_optional_date_year_boundaries() {
-        init_test_logging();
-        info!("test_parse_optional_date_year_boundaries: starting");
         // Far future date
         let result = parse_optional_date(Some("2099-12-31"));
         assert!(result.is_ok());
@@ -827,13 +715,10 @@ mod tests {
         // Past date
         let result = parse_optional_date(Some("2000-01-01"));
         assert!(result.is_ok());
-        info!("test_parse_optional_date_year_boundaries: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_leap_year() {
-        init_test_logging();
-        info!("test_parse_optional_date_leap_year: starting");
         // Feb 29 on leap year
         let result = parse_optional_date(Some("2024-02-29"));
         assert!(result.is_ok());
@@ -842,13 +727,10 @@ mod tests {
         let dt = date.unwrap();
         assert_eq!(dt.month(), 2);
         assert_eq!(dt.day(), 29);
-        info!("test_parse_optional_date_leap_year: assertions passed");
     }
 
     #[test]
     fn test_parse_optional_date_end_of_month() {
-        init_test_logging();
-        info!("test_parse_optional_date_end_of_month: starting");
         // 31-day month
         let result = parse_optional_date(Some("2026-03-31"));
         assert!(result.is_ok());
@@ -856,7 +738,6 @@ mod tests {
         // 30-day month
         let result = parse_optional_date(Some("2026-04-30"));
         assert!(result.is_ok());
-        info!("test_parse_optional_date_end_of_month: assertions passed");
     }
 
     // =========================================================================
@@ -865,12 +746,9 @@ mod tests {
 
     #[test]
     fn test_parse_optional_date_whitespace_only() {
-        init_test_logging();
-        info!("test_parse_optional_date_whitespace_only: starting");
         // Should be treated as non-empty by the string check, but may fail parsing
         let result = parse_optional_date(Some("   "));
         // Behavior depends on implementation - just ensure no panic
         let _ = result;
-        info!("test_parse_optional_date_whitespace_only: assertions passed");
     }
 }

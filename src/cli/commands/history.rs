@@ -29,7 +29,7 @@ pub fn execute(args: HistoryArgs, _cli: &config::CliOverrides) -> Result<()> {
 
 /// List available backups.
 fn list_backups(history_dir: &Path) -> Result<()> {
-    let backups = history::list_backups(history_dir, None)?;
+    let backups = history::list_backups(history_dir)?;
 
     if backups.is_empty() {
         println!("No backups found in {}", history_dir.display());
@@ -43,7 +43,7 @@ fn list_backups(history_dir: &Path) -> Result<()> {
     for entry in backups {
         let filename = entry.path.file_name().unwrap().to_string_lossy();
         let size = format_size(entry.size);
-        let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        let timestamp = entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
         println!("{filename:<30} {size:<10} {timestamp:<20}");
     }
 
@@ -79,11 +79,14 @@ fn diff_backup(beads_dir: &Path, history_dir: &Path, filename: &str) -> Result<(
     // Or better, use `bv --robot-diff` if possible? No, br should be standalone.
 
     // Let's shell out to `diff -u` for now as it's standard on linux/mac.
-    // Avoid GNU-only flags (like --color) to keep this portable.
+    // If it fails, we fallback or error.
     let status = std::process::Command::new("diff")
-        .arg("-u")
-        .arg(&current_path)
-        .arg(&backup_path)
+        .args([
+            "-u",
+            "--color=always",
+            current_path.to_str().unwrap(),
+            backup_path.to_str().unwrap(),
+        ])
         .status();
 
     if let Ok(s) = status {

@@ -21,6 +21,8 @@ use std::path::Path;
 ///
 /// Returns an error if the database cannot be opened or the query fails.
 pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+    validate_priority_range(&args.priority)?;
+
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -108,14 +110,29 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
             print!("{csv_output}");
         }
         OutputFormat::Text => {
-            // Note: bd outputs nothing when no issues found, matching that for conformance
-            for issue in &issues {
-                let line = format_issue_line_with(issue, format_options);
-                println!("{line}");
+            if issues.is_empty() {
+                println!("No issues found.");
+            } else {
+                for issue in &issues {
+                    let line = format_issue_line_with(issue, format_options);
+                    println!("{line}");
+                }
+                println!("\n{} issue(s)", issues.len());
             }
         }
     }
 
+    Ok(())
+}
+
+fn validate_priority_range(priorities: &[u8]) -> Result<()> {
+    for &priority in priorities {
+        if priority > 4 {
+            return Err(BeadsError::InvalidPriority {
+                priority: i32::from(priority),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -145,16 +162,16 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         )
     };
 
-    // Parse priority values (invalid values should error, not be silently dropped)
+    // Parse priority values
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        Some(
-            args.priority
-                .iter()
-                .map(|p| p.parse())
-                .collect::<Result<Vec<Priority>>>()?,
-        )
+        let parsed: Vec<Priority> = args
+            .priority
+            .iter()
+            .map(|&p| Priority(i32::from(p)))
+            .collect();
+        Some(parsed)
     };
 
     let include_closed = args.all
@@ -311,7 +328,7 @@ fn validate_sort_key(sort: Option<&str>) -> Result<()> {
     };
 
     match sort_key {
-        "priority" | "created_at" | "updated_at" | "title" | "created" | "updated" => Ok(()),
+        "priority" | "created_at" | "updated_at" | "title" => Ok(()),
         _ => Err(BeadsError::Validation {
             field: "sort".to_string(),
             reason: format!("invalid sort field '{sort_key}'"),
@@ -323,16 +340,9 @@ fn validate_sort_key(sort: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cli;
-    use tracing::info;
-
-    fn init_logging() {
-        crate::logging::init_test_logging();
-    }
 
     #[test]
     fn test_build_filters_includes_closed_for_terminal_status() {
-        init_logging();
-        info!("test_build_filters_includes_closed_for_terminal_status: starting");
         let args = cli::ListArgs {
             status: vec!["closed".to_string()],
             ..Default::default()
@@ -347,15 +357,12 @@ mod tests {
                 .expect("statuses")
                 .contains(&Status::Closed)
         );
-        info!("test_build_filters_includes_closed_for_terminal_status: assertions passed");
     }
 
     #[test]
     fn test_build_filters_parses_priorities() {
-        init_logging();
-        info!("test_build_filters_parses_priorities: starting");
         let args = cli::ListArgs {
-            priority: vec!["0".to_string(), "2".to_string()],
+            priority: vec![0, 2],
             ..Default::default()
         };
 
@@ -363,13 +370,10 @@ mod tests {
         let priorities = filters.priorities.expect("priorities");
         let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
         assert_eq!(values, vec![0, 2]);
-        info!("test_build_filters_parses_priorities: assertions passed");
     }
 
     #[test]
     fn test_needs_client_filters_detects_fields() {
-        init_logging();
-        info!("test_needs_client_filters_detects_fields: starting");
         let args = ListArgs::default();
         assert!(!needs_client_filters(&args));
 
@@ -384,6 +388,14 @@ mod tests {
             ..Default::default()
         };
         assert!(needs_client_filters(&args));
-        info!("test_needs_client_filters_detects_fields: assertions passed");
+    }
+
+    #[test]
+    fn test_validate_priority_range_rejects_out_of_range() {
+        let err = validate_priority_range(&[9]).unwrap_err();
+        match err {
+            BeadsError::InvalidPriority { priority } => assert_eq!(priority, 9),
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

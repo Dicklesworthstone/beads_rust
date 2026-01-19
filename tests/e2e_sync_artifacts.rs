@@ -238,7 +238,6 @@ impl SnapshotDiff {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_sync_export_with_artifacts() {
-    let _log = common::test_log("e2e_sync_export_with_artifacts");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_export");
 
@@ -370,7 +369,6 @@ fn e2e_sync_export_with_artifacts() {
 /// E2E test: Import cycle with artifact capture.
 #[test]
 fn e2e_sync_import_with_artifacts() {
-    let _log = common::test_log("e2e_sync_import_with_artifacts");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_import");
 
@@ -456,7 +454,6 @@ fn e2e_sync_import_with_artifacts() {
 /// E2E test: Full sync cycle (export -> modify -> import -> export).
 #[test]
 fn e2e_sync_full_cycle_with_artifacts() {
-    let _log = common::test_log("e2e_sync_full_cycle_with_artifacts");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_full_cycle");
 
@@ -564,7 +561,6 @@ fn e2e_sync_full_cycle_with_artifacts() {
 /// E2E test: Sync status command with artifact capture.
 #[test]
 fn e2e_sync_status_with_artifacts() {
-    let _log = common::test_log("e2e_sync_status_with_artifacts");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_status");
 
@@ -623,7 +619,6 @@ fn e2e_sync_status_with_artifacts() {
 /// E2E test: Error handling with artifact capture (conflict markers).
 #[test]
 fn e2e_sync_error_conflict_markers() {
-    let _log = common::test_log("e2e_sync_error_conflict_markers");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_error_conflict");
 
@@ -682,7 +677,6 @@ fn e2e_sync_error_conflict_markers() {
 /// E2E test: Empty database export behavior.
 #[test]
 fn e2e_sync_export_empty_db() {
-    let _log = common::test_log("e2e_sync_export_empty_db");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_export_empty");
 
@@ -739,7 +733,6 @@ fn e2e_sync_export_empty_db() {
 /// E2E test: Multiple exports preserve deterministic ordering.
 #[test]
 fn e2e_sync_deterministic_export() {
-    let _log = common::test_log("e2e_sync_deterministic_export");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_deterministic");
 
@@ -810,7 +803,6 @@ fn e2e_staleness_hash_check_prevents_false_touch() {
     use std::thread;
     use std::time::Duration;
 
-    let _log = common::test_log("e2e_staleness_hash_check_prevents_false_touch");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "staleness_hash_check");
 
@@ -903,7 +895,6 @@ fn e2e_staleness_hash_check_prevents_false_touch() {
 /// - beads_rust-3qi: Auto-import staleness detection (Lstat + content hash + conflict markers)
 #[test]
 fn e2e_staleness_detects_real_content_change() {
-    let _log = common::test_log("e2e_staleness_detects_real_content_change");
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "staleness_real_change");
 

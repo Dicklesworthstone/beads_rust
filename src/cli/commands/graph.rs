@@ -8,7 +8,7 @@
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{DependencyType, Status};
+use crate::model::Status;
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use serde::Serialize;
@@ -86,60 +86,59 @@ fn graph_single(storage: &SqliteStorage, root_id: &str, compact: bool, json: boo
             id: root_id.to_string(),
         })?;
 
-    // DFS to find all dependents (reverse deps)
+    // BFS to find all dependents (reverse deps)
     let mut visited: HashSet<String> = HashSet::new();
-    let mut stack: Vec<(String, usize)> = Vec::new();
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut edges: Vec<(String, String)> = Vec::new();
 
     // Start with root
-    stack.push((root_id.to_string(), 0));
+    queue.push_back((root_id.to_string(), 0));
     visited.insert(root_id.to_string());
 
-    while let Some((current_id, depth)) = stack.pop() {
-        let issue = if current_id == root_id {
-            root_issue.clone()
-        } else {
-            storage.get_issue(&current_id)?.unwrap_or_else(|| {
-                let mut i = root_issue.clone();
-                i.id.clone_from(&current_id);
-                i.title = "Unknown".to_string();
-                i
-            })
-        };
+    nodes.push(GraphNode {
+        id: root_id.to_string(),
+        title: root_issue.title.clone(),
+        status: root_issue.status.as_str().to_string(),
+        priority: root_issue.priority.0,
+        depth: 0,
+    });
 
-        nodes.push(GraphNode {
-            id: current_id.clone(),
-            title: issue.title.clone(),
-            status: issue.status.as_str().to_string(),
-            priority: issue.priority.0,
-            depth,
-        });
-
+    while let Some((current_id, depth)) = queue.pop_front() {
         // Get dependents (issues that depend on current_id)
-        let mut dependents = storage.get_dependents_with_metadata(&current_id)?;
+        let dependents = storage.get_dependents_with_metadata(&current_id)?;
 
-        // Only include dependency types that affect ready work
-        dependents.retain(|dep| {
-            dep.dep_type
-                .parse::<DependencyType>()
-                .unwrap_or(DependencyType::Blocks)
-                .affects_ready_work()
-        });
+        for dep in dependents {
+            // Only follow "blocks" type dependencies for graph traversal
+            if dep.dep_type != "blocks" {
+                continue;
+            }
 
-        // Sort dependents to ensure deterministic DFS order (stack reverses order)
-        dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
-
-        for dep in dependents.into_iter().rev() {
             // Record edge: dependent -> current (dependent depends on current)
             edges.push((dep.id.clone(), current_id.clone()));
 
             if !visited.contains(&dep.id) {
                 visited.insert(dep.id.clone());
-                stack.push((dep.id.clone(), depth + 1));
+                queue.push_back((dep.id.clone(), depth + 1));
+
+                nodes.push(GraphNode {
+                    id: dep.id.clone(),
+                    title: dep.title.clone(),
+                    status: dep.status.as_str().to_string(),
+                    priority: dep.priority.0,
+                    depth: depth + 1,
+                });
             }
         }
     }
+
+    // Sort nodes by depth, then by priority, then by id
+    nodes.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then(a.priority.cmp(&b.priority))
+            .then(a.id.cmp(&b.id))
+    });
 
     if json {
         let output = SingleGraphOutput {
@@ -231,9 +230,6 @@ fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
         // Get dependencies from bulk map
         if let Some(deps) = all_dependencies.get(&issue.id) {
             for dep in deps {
-                if !dep.dep_type.affects_ready_work() {
-                    continue;
-                }
                 let dep_id = &dep.depends_on_id;
                 // Only include edges within our issue set
                 if issue_set.contains(dep_id) {
@@ -395,7 +391,6 @@ fn calculate_depths(
         if let Some(deps) = all_dependencies.get(node_id) {
             let filtered: Vec<String> = deps
                 .iter()
-                .filter(|d| d.dep_type.affects_ready_work())
                 .map(|d| d.depends_on_id.clone())
                 .filter(|d| component_set.contains(d))
                 .collect();

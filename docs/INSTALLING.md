@@ -280,7 +280,7 @@ This creates:
 
 ### User Configuration
 
-Create `~/.config/beads/config.yaml` for global defaults:
+Create `~/.config/bd/config.yaml` for global defaults:
 
 ```yaml
 # Default issue prefix

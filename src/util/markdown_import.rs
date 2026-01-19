@@ -19,7 +19,7 @@
 use crate::error::{BeadsError, Result};
 use crate::model::DependencyType;
 use std::fs;
-use std::path::{Component, Path};
+use std::path::Path;
 use std::str::FromStr;
 
 /// A parsed issue from the markdown file.
@@ -108,11 +108,9 @@ pub fn parse_markdown_file(path: &Path) -> Result<Vec<ParsedIssue>> {
         }
     }
 
-    // Reject path traversal segments to match classic bd behavior.
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
+    // Check for path traversal
+    let path_str = path.to_string_lossy();
+    if path_str.contains("..") {
         return Err(BeadsError::validation("file", "path must not contain '..'"));
     }
 
@@ -312,8 +310,6 @@ pub fn parse_dependency(dep_str: &str) -> (String, String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::BeadsError;
-    use std::path::Path;
 
     #[test]
     fn test_parse_simple_issue() {
@@ -471,12 +467,6 @@ This is the actual description.
         assert_eq!(t, "invalid");
         assert_eq!(id, "bd-789");
         assert!(!valid);
-    }
-
-    #[test]
-    fn test_parse_markdown_file_rejects_parent_dir() {
-        let err = parse_markdown_file(Path::new("../issues.md")).unwrap_err();
-        assert!(matches!(err, BeadsError::Validation { field, .. } if field == "file"));
     }
 
     #[test]

@@ -267,13 +267,11 @@ fn keyword_tomorrow_is_future() {
     let parsed = result.unwrap();
     assert!(parsed > now, "tomorrow should be in the future");
 
-    // Should be roughly 1 day ahead. Since "tomorrow" is set to 9 AM tomorrow,
-    // the actual difference depends on current time of day. At 10 PM, it's only
-    // ~11 hours away. Just verify it's a positive duration and less than 48 hours.
+    // Should be roughly 1 day ahead
     let diff = parsed - now;
     assert!(
-        diff > Duration::zero() && diff < Duration::hours(48),
-        "tomorrow should be 0-48 hours away (got {diff:?})"
+        diff > Duration::hours(12) && diff < Duration::hours(48),
+        "tomorrow should be 12-48 hours away"
     );
 
     info!("proptest_tomorrow: PASS");

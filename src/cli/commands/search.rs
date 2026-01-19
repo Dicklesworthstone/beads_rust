@@ -12,7 +12,6 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::str::FromStr;
 
 /// Execute the search command.
 ///
@@ -28,6 +27,8 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
             reason: "search query cannot be empty".to_string(),
         });
     }
+
+    validate_priority_range(&args.filters.priority)?;
 
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -105,6 +106,17 @@ pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Res
     Ok(())
 }
 
+fn validate_priority_range(priorities: &[u8]) -> Result<()> {
+    for &priority in priorities {
+        if priority > 4 {
+            return Err(BeadsError::InvalidPriority {
+                priority: i32::from(priority),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     let statuses = if args.status.is_empty() {
         None
@@ -131,10 +143,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        let mut parsed = Vec::new();
-        for p in &args.priority {
-            parsed.push(Priority::from_str(p)?);
-        }
+        let parsed: Vec<Priority> = args
+            .priority
+            .iter()
+            .map(|&p| Priority(i32::from(p)))
+            .collect();
         Some(parsed)
     };
 
@@ -174,6 +187,8 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.priority_max.is_some()
         || args.desc_contains.is_some()
         || args.notes_contains.is_some()
+        || args.sort.is_some()
+        || args.reverse
         || args.deferred
         || args.overdue
 }
@@ -291,8 +306,8 @@ fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> 
 
     match sort_key {
         "priority" => issues.sort_by_key(|iwc| iwc.issue.priority),
-        "created_at" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.created_at)),
-        "updated_at" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.updated_at)),
+        "created_at" => issues.sort_by_key(|iwc| iwc.issue.created_at),
+        "updated_at" => issues.sort_by_key(|iwc| iwc.issue.updated_at),
         "title" => issues.sort_by(|a, b| {
             a.issue
                 .title
@@ -416,30 +431,5 @@ mod tests {
         assert_eq!(items[0].issue.title, "Alpha");
         items.reverse();
         assert_eq!(items[0].issue.title, "Beta");
-    }
-
-    #[test]
-    fn test_sort_created_at_desc_default() {
-        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
-
-        let issue_old = make_issue("bd-old", "Old", None, t1);
-        let issue_new = make_issue("bd-new", "New", None, t2);
-
-        let mut items = vec![
-            IssueWithCounts {
-                issue: issue_old,
-                dependency_count: 0,
-                dependent_count: 0,
-            },
-            IssueWithCounts {
-                issue: issue_new,
-                dependency_count: 0,
-                dependent_count: 0,
-            },
-        ];
-
-        apply_sort(&mut items, Some("created_at")).expect("sort");
-        assert_eq!(items[0].issue.id, "bd-new");
     }
 }

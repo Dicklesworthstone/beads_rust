@@ -198,19 +198,6 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // Migration: ensure compaction_level is never NULL (bd compatibility)
-    let has_compaction_level: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='compaction_level'")
-        .and_then(|mut stmt| stmt.exists([]))
-        .unwrap_or(false);
-
-    if has_compaction_level {
-        conn.execute(
-            "UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL",
-            [],
-        )?;
-    }
-
     Ok(())
 }
 

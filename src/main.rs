@@ -2,8 +2,8 @@ use beads_rust::cli::commands;
 use beads_rust::cli::{Cli, Commands};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
-use beads_rust::sync::{auto_flush, auto_import_if_stale};
-use beads_rust::{BeadsError, Result, StructuredError};
+use beads_rust::sync::auto_flush;
+use beads_rust::{BeadsError, StructuredError};
 use clap::Parser;
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -22,12 +22,6 @@ fn main() {
 
     // Track if this command potentially mutates data (for auto-flush)
     let is_mutating = is_mutating_command(&cli.command);
-
-    if should_auto_import(&cli.command) && !cli.no_db {
-        if let Err(e) = run_auto_import(&overrides, cli.allow_stale, cli.no_auto_import) {
-            handle_error(&e, cli.json);
-        }
-    }
 
     let result = match cli.command {
         Commands::Init {
@@ -61,8 +55,6 @@ fn main() {
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides),
         Commands::Doctor => commands::doctor::execute(cli.json, &overrides),
-        Commands::Info(args) => commands::info::execute(&args, cli.json, &overrides),
-        Commands::Where => commands::r#where::execute(cli.json, &overrides),
         Commands::Version => commands::version::execute(cli.json),
 
         #[cfg(feature = "self_update")]
@@ -75,10 +67,22 @@ fn main() {
         Commands::Config { command } => commands::config::execute(&command, cli.json, &overrides),
         Commands::History(args) => commands::history::execute(args, &overrides),
         Commands::Defer(args) => {
-            commands::defer::execute_defer(&args, cli.json || args.robot, &overrides)
+            let update_args = beads_rust::cli::UpdateArgs {
+                ids: args.ids,
+                defer: args.until,
+                status: Some("deferred".to_string()),
+                ..Default::default()
+            };
+            commands::update::execute(&update_args, &overrides)
         }
         Commands::Undefer(args) => {
-            commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides)
+            let update_args = beads_rust::cli::UpdateArgs {
+                ids: args.ids,
+                defer: Some(String::new()),       // Clear defer date
+                status: Some("open".to_string()), // Reset to open
+                ..Default::default()
+            };
+            commands::update::execute(&update_args, &overrides)
         }
         Commands::Orphans(args) => {
             commands::orphans::execute(&args, cli.json || args.robot, &overrides)
@@ -88,17 +92,6 @@ fn main() {
         }
         Commands::Query { command } => commands::query::execute(&command, cli.json, &overrides),
         Commands::Graph(args) => commands::graph::execute(&args, cli.json, &overrides),
-        Commands::Agents(args) => {
-            let agents_args = commands::agents::AgentsArgs {
-                add: args.add,
-                remove: args.remove,
-                update: args.update,
-                check: args.check,
-                dry_run: args.dry_run,
-                force: args.force,
-            };
-            commands::agents::execute(&agents_args, cli.json)
-        }
     };
 
     // Handle command result
@@ -132,87 +125,6 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         ),
         _ => false,
     }
-}
-
-const fn should_auto_import(cmd: &Commands) -> bool {
-    use beads_rust::cli::{
-        CommentCommands, DepCommands, EpicCommands, LabelCommands, QueryCommands,
-    };
-
-    match cmd {
-        Commands::List(_)
-        | Commands::Show { .. }
-        | Commands::Search(_)
-        | Commands::Ready(_)
-        | Commands::Blocked(_)
-        | Commands::Count(_)
-        | Commands::Stale(_)
-        | Commands::Lint(_)
-        | Commands::Stats(_)
-        | Commands::Status(_)
-        | Commands::Orphans(_)
-        | Commands::Changelog(_)
-        | Commands::Graph(_) => true,
-        Commands::Comments(args) => matches!(args.command, Some(CommentCommands::List(_)) | None),
-        Commands::Dep { command } => matches!(
-            command,
-            DepCommands::List(_) | DepCommands::Tree(_) | DepCommands::Cycles(_)
-        ),
-        Commands::Label { command } => {
-            matches!(command, LabelCommands::List(_) | LabelCommands::ListAll)
-        }
-        Commands::Epic { command } => match command {
-            EpicCommands::Status(_) => true,
-            EpicCommands::CloseEligible(args) => args.dry_run,
-        },
-        Commands::Query { command } => {
-            matches!(command, QueryCommands::Run(_) | QueryCommands::List)
-        }
-        _ => false,
-    }
-}
-
-/// Run auto-import before read-only commands when JSONL is newer.
-fn run_auto_import(
-    overrides: &config::CliOverrides,
-    allow_stale: bool,
-    no_auto_import: bool,
-) -> Result<()> {
-    // If not initialized, skip auto-import (e.g. running 'br init')
-    let beads_dir = match config::discover_beads_dir(Some(Path::new("."))) {
-        Ok(dir) => dir,
-        Err(BeadsError::NotInitialized) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-
-    let config::OpenStorageResult {
-        mut storage,
-        paths,
-        no_db,
-    } = config::open_storage_with_cli(&beads_dir, overrides)?;
-
-    if no_db {
-        return Ok(());
-    }
-
-    let expected_prefix = storage.get_config("issue_prefix")?;
-    let outcome = auto_import_if_stale(
-        &mut storage,
-        &paths.beads_dir,
-        &paths.jsonl_path,
-        expected_prefix.as_deref(),
-        allow_stale,
-        no_auto_import,
-    )?;
-
-    if outcome.attempted {
-        debug!(
-            imported_count = outcome.imported_count,
-            "Auto-import attempt completed"
-        );
-    }
-
-    Ok(())
 }
 
 /// Run auto-flush after mutating commands.

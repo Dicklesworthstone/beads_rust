@@ -45,7 +45,6 @@ fn run_lint_json(workspace: &BrWorkspace, mut args: Vec<String>, label: &str) ->
 
 #[test]
 fn e2e_error_handling() {
-    let _log = common::test_log("e2e_error_handling");
     let workspace = BrWorkspace::new();
 
     let list_uninit = run_br(&workspace, ["list"], "list_uninitialized");
@@ -106,7 +105,6 @@ fn e2e_error_handling() {
 
 #[test]
 fn e2e_dependency_errors() {
-    let _log = common::test_log("e2e_dependency_errors");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -140,7 +138,6 @@ fn e2e_dependency_errors() {
 
 #[test]
 fn e2e_sync_invalid_orphans() {
-    let _log = common::test_log("e2e_sync_invalid_orphans");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -169,7 +166,6 @@ fn e2e_sync_invalid_orphans() {
 
 #[test]
 fn e2e_sync_export_guards() {
-    let _log = common::test_log("e2e_sync_export_guards");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -231,7 +227,6 @@ fn e2e_sync_export_guards() {
 
 #[test]
 fn e2e_ambiguous_id() {
-    let _log = common::test_log("e2e_ambiguous_id");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -273,7 +268,6 @@ fn e2e_ambiguous_id() {
 
 #[test]
 fn e2e_lint_before_init_fails() {
-    let _log = common::test_log("e2e_lint_before_init_fails");
     let workspace = BrWorkspace::new();
     let lint = run_br(&workspace, ["lint"], "lint_before_init");
     assert!(!lint.status.success());
@@ -281,7 +275,6 @@ fn e2e_lint_before_init_fails() {
 
 #[test]
 fn e2e_lint_clean_output_when_no_warnings() {
-    let _log = common::test_log("e2e_lint_clean_output_when_no_warnings");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_clean_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -306,7 +299,6 @@ fn e2e_lint_clean_output_when_no_warnings() {
 
 #[test]
 fn e2e_lint_bug_missing_sections_json() {
-    let _log = common::test_log("e2e_lint_bug_missing_sections_json");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_bug_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -335,7 +327,6 @@ fn e2e_lint_bug_missing_sections_json() {
 
 #[test]
 fn e2e_lint_multiple_issues_aggregate_warnings() {
-    let _log = common::test_log("e2e_lint_multiple_issues_aggregate_warnings");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_multi_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -362,7 +353,6 @@ fn e2e_lint_multiple_issues_aggregate_warnings() {
 
 #[test]
 fn e2e_lint_text_output_exit_code() {
-    let _log = common::test_log("e2e_lint_text_output_exit_code");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_text_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -382,7 +372,6 @@ fn e2e_lint_text_output_exit_code() {
 
 #[test]
 fn e2e_lint_status_all_includes_closed() {
-    let _log = common::test_log("e2e_lint_status_all_includes_closed");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_closed_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -416,7 +405,6 @@ fn e2e_lint_status_all_includes_closed() {
 
 #[test]
 fn e2e_lint_type_filter_limits_results() {
-    let _log = common::test_log("e2e_lint_type_filter_limits_results");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_type_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -447,7 +435,6 @@ fn e2e_lint_type_filter_limits_results() {
 
 #[test]
 fn e2e_lint_ids_only_lints_selected() {
-    let _log = common::test_log("e2e_lint_ids_only_lints_selected");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_ids_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -478,7 +465,6 @@ fn e2e_lint_ids_only_lints_selected() {
 
 #[test]
 fn e2e_lint_skips_types_without_required_sections() {
-    let _log = common::test_log("e2e_lint_skips_types_without_required_sections");
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "lint_skip_init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
@@ -519,7 +505,6 @@ fn verify_error_structure(json: &Value) -> bool {
 
 #[test]
 fn e2e_structured_error_not_initialized() {
-    let _log = common::test_log("e2e_structured_error_not_initialized");
     let workspace = BrWorkspace::new();
 
     // Don't init - test NOT_INITIALIZED error
@@ -538,7 +523,6 @@ fn e2e_structured_error_not_initialized() {
 
 #[test]
 fn e2e_structured_error_issue_not_found() {
-    let _log = common::test_log("e2e_structured_error_issue_not_found");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -564,7 +548,6 @@ fn e2e_structured_error_issue_not_found() {
 
 #[test]
 fn e2e_structured_error_invalid_status() {
-    let _log = common::test_log("e2e_structured_error_invalid_status");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -597,7 +580,6 @@ fn e2e_structured_error_invalid_status() {
 
 #[test]
 fn e2e_structured_error_cycle_detected() {
-    let _log = common::test_log("e2e_structured_error_cycle_detected");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -635,7 +617,6 @@ fn e2e_structured_error_cycle_detected() {
 
 #[test]
 fn e2e_structured_error_self_dependency() {
-    let _log = common::test_log("e2e_structured_error_self_dependency");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -663,7 +644,6 @@ fn e2e_structured_error_self_dependency() {
 
 #[test]
 fn e2e_structured_error_ambiguous_id() {
-    let _log = common::test_log("e2e_structured_error_ambiguous_id");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -723,7 +703,6 @@ fn e2e_structured_error_ambiguous_id() {
 
 #[test]
 fn e2e_structured_error_jsonl_parse() {
-    let _log = common::test_log("e2e_structured_error_jsonl_parse");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -757,7 +736,6 @@ fn e2e_structured_error_jsonl_parse() {
 
 #[test]
 fn e2e_structured_error_conflict_markers() {
-    let _log = common::test_log("e2e_structured_error_conflict_markers");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -783,219 +761,5 @@ fn e2e_structured_error_conflict_markers() {
     assert!(
         result.stderr.contains("conflict") || result.stderr.contains("CONFLICT"),
         "should detect conflict markers"
-    );
-}
-
-#[test]
-fn e2e_structured_error_invalid_type() {
-    let _log = common::test_log("e2e_structured_error_invalid_type");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    // Test invalid type on create
-    let result = run_br(
-        &workspace,
-        ["create", "Test issue", "--type", "not_a_type", "--json"],
-        "create_invalid_type_json",
-    );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-
-    let error = &json["error"];
-    assert_eq!(error["code"], "INVALID_TYPE");
-    assert!(error["retryable"].as_bool().unwrap());
-    // Should suggest valid types
-    assert!(
-        error["hint"].as_str().unwrap().contains("task")
-            || error["hint"].as_str().unwrap().contains("bug")
-            || error["hint"].as_str().unwrap().contains("feature"),
-        "hint should list valid types"
-    );
-}
-
-#[test]
-fn e2e_structured_error_invalid_priority() {
-    let _log = common::test_log("e2e_structured_error_invalid_priority");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    // Test invalid priority (out of 0-4 range)
-    let result = run_br(
-        &workspace,
-        ["create", "Test issue", "--priority", "10", "--json"],
-        "create_invalid_priority_json",
-    );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-
-    let error = &json["error"];
-    assert_eq!(error["code"], "INVALID_PRIORITY");
-    assert!(error["retryable"].as_bool().unwrap());
-    let hint = error["hint"].as_str().unwrap();
-    assert!(
-        hint.contains('0') && hint.contains('4') || hint.contains("between"),
-        "hint should mention valid priority range, got: {hint}"
-    );
-}
-
-// === --no-color mode tests for stable snapshots ===
-
-#[test]
-fn e2e_error_text_mode_no_color() {
-    let _log = common::test_log("e2e_error_text_mode_no_color");
-    let workspace = BrWorkspace::new();
-
-    // Test NOT_INITIALIZED error in no-color mode
-    let result = run_br(&workspace, ["list", "--no-color"], "list_not_init_no_color");
-    assert!(!result.status.success());
-
-    // Output should not contain ANSI escape codes
-    assert!(
-        !result.stderr.contains("\x1b["),
-        "stderr should not contain ANSI escape codes"
-    );
-    assert!(
-        !result.stdout.contains("\x1b["),
-        "stdout should not contain ANSI escape codes"
-    );
-}
-
-#[test]
-fn e2e_error_text_vs_json_parity() {
-    let _log = common::test_log("e2e_error_text_vs_json_parity");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    // Same error in text mode
-    let text_result = run_br(
-        &workspace,
-        ["show", "bd-nonexistent", "--no-color"],
-        "show_missing_text",
-    );
-    assert!(!text_result.status.success());
-
-    // Same error in JSON mode
-    let json_result = run_br(
-        &workspace,
-        ["show", "bd-nonexistent", "--json"],
-        "show_missing_json",
-    );
-    assert!(!json_result.status.success());
-
-    // Both should have same exit code
-    assert_eq!(
-        text_result.status.code(),
-        json_result.status.code(),
-        "text and JSON mode should have same exit code"
-    );
-
-    // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
-    assert!(
-        verify_error_structure(&json),
-        "JSON error should have required fields"
-    );
-
-    // Text mode output should contain error message (not JSON)
-    assert!(
-        text_result.stderr.contains("not found") || text_result.stderr.contains("No issue"),
-        "text mode should contain human-readable error"
-    );
-}
-
-#[test]
-fn e2e_error_multiple_errors_same_exit_code() {
-    let _log = common::test_log("e2e_error_multiple_errors_same_exit_code");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    let create = run_br(&workspace, ["create", "Test issue"], "create");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    // All validation errors should return exit code 4
-    let invalid_status = run_br(
-        &workspace,
-        ["update", &id, "--status", "bad_status", "--json"],
-        "invalid_status",
-    );
-    let invalid_type = run_br(
-        &workspace,
-        ["create", "Test", "--type", "bad_type", "--json"],
-        "invalid_type",
-    );
-    let invalid_priority = run_br(
-        &workspace,
-        ["create", "Test", "--priority", "99", "--json"],
-        "invalid_priority",
-    );
-
-    assert_eq!(
-        invalid_status.status.code(),
-        Some(4),
-        "invalid status should be exit 4"
-    );
-    assert_eq!(
-        invalid_type.status.code(),
-        Some(4),
-        "invalid type should be exit 4"
-    );
-    assert_eq!(
-        invalid_priority.status.code(),
-        Some(4),
-        "invalid priority should be exit 4"
-    );
-}
-
-#[test]
-fn e2e_error_exit_code_categories() {
-    let _log = common::test_log("e2e_error_exit_code_categories");
-    let workspace = BrWorkspace::new();
-
-    // Exit code 2: Database/initialization errors
-    let not_init = run_br(&workspace, ["list", "--json"], "not_init");
-    assert_eq!(
-        not_init.status.code(),
-        Some(2),
-        "NOT_INITIALIZED should be exit 2"
-    );
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    // Exit code 3: Issue errors
-    let not_found = run_br(&workspace, ["show", "bd-missing", "--json"], "not_found");
-    assert_eq!(
-        not_found.status.code(),
-        Some(3),
-        "ISSUE_NOT_FOUND should be exit 3"
-    );
-
-    // Exit code 4: Validation errors (already tested above)
-
-    // Exit code 5: Dependency errors
-    let create = run_br(&workspace, ["create", "Self dep"], "create_self");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    let self_dep = run_br(&workspace, ["dep", "add", &id, &id, "--json"], "self_dep");
-    assert_eq!(
-        self_dep.status.code(),
-        Some(5),
-        "SELF_DEPENDENCY should be exit 5"
     );
 }

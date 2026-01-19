@@ -2,10 +2,10 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
+Blocked Issues (2 total):
 
-🚫 Blocked issues (2):
+1. [ID-REDACTED] P2 User model
+   Blocked by: ID-REDACTED:open (1 issue)
 
-[● P2] ID-REDACTED: User model
-  Blocked by 1 open dependencies: [ID-REDACTED]
-[● P2] ID-REDACTED: Auth module
-  Blocked by 1 open dependencies: [ID-REDACTED]
+2. [ID-REDACTED] P2 Auth module
+   Blocked by: ID-REDACTED:open (1 issue)

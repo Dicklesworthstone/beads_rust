@@ -18,15 +18,6 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Serialize Option<i32> as 0 when None (for bd conformance - bd expects integer, not null)
-#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
-fn serialize_compaction_level<S>(value: &Option<i32>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_i32(value.unwrap_or(0))
-}
-
 /// Issue lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -179,12 +170,9 @@ impl FromStr for IssueType {
             "feature" => Ok(Self::Feature),
             "epic" => Ok(Self::Epic),
             "chore" => Ok(Self::Chore),
-            // Note: docs and question are supported in br but not in bd
-            // For bd conformance, we only accept the 5 types above via CLI
-            // However, docs/question may exist in imported data
-            other => Err(crate::error::BeadsError::InvalidType {
-                issue_type: other.to_string(),
-            }),
+            "docs" => Ok(Self::Docs),
+            "question" => Ok(Self::Question),
+            other => Ok(Self::Custom(other.to_string())),
         }
     }
 }
@@ -449,9 +437,7 @@ pub struct Issue {
     pub original_type: Option<String>,
 
     // Compaction (legacy/compat)
-    // Note: Always serialize compaction_level as integer (0 when None) for bd conformance
-    // bd's Go sql scanner cannot handle NULL for integer columns
-    #[serde(default, serialize_with = "serialize_compaction_level")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction_level: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted_at: Option<DateTime<Utc>>,
@@ -479,51 +465,6 @@ pub struct Issue {
     pub dependencies: Vec<Dependency>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub comments: Vec<Comment>,
-}
-
-impl Default for Issue {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            content_hash: None,
-            title: String::new(),
-            description: None,
-            design: None,
-            acceptance_criteria: None,
-            notes: None,
-            status: Status::default(),
-            priority: Priority::default(),
-            issue_type: IssueType::default(),
-            assignee: None,
-            owner: None,
-            estimated_minutes: None,
-            created_at: Utc::now(),
-            created_by: None,
-            updated_at: Utc::now(),
-            closed_at: None,
-            close_reason: None,
-            closed_by_session: None,
-            due_at: None,
-            defer_until: None,
-            external_ref: None,
-            source_system: None,
-            deleted_at: None,
-            deleted_by: None,
-            delete_reason: None,
-            original_type: None,
-            compaction_level: None,
-            compacted_at: None,
-            compacted_at_commit: None,
-            original_size: None,
-            sender: None,
-            ephemeral: false,
-            pinned: false,
-            is_template: false,
-            labels: Vec::new(),
-            dependencies: Vec::new(),
-            comments: Vec::new(),
-        }
-    }
 }
 
 impl Issue {
@@ -939,16 +880,16 @@ mod tests {
 
     #[test]
     fn test_issue_type_from_str_all_variants() {
-        // Only these 5 types are valid via FromStr for bd conformance
         assert_eq!(IssueType::from_str("task").unwrap(), IssueType::Task);
         assert_eq!(IssueType::from_str("bug").unwrap(), IssueType::Bug);
         assert_eq!(IssueType::from_str("feature").unwrap(), IssueType::Feature);
         assert_eq!(IssueType::from_str("epic").unwrap(), IssueType::Epic);
         assert_eq!(IssueType::from_str("chore").unwrap(), IssueType::Chore);
-        // docs and question are rejected via FromStr for bd conformance
-        // but they can still exist via serde deserialization from imports
-        assert!(IssueType::from_str("docs").is_err());
-        assert!(IssueType::from_str("question").is_err());
+        assert_eq!(IssueType::from_str("docs").unwrap(), IssueType::Docs);
+        assert_eq!(
+            IssueType::from_str("question").unwrap(),
+            IssueType::Question
+        );
     }
 
     #[test]
@@ -959,11 +900,9 @@ mod tests {
     }
 
     #[test]
-    fn test_issue_type_from_str_custom_rejected() {
-        // Custom/unknown types are rejected for bd conformance
-        let result = IssueType::from_str("custom_type");
-        assert!(result.is_err());
-        // IssueType::Custom can still exist via serde deserialization
+    fn test_issue_type_from_str_custom() {
+        let result = IssueType::from_str("custom_type").unwrap();
+        assert_eq!(result, IssueType::Custom("custom_type".to_string()));
     }
 
     #[test]

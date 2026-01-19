@@ -49,7 +49,7 @@ pub struct SavedFilters {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub label_any: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub priority: Vec<String>,
+    pub priority: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority_min: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,7 +417,7 @@ mod tests {
             status: vec!["open".to_string()],
             type_: vec!["bug".to_string()],
             assignee: Some("alice".to_string()),
-            priority: vec!["1".to_string(), "2".to_string()],
+            priority: vec![1, 2],
             ..Default::default()
         };
 
@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(filters.status, vec!["open"]);
         assert_eq!(filters.type_, vec!["bug"]);
         assert_eq!(filters.assignee, Some("alice".to_string()));
-        assert_eq!(filters.priority, vec!["1", "2"]);
+        assert_eq!(filters.priority, vec![1, 2]);
     }
 
     #[test]
@@ -603,7 +603,7 @@ mod tests {
             id: vec!["abc".to_string()],
             label: vec!["urgent".to_string()],
             label_any: vec!["maybe".to_string()],
-            priority: vec!["1".to_string(), "2".to_string()],
+            priority: vec![1, 2],
             ..Default::default()
         };
 
@@ -615,7 +615,7 @@ mod tests {
         assert_eq!(merged.id, vec!["abc"]);
         assert_eq!(merged.label, vec!["urgent"]);
         assert_eq!(merged.label_any, vec!["maybe"]);
-        assert_eq!(merged.priority, vec!["1", "2"]);
+        assert_eq!(merged.priority, vec![1, 2]);
 
         // CLI with non-empty vecs - cli values win
         let cli2 = ListArgs {
@@ -624,7 +624,7 @@ mod tests {
             id: vec!["xyz".to_string()],
             label: vec!["low".to_string()],
             label_any: vec!["high".to_string()],
-            priority: vec!["3".to_string()],
+            priority: vec![3],
             ..Default::default()
         };
         let merged2 = saved.merge_with_cli(&cli2);
@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(merged2.id, vec!["xyz"]);
         assert_eq!(merged2.label, vec!["low"]);
         assert_eq!(merged2.label_any, vec!["high"]);
-        assert_eq!(merged2.priority, vec!["3"]);
+        assert_eq!(merged2.priority, vec![3]);
     }
 
     #[test]
@@ -730,7 +730,7 @@ mod tests {
             id: vec!["id1".to_string(), "id2".to_string()],
             label: vec!["urgent".to_string(), "backend".to_string()],
             label_any: vec!["optional".to_string()],
-            priority: vec!["0".to_string(), "1".to_string(), "2".to_string()],
+            priority: vec![0, 1, 2],
             priority_min: Some(0),
             priority_max: Some(2),
             title_contains: Some("search term".to_string()),

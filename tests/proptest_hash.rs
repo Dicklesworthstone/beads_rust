@@ -174,9 +174,11 @@ proptest! {
             &issue.issue_type,
             issue.assignee.as_deref(),
             issue.owner.as_deref(),
-            issue.created_by.as_deref(),
+            issue.estimated_minutes,
+            issue.due_at,
+            issue.defer_until,
             issue.external_ref.as_deref(),
-            issue.source_system.as_deref(),
+            issue.close_reason.as_deref(),
             issue.pinned,
             issue.is_template,
         );

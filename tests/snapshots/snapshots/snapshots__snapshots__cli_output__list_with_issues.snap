@@ -2,6 +2,8 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
-○ ID-REDACTED [● P2] [task] - Task: Update docs
-○ ID-REDACTED [● P2] [task] - Feature: Add dark mode
-○ ID-REDACTED [● P2] [task] - Bug: Fix login
+○ ID-REDACTED [P2] [task] Task: Update docs
+○ ID-REDACTED [P2] [task] Feature: Add dark mode
+○ ID-REDACTED [P2] [task] Bug: Fix login
+
+3 issue(s)
