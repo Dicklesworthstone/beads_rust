@@ -5,14 +5,13 @@ expression: normalize_json(&json)
 [
   {
     "blocked_by": [
-      "ISSUE_ID:open"
+      "ISSUE_ID"
     ],
     "blocked_by_count": 1,
-    "compaction_level": 0,
     "created_at": "TIMESTAMP",
+    "created_by": "ACTOR",
     "id": "ISSUE_ID",
     "issue_type": "task",
-    "original_size": 0,
     "priority": 2,
     "status": "open",
     "title": "Blocked issue",

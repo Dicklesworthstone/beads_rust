@@ -63,6 +63,7 @@ fn setup_workspace_with_issues() -> BrWorkspace {
 /// Test: Import rejects JSONL with truncated/partial lines
 #[test]
 fn edge_case_import_rejects_partial_lines() {
+    let _log = common::test_log("edge_case_import_rejects_partial_lines");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -125,6 +126,7 @@ fn edge_case_import_rejects_partial_lines() {
 /// Test: Import rejects JSONL with invalid JSON syntax
 #[test]
 fn edge_case_import_rejects_invalid_json() {
+    let _log = common::test_log("edge_case_import_rejects_invalid_json");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -187,6 +189,7 @@ fn edge_case_import_rejects_invalid_json() {
 /// Test: Import rejects JSONL with empty lines interspersed (should skip them gracefully)
 #[test]
 fn edge_case_import_handles_empty_lines() {
+    let _log = common::test_log("edge_case_import_handles_empty_lines");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -231,6 +234,7 @@ fn edge_case_import_handles_empty_lines() {
 /// Test: Import rejects JSONL containing git merge conflict markers
 #[test]
 fn edge_case_import_rejects_conflict_markers() {
+    let _log = common::test_log("edge_case_import_rejects_conflict_markers");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -330,6 +334,7 @@ fn edge_case_import_rejects_conflict_markers() {
 /// Test: Path validation blocks `../` traversal attempts
 #[test]
 fn edge_case_path_traversal_blocked() {
+    let _log = common::test_log("edge_case_path_traversal_blocked");
     let workspace = BrWorkspace::new();
 
     // Initialize beads
@@ -387,6 +392,7 @@ fn edge_case_path_traversal_blocked() {
 /// Test: Symlink escape attempts are blocked
 #[test]
 fn edge_case_symlink_escape_blocked() {
+    let _log = common::test_log("edge_case_symlink_escape_blocked");
     let workspace = BrWorkspace::new();
 
     // Initialize beads
@@ -454,6 +460,7 @@ fn edge_case_symlink_escape_blocked() {
 /// Test: Import handles extremely long lines
 #[test]
 fn edge_case_huge_line() {
+    let _log = common::test_log("edge_case_huge_line");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -505,7 +512,12 @@ fn edge_case_huge_line() {
     );
 
     // Verify no partial/corrupted state by checking we can still list issues
-    let list = run_br(&workspace, ["list"], "list_after_huge");
+    // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
+    let list = run_br(
+        &workspace,
+        ["list", "--no-auto-import", "--allow-stale"],
+        "list_after_huge",
+    );
     // If import succeeded, list should work; if it failed, list should show old data
     assert!(
         list.status.success(),
@@ -522,6 +534,7 @@ fn edge_case_huge_line() {
 /// Test: Import rejects files with invalid UTF-8
 #[test]
 fn edge_case_invalid_utf8() {
+    let _log = common::test_log("edge_case_invalid_utf8");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -582,6 +595,7 @@ fn edge_case_invalid_utf8() {
 /// Test: Import handles JSONL with only whitespace
 #[test]
 fn edge_case_whitespace_only() {
+    let _log = common::test_log("edge_case_whitespace_only");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -619,6 +633,7 @@ fn edge_case_whitespace_only() {
 /// Test: Import handles zero-byte file
 #[test]
 fn edge_case_empty_file() {
+    let _log = common::test_log("edge_case_empty_file");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -657,6 +672,7 @@ fn edge_case_empty_file() {
 /// Test: Import handles extremely nested JSON (stack depth attack)
 #[test]
 fn edge_case_deeply_nested_json() {
+    let _log = common::test_log("edge_case_deeply_nested_json");
     let workspace = setup_workspace_with_issues();
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
 
@@ -704,7 +720,12 @@ fn edge_case_deeply_nested_json() {
     );
 
     // The important thing is no crash/panic
-    let list = run_br(&workspace, ["list"], "list_after_nested");
+    // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
+    let list = run_br(
+        &workspace,
+        ["list", "--no-auto-import", "--allow-stale"],
+        "list_after_nested",
+    );
     assert!(
         list.status.success(),
         "System should remain stable after deeply nested JSON test"
@@ -739,7 +760,12 @@ fn edge_case_no_partial_writes_on_failure() {
     );
 
     // Check final state
-    let list_after = run_br(&workspace, ["list", "--json"], "list_after");
+    // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
+    let list_after = run_br(
+        &workspace,
+        ["list", "--json", "--no-auto-import", "--allow-stale"],
+        "list_after",
+    );
     let count_after = list_after.stdout.matches("\"id\"").count();
 
     // Log for postmortem
@@ -768,7 +794,12 @@ fn edge_case_no_partial_writes_on_failure() {
     );
 
     // At minimum, the system should be in a consistent state
-    let list_final = run_br(&workspace, ["list"], "list_final");
+    // Use --no-auto-import --allow-stale to verify DB state despite corrupt/newer JSONL
+    let list_final = run_br(
+        &workspace,
+        ["list", "--no-auto-import", "--allow-stale"],
+        "list_final",
+    );
     assert!(
         list_final.status.success(),
         "System should remain in consistent state after failed import"

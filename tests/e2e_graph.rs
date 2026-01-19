@@ -16,6 +16,7 @@ fn parse_created_id(stdout: &str) -> String {
 
 #[test]
 fn e2e_graph_single_issue_no_dependents() {
+    let _log = common::test_log("e2e_graph_single_issue_no_dependents");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -36,6 +37,7 @@ fn e2e_graph_single_issue_no_dependents() {
 
 #[test]
 fn e2e_graph_single_issue_with_dependents() {
+    let _log = common::test_log("e2e_graph_single_issue_with_dependents");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -88,6 +90,7 @@ fn e2e_graph_single_issue_with_dependents() {
 
 #[test]
 fn e2e_graph_single_issue_json() {
+    let _log = common::test_log("e2e_graph_single_issue_json");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -140,6 +143,7 @@ fn e2e_graph_single_issue_json() {
 
 #[test]
 fn e2e_graph_single_issue_compact() {
+    let _log = common::test_log("e2e_graph_single_issue_compact");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -194,6 +198,7 @@ fn e2e_graph_single_issue_compact() {
 
 #[test]
 fn e2e_graph_all_no_issues() {
+    let _log = common::test_log("e2e_graph_all_no_issues");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -210,6 +215,7 @@ fn e2e_graph_all_no_issues() {
 
 #[test]
 fn e2e_graph_all_with_connected_components() {
+    let _log = common::test_log("e2e_graph_all_with_connected_components");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -267,6 +273,7 @@ fn e2e_graph_all_with_connected_components() {
 
 #[test]
 fn e2e_graph_all_json() {
+    let _log = common::test_log("e2e_graph_all_json");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -320,6 +327,7 @@ fn e2e_graph_all_json() {
 
 #[test]
 fn e2e_graph_requires_issue_or_all() {
+    let _log = common::test_log("e2e_graph_requires_issue_or_all");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -336,6 +344,7 @@ fn e2e_graph_requires_issue_or_all() {
 
 #[test]
 fn e2e_graph_chain_depth() {
+    let _log = common::test_log("e2e_graph_chain_depth");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");

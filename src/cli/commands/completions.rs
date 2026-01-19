@@ -118,18 +118,28 @@ pub fn print_install_instructions(shell: ShellType) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::info;
+
+    fn init_logging() {
+        crate::logging::init_test_logging();
+    }
 
     #[test]
     fn test_convert_shell_type() {
+        init_logging();
+        info!("test_convert_shell_type: starting");
         assert_eq!(convert_shell_type(ShellType::Bash), Shell::Bash);
         assert_eq!(convert_shell_type(ShellType::Zsh), Shell::Zsh);
         assert_eq!(convert_shell_type(ShellType::Fish), Shell::Fish);
         assert_eq!(convert_shell_type(ShellType::PowerShell), Shell::PowerShell);
         assert_eq!(convert_shell_type(ShellType::Elvish), Shell::Elvish);
+        info!("test_convert_shell_type: assertions passed");
     }
 
     #[test]
     fn test_bash_completion_generation() {
+        init_logging();
+        info!("test_bash_completion_generation: starting");
         let mut cmd = Cli::command();
         let mut output = Vec::new();
         generate(Shell::Bash, &mut cmd, "br", &mut output);
@@ -142,10 +152,13 @@ mod tests {
         );
         assert!(script.contains("br"), "should reference br command");
         assert!(script.contains("_br"), "should define _br function");
+        info!("test_bash_completion_generation: assertions passed");
     }
 
     #[test]
     fn test_zsh_completion_generation() {
+        init_logging();
+        info!("test_zsh_completion_generation: starting");
         let mut cmd = Cli::command();
         let mut output = Vec::new();
         generate(Shell::Zsh, &mut cmd, "br", &mut output);
@@ -153,10 +166,13 @@ mod tests {
 
         assert!(script.contains("#compdef"), "should start with #compdef");
         assert!(script.contains("br"), "should reference br command");
+        info!("test_zsh_completion_generation: assertions passed");
     }
 
     #[test]
     fn test_fish_completion_generation() {
+        init_logging();
+        info!("test_fish_completion_generation: starting");
         let mut cmd = Cli::command();
         let mut output = Vec::new();
         generate(Shell::Fish, &mut cmd, "br", &mut output);
@@ -166,10 +182,13 @@ mod tests {
             script.contains("complete -c br"),
             "should use fish complete syntax"
         );
+        info!("test_fish_completion_generation: assertions passed");
     }
 
     #[test]
     fn test_completion_contains_commands() {
+        init_logging();
+        info!("test_completion_contains_commands: starting");
         let mut cmd = Cli::command();
         let mut output = Vec::new();
         generate(Shell::Bash, &mut cmd, "br", &mut output);
@@ -181,10 +200,13 @@ mod tests {
         assert!(script.contains("show"), "should include show command");
         assert!(script.contains("update"), "should include update command");
         assert!(script.contains("close"), "should include close command");
+        info!("test_completion_contains_commands: assertions passed");
     }
 
     #[test]
     fn test_completion_contains_global_flags() {
+        init_logging();
+        info!("test_completion_contains_global_flags: starting");
         let mut cmd = Cli::command();
         let mut output = Vec::new();
         generate(Shell::Bash, &mut cmd, "br", &mut output);
@@ -196,5 +218,6 @@ mod tests {
             script.contains("--verbose"),
             "should include --verbose flag"
         );
+        info!("test_completion_contains_global_flags: assertions passed");
     }
 }

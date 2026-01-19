@@ -869,54 +869,6 @@ download_release() {
 }
 
 # ============================================================================
-# Install bd-to-br migration skill
-# ============================================================================
-install_migration_skill() {
-    log_step "Installing bd-to-br migration skill..."
-
-    local skill_url="https://github.com/${OWNER}/${REPO}/archive/refs/heads/main.tar.gz"
-    local skill_name="bd-to-br-migration"
-
-    # Claude Code skill directory
-    local claude_skill_dir="$HOME/.claude/skills/$skill_name"
-    # Codex skill directory
-    local codex_home="${CODEX_HOME:-$HOME/.codex}"
-    local codex_skill_dir="$codex_home/skills/$skill_name"
-
-    # Download and extract skill from repo
-    local skill_tmp="$TMP/skill-extract"
-    mkdir -p "$skill_tmp"
-
-    if download_file "$skill_url" "$skill_tmp/repo.tar.gz"; then
-        tar -xzf "$skill_tmp/repo.tar.gz" -C "$skill_tmp" --strip-components=2 "*/skills/$skill_name" 2>/dev/null || true
-
-        if [ -d "$skill_tmp" ] && [ -f "$skill_tmp/SKILL.md" ]; then
-            # Install to Claude Code
-            mkdir -p "$HOME/.claude/skills"
-            rm -rf "$claude_skill_dir"
-            cp -r "$skill_tmp" "$claude_skill_dir"
-            log_success "Installed skill to $claude_skill_dir"
-
-            # Install to Codex
-            mkdir -p "$codex_home/skills"
-            rm -rf "$codex_skill_dir"
-            cp -r "$skill_tmp" "$codex_skill_dir"
-            log_success "Installed skill to $codex_skill_dir"
-
-            SKILL_INSTALLED=1
-        else
-            log_warn "Could not extract migration skill from repository"
-            SKILL_INSTALLED=0
-        fi
-    else
-        log_warn "Could not download migration skill"
-        SKILL_INSTALLED=0
-    fi
-}
-
-SKILL_INSTALLED=0
-
-# ============================================================================
 # Print installation summary
 # ============================================================================
 print_summary() {
@@ -950,14 +902,6 @@ print_summary() {
         gum style --faint "  br ready           Show ready work"
         gum style --faint "  br --help          Full help"
         echo ""
-
-        if [[ "$SKILL_INSTALLED" -eq 1 ]]; then
-            gum style --foreground 214 --bold "Migration Skill Installed"
-            gum style --faint "  Upgrading from bd (beads) to br (beads_rust)? Use:"
-            gum style --foreground 39 "    Claude Code:  /bd-to-br-migration"
-            gum style --foreground 39 "    Codex CLI:    \$bd-to-br-migration"
-            echo ""
-        fi
     else
         echo ""
         log_success "br installed successfully!"
@@ -979,14 +923,6 @@ print_summary() {
         echo "    br ready           Show ready work"
         echo "    br --help          Full help"
         echo ""
-
-        if [[ "$SKILL_INSTALLED" -eq 1 ]]; then
-            echo "  Migration Skill Installed:"
-            echo "    Upgrading from bd (beads) to br (beads_rust)? Use:"
-            echo "      Claude Code:  /bd-to-br-migration"
-            echo "      Codex CLI:    \$bd-to-br-migration"
-            echo ""
-        fi
     fi
 }
 
@@ -1030,9 +966,6 @@ main() {
     # Post-install steps
     maybe_add_path
     fix_alias_conflicts
-
-    # Install migration skill for Claude Code and Codex
-    install_migration_skill
 
     # Verify installation
     if [ "$VERIFY" -eq 1 ]; then

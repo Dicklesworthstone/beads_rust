@@ -122,6 +122,7 @@ fn setup_workspace_with_issues() -> (BrWorkspace, Vec<String>) {
 
 #[test]
 fn ready_cli_filters_by_assignee() {
+    let _log = common::test_log("ready_cli_filters_by_assignee");
     let (workspace, ids) = setup_workspace_with_issues();
 
     let result = run_br(
@@ -151,7 +152,9 @@ fn ready_cli_filters_by_assignee() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn ready_respects_external_dependencies() {
+    let _log = common::test_log("ready_respects_external_dependencies");
     let workspace = BrWorkspace::new();
     let external = BrWorkspace::new();
 
@@ -267,6 +270,7 @@ fn ready_respects_external_dependencies() {
 
 #[test]
 fn ready_cli_filters_unassigned_only() {
+    let _log = common::test_log("ready_cli_filters_unassigned_only");
     let (workspace, ids) = setup_workspace_with_issues();
 
     let result = run_br(
@@ -297,6 +301,7 @@ fn ready_cli_filters_unassigned_only() {
 
 #[test]
 fn ready_cli_filters_by_type() {
+    let _log = common::test_log("ready_cli_filters_by_type");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     // Filter by task type
@@ -319,6 +324,7 @@ fn ready_cli_filters_by_type() {
 
 #[test]
 fn ready_cli_filters_by_multiple_types() {
+    let _log = common::test_log("ready_cli_filters_by_multiple_types");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     // Filter by task and bug types
@@ -342,6 +348,7 @@ fn ready_cli_filters_by_multiple_types() {
 
 #[test]
 fn ready_cli_filters_by_priority() {
+    let _log = common::test_log("ready_cli_filters_by_priority");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Filter by priority 0 (critical)
@@ -362,6 +369,7 @@ fn ready_cli_filters_by_priority() {
 
 #[test]
 fn ready_cli_filters_by_multiple_priorities() {
+    let _log = common::test_log("ready_cli_filters_by_multiple_priorities");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     // Filter by priority 0 and 1
@@ -385,6 +393,7 @@ fn ready_cli_filters_by_multiple_priorities() {
 
 #[test]
 fn ready_cli_filters_by_label_and() {
+    let _log = common::test_log("ready_cli_filters_by_label_and");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Filter by "backend" label
@@ -416,6 +425,7 @@ fn ready_cli_filters_by_label_and() {
 
 #[test]
 fn ready_cli_filters_by_multiple_labels_and() {
+    let _log = common::test_log("ready_cli_filters_by_multiple_labels_and");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Filter by both "backend" AND "api" labels
@@ -436,6 +446,7 @@ fn ready_cli_filters_by_multiple_labels_and() {
 
 #[test]
 fn ready_cli_filters_by_label_or() {
+    let _log = common::test_log("ready_cli_filters_by_label_or");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     // Filter by "backend" OR "frontend" labels
@@ -462,6 +473,7 @@ fn ready_cli_filters_by_label_or() {
 
 #[test]
 fn ready_cli_respects_limit() {
+    let _log = common::test_log("ready_cli_respects_limit");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     let result = run_br(
@@ -479,6 +491,7 @@ fn ready_cli_respects_limit() {
 
 #[test]
 fn ready_cli_limit_zero_returns_all() {
+    let _log = common::test_log("ready_cli_limit_zero_returns_all");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     let result = run_br(
@@ -497,6 +510,7 @@ fn ready_cli_limit_zero_returns_all() {
 
 #[test]
 fn ready_cli_sort_priority() {
+    let _log = common::test_log("ready_cli_sort_priority");
     let (workspace, ids) = setup_workspace_with_issues();
 
     let result = run_br(
@@ -517,6 +531,7 @@ fn ready_cli_sort_priority() {
 
 #[test]
 fn ready_cli_combined_filters() {
+    let _log = common::test_log("ready_cli_combined_filters");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Filter by assignee "alice" AND type "task"
@@ -548,6 +563,7 @@ fn ready_cli_combined_filters() {
 
 #[test]
 fn ready_cli_excludes_blocked_issues() {
+    let _log = common::test_log("ready_cli_excludes_blocked_issues");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Create a dependency: issue 3 is blocked by issue 1
@@ -577,6 +593,7 @@ fn ready_cli_excludes_blocked_issues() {
 
 #[test]
 fn ready_cli_excludes_deferred_by_default() {
+    let _log = common::test_log("ready_cli_excludes_deferred_by_default");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Defer issue 3
@@ -616,6 +633,7 @@ fn ready_cli_excludes_deferred_by_default() {
 
 #[test]
 fn ready_cli_includes_deferred_with_flag() {
+    let _log = common::test_log("ready_cli_includes_deferred_with_flag");
     let (workspace, ids) = setup_workspace_with_issues();
 
     // Defer issue 3
@@ -655,19 +673,21 @@ fn ready_cli_includes_deferred_with_flag() {
 
 #[test]
 fn ready_cli_text_output_format() {
+    let _log = common::test_log("ready_cli_text_output_format");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     let result = run_br(&workspace, ["ready"], "ready_text");
     assert!(result.status.success(), "ready failed: {}", result.stderr);
 
-    // Should have the header
-    assert!(result.stdout.contains("Ready to work"));
-    // Should show priority prefix
-    assert!(result.stdout.contains("[P"));
+    // Should have the header (matches bd format)
+    assert!(result.stdout.contains("Ready work"));
+    // Should show priority badge (matches bd format: [● P2])
+    assert!(result.stdout.contains("[●"));
 }
 
 #[test]
 fn ready_cli_empty_result_message() {
+    let _log = common::test_log("ready_cli_empty_result_message");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -676,11 +696,13 @@ fn ready_cli_empty_result_message() {
     let result = run_br(&workspace, ["ready"], "ready_empty");
     assert!(result.status.success(), "ready failed: {}", result.stderr);
 
-    assert!(result.stdout.contains("No issues ready to work on"));
+    // Matches bd format: "✨ No open issues"
+    assert!(result.stdout.contains("No open issues"));
 }
 
 #[test]
 fn ready_cli_priority_p_format() {
+    let _log = common::test_log("ready_cli_priority_p_format");
     let (workspace, _ids) = setup_workspace_with_issues();
 
     // Priority can be specified as P0, P1, etc.

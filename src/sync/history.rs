@@ -42,15 +42,18 @@ pub struct BackupEntry {
 /// # Errors
 ///
 /// Returns an error if the backup cannot be created.
-pub fn backup_before_export(beads_dir: &Path, config: &HistoryConfig) -> Result<()> {
+pub fn backup_before_export(
+    beads_dir: &Path,
+    config: &HistoryConfig,
+    target_path: &Path,
+) -> Result<()> {
     if !config.enabled {
         return Ok(());
     }
 
     let history_dir = beads_dir.join(".br_history");
-    let current_jsonl = beads_dir.join("issues.jsonl");
 
-    if !current_jsonl.exists() {
+    if !target_path.exists() {
         return Ok(());
     }
 
@@ -59,14 +62,22 @@ pub fn backup_before_export(beads_dir: &Path, config: &HistoryConfig) -> Result<
         fs::create_dir_all(&history_dir).map_err(BeadsError::Io)?;
     }
 
+    // Determine backup filename based on target filename
+    let file_stem = target_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("issues");
+
     // Create timestamped backup
     let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-    let backup_name = format!("issues.{timestamp}.jsonl");
+    let backup_name = format!("{file_stem}.{timestamp}.jsonl");
     let backup_path = history_dir.join(backup_name);
 
     // Check if the content is identical to the most recent backup (deduplication)
-    if let Some(latest) = get_latest_backup(&history_dir)? {
-        if files_are_identical(&current_jsonl, &latest.path)? {
+    // We only check against backups that match the target's stem to avoid false positives
+    // across different files, though collisions are unlikely with timestamps.
+    if let Some(latest) = get_latest_backup(&history_dir, Some(file_stem))? {
+        if files_are_identical(target_path, &latest.path)? {
             tracing::debug!(
                 "Skipping backup: identical to latest {}",
                 latest.path.display()
@@ -75,11 +86,11 @@ pub fn backup_before_export(beads_dir: &Path, config: &HistoryConfig) -> Result<
         }
     }
 
-    fs::copy(&current_jsonl, &backup_path).map_err(BeadsError::Io)?;
+    fs::copy(target_path, &backup_path).map_err(BeadsError::Io)?;
     tracing::debug!("Created backup: {}", backup_path.display());
 
-    // Rotate history
-    rotate_history(&history_dir, config)?;
+    // Rotate history for this file stem
+    rotate_history(&history_dir, config, file_stem)?;
 
     Ok(())
 }
@@ -89,8 +100,10 @@ pub fn backup_before_export(beads_dir: &Path, config: &HistoryConfig) -> Result<
 /// # Errors
 ///
 /// Returns an error if listing or deleting backups fails.
-fn rotate_history(history_dir: &Path, config: &HistoryConfig) -> Result<()> {
-    let backups = list_backups(history_dir)?;
+fn rotate_history(history_dir: &Path, config: &HistoryConfig, file_stem: &str) -> Result<()> {
+    // Only rotate backups for this specific file
+    let prefix = format!("{file_stem}.");
+    let backups = list_backups(history_dir, Some(&prefix))?;
 
     if backups.is_empty() {
         return Ok(());
@@ -114,7 +127,7 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig) -> Result<()> {
     }
 
     if deleted_count > 0 {
-        tracing::debug!("Pruned {} old backup(s)", deleted_count);
+        tracing::debug!("Pruned {} old backup(s) for {}", deleted_count, file_stem);
     }
 
     Ok(())
@@ -122,10 +135,15 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig) -> Result<()> {
 
 /// List available backups sorted by date (newest first).
 ///
+/// # Arguments
+///
+/// * `history_dir` - Directory containing backups
+/// * `filter_prefix` - Optional prefix to filter filenames (e.g. "issues.")
+///
 /// # Errors
 ///
 /// Returns an error if the directory cannot be read.
-pub fn list_backups(history_dir: &Path) -> Result<Vec<BackupEntry>> {
+pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<Vec<BackupEntry>> {
     if !history_dir.exists() {
         return Ok(Vec::new());
     }
@@ -136,35 +154,53 @@ pub fn list_backups(history_dir: &Path) -> Result<Vec<BackupEntry>> {
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("issues.")
-                    && Path::new(name)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-                {
-                    // Parse timestamp from filename: issues.YYYYMMDD_HHMMSS.jsonl
-                    // Expected format: issues.20230101_120000.jsonl
-                    let timestamp = if name.len() >= 22 {
-                        let ts_str = &name[7..22]; // "20230101_120000"
-                        match NaiveDateTime::parse_from_str(ts_str, "%Y%m%d_%H%M%S") {
-                            Ok(dt) => Utc.from_utc_datetime(&dt),
-                            Err(_) => continue, // Strictly require valid timestamp
-                        }
-                    } else {
-                        continue; // Skip files that don't match length requirement
-                    };
+        if !path.is_file() {
+            continue;
+        }
 
-                    if let Ok(metadata) = fs::metadata(&path) {
-                        backups.push(BackupEntry {
-                            path,
-                            timestamp,
-                            size: metadata.len(),
-                        });
-                    }
-                }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if let Some(prefix) = filter_prefix {
+            if !name.starts_with(prefix) {
+                continue;
             }
         }
+
+        let is_jsonl = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"));
+        if !is_jsonl {
+            continue;
+        }
+
+        // Parse timestamp from filename: <stem>.YYYYMMDD_HHMMSS.jsonl
+        // We split by dot and treat the second-to-last component as the timestamp.
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+
+        let ts_str = parts[parts.len() - 2];
+        if ts_str.len() != 15 {
+            continue;
+        }
+
+        let Ok(dt) = NaiveDateTime::parse_from_str(ts_str, "%Y%m%d_%H%M%S") else {
+            continue;
+        };
+
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+
+        let timestamp = Utc.from_utc_datetime(&dt);
+        backups.push(BackupEntry {
+            path,
+            timestamp,
+            size: metadata.len(),
+        });
     }
 
     // Sort newest first
@@ -173,8 +209,12 @@ pub fn list_backups(history_dir: &Path) -> Result<Vec<BackupEntry>> {
     Ok(backups)
 }
 
-fn get_latest_backup(history_dir: &Path) -> Result<Option<BackupEntry>> {
-    let backups = list_backups(history_dir)?;
+fn get_latest_backup(history_dir: &Path, filter_stem: Option<&str>) -> Result<Option<BackupEntry>> {
+    // If filtering by stem, ensure we match "{stem}." to avoid prefix collisions
+    // e.g. "issues" shouldn't match "issues_archive"
+    let prefix = filter_stem.map(|s| format!("{s}."));
+    let backups = list_backups(history_dir, prefix.as_deref())?;
+
     Ok(backups.into_iter().next())
 }
 
@@ -232,7 +272,7 @@ pub fn prune_backups(
     keep: usize,
     older_than_days: Option<u32>,
 ) -> Result<usize> {
-    let mut backups = list_backups(history_dir)?;
+    let mut backups = list_backups(history_dir, None)?;
 
     // Sort by timestamp descending (newest first)
     backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -242,16 +282,12 @@ pub fn prune_backups(
     // Calculate age cutoff if provided
     let cutoff = older_than_days.map(|days| Utc::now() - chrono::Duration::days(i64::from(days)));
 
-    // Keep the first `keep` backups regardless of age
     for (i, entry) in backups.iter().enumerate() {
-        if i < keep {
-            continue;
-        }
+        // Delete if we have exceeded the count limit OR the age limit
+        let is_count_exceeded = i >= keep;
+        let is_age_exceeded = cutoff.is_some_and(|c| entry.timestamp < c);
 
-        // Check if expired
-        let expired = cutoff.is_some_and(|c| entry.timestamp < c);
-
-        if expired {
+        if is_count_exceeded || is_age_exceeded {
             if let Err(e) = fs::remove_file(&entry.path) {
                 tracing::warn!("Failed to delete backup {}: {}", entry.path.display(), e);
             } else {
@@ -301,14 +337,14 @@ mod tests {
         }
 
         // Verify initial state
-        let backups = list_backups(&history_dir).unwrap();
+        let backups = list_backups(&history_dir, None).unwrap();
         assert_eq!(backups.len(), 3);
 
-        // Run rotation
-        rotate_history(&history_dir, &config).unwrap();
+        // Run rotation for "issues" stem
+        rotate_history(&history_dir, &config, "issues").unwrap();
 
         // Should keep only max_count (2) newest files
-        let remaining = list_backups(&history_dir).unwrap();
+        let remaining = list_backups(&history_dir, None).unwrap();
         assert_eq!(remaining.len(), 2);
 
         // Ensure the oldest one was deleted
@@ -346,12 +382,12 @@ mod tests {
         let config = HistoryConfig::default();
 
         // First backup
-        backup_before_export(&beads_dir, &config).unwrap();
+        backup_before_export(&beads_dir, &config, &jsonl_path).unwrap();
 
         // Second backup (same content) - should be skipped
-        backup_before_export(&beads_dir, &config).unwrap();
+        backup_before_export(&beads_dir, &config, &jsonl_path).unwrap();
 
-        let backups = list_backups(&history_dir).unwrap();
+        let backups = list_backups(&history_dir, None).unwrap();
         assert_eq!(backups.len(), 1);
     }
 
@@ -365,14 +401,37 @@ mod tests {
         File::create(history_dir.join("issues.20230102_100000.jsonl")).unwrap();
         File::create(history_dir.join("issues.invalid_name.jsonl")).unwrap();
 
-        let backups = list_backups(history_dir).unwrap();
+        let backups = list_backups(history_dir, None).unwrap();
         assert_eq!(backups.len(), 2);
 
         // Newest first
         assert!(backups[0].path.to_string_lossy().contains("20230102"));
         assert!(backups[1].path.to_string_lossy().contains("20230101"));
     }
-}
 
-// Re-export needed chrono type for parsing
-// use chrono::NaiveDateTime;
+    #[test]
+    fn test_prune_backups() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+
+        // Create 5 files
+        for i in 0..5 {
+            let ts = Utc::now() - chrono::Duration::days(i64::from(i));
+            let ts_str = ts.format("%Y%m%d_%H%M%S");
+            File::create(history_dir.join(format!("issues.{ts_str}.jsonl"))).unwrap();
+        }
+
+        // Keep 3
+        let deleted = prune_backups(history_dir, 3, None).unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(list_backups(history_dir, None).unwrap().len(), 3);
+
+        // Keep 100 (default), older than 2 days
+        // Files remaining: 0, 1, 2 days old.
+        // older_than 2 means delete anything older than 48h (effectively file 2)
+        // file 1 (24h old) is kept.
+        let deleted_age = prune_backups(history_dir, 100, Some(2)).unwrap();
+        assert_eq!(deleted_age, 1);
+        assert_eq!(list_backups(history_dir, None).unwrap().len(), 2);
+    }
+}

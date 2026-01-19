@@ -62,6 +62,7 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
 
 #[test]
 fn e2e_basic_lifecycle() {
+    let _log = common::test_log("e2e_basic_lifecycle");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -136,6 +137,7 @@ fn e2e_basic_lifecycle() {
 
 #[test]
 fn e2e_quick_capture() {
+    let _log = common::test_log("e2e_quick_capture");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -151,6 +153,7 @@ fn e2e_quick_capture() {
 
 #[test]
 fn e2e_sync_roundtrip() {
+    let _log = common::test_log("e2e_sync_roundtrip");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
