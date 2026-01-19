@@ -93,10 +93,9 @@ impl<'a> RichIssueTable<'a> {
         for issue in self.issues {
             let status_icon = format_status_icon(&issue.status);
             let priority = format_priority(&issue.priority);
-            let title = self.max_title_width.map_or_else(
-                || issue.title.clone(),
-                |w| truncate_title(&issue.title, w),
-            );
+            let title = self
+                .max_title_width
+                .map_or_else(|| issue.title.clone(), |w| truncate_title(&issue.title, w));
 
             let mut cells = Vec::new();
 
@@ -166,9 +165,7 @@ impl<'a> RichIssuePanel<'a> {
         let priority = format_priority(&self.issue.priority);
         let type_str = self.issue.issue_type.as_str();
         let status_str = self.issue.status.as_str();
-        content.push_str(&format!(
-            "[{priority}] [{type_str}] {status_str}\n"
-        ));
+        content.push_str(&format!("[{priority}] [{type_str}] {status_str}\n"));
 
         // Description if present and enabled
         if self.show_description {
@@ -316,9 +313,7 @@ pub fn build_completion_bar(completed: usize, total: usize, _theme: &Theme) -> P
         0.0
     };
 
-    let mut bar = ProgressBar::new()
-        .width(20)
-        .bar_style(BarStyle::Block);
+    let mut bar = ProgressBar::new().width(20).bar_style(BarStyle::Block);
     bar.set_progress(progress);
     bar
 }
@@ -420,7 +415,10 @@ mod tests {
 
     #[test]
     fn test_table_with_title_truncation() {
-        let issues = vec![make_test_issue("test-1", "A very long title that should be truncated")];
+        let issues = vec![make_test_issue(
+            "test-1",
+            "A very long title that should be truncated",
+        )];
         let theme = Theme::new();
         let table = RichIssueTable::new(&issues, &theme).max_title_width(20);
         let _ = table.build_table();

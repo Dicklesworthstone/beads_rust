@@ -29,8 +29,7 @@ const FIXTURE_DIR: &str = "tests/fixtures/json_baseline";
 
 /// Get the path to a baseline fixture file.
 pub fn baseline_path(name: &str) -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(manifest_dir)
         .join(FIXTURE_DIR)
         .join(format!("{name}.json"))
