@@ -40,3 +40,6 @@ rustc-ice-*.txt
 
 # Claude Code temp files
 claude-upgrade-progress.json
+
+# Shell command artifacts (from malformed redirects like `> =`)
+=
