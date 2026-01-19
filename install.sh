@@ -14,6 +14,7 @@
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
+#   --skip-skills      Don't install Claude Code / Codex skills
 #   --uninstall        Remove br and clean up
 #   --help             Show this help
 #
@@ -41,6 +42,7 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/br-install.lock"
 SYSTEM=0
 NO_GUM=0
+SKIP_SKILLS=0
 MAX_RETRIES=3
 DOWNLOAD_TIMEOUT=120
 INSTALLER_VERSION="2.0.0"
@@ -299,6 +301,7 @@ usage() {
         gum style --faint "    --verify           Run self-test after install"
         gum style --faint "    --quiet            Suppress progress messages"
         gum style --faint "    --no-gum           Disable gum formatting"
+        gum style --faint "    --skip-skills      Don't install Claude/Codex skills"
         echo ""
         gum style --foreground 39 "  Maintenance"
         gum style --faint "    --uninstall        Remove br and clean up"
@@ -352,6 +355,7 @@ Options:
   --from-source      Build from source instead of downloading binary
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
+  --skip-skills      Don't install Claude Code / Codex skills
   --uninstall        Remove br and clean up
 
 Environment Variables:
@@ -401,6 +405,7 @@ while [ $# -gt 0 ]; do
         --from-source) FROM_SOURCE=1; shift;;
         --quiet|-q) QUIET=1; shift;;
         --no-gum) NO_GUM=1; shift;;
+        --skip-skills) SKIP_SKILLS=1; shift;;
         --uninstall) UNINSTALL=1; shift;;
         -h|--help) usage;;
         *) shift;;
@@ -640,6 +645,143 @@ fix_alias_conflicts() {
             fi
         fi
     done
+}
+
+# ============================================================================
+# Install Claude Code / Codex skills
+# ============================================================================
+install_skills() {
+    if [ "$SKIP_SKILLS" -eq 1 ]; then
+        log_step "Skipping skills installation (--skip-skills)"
+        return 0
+    fi
+
+    log_step "Installing Claude Code / Codex skills..."
+
+    local skills_base_url="https://raw.githubusercontent.com/${OWNER}/${REPO}/main/skills"
+    local claude_skills_dir="$HOME/.claude/skills"
+    local codex_skills_dir="${CODEX_HOME:-$HOME/.codex}/skills"
+
+    # List of skills to install (skill_name:files separated by commas)
+    local skills=(
+        "bd-to-br-migration:SKILL.md,SELF-TEST.md,references/TRANSFORMS.md,references/BULK.md,references/PITFALLS.md,scripts/find-bd-refs.sh,scripts/verify-migration.sh,subagents/batch-migrator.md"
+    )
+
+    local skill
+    for skill in "${skills[@]}"; do
+        local skill_name="${skill%%:*}"
+        local files_str="${skill#*:}"
+
+        log_step "Installing skill: $skill_name"
+
+        # Create skill directories
+        mkdir -p "$claude_skills_dir/$skill_name/references" 2>/dev/null || true
+        mkdir -p "$claude_skills_dir/$skill_name/scripts" 2>/dev/null || true
+        mkdir -p "$claude_skills_dir/$skill_name/subagents" 2>/dev/null || true
+        mkdir -p "$codex_skills_dir/$skill_name/references" 2>/dev/null || true
+        mkdir -p "$codex_skills_dir/$skill_name/scripts" 2>/dev/null || true
+        mkdir -p "$codex_skills_dir/$skill_name/subagents" 2>/dev/null || true
+
+        # Download each file
+        IFS=',' read -ra files <<< "$files_str"
+        local file
+        local files_installed=0
+        for file in "${files[@]}"; do
+            local url="$skills_base_url/$skill_name/$file"
+            local claude_dest="$claude_skills_dir/$skill_name/$file"
+            local codex_dest="$codex_skills_dir/$skill_name/$file"
+            local tmp_file="${claude_dest}.tmp.$$"
+
+            # Download to temp file first to avoid leaving empty files on failure
+            if download_file "$url" "$tmp_file"; then
+                mv "$tmp_file" "$claude_dest"
+                # Make scripts executable
+                [[ "$file" == scripts/* ]] && chmod +x "$claude_dest" 2>/dev/null || true
+                log_debug "Downloaded $file to Claude skills"
+                files_installed=$((files_installed + 1))
+
+                # Copy to Codex skills
+                cp "$claude_dest" "$codex_dest" 2>/dev/null || true
+                [[ "$file" == scripts/* ]] && chmod +x "$codex_dest" 2>/dev/null || true
+            else
+                rm -f "$tmp_file" 2>/dev/null || true
+                log_debug "Could not download $file (may not exist)"
+            fi
+        done
+
+        if [ "$files_installed" -gt 0 ]; then
+            log_success "Installed skill: $skill_name ($files_installed files)"
+        else
+            log_warn "Skill $skill_name: no files could be downloaded"
+        fi
+    done
+
+    # Print fancy skills summary
+    print_skills_summary "$claude_skills_dir" "$codex_skills_dir"
+}
+
+# Print beautiful skills installation summary
+print_skills_summary() {
+    local claude_dir="$1"
+    local codex_dir="$2"
+
+    [ "$QUIET" -eq 1 ] && return 0
+
+    echo ""
+    if [[ "$GUM_AVAILABLE" == "true" ]]; then
+        gum style \
+            --border rounded \
+            --border-foreground 213 \
+            --padding "1 2" \
+            --margin "1 0" \
+            "$(gum style --foreground 213 --bold '🎯 AI Coding Skills Installed!')" \
+            "" \
+            "$(gum style --foreground 245 'Skills help AI agents migrate from bd → br')"
+
+        echo ""
+        gum style --foreground 214 --bold "📍 Installed Locations"
+        gum style --foreground 39 "  Claude Code: $(gum style --foreground 82 "$claude_dir")"
+        gum style --foreground 39 "  Codex:       $(gum style --foreground 82 "$codex_dir")"
+
+        echo ""
+        gum style \
+            --border rounded \
+            --border-foreground 39 \
+            --padding "1 2" \
+            "$(gum style --foreground 39 --bold '⚡ How to Use Skills')" \
+            "" \
+            "$(gum style --foreground 214 'Claude Code') $(gum style --faint '(slash command):')" \
+            "  $(gum style --foreground 82 '/bd-to-br-migration')" \
+            "" \
+            "$(gum style --foreground 214 'Codex') $(gum style --faint '(dollar command):')" \
+            "  $(gum style --foreground 82 '$bd-to-br-migration')"
+
+        echo ""
+        gum style --foreground 245 --italic "Skills auto-trigger when agents detect bd→br migration needs"
+
+    else
+        echo ""
+        echo -e "${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${MAGENTA}${BOLD}║${NC}  ${BOLD}🎯 AI Coding Skills Installed!${NC}                            ${MAGENTA}${BOLD}║${NC}"
+        echo -e "${MAGENTA}${BOLD}║${NC}  ${DIM}Skills help AI agents migrate from bd → br${NC}                ${MAGENTA}${BOLD}║${NC}"
+        echo -e "${MAGENTA}${BOLD}╚════════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "${YELLOW}${BOLD}📍 Installed Locations${NC}"
+        echo -e "  ${CYAN}Claude Code:${NC} ${GREEN}$claude_dir${NC}"
+        echo -e "  ${CYAN}Codex:${NC}       ${GREEN}$codex_dir${NC}"
+        echo ""
+        echo -e "${BLUE}${BOLD}╭────────────────────────────────────────────────────────────╮${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}  ${BOLD}⚡ How to Use Skills${NC}                                      ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}                                                            ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}  ${YELLOW}Claude Code${NC} ${DIM}(slash command):${NC}                            ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}    ${GREEN}/bd-to-br-migration${NC}                                    ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}                                                            ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}  ${YELLOW}Codex${NC} ${DIM}(dollar command):${NC}                                  ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}│${NC}    ${GREEN}\$bd-to-br-migration${NC}                                    ${BLUE}${BOLD}│${NC}"
+        echo -e "${BLUE}${BOLD}╰────────────────────────────────────────────────────────────╯${NC}"
+        echo ""
+        echo -e "${DIM}${ITALIC}Skills auto-trigger when agents detect bd→br migration needs${NC}"
+    fi
 }
 
 # ============================================================================
@@ -966,6 +1108,7 @@ main() {
     # Post-install steps
     maybe_add_path
     fix_alias_conflicts
+    install_skills
 
     # Verify installation
     if [ "$VERIFY" -eq 1 ]; then
