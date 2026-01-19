@@ -134,6 +134,7 @@ pub struct IssueWithDependencyMetadata {
     pub title: String,
     pub status: Status,
     pub priority: Priority,
+    #[serde(rename = "dependency_type")]
     pub dep_type: String,
 }
 
