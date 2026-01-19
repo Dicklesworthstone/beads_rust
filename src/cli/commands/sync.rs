@@ -17,8 +17,8 @@ use crate::sync::{
 };
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::IsTerminal;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, IsTerminal};
 use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -723,10 +723,21 @@ fn execute_import(
         show_progress,
     };
 
-    // Get expected prefix from config
-    let prefix = storage
-        .get_config("issue_prefix")?
-        .unwrap_or_else(|| "bd".to_string());
+    // Get expected prefix from config, or auto-detect from JSONL
+    let configured_prefix = storage.get_config("issue_prefix")?;
+    let prefix = if let Some(p) = configured_prefix {
+        p
+    } else {
+        // No prefix configured - try to auto-detect from JSONL for migration scenarios
+        if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
+            info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
+            // Persist the detected prefix to config for future operations
+            storage.set_config("issue_prefix", &detected)?;
+            detected
+        } else {
+            "bd".to_string()
+        }
+    };
 
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
@@ -767,6 +778,45 @@ fn execute_import(
     }
 
     Ok(())
+}
+
+/// Detect the issue ID prefix from the first non-tombstone issue in a JSONL file.
+///
+/// Returns `None` if the file is empty or contains no issues with a recognizable prefix.
+/// A prefix is the part before the first hyphen in the issue ID (e.g., "mcp" from "mcp-015c").
+fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
+    let file = File::open(jsonl_path).ok()?;
+    let reader = BufReader::new(file);
+
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Parse as JSON to get the issue ID
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                // Skip tombstones (deleted issues)
+                if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+                    if status == "tombstone" {
+                        continue;
+                    }
+                }
+
+                // Extract prefix (part before first hyphen)
+                if let Some(hyphen_pos) = id.find('-') {
+                    let prefix = &id[..hyphen_pos];
+                    if !prefix.is_empty() {
+                        return Some(prefix.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Execute the --merge operation.
