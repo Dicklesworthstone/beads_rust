@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 
 /// Current version of the agent instructions blurb.
 /// Increment this when making breaking changes to the blurb format.
-pub const BLURB_VERSION: u8 = 1;
+pub const BLURB_VERSION: u8 = 3;
 
 /// Start marker for the blurb (includes version).
-pub const BLURB_START_MARKER: &str = "<!-- br-agent-instructions-v1 -->";
+pub const BLURB_START_MARKER: &str = "<!-- br-agent-instructions-v3 -->";
 
 /// End marker for the blurb.
 pub const BLURB_END_MARKER: &str = "<!-- end-br-agent-instructions -->";
@@ -24,7 +24,7 @@ pub const BLURB_END_MARKER: &str = "<!-- end-br-agent-instructions -->";
 pub const SUPPORTED_AGENT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "agents.md", "claude.md"];
 
 /// The agent instructions blurb to append to AGENTS.md files.
-pub const AGENT_BLURB: &str = r#"<!-- br-agent-instructions-v1 -->
+pub const AGENT_BLURB: &str = r#"<!-- br-agent-instructions-v3 -->
 
 ---
 
@@ -44,7 +44,7 @@ br show <id>          # Full issue details with dependencies
 br search "keyword"   # Full-text search
 
 # Create and update
-br create --title="..." --type=task --priority=2
+br create --title="..." --type=task --priority=2 --description="Details here"
 br update <id> --status=in_progress
 br close <id> --reason="Completed"
 br close <id1> <id2>  # Close multiple issues at once
@@ -726,7 +726,7 @@ mod tests {
         let detection = detect_agent_file(temp_dir.path());
         assert!(detection.found());
         assert!(detection.has_blurb);
-        assert_eq!(detection.blurb_version, 1);
+        assert_eq!(detection.blurb_version, BLURB_VERSION);
         assert!(!detection.needs_blurb());
         assert!(!detection.needs_upgrade());
     }
@@ -755,7 +755,7 @@ mod tests {
         let legacy_content = "# Agents\n\n<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->\n";
         let result = update_blurb(legacy_content);
         assert!(!result.contains("bv-agent-instructions"));
-        assert!(result.contains("br-agent-instructions-v1"));
+        assert!(result.contains(BLURB_START_MARKER));
     }
 
     #[test]
