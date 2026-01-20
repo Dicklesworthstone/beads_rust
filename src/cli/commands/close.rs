@@ -125,7 +125,7 @@ pub fn execute_with_args(
     args: &CloseArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     tracing::info!("Executing close command");
 
@@ -306,23 +306,26 @@ pub fn execute_with_args(
             println!("{output}");
         }
     } else {
-        for closed in &closed_issues {
-            print!("\u{2713} Closed {}: {}", closed.id, closed.title);
-            if let Some(reason) = &closed.close_reason {
-                println!(" ({reason})");
-            } else {
-                println!();
-            }
-        }
-        for skipped in &skipped_issues {
-            println!("\u{2298} Skipped {}: {}", skipped.id, skipped.reason);
-        }
-        if !unblocked_issues.is_empty() {
-            let ids: Vec<&str> = unblocked_issues.iter().map(|i| i.id.as_str()).collect();
-            println!("  Unblocked: {}", ids.join(", "));
-        }
         if closed_issues.is_empty() && skipped_issues.is_empty() {
-            println!("No issues to close.");
+            ctx.info("No issues to close.");
+        } else {
+            for closed in &closed_issues {
+                let mut msg = format!("Closed {}: {}", closed.id, closed.title);
+                if let Some(reason) = &closed.close_reason {
+                    msg.push_str(&format!(" ({reason})"));
+                }
+                ctx.success(&msg);
+            }
+            for skipped in &skipped_issues {
+                ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
+            }
+            if !unblocked_issues.is_empty() {
+                ctx.newline();
+                ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
+                for issue in &unblocked_issues {
+                    ctx.print(&format!("  {}: {}", issue.id, issue.title));
+                }
+            }
         }
     }
 

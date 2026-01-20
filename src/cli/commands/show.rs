@@ -2,13 +2,9 @@
 
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{
-    format_priority, format_priority_label, format_status_icon, format_status_icon_colored,
-};
-use crate::output::{OutputContext, OutputMode};
+use crate::format::{format_priority_label, format_status_icon_colored};
+use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::util::id::{IdResolver, ResolverConfig};
-use rich_rust::prelude::*;
-use rich_rust::segment::Segment;
 use std::fmt::Write as FmtWrite;
 
 /// Execute the show command.
@@ -74,7 +70,8 @@ pub fn execute(
                 println!(); // Separate multiple issues
             }
             if matches!(ctx.mode(), OutputMode::Rich) {
-                render_issue_details_rich(details, &ctx);
+                let panel = IssuePanel::from_details(details, ctx.theme());
+                panel.print(&ctx);
             } else {
                 print_issue_details(details, use_color);
             }
@@ -167,192 +164,6 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
     }
 
     output
-}
-
-struct ContentBuilder {
-    lines: Vec<Vec<Segment<'static>>>,
-    current_line: Vec<Segment<'static>>,
-}
-
-impl ContentBuilder {
-    fn new() -> Self {
-        Self {
-            lines: Vec::new(),
-            current_line: Vec::new(),
-        }
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    fn append(&mut self, text: impl Into<String>, style: Style) {
-        let text = text.into();
-        let parts: Vec<&str> = text.split('\n').collect();
-
-        for (i, part) in parts.iter().enumerate() {
-            if i > 0 {
-                self.flush_line();
-            }
-            if !part.is_empty() {
-                self.current_line
-                    .push(Segment::new(part.to_string(), Some(style.clone())));
-            }
-        }
-    }
-
-    fn flush_line(&mut self) {
-        // If current line is empty, push empty vec to represent blank line?
-        // Or if we just flushed, we are at start of new line.
-        // If append("\n"), parts are ["", ""].
-        // i=0: part="", nothing pushed.
-        // i=1: flush_line(). part="", nothing pushed.
-        // Result: 1 line flushed.
-        let line = std::mem::take(&mut self.current_line);
-        self.lines.push(line);
-    }
-
-    fn finish(mut self) -> Vec<Vec<Segment<'static>>> {
-        if !self.current_line.is_empty() {
-            self.lines.push(self.current_line);
-        }
-        self.lines
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn render_issue_details_rich(details: &crate::format::IssueDetails, ctx: &OutputContext) {
-    let theme = ctx.theme();
-    let issue = &details.issue;
-    let mut builder = ContentBuilder::new();
-
-    // Header: status icon + id + title + priority/status badge
-    let status_icon = format_status_icon(&issue.status);
-    builder.append(format!("{status_icon} "), theme.status_style(&issue.status));
-    builder.append(format!("{} · ", issue.id), theme.issue_id.clone());
-    builder.append(issue.title.clone(), theme.issue_title.clone());
-    builder.append("   [● ", Style::new());
-    builder.append(
-        format_priority(&issue.priority),
-        theme.priority_style(issue.priority),
-    );
-    builder.append(" · ", Style::new());
-    builder.append(
-        issue.status.as_str().to_uppercase(),
-        theme.status_style(&issue.status),
-    );
-    builder.append("]\n", Style::new());
-
-    // Owner/Type line
-    let owner = issue
-        .owner
-        .clone()
-        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".to_string()));
-    builder.append("Owner: ", theme.dimmed.clone());
-    builder.append(&owner, theme.username.clone());
-    builder.append(" · Type: ", theme.dimmed.clone());
-    builder.append(
-        issue.issue_type.as_str(),
-        theme.type_style(&issue.issue_type),
-    );
-    builder.append("\n", Style::new());
-
-    // Created/Updated line
-    builder.append("Created: ", theme.dimmed.clone());
-    builder.append(
-        issue.created_at.format("%Y-%m-%d").to_string(),
-        theme.timestamp.clone(),
-    );
-    builder.append(" · Updated: ", theme.dimmed.clone());
-    builder.append(
-        issue.updated_at.format("%Y-%m-%d").to_string(),
-        theme.timestamp.clone(),
-    );
-    builder.append("\n", Style::new());
-
-    // Assignee
-    if let Some(assignee) = &issue.assignee {
-        builder.append("Assignee: ", theme.dimmed.clone());
-        builder.append(assignee, theme.username.clone());
-        builder.append("\n", Style::new());
-    }
-
-    // Labels
-    if !details.labels.is_empty() {
-        builder.append("Labels:   ", theme.dimmed.clone());
-        for (i, label) in details.labels.iter().enumerate() {
-            if i > 0 {
-                builder.append(", ", theme.dimmed.clone());
-            }
-            builder.append(label, theme.label.clone());
-        }
-        builder.append("\n", Style::new());
-    }
-
-    // Description
-    if let Some(desc) = &issue.description {
-        builder.append("\n", Style::new());
-        builder.append(desc, theme.issue_description.clone());
-        builder.append("\n", Style::new());
-    }
-
-    // Dependencies
-    if !details.dependencies.is_empty() {
-        builder.append("\nDependencies:\n", theme.emphasis.clone());
-        for dep in &details.dependencies {
-            builder.append("  → ", theme.dimmed.clone());
-            builder.append(&dep.id, theme.issue_id.clone());
-            builder.append(" ", Style::new());
-            builder.append(
-                format!("[{}]", dep.status.as_str()),
-                theme.status_style(&dep.status),
-            );
-            builder.append(" ", Style::new());
-            builder.append(&dep.title, theme.issue_title.clone());
-            builder.append(" ", Style::new());
-            builder.append(format!("({})", dep.dep_type), theme.muted.clone());
-            builder.append("\n", Style::new());
-        }
-    }
-
-    // Dependents
-    if !details.dependents.is_empty() {
-        builder.append("\nDependents:\n", theme.emphasis.clone());
-        for dep in &details.dependents {
-            builder.append("  ← ", theme.dimmed.clone());
-            builder.append(&dep.id, theme.issue_id.clone());
-            builder.append(" ", Style::new());
-            builder.append(
-                format!("[{}]", dep.status.as_str()),
-                theme.status_style(&dep.status),
-            );
-            builder.append(" ", Style::new());
-            builder.append(&dep.title, theme.issue_title.clone());
-            builder.append(" ", Style::new());
-            builder.append(format!("({})", dep.dep_type), theme.muted.clone());
-            builder.append("\n", Style::new());
-        }
-    }
-
-    // Comments
-    if !details.comments.is_empty() {
-        builder.append("\nComments:\n", theme.emphasis.clone());
-        for comment in &details.comments {
-            builder.append("  ", Style::new());
-            builder.append(
-                comment.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-                theme.timestamp.clone(),
-            );
-            builder.append(" ", Style::new());
-            builder.append(&comment.author, theme.username.clone());
-            builder.append(": ", theme.dimmed.clone());
-            builder.append(&comment.body, theme.comment.clone());
-            builder.append("\n", Style::new());
-        }
-    }
-
-    let panel = Panel::new(builder.finish())
-        .title(Text::styled(issue.id.clone(), theme.panel_title.clone()))
-        .box_style(theme.box_style)
-        .border_style(theme.panel_border.clone());
-    ctx.render(&panel);
 }
 
 #[cfg(test)]

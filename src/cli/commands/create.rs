@@ -26,7 +26,7 @@ pub struct CreateConfig {
 ///
 /// Returns an error if validation fails, the database cannot be opened, or the issue cannot be created.
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     if let Some(ref file_path) = args.file {
         if args.title.is_some() || args.title_flag.is_some() {
             return Err(BeadsError::validation(
@@ -40,7 +40,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, _ctx: &OutputConte
                 "--dry-run is not supported with --file",
             ));
         }
-        return execute_import(file_path, args, cli);
+        return execute_import(file_path, args, cli, ctx);
     }
 
     // 1. Open storage (unless dry run without DB)
@@ -75,21 +75,21 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, _ctx: &OutputConte
             println!("{}", serde_json::to_string_pretty(&full_issue)?);
         }
     } else if args.dry_run {
-        println!("Dry run: would create issue {}", issue.id);
-        println!("Title: {}", issue.title);
-        println!("Type: {}", issue.issue_type);
-        println!("Priority: {}", issue.priority);
+        ctx.info(&format!("Dry run: would create issue {}", issue.id));
+        ctx.print(&format!("Title: {}", issue.title));
+        ctx.print(&format!("Type: {}", issue.issue_type));
+        ctx.print(&format!("Priority: {}", issue.priority));
         if !args.labels.is_empty() {
-            println!("Labels: {}", args.labels.join(", "));
+            ctx.print(&format!("Labels: {}", args.labels.join(", ")));
         }
         if let Some(parent) = &args.parent {
-            println!("Parent: {parent}");
+            ctx.print(&format!("Parent: {parent}"));
         }
         if !args.deps.is_empty() {
-            println!("Dependencies: {}", args.deps.join(", "));
+            ctx.print(&format!("Dependencies: {}", args.deps.join(", ")));
         }
     } else {
-        println!("Created {}: {}", issue.id, issue.title);
+        ctx.success(&format!("Created {}: {}", issue.id, issue.title));
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -337,7 +337,12 @@ fn add_relations(
 }
 
 #[allow(clippy::too_many_lines)]
-fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
+fn execute_import(
+    path: &Path,
+    args: &CreateArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let parsed_issues = parse_markdown_file(path)?;
     if parsed_issues.is_empty() {
         if cli.json.unwrap_or(false) {
@@ -517,13 +522,13 @@ fn execute_import(path: &Path, args: &CreateArgs, cli: &config::CliOverrides) ->
         let json_output = serde_json::to_string_pretty(&created_issues)?;
         println!("{json_output}");
     } else if !created_ids.is_empty() {
-        println!(
-            "✓ Created {} issues from {}:",
+        ctx.success(&format!(
+            "Created {} issues from {}:",
             created_ids.len(),
             path.display()
-        );
+        ));
         for (id, title) in created_ids {
-            println!("  ✓ {id}: {title}");
+            ctx.print(&format!("  {id}: {title}"));
         }
     }
 

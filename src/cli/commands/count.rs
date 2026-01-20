@@ -66,7 +66,21 @@ pub fn execute(
     let issues = storage.list_issues(&filters)?;
     let total = issues.len();
 
-    match args.by {
+    let by = args.by.or(if args.by_status {
+        Some(CountBy::Status)
+    } else if args.by_priority {
+        Some(CountBy::Priority)
+    } else if args.by_type {
+        Some(CountBy::Type)
+    } else if args.by_assignee {
+        Some(CountBy::Assignee)
+    } else if args.by_label {
+        Some(CountBy::Label)
+    } else {
+        None
+    });
+
+    match by {
         None => {
             if json {
                 let payload = serde_json::to_string(&CountOutput { count: total })?;

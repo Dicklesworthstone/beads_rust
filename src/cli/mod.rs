@@ -219,6 +219,7 @@ EXAMPLES:
     Upgrade(UpgradeArgs),
 
     /// Generate shell completions
+    #[command(alias = "completion")]
     Completions(CompletionsArgs),
 
     /// Record and label agent interactions (append-only JSONL)
@@ -895,10 +896,31 @@ pub struct AuditLabelArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CountArgs {
     /// Group counts by field
     #[arg(long, value_enum)]
     pub by: Option<CountBy>,
+
+    /// Group by status (alias for --by status)
+    #[arg(long)]
+    pub by_status: bool,
+
+    /// Group by priority (alias for --by priority)
+    #[arg(long)]
+    pub by_priority: bool,
+
+    /// Group by type (alias for --by type)
+    #[arg(long)]
+    pub by_type: bool,
+
+    /// Group by assignee (alias for --by assignee)
+    #[arg(long)]
+    pub by_assignee: bool,
+
+    /// Group by label (alias for --by label)
+    #[arg(long)]
+    pub by_label: bool,
 
     /// Filter by status (repeatable or comma-separated)
     #[arg(long, value_delimiter = ',')]
@@ -1208,8 +1230,9 @@ pub enum ConfigCommands {
 
     /// Set a config value
     Set {
-        /// Config key=value pair
-        kv: String,
+        /// Config key=value pair (or key value)
+        #[arg(num_args = 1..=2, value_name = "KV")]
+        args: Vec<String>,
     },
 
     /// Delete a config value

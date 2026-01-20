@@ -41,7 +41,7 @@ pub fn execute(
             let beads_dir = discover_beads_dir(None).ok();
             show_config(beads_dir.as_ref(), overrides, *project, *user, json_mode)
         }
-        ConfigCommands::Set { kv } => set_config_value(kv, json_mode),
+        ConfigCommands::Set { args } => set_config_value(args, json_mode),
         ConfigCommands::Delete { key } => delete_config_value(key, json_mode, overrides),
         ConfigCommands::Get { key } => {
             let beads_dir = discover_beads_dir(None).ok();
@@ -183,13 +183,22 @@ fn get_config_value(
 }
 
 /// Set a config value in project config (if available) or user config.
-fn set_config_value(kv: &str, json_mode: bool) -> Result<()> {
-    let (key, value) = kv
-        .split_once('=')
-        .ok_or_else(|| crate::error::BeadsError::Validation {
-            field: "config".to_string(),
-            reason: "Invalid format. Use: --set key=value".to_string(),
-        })?;
+fn set_config_value(args: &[String], json_mode: bool) -> Result<()> {
+    let (key, value) = match args.len() {
+        1 => args[0]
+            .split_once('=')
+            .ok_or_else(|| crate::error::BeadsError::Validation {
+                field: "config".to_string(),
+                reason: "Invalid format. Use: --set key=value or --set key value".to_string(),
+            })?,
+        2 => (args[0].as_str(), args[1].as_str()),
+        _ => {
+            return Err(crate::error::BeadsError::Validation {
+                field: "config".to_string(),
+                reason: "Invalid number of arguments".to_string(),
+            });
+        }
+    };
 
     // Determine target config file
     let (config_path, is_project) = if let Ok(beads_dir) = discover_beads_dir(None) {
@@ -568,7 +577,8 @@ mod tests {
     #[test]
     fn test_set_config_invalid_format() {
         // Test with empty HOME - will fail with proper error
-        let result = set_config_value("no_equals_sign", false);
+        let args = vec!["no_equals_sign".to_string()];
+        let result = set_config_value(&args, false);
         assert!(result.is_err());
     }
 

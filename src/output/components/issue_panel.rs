@@ -1,12 +1,15 @@
-use crate::model::Issue;
+use crate::format::{IssueDetails, IssueWithDependencyMetadata};
+use crate::model::{Comment, Dependency, Issue};
 use crate::output::{OutputContext, Theme};
 use rich_rust::prelude::*;
 
 /// Renders a single issue with full details in a styled panel.
 pub struct IssuePanel<'a> {
     issue: &'a Issue,
+    details: Option<&'a IssueDetails>,
     theme: &'a Theme,
     show_dependencies: bool,
+    show_dependents: bool,
     show_comments: bool,
 }
 
@@ -15,10 +18,42 @@ impl<'a> IssuePanel<'a> {
     pub fn new(issue: &'a Issue, theme: &'a Theme) -> Self {
         Self {
             issue,
+            details: None,
             theme,
             show_dependencies: true,
+            show_dependents: true,
             show_comments: true,
         }
+    }
+
+    #[must_use]
+    pub fn from_details(details: &'a IssueDetails, theme: &'a Theme) -> Self {
+        Self {
+            issue: &details.issue,
+            details: Some(details),
+            theme,
+            show_dependencies: true,
+            show_dependents: true,
+            show_comments: true,
+        }
+    }
+
+    #[must_use]
+    pub fn show_dependencies(mut self, show: bool) -> Self {
+        self.show_dependencies = show;
+        self
+    }
+
+    #[must_use]
+    pub fn show_dependents(mut self, show: bool) -> Self {
+        self.show_dependents = show;
+        self
+    }
+
+    #[must_use]
+    pub fn show_comments(mut self, show: bool) -> Self {
+        self.show_comments = show;
+        self
     }
 
     pub fn print(&self, ctx: &OutputContext) {
@@ -63,9 +98,13 @@ impl<'a> IssuePanel<'a> {
         }
 
         // Labels
-        if !self.issue.labels.is_empty() {
+        let labels = self
+            .details
+            .map(|d| d.labels.as_slice())
+            .unwrap_or(self.issue.labels.as_slice());
+        if !labels.is_empty() {
             content.append_styled("Labels:   ", self.theme.dimmed.clone());
-            for (i, label) in self.issue.labels.iter().enumerate() {
+            for (i, label) in labels.iter().enumerate() {
                 if i > 0 {
                     content.append(", ");
                 }
@@ -87,24 +126,34 @@ impl<'a> IssuePanel<'a> {
             self.theme.timestamp.clone(),
         );
 
-        // Dependencies
-        if self.show_dependencies && !self.issue.dependencies.is_empty() {
-            content.append_styled(
-                "\n───────────────────────────────────\n",
-                self.theme.dimmed.clone(),
-            );
-            content.append_styled("Dependencies:\n", self.theme.emphasis.clone());
-            for dep in &self.issue.dependencies {
-                content.append_styled("  → ", self.theme.dimmed.clone());
-                content.append_styled(&dep.depends_on_id, self.theme.issue_id.clone());
-                content.append(" ");
-                content.append_styled(&format!("({})\n", dep.dep_type), self.theme.muted.clone());
+        // Dependencies / Dependents
+        if self.show_dependencies {
+            if let Some(details) = self.details {
+                render_dependency_list(
+                    "Dependencies",
+                    &details.dependencies,
+                    &mut content,
+                    self.theme,
+                );
+            } else if !self.issue.dependencies.is_empty() {
+                render_dependency_refs(&self.issue.dependencies, &mut content, self.theme);
             }
         }
 
-        if self.show_comments && !self.issue.comments.is_empty() {
+        if self.show_dependents {
+            if let Some(details) = self.details {
+                render_dependency_list("Dependents", &details.dependents, &mut content, self.theme);
+            }
+        }
+
+        // Comments
+        let comments: &[Comment] = self
+            .details
+            .map(|d| d.comments.as_slice())
+            .unwrap_or(self.issue.comments.as_slice());
+        if self.show_comments && !comments.is_empty() {
             content.append_styled("\nComments:\n", self.theme.emphasis.clone());
-            for comment in &self.issue.comments {
+            for comment in comments {
                 content.append("  ");
                 content.append_styled(
                     &comment.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
@@ -125,5 +174,55 @@ impl<'a> IssuePanel<'a> {
             .border_style(self.theme.panel_border.clone());
 
         ctx.render(&panel);
+    }
+}
+
+fn render_dependency_list(
+    title: &str,
+    deps: &[IssueWithDependencyMetadata],
+    content: &mut Text,
+    theme: &Theme,
+) {
+    if deps.is_empty() {
+        return;
+    }
+
+    content.append_styled(
+        "\n───────────────────────────────────\n",
+        theme.dimmed.clone(),
+    );
+    content.append_styled(&format!("{title}:\n"), theme.emphasis.clone());
+    for dep in deps {
+        content.append_styled("  → ", theme.dimmed.clone());
+        content.append_styled(&dep.id, theme.issue_id.clone());
+        content.append(" ");
+        content.append_styled(
+            &format!("[{}]", dep.status.as_str()),
+            theme.status_style(&dep.status),
+        );
+        content.append(" ");
+        content.append_styled(&dep.title, theme.issue_title.clone());
+        content.append(" ");
+        content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
+        content.append("\n");
+    }
+}
+
+fn render_dependency_refs(deps: &[Dependency], content: &mut Text, theme: &Theme) {
+    if deps.is_empty() {
+        return;
+    }
+
+    content.append_styled(
+        "\n───────────────────────────────────\n",
+        theme.dimmed.clone(),
+    );
+    content.append_styled("Dependencies:\n", theme.emphasis.clone());
+    for dep in deps {
+        content.append_styled("  → ", theme.dimmed.clone());
+        content.append_styled(&dep.depends_on_id, theme.issue_id.clone());
+        content.append(" ");
+        content.append_styled(&format!("({})", dep.dep_type), theme.muted.clone());
+        content.append("\n");
     }
 }
