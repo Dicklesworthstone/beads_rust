@@ -1144,7 +1144,8 @@ fn execute_merge(
 
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
-    // TODO: support configurable conflict strategy via CLI args if needed
+    // Currently hardcoded to PreferNewer (Last Write Wins).
+    // Future work: support configurable conflict strategy via CLI args if needed.
     let strategy = ConflictResolution::PreferNewer;
     let tombstones = None;
 
@@ -1374,6 +1375,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
