@@ -82,7 +82,7 @@ struct SyncPathPolicy {
 /// Returns an error if the database cannot be opened or the sync operation fails.
 pub fn execute(
     args: &SyncArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -94,7 +94,7 @@ pub fn execute(
 
     let jsonl_path = paths.jsonl_path;
     let retention_days = paths.metadata.deletions_retention_days;
-    let use_json = json || args.robot;
+    let use_json = ctx.is_json() || args.robot;
     let quiet = cli.quiet.unwrap_or(false);
     let show_progress = should_show_progress(use_json, quiet);
     let path_policy = validate_sync_paths(&beads_dir, &jsonl_path, args.allow_external_jsonl)?;
@@ -126,7 +126,7 @@ pub fn execute(
             &beads_dir,
             &path_policy,
             args,
-            use_json,
+            _json,
             show_progress,
             retention_days,
             ctx,
@@ -136,7 +136,7 @@ pub fn execute(
             &mut storage,
             &path_policy,
             args,
-            use_json,
+            _json,
             show_progress,
             retention_days,
             cli,
@@ -265,7 +265,7 @@ fn contains_git_dir(path: &Path) -> bool {
 fn execute_status(
     storage: &crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let dirty_ids = storage.get_dirty_issue_ids()?;
@@ -351,8 +351,8 @@ fn execute_status(
     };
     debug!(jsonl_newer, db_newer, "Computed sync staleness");
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&status);
     } else if ctx.is_rich() {
         render_status_rich(&status, ctx);
     } else {
@@ -467,7 +467,7 @@ fn execute_flush(
     _beads_dir: &Path,
     path_policy: &SyncPathPolicy,
     args: &SyncArgs,
-    json: bool,
+    _json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
     ctx: &OutputContext,
@@ -548,7 +548,7 @@ fn execute_flush(
             }
         }
 
-        if json {
+        if ctx.is_json() {
             let result = FlushResult {
                 exported_issues: 0,
                 exported_dependencies: 0,
@@ -561,7 +561,7 @@ fn execute_flush(
                 errors: Vec::new(),
                 manifest_path: None,
             };
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            ctx.json_pretty(&result);
         } else {
             println!("Nothing to export (no dirty issues)");
         }
@@ -640,8 +640,8 @@ fn execute_flush(
         manifest_path,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&result);
     } else if ctx.is_rich() {
         render_flush_result_rich(&result, &report.errors, ctx);
     } else {
@@ -834,7 +834,7 @@ fn format_error_suffix(errors: &[ExportError], entity: ExportEntityType) -> Stri
 }
 
 fn should_show_progress(json: bool, quiet: bool) -> bool {
-    !json && !quiet && std::io::stderr().is_terminal()
+    !json && !quiet && std::io::stdout().is_terminal()
 }
 
 /// Execute the --import-only operation.
@@ -859,7 +859,7 @@ fn execute_import(
     // Check if JSONL exists
     if !jsonl_path.exists() {
         warn!(path = %jsonl_path.display(), "JSONL path missing, skipping import");
-        if json {
+        if ctx.is_json() {
             let result = ImportResultOutput {
                 created: 0,
                 updated: 0,
@@ -867,7 +867,7 @@ fn execute_import(
                 tombstone_skipped: 0,
                 blocked_cache_rebuilt: false,
             };
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            ctx.json_pretty(&result);
         } else {
             println!("No JSONL file found at {}", jsonl_path.display());
         }
@@ -889,7 +889,7 @@ fn execute_import(
                     "JSONL is current, skipping import"
                 );
 
-                if json {
+                if ctx.is_json() {
                     let result = ImportResultOutput {
                         created: 0,
                         updated: 0,
@@ -897,7 +897,7 @@ fn execute_import(
                         tombstone_skipped: 0,
                         blocked_cache_rebuilt: false,
                     };
-                    println!("{}", serde_json::to_string_pretty(&result)?);
+                    ctx.json_pretty(&result);
                 } else {
                     println!("JSONL is current (hash unchanged since last import)");
                 }
@@ -975,8 +975,8 @@ fn execute_import(
         blocked_cache_rebuilt: true,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&result);
     } else if ctx.is_rich() {
         render_import_result_rich(&result, ctx);
     } else {
@@ -1095,7 +1095,7 @@ fn execute_merge(
     storage: &mut crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
     args: &SyncArgs,
-    json: bool,
+    _json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
     cli: &config::CliOverrides,
@@ -1215,7 +1215,7 @@ fn execute_merge(
     finalize_export(storage, &export_result, Some(&export_result.issue_hashes))?;
 
     // Output success message
-    if json {
+    if ctx.is_json() {
         let output = serde_json::json!({
             "status": "success",
             "merged_issues": report.kept.len(),
@@ -1223,7 +1223,7 @@ fn execute_merge(
             "conflicts": report.conflicts.len(),
             "notes": report.notes,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if ctx.is_rich() {
         render_merge_result_rich(&report, ctx);
     } else {

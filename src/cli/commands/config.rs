@@ -11,8 +11,9 @@
 
 use crate::cli::ConfigCommands;
 use crate::config::{
-    CliOverrides, ConfigLayer, default_config_layer, discover_beads_dir, id_config_from_layer,
-    load_legacy_user_config, load_project_config, load_user_config, resolve_actor,
+    self, CliOverrides, ConfigLayer, ConfigPaths, default_config_layer, discover_beads_dir,
+    id_config_from_layer, load_legacy_user_config, load_project_config, load_user_config,
+    resolve_actor,
 };
 use crate::error::Result;
 use crate::output::OutputContext;
@@ -21,7 +22,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, info, trace};
 
@@ -114,7 +115,7 @@ fn build_layers(
     let defaults = default_config_layer();
 
     let db_layer = if let Some(dir) = beads_dir {
-        let storage = crate::config::open_storage_with_cli(dir, overrides)
+        let storage = config::open_storage_with_cli(dir, overrides)
             .ok()
             .map(|ctx| ctx.storage);
         if let Some(storage) = storage {
@@ -260,11 +261,11 @@ fn render_kv_table(title: &str, rows: &[(String, String)], ctx: &OutputContext) 
 }
 /// Show config file paths.
 fn show_paths(_json_mode: bool, ctx: &OutputContext) -> Result<()> {
+    let beads_dir = discover_beads_dir(Some(Path::new(".")))?;
+    let paths = ConfigPaths::resolve(&beads_dir, None)?;
     let user_config_path = get_user_config_path();
     let legacy_user_path = get_legacy_user_config_path();
-    let project_path = discover_beads_dir(None)
-        .ok()
-        .map(|dir| dir.join("config.yaml"));
+    let project_path = Some(paths.beads_dir.join("config.yaml"));
 
     if ctx.is_json() {
         let output = json!({
@@ -273,64 +274,27 @@ fn show_paths(_json_mode: bool, ctx: &OutputContext) -> Result<()> {
             "project_config": project_path.map(|p| p.display().to_string()),
         });
         ctx.json_pretty(&output);
-    } else if ctx.is_quiet() {
-        return Ok(());
-    } else if ctx.is_rich() {
-        let mut rows = Vec::new();
-        match user_config_path {
-            Some(path) => {
-                let status = if path.exists() { "exists" } else { "not found" };
-                rows.push((
-                    "User config".to_string(),
-                    format!("{} ({status})", path.display()),
-                ));
-            }
-            None => rows.push(("User config".to_string(), "HOME not set".to_string())),
-        }
-        if let Some(path) = legacy_user_path {
-            if path.exists() {
-                rows.push((
-                    "Legacy user".to_string(),
-                    format!("{} (exists)", path.display()),
-                ));
-            }
-        }
-        match project_path {
-            Some(path) => {
-                let status = if path.exists() { "exists" } else { "not found" };
-                rows.push((
-                    "Project config".to_string(),
-                    format!("{} ({status})", path.display()),
-                ));
-            }
-            None => rows.push((
-                "Project config".to_string(),
-                "no .beads directory found".to_string(),
-            )),
-        }
-
-        render_kv_table("Configuration Paths", &rows, ctx);
     } else {
-        println!("Configuration paths:");
-        println!();
         if let Some(path) = user_config_path {
             let exists = path.exists();
-            let status = if exists { "(exists)" } else { "(not found)" };
-            println!("  User config:    {} {}", path.display(), status);
+            let status = if exists { "exists" } else { "not found" };
+            println!("User config: {} ({})", path.display(), status);
         } else {
-            println!("  User config:    (HOME not set)");
+            println!("User config: (none)");
         }
+
         if let Some(path) = legacy_user_path {
             if path.exists() {
-                println!("  Legacy user:    {} (exists)", path.display());
+                println!("Legacy user config: {} (found)", path.display());
             }
         }
+
         if let Some(path) = project_path {
             let exists = path.exists();
-            let status = if exists { "(exists)" } else { "(not found)" };
-            println!("  Project config: {} {}", path.display(), status);
+            let status = if exists { "exists" } else { "not found" };
+            println!("Project config: {} ({})", path.display(), status);
         } else {
-            println!("  Project config: (no .beads directory found)");
+            println!("Project config: (none)");
         }
     }
 
@@ -623,7 +587,7 @@ fn delete_config_value(
 
     if let Some(dir) = &beads_dir {
         // Only try to open DB if we have a beads dir
-        if let Ok(mut storage_ctx) = crate::config::open_storage_with_cli(dir, overrides) {
+        if let Ok(mut storage_ctx) = config::open_storage_with_cli(dir, overrides) {
             // We ignore is_startup_key check here to allow deleting from YAML even if not in DB
             db_deleted = storage_ctx.storage.delete_config(key).unwrap_or(false);
         }

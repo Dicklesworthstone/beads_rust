@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 /// Returns an error if database operations fail or if inputs are invalid.
 pub fn execute(
     command: &DepCommands,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -40,9 +40,9 @@ pub fn execute(
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
 
     match command {
-        DepCommands::Add(args) => dep_add(args, storage, &resolver, &all_ids, &actor, json, ctx),
+        DepCommands::Add(args) => dep_add(args, storage, &resolver, &all_ids, &actor, _json, ctx),
         DepCommands::Remove(args) => {
-            dep_remove(args, storage, &resolver, &all_ids, &actor, json, ctx)
+            dep_remove(args, storage, &resolver, &all_ids, &actor, _json, ctx)
         }
         DepCommands::List(args) => dep_list(
             args,
@@ -50,7 +50,7 @@ pub fn execute(
             &resolver,
             &all_ids,
             &external_db_paths,
-            json,
+            _json,
             ctx,
         ),
         DepCommands::Tree(args) => dep_tree(
@@ -59,10 +59,10 @@ pub fn execute(
             &resolver,
             &all_ids,
             &external_db_paths,
-            json,
+            _json,
             ctx,
         ),
-        DepCommands::Cycles(args) => dep_cycles(args, storage, json, ctx),
+        DepCommands::Cycles(args) => dep_cycles(args, storage, _json, ctx),
     }?;
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -725,7 +725,7 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 }
 
 fn dep_cycles(
-    _args: &DepCyclesArgs,
+    args: &DepCyclesArgs,
     storage: &SqliteStorage,
     _json: bool,
     ctx: &OutputContext,

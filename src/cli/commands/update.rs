@@ -40,7 +40,7 @@ impl From<&Issue> for UpdatedIssueOutput {
 ///
 /// Returns an error if database operations fail or validation errors occur.
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    let json = cli.json.unwrap_or(false);
+    let _json = cli.json.unwrap_or(false);
     let beads_dir = config::discover_beads_dir(None)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
@@ -114,7 +114,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let issue_after = storage.get_issue(id)?;
 
         if let Some(issue) = issue_after {
-            if json {
+            if ctx.is_json() {
                 updated_issues.push(UpdatedIssueOutput::from(&issue));
             } else if has_updates {
                 print_update_summary(id, &issue.title, issue_before.as_ref(), &issue);
@@ -124,7 +124,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
     }
 
-    if json {
+    if ctx.is_json() {
         ctx.json_pretty(&updated_issues);
     }
 
@@ -243,7 +243,7 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
         issue_type,
         assignee,
         owner,
-        estimated_minutes: args.estimate,
+        estimated_minutes: args.estimate.map(Some),
         due_at,
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
