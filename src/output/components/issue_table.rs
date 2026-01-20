@@ -1,7 +1,10 @@
+use crate::format::truncate_title;
 use crate::model::Issue;
 use crate::output::Theme;
+use regex::{Regex, RegexBuilder};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Cell;
+use std::collections::HashMap;
 
 /// Renders a list of issues as a beautiful table.
 pub struct IssueTable<'a> {
@@ -9,6 +12,8 @@ pub struct IssueTable<'a> {
     theme: &'a Theme,
     columns: IssueTableColumns,
     title: Option<String>,
+    highlight_query: Option<String>,
+    context_snippets: Option<HashMap<String, String>>,
 }
 
 #[derive(Default, Clone)]
@@ -23,6 +28,7 @@ pub struct IssueTableColumns {
     pub labels: bool,
     pub created: bool,
     pub updated: bool,
+    pub context: bool,
 }
 
 impl IssueTableColumns {
@@ -62,6 +68,7 @@ impl IssueTableColumns {
             labels: true,
             created: true,
             updated: true,
+            context: false,
         }
     }
 }
@@ -74,6 +81,8 @@ impl<'a> IssueTable<'a> {
             theme,
             columns: IssueTableColumns::standard(),
             title: None,
+            highlight_query: None,
+            context_snippets: None,
         }
     }
 
@@ -90,7 +99,30 @@ impl<'a> IssueTable<'a> {
     }
 
     #[must_use]
+    pub fn highlight_query(mut self, query: impl Into<String>) -> Self {
+        let query = query.into();
+        if !query.trim().is_empty() {
+            self.highlight_query = Some(query);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn context_snippets(mut self, snippets: HashMap<String, String>) -> Self {
+        if !snippets.is_empty() {
+            self.context_snippets = Some(snippets);
+        }
+        self
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn build(&self) -> Table {
+        let highlight_regex = self
+            .highlight_query
+            .as_deref()
+            .and_then(build_highlight_regex);
+
         let mut table = Table::new()
             .box_style(self.theme.box_style)
             .border_style(self.theme.table_border.clone())
@@ -128,6 +160,9 @@ impl<'a> IssueTable<'a> {
         if self.columns.updated {
             table = table.with_column(Column::new("Updated").width(10));
         }
+        if self.columns.context {
+            table = table.with_column(Column::new("Context").min_width(20).max_width(60));
+        }
 
         // Add rows
         for issue in self.issues {
@@ -155,12 +190,9 @@ impl<'a> IssueTable<'a> {
                 );
             }
             if self.columns.title {
-                let mut title = issue.title.clone();
-                if title.len() > 57 {
-                    title.truncate(57);
-                    title.push_str("...");
-                }
-                cells.push(Cell::new(Text::new(title)).style(self.theme.issue_title.clone()));
+                let title = truncate_title(&issue.title, 60);
+                let title_text = highlight_text(&title, highlight_regex.as_ref(), self.theme);
+                cells.push(Cell::new(title_text).style(self.theme.issue_title.clone()));
             }
             if self.columns.assignee {
                 cells.push(
@@ -185,10 +217,78 @@ impl<'a> IssueTable<'a> {
                         .style(self.theme.timestamp.clone()),
                 );
             }
+            if self.columns.context {
+                let snippet = self
+                    .context_snippets
+                    .as_ref()
+                    .and_then(|snippets| snippets.get(&issue.id))
+                    .map_or("", String::as_str);
+                let snippet_text = highlight_text(snippet, highlight_regex.as_ref(), self.theme);
+                cells.push(Cell::new(snippet_text).style(self.theme.muted.clone()));
+            }
 
             table.add_row(Row::new(cells));
         }
 
         table
+    }
+}
+
+fn build_highlight_regex(query: &str) -> Option<Regex> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let pattern = regex::escape(trimmed);
+    RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+fn highlight_text(text: &str, regex: Option<&Regex>, theme: &Theme) -> Text {
+    let Some(regex) = regex else {
+        return Text::new(text);
+    };
+
+    let mut rich_text = Text::new("");
+    let mut last = 0;
+    let mut found = false;
+
+    for matched in regex.find_iter(text) {
+        found = true;
+        let start = matched.start();
+        let end = matched.end();
+        if start > last {
+            rich_text.append(&text[last..start]);
+        }
+        rich_text.append_styled(&text[start..end], theme.highlight.clone());
+        last = end;
+    }
+
+    if !found {
+        return Text::new(text);
+    }
+    if last < text.len() {
+        rich_text.append(&text[last..]);
+    }
+
+    rich_text
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::format::truncate_title;
+
+    #[test]
+    fn test_table_truncation_safe() {
+        let title = "😊".repeat(60); // 240 bytes, 60 chars, 120 visual width
+
+        let truncated = truncate_title(&title, 60);
+
+        // Should be safe and shorter than original
+        assert!(truncated.chars().count() < 60);
+        assert!(truncated.starts_with("😊"));
+        assert!(truncated.ends_with("..."));
     }
 }

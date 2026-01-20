@@ -5,6 +5,7 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::truncate_title;
 use crate::model::DependencyType;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
@@ -707,15 +708,6 @@ fn build_tree_node_rich(
     }
 
     tree_node
-}
-
-/// Truncate title to max length with ellipsis
-fn truncate_title(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    }
 }
 
 fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {

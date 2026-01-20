@@ -6,7 +6,9 @@
 use crate::cli::StatsArgs;
 use crate::config;
 use crate::error::Result;
-use crate::format::{Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary};
+use crate::format::{
+    Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary, truncate_title,
+};
 use crate::model::{IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -79,8 +81,10 @@ pub fn execute(
     };
 
     // Output based on mode
-    let use_json = json || args.robot;
-    if use_json {
+    if args.robot {
+        // Robot mode: key=value format for script consumption
+        print_robot_output(&output);
+    } else if json {
         let json_str = serde_json::to_string_pretty(&output)?;
         println!("{json_str}");
     } else if matches!(ctx.mode(), OutputMode::Rich) {
@@ -384,6 +388,50 @@ fn compute_recent_activity(beads_dir: &Path, hours: u32) -> Option<RecentActivit
     })
 }
 
+/// Print robot-friendly key=value output for script consumption.
+fn print_robot_output(output: &Statistics) {
+    let s = &output.summary;
+    println!(
+        "total={} open={} in_progress={} closed={} ready={} blocked={} deferred={} tombstone={} pinned={}",
+        s.total_issues,
+        s.open_issues,
+        s.in_progress_issues,
+        s.closed_issues,
+        s.ready_issues,
+        s.blocked_issues,
+        s.deferred_issues,
+        s.tombstone_issues,
+        s.pinned_issues,
+    );
+
+    if s.epics_eligible_for_closure > 0 {
+        println!("epics_closeable={}", s.epics_eligible_for_closure);
+    }
+
+    if let Some(avg) = s.average_lead_time_hours {
+        println!("avg_lead_time_hours={:.1}", avg);
+    }
+
+    for breakdown in &output.breakdowns {
+        for entry in &breakdown.counts {
+            // Normalize key for shell-friendly output
+            let key = entry
+                .key
+                .to_lowercase()
+                .replace(' ', "_")
+                .replace(['(', ')'], "");
+            println!("{}_{key}={}", breakdown.dimension, entry.count);
+        }
+    }
+
+    if let Some(activity) = &output.recent_activity {
+        println!(
+            "activity_hours={} commits={} changes={}",
+            activity.hours_tracked, activity.commit_count, activity.total_changes
+        );
+    }
+}
+
 /// Print text output for stats.
 fn print_text_output(output: &Statistics) {
     // Match bd format: 📊 Issue Database Status
@@ -638,7 +686,7 @@ fn render_breakdown_bars(
         };
 
         content.append_styled(
-            &format!("   {:<12}", truncate_key(&entry.key, 12)),
+            &format!("   {:<12}", truncate_title(&entry.key, 12)),
             style.clone(),
         );
         content.append_styled(&"\u{2588}".repeat(filled), style.clone());
@@ -657,15 +705,6 @@ fn capitalize(s: &str) -> String {
     chars.next().map_or_else(String::new, |first| {
         first.to_uppercase().chain(chars).collect()
     })
-}
-
-/// Truncate a key to fit in the label column.
-fn truncate_key(key: &str, max_len: usize) -> String {
-    if key.len() <= max_len {
-        key.to_string()
-    } else {
-        format!("{}...", &key[..max_len.saturating_sub(3)])
-    }
 }
 
 #[cfg(test)]
@@ -871,5 +910,41 @@ mod tests {
         assert_eq!(map.get("backend"), Some(&2));
         assert_eq!(map.get("urgent"), Some(&1));
         assert_eq!(map.get("(no labels)"), Some(&1));
+    }
+
+    #[test]
+    fn test_truncate_title_ascii() {
+        assert_eq!(truncate_title("short", 12), "short");
+        assert_eq!(truncate_title("exactly_twelve", 14), "exactly_twelve");
+        assert_eq!(
+            truncate_title("this_is_too_long_for_column", 12),
+            "this_is_t..."
+        );
+    }
+
+    #[test]
+    fn test_truncate_title_multibyte() {
+        // Multi-byte characters should not cause panics
+        let emoji = "😊".repeat(10); // 10 chars, 20 visual width
+        // truncate to 5 visual width
+        let result = truncate_title(&emoji, 5);
+        assert!(result.ends_with("..."));
+        // 5 visual width: "😊" (2) + "..." (3) = 5
+        assert_eq!(result, "😊...");
+
+        // Mixed ASCII and emoji
+        let mixed = "abc😊def";
+        // "abc" (3) + "😊" (2) + "def" (3) = 8 width
+        assert_eq!(truncate_title(mixed, 8), "abc😊def");
+        // "abc" (3) + "..." (3) = 6
+        assert_eq!(truncate_title(mixed, 6), "abc...");
+    }
+
+    #[test]
+    fn test_capitalize() {
+        assert_eq!(capitalize("type"), "Type");
+        assert_eq!(capitalize("priority"), "Priority");
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("ALREADY"), "ALREADY");
     }
 }

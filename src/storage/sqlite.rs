@@ -867,6 +867,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
+    #[allow(clippy::too_many_lines)]
     pub fn get_ready_issues(
         &self,
         filters: &ReadyFilters,
@@ -944,6 +945,26 @@ impl SqliteStorage {
             sql.push_str(" AND assignee IS NULL");
         }
 
+        // Filter by labels (AND logic)
+        for label in &filters.labels_and {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM labels WHERE labels.issue_id = issues.id AND labels.label = ?)");
+            params.push(Box::new(label.clone()));
+        }
+
+        // Filter by labels (OR logic)
+        if !filters.labels_or.is_empty() {
+            let placeholders: Vec<String> =
+                filters.labels_or.iter().map(|_| "?".to_string()).collect();
+            let _ = write!(
+                sql,
+                " AND id IN (SELECT issue_id FROM labels WHERE label IN ({}))",
+                placeholders.join(",")
+            );
+            for l in &filters.labels_or {
+                params.push(Box::new(l.clone()));
+            }
+        }
+
         // Sorting
         match sort {
             ReadySortPolicy::Hybrid => {
@@ -966,22 +987,6 @@ impl SqliteStorage {
 
         // Ready condition 2: NOT in blocked_issues_cache (filter in memory)
         issues.retain(|issue| !blocked_ids.contains(&issue.id));
-
-        // Filter by labels (AND logic) - requires join, do in memory for simplicity
-        if !filters.labels_and.is_empty() {
-            issues.retain(|issue| {
-                let labels = self.get_labels(&issue.id).unwrap_or_default();
-                filters.labels_and.iter().all(|l| labels.contains(l))
-            });
-        }
-
-        // Filter by labels (OR logic)
-        if !filters.labels_or.is_empty() {
-            issues.retain(|issue| {
-                let labels = self.get_labels(&issue.id).unwrap_or_default();
-                filters.labels_or.iter().any(|l| labels.contains(l))
-            });
-        }
 
         // Apply limit after all filtering
         if let Some(limit) = filters.limit {
@@ -4752,5 +4757,56 @@ mod tests {
         assert_eq!(blockers.len(), 1);
         // ID + ":unknown" (since external doesn't have status in our DB)
         assert_eq!(blockers[0], "external:foo\"bar:unknown");
+    }
+
+    #[test]
+    fn test_get_ready_issues_filters_by_labels() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        let i1 = make_issue("bd-1", "A", Status::Open, 2, None, t1, None);
+        let i2 = make_issue("bd-2", "B", Status::Open, 2, None, t1, None);
+        let i3 = make_issue("bd-3", "C", Status::Open, 2, None, t1, None);
+
+        storage.create_issue(&i1, "tester").unwrap();
+        storage.create_issue(&i2, "tester").unwrap();
+        storage.create_issue(&i3, "tester").unwrap();
+
+        storage.add_label("bd-1", "backend", "tester").unwrap();
+        storage.add_label("bd-1", "urgent", "tester").unwrap();
+        storage.add_label("bd-2", "backend", "tester").unwrap();
+        // bd-3 has no labels
+
+        // Filter AND: backend + urgent
+        let filters_and = ReadyFilters {
+            labels_and: vec!["backend".to_string(), "urgent".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters_and, ReadySortPolicy::Oldest)
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, "bd-1");
+
+        // Filter OR: urgent
+        let filters_or = ReadyFilters {
+            labels_or: vec!["urgent".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters_or, ReadySortPolicy::Oldest)
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, "bd-1");
+
+        // Filter OR: backend (should get 1 and 2)
+        let filters_or_backend = ReadyFilters {
+            labels_or: vec!["backend".to_string()],
+            ..Default::default()
+        };
+        let res = storage
+            .get_ready_issues(&filters_or_backend, ReadySortPolicy::Oldest)
+            .unwrap();
+        assert_eq!(res.len(), 2);
     }
 }

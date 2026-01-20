@@ -71,9 +71,28 @@ impl<'a> DependencyTree<'a> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.saturating_sub(3)])
+        let mut truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dep_tree_truncation_safe() {
+        // String with emojis (multi-byte)
+        let title = "😊".repeat(20); // 80 bytes, 20 chars.
+        // Max 10 chars.
+        let truncated = truncate(&title, 10);
+
+        assert_eq!(truncated.chars().count(), 10);
+        assert!(truncated.starts_with("😊"));
+        assert!(truncated.ends_with("..."));
     }
 }
