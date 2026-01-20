@@ -12,6 +12,7 @@ use common::cli::extract_json_payload;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_yaml::Value as YamlValue;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
@@ -23,11 +24,21 @@ use tempfile::TempDir;
 use tracing::info;
 
 /// Check if the `bd` (Go beads) binary is available on the system.
+/// Returns false if `bd` is aliased/symlinked to `br` (detected via version output).
 pub fn bd_available() -> bool {
     std::process::Command::new("bd")
         .arg("version")
         .output()
-        .is_ok_and(|o| o.status.success())
+        .is_ok_and(|o| {
+            if !o.status.success() {
+                return false;
+            }
+            // Check that this is actually Go bd, not br aliased as bd.
+            // Go bd outputs "bd version X" or "beads version X".
+            // Rust br outputs "br version X".
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            !stdout.starts_with("br ")
+        })
 }
 
 /// Skip test if bd binary is not available (used in CI where only br is built)
@@ -179,6 +190,8 @@ where
         duration_ms: duration.as_millis(),
         stdout_len: stdout.len(),
         stderr_len: stderr.len(),
+        stdout_sha256: Some(sha256_hex(&stdout)),
+        stderr_sha256: Some(sha256_hex(&stderr)),
         log_path: log_path.display().to_string(),
     };
     record_run(log_dir, entry, &stdout, &stderr, cwd);
@@ -227,6 +240,8 @@ fn run_and_log(mut cmd: Command, cwd: &PathBuf, log_dir: &PathBuf, label: &str) 
         duration_ms: duration.as_millis(),
         stdout_len: stdout.len(),
         stderr_len: stderr.len(),
+        stdout_sha256: Some(sha256_hex(&stdout)),
+        stderr_sha256: Some(sha256_hex(&stderr)),
         log_path: log_path.display().to_string(),
     };
     record_run(log_dir, entry, &stdout, &stderr, cwd);
@@ -289,6 +304,10 @@ struct RunLogEntry {
     duration_ms: u128,
     stdout_len: usize,
     stderr_len: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stdout_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stderr_sha256: Option<String>,
     log_path: String,
 }
 
@@ -332,6 +351,12 @@ fn env_flag(name: &str) -> bool {
         ),
         Err(_) => false,
     }
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn collect_dir_listing(path: &PathBuf) -> Vec<String> {

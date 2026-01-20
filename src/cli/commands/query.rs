@@ -232,7 +232,6 @@ struct QueryActionOutput {
 /// Returns an error if database operations fail or if inputs are invalid.
 pub fn execute(
     command: &QueryCommands,
-    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -240,19 +239,16 @@ pub fn execute(
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     match command {
-        QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, json, ctx),
-        QueryCommands::Run(args) => {
-            query_run(args, &storage_ctx.storage, json, cli, &beads_dir, ctx)
-        }
-        QueryCommands::List => query_list(&storage_ctx.storage, json, ctx),
-        QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, json, ctx),
+        QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, ctx),
+        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, cli, &beads_dir, ctx),
+        QueryCommands::List => query_list(&storage_ctx.storage, ctx),
+        QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, ctx),
     }
 }
 
 fn query_save(
     args: &QuerySaveArgs,
     storage: &mut crate::storage::SqliteStorage,
-    json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
@@ -290,13 +286,13 @@ fn query_save(
 
     info!(name, "Saved query created");
 
-    if json {
+    if ctx.is_json() {
         let output = QueryActionOutput {
             status: "ok".to_string(),
             name: name.to_string(),
             action: "saved".to_string(),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_save_rich(name, args.description.as_deref(), ctx);
     } else {
@@ -309,7 +305,6 @@ fn query_save(
 fn query_run(
     args: &QueryRunArgs,
     storage: &crate::storage::SqliteStorage,
-    json: bool,
     cli: &config::CliOverrides,
     _beads_dir: &Path,
     ctx: &OutputContext,
@@ -334,14 +329,10 @@ fn query_run(
 
     // Execute list command with merged args
     // We call the list execute function directly
-    super::list::execute(&merged_args, json, cli, ctx)
+    super::list::execute(&merged_args, ctx.is_json(), cli, ctx)
 }
 
-fn query_list(
-    storage: &crate::storage::SqliteStorage,
-    json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn query_list(storage: &crate::storage::SqliteStorage, ctx: &OutputContext) -> Result<()> {
     let all_config = storage.get_all_config()?;
 
     let mut queries: Vec<QueryListItem> = Vec::new();
@@ -367,12 +358,12 @@ fn query_list(
     // Sort by name
     queries.sort_by(|a, b| a.name.cmp(&b.name));
 
-    if json {
+    if ctx.is_json() {
         let output = QueryListOutput {
             count: queries.len(),
             queries,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_list_rich(&queries, ctx);
     } else if queries.is_empty() {
@@ -396,7 +387,6 @@ fn query_list(
 fn query_delete(
     args: &QueryDeleteArgs,
     storage: &mut crate::storage::SqliteStorage,
-    json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
@@ -413,13 +403,13 @@ fn query_delete(
 
     info!(name, "Saved query deleted");
 
-    if json {
+    if ctx.is_json() {
         let output = QueryActionOutput {
             status: "ok".to_string(),
             name: name.to_string(),
             action: "deleted".to_string(),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_query_delete_rich(name, ctx);
     } else {

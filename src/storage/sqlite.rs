@@ -667,7 +667,11 @@ impl SqliteStorage {
         }
 
         if !filters.include_closed {
-            sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            if filters.include_deferred {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
+            } else {
+                sql.push_str(" AND status NOT IN ('closed', 'tombstone', 'deferred')");
+            }
         }
 
         if !filters.include_templates {
@@ -717,7 +721,11 @@ impl SqliteStorage {
             // column names can't be parameterized)
             match sort_field.as_str() {
                 "priority" => {
-                    let _ = write!(sql, " ORDER BY priority {order}, created_at DESC");
+                    let secondary_order = if filters.reverse { "ASC" } else { "DESC" };
+                    let _ = write!(
+                        sql,
+                        " ORDER BY priority {order}, created_at {secondary_order}"
+                    );
                 }
                 "created_at" | "created" => {
                     let order = if filters.reverse { "ASC" } else { "DESC" };
@@ -940,7 +948,7 @@ impl SqliteStorage {
         if let Some(ref types) = filters.types {
             if !types.is_empty() {
                 let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
-                let _ = write!(sql, " AND issue_type IN ({})", placeholders.join(","));
+                let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
                 for t in types {
                     params.push(Box::new(t.as_str().to_string()));
                 }
@@ -2871,6 +2879,7 @@ pub struct ListFilters {
     pub assignee: Option<String>,
     pub unassigned: bool,
     pub include_closed: bool,
+    pub include_deferred: bool,
     pub include_templates: bool,
     pub title_contains: Option<String>,
     pub limit: Option<usize>,

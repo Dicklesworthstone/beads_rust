@@ -105,9 +105,7 @@ fn main() {
         Commands::Changelog(args) => {
             commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
-        Commands::Query { command } => {
-            commands::query::execute(&command, cli.json, &overrides, &output_ctx)
-        }
+        Commands::Query { command } => commands::query::execute(&command, &overrides, &output_ctx),
         Commands::Graph(args) => commands::graph::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Agents(args) => {
             let agents_args = commands::agents::AgentsArgs {

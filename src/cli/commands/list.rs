@@ -208,6 +208,12 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
 
+    let include_deferred = args.deferred
+        || args.all
+        || statuses
+            .as_ref()
+            .is_some_and(|parsed| parsed.contains(&Status::Deferred));
+
     Ok(ListFilters {
         statuses,
         types,
@@ -215,6 +221,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
         include_closed,
+        include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
         limit: args.limit,
@@ -225,7 +232,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         } else {
             Some(args.label.clone())
         },
-        labels_or: None,
+        labels_or: if args.label_any.is_empty() {
+            None
+        } else {
+            Some(args.label_any.clone())
+        },
         updated_before: None,
         updated_after: None,
     })
@@ -239,8 +250,6 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.priority_max.is_some()
         || args.desc_contains.is_some()
         || args.notes_contains.is_some()
-        || args.sort.is_some()
-        || args.reverse
         || args.deferred
         || args.overdue
 }

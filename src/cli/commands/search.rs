@@ -269,6 +269,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
         include_closed,
+        include_deferred: args.deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
         limit: args.limit,

@@ -39,12 +39,17 @@ pub fn execute(
     filters.statuses = Some(statuses);
 
     let now = Utc::now();
-    let issues = storage.list_issues(&filters)?;
-    let stale = filter_stale_issues(issues, now, args.days);
+    let threshold = now - Duration::days(args.days);
+    filters.updated_before = Some(threshold);
+    // Sort by updated_at ASC (oldest first) to show most stale items first
+    filters.sort = Some("updated_at".to_string());
+    filters.reverse = true; // updated_at default is DESC, so reverse gets ASC
+
+    let stale = storage.list_issues(&filters)?;
 
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_stale_rich(&stale, now, args.days);
+        render_stale_rich(&stale, now, args.days, ctx);
     } else if json {
         // Convert to StaleIssue for bd-compatible JSON output
         let stale_output: Vec<StaleIssue> = stale.iter().map(StaleIssue::from).collect();
@@ -91,29 +96,24 @@ fn parse_statuses(values: &[String]) -> Result<Vec<Status>> {
         .collect::<Result<Vec<Status>>>()
 }
 
-fn filter_stale_issues(mut issues: Vec<Issue>, now: DateTime<Utc>, days: i64) -> Vec<Issue> {
-    let threshold = now - Duration::days(days);
-    issues.retain(|issue| issue.updated_at <= threshold);
-    issues.sort_by_key(|issue| issue.updated_at);
-    issues
-}
-
-fn render_stale_rich(stale: &[Issue], now: DateTime<Utc>, threshold_days: i64) {
+fn render_stale_rich(
+    stale: &[Issue],
+    now: DateTime<Utc>,
+    threshold_days: i64,
+    ctx: &OutputContext,
+) {
     use rich_rust::Text;
     use rich_rust::prelude::*;
 
-    fn color(name: &str) -> Color {
-        Color::parse(name).unwrap_or_default()
-    }
-
     let console = Console::default();
+    let theme = ctx.theme();
 
     if stale.is_empty() {
         let mut text = Text::new("");
-        text.append_styled("\u{2728} ", Style::new().color(color("green")));
+        text.append_styled("\u{2728} ", theme.success.clone());
         text.append_styled(
             &format!("No stale issues (threshold: {}+ days)", threshold_days),
-            Style::new().bold().color(color("green")),
+            theme.success.clone().bold(),
         );
         console.print_renderable(&text);
         return;
@@ -121,11 +121,11 @@ fn render_stale_rich(stale: &[Issue], now: DateTime<Utc>, threshold_days: i64) {
 
     // Header
     let mut header = Text::new("");
-    header.append_styled("\u{23f3} ", Style::new().color(color("yellow")));
-    header.append_styled("Stale issues", Style::new().bold().color(color("yellow")));
+    header.append_styled("\u{23f3} ", theme.warning.clone());
+    header.append_styled("Stale issues", theme.warning.clone().bold());
     header.append_styled(
         &format!(" ({} not updated in {}+ days)", stale.len(), threshold_days),
-        Style::new().dim(),
+        theme.dimmed.clone(),
     );
     console.print_renderable(&header);
     console.print("");
@@ -134,41 +134,39 @@ fn render_stale_rich(stale: &[Issue], now: DateTime<Utc>, threshold_days: i64) {
         let days_stale = (now - issue.updated_at).num_days().max(0);
 
         // Staleness coloring: red (>30d), orange (14-30d), yellow (7-14d), dim (<7d)
+        // Using theme colors where possible, or falling back to specific logic
+        // We can use priority styles as proxies for urgency or define direct colors if needed
         let staleness_style = if days_stale > 30 {
-            Style::new().bold().color(color("red"))
+            theme.error.clone().bold()
         } else if days_stale > 14 {
-            Style::new().color(color("bright_yellow"))
+            theme.warning.clone().bold() // Bright yellow/orange
         } else if days_stale > 7 {
-            Style::new().color(color("yellow"))
+            theme.warning.clone()
         } else {
-            Style::new().dim()
+            theme.dimmed.clone()
         };
 
         // Status style
-        let status_style = match issue.status {
-            Status::Open => Style::new().color(color("blue")),
-            Status::InProgress => Style::new().color(color("yellow")),
-            _ => Style::new().dim(),
-        };
+        let status_style = theme.status_style(&issue.status);
 
         let mut line = Text::new("");
 
         // Days stale badge
-        line.append_styled(&format!("{:>3}d ", days_stale), staleness_style.clone());
+        line.append_styled(&format!("{:>3}d ", days_stale), staleness_style);
 
         // Status badge
         line.append_styled(&format!("[{}] ", issue.status.as_str()), status_style);
 
         // Issue ID
-        line.append_styled(&issue.id, Style::new().bold().color(color("cyan")));
+        line.append_styled(&issue.id, theme.issue_id.clone());
         line.append(" ");
 
         // Title
-        line.append(&issue.title);
+        line.append_styled(&issue.title, theme.issue_title.clone());
 
         // Assignee if present
         if let Some(ref assignee) = issue.assignee {
-            line.append_styled(&format!(" (@{})", assignee), Style::new().dim());
+            line.append_styled(&format!(" (@{})", assignee), theme.dimmed.clone());
         }
 
         console.print_renderable(&line);
@@ -226,6 +224,23 @@ mod tests {
             comments: vec![],
             content_hash: None,
         }
+    }
+
+    /// Filter and sort stale issues for testing purposes.
+    /// Note: In production, this filtering is done by the storage layer via SQL.
+    fn filter_stale_issues(
+        issues: Vec<Issue>,
+        now: DateTime<Utc>,
+        threshold_days: i64,
+    ) -> Vec<Issue> {
+        let threshold = now - Duration::days(threshold_days);
+        let mut stale: Vec<Issue> = issues
+            .into_iter()
+            .filter(|i| i.updated_at < threshold)
+            .collect();
+        // Sort by updated_at ascending (oldest first)
+        stale.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        stale
     }
 
     #[test]
