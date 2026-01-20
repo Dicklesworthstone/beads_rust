@@ -8,9 +8,10 @@ use crate::config;
 use crate::error::Result;
 use crate::format::{Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary};
 use crate::model::{IssueType, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
+use rich_rust::prelude::*;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -26,7 +27,7 @@ pub fn execute(
     args: &StatsArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -77,11 +78,13 @@ pub fn execute(
         recent_activity,
     };
 
-    // Output
+    // Output based on mode
     let use_json = json || args.robot;
     if use_json {
         let json_str = serde_json::to_string_pretty(&output)?;
         println!("{json_str}");
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_stats_rich(&output, ctx);
     } else {
         print_text_output(&output);
     }
@@ -450,6 +453,219 @@ fn print_text_output(output: &Statistics) {
 
     // Match bd footer
     println!("\nFor more details, use 'bd list' to see individual issues.");
+}
+
+/// Render stats with rich formatting.
+#[allow(clippy::cast_precision_loss)]
+fn render_stats_rich(output: &Statistics, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    // Build content as Text with multiple sections
+    let mut content = Text::new("");
+
+    // === Overview Section ===
+    content.append_styled("\u{1f4ca} Overview\n", theme.section.clone());
+
+    let s = &output.summary;
+
+    // Main stats row
+    content.append_styled("   Total: ", theme.dimmed.clone());
+    content.append_styled(&s.total_issues.to_string(), theme.emphasis.clone());
+
+    content.append_styled("    Ready: ", theme.dimmed.clone());
+    content.append_styled(&s.ready_issues.to_string(), theme.success.clone());
+    content.append_styled(" \u{2713}", theme.success.clone());
+
+    content.append_styled("    Blocked: ", theme.dimmed.clone());
+    content.append_styled(&s.blocked_issues.to_string(), theme.warning.clone());
+    if s.blocked_issues > 0 {
+        content.append_styled(" \u{26a0}", theme.warning.clone());
+    }
+    content.append("\n\n");
+
+    // === Status Breakdown ===
+    content.append_styled("\u{1f4c8} By Status\n", theme.section.clone());
+    render_status_bars(&mut content, s, theme);
+    content.append("\n");
+
+    // === Optional Breakdowns ===
+    for breakdown in &output.breakdowns {
+        content.append_styled(
+            &format!("\u{1f4c8} By {}\n", capitalize(&breakdown.dimension)),
+            theme.section.clone(),
+        );
+        render_breakdown_bars(&mut content, breakdown, s.total_issues, theme);
+        content.append("\n");
+    }
+
+    // === Recent Activity ===
+    if let Some(activity) = &output.recent_activity {
+        content.append_styled(
+            &format!(
+                "\u{1f4c5} Activity (last {} hours)\n",
+                activity.hours_tracked
+            ),
+            theme.section.clone(),
+        );
+        content.append_styled("   Commits: ", theme.dimmed.clone());
+        content.append(&activity.commit_count.to_string());
+        if activity.total_changes > 0 {
+            content.append_styled("    Changes: ", theme.dimmed.clone());
+            content.append(&activity.total_changes.to_string());
+        }
+        content.append("\n\n");
+    }
+
+    // === Health Warnings ===
+    let mut warnings = Vec::new();
+    if s.blocked_issues > 5 {
+        warnings.push(format!("{} issues blocked", s.blocked_issues));
+    }
+    if s.epics_eligible_for_closure > 0 {
+        warnings.push(format!(
+            "{} epic{} ready to close",
+            s.epics_eligible_for_closure,
+            if s.epics_eligible_for_closure == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    if s.deferred_issues > 10 {
+        warnings.push(format!("{} issues deferred", s.deferred_issues));
+    }
+
+    if !warnings.is_empty() {
+        content.append_styled("\u{26a0} Health Warnings\n", theme.warning.clone());
+        for warning in &warnings {
+            content.append_styled("   \u{2022} ", theme.warning.clone());
+            content.append(warning);
+            content.append("\n");
+        }
+    }
+
+    // Wrap in panel
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Project Health", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render status distribution as progress bars.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_status_bars(content: &mut Text, summary: &StatsSummary, theme: &crate::output::Theme) {
+    let total = summary.total_issues.max(1);
+    let bar_width: usize = 24;
+
+    let statuses = [
+        ("Open", summary.open_issues, &theme.status_open),
+        (
+            "In Progress",
+            summary.in_progress_issues,
+            &theme.status_in_progress,
+        ),
+        ("Blocked", summary.blocked_issues, &theme.status_blocked),
+        ("Closed", summary.closed_issues, &theme.status_closed),
+    ];
+
+    for (label, count, style) in statuses {
+        if count == 0 {
+            continue;
+        }
+        let pct = (count as f64 / total as f64) * 100.0;
+        let filled = ((count as f64 / total as f64) * bar_width as f64).round() as usize;
+        let empty = bar_width.saturating_sub(filled);
+
+        content.append_styled(&format!("   {:<12}", label), style.clone());
+        content.append_styled(&"\u{2588}".repeat(filled), style.clone());
+        content.append_styled(&"\u{2591}".repeat(empty), theme.dimmed.clone());
+        content.append_styled(
+            &format!(" {:>3} ({:.0}%)", count, pct),
+            theme.dimmed.clone(),
+        );
+        content.append("\n");
+    }
+}
+
+/// Render a breakdown as progress bars.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn render_breakdown_bars(
+    content: &mut Text,
+    breakdown: &Breakdown,
+    total: usize,
+    theme: &crate::output::Theme,
+) {
+    let total = total.max(1);
+    let bar_width: usize = 24;
+
+    for entry in &breakdown.counts {
+        let pct = (entry.count as f64 / total as f64) * 100.0;
+        let filled = ((entry.count as f64 / total as f64) * bar_width as f64).round() as usize;
+        let empty = bar_width.saturating_sub(filled);
+
+        // Choose style based on key
+        let style = match breakdown.dimension.as_str() {
+            "priority" => match entry.key.as_str() {
+                "P0" => theme.priority_critical.clone(),
+                "P1" => theme.priority_high.clone(),
+                "P2" => theme.priority_medium.clone(),
+                "P3" => theme.priority_low.clone(),
+                _ => theme.priority_backlog.clone(),
+            },
+            "type" => match entry.key.as_str() {
+                "task" => theme.type_task.clone(),
+                "bug" => theme.type_bug.clone(),
+                "feature" => theme.type_feature.clone(),
+                "epic" => theme.type_epic.clone(),
+                "chore" => theme.type_chore.clone(),
+                "docs" => theme.type_docs.clone(),
+                "question" => theme.type_question.clone(),
+                _ => theme.dimmed.clone(),
+            },
+            _ => theme.accent.clone(),
+        };
+
+        content.append_styled(
+            &format!("   {:<12}", truncate_key(&entry.key, 12)),
+            style.clone(),
+        );
+        content.append_styled(&"\u{2588}".repeat(filled), style.clone());
+        content.append_styled(&"\u{2591}".repeat(empty), theme.dimmed.clone());
+        content.append_styled(
+            &format!(" {:>3} ({:.0}%)", entry.count, pct),
+            theme.dimmed.clone(),
+        );
+        content.append("\n");
+    }
+}
+
+/// Capitalize the first letter of a string.
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
+/// Truncate a key to fit in the label column.
+fn truncate_key(key: &str, max_len: usize) -> String {
+    if key.len() <= max_len {
+        key.to_string()
+    } else {
+        format!("{}...", &key[..max_len.saturating_sub(3)])
+    }
 }
 
 #[cfg(test)]
