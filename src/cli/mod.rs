@@ -839,6 +839,10 @@ pub enum AuditCommands {
     Record(AuditRecordArgs),
     /// Append a label entry referencing an existing interaction
     Label(AuditLabelArgs),
+    /// View audit log for an issue
+    Log(AuditLogArgs),
+    /// View audit summary
+    Summary(AuditSummaryArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -893,6 +897,19 @@ pub struct AuditLabelArgs {
     /// Reason for label
     #[arg(long)]
     pub reason: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditLogArgs {
+    /// Issue ID
+    pub id: String,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct AuditSummaryArgs {
+    /// Show summary for last N days (default: 30)
+    #[arg(long, default_value_t = 30)]
+    pub days: u32,
 }
 
 #[derive(Args, Debug, Clone)]

@@ -2,8 +2,9 @@ use crate::cli::{CountArgs, CountBy};
 use crate::config;
 use crate::error::Result;
 use crate::model::{IssueType, Priority, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -33,7 +34,7 @@ pub fn execute(
     args: &CountArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(None)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -85,6 +86,8 @@ pub fn execute(
             if json {
                 let payload = serde_json::to_string(&CountOutput { count: total })?;
                 println!("{payload}");
+            } else if matches!(ctx.mode(), OutputMode::Rich) {
+                render_count_simple_rich(total, ctx);
             } else {
                 println!("{total}");
             }
@@ -94,6 +97,8 @@ pub fn execute(
             if json {
                 let payload = serde_json::to_string(&CountGroupedOutput { total, groups })?;
                 println!("{payload}");
+            } else if matches!(ctx.mode(), OutputMode::Rich) {
+                render_count_grouped_rich(total, &groups, by, ctx);
             } else {
                 println!("Total: {total}");
                 for group in groups {
@@ -104,6 +109,70 @@ pub fn execute(
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rich Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Render simple count with rich formatting.
+fn render_count_simple_rich(total: usize, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("Total: ", theme.dimmed.clone());
+    content.append_styled(&total.to_string(), theme.emphasis.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Issue Count", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render grouped count with rich formatting.
+fn render_count_grouped_rich(
+    total: usize,
+    groups: &[CountGroup],
+    by: CountBy,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("Total: ", theme.dimmed.clone());
+    content.append_styled(&total.to_string(), theme.emphasis.clone());
+    content.append("\n\n");
+
+    // Find longest group name for alignment
+    let max_len = groups.iter().map(|g| g.group.len()).max().unwrap_or(0);
+
+    for group in groups {
+        let padded = format!("{:<width$}", group.group, width = max_len);
+        content.append_styled(&padded, theme.accent.clone());
+        content.append("  ");
+        content.append_styled(&group.count.to_string(), theme.emphasis.clone());
+        content.append("\n");
+    }
+
+    let title = match by {
+        CountBy::Status => "Issue Counts by Status",
+        CountBy::Priority => "Issue Counts by Priority",
+        CountBy::Type => "Issue Counts by Type",
+        CountBy::Assignee => "Issue Counts by Assignee",
+        CountBy::Label => "Issue Counts by Label",
+    };
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(title, theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }
 
 fn parse_statuses(values: &[String]) -> Result<Vec<Status>> {

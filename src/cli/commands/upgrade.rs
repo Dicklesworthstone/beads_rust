@@ -4,7 +4,8 @@
 
 use crate::cli::UpgradeArgs;
 use crate::error::{BeadsError, Result};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
+use rich_rust::prelude::*;
 use self_update::backends::github;
 use self_update::cargo_crate_version;
 use self_update::update::ReleaseUpdate;
@@ -44,22 +45,22 @@ struct UpdateResult {
 /// # Errors
 ///
 /// Returns an error if the update check or download fails.
-pub fn execute(args: &UpgradeArgs, json: bool, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &UpgradeArgs, json: bool, ctx: &OutputContext) -> Result<()> {
     let current_version = cargo_crate_version!();
 
     if args.dry_run {
-        return execute_dry_run(args, current_version, json);
+        return execute_dry_run(args, current_version, json, ctx);
     }
 
     if args.check {
-        return execute_check(current_version, json);
+        return execute_check(current_version, json, ctx);
     }
 
-    execute_upgrade(args, current_version, json)
+    execute_upgrade(args, current_version, json, ctx)
 }
 
 /// Execute check-only mode.
-fn execute_check(current_version: &str, json: bool) -> Result<()> {
+fn execute_check(current_version: &str, json: bool, ctx: &OutputContext) -> Result<()> {
     tracing::info!("Checking for updates...");
 
     let updater = build_updater(current_version)?;
@@ -80,6 +81,8 @@ fn execute_check(current_version: &str, json: bool) -> Result<()> {
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_check_rich(&result, ctx);
     } else {
         println!("Current version: {current_version}");
         println!("Latest version:  {latest_version}");
@@ -95,7 +98,12 @@ fn execute_check(current_version: &str, json: bool) -> Result<()> {
 }
 
 /// Execute dry-run mode.
-fn execute_dry_run(args: &UpgradeArgs, current_version: &str, json: bool) -> Result<()> {
+fn execute_dry_run(
+    args: &UpgradeArgs,
+    current_version: &str,
+    json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     tracing::info!("Dry-run mode: checking what would happen...");
 
     let target_version = args.version.as_deref();
@@ -121,6 +129,14 @@ fn execute_dry_run(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
             "would_update": would_update,
         });
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_dry_run_rich(
+            current_version,
+            install_version,
+            &download_url,
+            would_update,
+            ctx,
+        );
     } else {
         println!("Dry-run mode (no changes will be made)\n");
         println!("Current version: {current_version}");
@@ -141,16 +157,27 @@ fn execute_dry_run(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
 }
 
 /// Execute the actual upgrade.
-fn execute_upgrade(args: &UpgradeArgs, current_version: &str, json: bool) -> Result<()> {
+fn execute_upgrade(
+    args: &UpgradeArgs,
+    current_version: &str,
+    json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     tracing::info!(current = %current_version, "Starting upgrade...");
 
-    if !json {
+    let is_rich = matches!(ctx.mode(), OutputMode::Rich);
+
+    if !json && !is_rich {
         println!("Checking for updates...");
         println!("Current version: {current_version}");
+    } else if is_rich {
+        ctx.info(&format!(
+            "Checking for updates (current: {current_version})..."
+        ));
     }
 
     let updater = if let Some(ref target_version) = args.version {
-        build_updater_with_target(target_version, current_version, !json)?
+        build_updater_with_target(target_version, current_version, !json && !is_rich)?
     } else {
         build_updater(current_version)?
     };
@@ -159,7 +186,7 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
     let latest = updater.get_latest_release().map_err(map_update_error)?;
     let latest_version = &latest.version;
 
-    if !json {
+    if !json && !is_rich {
         println!("Latest version:  {latest_version}");
     }
 
@@ -175,14 +202,18 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
 
         if json {
             println!("{}", serde_json::to_string_pretty(&result)?);
+        } else if is_rich {
+            render_up_to_date_rich(current_version, latest_version, ctx);
         } else {
             println!("\n\u{2713} Already up to date");
         }
         return Ok(());
     }
 
-    if !json {
+    if !json && !is_rich {
         println!("\nDownloading {latest_version}...");
+    } else if is_rich {
+        ctx.info(&format!("Downloading {latest_version}..."));
     }
 
     // Perform the update
@@ -201,6 +232,8 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, json: bool) -> Res
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if is_rich {
+        render_upgrade_result_rich(&result, current_version, ctx);
     } else if status.updated() {
         println!(
             "\n\u{2713} Updated br from {current_version} to {}",
@@ -271,6 +304,152 @@ fn version_newer(new: &str, current: &str) -> bool {
 
     // If all compared parts are equal, the one with more parts is newer
     new_parts.len() > current_parts.len()
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rich Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Render update check results with rich formatting.
+fn render_check_rich(result: &UpdateCheckResult, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    // Version comparison
+    content.append_styled("Current version:  ", theme.dimmed.clone());
+    content.append_styled(&result.current_version, theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Latest version:   ", theme.dimmed.clone());
+    if result.update_available {
+        content.append_styled(&result.latest_version, theme.success.clone());
+        content.append_styled(" ✓ NEW", theme.success.clone());
+    } else {
+        content.append_styled(&result.latest_version, theme.emphasis.clone());
+    }
+    content.append("\n\n");
+
+    // Status message
+    if result.update_available {
+        content.append_styled("↑ ", theme.success.clone());
+        content.append_styled("Update available! ", theme.success.clone());
+        content.append("Run ");
+        content.append_styled("`br upgrade`", theme.accent.clone());
+        content.append(" to install.\n");
+    } else {
+        content.append_styled("✓ ", theme.success.clone());
+        content.append("Already up to date\n");
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Upgrade Check", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render dry-run results with rich formatting.
+fn render_dry_run_rich(
+    current_version: &str,
+    target_version: &str,
+    download_url: &str,
+    would_update: bool,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled("⚡ Dry-run mode ", theme.warning.clone());
+    content.append_styled("(no changes will be made)\n\n", theme.dimmed.clone());
+
+    content.append_styled("Current version:  ", theme.dimmed.clone());
+    content.append_styled(current_version, theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Target version:   ", theme.dimmed.clone());
+    content.append_styled(target_version, theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Would download:   ", theme.dimmed.clone());
+    content.append_styled(download_url, theme.accent.clone());
+    content.append("\n");
+
+    content.append_styled("Would install:    ", theme.dimmed.clone());
+    if would_update {
+        content.append_styled("yes", theme.success.clone());
+    } else {
+        content.append_styled("no (already up to date)", theme.warning.clone());
+    }
+    content.append("\n\n");
+
+    content.append_styled("No changes made.", theme.dimmed.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Upgrade Dry Run", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render "already up to date" message with rich formatting.
+fn render_up_to_date_rich(current_version: &str, latest_version: &str, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled("Current version:  ", theme.dimmed.clone());
+    content.append_styled(current_version, theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Latest version:   ", theme.dimmed.clone());
+    content.append_styled(latest_version, theme.emphasis.clone());
+    content.append("\n\n");
+
+    content.append_styled("✓ ", theme.success.clone());
+    content.append("Already up to date\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Upgrade Status", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render upgrade result with rich formatting.
+fn render_upgrade_result_rich(result: &UpdateResult, current_version: &str, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    if result.updated {
+        content.append_styled("✓ ", theme.success.clone());
+        content.append_styled("Upgraded ", theme.success.clone());
+        content.append("br from ");
+        content.append_styled(current_version, theme.dimmed.clone());
+        content.append(" to ");
+        content.append_styled(&result.new_version, theme.success.clone());
+        content.append("\n");
+    } else {
+        content.append_styled("✓ ", theme.success.clone());
+        content.append("Already up to date\n");
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Upgrade Complete", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }
 
 #[cfg(test)]

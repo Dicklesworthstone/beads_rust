@@ -689,3 +689,103 @@ fn e2e_audit_with_actor_override() {
     assert_eq!(entries[0]["actor"], "test-agent");
     info!("e2e_audit_with_actor_override: done");
 }
+
+#[test]
+fn e2e_audit_log_for_issue() {
+    common::init_test_logging();
+    info!("e2e_audit_log_for_issue: start");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success());
+
+    // Create an issue
+    let create = run_br(&workspace, ["create", "Test Issue"], "create");
+    assert!(create.status.success());
+    // Parse ID from output: "Created bd-123: Test Issue" or similar
+    let output = create.stdout.trim();
+    let id = if let Some(word) = output.split_whitespace().find(|word| word.starts_with("bd-")) {
+        word.trim_end_matches(':').to_string() // Remove trailing colon
+    } else {
+        // Fallback
+        output.split(':').next().unwrap_or("").replace("Created ", "").trim().to_string()
+    };
+
+    // Update it to generate events
+    let update = run_br(&workspace, ["update", &id, "--priority", "0"], "update_priority");
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+    
+    let close = run_br(&workspace, ["close", &id, "--reason", "Done"], "close");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    // Check log
+    let log = run_br(&workspace, ["audit", "log", &id], "audit_log");
+    assert!(log.status.success(), "audit log failed: {}", log.stderr);
+    assert!(log.stdout.contains("created"), "should show created event");
+    assert!(
+        log.stdout.contains("priority_changed") || log.stdout.contains("updated"),
+        "should show update event"
+    );
+    assert!(log.stdout.contains("closed"), "should show closed event");
+    assert!(log.stdout.contains("Done"), "should show close reason");
+
+    // Check JSON log
+    let log_json = run_br(
+        &workspace,
+        ["audit", "log", &id, "--json"],
+        "audit_log_json",
+    );
+    assert!(log_json.status.success());
+    let payload = extract_json_payload(&log_json.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid json");
+    assert_eq!(json["issue_id"], id);
+    assert!(json["events"].as_array().unwrap().len() >= 3);
+
+    info!("e2e_audit_log_for_issue: done");
+}
+
+#[test]
+fn e2e_audit_summary() {
+    common::init_test_logging();
+    info!("e2e_audit_summary: start");
+    let workspace = BrWorkspace::new();
+    run_br(&workspace, ["init"], "init");
+
+    // Generate activity
+    run_br(&workspace, ["create", "Issue 1"], "create1");
+    run_br(&workspace, ["create", "Issue 2"], "create2");
+
+    // Get ID of Issue 1
+    let list = run_br(&workspace, ["list", "--json"], "list");
+    let json: Vec<Value> = serde_json::from_str(&extract_json_payload(&list.stdout)).unwrap();
+    let id1 = json.iter().find(|i| i["title"] == "Issue 1").unwrap()["id"]
+        .as_str()
+        .unwrap();
+
+    run_br(&workspace, ["close", id1], "close");
+
+    // Check summary
+    let summary = run_br(&workspace, ["audit", "summary"], "audit_summary");
+    assert!(
+        summary.status.success(),
+        "audit summary failed: {}",
+        summary.stderr
+    );
+    assert!(summary.stdout.contains("Audit Summary"), "should show title");
+    assert!(summary.stdout.contains("TOTAL"), "should show totals");
+
+    // Check JSON summary
+    let summary_json = run_br(
+        &workspace,
+        ["audit", "summary", "--json"],
+        "audit_summary_json",
+    );
+    assert!(summary_json.status.success());
+    let payload = extract_json_payload(&summary_json.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid json");
+
+    let totals = &json["totals"];
+    assert!(totals["created"].as_u64().unwrap() >= 2);
+    assert!(totals["closed"].as_u64().unwrap() >= 1);
+
+    info!("e2e_audit_summary: done");
+}

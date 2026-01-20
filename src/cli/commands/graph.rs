@@ -8,10 +8,11 @@
 use crate::cli::GraphArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{DependencyType, Status};
-use crate::output::OutputContext;
+use crate::model::{DependencyType, Issue, Status};
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -61,7 +62,7 @@ pub fn execute(
     args: &GraphArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -72,19 +73,25 @@ pub fn execute(
     let all_ids = storage_ctx.storage.get_all_ids()?;
 
     if args.all {
-        graph_all(&storage_ctx.storage, args.compact, json)
+        graph_all(&storage_ctx.storage, args.compact, json, ctx)
     } else {
         let issue_id = args.issue.as_ref().ok_or_else(|| {
             BeadsError::validation("issue", "Issue ID required unless --all is specified")
         })?;
 
         let resolved_id = resolve_issue_id(&storage_ctx.storage, &resolver, &all_ids, issue_id)?;
-        graph_single(&storage_ctx.storage, &resolved_id, args.compact, json)
+        graph_single(&storage_ctx.storage, &resolved_id, args.compact, json, ctx)
     }
 }
 
 /// Show graph for a single issue (traverse dependents only).
-fn graph_single(storage: &SqliteStorage, root_id: &str, compact: bool, json: bool) -> Result<()> {
+fn graph_single(
+    storage: &SqliteStorage,
+    root_id: &str,
+    compact: bool,
+    json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     // Verify the root issue exists
     let root_issue = storage
         .get_issue(root_id)?
@@ -160,11 +167,17 @@ fn graph_single(storage: &SqliteStorage, root_id: &str, compact: bool, json: boo
 
     // Text output
     if nodes.len() == 1 {
-        println!("No dependents for {root_id}");
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_no_dependents_rich(root_id, &root_issue, ctx);
+        } else {
+            println!("No dependents for {root_id}");
+        }
         return Ok(());
     }
 
-    if compact {
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_single_graph_rich(&nodes, &root_issue, ctx);
+    } else if compact {
         // One-liner format: root <- dep1 <- dep2 ...
         let dependent_ids: Vec<&str> = nodes.iter().skip(1).map(|n| n.id.as_str()).collect();
         println!("{} <- {}", root_id, dependent_ids.join(" <- "));
@@ -193,7 +206,12 @@ fn graph_single(storage: &SqliteStorage, root_id: &str, compact: bool, json: boo
 
 /// Show graph for all `open`/`in_progress`/`blocked` issues.
 #[allow(clippy::too_many_lines)]
-fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
+fn graph_all(
+    storage: &SqliteStorage,
+    compact: bool,
+    json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     // Get all open/in_progress/blocked issues
     let filters = ListFilters {
         statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked]),
@@ -213,6 +231,8 @@ fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
                 total_components: 0,
             };
             println!("{}", serde_json::to_string_pretty(&output)?);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
+            render_no_issues_rich(ctx);
         } else {
             println!("No open/in_progress/blocked issues found");
         }
@@ -348,36 +368,40 @@ fn graph_all(storage: &SqliteStorage, compact: bool, json: bool) -> Result<()> {
     }
 
     // Text output
-    println!(
-        "Dependency graph: {} issues in {} component(s)",
-        total_nodes,
-        components.len()
-    );
-    println!();
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_all_graph_rich(&components, total_nodes, ctx);
+    } else {
+        println!(
+            "Dependency graph: {} issues in {} component(s)",
+            total_nodes,
+            components.len()
+        );
+        println!();
 
-    for (i, component) in components.iter().enumerate() {
-        if compact {
-            // Compact: one line per component
-            let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-            println!("Component {}: {}", i + 1, ids.join(", "));
-        } else {
-            // Detailed view
-            println!(
-                "Component {} ({} issues, roots: {}):",
-                i + 1,
-                component.nodes.len(),
-                component.roots.join(", ")
-            );
-
-            for node in &component.nodes {
-                let indent = "  ".repeat(node.depth + 1);
-                let root_marker = if node.depth == 0 { " (root)" } else { "" };
+        for (i, component) in components.iter().enumerate() {
+            if compact {
+                // Compact: one line per component
+                let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
+                println!("Component {}: {}", i + 1, ids.join(", "));
+            } else {
+                // Detailed view
                 println!(
-                    "{}{}: {} [P{}] [{}]{}",
-                    indent, node.id, node.title, node.priority, node.status, root_marker
+                    "Component {} ({} issues, roots: {}):",
+                    i + 1,
+                    component.nodes.len(),
+                    component.roots.join(", ")
                 );
+
+                for node in &component.nodes {
+                    let indent = "  ".repeat(node.depth + 1);
+                    let root_marker = if node.depth == 0 { " (root)" } else { "" };
+                    println!(
+                        "{}{}: {} [P{}] [{}]{}",
+                        indent, node.id, node.title, node.priority, node.status, root_marker
+                    );
+                }
+                println!();
             }
-            println!();
         }
     }
 
@@ -461,6 +485,225 @@ fn resolve_issue_id(
             |hash| find_matching_ids(all_ids, hash),
         )
         .map(|resolved| resolved.id)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rich Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Render single graph with rich formatting.
+fn render_single_graph_rich(nodes: &[GraphNode], root_issue: &Issue, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    // Header with root info
+    content.append_styled("Root: ", theme.dimmed.clone());
+    content.append_styled(&root_issue.id, theme.issue_id.clone());
+    content.append(" ");
+    content.append_styled(&root_issue.title, theme.emphasis.clone());
+    content.append("\n\n");
+
+    // Dependent count
+    let dep_count = nodes.len() - 1;
+    content.append_styled(
+        &format!(
+            "{} dependent{}\n\n",
+            dep_count,
+            if dep_count == 1 { "" } else { "s" }
+        ),
+        theme.dimmed.clone(),
+    );
+
+    // Render tree
+    for node in nodes {
+        let indent = "  ".repeat(node.depth);
+
+        // Depth indicator
+        if node.depth == 0 {
+            content.append_styled("● ", theme.success.clone());
+        } else {
+            content.append(&indent);
+            content.append_styled("← ", theme.dimmed.clone());
+        }
+
+        // ID
+        content.append_styled(&node.id, theme.issue_id.clone());
+        content.append(" ");
+
+        // Title
+        content.append(&node.title);
+        content.append(" ");
+
+        // Priority badge
+        let priority_style = priority_style(node.priority, theme);
+        content.append_styled(&format!("[P{}]", node.priority), priority_style);
+        content.append(" ");
+
+        // Status badge
+        let status_style = status_style(&node.status, theme);
+        content.append_styled(&format!("[{}]", node.status), status_style);
+
+        if node.depth == 0 {
+            content.append_styled(" (root)", theme.dimmed.clone());
+        }
+        content.append("\n");
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render no dependents message with rich formatting.
+fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled("● ", theme.success.clone());
+    content.append_styled(root_id, theme.issue_id.clone());
+    content.append(" ");
+    content.append(&root_issue.title);
+    content.append("\n\n");
+    content.append_styled("No dependents found", theme.dimmed.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render all graph (connected components) with rich formatting.
+fn render_all_graph_rich(
+    components: &[ConnectedComponent],
+    total_nodes: usize,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    // Summary header
+    content.append_styled(
+        &format!(
+            "{} issue{} in {} component{}\n",
+            total_nodes,
+            if total_nodes == 1 { "" } else { "s" },
+            components.len(),
+            if components.len() == 1 { "" } else { "s" }
+        ),
+        theme.section.clone(),
+    );
+
+    // Render each component
+    for (i, component) in components.iter().enumerate() {
+        content.append("\n");
+
+        // Component header
+        content.append_styled(&format!("Component {}", i + 1), theme.emphasis.clone());
+        content.append_styled(
+            &format!(
+                " ({} issue{}, roots: {})\n",
+                component.nodes.len(),
+                if component.nodes.len() == 1 { "" } else { "s" },
+                component.roots.join(", ")
+            ),
+            theme.dimmed.clone(),
+        );
+
+        // Render nodes in component
+        for node in &component.nodes {
+            let indent = "  ".repeat(node.depth + 1);
+            content.append(&indent);
+
+            // ID
+            content.append_styled(&node.id, theme.issue_id.clone());
+            content.append(" ");
+
+            // Title (truncate if too long)
+            let title = if node.title.len() > 40 {
+                format!("{}...", &node.title[..37])
+            } else {
+                node.title.clone()
+            };
+            content.append(&title);
+            content.append(" ");
+
+            // Priority badge
+            let priority_style = priority_style(node.priority, theme);
+            content.append_styled(&format!("[P{}]", node.priority), priority_style);
+            content.append(" ");
+
+            // Status badge
+            let status_style = status_style(&node.status, theme);
+            content.append_styled(&format!("[{}]", node.status), status_style);
+
+            if node.depth == 0 {
+                content.append_styled(" (root)", theme.dimmed.clone());
+            }
+            content.append("\n");
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render no issues message with rich formatting.
+fn render_no_issues_rich(ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled(
+        "No open/in_progress/blocked issues found",
+        theme.dimmed.clone(),
+    );
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Get style for priority level.
+fn priority_style(priority: i32, theme: &crate::output::Theme) -> Style {
+    match priority {
+        0 => theme.priority_critical.clone(),
+        1 => theme.priority_high.clone(),
+        2 => theme.priority_medium.clone(),
+        3 => theme.priority_low.clone(),
+        _ => theme.priority_backlog.clone(),
+    }
+}
+
+/// Get style for status.
+fn status_style(status: &str, theme: &crate::output::Theme) -> Style {
+    match status {
+        "open" => theme.status_open.clone(),
+        "in_progress" => theme.status_in_progress.clone(),
+        "blocked" => theme.status_blocked.clone(),
+        "closed" => theme.status_closed.clone(),
+        "deferred" => theme.status_deferred.clone(),
+        _ => theme.dimmed.clone(),
+    }
 }
 
 #[cfg(test)]

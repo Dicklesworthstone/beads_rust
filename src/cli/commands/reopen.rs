@@ -4,9 +4,10 @@ use crate::cli::ReopenArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use rich_rust::prelude::*;
 use serde::Serialize;
 
 /// Result of reopening a single issue.
@@ -44,7 +45,7 @@ pub fn execute(
     args: &ReopenArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let use_json = json || args.robot;
 
@@ -150,6 +151,13 @@ pub fn execute(
         };
         let output = serde_json::to_string_pretty(&result).map_err(BeadsError::Json)?;
         println!("{output}");
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_reopen_rich(
+            &reopened_issues,
+            &skipped_issues,
+            args.reason.as_deref(),
+            ctx,
+        );
     } else {
         for reopened in &reopened_issues {
             print!("\u{2713} Reopened {}: {}", reopened.id, reopened.title);
@@ -169,4 +177,60 @@ pub fn execute(
 
     storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
+}
+
+/// Render reopen results with rich formatting.
+fn render_reopen_rich(
+    reopened: &[ReopenedIssue],
+    skipped: &[SkippedIssue],
+    reason: Option<&str>,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    if reopened.is_empty() && skipped.is_empty() {
+        content.append("No issues to reopen.\n");
+    } else {
+        for item in reopened {
+            content.append_styled("\u{2713} ", theme.success.clone());
+            content.append_styled("Reopened ", theme.success.clone());
+            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append(": ");
+            content.append(&item.title);
+            if let Some(r) = reason {
+                content.append_styled(&format!(" ({r})"), theme.dimmed.clone());
+            }
+            content.append("\n");
+            content.append_styled("  Status: ", theme.dimmed.clone());
+            content.append_styled("closed", theme.error.clone());
+            content.append(" \u{2192} ");
+            content.append_styled("open", theme.success.clone());
+            content.append("\n");
+        }
+
+        for item in skipped {
+            content.append_styled("\u{2298} ", theme.warning.clone());
+            content.append_styled("Skipped ", theme.warning.clone());
+            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append(": ");
+            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append("\n");
+        }
+    }
+
+    let title = if reopened.len() == 1 && skipped.is_empty() {
+        "Issue Reopened"
+    } else {
+        "Reopen Results"
+    };
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(title, theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }

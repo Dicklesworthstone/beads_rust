@@ -13,19 +13,19 @@ use std::path::Path;
 /// # Errors
 ///
 /// Returns an error if history operations fail (e.g. IO error, invalid path).
-pub fn execute(args: HistoryArgs, _cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: HistoryArgs, _cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let history_dir = beads_dir.join(".br_history");
 
     match args.command {
-        Some(HistoryCommands::Diff { file }) => diff_backup(&beads_dir, &history_dir, &file, _ctx),
+        Some(HistoryCommands::Diff { file }) => diff_backup(&beads_dir, &history_dir, &file, ctx),
         Some(HistoryCommands::Restore { file, force }) => {
-            restore_backup(&beads_dir, &history_dir, &file, force, _ctx)
+            restore_backup(&beads_dir, &history_dir, &file, force, ctx)
         }
         Some(HistoryCommands::Prune { keep, older_than }) => {
-            prune_backups(&history_dir, keep, older_than, _ctx)
+            prune_backups(&history_dir, keep, older_than, ctx)
         }
-        Some(HistoryCommands::List) | None => list_backups(&history_dir, _ctx),
+        Some(HistoryCommands::List) | None => list_backups(&history_dir, ctx),
     }
 }
 
@@ -218,9 +218,7 @@ fn diff_backup(
             }
         }
         Err(err) => {
-            return Err(BeadsError::Config(format!(
-                "Failed to run diff: {err}"
-            )));
+            return Err(BeadsError::Config(format!("Failed to run diff: {err}")));
         }
     }
 
@@ -271,9 +269,8 @@ fn restore_backup(
 
     if ctx.is_rich() {
         let theme = ctx.theme();
-        let body = format!(
-            "Restored {filename} to issues.jsonl.\nNext: br sync --import-only --force"
-        );
+        let body =
+            format!("Restored {filename} to issues.jsonl.\nNext: br sync --import-only --force");
         let panel = Panel::from_text(&body)
             .title(Text::styled("History Restore", theme.panel_title.clone()))
             .box_style(theme.box_style)
@@ -315,7 +312,9 @@ fn prune_backups(
         let theme = ctx.theme();
         let mut body = format!("Pruned {deleted} backup(s).");
         if let Some(days) = older_than_days {
-            body.push_str(&format!("\nCriteria: keep {keep}, delete older than {days} days"));
+            body.push_str(&format!(
+                "\nCriteria: keep {keep}, delete older than {days} days"
+            ));
         } else {
             body.push_str(&format!("\nCriteria: keep {keep} newest backups"));
         }

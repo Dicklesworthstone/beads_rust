@@ -2,10 +2,11 @@ use crate::cli::QuickArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, IssueType, Priority, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::util::id::IdGenerator;
 use crate::validation::LabelValidator;
 use chrono::Utc;
+use rich_rust::prelude::*;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -27,7 +28,7 @@ fn split_labels(values: &[String]) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error if validation fails, the database cannot be opened, or creation fails.
-pub fn execute(args: QuickArgs, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let title = args.title.join(" ").trim().to_string();
     if title.is_empty() {
         return Err(BeadsError::validation("title", "cannot be empty"));
@@ -123,8 +124,42 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, _ctx: &OutputContext
         }
     }
 
-    println!("{}", issue.id);
+    // Output
+    if ctx.is_json() {
+        let output = serde_json::json!({
+            "id": issue.id,
+            "title": issue.title,
+        });
+        println!("{}", serde_json::to_string(&output)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_quick_created_rich(&issue.id, &issue.title, ctx);
+    } else {
+        println!("{}", issue.id);
+    }
 
     storage_ctx.flush_no_db_if_dirty()?;
     Ok(())
+}
+
+/// Render quick create result with rich formatting.
+fn render_quick_created_rich(id: &str, title: &str, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("\u{2713} ", theme.success.clone());
+    content.append_styled("Created ", theme.success.clone());
+    content.append_styled(id, theme.emphasis.clone());
+    content.append("\n");
+    content.append_styled("  \"", theme.dimmed.clone());
+    content.append(title);
+    content.append_styled("\"", theme.dimmed.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Quick Create", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }

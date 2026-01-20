@@ -74,7 +74,12 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.whats_new {
-        return print_message(json, ctx, "No whats-new data available for br.", "whats_new");
+        return print_message(
+            json,
+            ctx,
+            "No whats-new data available for br.",
+            "whats_new",
+        );
     }
     if args.thanks {
         return print_message(
@@ -313,7 +318,10 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
     }
 
     let panel = Panel::from_rich_text(&content, width)
-        .title(Text::styled("Project Information", theme.panel_title.clone()))
+        .title(Text::styled(
+            "Project Information",
+            theme.panel_title.clone(),
+        ))
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);

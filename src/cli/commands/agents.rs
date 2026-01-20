@@ -734,14 +734,7 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
 
     let mut content = Text::new("");
 
-    if !detection.found() {
-        content.append_styled("\u{2717} ", theme.warning.clone());
-        content.append("No AGENTS.md or CLAUDE.md found in ");
-        content.append_styled(&work_dir.display().to_string(), theme.accent.clone());
-        content.append("\n\n");
-        content.append_styled("To add beads workflow instructions:\n", theme.dimmed.clone());
-        content.append_styled("  br agents --add", theme.accent.clone());
-    } else {
+    if detection.found() {
         let file_path = detection.file_path.as_ref().unwrap();
         let file_type = detection.file_type.as_ref().unwrap();
 
@@ -776,10 +769,23 @@ fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &Outp
             content.append_styled("To add:\n", theme.dimmed.clone());
             content.append_styled("  br agents --add", theme.accent.clone());
         }
+    } else {
+        content.append_styled("\u{2717} ", theme.warning.clone());
+        content.append("No AGENTS.md or CLAUDE.md found in ");
+        content.append_styled(&work_dir.display().to_string(), theme.accent.clone());
+        content.append("\n\n");
+        content.append_styled(
+            "To add beads workflow instructions:\n",
+            theme.dimmed.clone(),
+        );
+        content.append_styled("  br agents --add", theme.accent.clone());
     }
 
     let panel = Panel::from_rich_text(&content, width)
-        .title(Text::styled("Agent Instructions", theme.panel_title.clone()))
+        .title(Text::styled(
+            "Agent Instructions",
+            theme.panel_title.clone(),
+        ))
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
@@ -806,7 +812,10 @@ fn render_dry_run_add_rich(file_path: &Path, ctx: &OutputContext) {
     let width = ctx.width();
 
     let mut content = Text::new("");
-    content.append_styled("Would add beads workflow instructions to:\n", theme.dimmed.clone());
+    content.append_styled(
+        "Would add beads workflow instructions to:\n",
+        theme.dimmed.clone(),
+    );
     content.append_styled(&file_path.display().to_string(), theme.accent.clone());
 
     let panel = Panel::from_rich_text(&content, width)
@@ -895,7 +904,10 @@ fn render_dry_run_update_rich(file_path: &Path, from_version: &str, ctx: &Output
     let width = ctx.width();
 
     let mut content = Text::new("");
-    content.append_styled("Would update beads workflow instructions from ", theme.dimmed.clone());
+    content.append_styled(
+        "Would update beads workflow instructions from ",
+        theme.dimmed.clone(),
+    );
     content.append_styled(from_version, theme.warning.clone());
     content.append_styled(" to ", theme.dimmed.clone());
     content.append_styled(&format!("v{BLURB_VERSION}"), theme.success.clone());

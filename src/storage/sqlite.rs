@@ -117,6 +117,24 @@ impl SqliteStorage {
         Ok(Self { conn })
     }
 
+    /// Get audit events for a specific issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_events(&self, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
+        crate::storage::events::get_events(&self.conn, issue_id, limit)
+    }
+
+    /// Get all audit events (for summary).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_all_events(&self, limit: usize) -> Result<Vec<Event>> {
+        crate::storage::events::get_all_events(&self.conn, limit)
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// # Errors
@@ -328,6 +346,13 @@ impl SqliteStorage {
                     Some(status.as_str().to_string()),
                     None,
                 );
+
+                // Record Closed event if status is now Closed
+                if *status == Status::Closed {
+                    let reason = updates.close_reason.as_ref().and_then(|r| r.clone());
+                    ctx.record_event(EventType::Closed, id, reason);
+                }
+
                 ctx.invalidate_cache();
             }
 
@@ -604,7 +629,7 @@ impl SqliteStorage {
         if let Some(ref statuses) = filters.statuses {
             if !statuses.is_empty() {
                 let placeholders: Vec<String> = statuses.iter().map(|_| "?".to_string()).collect();
-                let _ = write!(sql, " AND status IN ({})", placeholders.join(","));
+                let _ = write!(sql, " AND status IN ({}) ", placeholders.join(","));
                 for s in statuses {
                     params.push(Box::new(s.as_str().to_string()));
                 }
@@ -614,7 +639,7 @@ impl SqliteStorage {
         if let Some(ref types) = filters.types {
             if !types.is_empty() {
                 let placeholders: Vec<String> = types.iter().map(|_| "?".to_string()).collect();
-                let _ = write!(sql, " AND issue_type IN ({})", placeholders.join(","));
+                let _ = write!(sql, " AND issue_type IN ({}) ", placeholders.join(","));
                 for t in types {
                     params.push(Box::new(t.as_str().to_string()));
                 }
@@ -625,7 +650,7 @@ impl SqliteStorage {
             if !priorities.is_empty() {
                 let placeholders: Vec<String> =
                     priorities.iter().map(|_| "?".to_string()).collect();
-                let _ = write!(sql, " AND priority IN ({})", placeholders.join(","));
+                let _ = write!(sql, " AND priority IN ({}) ", placeholders.join(","));
                 for p in priorities {
                     params.push(Box::new(p.0));
                 }
@@ -968,7 +993,7 @@ impl SqliteStorage {
         // Sorting
         match sort {
             ReadySortPolicy::Hybrid => {
-                // P0/P1 first by created_at ASC, then others by created_at ASC
+                // P0/P1 first by `created_at` ASC, then others by `created_at` ASC
                 sql.push_str(" ORDER BY CASE WHEN priority <= 1 THEN 0 ELSE 1 END, created_at ASC");
             }
             ReadySortPolicy::Priority => {
@@ -2185,7 +2210,9 @@ impl SqliteStorage {
             [issue_id],
             |row| row.get(0),
         )?;
-        Ok(usize::try_from(count).unwrap_or(0))
+        // count is always non-negative from COUNT(*), safe to cast
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(count as usize)
     }
 
     /// Count how many issues depend on this one.
@@ -2199,7 +2226,9 @@ impl SqliteStorage {
             [issue_id],
             |row| row.get(0),
         )?;
-        Ok(usize::try_from(count).unwrap_or(0))
+        // count is always non-negative from COUNT(*), safe to cast
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(count as usize)
     }
 
     /// Count dependencies for multiple issues efficiently.
@@ -2236,8 +2265,6 @@ impl SqliteStorage {
 
             for row in rows {
                 let (issue_id, count) = row?;
-                // count from COUNT(*) is non-negative
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 map.insert(issue_id, count as usize);
             }
         }
@@ -2279,8 +2306,6 @@ impl SqliteStorage {
 
             for row in rows {
                 let (issue_id, count) = row?;
-                // count from COUNT(*) is non-negative
-                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 map.insert(issue_id, count as usize);
             }
         }
@@ -3177,9 +3202,9 @@ impl SqliteStorage {
                 WHERE issue_id = ?1 {type_filter}
                 UNION
                 -- Recursive step: dependencies of dependencies
-                SELECT d.depends_on_id
+                SELECT d.issue_id
                 FROM dependencies d
-                JOIN transitive_deps td ON d.issue_id = td.id
+                JOIN transitive_deps td ON d.depends_on_id = td.id
                 WHERE 1=1 {type_filter}
             )
             SELECT 1 FROM transitive_deps WHERE id = ?2 LIMIT 1;
@@ -3890,7 +3915,7 @@ mod tests {
         let issues = storage
             .get_ready_issues(&filters, ReadySortPolicy::Oldest)
             .unwrap();
-        let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+        let ids: Vec<_> = issues.iter().map(|i| i.id.as_str()).collect();
         // blocker is ready (not blocked by anything)
         assert!(ids.contains(&"bd-blocker"));
         // blocked is NOT ready (blocked by blocker)
@@ -4728,6 +4753,38 @@ mod tests {
         assert!(ids.contains(&"bd-old"));
         assert!(ids.contains(&"bd-new"));
         assert!(!ids.contains(&"bd-older"));
+    }
+
+    #[test]
+    fn test_list_issues_filter_by_labels() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        let issue1 = make_issue("bd-l1", "Issue with label", Status::Open, 2, None, t1, None);
+        let issue2 = make_issue(
+            "bd-l2",
+            "Issue without label",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue1, "tester").unwrap();
+        storage.create_issue(&issue2, "tester").unwrap();
+
+        // Add label to issue1
+        storage.add_label("bd-l1", "test-label", "tester").unwrap();
+
+        // Filter by label
+        let filters = ListFilters {
+            labels: Some(vec!["test-label".to_string()]),
+            ..Default::default()
+        };
+
+        let issues = storage.list_issues(&filters).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, "bd-l1");
     }
 
     #[test]

@@ -7,8 +7,9 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use chrono::{DateTime, Utc};
+use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{debug, info};
@@ -239,12 +240,12 @@ pub fn execute(
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     match command {
-        QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, json),
+        QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, json, ctx),
         QueryCommands::Run(args) => {
             query_run(args, &storage_ctx.storage, json, cli, &beads_dir, ctx)
         }
-        QueryCommands::List => query_list(&storage_ctx.storage, json),
-        QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, json),
+        QueryCommands::List => query_list(&storage_ctx.storage, json, ctx),
+        QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, json, ctx),
     }
 }
 
@@ -252,6 +253,7 @@ fn query_save(
     args: &QuerySaveArgs,
     storage: &mut crate::storage::SqliteStorage,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
 
@@ -295,6 +297,8 @@ fn query_save(
             action: "saved".to_string(),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_query_save_rich(name, args.description.as_deref(), ctx);
     } else {
         println!("Saved query '{name}'");
     }
@@ -333,7 +337,11 @@ fn query_run(
     super::list::execute(&merged_args, json, cli, ctx)
 }
 
-fn query_list(storage: &crate::storage::SqliteStorage, json: bool) -> Result<()> {
+fn query_list(
+    storage: &crate::storage::SqliteStorage,
+    json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     let all_config = storage.get_all_config()?;
 
     let mut queries: Vec<QueryListItem> = Vec::new();
@@ -365,6 +373,8 @@ fn query_list(storage: &crate::storage::SqliteStorage, json: bool) -> Result<()>
             queries,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_query_list_rich(&queries, ctx);
     } else if queries.is_empty() {
         println!("No saved queries");
     } else {
@@ -387,6 +397,7 @@ fn query_delete(
     args: &QueryDeleteArgs,
     storage: &mut crate::storage::SqliteStorage,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
     let key = format!("{QUERY_KEY_PREFIX}{name}");
@@ -409,11 +420,101 @@ fn query_delete(
             action: "deleted".to_string(),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_query_delete_rich(name, ctx);
     } else {
         println!("Deleted query '{name}'");
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rich Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Render query save result with rich formatting.
+fn render_query_save_rich(name: &str, description: Option<&str>, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("\u{2713} ", theme.success.clone());
+    content.append_styled("Saved query ", theme.success.clone());
+    content.append_styled(name, theme.emphasis.clone());
+    content.append("\n");
+    if let Some(desc) = description {
+        content.append_styled("  ", theme.dimmed.clone());
+        content.append_styled(desc, theme.dimmed.clone());
+        content.append("\n");
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Query Saved", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render query list with rich formatting.
+fn render_query_list_rich(queries: &[QueryListItem], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    if queries.is_empty() {
+        content.append_styled("No saved queries\n", theme.dimmed.clone());
+    } else {
+        // Find longest name for alignment
+        let max_name_len = queries.iter().map(|q| q.name.len()).max().unwrap_or(0);
+
+        for q in queries {
+            let padded_name = format!("{:<width$}", q.name, width = max_name_len);
+            content.append_styled(&padded_name, theme.emphasis.clone());
+            content.append("  ");
+            if let Some(ref desc) = q.description {
+                content.append_styled(desc, theme.dimmed.clone());
+            } else {
+                content.append_styled("(no description)", theme.dimmed.clone());
+            }
+            content.append("\n");
+        }
+
+        content.append("\n");
+        content.append_styled(
+            &format!("{} query(ies) total", queries.len()),
+            theme.dimmed.clone(),
+        );
+        content.append("\n");
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Saved Queries", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render query delete result with rich formatting.
+fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("\u{2713} ", theme.success.clone());
+    content.append_styled("Deleted query ", theme.success.clone());
+    content.append_styled(name, theme.emphasis.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Query Deleted", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }
 
 #[cfg(test)]

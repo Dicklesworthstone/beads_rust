@@ -4,10 +4,11 @@ use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
 use crate::model::{EpicStatus, IssueType, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use chrono::Utc;
 use colored::Colorize;
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::path::Path;
@@ -33,7 +34,7 @@ fn execute_status(
     args: &EpicStatusArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -52,12 +53,20 @@ fn execute_status(
     }
 
     if epics.is_empty() {
-        println!("No open epics found");
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_empty_epics_rich(ctx);
+        } else {
+            println!("No open epics found");
+        }
         return Ok(());
     }
 
-    for epic_status in &epics {
-        render_epic_status(epic_status, use_color);
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_epic_status_list_rich(&epics, ctx);
+    } else {
+        for epic_status in &epics {
+            render_epic_status(epic_status, use_color);
+        }
     }
 
     Ok(())
@@ -73,7 +82,7 @@ fn execute_close_eligible(
     args: &EpicCloseEligibleArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -87,6 +96,8 @@ fn execute_close_eligible(
     if epics.is_empty() {
         if json {
             println!("[]");
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
+            render_no_eligible_rich(ctx);
         } else {
             println!("No epics eligible for closure");
         }
@@ -96,6 +107,8 @@ fn execute_close_eligible(
     if args.dry_run {
         if json {
             println!("{}", serde_json::to_string_pretty(&epics)?);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
+            render_dry_run_rich(&epics, ctx);
         } else {
             println!("Would close {} epic(s):", epics.len());
             for epic_status in &epics {
@@ -131,6 +144,8 @@ fn execute_close_eligible(
             count: closed_ids.len(),
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_close_result_rich(&closed_ids, ctx);
     } else {
         println!("✓ Closed {} epic(s)", closed_ids.len());
         for id in &closed_ids {
@@ -231,6 +246,194 @@ fn render_status_icon(eligible: bool, percentage: usize, use_color: bool) -> Str
     } else {
         "○".to_string()
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rich Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Render the epic status list with rich formatting.
+fn render_epic_status_list_rich(epics: &[EpicStatus], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    for (i, epic_status) in epics.iter().enumerate() {
+        if i > 0 {
+            content.append("\n");
+        }
+
+        let total = epic_status.total_children;
+        let closed = epic_status.closed_children;
+        let percentage = if total > 0 { (closed * 100) / total } else { 0 };
+
+        // Status icon
+        if epic_status.eligible_for_close {
+            content.append_styled("✓ ", theme.success.clone());
+        } else if percentage > 0 {
+            content.append_styled("○ ", theme.warning.clone());
+        } else {
+            content.append_styled("○ ", theme.dimmed.clone());
+        }
+
+        // ID and title
+        content.append_styled(&epic_status.epic.id, theme.issue_id.clone());
+        content.append(" ");
+        content.append_styled(&epic_status.epic.title, theme.emphasis.clone());
+        content.append("\n");
+
+        // Progress bar
+        content.append("   ");
+        render_progress_bar(&mut content, closed, total, percentage, theme);
+        content.append("\n");
+
+        // Eligible notice
+        if epic_status.eligible_for_close {
+            content.append("   ");
+            content.append_styled("Ready for closure", theme.success.clone());
+            content.append("\n");
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Epic Status", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render a progress bar inline.
+fn render_progress_bar(
+    content: &mut Text,
+    closed: usize,
+    total: usize,
+    percentage: usize,
+    theme: &crate::output::Theme,
+) {
+    let bar_width = 20;
+    let filled = if total > 0 {
+        (closed * bar_width) / total
+    } else {
+        0
+    };
+    let empty = bar_width - filled;
+
+    content.append_styled("[", theme.dimmed.clone());
+    if filled > 0 {
+        content.append_styled(&"█".repeat(filled), theme.success.clone());
+    }
+    if empty > 0 {
+        content.append_styled(&"░".repeat(empty), theme.dimmed.clone());
+    }
+    content.append_styled("] ", theme.dimmed.clone());
+
+    content.append(&format!("{closed}/{total} "));
+    content.append_styled(&format!("({percentage}%)"), theme.dimmed.clone());
+}
+
+/// Render empty epics message with rich formatting.
+fn render_empty_epics_rich(ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("No open epics found", theme.dimmed.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Epic Status", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render no eligible epics message with rich formatting.
+fn render_no_eligible_rich(ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("No epics eligible for closure", theme.dimmed.clone());
+    content.append("\n");
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Epic Close", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render dry-run results with rich formatting.
+fn render_dry_run_rich(epics: &[EpicStatus], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled("⚡ Dry-run mode ", theme.warning.clone());
+    content.append_styled("(no changes will be made)\n\n", theme.dimmed.clone());
+
+    content.append(&format!(
+        "Would close {} epic{}:\n\n",
+        epics.len(),
+        if epics.len() == 1 { "" } else { "s" }
+    ));
+
+    for epic_status in epics {
+        content.append_styled("  • ", theme.dimmed.clone());
+        content.append_styled(&epic_status.epic.id, theme.issue_id.clone());
+        content.append(" ");
+        content.append(&epic_status.epic.title);
+        content.append("\n");
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(
+            "Epic Close (Dry Run)",
+            theme.panel_title.clone(),
+        ))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render close results with rich formatting.
+fn render_close_result_rich(closed_ids: &[String], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled("✓ ", theme.success.clone());
+    content.append_styled(
+        &format!(
+            "Closed {} epic{}\n",
+            closed_ids.len(),
+            if closed_ids.len() == 1 { "" } else { "s" }
+        ),
+        theme.success.clone(),
+    );
+
+    if !closed_ids.is_empty() {
+        content.append("\n");
+        for id in closed_ids {
+            content.append_styled("  • ", theme.dimmed.clone());
+            content.append_styled(id, theme.issue_id.clone());
+            content.append("\n");
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Epic Close", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }
 
 #[cfg(test)]

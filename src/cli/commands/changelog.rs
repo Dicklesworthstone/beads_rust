@@ -7,13 +7,15 @@ use crate::cli::ChangelogArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::ListFilters;
 use crate::util::time::{parse_flexible_timestamp, parse_relative_time};
 use chrono::{DateTime, Utc};
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::process::Command;
+use tracing::debug;
 
 /// Changelog output structure.
 #[derive(Serialize, Debug)]
@@ -58,13 +60,15 @@ pub fn execute(
     args: &ChangelogArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(None)?;
     let config::OpenStorageResult { storage, .. } = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let (since_dt, since_label) = resolve_since(args)?;
     let until = Utc::now();
+
+    debug!(since = %since_label, "Filtering closed issues for changelog");
 
     let filters = ListFilters {
         statuses: Some(vec![Status::Closed]),
@@ -92,6 +96,7 @@ pub fn execute(
     let mut groups = Vec::new();
     for (issue_type, mut items) in grouped {
         items.sort_by_key(|issue| issue.priority);
+        let label = type_to_header(&issue_type);
         let issues = items
             .into_iter()
             .map(|issue| ChangelogEntry {
@@ -104,7 +109,7 @@ pub fn execute(
 
         groups.push(ChangelogGroup {
             issue_type: issue_type.clone(),
-            label: issue_type,
+            label,
             issues,
         });
     }
@@ -117,14 +122,51 @@ pub fn execute(
         groups,
     };
 
+    debug!(
+        total_closed = output.total_closed,
+        groups = output.groups.len(),
+        "Generated changelog"
+    );
+
     if json || args.robot {
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
 
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_changelog_rich(&output, ctx);
+    } else {
+        print_text_output(&output);
+    }
+
+    Ok(())
+}
+
+/// Convert issue type to human-readable changelog header.
+fn type_to_header(issue_type: &str) -> String {
+    match issue_type {
+        "bug" => "Bug Fixes".to_string(),
+        "feature" => "Features".to_string(),
+        "task" => "Tasks".to_string(),
+        "epic" => "Epics".to_string(),
+        "chore" => "Maintenance".to_string(),
+        "docs" => "Documentation".to_string(),
+        "question" => "Questions Resolved".to_string(),
+        other => {
+            // Capitalize first letter for custom types
+            let mut chars = other.chars();
+            chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        }
+    }
+}
+
+/// Print plain text output for changelog.
+fn print_text_output(output: &ChangelogOutput) {
     println!(
         "Changelog since {} ({} closed issues):",
-        output.since, total_closed
+        output.since, output.total_closed
     );
     for group in &output.groups {
         println!();
@@ -133,8 +175,90 @@ pub fn execute(
             println!("- [{}] {} {}", entry.priority, entry.id, entry.title);
         }
     }
+}
 
-    Ok(())
+/// Render changelog with rich formatting.
+fn render_changelog_rich(output: &ChangelogOutput, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    // Date range header
+    let date_header = format_date_range(&output.since, &output.until);
+    content.append_styled(&format!("{date_header}\n\n"), theme.section.clone());
+
+    if output.groups.is_empty() {
+        content.append_styled("No closed issues in this period.\n", theme.dimmed.clone());
+    } else {
+        // Render each group
+        for group in &output.groups {
+            // Group header with icon
+            let icon = type_icon(&group.issue_type);
+            content.append_styled(&format!("{icon} {}\n", group.label), theme.emphasis.clone());
+
+            // Issue entries
+            for entry in &group.issues {
+                content.append_styled("  • ", theme.dimmed.clone());
+                content.append(&entry.title);
+                content.append_styled(&format!(" ({})", entry.id), theme.issue_id.clone());
+                content.append("\n");
+            }
+            content.append("\n");
+        }
+    }
+
+    // Footer with total count
+    content.append_styled(
+        &format!(
+            "Closed: {} issue{}",
+            output.total_closed,
+            if output.total_closed == 1 { "" } else { "s" }
+        ),
+        theme.success.clone(),
+    );
+
+    // Wrap in panel
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Changelog", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Format the date range header.
+fn format_date_range(since: &str, until: &str) -> String {
+    // Try to parse and format nicely, fall back to raw strings
+    let since_fmt = format_date_brief(since);
+    let until_fmt = format_date_brief(until);
+    format!("{since_fmt} → {until_fmt}")
+}
+
+/// Format a date string briefly (YYYY-MM-DD or original if parse fails).
+fn format_date_brief(date_str: &str) -> String {
+    if date_str == "all" {
+        return "all time".to_string();
+    }
+    // Try to parse RFC3339 and extract just the date portion
+    if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
+        return dt.format("%Y-%m-%d").to_string();
+    }
+    date_str.to_string()
+}
+
+/// Get an icon for issue type.
+fn type_icon(issue_type: &str) -> &'static str {
+    match issue_type {
+        "bug" => "\u{1f41b}",     // 🐛
+        "feature" => "\u{2728}",  // ✨
+        "task" => "\u{2705}",     // ✅
+        "epic" => "\u{1f3c6}",    // 🏆
+        "chore" => "\u{1f9f9}",   // 🧹
+        "docs" => "\u{1f4da}",    // 📚
+        "question" => "\u{2753}", // ❓
+        _ => "\u{1f4cb}",         // 📋
+    }
 }
 
 fn resolve_since(args: &ChangelogArgs) -> Result<(Option<DateTime<Utc>>, String)> {
@@ -215,5 +339,134 @@ mod tests {
         let (dt, label) = resolve_since(&args).unwrap();
         assert!(dt.is_none());
         assert_eq!(label, "all");
+    }
+
+    #[test]
+    fn test_type_to_header() {
+        assert_eq!(type_to_header("bug"), "Bug Fixes");
+        assert_eq!(type_to_header("feature"), "Features");
+        assert_eq!(type_to_header("task"), "Tasks");
+        assert_eq!(type_to_header("epic"), "Epics");
+        assert_eq!(type_to_header("chore"), "Maintenance");
+        assert_eq!(type_to_header("docs"), "Documentation");
+        assert_eq!(type_to_header("question"), "Questions Resolved");
+        // Custom types get capitalized
+        assert_eq!(type_to_header("custom"), "Custom");
+        assert_eq!(type_to_header("refactor"), "Refactor");
+    }
+
+    #[test]
+    fn test_type_icon() {
+        assert_eq!(type_icon("bug"), "\u{1f41b}");
+        assert_eq!(type_icon("feature"), "\u{2728}");
+        assert_eq!(type_icon("task"), "\u{2705}");
+        assert_eq!(type_icon("epic"), "\u{1f3c6}");
+        assert_eq!(type_icon("chore"), "\u{1f9f9}");
+        assert_eq!(type_icon("docs"), "\u{1f4da}");
+        assert_eq!(type_icon("question"), "\u{2753}");
+        // Unknown types get clipboard
+        assert_eq!(type_icon("custom"), "\u{1f4cb}");
+    }
+
+    #[test]
+    fn test_format_date_brief() {
+        assert_eq!(format_date_brief("all"), "all time");
+        assert_eq!(format_date_brief("2024-01-15T10:30:00+00:00"), "2024-01-15");
+        assert_eq!(format_date_brief("2024-01-15T10:30:00Z"), "2024-01-15");
+        // Invalid format returns original
+        assert_eq!(format_date_brief("invalid"), "invalid");
+    }
+
+    #[test]
+    fn test_format_date_range() {
+        let result = format_date_range("all", "2024-01-22T00:00:00Z");
+        assert!(result.contains("all time"));
+        assert!(result.contains("2024-01-22"));
+        assert!(result.contains("→"));
+    }
+
+    #[test]
+    fn test_changelog_grouping() {
+        // Test that ChangelogOutput can be constructed properly
+        let output = ChangelogOutput {
+            since: "2024-01-01T00:00:00Z".to_string(),
+            until: "2024-01-22T00:00:00Z".to_string(),
+            total_closed: 3,
+            groups: vec![
+                ChangelogGroup {
+                    issue_type: "bug".to_string(),
+                    label: "Bug Fixes".to_string(),
+                    issues: vec![ChangelogEntry {
+                        id: "bd-abc1".to_string(),
+                        title: "Fix auth timeout".to_string(),
+                        priority: "P1".to_string(),
+                        closed_at: Some("2024-01-15T00:00:00Z".to_string()),
+                    }],
+                },
+                ChangelogGroup {
+                    issue_type: "feature".to_string(),
+                    label: "Features".to_string(),
+                    issues: vec![
+                        ChangelogEntry {
+                            id: "bd-def2".to_string(),
+                            title: "Add dark mode".to_string(),
+                            priority: "P2".to_string(),
+                            closed_at: Some("2024-01-16T00:00:00Z".to_string()),
+                        },
+                        ChangelogEntry {
+                            id: "bd-ghi3".to_string(),
+                            title: "User preferences".to_string(),
+                            priority: "P2".to_string(),
+                            closed_at: Some("2024-01-17T00:00:00Z".to_string()),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        assert_eq!(output.groups.len(), 2);
+        assert_eq!(output.groups[0].issues.len(), 1);
+        assert_eq!(output.groups[1].issues.len(), 2);
+        assert_eq!(output.total_closed, 3);
+    }
+
+    #[test]
+    fn test_json_serialization() {
+        let output = ChangelogOutput {
+            since: "all".to_string(),
+            until: "2024-01-22T00:00:00Z".to_string(),
+            total_closed: 1,
+            groups: vec![ChangelogGroup {
+                issue_type: "bug".to_string(),
+                label: "Bug Fixes".to_string(),
+                issues: vec![ChangelogEntry {
+                    id: "bd-test".to_string(),
+                    title: "Test issue".to_string(),
+                    priority: "P1".to_string(),
+                    closed_at: None,
+                }],
+            }],
+        };
+
+        let json_str = serde_json::to_string_pretty(&output).unwrap();
+        assert!(json_str.contains("\"since\": \"all\""));
+        assert!(json_str.contains("\"total_closed\": 1"));
+        assert!(json_str.contains("Bug Fixes"));
+        assert!(json_str.contains("bd-test"));
+        // closed_at should be omitted when None
+        assert!(!json_str.contains("closed_at"));
+    }
+
+    #[test]
+    fn test_empty_changelog() {
+        let output = ChangelogOutput {
+            since: "all".to_string(),
+            until: "2024-01-22T00:00:00Z".to_string(),
+            total_closed: 0,
+            groups: vec![],
+        };
+
+        assert!(output.groups.is_empty());
+        assert_eq!(output.total_closed, 0);
     }
 }

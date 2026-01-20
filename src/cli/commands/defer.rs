@@ -5,10 +5,11 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::ReadyIssue;
 use crate::model::{Issue, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use crate::util::time::parse_flexible_timestamp;
+use rich_rust::prelude::*;
 use serde::Serialize;
 
 /// Result of deferring a single issue (for text output).
@@ -37,7 +38,7 @@ pub fn execute_defer(
     args: &DeferArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let use_json = json || args.robot;
 
@@ -144,6 +145,8 @@ pub fn execute_defer(
         let json_output: Vec<ReadyIssue> = deferred_full.iter().map(ReadyIssue::from).collect();
         let output = serde_json::to_string_pretty(&json_output).map_err(BeadsError::Json)?;
         println!("{output}");
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_defer_rich(&deferred_issues, &skipped_issues, ctx);
     } else {
         for deferred in &deferred_issues {
             print!("\u{23f1} Deferred {}: {}", deferred.id, deferred.title);
@@ -174,7 +177,7 @@ pub fn execute_undefer(
     args: &UndeferArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let use_json = json || args.robot;
 
@@ -273,6 +276,8 @@ pub fn execute_undefer(
         let json_output: Vec<ReadyIssue> = undeferred_full.iter().map(ReadyIssue::from).collect();
         let output = serde_json::to_string_pretty(&json_output).map_err(BeadsError::Json)?;
         println!("{output}");
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_undefer_rich(&undeferred_issues, &skipped_issues, ctx);
     } else {
         for undeferred in &undeferred_issues {
             println!(
@@ -289,6 +294,119 @@ pub fn execute_undefer(
     }
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// Rich Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Render defer results with rich formatting.
+fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    if deferred.is_empty() && skipped.is_empty() {
+        content.append("No issues to defer.\n");
+    } else {
+        for item in deferred {
+            content.append_styled("\u{23f1} ", theme.warning.clone());
+            content.append_styled("Deferred ", theme.warning.clone());
+            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append(": ");
+            content.append(&item.title);
+            content.append("\n");
+            content.append_styled("  Status: ", theme.dimmed.clone());
+            content.append_styled("open", theme.success.clone());
+            content.append(" \u{2192} ");
+            content.append_styled("deferred", theme.warning.clone());
+            content.append("\n");
+            if let Some(ref until) = item.defer_until {
+                content.append_styled("  Until:  ", theme.dimmed.clone());
+                content.append_styled(until, theme.accent.clone());
+                content.append("\n");
+            } else {
+                content.append_styled("  Until:  ", theme.dimmed.clone());
+                content.append_styled("indefinitely", theme.dimmed.clone());
+                content.append("\n");
+            }
+        }
+
+        for item in skipped {
+            content.append_styled("\u{2298} ", theme.dimmed.clone());
+            content.append_styled("Skipped ", theme.dimmed.clone());
+            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append(": ");
+            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append("\n");
+        }
+    }
+
+    let title = if deferred.len() == 1 && skipped.is_empty() {
+        "Issue Deferred"
+    } else {
+        "Defer Results"
+    };
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(title, theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render undefer results with rich formatting.
+fn render_undefer_rich(
+    undeferred: &[DeferredIssue],
+    skipped: &[SkippedIssue],
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    if undeferred.is_empty() && skipped.is_empty() {
+        content.append("No issues to undefer.\n");
+    } else {
+        for item in undeferred {
+            content.append_styled("\u{2713} ", theme.success.clone());
+            content.append_styled("Undeferred ", theme.success.clone());
+            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append(": ");
+            content.append(&item.title);
+            content.append("\n");
+            content.append_styled("  Status: ", theme.dimmed.clone());
+            content.append_styled("deferred", theme.warning.clone());
+            content.append(" \u{2192} ");
+            content.append_styled("open", theme.success.clone());
+            content.append("\n");
+        }
+
+        for item in skipped {
+            content.append_styled("\u{2298} ", theme.dimmed.clone());
+            content.append_styled("Skipped ", theme.dimmed.clone());
+            content.append_styled(&item.id, theme.emphasis.clone());
+            content.append(": ");
+            content.append_styled(&item.reason, theme.dimmed.clone());
+            content.append("\n");
+        }
+    }
+
+    let title = if undeferred.len() == 1 && skipped.is_empty() {
+        "Issue Undeferred"
+    } else {
+        "Undefer Results"
+    };
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(title, theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }
 
 #[cfg(test)]
