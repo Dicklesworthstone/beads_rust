@@ -4,8 +4,9 @@
 //! beads workflow instructions in AGENTS.md or CLAUDE.md files.
 
 use crate::error::{BeadsError, Result};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use regex::Regex;
+use rich_rust::prelude::*;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -360,7 +361,7 @@ pub struct AgentsArgs {
 /// # Errors
 ///
 /// Returns an error if file operations fail.
-pub fn execute(args: &AgentsArgs, json: bool, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &AgentsArgs, json: bool, ctx: &OutputContext) -> Result<()> {
     let work_dir = std::env::current_dir()?;
     let detection = detect_agent_file_in_parents(&work_dir, 3);
 
@@ -372,19 +373,19 @@ pub fn execute(args: &AgentsArgs, json: bool, _ctx: &OutputContext) -> Result<()
     let is_check = !args.add && !args.remove && !args.update;
 
     if is_check || args.check {
-        return execute_check(&detection, &work_dir);
+        return execute_check(&detection, &work_dir, ctx);
     }
 
     if args.add {
-        return execute_add(&detection, &work_dir, args.dry_run, args.force);
+        return execute_add(&detection, &work_dir, args.dry_run, args.force, ctx);
     }
 
     if args.remove {
-        return execute_remove(&detection, args.dry_run, args.force);
+        return execute_remove(&detection, args.dry_run, args.force, ctx);
     }
 
     if args.update {
-        return execute_update(&detection, args.dry_run, args.force);
+        return execute_update(&detection, args.dry_run, args.force, ctx);
     }
 
     Ok(())
@@ -407,7 +408,16 @@ fn execute_json(detection: &AgentFileDetection, _args: &AgentsArgs) -> Result<()
 }
 
 #[allow(clippy::unnecessary_wraps)]
-fn execute_check(detection: &AgentFileDetection, work_dir: &Path) -> Result<()> {
+fn execute_check(
+    detection: &AgentFileDetection,
+    work_dir: &Path,
+    ctx: &OutputContext,
+) -> Result<()> {
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_check_rich(detection, work_dir, ctx);
+        return Ok(());
+    }
+
     if !detection.found() {
         println!(
             "No AGENTS.md or CLAUDE.md found in {} or parent directories.",
@@ -452,15 +462,20 @@ fn execute_add(
     work_dir: &Path,
     dry_run: bool,
     force: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     // Check if blurb already exists
     if detection.has_blurb
         && !detection.has_legacy_blurb
         && detection.blurb_version >= BLURB_VERSION
     {
-        println!(
-            "AGENTS.md already contains current beads workflow instructions (v{BLURB_VERSION})."
-        );
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_already_current_rich(ctx);
+        } else {
+            println!(
+                "AGENTS.md already contains current beads workflow instructions (v{BLURB_VERSION})."
+            );
+        }
         return Ok(());
     }
 
@@ -479,18 +494,22 @@ fn execute_add(
     if detection.has_legacy_blurb
         || (detection.has_blurb && detection.blurb_version < BLURB_VERSION)
     {
-        return execute_update(detection, dry_run, force);
+        return execute_update(detection, dry_run, force, ctx);
     }
 
     let new_content = append_blurb(&content);
 
     if dry_run {
-        println!(
-            "Would add beads workflow instructions to: {}",
-            file_path.display()
-        );
-        println!("\n--- Preview ---");
-        println!("{AGENT_BLURB}");
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_dry_run_add_rich(&file_path, ctx);
+        } else {
+            println!(
+                "Would add beads workflow instructions to: {}",
+                file_path.display()
+            );
+            println!("\n--- Preview ---");
+            println!("{AGENT_BLURB}");
+        }
         return Ok(());
     }
 
@@ -517,21 +536,30 @@ fn execute_add(
                 backup_path.display(),
                 e
             );
-        } else {
+        } else if !matches!(ctx.mode(), OutputMode::Rich) {
             println!("Backup created: {}", backup_path.display());
         }
     }
 
-    fs::write(&file_path, new_content)?;
-    println!(
-        "Added beads workflow instructions to: {}",
-        file_path.display()
-    );
+    fs::write(&file_path, &new_content)?;
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_add_success_rich(&file_path, new_content.len(), ctx);
+    } else {
+        println!(
+            "Added beads workflow instructions to: {}",
+            file_path.display()
+        );
+    }
 
     Ok(())
 }
 
-fn execute_remove(detection: &AgentFileDetection, dry_run: bool, force: bool) -> Result<()> {
+fn execute_remove(
+    detection: &AgentFileDetection,
+    dry_run: bool,
+    force: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     if !detection.found() {
         return Err(BeadsError::Validation {
             field: "AGENTS.md".to_string(),
@@ -540,7 +568,11 @@ fn execute_remove(detection: &AgentFileDetection, dry_run: bool, force: bool) ->
     }
 
     if !detection.has_blurb && !detection.has_legacy_blurb {
-        println!("No beads workflow instructions found to remove.");
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_nothing_to_remove_rich(ctx);
+        } else {
+            println!("No beads workflow instructions found to remove.");
+        }
         return Ok(());
     }
 
@@ -554,10 +586,14 @@ fn execute_remove(detection: &AgentFileDetection, dry_run: bool, force: bool) ->
     };
 
     if dry_run {
-        println!(
-            "Would remove beads workflow instructions from: {}",
-            file_path.display()
-        );
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_dry_run_remove_rich(file_path, ctx);
+        } else {
+            println!(
+                "Would remove beads workflow instructions from: {}",
+                file_path.display()
+            );
+        }
         return Ok(());
     }
 
@@ -585,20 +621,29 @@ fn execute_remove(detection: &AgentFileDetection, dry_run: bool, force: bool) ->
             backup_path.display(),
             e
         );
-    } else {
+    } else if !matches!(ctx.mode(), OutputMode::Rich) {
         println!("Backup created: {}", backup_path.display());
     }
 
     fs::write(file_path, new_content)?;
-    println!(
-        "Removed beads workflow instructions from: {}",
-        file_path.display()
-    );
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_remove_success_rich(file_path, ctx);
+    } else {
+        println!(
+            "Removed beads workflow instructions from: {}",
+            file_path.display()
+        );
+    }
 
     Ok(())
 }
 
-fn execute_update(detection: &AgentFileDetection, dry_run: bool, force: bool) -> Result<()> {
+fn execute_update(
+    detection: &AgentFileDetection,
+    dry_run: bool,
+    force: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     if !detection.found() {
         return Err(BeadsError::Validation {
             field: "AGENTS.md".to_string(),
@@ -607,7 +652,11 @@ fn execute_update(detection: &AgentFileDetection, dry_run: bool, force: bool) ->
     }
 
     if !detection.needs_upgrade() {
-        println!("Beads workflow instructions are already up to date (v{BLURB_VERSION}).");
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_already_up_to_date_rich(ctx);
+        } else {
+            println!("Beads workflow instructions are already up to date (v{BLURB_VERSION}).");
+        }
         return Ok(());
     }
 
@@ -615,26 +664,26 @@ fn execute_update(detection: &AgentFileDetection, dry_run: bool, force: bool) ->
     let content = detection.content.as_ref().unwrap();
     let new_content = update_blurb(content);
 
+    let from_version = if detection.has_legacy_blurb {
+        "bv (legacy)".to_string()
+    } else {
+        format!("v{}", detection.blurb_version)
+    };
+
     if dry_run {
-        let from_version = if detection.has_legacy_blurb {
-            "bv (legacy)".to_string()
+        if matches!(ctx.mode(), OutputMode::Rich) {
+            render_dry_run_update_rich(file_path, &from_version, ctx);
         } else {
-            format!("v{}", detection.blurb_version)
-        };
-        println!(
-            "Would update beads workflow instructions from {from_version} to v{BLURB_VERSION}"
-        );
-        println!("File: {}", file_path.display());
+            println!(
+                "Would update beads workflow instructions from {from_version} to v{BLURB_VERSION}"
+            );
+            println!("File: {}", file_path.display());
+        }
         return Ok(());
     }
 
     // Prompt for confirmation unless forced
     if !force {
-        let from_version = if detection.has_legacy_blurb {
-            "bv (legacy)".to_string()
-        } else {
-            format!("v{}", detection.blurb_version)
-        };
         println!(
             "This will update beads workflow instructions from {from_version} to v{BLURB_VERSION}."
         );
@@ -657,18 +706,230 @@ fn execute_update(detection: &AgentFileDetection, dry_run: bool, force: bool) ->
             backup_path.display(),
             e
         );
-    } else {
+    } else if !matches!(ctx.mode(), OutputMode::Rich) {
         println!("Backup created: {}", backup_path.display());
     }
 
-    fs::write(file_path, new_content)?;
-    println!(
-        "Updated beads workflow instructions to v{} in: {}",
-        BLURB_VERSION,
-        file_path.display()
-    );
+    fs::write(file_path, &new_content)?;
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_update_success_rich(file_path, &from_version, new_content.len(), ctx);
+    } else {
+        println!(
+            "Updated beads workflow instructions to v{} in: {}",
+            BLURB_VERSION,
+            file_path.display()
+        );
+    }
 
     Ok(())
+}
+
+// --- Rich output render functions ---
+
+/// Render check result as a rich panel.
+fn render_check_rich(detection: &AgentFileDetection, work_dir: &Path, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    if !detection.found() {
+        content.append_styled("\u{2717} ", theme.warning.clone());
+        content.append("No AGENTS.md or CLAUDE.md found in ");
+        content.append_styled(&work_dir.display().to_string(), theme.accent.clone());
+        content.append("\n\n");
+        content.append_styled("To add beads workflow instructions:\n", theme.dimmed.clone());
+        content.append_styled("  br agents --add", theme.accent.clone());
+    } else {
+        let file_path = detection.file_path.as_ref().unwrap();
+        let file_type = detection.file_type.as_ref().unwrap();
+
+        content.append_styled("File        ", theme.dimmed.clone());
+        content.append_styled(file_type, theme.emphasis.clone());
+        content.append("\n");
+        content.append_styled("Path        ", theme.dimmed.clone());
+        content.append_styled(&file_path.display().to_string(), theme.accent.clone());
+        content.append("\n\n");
+
+        if detection.has_legacy_blurb {
+            content.append_styled("\u{26A0} ", theme.warning.clone());
+            content.append("Contains legacy bv blurb (needs upgrade to br format)\n\n");
+            content.append_styled("To upgrade:\n", theme.dimmed.clone());
+            content.append_styled("  br agents --update", theme.accent.clone());
+        } else if detection.has_blurb {
+            if detection.blurb_version < BLURB_VERSION {
+                content.append_styled("\u{26A0} ", theme.warning.clone());
+                content.append(&format!(
+                    "Contains br blurb v{} (current: v{})\n\n",
+                    detection.blurb_version, BLURB_VERSION
+                ));
+                content.append_styled("To update:\n", theme.dimmed.clone());
+                content.append_styled("  br agents --update", theme.accent.clone());
+            } else {
+                content.append_styled("\u{2713} ", theme.success.clone());
+                content.append(&format!("Contains current br blurb v{BLURB_VERSION}"));
+            }
+        } else {
+            content.append_styled("\u{2717} ", theme.warning.clone());
+            content.append("No beads workflow instructions found\n\n");
+            content.append_styled("To add:\n", theme.dimmed.clone());
+            content.append_styled("  br agents --add", theme.accent.clone());
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Agent Instructions", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render "already current" message in rich mode.
+fn render_already_current_rich(ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append(&format!(
+        "AGENTS.md already contains current beads workflow instructions (v{BLURB_VERSION})."
+    ));
+
+    console.print_renderable(&text);
+}
+
+/// Render dry-run add preview in rich mode.
+fn render_dry_run_add_rich(file_path: &Path, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("Would add beads workflow instructions to:\n", theme.dimmed.clone());
+    content.append_styled(&file_path.display().to_string(), theme.accent.clone());
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dry Run", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render add success in rich mode.
+fn render_add_success_rich(file_path: &Path, _bytes: usize, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append("Added beads workflow instructions to: ");
+    text.append_styled(&file_path.display().to_string(), theme.accent.clone());
+
+    console.print_renderable(&text);
+}
+
+/// Render "nothing to remove" message in rich mode.
+fn render_nothing_to_remove_rich(ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append("No beads workflow instructions found to remove.");
+
+    console.print_renderable(&text);
+}
+
+/// Render dry-run remove preview in rich mode.
+fn render_dry_run_remove_rich(file_path: &Path, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled(
+        "Would remove beads workflow instructions from:\n",
+        theme.dimmed.clone(),
+    );
+    content.append_styled(&file_path.display().to_string(), theme.accent.clone());
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dry Run", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render remove success in rich mode.
+fn render_remove_success_rich(file_path: &Path, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append("Removed beads workflow instructions from: ");
+    text.append_styled(&file_path.display().to_string(), theme.accent.clone());
+
+    console.print_renderable(&text);
+}
+
+/// Render "already up to date" message in rich mode.
+fn render_already_up_to_date_rich(ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append(&format!(
+        "Beads workflow instructions are already up to date (v{BLURB_VERSION})."
+    ));
+
+    console.print_renderable(&text);
+}
+
+/// Render dry-run update preview in rich mode.
+fn render_dry_run_update_rich(file_path: &Path, from_version: &str, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+    content.append_styled("Would update beads workflow instructions from ", theme.dimmed.clone());
+    content.append_styled(from_version, theme.warning.clone());
+    content.append_styled(" to ", theme.dimmed.clone());
+    content.append_styled(&format!("v{BLURB_VERSION}"), theme.success.clone());
+    content.append("\n");
+    content.append_styled("File: ", theme.dimmed.clone());
+    content.append_styled(&file_path.display().to_string(), theme.accent.clone());
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dry Run", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render update success in rich mode.
+fn render_update_success_rich(
+    file_path: &Path,
+    from_version: &str,
+    _bytes: usize,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append("Updated beads workflow instructions from ");
+    text.append_styled(from_version, theme.warning.clone());
+    text.append(" to ");
+    text.append_styled(&format!("v{BLURB_VERSION}"), theme.success.clone());
+    text.append(" in: ");
+    text.append_styled(&file_path.display().to_string(), theme.accent.clone());
+
+    console.print_renderable(&text);
 }
 
 #[cfg(test)]
