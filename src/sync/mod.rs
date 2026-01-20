@@ -2464,8 +2464,7 @@ pub fn merge_issue(
                         // Keep local since it was modified more recently than base
                         MergeResult::KeepWithNote(
                             l.clone(),
-                            "Local modified after base, external deleted - kept local"
-                                .to_string(),
+                            "Local modified after base, external deleted - kept local".to_string(),
                         )
                     }
                     ConflictResolution::Manual => {
@@ -3881,7 +3880,12 @@ mod tests {
         let result = preflight_import(&jsonl_path, &config).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(result.failures().iter().any(|c| c.name == "no_conflict_markers"));
+        assert!(
+            result
+                .failures()
+                .iter()
+                .any(|c| c.name == "no_conflict_markers")
+        );
     }
 
     #[test]
