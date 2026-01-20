@@ -283,7 +283,7 @@ fn label_list(
     Ok(())
 }
 
-fn label_list_all(storage: &SqliteStorage, json: bool, ctx: &OutputContext) -> Result<()> {
+fn label_list_all(storage: &SqliteStorage, _json: bool, ctx: &OutputContext) -> Result<()> {
     let labels_with_counts = storage.get_unique_labels_with_counts()?;
 
     let label_counts: Vec<LabelCount> = labels_with_counts
@@ -294,8 +294,8 @@ fn label_list_all(storage: &SqliteStorage, json: bool, ctx: &OutputContext) -> R
         })
         .collect();
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&label_counts)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&label_counts);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_label_counts_rich(&label_counts, ctx);
     } else if label_counts.is_empty() {
