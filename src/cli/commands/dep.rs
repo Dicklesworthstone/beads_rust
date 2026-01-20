@@ -9,6 +9,7 @@ use crate::model::DependencyType;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ pub fn execute(
     command: &DepCommands,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -38,15 +39,29 @@ pub fn execute(
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
 
     match command {
-        DepCommands::Add(args) => dep_add(args, storage, &resolver, &all_ids, &actor, json),
-        DepCommands::Remove(args) => dep_remove(args, storage, &resolver, &all_ids, &actor, json),
-        DepCommands::List(args) => {
-            dep_list(args, storage, &resolver, &all_ids, &external_db_paths, json)
+        DepCommands::Add(args) => dep_add(args, storage, &resolver, &all_ids, &actor, json, ctx),
+        DepCommands::Remove(args) => {
+            dep_remove(args, storage, &resolver, &all_ids, &actor, json, ctx)
         }
-        DepCommands::Tree(args) => {
-            dep_tree(args, storage, &resolver, &all_ids, &external_db_paths, json)
-        }
-        DepCommands::Cycles(args) => dep_cycles(args, storage, json),
+        DepCommands::List(args) => dep_list(
+            args,
+            storage,
+            &resolver,
+            &all_ids,
+            &external_db_paths,
+            json,
+            ctx,
+        ),
+        DepCommands::Tree(args) => dep_tree(
+            args,
+            storage,
+            &resolver,
+            &all_ids,
+            &external_db_paths,
+            json,
+            ctx,
+        ),
+        DepCommands::Cycles(args) => dep_cycles(args, storage, json, ctx),
     }?;
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -102,6 +117,7 @@ fn dep_add(
     all_ids: &[String],
     actor: &str,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
@@ -162,14 +178,35 @@ fn dep_add(
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else if added {
-        println!(
-            "Added dependency: {} -> {} ({})",
-            issue_id,
-            depends_on_id,
-            dep_type.as_str()
-        );
+        if ctx.is_rich() {
+            // Rich mode: Show detailed visual feedback
+            ctx.success(&format!(
+                "Added dependency: {} → {}",
+                issue_id, depends_on_id
+            ));
+            let relationship = match dep_type {
+                DependencyType::Blocks => format!("  {} now blocks {}", issue_id, depends_on_id),
+                DependencyType::ParentChild => {
+                    format!("  {} is parent of {}", depends_on_id, issue_id)
+                }
+                DependencyType::WaitsFor => {
+                    format!("  {} waits for {}", issue_id, depends_on_id)
+                }
+                _ => format!("  Relationship: {}", dep_type.as_str()),
+            };
+            ctx.print(&relationship);
+        } else {
+            ctx.success(&format!(
+                "Added dependency: {} -> {} ({})",
+                issue_id,
+                depends_on_id,
+                dep_type.as_str()
+            ));
+        }
     } else {
-        println!("Dependency already exists: {issue_id} -> {depends_on_id}");
+        ctx.info(&format!(
+            "Dependency already exists: {issue_id} → {depends_on_id}"
+        ));
     }
 
     Ok(())
@@ -182,6 +219,7 @@ fn dep_remove(
     all_ids: &[String],
     actor: &str,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
@@ -204,9 +242,24 @@ fn dep_remove(
         };
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else if removed {
-        println!("Removed dependency: {issue_id} -> {depends_on_id}");
+        if ctx.is_rich() {
+            ctx.success(&format!(
+                "Removed dependency: {} → {}",
+                issue_id, depends_on_id
+            ));
+            ctx.print(&format!(
+                "  {} no longer depends on {}",
+                issue_id, depends_on_id
+            ));
+        } else {
+            ctx.success(&format!(
+                "Removed dependency: {issue_id} -> {depends_on_id}"
+            ));
+        }
     } else {
-        println!("Dependency not found: {issue_id} -> {depends_on_id}");
+        ctx.warning(&format!(
+            "Dependency not found: {issue_id} → {depends_on_id}"
+        ));
     }
 
     Ok(())
@@ -219,6 +272,7 @@ fn dep_list(
     all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
@@ -285,34 +339,115 @@ fn dep_list(
             DepDirection::Up => "dependents",
             DepDirection::Both => "dependencies or dependents",
         };
-        println!("No {direction_str} for {issue_id}");
+        ctx.info(&format!("No {direction_str} for {issue_id}"));
         return Ok(());
     }
 
-    let header = match args.direction {
-        DepDirection::Down => format!("Dependencies of {} ({}):", issue_id, items.len()),
-        DepDirection::Up => format!("Dependents of {} ({}):", issue_id, items.len()),
-        DepDirection::Both => format!(
-            "Dependencies and dependents of {} ({}):",
-            issue_id,
-            items.len()
-        ),
-    };
-    println!("{header}");
-
-    for item in items {
-        let arrow = if item.issue_id == issue_id {
-            format!("  -> {} ({})", item.depends_on_id, item.dep_type)
-        } else {
-            format!("  <- {} ({})", item.issue_id, item.dep_type)
+    if ctx.is_rich() {
+        // Rich mode: Use panel with tree-like display
+        render_dep_list_rich(ctx, &issue_id, &items, args.direction);
+    } else {
+        // Plain mode: Simple text output
+        let header = match args.direction {
+            DepDirection::Down => format!("Dependencies of {} ({}):", issue_id, items.len()),
+            DepDirection::Up => format!("Dependents of {} ({}):", issue_id, items.len()),
+            DepDirection::Both => format!(
+                "Dependencies and dependents of {} ({}):",
+                issue_id,
+                items.len()
+            ),
         };
-        println!(
-            "{}: {} [P{}] [{}]",
-            arrow, item.title, item.priority, item.status
-        );
+        ctx.info(&header);
+
+        for item in &items {
+            let arrow = if item.issue_id == issue_id {
+                format!("  -> {} ({})", item.depends_on_id, item.dep_type)
+            } else {
+                format!("  <- {} ({})", item.issue_id, item.dep_type)
+            };
+            ctx.print(&format!(
+                "{}: {} [P{}] [{}]",
+                arrow, item.title, item.priority, item.status
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// Render dependency list in rich mode with panel and tree-like display
+fn render_dep_list_rich(
+    ctx: &OutputContext,
+    issue_id: &str,
+    items: &[DepListItem],
+    direction: DepDirection,
+) {
+    let theme = ctx.theme();
+
+    // Separate items into dependencies (this issue depends on) and dependents (depend on this)
+    let (deps, dependents): (Vec<_>, Vec<_>) =
+        items.iter().partition(|item| item.issue_id == issue_id);
+
+    let mut content = String::new();
+
+    // Show dependencies (what this issue depends on)
+    if !deps.is_empty() && matches!(direction, DepDirection::Down | DepDirection::Both) {
+        content.push_str(&format!("[bold]Depends on ({}):[/]\n", deps.len()));
+        for (i, item) in deps.iter().enumerate() {
+            let prefix = if i == deps.len() - 1 {
+                "└──"
+            } else {
+                "├──"
+            };
+            let status_indicator = format_status_indicator(&item.status);
+            content.push_str(&format!(
+                "{} {} {} {}\n",
+                prefix, item.depends_on_id, status_indicator, item.title
+            ));
+        }
+    }
+
+    // Add separator if showing both directions
+    if !deps.is_empty() && !dependents.is_empty() && matches!(direction, DepDirection::Both) {
+        content.push('\n');
+    }
+
+    // Show dependents (what depends on this issue)
+    if !dependents.is_empty() && matches!(direction, DepDirection::Up | DepDirection::Both) {
+        content.push_str(&format!(
+            "[bold]Blocked by this ({}):[/]\n",
+            dependents.len()
+        ));
+        for (i, item) in dependents.iter().enumerate() {
+            let prefix = if i == dependents.len() - 1 {
+                "└──"
+            } else {
+                "├──"
+            };
+            let status_indicator = format_status_indicator(&item.status);
+            content.push_str(&format!(
+                "{} {} {} {}\n",
+                prefix, item.issue_id, status_indicator, item.title
+            ));
+        }
+    }
+
+    let panel = Panel::from_text(&content)
+        .title(Text::new(format!("Dependencies for {}", issue_id)))
+        .border_style(theme.panel_border.clone());
+
+    ctx.render(&panel);
+}
+
+/// Format status indicator with appropriate styling hints
+fn format_status_indicator(status: &str) -> String {
+    match status {
+        "open" => "[green][open][/]".to_string(),
+        "in_progress" => "[yellow][in-progress][/]".to_string(),
+        "closed" => "[dim][closed] ✓[/]".to_string(),
+        "blocked" => "[red][blocked][/]".to_string(),
+        _ => format!("[{}]", status),
+    }
 }
 
 fn apply_external_dep_list_metadata(
@@ -357,6 +492,7 @@ fn dep_tree(
     all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let root_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
     let root_issue = storage
@@ -470,26 +606,116 @@ fn dep_tree(
 
     // Text tree output
     if nodes.is_empty() {
-        println!("No dependency tree for {root_id}");
+        ctx.info(&format!("No dependency tree for {root_id}"));
         return Ok(());
     }
 
-    for node in &nodes {
-        let indent = "  ".repeat(node.depth);
-        let prefix = if node.depth == 0 {
-            ""
-        } else if node.truncated {
-            "├── (truncated) "
-        } else {
-            "├── "
-        };
-        println!(
-            "{}{}{}: {} [P{}] [{}]",
-            indent, prefix, node.id, node.title, node.priority, node.status
-        );
+    if ctx.is_rich() {
+        // Rich mode: Use tree component with styled output
+        render_dep_tree_rich(ctx, &nodes);
+    } else {
+        // Plain mode: Simple indented text
+        for node in &nodes {
+            let indent = "  ".repeat(node.depth);
+            let prefix = if node.depth == 0 {
+                ""
+            } else if node.truncated {
+                "├── (truncated) "
+            } else {
+                "├── "
+            };
+            ctx.print(&format!(
+                "{}{}{}: {} [P{}] [{}]",
+                indent, prefix, node.id, node.title, node.priority, node.status
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// Render dependency tree in rich mode using Tree component
+fn render_dep_tree_rich(ctx: &OutputContext, nodes: &[TreeNode]) {
+    if nodes.is_empty() {
+        return;
+    }
+
+    let theme = ctx.theme();
+
+    // Build tree structure from flat nodes list
+    // The nodes are in DFS order with parent_id references
+    let root = build_tree_node_rich(&nodes[0], nodes);
+    let tree = Tree::new(root)
+        .guides(TreeGuides::Rounded)
+        .guide_style(theme.dimmed.clone());
+
+    ctx.render(&tree);
+}
+
+/// Recursively build a tree node for rich rendering
+fn build_tree_node_rich(
+    node: &TreeNode,
+    all_nodes: &[TreeNode],
+) -> rich_rust::renderables::TreeNode {
+    // Format the node label with status styling
+    let status_style = match node.status.as_str() {
+        "open" => "[green]",
+        "in_progress" => "[yellow]",
+        "closed" => "[dim]",
+        "blocked" => "[red]",
+        _ => "[white]",
+    };
+    let status_close = "[/]";
+
+    let status_indicator = match node.status.as_str() {
+        "closed" => " ✓",
+        "blocked" => " ⚠",
+        _ => "",
+    };
+
+    let label = if node.truncated {
+        format!(
+            "{} {}[{}]{}{} {} [dim](truncated)[/]",
+            node.id,
+            status_style,
+            node.status,
+            status_close,
+            status_indicator,
+            truncate_title(&node.title, 35)
+        )
+    } else {
+        format!(
+            "{} {}[{}]{}{} {}",
+            node.id,
+            status_style,
+            node.status,
+            status_close,
+            status_indicator,
+            truncate_title(&node.title, 40)
+        )
+    };
+
+    let mut tree_node = rich_rust::renderables::TreeNode::new(Text::new(label));
+
+    // Find and add children (nodes whose parent_id matches this node's id)
+    for child in all_nodes
+        .iter()
+        .filter(|n| n.parent_id.as_ref() == Some(&node.id))
+    {
+        let child_node = build_tree_node_rich(child, all_nodes);
+        tree_node = tree_node.child(child_node);
+    }
+
+    tree_node
+}
+
+/// Truncate title to max length with ellipsis
+fn truncate_title(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    }
 }
 
 fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
@@ -506,7 +732,12 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
-fn dep_cycles(_args: &DepCyclesArgs, storage: &SqliteStorage, json: bool) -> Result<()> {
+fn dep_cycles(
+    _args: &DepCyclesArgs,
+    storage: &SqliteStorage,
+    json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     let cycles = storage.detect_all_cycles()?;
     let count = cycles.len();
 
@@ -517,15 +748,53 @@ fn dep_cycles(_args: &DepCyclesArgs, storage: &SqliteStorage, json: bool) -> Res
     }
 
     if count == 0 {
-        println!("No dependency cycles detected.");
+        ctx.success("No dependency cycles detected.");
+    } else if ctx.is_rich() {
+        // Rich mode: Show cycles with red highlighting in a panel
+        render_cycles_rich(ctx, &cycles, count);
     } else {
-        println!("Found {count} dependency cycle(s):");
+        // Plain mode: Simple text output
+        ctx.warning(&format!("Found {count} dependency cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
-            println!("  {}. {}", i + 1, cycle.join(" -> "));
+            ctx.print(&format!("  {}. {}", i + 1, cycle.join(" -> ")));
         }
     }
 
     Ok(())
+}
+
+/// Render cycles in rich mode with red highlighting
+fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize) {
+    let theme = ctx.theme();
+
+    let mut content = String::new();
+    content.push_str(&format!(
+        "[bold red]⚠ {} dependency cycle(s) detected:[/]\n\n",
+        count
+    ));
+
+    for (i, cycle) in cycles.iter().enumerate() {
+        // Format cycle path with arrows
+        let cycle_path = cycle.join(" [red]→[/] ");
+        content.push_str(&format!("[bold]Cycle {}:[/]\n", i + 1));
+        content.push_str(&format!("  [red]{}[/]\n", cycle_path));
+
+        // Add underline visual
+        let path_len = cycle.iter().map(|s| s.len() + 4).sum::<usize>();
+        content.push_str(&format!("  [red]{}[/]\n", "^".repeat(path_len.min(60))));
+
+        if i < cycles.len() - 1 {
+            content.push('\n');
+        }
+    }
+
+    content.push_str("\n[dim]Suggestion: Remove one dependency from each cycle to break it.[/]");
+
+    let panel = Panel::from_text(&content)
+        .title(Text::new("Dependency Cycles"))
+        .border_style(theme.error.clone());
+
+    ctx.render(&panel);
 }
 
 fn resolve_issue_id(
