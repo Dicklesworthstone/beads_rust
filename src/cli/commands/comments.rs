@@ -3,9 +3,12 @@
 use crate::cli::{CommentAddArgs, CommentCommands, CommentListArgs, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::output::OutputContext;
+use crate::model::Comment;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use chrono::{DateTime, Utc};
+use rich_rust::prelude::*;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -20,7 +23,7 @@ pub fn execute(
     args: &CommentsArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -40,16 +43,17 @@ pub fn execute(
             &all_ids,
             actor.as_deref(),
             json,
+            ctx,
         ),
         Some(CommentCommands::List(list_args)) => {
-            list_comments(list_args, storage, &resolver, &all_ids, json)
+            list_comments(list_args, storage, &resolver, &all_ids, json, ctx)
         }
         None => {
             let id = args
                 .id
                 .as_deref()
                 .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
-            list_comments_by_id(id, storage, &resolver, &all_ids, json)
+            list_comments_by_id(id, storage, &resolver, &all_ids, json, ctx)
         }
     }?;
 
@@ -64,6 +68,7 @@ fn add_comment(
     all_ids: &[String],
     actor: Option<&str>,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.id)?;
     let text = read_comment_text(args)?;
@@ -80,6 +85,8 @@ fn add_comment(
     if json {
         let output = serde_json::to_string_pretty(&comment)?;
         println!("{output}");
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        render_comment_added_rich(&issue_id, &comment, ctx);
     } else {
         println!("Comment added to {issue_id}");
     }
@@ -93,8 +100,9 @@ fn list_comments(
     resolver: &IdResolver,
     all_ids: &[String],
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
-    list_comments_by_id(&args.id, storage, resolver, all_ids, json)
+    list_comments_by_id(&args.id, storage, resolver, all_ids, json, ctx)
 }
 
 fn list_comments_by_id(
@@ -103,6 +111,7 @@ fn list_comments_by_id(
     resolver: &IdResolver,
     all_ids: &[String],
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, id)?;
     let comments = storage.get_comments(&issue_id)?;
@@ -110,6 +119,11 @@ fn list_comments_by_id(
     if json {
         let output = serde_json::to_string_pretty(&comments)?;
         println!("{output}");
+        return Ok(());
+    }
+
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_comments_list_rich(&issue_id, &comments, ctx);
         return Ok(());
     }
 
@@ -127,6 +141,117 @@ fn list_comments_by_id(
     }
 
     Ok(())
+}
+
+/// Render a list of comments in rich format.
+fn render_comments_list_rich(issue_id: &str, comments: &[Comment], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    if comments.is_empty() {
+        let mut text = Text::new("");
+        text.append_styled("\u{1f4ad} ", theme.dimmed.clone());
+        text.append_styled(
+            &format!("No comments for {issue_id}."),
+            theme.dimmed.clone(),
+        );
+        console.print_renderable(&text);
+        return;
+    }
+
+    let mut content = Text::new("");
+    let now = Utc::now();
+
+    for (i, comment) in comments.iter().enumerate() {
+        if i > 0 {
+            // Separator between comments
+            content.append_styled(
+                &"\u{2500}".repeat(40.min(width.saturating_sub(4))),
+                theme.dimmed.clone(),
+            );
+            content.append("\n\n");
+        }
+
+        // Author and timestamp
+        content.append_styled(&format!("@{}", comment.author), theme.username.clone());
+        content.append_styled(" \u{2022} ", theme.dimmed.clone());
+        content.append_styled(
+            &format_relative_time(comment.created_at, now),
+            theme.timestamp.clone(),
+        );
+        content.append("\n");
+
+        // Comment body
+        content.append(comment.body.trim_end_matches('\n'));
+        content.append("\n\n");
+    }
+
+    let title = format!("Comments: {} ({})", issue_id, comments.len());
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(&title, theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render confirmation for a newly added comment.
+fn render_comment_added_rich(issue_id: &str, comment: &Comment, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("\u{2713} ", theme.success.clone());
+    text.append_styled("Added comment to ", theme.success.clone());
+    text.append_styled(issue_id, theme.issue_id.clone());
+    console.print_renderable(&text);
+
+    console.print("");
+
+    // Show the comment that was added
+    let mut comment_text = Text::new("");
+    comment_text.append_styled(&format!("@{}", comment.author), theme.username.clone());
+    comment_text.append_styled(" \u{2022} just now", theme.timestamp.clone());
+    comment_text.append("\n");
+    comment_text.append(comment.body.trim_end_matches('\n'));
+    console.print_renderable(&comment_text);
+}
+
+/// Format a timestamp as relative time (e.g., "2 days ago", "3 hours ago").
+fn format_relative_time(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let duration = now.signed_duration_since(timestamp);
+    let seconds = duration.num_seconds();
+
+    if seconds < 60 {
+        return "just now".to_string();
+    }
+
+    let minutes = duration.num_minutes();
+    if minutes < 60 {
+        return format!(
+            "{} minute{} ago",
+            minutes,
+            if minutes == 1 { "" } else { "s" }
+        );
+    }
+
+    let hours = duration.num_hours();
+    if hours < 24 {
+        return format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" });
+    }
+
+    let days = duration.num_days();
+    if days < 30 {
+        return format!("{} day{} ago", days, if days == 1 { "" } else { "s" });
+    }
+
+    let months = days / 30;
+    if months < 12 {
+        return format!("{} month{} ago", months, if months == 1 { "" } else { "s" });
+    }
+
+    let years = months / 12;
+    format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
 }
 
 fn resolve_issue_id(
