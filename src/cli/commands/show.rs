@@ -60,10 +60,9 @@ pub fn execute(
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
-    if json {
+    if ctx.is_json() {
         // Output full details as JSON
-        let output = serde_json::to_string_pretty(&details_list)?;
-        println!("{output}");
+        ctx.json_pretty(&details_list);
     } else {
         for (i, details) in details_list.iter().enumerate() {
             if i > 0 {

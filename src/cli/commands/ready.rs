@@ -83,7 +83,6 @@ pub fn execute(
     }
 
     // Output
-    let use_json = json || args.robot;
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }

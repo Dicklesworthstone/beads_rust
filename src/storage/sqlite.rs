@@ -402,7 +402,7 @@ impl SqliteStorage {
                 add_update("owner", Box::new(val.as_deref().unwrap_or("").to_string()));
             }
             if let Some(ref val) = updates.estimated_minutes {
-                issue.estimated_minutes = Some(*val);
+                issue.estimated_minutes = *val;
                 add_update("estimated_minutes", Box::new(*val));
             }
             if let Some(ref val) = updates.external_ref {
@@ -2910,7 +2910,7 @@ pub struct IssueUpdate {
     pub issue_type: Option<IssueType>,
     pub assignee: Option<Option<String>>,
     pub owner: Option<Option<String>>,
-    pub estimated_minutes: Option<i32>,
+    pub estimated_minutes: Option<Option<i32>>,
     pub due_at: Option<Option<DateTime<Utc>>>,
     pub defer_until: Option<Option<DateTime<Utc>>>,
     pub external_ref: Option<Option<String>>,

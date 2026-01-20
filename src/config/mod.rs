@@ -153,6 +153,36 @@ impl ConfigPaths {
             metadata,
         })
     }
+
+    /// Get the user config path (~/.config/beads/config.yaml).
+    /// Returns None if HOME is not set.
+    #[must_use]
+    pub fn user_config_path(&self) -> Option<PathBuf> {
+        env::var("HOME").ok().map(|home| {
+            let config_root = Path::new(&home).join(".config");
+            let beads_path = config_root.join("beads").join("config.yaml");
+            if beads_path.exists() {
+                beads_path
+            } else {
+                config_root.join("bd").join("config.yaml")
+            }
+        })
+    }
+
+    /// Get the legacy user config path (~/.beads/config.yaml).
+    /// Returns None if HOME is not set.
+    #[must_use]
+    pub fn legacy_user_config_path(&self) -> Option<PathBuf> {
+        env::var("HOME")
+            .ok()
+            .map(|home| Path::new(&home).join(".beads").join("config.yaml"))
+    }
+
+    /// Get the project config path (.beads/config.yaml).
+    #[must_use]
+    pub fn project_config_path(&self) -> Option<PathBuf> {
+        Some(self.beads_dir.join("config.yaml"))
+    }
 }
 
 /// Discover the active `.beads` directory.

@@ -40,8 +40,6 @@ pub fn execute_defer(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let _use_json = json || args.robot;
-
     tracing::info!("Executing defer command");
 
     if args.ids.is_empty() {
@@ -178,8 +176,6 @@ pub fn execute_undefer(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let _use_json = json || args.robot;
-
     tracing::info!("Executing undefer command");
 
     if args.ids.is_empty() {

@@ -107,7 +107,7 @@ pub fn execute(
 
     // Handle --status flag
     if args.status {
-        return execute_status(&storage, &path_policy, use_json, ctx);
+        return execute_status(&storage, &path_policy, _json, ctx);
     }
 
     // Validate mutually exclusive modes

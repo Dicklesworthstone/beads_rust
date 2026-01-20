@@ -97,10 +97,10 @@ fn list_comments(
     storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
-    _json: bool,
+    json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    list_comments_by_id(&args.id, storage, resolver, all_ids, _json, ctx)
+    list_comments_by_id(&args.id, storage, resolver, all_ids, json, ctx)
 }
 
 fn list_comments_by_id(

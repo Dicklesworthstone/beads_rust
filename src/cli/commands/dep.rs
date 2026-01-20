@@ -725,7 +725,7 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 }
 
 fn dep_cycles(
-    args: &DepCyclesArgs,
+    _args: &DepCyclesArgs,
     storage: &SqliteStorage,
     _json: bool,
     ctx: &OutputContext,
