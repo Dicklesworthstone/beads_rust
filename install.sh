@@ -920,9 +920,10 @@ build_from_source() {
     local target_dir="$TMP/target"
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
         gum spin --spinner dot --title "Compiling br (release mode)..." -- \
-            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release 2>&1"
+            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release" \
+            || die "Build failed"
     else
-        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release 2>&1) || die "Build failed"
+        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release) || die "Build failed"
     fi
 
     # Find the binary
@@ -949,8 +950,10 @@ download_release() {
     local archive_name="br-${VERSION}-${platform}.tar.gz"
     local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
 
-    run_with_spinner "Downloading $archive_name..." \
-        download_file "$url" "$TMP/$archive_name"
+    log_step "Downloading $archive_name..."
+    if ! download_file "$url" "$TMP/$archive_name"; then
+        return 1
+    fi
 
     if [ ! -f "$TMP/$archive_name" ]; then
         return 1
