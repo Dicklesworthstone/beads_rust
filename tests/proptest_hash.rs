@@ -48,6 +48,7 @@ fn make_issue(title: &str, description: Option<&str>) -> Issue {
         defer_until: None,
         external_ref: None,
         source_system: None,
+        source_repo: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
