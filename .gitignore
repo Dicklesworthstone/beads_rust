@@ -43,3 +43,7 @@ claude-upgrade-progress.json
 
 # Shell command artifacts (from malformed redirects like `> =`)
 =
+
+# Local Cargo and Rustup caches (agent workspace artifacts)
+.cargo/
+.rustup/
