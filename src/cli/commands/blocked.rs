@@ -9,7 +9,7 @@ use crate::config::{
 use crate::error::{BeadsError, Result};
 use crate::format::{BlockedIssue, BlockedIssueOutput};
 use crate::model::{IssueType, Priority};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use std::str::FromStr;
 
 /// Execute the blocked command.
@@ -24,7 +24,7 @@ pub fn execute(
     args: &BlockedArgs,
     json: bool,
     overrides: &CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     tracing::info!("Fetching blocked issues from cache");
 
@@ -118,7 +118,9 @@ pub fn execute(
     }
 
     // Output
-    if json {
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_blocked_rich(&blocked_issues, args.detailed, storage);
+    } else if json {
         // Use BlockedIssueOutput for bd parity (excludes compaction_level, original_size)
         // Also strip status suffix from blocked_by entries (bd uses bare IDs)
         let output: Vec<BlockedIssueOutput> = blocked_issues
@@ -263,6 +265,101 @@ fn blocker_id_from_ref(blocker_ref: &str) -> &str {
     blocker_ref
         .rsplit_once(':')
         .map_or(blocker_ref, |(prefix, _)| prefix)
+}
+
+fn render_blocked_rich(
+    blocked_issues: &[BlockedIssue],
+    verbose: bool,
+    storage: &crate::storage::SqliteStorage,
+) {
+    use rich_rust::Text;
+    use rich_rust::prelude::*;
+
+    fn color(name: &str) -> Color {
+        Color::parse(name).unwrap_or_default()
+    }
+
+    let console = Console::default();
+
+    if blocked_issues.is_empty() {
+        let mut text = Text::new("");
+        text.append_styled("\u{2728} ", Style::new().color(color("green")));
+        text.append_styled(
+            "No blocked issues",
+            Style::new().bold().color(color("green")),
+        );
+        console.print_renderable(&text);
+        return;
+    }
+
+    // Header
+    let mut header = Text::new("");
+    header.append_styled("\u{1f6ab} ", Style::new().color(color("red")));
+    header.append_styled("Blocked issues", Style::new().bold().color(color("red")));
+    header.append_styled(&format!(" ({})", blocked_issues.len()), Style::new().dim());
+    console.print_renderable(&header);
+    console.print("");
+
+    for bi in blocked_issues {
+        let priority = bi.issue.priority.0;
+        let blocker_count = bi.blocked_by_count;
+
+        // Color code blocker count: yellow(1), orange(2-3), red(4+)
+        let count_style = match blocker_count {
+            1 => Style::new().color(color("yellow")),
+            2 | 3 => Style::new().color(color("bright_yellow")),
+            _ => Style::new().color(color("red")),
+        };
+
+        let mut line = Text::new("");
+        line.append_styled(
+            &format!("[P{}] ", priority),
+            Style::new().bold().color(color("magenta")),
+        );
+        line.append_styled(&bi.issue.id, Style::new().bold().color(color("cyan")));
+        line.append(": ");
+        line.append(&bi.issue.title);
+        line.append_styled(&format!(" [{} blockers]", blocker_count), count_style);
+        console.print_renderable(&line);
+
+        if verbose {
+            let mut blocked_label = Text::new("");
+            blocked_label.append_styled("  Blocked by:", Style::new().dim());
+            console.print_renderable(&blocked_label);
+
+            for blocker_ref in &bi.blocked_by {
+                let blocker_id = blocker_id_from_ref(blocker_ref);
+                let mut blocker_line = Text::new("");
+                blocker_line.append_styled("    \u{2022} ", Style::new().color(color("yellow")));
+                blocker_line.append_styled(blocker_id, Style::new().color(color("cyan")));
+
+                if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
+                    blocker_line.append(": ");
+                    blocker_line.append(&blocker.title);
+                    blocker_line
+                        .append_styled(&format!(" [P{}]", blocker.priority.0), Style::new().dim());
+                    blocker_line
+                        .append_styled(&format!(" [{}]", blocker.status), Style::new().dim());
+                } else {
+                    blocker_line.append_styled(" (not found)", Style::new().dim());
+                }
+                console.print_renderable(&blocker_line);
+            }
+        } else {
+            let ids: Vec<&str> = bi
+                .blocked_by
+                .iter()
+                .map(|r| blocker_id_from_ref(r))
+                .collect();
+            let mut detail = Text::new("");
+            detail.append_styled("  Blocked by: ", Style::new().dim());
+            detail.append_styled(
+                &format!("[{}]", ids.join(", ")),
+                Style::new().color(color("yellow")),
+            );
+            console.print_renderable(&detail);
+        }
+    }
 }
 
 #[cfg(test)]

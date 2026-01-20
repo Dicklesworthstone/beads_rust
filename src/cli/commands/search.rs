@@ -7,10 +7,11 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
 use crate::model::{IssueType, Priority, Status};
-use crate::output::OutputContext;
+use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
-use std::collections::HashSet;
+use regex::{Regex, RegexBuilder};
+use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::str::FromStr;
@@ -21,6 +22,7 @@ use std::str::FromStr;
 ///
 /// Returns an error if the query is empty, the database cannot be opened,
 /// or the query fails.
+#[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &SearchArgs,
     json: bool,
@@ -93,22 +95,133 @@ pub fn execute(
         }
     }
 
+    let quiet = cli.quiet.unwrap_or(false);
+    let ctx = OutputContext::from_flags(json, quiet, !use_color);
+
     if json {
         let json_output = serde_json::to_string_pretty(&issues_with_counts)?;
         println!("{json_output}");
-    } else {
-        println!(
-            "Found {} issue(s) matching '{}'",
-            issues_with_counts.len(),
-            query
-        );
-        for iwc in &issues_with_counts {
-            let line = format_issue_line_with(&iwc.issue, format_options);
-            println!("{line}");
+        return Ok(());
+    }
+
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        let issues: Vec<_> = issues_with_counts
+            .iter()
+            .map(|iwc| iwc.issue.clone())
+            .collect();
+        let context_snippets = build_context_snippets(&issues, query);
+        let show_context = !context_snippets.is_empty();
+        let columns = IssueTableColumns {
+            id: true,
+            priority: true,
+            status: true,
+            issue_type: true,
+            title: true,
+            assignee: true,
+            context: show_context,
+            ..Default::default()
+        };
+        let mut table = IssueTable::new(&issues, ctx.theme())
+            .columns(columns)
+            .title(format!(
+                "Search: \"{}\" - {} result{}",
+                query,
+                issues.len(),
+                if issues.len() == 1 { "" } else { "s" }
+            ))
+            .highlight_query(query);
+        if show_context {
+            table = table.context_snippets(context_snippets);
         }
+        ctx.render(&table.build());
+        return Ok(());
+    }
+
+    ctx.info(&format!(
+        "Found {} issue(s) matching '{}'",
+        issues_with_counts.len(),
+        query
+    ));
+    for iwc in &issues_with_counts {
+        let line = format_issue_line_with(&iwc.issue, format_options);
+        ctx.print(&line);
     }
 
     Ok(())
+}
+
+fn build_context_snippets(issues: &[crate::model::Issue], query: &str) -> HashMap<String, String> {
+    let Some(regex) = build_highlight_regex(query) else {
+        return HashMap::new();
+    };
+
+    let mut snippets = HashMap::new();
+    for issue in issues {
+        if let Some(description) = issue.description.as_deref() {
+            if let Some(mat) = regex.find(description) {
+                let snippet = snippet_around_match(description, mat.start(), mat.end(), 32);
+                if !snippet.is_empty() {
+                    snippets.insert(issue.id.clone(), snippet);
+                    continue;
+                }
+            }
+        }
+
+        if regex.is_match(&issue.id) && !regex.is_match(&issue.title) {
+            snippets.insert(issue.id.clone(), "ID match".to_string());
+        }
+    }
+
+    snippets
+}
+
+fn build_highlight_regex(query: &str) -> Option<Regex> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let pattern = regex::escape(trimmed);
+    RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+fn snippet_around_match(text: &str, start: usize, end: usize, radius: usize) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let mut char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    char_starts.push(text.len());
+
+    let total_chars = char_starts.len().saturating_sub(1);
+    let start_char = char_starts.partition_point(|&idx| idx < start);
+    let end_char = char_starts.partition_point(|&idx| idx < end);
+
+    let snippet_start_char = start_char.saturating_sub(radius);
+    let snippet_end_char = (end_char + radius).min(total_chars);
+
+    let snippet_start_byte = char_starts[snippet_start_char];
+    let snippet_end_byte = char_starts[snippet_end_char];
+
+    let mut snippet = text[snippet_start_byte..snippet_end_byte]
+        .trim()
+        .to_string();
+    snippet = normalize_whitespace(&snippet);
+
+    if snippet_start_char > 0 {
+        snippet.insert_str(0, "...");
+    }
+    if snippet_end_char < total_chars {
+        snippet.push_str("...");
+    }
+
+    snippet
+}
+
+fn normalize_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {

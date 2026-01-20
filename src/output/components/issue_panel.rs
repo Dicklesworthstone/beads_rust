@@ -100,8 +100,7 @@ impl<'a> IssuePanel<'a> {
         // Labels
         let labels = self
             .details
-            .map(|d| d.labels.as_slice())
-            .unwrap_or(self.issue.labels.as_slice());
+            .map_or(self.issue.labels.as_slice(), |d| d.labels.as_slice());
         if !labels.is_empty() {
             content.append_styled("Labels:   ", self.theme.dimmed.clone());
             for (i, label) in labels.iter().enumerate() {
@@ -149,8 +148,7 @@ impl<'a> IssuePanel<'a> {
         // Comments
         let comments: &[Comment] = self
             .details
-            .map(|d| d.comments.as_slice())
-            .unwrap_or(self.issue.comments.as_slice());
+            .map_or(self.issue.comments.as_slice(), |d| d.comments.as_slice());
         if self.show_comments && !comments.is_empty() {
             content.append_styled("\nComments:\n", self.theme.emphasis.clone());
             for comment in comments {

@@ -7,14 +7,16 @@ use crate::cli::OrphansArgs;
 use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::Result;
-use crate::model::Status;
-use crate::output::OutputContext;
+use crate::model::{Issue, Status};
+use crate::output::{IssueTable, IssueTableColumns, OutputContext};
 use crate::storage::ListFilters;
 use regex::Regex;
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use tracing::{debug, trace};
 
 /// Output format for orphan issues.
 #[derive(Debug, Clone, Serialize)]
@@ -44,13 +46,13 @@ pub fn execute(
 ) -> Result<()> {
     // Try to discover beads directory - return empty if not found
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
-        output_empty(json);
+        output_empty(json || args.robot, ctx);
         return Ok(());
     };
 
     // Try to open storage - return empty if not found
     let Ok(storage_ctx) = config::open_storage_with_cli(&beads_dir, cli) else {
-        output_empty(json);
+        output_empty(json || args.robot, ctx);
         return Ok(());
     };
     let storage = &storage_ctx.storage;
@@ -61,18 +63,23 @@ pub fn execute(
 
     // Check if we're in a git repo by running git rev-parse
     if !is_git_repo() {
-        output_empty(json);
+        output_empty(json || args.robot, ctx);
         return Ok(());
     }
 
     // Get git log and extract issue references
     let Ok(commit_refs) = get_git_commit_refs(&prefix) else {
-        output_empty(json);
+        output_empty(json || args.robot, ctx);
         return Ok(());
     };
 
+    trace!(
+        commit_refs = commit_refs.len(),
+        "Retrieved commit references"
+    );
+
     if commit_refs.is_empty() {
-        output_empty(json);
+        output_empty(json || args.robot, ctx);
         return Ok(());
     }
 
@@ -82,6 +89,7 @@ pub fn execute(
         ..Default::default()
     };
     let issues = storage.list_issues(&filters)?;
+    debug!(total_issues = issues.len(), "Scanning for orphaned issues");
 
     // Build a map of issue_id -> (commit_hash, commit_message)
     // We already have latest-first from git log, so first occurrence wins
@@ -94,20 +102,34 @@ pub fn execute(
 
     // Find orphans: issues that are referenced in commits but still open
     let mut orphans: Vec<OrphanIssue> = Vec::new();
-    for issue in &issues {
+    let mut orphan_issues: Vec<Issue> = Vec::new();
+    let mut context_snippets: HashMap<String, String> = HashMap::new();
+
+    for issue in issues {
         if let Some((commit_hash, commit_msg)) = issue_commits.get(&issue.id) {
+            let issue_id = issue.id.clone();
+            let title = issue.title.clone();
+            let status = issue.status.as_str().to_string();
+
+            if args.details {
+                context_snippets.insert(issue_id.clone(), format!("{commit_hash} {commit_msg}"));
+            }
+
             orphans.push(OrphanIssue {
-                issue_id: issue.id.clone(),
-                title: issue.title.clone(),
-                status: issue.status.as_str().to_string(),
+                issue_id,
+                title,
+                status,
                 latest_commit: commit_hash.clone(),
                 latest_commit_message: commit_msg.clone(),
             });
+            orphan_issues.push(issue);
         }
     }
 
     // Sort by issue_id for consistent output
     orphans.sort_by(|a, b| a.issue_id.cmp(&b.issue_id));
+    orphan_issues.sort_by(|a, b| a.id.cmp(&b.id));
+    debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
     if json || args.robot {
         println!("{}", serde_json::to_string_pretty(&orphans)?);
@@ -115,29 +137,58 @@ pub fn execute(
     }
 
     if orphans.is_empty() {
-        println!("No orphan issues found (open issues referenced in commits)");
+        output_empty(false, ctx);
         return Ok(());
     }
 
-    println!(
-        "Orphan issues ({} open/in_progress referenced in commits):",
-        orphans.len()
-    );
-    println!();
+    if ctx.is_rich() {
+        let columns = IssueTableColumns {
+            id: true,
+            priority: true,
+            status: false,
+            issue_type: false,
+            title: true,
+            assignee: false,
+            labels: false,
+            created: false,
+            updated: false,
+            context: args.details,
+        };
 
-    for (idx, orphan) in orphans.iter().enumerate() {
-        println!(
-            "{}. [{}] {} {}",
-            idx + 1,
-            orphan.status,
-            orphan.issue_id,
-            orphan.title
-        );
+        let mut table = IssueTable::new(&orphan_issues, ctx.theme())
+            .columns(columns)
+            .title(format!("Orphan Issues ({})", orphan_issues.len()));
+
         if args.details {
+            table = table.context_snippets(context_snippets);
+        }
+
+        let table = table.build();
+        ctx.render(&table);
+        ctx.print(
+            "\nSuggestion: Assign these to an epic or set a parent with br update <ID> --parent <EPIC_ID>\n",
+        );
+    } else {
+        println!(
+            "Orphan issues ({} open/in_progress referenced in commits):",
+            orphans.len()
+        );
+        println!();
+
+        for (idx, orphan) in orphans.iter().enumerate() {
             println!(
-                "   Commit: {} {}",
-                orphan.latest_commit, orphan.latest_commit_message
+                "{}. [{}] {} {}",
+                idx + 1,
+                orphan.status,
+                orphan.issue_id,
+                orphan.title
             );
+            if args.details {
+                println!(
+                    "   Commit: {} {}",
+                    orphan.latest_commit, orphan.latest_commit_message
+                );
+            }
         }
     }
 
@@ -250,13 +301,26 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
 }
 
 /// Output empty result in appropriate format.
-fn output_empty(json: bool) {
-    if json {
+fn output_empty(json: bool, ctx: &OutputContext) {
+    if json || ctx.is_json() {
         println!("[]");
-    } else {
-        // Match bd format
-        println!("✓ No orphaned issues found");
+        return;
     }
+    if ctx.is_quiet() {
+        return;
+    }
+    if ctx.is_rich() {
+        let theme = ctx.theme();
+        let panel = Panel::from_text("No orphaned issues found.")
+            .title(Text::styled("Orphans", theme.panel_title.clone()))
+            .box_style(theme.box_style)
+            .border_style(theme.panel_border.clone());
+        ctx.render(&panel);
+        return;
+    }
+
+    // Match bd format
+    println!("✓ No orphaned issues found");
 }
 
 #[cfg(test)]

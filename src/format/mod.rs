@@ -34,8 +34,10 @@
 
 pub mod context;
 pub mod csv;
+pub mod markdown;
 mod output;
 pub mod rich;
+pub mod syntax;
 mod text;
 pub mod theme;
 
@@ -54,3 +56,12 @@ pub use text::{
 // Rich output support
 pub use context::{OutputContext, OutputMode};
 pub use theme::Theme;
+
+// Syntax highlighting
+pub use syntax::{
+    available_themes, detect_language_from_filename, highlight_code, parse_code_fence,
+    supported_languages,
+};
+
+// Markdown rendering
+pub use markdown::{contains_markdown, escape_markdown, render_markdown};

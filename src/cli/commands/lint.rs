@@ -9,7 +9,9 @@ use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
+use rich_rust::prelude::*;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Serialize)]
@@ -80,7 +82,7 @@ pub fn execute(
     args: &LintArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -105,28 +107,125 @@ pub fn execute(
         return Ok(());
     }
 
-    if summary.results.is_empty() {
-        println!(
-            "✓ No template warnings found ({} issues checked)",
-            summary.checked
-        );
-        return Ok(());
+    if ctx.is_quiet() {
+        if summary.results.is_empty() {
+            return Ok(());
+        }
+        std::process::exit(summary.exit_code(false));
     }
 
-    println!(
-        "Template warnings ({} issues, {} warnings):\n",
-        summary.results.len(),
-        summary.warnings
-    );
-    for result in &summary.results {
-        println!("{} [{}]: {}", result.id, result.issue_type, result.title);
-        for missing in &result.missing {
-            println!("  ⚠ Missing: {missing}");
+    if ctx.is_rich() {
+        render_lint_rich(&summary, ctx);
+    } else {
+        if summary.results.is_empty() {
+            println!(
+                "✓ No template warnings found ({} issues checked)",
+                summary.checked
+            );
+            return Ok(());
         }
-        println!();
+
+        println!(
+            "Template warnings ({} issues, {} warnings):\n",
+            summary.results.len(),
+            summary.warnings
+        );
+        for result in &summary.results {
+            println!("{} [{}]: {}", result.id, result.issue_type, result.title);
+            for missing in &result.missing {
+                println!("  ⚠ Missing: {missing}");
+            }
+            println!();
+        }
     }
 
     std::process::exit(summary.exit_code(false));
+}
+
+fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
+    let theme = ctx.theme();
+    let mut content = Text::new("");
+
+    content.append_styled("Template Lint\n", theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Checked: ", theme.dimmed.clone());
+    content.append_styled(&summary.checked.to_string(), theme.emphasis.clone());
+    content.append_styled("    Warnings: ", theme.dimmed.clone());
+    if summary.warnings == 0 {
+        content.append_styled("0", theme.success.clone());
+    } else {
+        content.append_styled(&summary.warnings.to_string(), theme.warning.clone());
+    }
+    content.append("\n\n");
+
+    if summary.results.is_empty() {
+        content.append_styled(
+            &format!(
+                "✓ No template warnings found ({} issues checked)",
+                summary.checked
+            ),
+            theme.success.clone(),
+        );
+    } else {
+        let mut by_type: BTreeMap<&str, Vec<&LintResult>> = BTreeMap::new();
+        for result in &summary.results {
+            by_type
+                .entry(result.issue_type.as_str())
+                .or_default()
+                .push(result);
+        }
+
+        for (issue_type, results) in by_type {
+            content.append_styled(
+                &format!("{issue_type} ({})\n", results.len()),
+                theme.section.clone(),
+            );
+            for result in results {
+                content.append_styled("- ", theme.warning.clone());
+                content.append_styled(&result.id, theme.issue_id.clone());
+                content.append(" ");
+                content.append_styled(
+                    &format!("[{}] ", result.issue_type),
+                    issue_type_style(theme, &result.issue_type),
+                );
+                content.append_styled(&result.title, theme.issue_title.clone());
+                content.append("\n");
+
+                for missing in &result.missing {
+                    content.append_styled("    missing: ", theme.dimmed.clone());
+                    content.append_styled(missing, theme.warning.clone());
+                    content.append("\n");
+                }
+            }
+            content.append("\n");
+        }
+
+        content.append_styled(
+            "Tip: Add the missing sections to issue descriptions to clear warnings.\n",
+            theme.dimmed.clone(),
+        );
+    }
+
+    let panel = Panel::from_rich_text(&content, ctx.width())
+        .title(Text::styled("Lint Results", theme.panel_title.clone()))
+        .box_style(theme.box_style)
+        .border_style(theme.panel_border.clone());
+
+    ctx.render(&panel);
+}
+
+fn issue_type_style(theme: &crate::output::Theme, issue_type: &str) -> Style {
+    match issue_type {
+        "task" => theme.type_task.clone(),
+        "bug" => theme.type_bug.clone(),
+        "feature" => theme.type_feature.clone(),
+        "epic" => theme.type_epic.clone(),
+        "chore" => theme.type_chore.clone(),
+        "docs" => theme.type_docs.clone(),
+        "question" => theme.type_question.clone(),
+        _ => theme.dimmed.clone(),
+    }
 }
 
 fn build_filters(args: &LintArgs) -> Result<ListFilters> {

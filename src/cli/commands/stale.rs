@@ -3,7 +3,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::StaleIssue;
 use crate::model::{Issue, Status};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::ListFilters;
 use chrono::{DateTime, Duration, Utc};
 
@@ -16,7 +16,7 @@ pub fn execute(
     args: &StaleArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     if args.days < 0 {
         return Err(BeadsError::validation("days", "must be >= 0"));
@@ -42,40 +42,42 @@ pub fn execute(
     let issues = storage.list_issues(&filters)?;
     let stale = filter_stale_issues(issues, now, args.days);
 
-    if json {
+    // Output based on mode
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        render_stale_rich(&stale, now, args.days);
+    } else if json {
         // Convert to StaleIssue for bd-compatible JSON output
         let stale_output: Vec<StaleIssue> = stale.iter().map(StaleIssue::from).collect();
         let payload = serde_json::to_string(&stale_output)?;
         println!("{payload}");
-        return Ok(());
-    }
-
-    println!(
-        "Stale issues ({} not updated in {}+ days):",
-        stale.len(),
-        args.days
-    );
-    for (idx, issue) in stale.iter().enumerate() {
-        let days_stale = (now - issue.updated_at).num_days().max(0);
-        let status = issue.status.as_str();
-        if let Some(assignee) = issue.assignee.as_deref() {
-            println!(
-                "{}. [{}] {}d {} {} ({assignee})",
-                idx + 1,
-                status,
-                days_stale,
-                issue.id,
-                issue.title
-            );
-        } else {
-            println!(
-                "{}. [{}] {}d {} {}",
-                idx + 1,
-                status,
-                days_stale,
-                issue.id,
-                issue.title
-            );
+    } else {
+        println!(
+            "Stale issues ({} not updated in {}+ days):",
+            stale.len(),
+            args.days
+        );
+        for (idx, issue) in stale.iter().enumerate() {
+            let days_stale = (now - issue.updated_at).num_days().max(0);
+            let status = issue.status.as_str();
+            if let Some(assignee) = issue.assignee.as_deref() {
+                println!(
+                    "{}. [{}] {}d {} {} ({assignee})",
+                    idx + 1,
+                    status,
+                    days_stale,
+                    issue.id,
+                    issue.title
+                );
+            } else {
+                println!(
+                    "{}. [{}] {}d {} {}",
+                    idx + 1,
+                    status,
+                    days_stale,
+                    issue.id,
+                    issue.title
+                );
+            }
         }
     }
 
@@ -94,6 +96,83 @@ fn filter_stale_issues(mut issues: Vec<Issue>, now: DateTime<Utc>, days: i64) ->
     issues.retain(|issue| issue.updated_at <= threshold);
     issues.sort_by_key(|issue| issue.updated_at);
     issues
+}
+
+fn render_stale_rich(stale: &[Issue], now: DateTime<Utc>, threshold_days: i64) {
+    use rich_rust::Text;
+    use rich_rust::prelude::*;
+
+    fn color(name: &str) -> Color {
+        Color::parse(name).unwrap_or_default()
+    }
+
+    let console = Console::default();
+
+    if stale.is_empty() {
+        let mut text = Text::new("");
+        text.append_styled("\u{2728} ", Style::new().color(color("green")));
+        text.append_styled(
+            &format!("No stale issues (threshold: {}+ days)", threshold_days),
+            Style::new().bold().color(color("green")),
+        );
+        console.print_renderable(&text);
+        return;
+    }
+
+    // Header
+    let mut header = Text::new("");
+    header.append_styled("\u{23f3} ", Style::new().color(color("yellow")));
+    header.append_styled("Stale issues", Style::new().bold().color(color("yellow")));
+    header.append_styled(
+        &format!(" ({} not updated in {}+ days)", stale.len(), threshold_days),
+        Style::new().dim(),
+    );
+    console.print_renderable(&header);
+    console.print("");
+
+    for issue in stale {
+        let days_stale = (now - issue.updated_at).num_days().max(0);
+
+        // Staleness coloring: red (>30d), orange (14-30d), yellow (7-14d), dim (<7d)
+        let staleness_style = if days_stale > 30 {
+            Style::new().bold().color(color("red"))
+        } else if days_stale > 14 {
+            Style::new().color(color("bright_yellow"))
+        } else if days_stale > 7 {
+            Style::new().color(color("yellow"))
+        } else {
+            Style::new().dim()
+        };
+
+        // Status style
+        let status_style = match issue.status {
+            Status::Open => Style::new().color(color("blue")),
+            Status::InProgress => Style::new().color(color("yellow")),
+            _ => Style::new().dim(),
+        };
+
+        let mut line = Text::new("");
+
+        // Days stale badge
+        line.append_styled(&format!("{:>3}d ", days_stale), staleness_style.clone());
+
+        // Status badge
+        line.append_styled(&format!("[{}] ", issue.status.as_str()), status_style);
+
+        // Issue ID
+        line.append_styled(&issue.id, Style::new().bold().color(color("cyan")));
+        line.append(" ");
+
+        // Title
+        line.append(&issue.title);
+
+        // Assignee if present
+        if let Some(ref assignee) = issue.assignee {
+            line.append_styled(&format!(" (@{})", assignee), Style::new().dim());
+        }
+
+        console.print_renderable(&line);
+    }
 }
 
 #[cfg(test)]

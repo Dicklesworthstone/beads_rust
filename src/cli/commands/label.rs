@@ -585,11 +585,7 @@ fn render_rename_result_rich(old_name: &str, new_name: &str, count: usize, ctx: 
     text.append(" \u{2192} ");
     text.append_styled(new_name, Style::new().color(label_color(new_name)).bold());
     text.append_styled(
-        &format!(
-            " on {} issue{}",
-            count,
-            if count == 1 { "" } else { "s" }
-        ),
+        &format!(" on {} issue{}", count, if count == 1 { "" } else { "s" }),
         theme.dimmed.clone(),
     );
 

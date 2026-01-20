@@ -1,6 +1,7 @@
 use crate::error::{BeadsError, Result};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
+use rich_rust::prelude::*;
 use std::fs;
 use std::path::Path;
 
@@ -13,11 +14,12 @@ pub fn execute(
     prefix: Option<String>,
     force: bool,
     root_dir: Option<&Path>,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let base_dir = root_dir.unwrap_or_else(|| Path::new("."));
     let beads_dir = base_dir.join(".beads");
 
+    let mut created_dir = false;
     if beads_dir.exists() {
         // Check if DB exists
         let db_path = beads_dir.join("beads.db");
@@ -26,22 +28,26 @@ pub fn execute(
         }
     } else {
         fs::create_dir(&beads_dir)?;
+        created_dir = true;
     }
 
     let db_path = beads_dir.join("beads.db");
+    let db_existed = db_path.exists();
 
     // Initialize DB (creates file and applies schema)
     let mut storage = SqliteStorage::open(&db_path)?;
 
     // Set prefix in config table if provided
+    let mut prefix_set = None;
     if let Some(p) = prefix {
         storage.set_config("issue_prefix", &p)?;
-        println!("Prefix set to: {p}");
+        prefix_set = Some(p);
     }
 
     // Write metadata.json
     let metadata_path = beads_dir.join("metadata.json");
-    if !metadata_path.exists() || force {
+    let metadata_existed = metadata_path.exists();
+    if !metadata_existed || force {
         let metadata = r#"{
   "database": "beads.db",
   "jsonl_export": "issues.jsonl"
@@ -51,7 +57,8 @@ pub fn execute(
 
     // Write config.yaml template
     let config_path = beads_dir.join("config.yaml");
-    if !config_path.exists() {
+    let config_existed = config_path.exists();
+    if !config_existed {
         let config = r"# Beads Project Configuration
 # issue_prefix: bd
 # default_priority: 2
@@ -62,7 +69,8 @@ pub fn execute(
 
     // Write .gitignore
     let gitignore_path = beads_dir.join(".gitignore");
-    if !gitignore_path.exists() {
+    let gitignore_existed = gitignore_path.exists();
+    if !gitignore_existed {
         let gitignore = r"# Database
 *.db
 *.db-shm
@@ -78,8 +86,173 @@ last-touched
         fs::write(gitignore_path, gitignore)?;
     }
 
-    println!("Initialized beads workspace in .beads/");
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
+    if matches!(ctx.mode(), OutputMode::Rich) {
+        let steps = build_init_steps(
+            created_dir,
+            db_existed,
+            metadata_existed,
+            force,
+            config_existed,
+            gitignore_existed,
+            prefix_set.as_deref(),
+        );
+        render_init_rich(&beads_dir, &steps, prefix_set.as_deref(), ctx);
+    } else {
+        if let Some(p) = prefix_set.as_deref() {
+            println!("Prefix set to: {p}");
+        }
+        println!("Initialized beads workspace in .beads/");
+    }
+
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum InitStepStatus {
+    Created,
+    Updated,
+    Existing,
+}
+
+struct InitStep {
+    label: String,
+    status: InitStepStatus,
+}
+
+#[allow(clippy::fn_params_excessive_bools)]
+fn build_init_steps(
+    created_dir: bool,
+    db_existed: bool,
+    metadata_existed: bool,
+    force: bool,
+    config_existed: bool,
+    gitignore_existed: bool,
+    prefix: Option<&str>,
+) -> Vec<InitStep> {
+    let mut steps = Vec::new();
+
+    steps.push(InitStep {
+        label: ".beads/ directory".to_string(),
+        status: if created_dir {
+            InitStepStatus::Created
+        } else {
+            InitStepStatus::Existing
+        },
+    });
+
+    steps.push(InitStep {
+        label: "SQLite database (beads.db)".to_string(),
+        status: if db_existed {
+            InitStepStatus::Existing
+        } else {
+            InitStepStatus::Created
+        },
+    });
+
+    let metadata_status = if !metadata_existed {
+        InitStepStatus::Created
+    } else if force {
+        InitStepStatus::Updated
+    } else {
+        InitStepStatus::Existing
+    };
+    steps.push(InitStep {
+        label: "metadata.json".to_string(),
+        status: metadata_status,
+    });
+
+    steps.push(InitStep {
+        label: "config.yaml".to_string(),
+        status: if config_existed {
+            InitStepStatus::Existing
+        } else {
+            InitStepStatus::Created
+        },
+    });
+
+    steps.push(InitStep {
+        label: ".gitignore".to_string(),
+        status: if gitignore_existed {
+            InitStepStatus::Existing
+        } else {
+            InitStepStatus::Created
+        },
+    });
+
+    if let Some(prefix) = prefix {
+        steps.push(InitStep {
+            label: format!("Issue prefix set to '{prefix}'"),
+            status: InitStepStatus::Updated,
+        });
+    }
+
+    steps
+}
+
+fn render_init_rich(
+    beads_dir: &Path,
+    steps: &[InitStep],
+    prefix: Option<&str>,
+    ctx: &OutputContext,
+) {
+    let theme = ctx.theme();
+    let mut content = Text::new("");
+
+    content.append_styled("Workspace initialized\n", theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Location: ", theme.dimmed.clone());
+    content.append_styled(&beads_dir.display().to_string(), theme.accent.clone());
+    content.append("\n\n");
+
+    content.append_styled("Steps:\n", theme.emphasis.clone());
+    for step in steps {
+        append_step(&mut content, step, theme);
+    }
+
+    content.append("\n");
+    content.append_styled("Layout:\n", theme.emphasis.clone());
+    content.append("  .beads/\n");
+    content.append("    |-- beads.db\n");
+    content.append("    |-- metadata.json\n");
+    content.append("    |-- config.yaml\n");
+    content.append("    |-- .gitignore\n");
+    content.append("    `-- issues.jsonl (created on first sync)\n");
+
+    content.append("\n");
+    content.append_styled("Next steps:\n", theme.emphasis.clone());
+    content.append("  br create \"My first issue\"\n");
+    content.append("  br list\n");
+
+    if prefix.is_none() {
+        content.append("\n");
+        content.append_styled(
+            "Tip: Set a custom prefix with `br init --prefix <name>`\n",
+            theme.dimmed.clone(),
+        );
+    }
+
+    let panel = Panel::from_rich_text(&content, ctx.width())
+        .title(Text::new("Beads Initialized"))
+        .box_style(theme.box_style)
+        .border_style(theme.panel_border.clone());
+
+    ctx.render(&panel);
+}
+
+fn append_step(content: &mut Text, step: &InitStep, theme: &crate::output::Theme) {
+    let (icon, style) = match step.status {
+        InitStepStatus::Created => ("[+]", theme.success.clone()),
+        InitStepStatus::Updated => ("[*]", theme.warning.clone()),
+        InitStepStatus::Existing => ("[=]", theme.dimmed.clone()),
+    };
+    content.append_styled(&format!("{icon} "), style);
+    content.append_styled(&step.label, theme.issue_title.clone());
+    content.append("\n");
 }
 
 #[cfg(test)]

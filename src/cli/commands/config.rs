@@ -11,17 +11,67 @@
 
 use crate::cli::ConfigCommands;
 use crate::config::{
-    CliOverrides, ConfigLayer, discover_beads_dir, id_config_from_layer, load_config,
-    load_project_config, load_user_config, resolve_actor,
+    CliOverrides, ConfigLayer, default_config_layer, discover_beads_dir, id_config_from_layer,
+    load_legacy_user_config, load_project_config, load_user_config, resolve_actor,
 };
 use crate::error::Result;
 use crate::output::OutputContext;
+use rich_rust::prelude::*;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use tracing::{debug, info, trace};
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigSource {
+    Default,
+    Db,
+    LegacyUser,
+    User,
+    Project,
+    Environment,
+    Cli,
+}
+
+impl ConfigSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Db => "db",
+            Self::LegacyUser => "legacy user",
+            Self::User => "user config",
+            Self::Project => ".beads/config",
+            Self::Environment => "environment",
+            Self::Cli => "cli",
+        }
+    }
+
+    fn heading(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Db => "DB",
+            Self::LegacyUser => "Legacy User",
+            Self::User => "User",
+            Self::Project => "Project",
+            Self::Environment => "Environment",
+            Self::Cli => "CLI",
+        }
+    }
+}
+
+struct ConfigEntry {
+    key: String,
+    value: String,
+    source: ConfigSource,
+}
+
+struct LayerWithSource {
+    source: ConfigSource,
+    layer: ConfigLayer,
+}
 
 /// Execute the config command.
 ///
@@ -32,39 +82,234 @@ pub fn execute(
     command: &ConfigCommands,
     json_mode: bool,
     overrides: &CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     match command {
-        ConfigCommands::Path => show_paths(json_mode),
+        ConfigCommands::Path => show_paths(json_mode, ctx),
         ConfigCommands::Edit => edit_config(),
         ConfigCommands::List { project, user } => {
             let beads_dir = discover_beads_dir(None).ok();
-            show_config(beads_dir.as_ref(), overrides, *project, *user, json_mode)
+            show_config(
+                beads_dir.as_ref(),
+                overrides,
+                *project,
+                *user,
+                json_mode,
+                ctx,
+            )
         }
-        ConfigCommands::Set { args } => set_config_value(args, json_mode),
-        ConfigCommands::Delete { key } => delete_config_value(key, json_mode, overrides),
+        ConfigCommands::Set { args } => set_config_value(args, json_mode, ctx),
+        ConfigCommands::Delete { key } => delete_config_value(key, json_mode, overrides, ctx),
         ConfigCommands::Get { key } => {
             let beads_dir = discover_beads_dir(None).ok();
-            get_config_value(key, beads_dir.as_ref(), overrides, json_mode)
+            get_config_value(key, beads_dir.as_ref(), overrides, json_mode, ctx)
         }
     }
 }
 
+fn build_layers(
+    beads_dir: Option<&PathBuf>,
+    overrides: &CliOverrides,
+) -> Result<Vec<LayerWithSource>> {
+    let defaults = default_config_layer();
+
+    let db_layer = if let Some(dir) = beads_dir {
+        let storage = crate::config::open_storage_with_cli(dir, overrides)
+            .ok()
+            .map(|ctx| ctx.storage);
+        if let Some(storage) = storage {
+            ConfigLayer::from_db(&storage)?
+        } else {
+            ConfigLayer::default()
+        }
+    } else {
+        ConfigLayer::default()
+    };
+
+    let legacy_user = load_legacy_user_config()?;
+    let user = load_user_config()?;
+    let project = if let Some(dir) = beads_dir {
+        load_project_config(dir)?
+    } else {
+        ConfigLayer::default()
+    };
+    let env_layer = ConfigLayer::from_env();
+    let cli_layer = overrides.as_layer();
+
+    Ok(vec![
+        LayerWithSource {
+            source: ConfigSource::Default,
+            layer: defaults,
+        },
+        LayerWithSource {
+            source: ConfigSource::Db,
+            layer: db_layer,
+        },
+        LayerWithSource {
+            source: ConfigSource::LegacyUser,
+            layer: legacy_user,
+        },
+        LayerWithSource {
+            source: ConfigSource::User,
+            layer: user,
+        },
+        LayerWithSource {
+            source: ConfigSource::Project,
+            layer: project,
+        },
+        LayerWithSource {
+            source: ConfigSource::Environment,
+            layer: env_layer,
+        },
+        LayerWithSource {
+            source: ConfigSource::Cli,
+            layer: cli_layer,
+        },
+    ])
+}
+
+fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
+    let mut merged = ConfigLayer::default();
+    for layer in layers {
+        merged.merge_from(&layer.layer);
+    }
+    merged
+}
+
+fn resolve_source(key: &str, layers: &[LayerWithSource]) -> ConfigSource {
+    for layer in layers.iter().rev() {
+        if layer.layer.runtime.contains_key(key) || layer.layer.startup.contains_key(key) {
+            return layer.source;
+        }
+    }
+    ConfigSource::Default
+}
+
+fn format_config_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "\"\"".to_string();
+    }
+    if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+    {
+        return trimmed.to_string();
+    }
+    if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
+        return trimmed.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(lower.as_str(), "true" | "false" | "null") {
+        return trimmed.to_string();
+    }
+    format!("\"{trimmed}\"")
+}
+
+fn render_config_table(title: &str, entries: &[ConfigEntry], ctx: &OutputContext) {
+    let theme = ctx.theme();
+    if entries.is_empty() {
+        let panel = Panel::from_text("No configuration values found.")
+            .title(Text::styled(title, theme.panel_title.clone()))
+            .box_style(theme.box_style)
+            .border_style(theme.panel_border.clone());
+        ctx.render(&panel);
+        return;
+    }
+
+    let mut table = Table::new()
+        .box_style(theme.box_style)
+        .border_style(theme.panel_border.clone())
+        .title(Text::styled(title, theme.panel_title.clone()));
+
+    table = table
+        .with_column(Column::new("Key").min_width(16).max_width(30))
+        .with_column(Column::new("Value").min_width(12).max_width(50))
+        .with_column(Column::new("Source").min_width(12).max_width(20));
+
+    for entry in entries {
+        let key_cell = Cell::new(Text::styled(&entry.key, theme.emphasis.clone()));
+        let value_cell = Cell::new(Text::new(entry.value.clone()));
+        let source_cell = Cell::new(Text::styled(entry.source.label(), theme.dimmed.clone()));
+        table.add_row(Row::new(vec![key_cell, value_cell, source_cell]));
+    }
+
+    ctx.render(&table);
+}
+
+fn render_kv_table(title: &str, rows: &[(String, String)], ctx: &OutputContext) {
+    let theme = ctx.theme();
+    if rows.is_empty() {
+        return;
+    }
+    let mut table = Table::new()
+        .box_style(theme.box_style)
+        .border_style(theme.panel_border.clone())
+        .title(Text::styled(title, theme.panel_title.clone()));
+
+    table = table
+        .with_column(Column::new("Key").min_width(16).max_width(30))
+        .with_column(Column::new("Value").min_width(12).max_width(50));
+
+    for (key, value) in rows {
+        let key_cell = Cell::new(Text::styled(key, theme.emphasis.clone()));
+        let value_cell = Cell::new(Text::new(value.clone()));
+        table.add_row(Row::new(vec![key_cell, value_cell]));
+    }
+
+    ctx.render(&table);
+}
 /// Show config file paths.
-fn show_paths(json_mode: bool) -> Result<()> {
+fn show_paths(json_mode: bool, ctx: &OutputContext) -> Result<()> {
     let user_config_path = get_user_config_path();
     let legacy_user_path = get_legacy_user_config_path();
     let project_path = discover_beads_dir(None)
         .ok()
         .map(|dir| dir.join("config.yaml"));
 
-    if json_mode {
+    if json_mode || ctx.is_json() {
         let output = json!({
             "user_config": user_config_path.map(|p| p.display().to_string()),
             "legacy_user_config": legacy_user_path.map(|p| p.display().to_string()),
             "project_config": project_path.map(|p| p.display().to_string()),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if ctx.is_quiet() {
+        return Ok(());
+    } else if ctx.is_rich() {
+        let mut rows = Vec::new();
+        match user_config_path {
+            Some(path) => {
+                let status = if path.exists() { "exists" } else { "not found" };
+                rows.push((
+                    "User config".to_string(),
+                    format!("{} ({status})", path.display()),
+                ));
+            }
+            None => rows.push(("User config".to_string(), "HOME not set".to_string())),
+        }
+        if let Some(path) = legacy_user_path {
+            if path.exists() {
+                rows.push((
+                    "Legacy user".to_string(),
+                    format!("{} (exists)", path.display()),
+                ));
+            }
+        }
+        match project_path {
+            Some(path) => {
+                let status = if path.exists() { "exists" } else { "not found" };
+                rows.push((
+                    "Project config".to_string(),
+                    format!("{} ({status})", path.display()),
+                ));
+            }
+            None => rows.push((
+                "Project config".to_string(),
+                "no .beads directory found".to_string(),
+            )),
+        }
+
+        render_kv_table("Configuration Paths", &rows, ctx);
     } else {
         println!("Configuration paths:");
         println!();
@@ -141,23 +386,11 @@ fn get_config_value(
     beads_dir: Option<&PathBuf>,
     overrides: &CliOverrides,
     json_mode: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
-    let layer = if let Some(dir) = beads_dir {
-        // Try to open storage for DB config
-        let storage = crate::config::open_storage_with_cli(dir, overrides)
-            .ok()
-            .map(|ctx| ctx.storage);
-        load_config(dir, storage.as_ref(), overrides)?
-    } else {
-        // No beads dir, just use env and user configs
-        let mut layer = ConfigLayer::default();
-        if let Ok(user) = load_user_config() {
-            layer.merge_from(&user);
-        }
-        layer.merge_from(&ConfigLayer::from_env());
-        layer.merge_from(&overrides.as_layer());
-        layer
-    };
+    debug!(key, "Reading config key");
+    let layers = build_layers(beads_dir, overrides)?;
+    let layer = merge_layers(&layers);
 
     // Look for the key in both runtime and startup
     let value = layer
@@ -166,14 +399,31 @@ fn get_config_value(
         .or_else(|| layer.startup.get(key))
         .cloned();
 
-    if json_mode {
+    if json_mode || ctx.is_json() {
         let output = json!({
             "key": key,
             "value": value,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if let Some(v) = value {
-        println!("{v}");
+        if ctx.is_quiet() {
+            return Ok(());
+        }
+        if ctx.is_rich() {
+            let source = resolve_source(key, &layers);
+            trace!(key, source = ?source, "Config source resolved");
+            render_config_table(
+                "Config Value",
+                &[ConfigEntry {
+                    key: key.to_string(),
+                    value: format_config_value(&v),
+                    source,
+                }],
+                ctx,
+            );
+        } else {
+            println!("{v}");
+        }
     } else {
         eprintln!("Config key not found: {key}");
         std::process::exit(1);
@@ -183,7 +433,7 @@ fn get_config_value(
 }
 
 /// Set a config value in project config (if available) or user config.
-fn set_config_value(args: &[String], json_mode: bool) -> Result<()> {
+fn set_config_value(args: &[String], json_mode: bool, ctx: &OutputContext) -> Result<()> {
     let (key, value) = match args.len() {
         1 => args[0]
             .split_once('=')
@@ -231,21 +481,26 @@ fn set_config_value(args: &[String], json_mode: bool) -> Result<()> {
     };
 
     // Set the value
-    {
-        // Handle nested keys (e.g., "display.color")
-        let parts: Vec<&str> = key.split('.').collect();
-        set_yaml_value(
-            &mut config,
-            &parts,
-            serde_yaml::Value::String(value.to_string()),
-        );
-    }
+    let parts: Vec<&str> = key.split('.').collect();
+    let old_value = get_yaml_value(&config, &parts);
+    set_yaml_value(
+        &mut config,
+        &parts,
+        serde_yaml::Value::String(value.to_string()),
+    );
 
     // Write back
     let yaml_str = serde_yaml::to_string(&config)?;
     fs::write(&config_path, yaml_str)?;
 
-    if json_mode {
+    info!(
+        key,
+        old_value = old_value.as_deref(),
+        new_value = value,
+        "Config updated"
+    );
+
+    if json_mode || ctx.is_json() {
         let output = json!({
             "key": key,
             "value": value,
@@ -253,6 +508,42 @@ fn set_config_value(args: &[String], json_mode: bool) -> Result<()> {
             "scope": if is_project { "project" } else { "user" }
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if ctx.is_quiet() {
+        return Ok(());
+    } else if ctx.is_rich() {
+        let theme = ctx.theme();
+        let mut content = Text::new("");
+        content.append_styled("Configuration updated\n", theme.emphasis.clone());
+        content.append("\n");
+
+        content.append_styled("Key: ", theme.dimmed.clone());
+        content.append_styled(key, theme.issue_title.clone());
+        content.append("\n");
+
+        content.append_styled("Value: ", theme.dimmed.clone());
+        content.append(&format_config_value(value));
+        content.append("\n");
+
+        if let Some(old) = old_value {
+            content.append_styled("Previous: ", theme.dimmed.clone());
+            content.append(&format_config_value(&old));
+            content.append("\n");
+        }
+
+        content.append_styled("Scope: ", theme.dimmed.clone());
+        content.append(if is_project { "project" } else { "user" });
+        content.append("\n");
+
+        content.append_styled("Path: ", theme.dimmed.clone());
+        content.append(&config_path.display().to_string());
+        content.append("\n");
+
+        let panel = Panel::from_rich_text(&content, ctx.width())
+            .title(Text::styled("Config Set", theme.panel_title.clone()))
+            .box_style(theme.box_style)
+            .border_style(theme.panel_border.clone());
+
+        ctx.render(&panel);
     } else {
         println!("Set {key}={value} in {}", config_path.display());
     }
@@ -290,8 +581,42 @@ fn set_yaml_value(config: &mut serde_yaml::Value, parts: &[&str], value: serde_y
     }
 }
 
+fn get_yaml_value(value: &serde_yaml::Value, parts: &[&str]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+
+    if let serde_yaml::Value::Mapping(map) = value {
+        let key = serde_yaml::Value::String(parts[0].to_string());
+        let child = map.get(&key)?;
+        if parts.len() == 1 {
+            return yaml_value_to_string(child);
+        }
+        return get_yaml_value(child, &parts[1..]);
+    }
+
+    None
+}
+
+fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::Null => Some("null".to_string()),
+        serde_yaml::Value::Bool(value) => Some(value.to_string()),
+        serde_yaml::Value::Number(value) => Some(value.to_string()),
+        serde_yaml::Value::String(value) => Some(value.clone()),
+        _ => serde_yaml::to_string(value)
+            .ok()
+            .map(|value| value.trim().to_string()),
+    }
+}
+
 /// Delete a config value from the database, project config, and user config.
-fn delete_config_value(key: &str, json_mode: bool, overrides: &CliOverrides) -> Result<()> {
+fn delete_config_value(
+    key: &str,
+    json_mode: bool,
+    overrides: &CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     // 1. Delete from DB
     let beads_dir = discover_beads_dir(None).ok();
     let mut db_deleted = false;
@@ -337,7 +662,7 @@ fn delete_config_value(key: &str, json_mode: bool, overrides: &CliOverrides) -> 
         }
     }
 
-    if json_mode {
+    if json_mode || ctx.is_json() {
         let output = json!({
             "key": key,
             "deleted_from_db": db_deleted,
@@ -345,6 +670,8 @@ fn delete_config_value(key: &str, json_mode: bool, overrides: &CliOverrides) -> 
             "deleted_from_user": user_deleted,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if ctx.is_quiet() {
+        return Ok(());
     } else if db_deleted || project_deleted || user_deleted {
         let mut sources = Vec::new();
         if db_deleted {
@@ -356,7 +683,34 @@ fn delete_config_value(key: &str, json_mode: bool, overrides: &CliOverrides) -> 
         if user_deleted {
             sources.push("User");
         }
-        println!("Deleted config key: {key} (from {})", sources.join(", "));
+        if ctx.is_rich() {
+            let theme = ctx.theme();
+            let mut content = Text::new("");
+            content.append_styled("Configuration deleted\n", theme.emphasis.clone());
+            content.append("\n");
+            content.append_styled("Key: ", theme.dimmed.clone());
+            content.append_styled(key, theme.issue_title.clone());
+            content.append("\n");
+            content.append_styled("Sources: ", theme.dimmed.clone());
+            content.append(&sources.join(", "));
+            content.append("\n");
+
+            let panel = Panel::from_rich_text(&content, ctx.width())
+                .title(Text::styled("Config Delete", theme.panel_title.clone()))
+                .box_style(theme.box_style)
+                .border_style(theme.panel_border.clone());
+            ctx.render(&panel);
+        } else {
+            println!("Deleted config key: {key} (from {})", sources.join(", "));
+        }
+    } else if ctx.is_rich() {
+        let theme = ctx.theme();
+        let message = format!("Config key not found: {key}");
+        let panel = Panel::from_text(&message)
+            .title(Text::styled("Config Delete", theme.panel_title.clone()))
+            .box_style(theme.box_style)
+            .border_style(theme.panel_border.clone());
+        ctx.render(&panel);
     } else {
         println!("Config key not found: {key}");
     }
@@ -388,21 +742,35 @@ fn delete_nested(value: &mut serde_yaml::Value, path: &[&str]) -> bool {
 }
 
 /// Show merged configuration.
+#[allow(clippy::too_many_lines)]
 fn show_config(
     beads_dir: Option<&PathBuf>,
     overrides: &CliOverrides,
     project_only: bool,
     user_only: bool,
     json_mode: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     if project_only {
         // Show only project config
         if let Some(dir) = beads_dir {
             let layer = load_project_config(dir)?;
-            return output_layer(&layer, "project", json_mode);
+            return output_layer(&layer, ConfigSource::Project, json_mode, ctx);
         }
-        if json_mode {
+        if json_mode || ctx.is_json() {
             println!("{{}}");
+        } else if ctx.is_quiet() {
+            return Ok(());
+        } else if ctx.is_rich() {
+            let theme = ctx.theme();
+            let panel = Panel::from_text("No project config (no .beads directory found).")
+                .title(Text::styled(
+                    "Project Configuration",
+                    theme.panel_title.clone(),
+                ))
+                .box_style(theme.box_style)
+                .border_style(theme.panel_border.clone());
+            ctx.render(&panel);
         } else {
             println!("No project config (no .beads directory found)");
         }
@@ -412,30 +780,18 @@ fn show_config(
     if user_only {
         // Show only user config
         let layer = load_user_config()?;
-        return output_layer(&layer, "user", json_mode);
+        return output_layer(&layer, ConfigSource::User, json_mode, ctx);
     }
 
     // Show merged config
-    let layer = if let Some(dir) = beads_dir {
-        let storage = crate::config::open_storage_with_cli(dir, overrides)
-            .ok()
-            .map(|ctx| ctx.storage);
-        load_config(dir, storage.as_ref(), overrides)?
-    } else {
-        let mut layer = ConfigLayer::default();
-        if let Ok(user) = load_user_config() {
-            layer.merge_from(&user);
-        }
-        layer.merge_from(&ConfigLayer::from_env());
-        layer.merge_from(&overrides.as_layer());
-        layer
-    };
+    let layers = build_layers(beads_dir, overrides)?;
+    let layer = merge_layers(&layers);
 
     // Compute derived values
     let id_config = id_config_from_layer(&layer);
     let actor = resolve_actor(&layer);
 
-    if json_mode {
+    if json_mode || ctx.is_json() {
         let mut all_keys: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
         for (k, v) in &layer.runtime {
@@ -458,6 +814,45 @@ fn show_config(
         all_keys.insert("_computed.actor".to_string(), json!(actor));
 
         println!("{}", serde_json::to_string_pretty(&all_keys)?);
+    } else if ctx.is_quiet() {
+        return Ok(());
+    } else if ctx.is_rich() {
+        let mut entries = Vec::new();
+        let mut keys: Vec<_> = layer.runtime.keys().chain(layer.startup.keys()).collect();
+        keys.sort();
+        keys.dedup();
+
+        for key in keys {
+            let value = layer
+                .runtime
+                .get(key)
+                .or_else(|| layer.startup.get(key))
+                .cloned()
+                .unwrap_or_default();
+            let source = resolve_source(key, &layers);
+            trace!(key, source = ?source, "Config source resolved");
+            entries.push(ConfigEntry {
+                key: key.clone(),
+                value: format_config_value(&value),
+                source,
+            });
+        }
+
+        render_config_table("Configuration", &entries, ctx);
+
+        let computed_rows = vec![
+            ("prefix".to_string(), format_config_value(&id_config.prefix)),
+            (
+                "min_hash_length".to_string(),
+                format_config_value(&id_config.min_hash_length.to_string()),
+            ),
+            (
+                "max_hash_length".to_string(),
+                format_config_value(&id_config.max_hash_length.to_string()),
+            ),
+            ("actor".to_string(), format_config_value(&actor)),
+        ];
+        render_kv_table("Computed Values", &computed_rows, ctx);
     } else {
         println!("Current configuration (merged):");
         println!();
@@ -500,8 +895,13 @@ fn show_config(
 }
 
 /// Output a single config layer.
-fn output_layer(layer: &ConfigLayer, source: &str, json_mode: bool) -> Result<()> {
-    if json_mode {
+fn output_layer(
+    layer: &ConfigLayer,
+    source: ConfigSource,
+    json_mode: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    if json_mode || ctx.is_json() {
         let mut all_keys: BTreeMap<String, &str> = BTreeMap::new();
         for (k, v) in &layer.runtime {
             all_keys.insert(k.clone(), v);
@@ -510,8 +910,36 @@ fn output_layer(layer: &ConfigLayer, source: &str, json_mode: bool) -> Result<()
             all_keys.insert(k.clone(), v);
         }
         println!("{}", serde_json::to_string_pretty(&all_keys)?);
+    } else if ctx.is_quiet() {
+        return Ok(());
+    } else if ctx.is_rich() {
+        let mut all_keys: Vec<_> = layer.runtime.keys().chain(layer.startup.keys()).collect();
+        all_keys.sort();
+        all_keys.dedup();
+
+        let entries = all_keys
+            .into_iter()
+            .filter_map(|key| {
+                let value = layer
+                    .runtime
+                    .get(key)
+                    .or_else(|| layer.startup.get(key))
+                    .cloned()?;
+                Some(ConfigEntry {
+                    key: key.clone(),
+                    value: format_config_value(&value),
+                    source,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        render_config_table(
+            &format!("{} Configuration", source.heading()),
+            &entries,
+            ctx,
+        );
     } else {
-        println!("{source} configuration:");
+        println!("{} configuration:", source.heading());
         println!();
 
         let mut all_keys: Vec<_> = layer.runtime.keys().chain(layer.startup.keys()).collect();
@@ -578,7 +1006,8 @@ mod tests {
     fn test_set_config_invalid_format() {
         // Test with empty HOME - will fail with proper error
         let args = vec!["no_equals_sign".to_string()];
-        let result = set_config_value(&args, false);
+        let ctx = OutputContext::from_flags(false, false, true);
+        let result = set_config_value(&args, false, &ctx);
         assert!(result.is_err());
     }
 

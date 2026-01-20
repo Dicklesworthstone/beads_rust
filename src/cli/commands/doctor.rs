@@ -8,6 +8,7 @@ use crate::output::OutputContext;
 use crate::sync::{
     PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
 };
+use rich_rust::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -60,12 +61,24 @@ fn has_error(checks: &[CheckResult]) -> bool {
         .any(|check| matches!(check.status, CheckStatus::Error))
 }
 
-fn print_report(report: &DoctorReport, json: bool) -> Result<()> {
-    if json {
+fn print_report(report: &DoctorReport, json: bool, ctx: &OutputContext) -> Result<()> {
+    if json || ctx.is_json() {
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+    if ctx.is_rich() {
+        render_doctor_rich(report, ctx);
+        return Ok(());
+    }
 
+    print_report_plain(report);
+    Ok(())
+}
+
+fn print_report_plain(report: &DoctorReport) {
     println!("br doctor");
     for check in &report.checks {
         let label = match check.status {
@@ -79,7 +92,76 @@ fn print_report(report: &DoctorReport, json: bool) -> Result<()> {
             println!("{label} {}", check.name);
         }
     }
-    Ok(())
+}
+
+fn render_doctor_rich(report: &DoctorReport, ctx: &OutputContext) {
+    let theme = ctx.theme();
+    let mut content = Text::new("");
+
+    let mut ok_count = 0usize;
+    let mut warn_count = 0usize;
+    let mut error_count = 0usize;
+    for check in &report.checks {
+        match check.status {
+            CheckStatus::Ok => ok_count += 1,
+            CheckStatus::Warn => warn_count += 1,
+            CheckStatus::Error => error_count += 1,
+        }
+    }
+
+    content.append_styled("Diagnostics Report\n", theme.emphasis.clone());
+    content.append("\n");
+
+    content.append_styled("Status: ", theme.dimmed.clone());
+    if report.ok {
+        content.append_styled("OK", theme.success.clone());
+    } else {
+        content.append_styled("Issues found", theme.error.clone());
+    }
+    content.append("\n");
+
+    content.append_styled("Checks: ", theme.dimmed.clone());
+    content.append_styled(
+        &format!("{ok_count} ok, {warn_count} warn, {error_count} error"),
+        theme.accent.clone(),
+    );
+    content.append("\n\n");
+
+    for check in &report.checks {
+        let (label, style) = match check.status {
+            CheckStatus::Ok => ("[OK]", theme.success.clone()),
+            CheckStatus::Warn => ("[WARN]", theme.warning.clone()),
+            CheckStatus::Error => ("[ERROR]", theme.error.clone()),
+        };
+
+        content.append_styled(label, style);
+        content.append(" ");
+        content.append_styled(&check.name, theme.issue_title.clone());
+        if let Some(message) = &check.message {
+            content.append_styled(": ", theme.dimmed.clone());
+            content.append(message);
+        }
+        content.append("\n");
+
+        if !matches!(check.status, CheckStatus::Ok) {
+            if let Some(details) = &check.details {
+                if let Ok(details_text) = serde_json::to_string_pretty(details) {
+                    for line in details_text.lines() {
+                        content.append_styled("    ", theme.dimmed.clone());
+                        content.append_styled(line, theme.dimmed.clone());
+                        content.append("\n");
+                    }
+                }
+            }
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, ctx.width())
+        .title(Text::styled("Doctor", theme.panel_title.clone()))
+        .box_style(theme.box_style)
+        .border_style(theme.panel_border.clone());
+
+    ctx.render(&panel);
 }
 
 fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
@@ -708,7 +790,7 @@ fn check_sync_metadata(
 ///
 /// Returns an error if report serialization fails or if IO operations fail.
 #[allow(clippy::too_many_lines)]
-pub fn execute(json: bool, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(json: bool, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let mut checks = Vec::new();
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
         push_check(
@@ -722,7 +804,7 @@ pub fn execute(json: bool, cli: &config::CliOverrides, _ctx: &OutputContext) -> 
             ok: !has_error(&checks),
             checks,
         };
-        print_report(&report, json)?;
+        print_report(&report, json, ctx)?;
         std::process::exit(1);
     };
 
@@ -740,7 +822,7 @@ pub fn execute(json: bool, cli: &config::CliOverrides, _ctx: &OutputContext) -> 
                 ok: !has_error(&checks),
                 checks,
             };
-            print_report(&report, json)?;
+            print_report(&report, json, ctx)?;
             std::process::exit(1);
         }
     };
@@ -819,7 +901,7 @@ pub fn execute(json: bool, cli: &config::CliOverrides, _ctx: &OutputContext) -> 
         ok: !has_error(&checks),
         checks,
     };
-    print_report(&report, json)?;
+    print_report(&report, json, ctx)?;
 
     if !report.ok {
         std::process::exit(1);
