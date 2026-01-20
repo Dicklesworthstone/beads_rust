@@ -113,7 +113,63 @@ This tool is a Rust port of the "classic" beads issue tracker (SQLite + JSONL hy
 
 ---
 
-## Output Style
+## Output Modes
+
+br supports multiple output modes for different use cases:
+
+| Mode | When Active | Description |
+|------|-------------|-------------|
+| **Rich** | TTY with colors | Colored panels, tables, styled text |
+| **Plain** | `NO_COLOR` env or `--no-color` | Text output without ANSI codes |
+| **JSON** | `--json` or `--robot` | Machine-readable structured output |
+| **Quiet** | `--quiet` or `-q` | Minimal output |
+
+### Mode Detection
+
+The output mode is automatically detected:
+
+1. `--json` or `--robot` flags → **JSON mode**
+2. `--quiet` flag → **Quiet mode**
+3. `NO_COLOR` env var or `--no-color` → **Plain mode**
+4. Non-TTY stdout (piped output) → **Plain mode**
+5. Otherwise → **Rich mode** (default for interactive terminals)
+
+### For Coding Agents
+
+**CRITICAL:** Always use `--json` or `--robot` flags when parsing br output programmatically.
+
+```bash
+# CORRECT - stable, parseable output
+br list --json | jq '.[0]'
+br ready --robot
+
+# WRONG - output format may vary based on terminal state
+br list | head -1
+```
+
+JSON mode guarantees:
+- Stable schema (changes are versioned and documented)
+- No ANSI escape codes
+- Clean stdout (diagnostics go to stderr)
+- Exit codes for success/failure
+
+### Rich Output Features
+
+In Rich mode, br provides enhanced terminal output:
+
+- **Tables** - Formatted with borders and alignment
+- **Panels** - Boxed content with titles
+- **Status icons** - ✓ success, ✗ error, ⚠ warning
+- **Colors** - Priority-based coloring, status highlighting
+- **Progress** - Spinners for long operations
+
+These features are **automatically disabled** when:
+- Output is piped to another command
+- `NO_COLOR` environment variable is set
+- `--no-color` flag is used
+- `--json` mode is active
+
+### Output Style Guidelines
 
 - **Text output** is user-facing and may include color. Avoid verbose debug spew unless `--verbose` is set.
 - **JSON output** must be stable and machine-parseable. Do not change JSON shapes without explicit intent and tests.
