@@ -58,12 +58,7 @@ struct AllGraphOutput {
 /// # Errors
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
-pub fn execute(
-    args: &GraphArgs,
-    json: bool,
-    cli: &config::CliOverrides,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
@@ -73,14 +68,14 @@ pub fn execute(
     let all_ids = storage_ctx.storage.get_all_ids()?;
 
     if args.all {
-        graph_all(&storage_ctx.storage, args.compact, json, ctx)
+        graph_all(&storage_ctx.storage, args.compact, ctx)
     } else {
         let issue_id = args.issue.as_ref().ok_or_else(|| {
             BeadsError::validation("issue", "Issue ID required unless --all is specified")
         })?;
 
         let resolved_id = resolve_issue_id(&storage_ctx.storage, &resolver, &all_ids, issue_id)?;
-        graph_single(&storage_ctx.storage, &resolved_id, args.compact, json, ctx)
+        graph_single(&storage_ctx.storage, &resolved_id, args.compact, ctx)
     }
 }
 
@@ -89,7 +84,6 @@ fn graph_single(
     storage: &SqliteStorage,
     root_id: &str,
     compact: bool,
-    json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     // Verify the root issue exists
@@ -154,14 +148,14 @@ fn graph_single(
         }
     }
 
-    if json {
+    if ctx.is_json() {
         let output = SingleGraphOutput {
             root: root_id.to_string(),
             count: nodes.len(),
             nodes,
             edges,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -206,12 +200,7 @@ fn graph_single(
 
 /// Show graph for all `open`/`in_progress`/`blocked` issues.
 #[allow(clippy::too_many_lines)]
-fn graph_all(
-    storage: &SqliteStorage,
-    compact: bool,
-    json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Result<()> {
     // Get all open/in_progress/blocked issues
     let filters = ListFilters {
         statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked]),
@@ -224,13 +213,13 @@ fn graph_all(
     debug!(count = issues.len(), "Found issues for graph");
 
     if issues.is_empty() {
-        if json {
+        if ctx.is_json() {
             let output = AllGraphOutput {
                 components: vec![],
                 total_nodes: 0,
                 total_components: 0,
             };
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            ctx.json_pretty(&output);
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_no_issues_rich(ctx);
         } else {
@@ -357,13 +346,13 @@ fn graph_all(
 
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
 
-    if json {
+    if ctx.is_json() {
         let output = AllGraphOutput {
             total_nodes,
             total_components: components.len(),
             components,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 

@@ -14,7 +14,6 @@ use chrono::{DateTime, Duration, Utc};
 /// Returns an error if filters are invalid or the database query fails.
 pub fn execute(
     args: &StaleArgs,
-    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -50,11 +49,10 @@ pub fn execute(
     // Output based on mode
     if matches!(ctx.mode(), OutputMode::Rich) {
         render_stale_rich(&stale, now, args.days, ctx);
-    } else if json {
+    } else if ctx.is_json() {
         // Convert to StaleIssue for bd-compatible JSON output
         let stale_output: Vec<StaleIssue> = stale.iter().map(StaleIssue::from).collect();
-        let payload = serde_json::to_string(&stale_output)?;
-        println!("{payload}");
+        ctx.json(&stale_output);
     } else {
         println!(
             "Stale issues ({} not updated in {}+ days):",

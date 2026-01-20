@@ -68,7 +68,7 @@ fn main() {
             commands::label::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
-        Commands::Stale(args) => commands::stale::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Blocked(args) => {
@@ -106,7 +106,7 @@ fn main() {
             commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Query { command } => commands::query::execute(&command, &overrides, &output_ctx),
-        Commands::Graph(args) => commands::graph::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Graph(args) => commands::graph::execute(&args, &overrides, &output_ctx),
         Commands::Agents(args) => {
             let agents_args = commands::agents::AgentsArgs {
                 add: args.add,
