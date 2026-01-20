@@ -32,7 +32,7 @@ struct CountGroupedOutput {
 /// Returns an error if filters are invalid or the database query fails.
 pub fn execute(
     args: &CountArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -83,9 +83,8 @@ pub fn execute(
 
     match by {
         None => {
-            if json {
-                let payload = serde_json::to_string(&CountOutput { count: total })?;
-                println!("{payload}");
+            if ctx.is_json() {
+                ctx.json_pretty(&CountOutput { count: total });
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 render_count_simple_rich(total, ctx);
             } else {
@@ -94,9 +93,8 @@ pub fn execute(
         }
         Some(by) => {
             let groups = group_counts(storage, &issues, by)?;
-            if json {
-                let payload = serde_json::to_string(&CountGroupedOutput { total, groups })?;
-                println!("{payload}");
+            if ctx.is_json() {
+                ctx.json_pretty(&CountGroupedOutput { total, groups });
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 render_count_grouped_rich(total, &groups, by, ctx);
             } else {

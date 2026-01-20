@@ -13,6 +13,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
+use unicode_width::UnicodeWidthStr;
 
 /// Execute the ready command.
 ///
@@ -143,7 +144,7 @@ fn format_ready_line(
     let title = max_width.map_or_else(
         || issue.title.clone(),
         |width| {
-            let max_title = width.saturating_sub(prefix_plain.chars().count());
+            let max_title = width.saturating_sub(UnicodeWidthStr::width(prefix_plain.as_str()));
             truncate_title(&issue.title, max_title)
         },
     );

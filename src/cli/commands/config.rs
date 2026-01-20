@@ -719,7 +719,8 @@ fn show_config(
         // Show only project config
         if let Some(dir) = beads_dir {
             let layer = load_project_config(dir)?;
-            return output_layer(&layer, ConfigSource::Project, json_mode, ctx);
+            output_layer(&layer, ConfigSource::Project, json_mode, ctx);
+            return Ok(());
         }
         if ctx.is_json() {
             ctx.json(&serde_json::Map::new());
@@ -744,7 +745,8 @@ fn show_config(
     if user_only {
         // Show only user config
         let layer = load_user_config()?;
-        return output_layer(&layer, ConfigSource::User, json_mode, ctx);
+        output_layer(&layer, ConfigSource::User, json_mode, ctx);
+        return Ok(());
     }
 
     // Show merged config
@@ -859,12 +861,7 @@ fn show_config(
 }
 
 /// Output a single config layer.
-fn output_layer(
-    layer: &ConfigLayer,
-    source: ConfigSource,
-    _json_mode: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn output_layer(layer: &ConfigLayer, source: ConfigSource, _json_mode: bool, ctx: &OutputContext) {
     if ctx.is_json() {
         let mut all_keys: BTreeMap<String, &str> = BTreeMap::new();
         for (k, v) in &layer.runtime {
@@ -875,7 +872,7 @@ fn output_layer(
         }
         ctx.json_pretty(&all_keys);
     } else if ctx.is_quiet() {
-        return Ok(());
+        // Nothing to output in quiet mode
     } else if ctx.is_rich() {
         let mut all_keys: Vec<_> = layer.runtime.keys().chain(layer.startup.keys()).collect();
         all_keys.sort();
@@ -923,8 +920,6 @@ fn output_layer(
             }
         }
     }
-
-    Ok(())
 }
 
 /// Get user config path.

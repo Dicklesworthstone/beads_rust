@@ -5,6 +5,11 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
+use common::harness::{
+    TestWorkspace, extract_json_payload as harness_extract_json,
+    parse_created_id as harness_parse_id,
+};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -662,4 +667,384 @@ fn e2e_label_persistence_jsonl() {
         label_arr.contains(&"persisted".to_string()),
         "label not persisted in jsonl"
     );
+}
+
+// =============================================================================
+// Harness + Dataset Registry Tests (beads_rust-2vb0)
+// =============================================================================
+//
+// These tests use the full E2E harness with artifact logging and the dataset
+// registry to test label commands against real datasets.
+
+/// Check if the beads_rust dataset is available (has beads.db)
+fn beads_rust_dataset_available() -> bool {
+    DatasetRegistry::new().is_available(KnownDataset::BeadsRust)
+}
+
+/// Test label list-all with TestWorkspace harness (fresh workspace with artifacts)
+#[test]
+fn e2e_harness_label_list_all_fresh() {
+    let _log = common::test_log("e2e_harness_label_list_all_fresh");
+    let mut ws = TestWorkspace::new("e2e_labels", "harness_label_list_all_fresh");
+
+    // Initialize workspace
+    let init = ws.init_br();
+    init.assert_success();
+
+    // Create issues with labels
+    let create1 = ws.run_br(["create", "Issue with labels A"], "create1");
+    create1.assert_success();
+    let id1 = harness_parse_id(&create1.stdout);
+
+    let create2 = ws.run_br(["create", "Issue with labels B"], "create2");
+    create2.assert_success();
+    let id2 = harness_parse_id(&create2.stdout);
+
+    // Add various labels
+    let add1 = ws.run_br(["label", "add", &id1, "bug"], "add_bug");
+    add1.assert_success();
+
+    let add2 = ws.run_br(["label", "add", &id1, "urgent"], "add_urgent");
+    add2.assert_success();
+
+    let add3 = ws.run_br(["label", "add", &id2, "feature"], "add_feature");
+    add3.assert_success();
+
+    let add4 = ws.run_br(["label", "add", &id2, "bug"], "add_bug2");
+    add4.assert_success();
+
+    // Test list-all command
+    let list_all = ws.run_br(["label", "list-all", "--json"], "list_all");
+    list_all.assert_success();
+
+    // Verify JSON output shape
+    let payload = harness_extract_json(&list_all.stdout);
+    let result: Value = serde_json::from_str(&payload).expect("list-all json");
+
+    // Result should be an array of label objects
+    assert!(result.is_array(), "list-all should return array");
+    let labels = result.as_array().unwrap();
+
+    // Should have at least bug, urgent, feature
+    assert!(labels.len() >= 3, "expected at least 3 labels, got {}", labels.len());
+
+    // Verify each label has required fields
+    for label in labels {
+        assert!(
+            label.get("name").is_some(),
+            "label should have 'name' field"
+        );
+        assert!(
+            label.get("count").is_some(),
+            "label should have 'count' field"
+        );
+    }
+
+    // Verify 'bug' appears with count=2 (used on both issues)
+    let bug_label = labels.iter().find(|l| l["name"] == "bug");
+    assert!(bug_label.is_some(), "bug label should be in list-all");
+    assert_eq!(
+        bug_label.unwrap()["count"], 2,
+        "bug label should have count=2"
+    );
+
+    ws.finish(true);
+}
+
+/// Test label list-all with real dataset (beads_rust)
+#[test]
+fn e2e_harness_label_list_all_real_dataset() {
+    let _log = common::test_log("e2e_harness_label_list_all_real_dataset");
+
+    if !beads_rust_dataset_available() {
+        eprintln!("Skipping e2e_harness_label_list_all_real_dataset: beads_rust dataset not available");
+        return;
+    }
+
+    // Create isolated copy of beads_rust dataset
+    let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
+        .expect("should create isolated beads_rust");
+
+    // Run list-all on the isolated dataset
+    use std::process::Command;
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .args(["label", "list-all", "--json"])
+        .current_dir(isolated.workspace_root())
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run br label list-all");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Verify exit code
+    assert!(
+        output.status.success(),
+        "label list-all failed on real dataset: {stderr}"
+    );
+
+    // Verify JSON output shape
+    let payload = harness_extract_json(&stdout);
+    let result: Value = serde_json::from_str(&payload).expect("list-all json from real dataset");
+
+    assert!(result.is_array(), "list-all should return array");
+    let labels = result.as_array().unwrap();
+
+    // Real dataset should have labels
+    assert!(
+        !labels.is_empty(),
+        "beads_rust dataset should have labels"
+    );
+
+    // Verify schema: each label has name and count
+    for label in labels {
+        assert!(
+            label.get("name").is_some(),
+            "label should have 'name' field"
+        );
+        assert!(
+            label.get("count").is_some(),
+            "label should have 'count' field"
+        );
+        // count should be a positive number
+        if let Some(count) = label.get("count").and_then(|c| c.as_i64()) {
+            assert!(count >= 1, "label count should be >= 1");
+        }
+    }
+}
+
+/// Test label rename with TestWorkspace harness (fresh workspace with artifacts)
+#[test]
+fn e2e_harness_label_rename_fresh() {
+    let _log = common::test_log("e2e_harness_label_rename_fresh");
+    let mut ws = TestWorkspace::new("e2e_labels", "harness_label_rename_fresh");
+
+    // Initialize workspace
+    let init = ws.init_br();
+    init.assert_success();
+
+    // Create issues with the label we'll rename
+    let create1 = ws.run_br(["create", "Issue for rename test 1"], "create1");
+    create1.assert_success();
+    let id1 = harness_parse_id(&create1.stdout);
+
+    let create2 = ws.run_br(["create", "Issue for rename test 2"], "create2");
+    create2.assert_success();
+    let id2 = harness_parse_id(&create2.stdout);
+
+    let create3 = ws.run_br(["create", "Issue without target label"], "create3");
+    create3.assert_success();
+    let id3 = harness_parse_id(&create3.stdout);
+
+    // Add labels
+    let add1 = ws.run_br(["label", "add", &id1, "old-label"], "add_old1");
+    add1.assert_success();
+
+    let add2 = ws.run_br(["label", "add", &id2, "old-label"], "add_old2");
+    add2.assert_success();
+
+    let add3 = ws.run_br(["label", "add", &id3, "other-label"], "add_other");
+    add3.assert_success();
+
+    // Rename the label
+    let rename = ws.run_br(
+        ["label", "rename", "old-label", "new-label", "--json"],
+        "rename",
+    );
+    rename.assert_success();
+
+    // Verify JSON output shape
+    let payload = harness_extract_json(&rename.stdout);
+    let result: Value = serde_json::from_str(&payload).expect("rename json");
+
+    // Verify required fields in response
+    assert_eq!(result["old_name"], "old-label", "old_name should match");
+    assert_eq!(result["new_name"], "new-label", "new_name should match");
+    assert_eq!(
+        result["affected_issues"], 2,
+        "should affect 2 issues"
+    );
+
+    // Verify old label is gone
+    let list_all = ws.run_br(["label", "list-all", "--json"], "list_all_after");
+    list_all.assert_success();
+
+    let list_payload = harness_extract_json(&list_all.stdout);
+    let labels: Value = serde_json::from_str(&list_payload).expect("list-all json");
+    let labels_arr = labels.as_array().unwrap();
+
+    let old_exists = labels_arr.iter().any(|l| l["name"] == "old-label");
+    assert!(!old_exists, "old-label should not exist after rename");
+
+    let new_exists = labels_arr.iter().any(|l| l["name"] == "new-label");
+    assert!(new_exists, "new-label should exist after rename");
+
+    // Verify new label has correct count
+    let new_label = labels_arr.iter().find(|l| l["name"] == "new-label").unwrap();
+    assert_eq!(new_label["count"], 2, "new-label should have count=2");
+
+    // Verify issues have the new label
+    let show1 = ws.run_br(["show", &id1, "--json"], "show1");
+    show1.assert_success();
+    let show1_payload = harness_extract_json(&show1.stdout);
+    let issues1: Vec<Value> = serde_json::from_str(&show1_payload).expect("show1 json");
+    let labels1: Vec<String> =
+        serde_json::from_value(issues1[0]["labels"].clone()).unwrap();
+    assert!(
+        labels1.contains(&"new-label".to_string()),
+        "issue1 should have new-label"
+    );
+    assert!(
+        !labels1.contains(&"old-label".to_string()),
+        "issue1 should not have old-label"
+    );
+
+    ws.finish(true);
+}
+
+/// Test label rename on real dataset (beads_rust)
+/// This test runs rename on an isolated copy of the real dataset
+#[test]
+fn e2e_harness_label_rename_real_dataset() {
+    let _log = common::test_log("e2e_harness_label_rename_real_dataset");
+
+    if !beads_rust_dataset_available() {
+        eprintln!("Skipping e2e_harness_label_rename_real_dataset: beads_rust dataset not available");
+        return;
+    }
+
+    // Create isolated copy of beads_rust dataset
+    let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
+        .expect("should create isolated beads_rust");
+
+    use std::process::Command;
+
+    // First, list all labels to find one we can rename
+    let list_output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .args(["label", "list-all", "--json"])
+        .current_dir(isolated.workspace_root())
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run br label list-all");
+
+    let list_stdout = String::from_utf8_lossy(&list_output.stdout).to_string();
+    assert!(list_output.status.success(), "list-all failed");
+
+    let list_payload = harness_extract_json(&list_stdout);
+    let labels: Value = serde_json::from_str(&list_payload).expect("list-all json");
+    let labels_arr = labels.as_array().unwrap();
+
+    if labels_arr.is_empty() {
+        eprintln!("No labels in dataset, skipping rename test");
+        return;
+    }
+
+    // Pick a label to rename (first one)
+    let old_name = labels_arr[0]["name"].as_str().unwrap();
+    let old_count = labels_arr[0]["count"].as_i64().unwrap();
+    let new_name = format!("{old_name}-renamed");
+
+    // Perform rename
+    let rename_output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .args(["label", "rename", old_name, &new_name, "--json"])
+        .current_dir(isolated.workspace_root())
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run br label rename");
+
+    let rename_stdout = String::from_utf8_lossy(&rename_output.stdout).to_string();
+    let rename_stderr = String::from_utf8_lossy(&rename_output.stderr).to_string();
+
+    assert!(
+        rename_output.status.success(),
+        "label rename failed: {rename_stderr}"
+    );
+
+    // Verify JSON output
+    let rename_payload = harness_extract_json(&rename_stdout);
+    let result: Value = serde_json::from_str(&rename_payload).expect("rename json");
+
+    assert_eq!(result["old_name"], old_name);
+    assert_eq!(result["new_name"], new_name);
+    assert_eq!(
+        result["affected_issues"], old_count,
+        "affected_issues should match original count"
+    );
+
+    // Verify list-all shows new label, not old
+    let verify_output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .args(["label", "list-all", "--json"])
+        .current_dir(isolated.workspace_root())
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run br label list-all verify");
+
+    let verify_stdout = String::from_utf8_lossy(&verify_output.stdout).to_string();
+
+    let verify_payload = harness_extract_json(&verify_stdout);
+    let verify_labels: Value = serde_json::from_str(&verify_payload).expect("verify json");
+    let verify_arr = verify_labels.as_array().unwrap();
+
+    let old_exists = verify_arr.iter().any(|l| l["name"] == old_name);
+    let new_exists = verify_arr.iter().any(|l| l["name"] == new_name);
+
+    assert!(!old_exists, "old label should not exist after rename");
+    assert!(new_exists, "new label should exist after rename");
+}
+
+/// Test label list-all with empty workspace
+#[test]
+fn e2e_harness_label_list_all_empty() {
+    let _log = common::test_log("e2e_harness_label_list_all_empty");
+    let mut ws = TestWorkspace::new("e2e_labels", "harness_label_list_all_empty");
+
+    // Initialize workspace
+    let init = ws.init_br();
+    init.assert_success();
+
+    // Test list-all on empty workspace (no issues, no labels)
+    let list_all = ws.run_br(["label", "list-all", "--json"], "list_all_empty");
+    list_all.assert_success();
+
+    // Verify JSON output is empty array
+    let payload = harness_extract_json(&list_all.stdout);
+    let result: Value = serde_json::from_str(&payload).expect("list-all json");
+
+    assert!(result.is_array(), "list-all should return array");
+    assert!(
+        result.as_array().unwrap().is_empty(),
+        "list-all on empty workspace should return []"
+    );
+
+    ws.finish(true);
+}
+
+/// Test label rename error cases with harness
+#[test]
+fn e2e_harness_label_rename_errors() {
+    let _log = common::test_log("e2e_harness_label_rename_errors");
+    let mut ws = TestWorkspace::new("e2e_labels", "harness_label_rename_errors");
+
+    // Initialize workspace
+    let init = ws.init_br();
+    init.assert_success();
+
+    // Try to rename non-existent label
+    let rename = ws.run_br(
+        ["label", "rename", "nonexistent", "newname", "--json"],
+        "rename_nonexistent",
+    );
+
+    // Should fail (non-zero exit code)
+    assert!(
+        !rename.success,
+        "renaming nonexistent label should fail"
+    );
+    assert!(
+        rename.stderr.contains("not found") || rename.stderr.contains("No issues"),
+        "error message should indicate label not found: {}",
+        rename.stderr
+    );
+
+    ws.finish(true);
 }

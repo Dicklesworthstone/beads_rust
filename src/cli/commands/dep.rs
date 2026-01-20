@@ -605,6 +605,27 @@ fn dep_tree(
         return Ok(());
     }
 
+    // Mermaid format output
+    if args.format.eq_ignore_ascii_case("mermaid") {
+        ctx.print("graph TD");
+        // Output node definitions
+        for node in &nodes {
+            // Escape quotes in title for mermaid
+            let escaped_title = node.title.replace('"', "'");
+            ctx.print(&format!(
+                "    {}[\"{}: {} [P{}]\"]",
+                node.id, node.id, escaped_title, node.priority
+            ));
+        }
+        // Output edges (child --> parent means child depends on parent)
+        for node in &nodes {
+            if let Some(ref parent_id) = node.parent_id {
+                ctx.print(&format!("    {} --> {}", node.id, parent_id));
+            }
+        }
+        return Ok(());
+    }
+
     // Text tree output
     if nodes.is_empty() {
         ctx.info(&format!("No dependency tree for {root_id}"));

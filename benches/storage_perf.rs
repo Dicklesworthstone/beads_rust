@@ -265,6 +265,7 @@ fn bench_update_issue(c: &mut Criterion) {
                 deleted_at: None,
                 deleted_by: None,
                 delete_reason: None,
+                skip_cache_rebuild: false,
             };
             let _ = storage.update_issue(black_box(&id), black_box(&update), "benchmark");
             counter += 1;

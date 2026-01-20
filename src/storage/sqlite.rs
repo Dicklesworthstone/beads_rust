@@ -933,7 +933,8 @@ impl SqliteStorage {
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
         if !filters.include_deferred {
-            sql.push_str(" AND (defer_until IS NULL OR defer_until <= datetime('now'))");
+            // Compare using SQLite datetime parsing to handle RFC3339 timestamps consistently.
+            sql.push_str(" AND (defer_until IS NULL OR datetime(defer_until) <= datetime('now'))");
         }
 
         // Ready condition 4: not pinned
@@ -1962,9 +1963,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_labels(&self) -> Result<HashMap<String, Vec<String>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT issue_id, label FROM labels ORDER BY issue_id, label",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;

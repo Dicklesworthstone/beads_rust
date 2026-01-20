@@ -1098,14 +1098,20 @@ mod tests {
         storage.create_issue(&i2, "test").unwrap();
 
         // Root blocks A
-        storage.add_dependency("bd-1", "root", "waits-for", "test").unwrap();
+        storage
+            .add_dependency("bd-1", "root", "waits-for", "test")
+            .unwrap();
         // A blocks B
-        storage.add_dependency("bd-2", "bd-1", "waits-for", "test").unwrap();
+        storage
+            .add_dependency("bd-2", "bd-1", "waits-for", "test")
+            .unwrap();
         // B blocks A (cycle)
-        storage.add_dependency("bd-1", "bd-2", "waits-for", "test").unwrap();
+        storage
+            .add_dependency("bd-1", "bd-2", "waits-for", "test")
+            .unwrap();
 
         let ctx = OutputContext::from_flags(true, false, true); // JSON mode
-        
+
         // This should not hang even with root feeding into cycle
         // If it hangs, the test runner will timeout
         let result = graph_all(&storage, false, &ctx);

@@ -82,7 +82,7 @@ struct SyncPathPolicy {
 /// Returns an error if the database cannot be opened or the sync operation fails.
 pub fn execute(
     args: &SyncArgs,
-    _json: bool,
+    json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -107,7 +107,7 @@ pub fn execute(
 
     // Handle --status flag
     if args.status {
-        return execute_status(&storage, &path_policy, _json, ctx);
+        return execute_status(&storage, &path_policy, json, ctx);
     }
 
     // Validate mutually exclusive modes
@@ -126,7 +126,7 @@ pub fn execute(
             &beads_dir,
             &path_policy,
             args,
-            _json,
+            json,
             show_progress,
             retention_days,
             ctx,
@@ -136,7 +136,7 @@ pub fn execute(
             &mut storage,
             &path_policy,
             args,
-            _json,
+            json,
             show_progress,
             retention_days,
             cli,
@@ -843,7 +843,7 @@ fn execute_import(
     storage: &mut crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
     args: &SyncArgs,
-    json: bool,
+    _json: bool,
     show_progress: bool,
     ctx: &OutputContext,
 ) -> Result<()> {

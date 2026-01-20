@@ -525,3 +525,285 @@ fn e2e_history_prune_with_older_than() {
         prune.stdout
     );
 }
+
+// =============================================================================
+// ADDITIONAL RESTORE TESTS
+// =============================================================================
+
+#[test]
+fn e2e_history_restore_without_force_succeeds_when_no_current() {
+    let _log = common::test_log("e2e_history_restore_without_force_succeeds_when_no_current");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create issue to trigger backup
+    create_issue(&workspace, "Issue for restore test", "create_restore_test");
+    sync_flush(&workspace);
+
+    let backups = list_backup_files(&workspace);
+    assert!(!backups.is_empty(), "should have backup");
+    let backup_file = &backups[0];
+
+    // Remove current issues.jsonl
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::remove_file(&jsonl_path).expect("remove issues.jsonl");
+
+    // Restore WITHOUT --force should succeed when no current file exists
+    let restore = run_br(
+        &workspace,
+        ["history", "restore", backup_file],
+        "history_restore_no_current",
+    );
+    assert!(
+        restore.status.success(),
+        "restore should succeed without --force when no issues.jsonl exists: {}",
+        restore.stderr
+    );
+
+    // Verify file was restored
+    assert!(jsonl_path.exists(), "issues.jsonl should be restored");
+}
+
+#[test]
+fn e2e_history_restore_verifies_content() {
+    let _log = common::test_log("e2e_history_restore_verifies_content");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create issue with known title
+    create_issue(&workspace, "Known issue for restore", "create_known");
+    sync_flush(&workspace);
+
+    let backups = list_backup_files(&workspace);
+    assert!(!backups.is_empty(), "should have backup");
+    let backup_file = &backups[0];
+
+    // Read backup content
+    let backup_path = workspace
+        .root
+        .join(".beads")
+        .join(".br_history")
+        .join(backup_file);
+    let backup_content = fs::read_to_string(&backup_path).expect("read backup");
+
+    // Create a different issue to change current state
+    create_issue(&workspace, "Different issue", "create_different");
+    sync_flush(&workspace);
+
+    // Restore the backup
+    let restore = run_br(
+        &workspace,
+        ["history", "restore", backup_file, "--force"],
+        "history_restore_verify",
+    );
+    assert!(restore.status.success(), "restore failed: {}", restore.stderr);
+
+    // Verify restored content matches backup
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let restored_content = fs::read_to_string(&jsonl_path).expect("read restored");
+    assert_eq!(
+        backup_content, restored_content,
+        "restored content should match backup exactly"
+    );
+}
+
+// =============================================================================
+// ADDITIONAL DIFF TESTS
+// =============================================================================
+
+#[test]
+fn e2e_history_diff_fails_when_no_current_jsonl() {
+    let _log = common::test_log("e2e_history_diff_fails_when_no_current_jsonl");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create issue to trigger backup
+    create_issue(&workspace, "Issue for diff test", "create_diff_test");
+    sync_flush(&workspace);
+
+    let backups = list_backup_files(&workspace);
+    assert!(!backups.is_empty(), "should have backup");
+    let backup_file = &backups[0];
+
+    // Remove current issues.jsonl
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    fs::remove_file(&jsonl_path).expect("remove issues.jsonl");
+
+    // Diff should fail when current issues.jsonl doesn't exist
+    let diff = run_br(
+        &workspace,
+        ["history", "diff", backup_file],
+        "history_diff_no_current",
+    );
+    assert!(
+        !diff.status.success(),
+        "diff should fail when no current issues.jsonl"
+    );
+    assert!(
+        diff.stderr.contains("not found") || diff.stderr.contains("issues.jsonl"),
+        "error should mention missing issues.jsonl: {}",
+        diff.stderr
+    );
+}
+
+// =============================================================================
+// ADDITIONAL PRUNE TESTS
+// =============================================================================
+
+#[test]
+fn e2e_history_prune_removes_oldest_backups() {
+    let _log = common::test_log("e2e_history_prune_removes_oldest_backups");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create multiple backups with different timestamps
+    for i in 0..5 {
+        thread::sleep(Duration::from_millis(1100)); // Ensure different timestamps
+        create_issue(
+            &workspace,
+            &format!("Issue for prune test {i}"),
+            &format!("create_prune_{i}"),
+        );
+        sync_flush(&workspace);
+    }
+
+    let backups_before = list_backup_files(&workspace);
+    assert!(
+        backups_before.len() >= 4,
+        "should have at least 4 backups: {backups_before:?}"
+    );
+
+    // Save the most recent backup names (sorted, last ones are newest)
+    let expected_kept: Vec<_> = backups_before.iter().rev().take(2).cloned().collect();
+
+    // Prune to keep only 2 (with older_than=0 to force deletion of old ones)
+    let prune = run_br(
+        &workspace,
+        ["history", "prune", "--keep", "2", "--older-than", "0"],
+        "history_prune_oldest",
+    );
+    assert!(prune.status.success(), "prune failed: {}", prune.stderr);
+
+    let backups_after = list_backup_files(&workspace);
+
+    // Should have exactly 2 backups (or at most 2)
+    assert!(
+        backups_after.len() <= 2,
+        "should have at most 2 backups after prune: {backups_after:?}"
+    );
+
+    // The kept backups should be the newest ones
+    for backup in &backups_after {
+        assert!(
+            expected_kept.contains(backup),
+            "kept backup {backup} should be one of the newest: {expected_kept:?}"
+        );
+    }
+}
+
+// =============================================================================
+// JSON OUTPUT TESTS
+// =============================================================================
+
+#[test]
+fn e2e_history_list_json_output() {
+    let _log = common::test_log("e2e_history_list_json_output");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create issue to trigger backup
+    create_issue(&workspace, "Issue for JSON test", "create_json_test");
+    sync_flush(&workspace);
+
+    // List with --robot flag for JSON output
+    let list = run_br(
+        &workspace,
+        ["--robot", "history", "list"],
+        "history_list_json",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+
+    // Parse JSON output
+    let json: serde_json::Value =
+        serde_json::from_str(&list.stdout).expect("should be valid JSON");
+
+    // Verify JSON structure
+    assert!(json.get("directory").is_some(), "should have directory field");
+    assert!(json.get("count").is_some(), "should have count field");
+    assert!(json.get("backups").is_some(), "should have backups array");
+
+    let backups = json["backups"].as_array().expect("backups should be array");
+    if !backups.is_empty() {
+        let backup = &backups[0];
+        assert!(
+            backup.get("filename").is_some(),
+            "backup should have filename"
+        );
+        assert!(
+            backup.get("size_bytes").is_some(),
+            "backup should have size_bytes"
+        );
+        assert!(
+            backup.get("timestamp").is_some(),
+            "backup should have timestamp"
+        );
+    }
+}
+
+#[test]
+fn e2e_history_restore_json_output() {
+    let _log = common::test_log("e2e_history_restore_json_output");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create issue to trigger backup
+    create_issue(&workspace, "Issue for JSON restore", "create_json_restore");
+    sync_flush(&workspace);
+
+    let backups = list_backup_files(&workspace);
+    assert!(!backups.is_empty(), "should have backup");
+    let backup_file = &backups[0];
+
+    // Restore with --robot flag for JSON output
+    let restore = run_br(
+        &workspace,
+        ["--robot", "history", "restore", backup_file, "--force"],
+        "history_restore_json",
+    );
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        restore.stderr
+    );
+
+    // Parse JSON output
+    let json: serde_json::Value =
+        serde_json::from_str(&restore.stdout).expect("should be valid JSON");
+
+    // Verify JSON structure
+    assert_eq!(json["action"], "restore", "action should be restore");
+    assert_eq!(json["backup"], backup_file, "backup field should match");
+    assert_eq!(json["restored"], true, "restored should be true");
+    assert!(json.get("next_step").is_some(), "should have next_step");
+}
+
+#[test]
+fn e2e_history_prune_json_output() {
+    let _log = common::test_log("e2e_history_prune_json_output");
+    let workspace = setup_workspace_with_jsonl();
+
+    // Create issue to trigger backup
+    create_issue(&workspace, "Issue for JSON prune", "create_json_prune");
+    sync_flush(&workspace);
+
+    // Prune with --robot flag for JSON output
+    let prune = run_br(
+        &workspace,
+        ["--robot", "history", "prune", "--keep", "10"],
+        "history_prune_json",
+    );
+    assert!(prune.status.success(), "prune failed: {}", prune.stderr);
+
+    // Parse JSON output
+    let json: serde_json::Value =
+        serde_json::from_str(&prune.stdout).expect("should be valid JSON");
+
+    // Verify JSON structure
+    assert_eq!(json["action"], "prune", "action should be prune");
+    assert!(json.get("deleted").is_some(), "should have deleted count");
+    assert_eq!(json["keep"], 10, "keep should be 10");
+}

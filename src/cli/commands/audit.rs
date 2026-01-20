@@ -130,8 +130,8 @@ pub fn execute(
     let actor = config::resolve_actor(&layer);
 
     match command {
-        AuditCommands::Record(args) => record_entry(args, &beads_dir, &actor, json),
-        AuditCommands::Label(args) => label_entry(args, &beads_dir, &actor, json),
+        AuditCommands::Record(args) => record_entry(args, &beads_dir, &actor, ctx),
+        AuditCommands::Label(args) => label_entry(args, &beads_dir, &actor, ctx),
         AuditCommands::Log(args) => execute_log(args, &beads_dir, cli, json, ctx),
         AuditCommands::Summary(args) => execute_summary(args, &beads_dir, cli, json, ctx),
     }
@@ -141,19 +141,19 @@ fn execute_log(
     args: &AuditLogArgs,
     beads_dir: &Path,
     cli: &config::CliOverrides,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     let issue_id = &args.id;
     let events = storage_ctx.storage.get_events(issue_id, 0)?;
 
-    if json {
+    if ctx.is_json() {
         let output = AuditLogOutput {
             issue_id: issue_id.clone(),
             events: events.iter().map(map_event_to_output).collect(),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -170,7 +170,7 @@ fn execute_summary(
     args: &AuditSummaryArgs,
     beads_dir: &Path,
     cli: &config::CliOverrides,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
@@ -222,13 +222,13 @@ fn execute_summary(
     let mut actors: Vec<_> = actor_map.into_values().collect();
     actors.sort_by(|a, b| b.total.cmp(&a.total));
 
-    if json {
+    if ctx.is_json() {
         let output = AuditSummaryOutput {
             period_days: args.days,
             totals,
             actors,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -253,7 +253,12 @@ fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
     }
 }
 
-fn record_entry(args: &AuditRecordArgs, beads_dir: &Path, actor: &str, json: bool) -> Result<()> {
+fn record_entry(
+    args: &AuditRecordArgs,
+    beads_dir: &Path,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
     let use_stdin = args.stdin;
 
     let mut entry = if use_stdin {
@@ -305,8 +310,8 @@ fn record_entry(args: &AuditRecordArgs, beads_dir: &Path, actor: &str, json: boo
         kind: entry.kind.clone(),
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&output);
     } else {
         println!("{id}");
     }
@@ -314,7 +319,12 @@ fn record_entry(args: &AuditRecordArgs, beads_dir: &Path, actor: &str, json: boo
     Ok(())
 }
 
-fn label_entry(args: &AuditLabelArgs, beads_dir: &Path, actor: &str, json: bool) -> Result<()> {
+fn label_entry(
+    args: &AuditLabelArgs,
+    beads_dir: &Path,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
     let label = args
         .label
         .as_deref()
@@ -348,8 +358,8 @@ fn label_entry(args: &AuditLabelArgs, beads_dir: &Path, actor: &str, json: bool)
         label,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&output);
     } else {
         println!("{id}");
     }

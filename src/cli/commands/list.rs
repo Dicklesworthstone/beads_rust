@@ -24,9 +24,9 @@ use std::path::Path;
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &ListArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    outer_ctx: &OutputContext,
 ) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
@@ -71,7 +71,7 @@ pub fn execute(
     }
 
     // Determine output format: --json flag overrides --format
-    let output_format = if json {
+    let output_format = if outer_ctx.is_json() {
         OutputFormat::Json
     } else {
         args.format
