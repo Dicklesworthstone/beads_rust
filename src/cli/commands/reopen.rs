@@ -149,8 +149,12 @@ pub fn execute(
             reopened: reopened_issues,
             skipped: skipped_issues,
         };
-        let output = serde_json::to_string_pretty(&result).map_err(BeadsError::Json)?;
-        println!("{output}");
+        if ctx.is_json() {
+            ctx.json_pretty(&result);
+        } else {
+            let json_ctx = OutputContext::from_flags(true, false, true);
+            json_ctx.json_pretty(&result);
+        }
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_reopen_rich(
             &reopened_issues,

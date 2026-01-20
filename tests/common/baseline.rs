@@ -204,18 +204,27 @@ impl BaselineStore {
     }
 
     /// Set baseline for an operation.
-    pub fn set_baseline(&mut self, dataset: &str, issue_count: usize, operation: &str, baseline: OperationBaseline) {
+    pub fn set_baseline(
+        &mut self,
+        dataset: &str,
+        issue_count: usize,
+        operation: &str,
+        baseline: OperationBaseline,
+    ) {
         self.updated_at = chrono::Utc::now().to_rfc3339();
 
-        let dataset_baseline = self.datasets.entry(dataset.to_string()).or_insert_with(|| {
-            DatasetBaseline {
-                name: dataset.to_string(),
-                issue_count,
-                operations: HashMap::new(),
-            }
-        });
+        let dataset_baseline =
+            self.datasets
+                .entry(dataset.to_string())
+                .or_insert_with(|| DatasetBaseline {
+                    name: dataset.to_string(),
+                    issue_count,
+                    operations: HashMap::new(),
+                });
 
-        dataset_baseline.operations.insert(operation.to_string(), baseline);
+        dataset_baseline
+            .operations
+            .insert(operation.to_string(), baseline);
     }
 }
 
@@ -326,8 +335,10 @@ impl RegressionResult {
             // Within threshold
             (
                 RegressionStatus::Ok,
-                format!("{change_pct:.1}% slower (within {:.0}% threshold)",
-                    (config.duration_threshold - 1.0) * 100.0),
+                format!(
+                    "{change_pct:.1}% slower (within {:.0}% threshold)",
+                    (config.duration_threshold - 1.0) * 100.0
+                ),
             )
         } else {
             // Regression
@@ -455,10 +466,22 @@ impl RegressionSummary {
     /// Create summary from individual results.
     pub fn from_results(results: Vec<RegressionResult>, config: &RegressionConfig) -> Self {
         let total_operations = results.len();
-        let regression_count = results.iter().filter(|r| r.status == RegressionStatus::Regression).count();
-        let warning_count = results.iter().filter(|r| r.status == RegressionStatus::Warning).count();
-        let no_baseline_count = results.iter().filter(|r| r.baseline_ratio.is_none()).count();
-        let ok_count = results.iter().filter(|r| r.status == RegressionStatus::Ok && r.baseline_ratio.is_some()).count();
+        let regression_count = results
+            .iter()
+            .filter(|r| r.status == RegressionStatus::Regression)
+            .count();
+        let warning_count = results
+            .iter()
+            .filter(|r| r.status == RegressionStatus::Warning)
+            .count();
+        let no_baseline_count = results
+            .iter()
+            .filter(|r| r.baseline_ratio.is_none())
+            .count();
+        let ok_count = results
+            .iter()
+            .filter(|r| r.status == RegressionStatus::Ok && r.baseline_ratio.is_some())
+            .count();
 
         // In strict mode, any regression means failure
         let passed = if config.strict_mode {
@@ -494,7 +517,9 @@ impl RegressionSummary {
         println!();
 
         if self.no_baseline_count == self.total_operations {
-            println!("No baselines established yet. Run with BENCH_UPDATE_BASELINE=1 to create baselines.");
+            println!(
+                "No baselines established yet. Run with BENCH_UPDATE_BASELINE=1 to create baselines."
+            );
             return;
         }
 
@@ -508,8 +533,14 @@ impl RegressionSummary {
             let key = format!("{}/{}", result.dataset, result.operation);
             let status = format!("{}", result.status);
             let current = format!("{:.3}", result.current_ratio);
-            let baseline = result.baseline_ratio.map(|r| format!("{:.3}", r)).unwrap_or_else(|| "n/a".to_string());
-            let change = result.change_pct.map(|p| format!("{:+.1}%", p)).unwrap_or_else(|| "n/a".to_string());
+            let baseline = result
+                .baseline_ratio
+                .map(|r| format!("{:.3}", r))
+                .unwrap_or_else(|| "n/a".to_string());
+            let change = result
+                .change_pct
+                .map(|p| format!("{:+.1}%", p))
+                .unwrap_or_else(|| "n/a".to_string());
 
             // Truncate reason for display
             let reason = if result.reason.len() > 30 {
@@ -603,8 +634,7 @@ mod tests {
         };
 
         // Current is 0.4 (better than baseline 0.5)
-        let result =
-            RegressionResult::check("list", "beads_rust", 0.4, None, &baseline, &config);
+        let result = RegressionResult::check("list", "beads_rust", 0.4, None, &baseline, &config);
         assert!(!result.is_regression);
         assert_eq!(result.status, RegressionStatus::Ok);
         assert!(result.reason.contains("faster"));
@@ -623,8 +653,7 @@ mod tests {
         };
 
         // Current is 0.55 (10% worse than baseline 0.5, within 20% threshold)
-        let result =
-            RegressionResult::check("list", "beads_rust", 0.55, None, &baseline, &config);
+        let result = RegressionResult::check("list", "beads_rust", 0.55, None, &baseline, &config);
         assert!(!result.is_regression);
         assert_eq!(result.status, RegressionStatus::Ok);
     }
@@ -642,8 +671,7 @@ mod tests {
         };
 
         // Current is 0.7 (40% worse than baseline 0.5, exceeds 20% threshold)
-        let result =
-            RegressionResult::check("list", "beads_rust", 0.7, None, &baseline, &config);
+        let result = RegressionResult::check("list", "beads_rust", 0.7, None, &baseline, &config);
         assert!(result.is_regression);
         assert_eq!(result.status, RegressionStatus::Regression);
     }

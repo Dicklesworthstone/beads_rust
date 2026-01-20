@@ -20,7 +20,7 @@ pub mod scenarios;
 
 pub use artifact_validator::ArtifactValidator;
 pub use baseline::{
-    BaselineStore, RegressionConfig, RegressionResult, RegressionSummary, RegressionStatus,
+    BaselineStore, RegressionConfig, RegressionResult, RegressionStatus, RegressionSummary,
     should_update_baseline, update_baselines_from_results,
 };
 pub use binary_discovery::{BinaryVersion, DiscoveredBinaries, discover_binaries};

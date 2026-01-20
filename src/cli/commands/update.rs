@@ -39,7 +39,7 @@ impl From<&Issue> for UpdatedIssueOutput {
 /// # Errors
 ///
 /// Returns an error if database operations fail or validation errors occur.
-pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let json = cli.json.unwrap_or(false);
     let beads_dir = config::discover_beads_dir(None)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -125,8 +125,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, _ctx: &OutputConte
     }
 
     if json {
-        let json_output = serde_json::to_string_pretty(&updated_issues)?;
-        println!("{json_output}");
+        ctx.json_pretty(&updated_issues);
     }
 
     storage_ctx.flush_no_db_if_dirty()?;

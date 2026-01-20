@@ -3467,8 +3467,8 @@ mod tests {
 
         let incoming = make_issue_at("bd-1", "Incoming", fixed_time(200));
 
-        let collision = detect_collision(&incoming, &storage, &incoming.content_hash.clone().unwrap())
-            .unwrap();
+        let computed_hash = crate::util::content_hash(&incoming);
+        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
 
         assert!(
             matches!(collision, CollisionResult::Match { .. }),
