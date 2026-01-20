@@ -1118,8 +1118,9 @@ mod tests {
             tx.send(()).unwrap();
         });
 
-        if rx.recv_timeout(Duration::from_secs(2)).is_err() {
-            panic!("graph_all timed out (likely infinite loop on cycle)");
-        }
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "graph_all timed out (likely infinite loop on cycle)"
+        );
     }
 }

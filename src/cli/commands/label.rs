@@ -283,7 +283,7 @@ fn label_list(
     Ok(())
 }
 
-fn label_list_all(storage: &SqliteStorage, json: bool, ctx: &OutputContext) -> Result<()> {
+fn label_list_all(storage: &SqliteStorage, _json: bool, ctx: &OutputContext) -> Result<()> {
     let labels_with_counts = storage.get_unique_labels_with_counts()?;
 
     let label_counts: Vec<LabelCount> = labels_with_counts
@@ -294,8 +294,8 @@ fn label_list_all(storage: &SqliteStorage, json: bool, ctx: &OutputContext) -> R
         })
         .collect();
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&label_counts)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&label_counts);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_label_counts_rich(&label_counts, ctx);
     } else if label_counts.is_empty() {
@@ -319,7 +319,7 @@ fn label_rename(
     args: &LabelRenameArgs,
     storage: &mut SqliteStorage,
     actor: &str,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     validate_label(&args.new_name)?;
@@ -333,13 +333,13 @@ fn label_rename(
     let count = storage.rename_label(&args.old_name, &args.new_name, actor)?;
 
     if count == 0 {
-        if json {
+        if ctx.is_json() {
             let result = RenameResult {
                 old_name: args.old_name.clone(),
                 new_name: args.new_name.clone(),
                 affected_issues: 0,
             };
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            ctx.json_pretty(&result);
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_rename_not_found_rich(&args.old_name, ctx);
         } else {
@@ -348,13 +348,13 @@ fn label_rename(
         return Ok(());
     }
 
-    if json {
+    if ctx.is_json() {
         let result = RenameResult {
             old_name: args.old_name.clone(),
             new_name: args.new_name.clone(),
             affected_issues: count,
         };
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        ctx.json_pretty(&result);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_rename_result_rich(&args.old_name, &args.new_name, count, ctx);
     } else {

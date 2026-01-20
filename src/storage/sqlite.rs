@@ -353,7 +353,9 @@ impl SqliteStorage {
                     ctx.record_event(EventType::Closed, id, reason);
                 }
 
-                ctx.invalidate_cache();
+                if !updates.skip_cache_rebuild {
+                    ctx.invalidate_cache();
+                }
             }
 
             // Priority
@@ -2910,7 +2912,7 @@ pub struct IssueUpdate {
     pub issue_type: Option<IssueType>,
     pub assignee: Option<Option<String>>,
     pub owner: Option<Option<String>>,
-    pub estimated_minutes: Option<Option<i32>>,
+    pub estimated_minutes: Option<i32>,
     pub due_at: Option<Option<DateTime<Utc>>>,
     pub defer_until: Option<Option<DateTime<Utc>>>,
     pub external_ref: Option<Option<String>>,
@@ -2920,6 +2922,9 @@ pub struct IssueUpdate {
     pub deleted_at: Option<Option<DateTime<Utc>>>,
     pub deleted_by: Option<Option<String>>,
     pub delete_reason: Option<Option<String>>,
+    /// If true, do not rebuild the blocked cache after update.
+    /// Caller is responsible for rebuilding cache if needed.
+    pub skip_cache_rebuild: bool,
 }
 
 impl IssueUpdate {

@@ -108,7 +108,7 @@ fn list_comments_by_id(
     storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, id)?;

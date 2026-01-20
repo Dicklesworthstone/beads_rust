@@ -18,8 +18,10 @@ use tracing::info;
 /// Parse issue ID from create output.
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
+    // Handle both "✓ Created ID: ..." and "Created ID: ..." formats
     let id_part = line
-        .strip_prefix("Created ")
+        .strip_prefix("✓ Created ")
+        .or_else(|| line.strip_prefix("Created "))
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("");
     id_part.trim().to_string()

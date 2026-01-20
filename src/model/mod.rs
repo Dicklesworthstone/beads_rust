@@ -239,7 +239,7 @@ impl DependencyType {
     pub const fn is_blocking(&self) -> bool {
         matches!(
             self,
-            Self::Blocks | Self::ParentChild | Self::ConditionalBlocks
+            Self::Blocks | Self::ParentChild | Self::ConditionalBlocks | Self::WaitsFor
         )
     }
 }
@@ -1061,7 +1061,7 @@ mod tests {
         assert!(DependencyType::Blocks.is_blocking());
         assert!(DependencyType::ParentChild.is_blocking());
         assert!(DependencyType::ConditionalBlocks.is_blocking());
-        assert!(!DependencyType::WaitsFor.is_blocking());
+        assert!(DependencyType::WaitsFor.is_blocking());
         assert!(!DependencyType::Related.is_blocking());
         assert!(!DependencyType::DiscoveredFrom.is_blocking());
         assert!(!DependencyType::RepliesTo.is_blocking());
