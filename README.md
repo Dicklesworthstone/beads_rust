@@ -166,7 +166,29 @@ br ready --json  # Structured output for agents
 br show bd-abc123 --json
 ```
 
-### 5. Minimal Footprint
+### 5. Rich Terminal Output
+
+Interactive terminals get enhanced visual output:
+
+```bash
+# Rich mode (default in TTY)
+br list           # Formatted tables with colors
+br show bd-abc    # Styled panels with metadata
+
+# Plain mode (piped or --no-color)
+br list | cat     # Clean text, no ANSI codes
+
+# JSON mode (--json or --robot)
+br list --json    # Structured output for tools
+```
+
+Output mode is auto-detected:
+- **Rich**: Interactive TTY with color support
+- **Plain**: Piped output or `NO_COLOR` environment
+- **JSON**: Machine-readable (`--json` flag)
+- **Quiet**: Minimal output (`--quiet` flag)
+
+### 6. Minimal Footprint
 
 ~20K lines of Rust vs ~276K lines in the original Go beads. Faster compilation, smaller binary, fewer moving parts.
 

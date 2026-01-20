@@ -3,17 +3,21 @@ use crate::cli::Cli;
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use std::io::IsTerminal;
+use std::sync::OnceLock;
 
 /// Central output coordinator that respects robot/json/quiet modes.
+///
+/// Uses lazy initialization for console and theme to ensure zero overhead
+/// in JSON/Quiet modes where rich output is never used.
 pub struct OutputContext {
-    /// Rich console for human-readable output
-    console: Console,
-    /// Theme for consistent styling
-    theme: Theme,
-    /// Output mode
+    /// Output mode (always set eagerly - cheap)
     mode: OutputMode,
-    /// Terminal width (cached)
-    width: usize,
+    /// Terminal width (cached, lazy)
+    width: OnceLock<usize>,
+    /// Rich console for human-readable output (lazy)
+    console: OnceLock<Console>,
+    /// Theme for consistent styling (lazy)
+    theme: OnceLock<Theme>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,22 +33,24 @@ pub enum OutputMode {
 }
 
 impl OutputContext {
-    /// Create from CLI global args
+    /// Create from CLI global args.
+    ///
+    /// Only mode is set eagerly; console/theme/width are lazy-initialized
+    /// on first access to ensure zero overhead in JSON/Quiet modes.
     #[must_use]
     pub fn from_args(args: &Cli) -> Self {
-        let mode = Self::detect_mode(args);
-        let console = Self::create_console(mode);
-        let width = console.width();
-
         Self {
-            console,
-            theme: Theme::default(),
-            mode,
-            width,
+            mode: Self::detect_mode(args),
+            width: OnceLock::new(),
+            console: OnceLock::new(),
+            theme: OnceLock::new(),
         }
     }
 
     /// Create from CLI-style flags.
+    ///
+    /// Only mode is set eagerly; console/theme/width are lazy-initialized
+    /// on first access to ensure zero overhead in JSON/Quiet modes.
     #[must_use]
     pub fn from_flags(json: bool, quiet: bool, no_color: bool) -> Self {
         let mode = if json {
@@ -58,14 +64,11 @@ impl OutputContext {
             OutputMode::Rich
         };
 
-        let console = Self::create_console(mode);
-        let width = console.width();
-
         Self {
-            console,
-            theme: Theme::default(),
             mode,
-            width,
+            width: OnceLock::new(),
+            console: OnceLock::new(),
+            theme: OnceLock::new(),
         }
     }
 
@@ -85,18 +88,18 @@ impl OutputContext {
         OutputMode::Rich
     }
 
-    fn create_console(mode: OutputMode) -> Console {
-        match mode {
+    /// Lazily create console based on mode.
+    fn console(&self) -> &Console {
+        self.console.get_or_init(|| match self.mode {
             OutputMode::Rich => Console::new(),
-            OutputMode::Plain | OutputMode::Quiet => {
+            OutputMode::Plain | OutputMode::Quiet | OutputMode::Json => {
                 Console::builder().no_color().force_terminal(false).build()
             }
-            OutputMode::Json => Console::builder().no_color().force_terminal(false).build(),
-        }
+        })
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Mode Checks
+    // Mode Checks (no lazy initialization needed - mode is always set)
     // ─────────────────────────────────────────────────────────────
 
     pub fn mode(&self) -> OutputMode {
@@ -114,11 +117,17 @@ impl OutputContext {
     pub fn is_plain(&self) -> bool {
         self.mode == OutputMode::Plain
     }
+
+    /// Get terminal width (lazy-initialized).
     pub fn width(&self) -> usize {
-        self.width
+        *self.width.get_or_init(|| self.console().width())
     }
+
+    /// Get theme (lazy-initialized).
+    ///
+    /// In JSON/Quiet modes, this is never called, so theme is never created.
     pub fn theme(&self) -> &Theme {
-        &self.theme
+        self.theme.get_or_init(Theme::default)
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -127,17 +136,16 @@ impl OutputContext {
 
     pub fn print(&self, content: &str) {
         match self.mode {
-            OutputMode::Rich => self.console.print(content),
-            OutputMode::Plain => {
-                self.console.print(content);
+            OutputMode::Rich | OutputMode::Plain => {
+                self.console().print(content);
             }
-            OutputMode::Quiet | OutputMode::Json => {} //
+            OutputMode::Quiet | OutputMode::Json => {} // No console access - zero overhead
         }
     }
 
     pub fn render<R: Renderable>(&self, renderable: &R) {
         if self.is_rich() {
-            self.console.print_renderable(renderable);
+            self.console().print_renderable(renderable);
         }
     }
 
@@ -146,6 +154,7 @@ impl OutputContext {
     /// Panics if serialization fails.
     pub fn json<T: serde::Serialize>(&self, value: &T) {
         if self.is_json() {
+            // Direct println - no console/theme initialization needed
             println!("{}", serde_json::to_string(value).unwrap());
         }
     }
@@ -156,8 +165,9 @@ impl OutputContext {
     pub fn json_pretty<T: serde::Serialize>(&self, value: &T) {
         if self.is_rich() {
             let json = rich_rust::renderables::Json::new(serde_json::to_value(value).unwrap());
-            self.console.print_renderable(&json);
+            self.console().print_renderable(&json);
         } else if self.is_json() {
+            // Direct println - no console/theme initialization needed
             println!("{}", serde_json::to_string_pretty(value).unwrap());
         }
     }
@@ -169,7 +179,7 @@ impl OutputContext {
     pub fn success(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console.print(&format!("[bold green]✓[/] {}", message));
+                self.console().print(&format!("[bold green]✓[/] {}", message));
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json => {} //
@@ -181,7 +191,7 @@ impl OutputContext {
             OutputMode::Rich => {
                 let panel = Panel::from_text(message).title(Text::new("Error"));
                 // .border_style(self.theme.error.clone()); // border_style missing?
-                self.console.print_renderable(&panel);
+                self.console().print_renderable(&panel);
             }
             OutputMode::Plain | OutputMode::Quiet => eprintln!("Error: {}", message),
             OutputMode::Json => {} //
@@ -191,7 +201,7 @@ impl OutputContext {
     pub fn warning(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console
+                self.console()
                     .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]", message));
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
@@ -202,7 +212,7 @@ impl OutputContext {
     pub fn info(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console.print(&format!("[blue]ℹ[/] {}", message));
+                self.console().print(&format!("[blue]ℹ[/] {}", message));
             }
             OutputMode::Plain => println!("{}", message),
             OutputMode::Quiet | OutputMode::Json => {} //
@@ -214,7 +224,7 @@ impl OutputContext {
             let rule = Rule::with_title(Text::new(title))
                 // .style(self.theme.section.clone())
                 ;
-            self.console.print_renderable(&rule);
+            self.console().print_renderable(&rule);
         } else if self.is_plain() {
             println!("\n─── {} ───\n", title);
         }
@@ -235,9 +245,9 @@ impl OutputContext {
                     text.append(&format!("• {}\n", suggestion));
                 }
 
-                let panel = Panel::from_rich_text(&text, self.width).title(Text::new(title));
+                let panel = Panel::from_rich_text(&text, self.width()).title(Text::new(title));
                 // .border_style(self.theme.error.clone());
-                self.console.print_renderable(&panel);
+                self.console().print_renderable(&panel);
             }
             OutputMode::Plain => {
                 eprintln!("Error: {} - {}", title, description);

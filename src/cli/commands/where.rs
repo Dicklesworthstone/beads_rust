@@ -29,9 +29,9 @@ struct WhereOutput {
 /// # Errors
 ///
 /// Returns an error if redirect resolution fails.
-pub fn execute(json: bool, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let Ok(beads_dir) = config::discover_beads_dir(Some(Path::new("."))) else {
-        return handle_missing_beads(json, ctx);
+        return handle_missing_beads(ctx);
     };
 
     let final_dir = follow_redirects(&beads_dir, 10)?;
