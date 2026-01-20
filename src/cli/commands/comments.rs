@@ -82,12 +82,10 @@ fn add_comment(
 
     let comment = storage.add_comment(&issue_id, &author, &text)?;
 
-    if json {
-        let output = serde_json::to_string_pretty(&comment)?;
-        println!("{output}");
-    } else if matches!(ctx.mode(), OutputMode::Rich) {
+    ctx.json_pretty(&comment);
+    if ctx.is_rich() {
         render_comment_added_rich(&issue_id, &comment, ctx);
-    } else {
+    } else if !ctx.is_json() {
         println!("Comment added to {issue_id}");
     }
 
@@ -116,9 +114,8 @@ fn list_comments_by_id(
     let issue_id = resolve_issue_id(storage, resolver, all_ids, id)?;
     let comments = storage.get_comments(&issue_id)?;
 
-    if json {
-        let output = serde_json::to_string_pretty(&comments)?;
-        println!("{output}");
+    if ctx.is_json() {
+        ctx.json_pretty(&comments);
         return Ok(());
     }
 
