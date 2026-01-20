@@ -722,10 +722,10 @@ fn e2e_history_list_json_output() {
     create_issue(&workspace, "Issue for JSON test", "create_json_test");
     sync_flush(&workspace);
 
-    // List with --robot flag for JSON output
+    // List with --json flag for JSON output
     let list = run_br(
         &workspace,
-        ["--robot", "history", "list"],
+        ["--json", "history", "list"],
         "history_list_json",
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
@@ -772,10 +772,10 @@ fn e2e_history_restore_json_output() {
     assert!(!backups.is_empty(), "should have backup");
     let backup_file = &backups[0];
 
-    // Restore with --robot flag for JSON output
+    // Restore with --json flag for JSON output
     let restore = run_br(
         &workspace,
-        ["--robot", "history", "restore", backup_file, "--force"],
+        ["--json", "history", "restore", backup_file, "--force"],
         "history_restore_json",
     );
     assert!(
@@ -808,10 +808,10 @@ fn e2e_history_prune_json_output() {
     create_issue(&workspace, "Issue for JSON prune", "create_json_prune");
     sync_flush(&workspace);
 
-    // Prune with --robot flag for JSON output
+    // Prune with --json flag for JSON output
     let prune = run_br(
         &workspace,
-        ["--robot", "history", "prune", "--keep", "10"],
+        ["--json", "history", "prune", "--keep", "10"],
         "history_prune_json",
     );
     assert!(prune.status.success(), "prune failed: {}", prune.stderr);

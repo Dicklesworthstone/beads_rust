@@ -216,11 +216,7 @@ impl SqliteStorage {
                     source_repo, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
                     sender, ephemeral, pinned, is_template
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )",
-                rusqlite::params![
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",                rusqlite::params![
                     issue.id,
                     issue.content_hash,
                     issue.title,
@@ -3416,8 +3412,7 @@ impl SqliteStorage {
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                 pinned, is_template
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             rusqlite::params![
                 issue.id,
@@ -3985,9 +3980,6 @@ mod tests {
         storage.create_issue(&parent, "tester").unwrap();
         storage.create_issue(&child, "tester").unwrap();
         // Parent (bd-p1) depends on external capability
-        storage
-            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
-            .unwrap();
         storage
             .add_dependency("bd-c1", "bd-p1", "parent-child", "tester")
             .unwrap();
