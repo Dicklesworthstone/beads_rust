@@ -9,6 +9,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
 use crate::model::{IssueType, Priority, Status};
+use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::HashSet;
@@ -69,6 +70,15 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
     } else {
         args.format
     };
+    let quiet = cli.quiet.unwrap_or(false);
+    let ctx = OutputContext::from_flags(
+        matches!(output_format, OutputFormat::Json),
+        quiet,
+        !use_color,
+    );
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
 
     // Output
     match output_format {
@@ -108,10 +118,40 @@ pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Resul
             print!("{csv_output}");
         }
         OutputFormat::Text => {
-            // Note: bd outputs nothing when no issues found, matching that for conformance
-            for issue in &issues {
-                let line = format_issue_line_with(issue, format_options);
-                println!("{line}");
+            if matches!(ctx.mode(), OutputMode::Rich) {
+                let columns = if args.long {
+                    IssueTableColumns {
+                        id: true,
+                        priority: true,
+                        status: true,
+                        issue_type: true,
+                        title: true,
+                        assignee: true,
+                        created: true,
+                        updated: true,
+                        ..Default::default()
+                    }
+                } else {
+                    IssueTableColumns {
+                        id: true,
+                        priority: true,
+                        status: true,
+                        issue_type: true,
+                        title: true,
+                        ..Default::default()
+                    }
+                };
+                let table = IssueTable::new(&issues, ctx.theme())
+                    .columns(columns)
+                    .title(format!("Issues ({})", issues.len()))
+                    .build();
+                ctx.render(&table);
+            } else {
+                // Note: bd outputs nothing when no issues found, matching that for conformance
+                for issue in &issues {
+                    let line = format_issue_line_with(issue, format_options);
+                    println!("{line}");
+                }
             }
         }
     }
