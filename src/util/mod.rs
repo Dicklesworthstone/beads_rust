@@ -44,7 +44,7 @@ pub fn set_last_touched_id(beads_dir: &Path, id: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o644);
     }
 
     if let Ok(mut file) = options.open(path) {
@@ -106,6 +106,6 @@ mod tests {
 
         set_last_touched_id(&beads_dir, "bd-abc123");
         let metadata = fs::metadata(last_touched_path(&beads_dir)).expect("metadata");
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
     }
 }

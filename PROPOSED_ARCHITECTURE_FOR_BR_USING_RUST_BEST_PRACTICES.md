@@ -2590,11 +2590,11 @@ fn write_jsonl_atomic(issues: &[Issue], temp_path: &Path, final_path: &Path) -> 
     fs::rename(temp_path, final_path)
         .context("Failed to rename export file")?;
 
-    // Set permissions (0600)
+    // Set permissions (0644) - world-readable for multi-user/agent access
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
+        let perms = std::fs::Permissions::from_mode(0o644);
         fs::set_permissions(final_path, perms)?;
     }
 

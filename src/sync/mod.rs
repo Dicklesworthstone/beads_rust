@@ -1387,11 +1387,11 @@ pub fn export_to_jsonl_with_policy(
     // Atomic rename
     fs::rename(&temp_path, output_path)?;
 
-    // Set file permissions (0600)
+    // Set file permissions (0644) - world-readable for multi-user/agent access
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
+        let perms = std::fs::Permissions::from_mode(0o644);
         let _ = fs::set_permissions(output_path, perms);
     }
 
