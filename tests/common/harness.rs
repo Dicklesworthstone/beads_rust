@@ -1456,7 +1456,10 @@ pub fn extract_json_payload(stdout: &str) -> String {
 /// Parse the created ID from br create output
 pub fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
-    line.strip_prefix("Created ")
+    // Handle both formats: "Created bd-xxx: title" and "✓ Created bd-xxx: title"
+    let normalized = line.strip_prefix("✓ ").unwrap_or(line);
+    normalized
+        .strip_prefix("Created ")
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("")
         .trim()

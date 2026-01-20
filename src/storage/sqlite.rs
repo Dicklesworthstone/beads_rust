@@ -402,7 +402,7 @@ impl SqliteStorage {
                 add_update("owner", Box::new(val.as_deref().unwrap_or("").to_string()));
             }
             if let Some(ref val) = updates.estimated_minutes {
-                issue.estimated_minutes = *val;
+                issue.estimated_minutes = Some(*val);
                 add_update("estimated_minutes", Box::new(*val));
             }
             if let Some(ref val) = updates.external_ref {
@@ -1954,6 +1954,29 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get all labels for all issues as a map of issue_id -> labels.
+    ///
+    /// Used for export and sync operations that need complete label state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_all_labels(&self) -> Result<HashMap<String, Vec<String>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT issue_id, label FROM labels ORDER BY issue_id, label",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let (issue_id, label) = row?;
+            map.entry(issue_id).or_default().push(label);
+        }
+        Ok(map)
+    }
+
     /// Get all unique labels with their issue counts.
     ///
     /// Returns a vector of (label, count) pairs sorted alphabetically by label.
@@ -2488,31 +2511,6 @@ impl SqliteStorage {
             map.entry(comment.issue_id.clone())
                 .or_default()
                 .push(comment);
-        }
-        Ok(map)
-    }
-
-    /// Get all labels for all issues.
-    ///
-    /// Returns a map from `issue_id` to its list of labels.
-    /// This avoids N+1 queries when populating issues for export.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database query fails.
-    pub fn get_all_labels(&self) -> Result<HashMap<String, Vec<String>>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows {
-            let (issue_id, label) = row?;
-            map.entry(issue_id).or_default().push(label);
         }
         Ok(map)
     }

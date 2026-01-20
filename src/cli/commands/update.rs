@@ -243,7 +243,7 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
         issue_type,
         assignee,
         owner,
-        estimated_minutes: args.estimate.map(Some),
+        estimated_minutes: args.estimate,
         due_at,
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),
@@ -253,6 +253,7 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
+        skip_cache_rebuild: false,
     })
 }
 

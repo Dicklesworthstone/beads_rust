@@ -62,9 +62,9 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // Output
     if args.silent {
         println!("{}", issue.id);
-    } else if cli.json.unwrap_or(false) {
+    } else if ctx.is_json() {
         if args.dry_run {
-            println!("{}", serde_json::to_string_pretty(&issue)?);
+            ctx.json_pretty(&issue);
         } else {
             let full_issue = storage_ctx
                 .storage
@@ -72,7 +72,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 .ok_or_else(|| BeadsError::IssueNotFound {
                     id: issue.id.clone(),
                 })?;
-            println!("{}", serde_json::to_string_pretty(&full_issue)?);
+            ctx.json_pretty(&full_issue);
         }
     } else if args.dry_run {
         ctx.info(&format!("Dry run: would create issue {}", issue.id));
@@ -346,8 +346,8 @@ fn execute_import(
 ) -> Result<()> {
     let parsed_issues = parse_markdown_file(path)?;
     if parsed_issues.is_empty() {
-        if cli.json.unwrap_or(false) {
-            println!("[]");
+        if ctx.is_json() {
+            ctx.json(&Vec::<Issue>::new());
         }
         return Ok(());
     }
@@ -361,7 +361,7 @@ fn execute_import(
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
     let now = Utc::now();
-    let json_mode = cli.json.unwrap_or(false);
+    let _json_mode = cli.json.unwrap_or(false);
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
 
@@ -508,7 +508,7 @@ fn execute_import(
             }
         }
 
-        if json_mode {
+        if ctx.is_json() {
             if let Some(full_issue) = storage.get_issue_for_export(&id)? {
                 created_issues.push(full_issue);
             } else {
@@ -519,9 +519,8 @@ fn execute_import(
         created_ids.push((id, title));
     }
 
-    if json_mode {
-        let json_output = serde_json::to_string_pretty(&created_issues)?;
-        println!("{json_output}");
+    if ctx.is_json() {
+        ctx.json_pretty(&created_issues);
     } else if !created_ids.is_empty() {
         ctx.success(&format!(
             "Created {} issues from {}:",

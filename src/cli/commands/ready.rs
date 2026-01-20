@@ -87,11 +87,10 @@ pub fn execute(
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
-    if use_json {
+    if ctx.is_json() {
         // Use ReadyIssue for bd parity (excludes compaction_level, original_size, dependency_count, dependent_count)
         let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
-        let json_output = serde_json::to_string_pretty(&ready_output)?;
-        println!("{json_output}");
+        ctx.json_pretty(&ready_output);
     } else if ready_issues.is_empty() {
         // Match bd empty output format
         println!("✨ No open issues");

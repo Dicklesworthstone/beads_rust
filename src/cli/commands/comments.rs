@@ -67,7 +67,7 @@ fn add_comment(
     resolver: &IdResolver,
     all_ids: &[String],
     actor: Option<&str>,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.id)?;
@@ -97,10 +97,10 @@ fn list_comments(
     storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    list_comments_by_id(&args.id, storage, resolver, all_ids, json, ctx)
+    list_comments_by_id(&args.id, storage, resolver, all_ids, _json, ctx)
 }
 
 fn list_comments_by_id(

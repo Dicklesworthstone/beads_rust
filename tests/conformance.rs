@@ -154,6 +154,8 @@ where
     cmd.args(args);
     cmd.env("NO_COLOR", "1");
     cmd.env("HOME", cwd);
+    // Force bd to operate on the local workspace to avoid contributor routing to planning repos.
+    cmd.env("BEADS_DIR", cwd.join(".beads"));
 
     let start = Instant::now();
     let output = cmd.output().expect(&format!("run {binary}"));

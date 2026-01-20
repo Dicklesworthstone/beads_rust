@@ -6,7 +6,7 @@ use crate::cli::BlockedArgs;
 use crate::config::{
     CliOverrides, discover_beads_dir, external_project_db_paths, load_config, open_storage_with_cli,
 };
-use crate::error::{BeadsError, Result};
+use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput};
 use crate::model::{IssueType, Priority};
 use crate::output::{OutputContext, OutputMode};
@@ -22,7 +22,7 @@ use std::str::FromStr;
 /// - Querying blocked issues fails
 pub fn execute(
     args: &BlockedArgs,
-    json: bool,
+    _json: bool,
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -120,7 +120,7 @@ pub fn execute(
     // Output
     if matches!(ctx.mode(), OutputMode::Rich) {
         render_blocked_rich(&blocked_issues, args.detailed, storage);
-    } else if json {
+    } else if ctx.is_json() {
         // Use BlockedIssueOutput for bd parity (excludes compaction_level, original_size)
         // Also strip status suffix from blocked_by entries (bd uses bare IDs)
         let output: Vec<BlockedIssueOutput> = blocked_issues
@@ -143,8 +143,7 @@ pub fn execute(
                 updated_at: bi.issue.updated_at,
             })
             .collect();
-        let json_str = serde_json::to_string_pretty(&output).map_err(BeadsError::Json)?;
-        println!("{json_str}");
+        ctx.json_pretty(&output);
     } else {
         print_text_output(&blocked_issues, args.detailed, storage);
     }

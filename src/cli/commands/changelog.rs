@@ -58,7 +58,7 @@ pub struct ChangelogEntry {
 /// Returns an error if config loading, git lookup, or storage access fails.
 pub fn execute(
     args: &ChangelogArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -128,8 +128,8 @@ pub fn execute(
         "Generated changelog"
     );
 
-    if json || args.robot {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&output);
         return Ok(());
     }
 

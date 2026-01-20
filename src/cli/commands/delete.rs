@@ -53,7 +53,7 @@ impl DeleteResult {
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &DeleteArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -197,8 +197,8 @@ pub fn execute(
     result.deleted_count = result.deleted.len();
 
     // 9. Output
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&result);
         storage_ctx.flush_no_db_if_dirty()?;
         return Ok(());
     }

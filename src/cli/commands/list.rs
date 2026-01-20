@@ -115,8 +115,7 @@ pub fn execute(
                     }
                 })
                 .collect();
-            let json_output = serde_json::to_string_pretty(&issues_with_counts)?;
-            println!("{json_output}");
+            ctx.json_pretty(&issues_with_counts);
         }
         OutputFormat::Csv => {
             let fields = csv::parse_fields(args.fields.as_deref());

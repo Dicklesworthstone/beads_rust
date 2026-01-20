@@ -53,10 +53,10 @@ where
 
 /// Helper to parse created issue ID from stdout.
 fn parse_created_id(stdout: &str) -> String {
-    stdout
-        .lines()
-        .next()
-        .unwrap_or("")
+    let line = stdout.lines().next().unwrap_or("");
+    // Handle both formats: "Created bd-xxx: title" and "✓ Created bd-xxx: title"
+    let normalized = line.strip_prefix("✓ ").unwrap_or(line);
+    normalized
         .strip_prefix("Created ")
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("")

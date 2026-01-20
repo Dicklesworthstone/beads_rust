@@ -259,20 +259,20 @@ fn render_kv_table(title: &str, rows: &[(String, String)], ctx: &OutputContext) 
     ctx.render(&table);
 }
 /// Show config file paths.
-fn show_paths(json_mode: bool, ctx: &OutputContext) -> Result<()> {
+fn show_paths(_json_mode: bool, ctx: &OutputContext) -> Result<()> {
     let user_config_path = get_user_config_path();
     let legacy_user_path = get_legacy_user_config_path();
     let project_path = discover_beads_dir(None)
         .ok()
         .map(|dir| dir.join("config.yaml"));
 
-    if json_mode || ctx.is_json() {
+    if ctx.is_json() {
         let output = json!({
             "user_config": user_config_path.map(|p| p.display().to_string()),
             "legacy_user_config": legacy_user_path.map(|p| p.display().to_string()),
             "project_config": project_path.map(|p| p.display().to_string()),
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if ctx.is_rich() {
@@ -385,7 +385,7 @@ fn get_config_value(
     key: &str,
     beads_dir: Option<&PathBuf>,
     overrides: &CliOverrides,
-    json_mode: bool,
+    _json_mode: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     debug!(key, "Reading config key");
@@ -399,12 +399,12 @@ fn get_config_value(
         .or_else(|| layer.startup.get(key))
         .cloned();
 
-    if json_mode || ctx.is_json() {
+    if ctx.is_json() {
         let output = json!({
             "key": key,
             "value": value,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if let Some(v) = value {
         if ctx.is_quiet() {
             return Ok(());
@@ -433,7 +433,7 @@ fn get_config_value(
 }
 
 /// Set a config value in project config (if available) or user config.
-fn set_config_value(args: &[String], json_mode: bool, ctx: &OutputContext) -> Result<()> {
+fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> Result<()> {
     let (key, value) = match args.len() {
         1 => args[0]
             .split_once('=')
@@ -500,14 +500,14 @@ fn set_config_value(args: &[String], json_mode: bool, ctx: &OutputContext) -> Re
         "Config updated"
     );
 
-    if json_mode || ctx.is_json() {
+    if ctx.is_json() {
         let output = json!({
             "key": key,
             "value": value,
             "path": config_path.display().to_string(),
             "scope": if is_project { "project" } else { "user" }
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if ctx.is_rich() {
@@ -613,7 +613,7 @@ fn yaml_value_to_string(value: &serde_yaml::Value) -> Option<String> {
 /// Delete a config value from the database, project config, and user config.
 fn delete_config_value(
     key: &str,
-    json_mode: bool,
+    _json_mode: bool,
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -662,14 +662,14 @@ fn delete_config_value(
         }
     }
 
-    if json_mode || ctx.is_json() {
+    if ctx.is_json() {
         let output = json!({
             "key": key,
             "deleted_from_db": db_deleted,
             "deleted_from_project": project_deleted,
             "deleted_from_user": user_deleted,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if db_deleted || project_deleted || user_deleted {
@@ -757,8 +757,8 @@ fn show_config(
             let layer = load_project_config(dir)?;
             return output_layer(&layer, ConfigSource::Project, json_mode, ctx);
         }
-        if json_mode || ctx.is_json() {
-            println!("{{}}");
+        if ctx.is_json() {
+            ctx.json(&serde_json::Map::new());
         } else if ctx.is_quiet() {
             return Ok(());
         } else if ctx.is_rich() {
@@ -791,7 +791,7 @@ fn show_config(
     let id_config = id_config_from_layer(&layer);
     let actor = resolve_actor(&layer);
 
-    if json_mode || ctx.is_json() {
+    if ctx.is_json() {
         let mut all_keys: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
         for (k, v) in &layer.runtime {
@@ -813,7 +813,7 @@ fn show_config(
         );
         all_keys.insert("_computed.actor".to_string(), json!(actor));
 
-        println!("{}", serde_json::to_string_pretty(&all_keys)?);
+        ctx.json_pretty(&all_keys);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if ctx.is_rich() {
@@ -898,10 +898,10 @@ fn show_config(
 fn output_layer(
     layer: &ConfigLayer,
     source: ConfigSource,
-    json_mode: bool,
+    _json_mode: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    if json_mode || ctx.is_json() {
+    if ctx.is_json() {
         let mut all_keys: BTreeMap<String, &str> = BTreeMap::new();
         for (k, v) in &layer.runtime {
             all_keys.insert(k.clone(), v);
@@ -909,7 +909,7 @@ fn output_layer(
         for (k, v) in &layer.startup {
             all_keys.insert(k.clone(), v);
         }
-        println!("{}", serde_json::to_string_pretty(&all_keys)?);
+        ctx.json_pretty(&all_keys);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if ctx.is_rich() {

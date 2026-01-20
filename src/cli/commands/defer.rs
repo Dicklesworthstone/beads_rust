@@ -40,7 +40,7 @@ pub fn execute_defer(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let use_json = json || args.robot;
+    let _use_json = json || args.robot;
 
     tracing::info!("Executing defer command");
 
@@ -140,11 +140,10 @@ pub fn execute_defer(
     }
 
     // Output
-    if use_json {
+    if ctx.is_json() {
         // bd outputs a bare array of updated issues
         let json_output: Vec<ReadyIssue> = deferred_full.iter().map(ReadyIssue::from).collect();
-        let output = serde_json::to_string_pretty(&json_output).map_err(BeadsError::Json)?;
-        println!("{output}");
+        ctx.json_pretty(&json_output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_defer_rich(&deferred_issues, &skipped_issues, ctx);
     } else {
@@ -179,7 +178,7 @@ pub fn execute_undefer(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let use_json = json || args.robot;
+    let _use_json = json || args.robot;
 
     tracing::info!("Executing undefer command");
 
@@ -271,11 +270,10 @@ pub fn execute_undefer(
     }
 
     // Output
-    if use_json {
+    if ctx.is_json() {
         // bd outputs a bare array of updated issues
         let json_output: Vec<ReadyIssue> = undeferred_full.iter().map(ReadyIssue::from).collect();
-        let output = serde_json::to_string_pretty(&json_output).map_err(BeadsError::Json)?;
-        println!("{output}");
+        ctx.json_pretty(&json_output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_undefer_rich(&undeferred_issues, &skipped_issues, ctx);
     } else {

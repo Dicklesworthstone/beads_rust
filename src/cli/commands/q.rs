@@ -130,7 +130,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
             "id": issue.id,
             "title": issue.title,
         });
-        println!("{}", serde_json::to_string(&output)?);
+        ctx.json(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_quick_created_rich(&issue.id, &issue.title, ctx);
     } else {

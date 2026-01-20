@@ -25,7 +25,9 @@ pub fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
-    let id_part = line
+    // Handle both formats: "Created bd-xxx: title" and "✓ Created bd-xxx: title"
+    let normalized = line.strip_prefix("✓ ").unwrap_or(line);
+    let id_part = normalized
         .strip_prefix("Created ")
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("");

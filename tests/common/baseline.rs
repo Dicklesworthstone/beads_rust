@@ -524,8 +524,8 @@ impl RegressionSummary {
         }
 
         println!(
-            "{:<25} {:<15} {:>12} {:>12} {:>12} {}",
-            "Dataset/Operation", "Status", "Current", "Baseline", "Change", "Reason"
+            "{:<25} {:<15} {:>12} {:>12} {:>12} Reason",
+            "Dataset/Operation", "Status", "Current", "Baseline", "Change"
         );
         println!("{}", "-".repeat(95));
 
@@ -535,12 +535,10 @@ impl RegressionSummary {
             let current = format!("{:.3}", result.current_ratio);
             let baseline = result
                 .baseline_ratio
-                .map(|r| format!("{:.3}", r))
-                .unwrap_or_else(|| "n/a".to_string());
+                .map_or_else(|| "n/a".to_string(), |r| format!("{:.3}", r));
             let change = result
                 .change_pct
-                .map(|p| format!("{:+.1}%", p))
-                .unwrap_or_else(|| "n/a".to_string());
+                .map_or_else(|| "n/a".to_string(), |p| format!("{:+.1}%", p));
 
             // Truncate reason for display
             let reason = if result.reason.len() > 30 {

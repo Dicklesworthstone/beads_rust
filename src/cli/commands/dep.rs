@@ -117,7 +117,7 @@ fn dep_add(
     resolver: &IdResolver,
     all_ids: &[String],
     actor: &str,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
@@ -169,7 +169,7 @@ fn dep_add(
 
     let added = storage.add_dependency(&issue_id, &depends_on_id, dep_type.as_str(), actor)?;
 
-    if json {
+    if ctx.is_json() {
         let result = DepActionResult {
             status: if added { "ok" } else { "exists" }.to_string(),
             issue_id: issue_id.clone(),
@@ -177,7 +177,7 @@ fn dep_add(
             dep_type: dep_type.as_str().to_string(),
             action: if added { "added" } else { "already_exists" }.to_string(),
         };
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        ctx.json_pretty(&result);
     } else if added {
         if ctx.is_rich() {
             // Rich mode: Show detailed visual feedback
@@ -219,7 +219,7 @@ fn dep_remove(
     resolver: &IdResolver,
     all_ids: &[String],
     actor: &str,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
@@ -233,7 +233,7 @@ fn dep_remove(
 
     let removed = storage.remove_dependency(&issue_id, &depends_on_id, actor)?;
 
-    if json {
+    if ctx.is_json() {
         let result = DepActionResult {
             status: if removed { "ok" } else { "not_found" }.to_string(),
             issue_id: issue_id.clone(),
@@ -241,7 +241,7 @@ fn dep_remove(
             dep_type: "unknown".to_string(),
             action: if removed { "removed" } else { "not_found" }.to_string(),
         };
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        ctx.json_pretty(&result);
     } else if removed {
         if ctx.is_rich() {
             ctx.success(&format!(
@@ -272,7 +272,7 @@ fn dep_list(
     resolver: &IdResolver,
     all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
@@ -329,8 +329,8 @@ fn dep_list(
         apply_external_dep_list_metadata(&mut items, &external_statuses);
     }
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&items)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&items);
         return Ok(());
     }
 
@@ -492,7 +492,7 @@ fn dep_tree(
     resolver: &IdResolver,
     all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let root_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
@@ -600,8 +600,8 @@ fn dep_tree(
         }
     }
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&nodes)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&nodes);
         return Ok(());
     }
 
@@ -727,15 +727,15 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 fn dep_cycles(
     _args: &DepCyclesArgs,
     storage: &SqliteStorage,
-    json: bool,
+    _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     let cycles = storage.detect_all_cycles()?;
     let count = cycles.len();
 
-    if json {
+    if ctx.is_json() {
         let result = CyclesResult { cycles, count };
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        ctx.json_pretty(&result);
         return Ok(());
     }
 
