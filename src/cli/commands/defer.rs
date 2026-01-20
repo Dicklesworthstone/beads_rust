@@ -36,7 +36,7 @@ pub struct SkippedIssue {
 /// Returns an error if database operations fail or IDs cannot be resolved.
 pub fn execute_defer(
     args: &DeferArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -138,7 +138,8 @@ pub fn execute_defer(
     }
 
     // Output
-    if ctx.is_json() {
+    let use_json = ctx.is_json() || args.robot;
+    if use_json {
         // bd outputs a bare array of updated issues
         let json_output: Vec<ReadyIssue> = deferred_full.iter().map(ReadyIssue::from).collect();
         ctx.json_pretty(&json_output);
@@ -172,7 +173,7 @@ pub fn execute_defer(
 /// Returns an error if database operations fail or IDs cannot be resolved.
 pub fn execute_undefer(
     args: &UndeferArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -266,7 +267,8 @@ pub fn execute_undefer(
     }
 
     // Output
-    if ctx.is_json() {
+    let use_json = ctx.is_json() || args.robot;
+    if use_json {
         // bd outputs a bare array of updated issues
         let json_output: Vec<ReadyIssue> = undeferred_full.iter().map(ReadyIssue::from).collect();
         ctx.json_pretty(&json_output);
