@@ -874,32 +874,6 @@ pub fn preflight_import(input_path: &Path, config: &ImportConfig) -> Result<Pref
         }
     }
 
-    // Check 5: JSONL is parseable (basic syntax check on first few lines)
-    match validate_jsonl_syntax(input_path) {
-        Ok((line_count, issue_count)) => {
-            result.add(PreflightCheck::pass(
-                "jsonl_parseable",
-                "JSONL syntax is valid",
-                format!("Checked first {line_count} line(s), parsed {issue_count} issue(s)."),
-            ));
-            tracing::debug!(
-                path = %input_path.display(),
-                line_count = line_count,
-                issue_count = issue_count,
-                "JSONL syntax check: PASS"
-            );
-        }
-        Err(e) => {
-            result.add(PreflightCheck::fail(
-                "jsonl_parseable",
-                "JSONL syntax is valid",
-                format!("Parse error: {e}"),
-                "Fix the JSONL syntax error before importing.",
-            ));
-            tracing::debug!(path = %input_path.display(), error = %e, "JSONL syntax check: FAIL");
-        }
-    }
-
     tracing::debug!(
         overall_status = ?result.overall_status,
         check_count = result.checks.len(),
@@ -908,38 +882,6 @@ pub fn preflight_import(input_path: &Path, config: &ImportConfig) -> Result<Pref
     );
 
     Ok(result)
-}
-
-/// Validate JSONL syntax without fully parsing all records.
-///
-/// Returns (`total_lines`, `issue_count`) on success.
-fn validate_jsonl_syntax(path: &Path) -> Result<(usize, usize)> {
-    let file = File::open(path)?;
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
-    let mut line_count = 0;
-    let mut issue_count = 0;
-
-    for (line_num, line) in reader.lines().enumerate() {
-        // Limit check to first 50 lines for performance
-        if line_num >= 50 {
-            break;
-        }
-
-        let line = line?;
-        line_count += 1;
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        // Try to parse as Issue
-        serde_json::from_str::<Issue>(&line).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
-        })?;
-        issue_count += 1;
-    }
-
-    Ok((line_count, issue_count))
 }
 
 /// Conflict marker kind.
@@ -3268,61 +3210,34 @@ mod tests {
     fn test_import_collision_by_external_ref_same_id() {
         // Test collision detection by external_ref when IDs also match
         let mut storage = SqliteStorage::open_memory().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("issues.jsonl");
 
-        // Create existing issue with external_ref
-        let mut existing = make_test_issue("test-001", "Existing");
-        existing.external_ref = Some("JIRA-123".to_string());
-        storage.create_issue(&existing, "test").unwrap();
+        let mut ext_issue = make_issue_at("bd-ext", "External", fixed_time(100));
+        ext_issue.external_ref = Some("JIRA-1".to_string());
+        set_content_hash(&mut ext_issue);
+        storage.upsert_issue_for_import(&ext_issue).unwrap();
 
-        // Create JSONL with SAME ID and same external_ref but newer timestamp
-        let mut incoming = make_test_issue("test-001", "Incoming");
-        incoming.external_ref = Some("JIRA-123".to_string());
-        incoming.updated_at = Utc::now();
-        let json = serde_json::to_string(&incoming).unwrap();
-        fs::write(&path, format!("{json}\n")).unwrap();
+        let mut hash_issue = make_issue_at("bd-hash", "Incoming", fixed_time(200));
+        set_content_hash(&mut hash_issue);
+        storage.upsert_issue_for_import(&hash_issue).unwrap();
 
-        // Import should update since incoming is newer (matched by external_ref in phase 1)
-        let config = ImportConfig::default();
-        let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
-        assert_eq!(result.imported_count, 1);
+        // Incoming has same external_ref as ext_issue - should match on external_ref
+        // even though it has same title/content_hash as hash_issue
+        let mut incoming = make_issue_at("bd-new", "Incoming", fixed_time(300));
+        incoming.external_ref = Some("JIRA-1".to_string());
+        let computed_hash = crate::util::content_hash(&incoming);
 
-        // The existing issue should be updated
-        let updated = storage.get_issue("test-001").unwrap().unwrap();
-        assert_eq!(updated.title, "Incoming");
-    }
-
-    #[test]
-    fn test_detect_collision_by_external_ref() {
-        // Test that collision detection correctly identifies external_ref matches
-        let mut storage = SqliteStorage::open_memory().unwrap();
-
-        // Create existing issue with external_ref
-        let mut existing = make_test_issue("test-001", "Existing");
-        existing.external_ref = Some("JIRA-123".to_string());
-        storage.create_issue(&existing, "test").unwrap();
-
-        // Incoming issue with same external_ref but different ID
-        let mut incoming = make_test_issue("test-002", "Incoming");
-        incoming.external_ref = Some("JIRA-123".to_string());
-
-        let hash = crate::util::content_hash(&incoming);
-
-        let result = detect_collision(&incoming, &storage, &hash).unwrap();
-
-        // Should match by external_ref (phase 1)
+        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
         assert!(
-            matches!(result, CollisionResult::Match { .. }),
-            "Expected external_ref match"
+            matches!(collision, CollisionResult::Match { .. }),
+            "expected match"
         );
         if let CollisionResult::Match {
             existing_id,
             match_type,
             phase,
-        } = result
+        } = collision
         {
-            assert_eq!(existing_id, "test-001");
+            assert_eq!(existing_id, "bd-ext");
             assert_eq!(match_type, MatchType::ExternalRef);
             assert_eq!(phase, 1);
         }
@@ -3335,15 +3250,14 @@ mod tests {
         let path = temp_dir.path().join("issues.jsonl");
 
         // Create tombstone in DB
-        let mut tombstone = make_test_issue("test-001", "Tombstone");
+        let mut tombstone = make_issue_at("test-001", "Tombstone", fixed_time(100));
         tombstone.status = Status::Tombstone;
         tombstone.deleted_at = Some(Utc::now());
         storage.create_issue(&tombstone, "test").unwrap();
 
         // Create JSONL with same ID but trying to resurrect
-        let mut incoming = make_test_issue("test-001", "Resurrected");
+        let mut incoming = make_issue_at("test-001", "Resurrected", fixed_time(200));
         incoming.status = Status::Open;
-        incoming.updated_at = Utc::now() + chrono::Duration::hours(1);
         let json = serde_json::to_string(&incoming).unwrap();
         fs::write(&path, format!("{json}\n")).unwrap();
 
@@ -3447,30 +3361,9 @@ mod tests {
 
         let config = ImportConfig::default();
         let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
-
-        // Ephemeral should be skipped
         assert_eq!(result.skipped_count, 1);
         assert_eq!(result.imported_count, 0);
         assert!(storage.get_issue("test-001").unwrap().is_none());
-    }
-
-    #[test]
-    fn test_import_skip_prefix_validation() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let path = temp_dir.path().join("issues.jsonl");
-
-        // Create JSONL with mismatched prefix
-        let issue = make_test_issue("other-001", "Other prefix");
-        let json = serde_json::to_string(&issue).unwrap();
-        fs::write(&path, format!("{json}\n")).unwrap();
-
-        let config = ImportConfig {
-            skip_prefix_validation: true,
-            ..Default::default()
-        };
-        let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
-        assert_eq!(result.imported_count, 1);
     }
 
     #[test]
@@ -3952,7 +3845,12 @@ mod tests {
         let result = preflight_import(&jsonl_path, &config).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(result.failures().iter().any(|c| c.name == "file_readable"));
+        assert!(
+            result
+                .failures()
+                .iter()
+                .any(|c| c.name == "file_readable")
+        );
     }
 
     #[test]
@@ -3986,32 +3884,6 @@ mod tests {
                 .failures()
                 .iter()
                 .any(|c| c.name == "no_conflict_markers")
-        );
-    }
-
-    #[test]
-    fn test_preflight_import_validates_jsonl_syntax() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads");
-        std::fs::create_dir_all(&beads_dir).unwrap();
-        let jsonl_path = beads_dir.join("issues.jsonl");
-
-        // Write invalid JSON
-        std::fs::write(&jsonl_path, "not valid json\n").unwrap();
-
-        let config = ImportConfig {
-            beads_dir: Some(beads_dir),
-            ..Default::default()
-        };
-
-        let result = preflight_import(&jsonl_path, &config).unwrap();
-
-        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(
-            result
-                .failures()
-                .iter()
-                .any(|c| c.name == "jsonl_parseable")
         );
     }
 

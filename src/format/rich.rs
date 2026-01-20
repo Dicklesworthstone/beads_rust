@@ -36,7 +36,7 @@
 //! ```
 
 use crate::format::text::{format_priority, format_status_icon, truncate_title};
-use crate::format::theme::Theme;
+use crate::output::Theme;
 use crate::model::{Issue, Status};
 use rich_rust::prelude::*;
 
@@ -107,7 +107,7 @@ impl<'a> RichIssueTable<'a> {
             cells.push(Cell::new(&*issue.id).style(self.theme.issue_id.clone()));
 
             // Priority with color
-            let priority_style = self.theme.priority_style(&issue.priority);
+            let priority_style = self.theme.priority_style(issue.priority);
             cells.push(Cell::new(priority).style(priority_style.clone()));
 
             // Type (if showing)
