@@ -93,9 +93,12 @@ self_update = ["dep:self_update", "dep:semver"]
 unsafe_code = "forbid"
 
 [lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
 # Allow these lints to unblock CI (need higher priority than groups)
 cast_precision_loss = { level = "allow", priority = 1 }
 doc_markdown = { level = "allow", priority = 1 }
 missing_const_for_fn = { level = "allow", priority = 1 }
+uninlined_format_args = { level = "allow", priority = 1 }
+useless_let_if_seq = { level = "allow", priority = 1 }
+format_push_string = { level = "allow", priority = 1 }
