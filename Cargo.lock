@@ -3023,6 +3023,7 @@ dependencies = [
 [[package]]
 name = "rich_rust"
 version = "0.1.0"
+source = "git+https://github.com/Dicklesworthstone/rich_rust.git#70b1712b70658c0e5e9db20d5404bbee4de5133e"
 dependencies = [
  "bitflags",
  "crossterm 0.29.0",
