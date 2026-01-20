@@ -41,10 +41,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::cast_precision_loss -A clippy::doc_markdown -A clippy::missing_const_for_fn
+        run: cargo clippy --all-targets --all-features
 
       - name: Clippy (no default features)
-        run: cargo clippy --all-targets --no-default-features -- -D warnings -A clippy::cast_precision_loss -A clippy::doc_markdown -A clippy::missing_const_for_fn
+        run: cargo clippy --all-targets --no-default-features
 
       - name: Check (all targets)
         run: cargo check --all-targets --all-features

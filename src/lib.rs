@@ -17,7 +17,7 @@
 //! - [`util`] - Utility functions (hashing, time, paths)
 
 #![forbid(unsafe_code)]
-#![warn(clippy::pedantic, clippy::nursery)]
+// Lint configuration is in Cargo.toml [lints.clippy] section
 #![allow(clippy::module_name_repetitions)]
 
 pub mod cli;
