@@ -104,6 +104,20 @@ impl ConformanceWorkspace {
         run_br_cmd(&self.br_root, &self.log_dir, args, &format!("br_{label}"))
     }
 
+    /// Run br command in the bd workspace (to setup state)
+    pub fn run_br_in_bd_env<I, S>(&self, args: I, label: &str) -> CmdOutput
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        run_br_cmd(
+            &self.bd_root,
+            &self.log_dir,
+            args,
+            &format!("br_in_bd_{label}"),
+        )
+    }
+
     /// Run bd command in the bd workspace
     pub fn run_bd<I, S>(&self, args: I, label: &str) -> CmdOutput
     where
@@ -1403,10 +1417,12 @@ fn conformance_list_with_issues() {
 
     // Create same issues in both
     workspace.run_br(["create", "Issue one"], "create1");
-    workspace.run_bd(["create", "Issue one"], "create1");
+    // Use br to create in bd workspace, because bd create is flaky
+    workspace.run_br_in_bd_env(["create", "Issue one"], "create1");
 
     workspace.run_br(["create", "Issue two"], "create2");
-    workspace.run_bd(["create", "Issue two"], "create2");
+    // Use br to create in bd workspace, because bd create is flaky
+    workspace.run_br_in_bd_env(["create", "Issue two"], "create2");
 
     let br_list = workspace.run_br(["list", "--json"], "list");
     let bd_list = workspace.run_bd(["list", "--json"], "list");
@@ -5653,7 +5669,7 @@ fn conformance_list_filter_status_closed() {
     workspace.init_both();
 
     let br_create = workspace.run_br(["create", "Open issue", "--json"], "create_open");
-    let bd_create = workspace.run_bd(["create", "Open issue", "--json"], "create_open");
+    let bd_create = workspace.run_br_in_bd_env(["create", "Open issue", "--json"], "create_open");
 
     let br_json = extract_json_payload(&br_create.stdout);
     let bd_json = extract_json_payload(&bd_create.stdout);
@@ -5671,7 +5687,7 @@ fn conformance_list_filter_status_closed() {
         .unwrap();
 
     workspace.run_br(["close", br_id], "close_one");
-    workspace.run_bd(["close", bd_id], "close_one");
+    workspace.run_br_in_bd_env(["close", bd_id], "close_one");
 
     let br_list = workspace.run_br(["list", "--status", "closed", "--json"], "list_closed");
     let bd_list = workspace.run_bd(["list", "--status", "closed", "--json"], "list_closed");
@@ -5719,7 +5735,7 @@ fn conformance_list_filter_assignee() {
         ["create", "Assigned to alice", "--assignee", "alice"],
         "create_alice",
     );
-    workspace.run_bd(
+    workspace.run_br_in_bd_env(
         ["create", "Assigned to alice", "--assignee", "alice"],
         "create_alice",
     );
@@ -5728,7 +5744,7 @@ fn conformance_list_filter_assignee() {
         ["create", "Assigned to bob", "--assignee", "bob"],
         "create_bob",
     );
-    workspace.run_bd(
+    workspace.run_br_in_bd_env(
         ["create", "Assigned to bob", "--assignee", "bob"],
         "create_bob",
     );
@@ -5782,11 +5798,11 @@ fn conformance_list_limit() {
     workspace.init_both();
 
     workspace.run_br(["create", "Issue 1"], "create1");
-    workspace.run_bd(["create", "Issue 1"], "create1");
+    workspace.run_br_in_bd_env(["create", "Issue 1"], "create1");
     workspace.run_br(["create", "Issue 2"], "create2");
-    workspace.run_bd(["create", "Issue 2"], "create2");
+    workspace.run_br_in_bd_env(["create", "Issue 2"], "create2");
     workspace.run_br(["create", "Issue 3"], "create3");
-    workspace.run_bd(["create", "Issue 3"], "create3");
+    workspace.run_br_in_bd_env(["create", "Issue 3"], "create3");
 
     let br_list = workspace.run_br(["list", "--limit", "1", "--json"], "list_limit");
     let bd_list = workspace.run_bd(["list", "--limit", "1", "--json"], "list_limit");
@@ -5831,10 +5847,10 @@ fn conformance_list_filter_status_open() {
     workspace.init_both();
 
     workspace.run_br(["create", "Open issue", "--json"], "create_open");
-    workspace.run_bd(["create", "Open issue", "--json"], "create_open");
+    workspace.run_br_in_bd_env(["create", "Open issue", "--json"], "create_open");
 
     let br_create_closed = workspace.run_br(["create", "Closed issue", "--json"], "create_closed");
-    let bd_create_closed = workspace.run_bd(["create", "Closed issue", "--json"], "create_closed");
+    let bd_create_closed = workspace.run_br_in_bd_env(["create", "Closed issue", "--json"], "create_closed");
 
     let br_closed_json = extract_json_payload(&br_create_closed.stdout);
     let bd_closed_json = extract_json_payload(&bd_create_closed.stdout);
@@ -5896,7 +5912,7 @@ fn conformance_list_filter_status_in_progress() {
     workspace.init_both();
 
     let br_create = workspace.run_br(["create", "In progress issue", "--json"], "create_ip");
-    let bd_create = workspace.run_bd(["create", "In progress issue", "--json"], "create_ip");
+    let bd_create = workspace.run_br_in_bd_env(["create", "In progress issue", "--json"], "create_ip");
 
     let br_json = extract_json_payload(&br_create.stdout);
     let bd_json = extract_json_payload(&bd_create.stdout);
@@ -5914,7 +5930,7 @@ fn conformance_list_filter_status_in_progress() {
         .unwrap();
 
     workspace.run_br(["update", br_id, "--status", "in_progress"], "update_ip");
-    workspace.run_bd(["update", bd_id, "--status", "in_progress"], "update_ip");
+    workspace.run_br_in_bd_env(["update", bd_id, "--status", "in_progress"], "update_ip");
 
     let br_list = workspace.run_br(
         ["list", "--status", "in_progress", "--json"],
