@@ -247,6 +247,15 @@ pub struct RegressionResult {
     /// Percentage change from baseline.
     pub change_pct: Option<f64>,
 
+    /// Current RSS ratio (br/bd), if available.
+    pub current_rss_ratio: Option<f64>,
+
+    /// Baseline RSS ratio (if available).
+    pub baseline_rss_ratio: Option<f64>,
+
+    /// Percentage change in RSS from baseline.
+    pub rss_change_pct: Option<f64>,
+
     /// Human-readable reason for the status.
     pub reason: String,
 }
@@ -272,7 +281,12 @@ impl std::fmt::Display for RegressionStatus {
 
 impl RegressionResult {
     /// Create result for when no baseline exists.
-    pub fn no_baseline(operation: &str, dataset: &str, current_ratio: f64) -> Self {
+    pub fn no_baseline(
+        operation: &str,
+        dataset: &str,
+        current_ratio: f64,
+        current_rss_ratio: Option<f64>,
+    ) -> Self {
         Self {
             operation: operation.to_string(),
             dataset: dataset.to_string(),
@@ -281,6 +295,9 @@ impl RegressionResult {
             current_ratio,
             baseline_ratio: None,
             change_pct: None,
+            current_rss_ratio,
+            baseline_rss_ratio: None,
+            rss_change_pct: None,
             reason: "No baseline established yet".to_string(),
         }
     }
@@ -290,6 +307,7 @@ impl RegressionResult {
         operation: &str,
         dataset: &str,
         current_ratio: f64,
+        current_rss_ratio: Option<f64>,
         baseline: &OperationBaseline,
         config: &RegressionConfig,
     ) -> Self {
@@ -297,7 +315,7 @@ impl RegressionResult {
         let ratio_change = current_ratio / baseline_ratio;
         let change_pct = (ratio_change - 1.0) * 100.0;
 
-        let (status, reason) = if ratio_change <= 1.0 {
+        let (duration_status, duration_reason) = if ratio_change <= 1.0 {
             // Improvement or same
             let improvement = (1.0 - ratio_change) * 100.0;
             (
@@ -322,6 +340,51 @@ impl RegressionResult {
             )
         };
 
+        let mut rss_regression = false;
+        let mut rss_change_pct = None;
+        let mut rss_reason = None::<String>;
+        let baseline_rss_ratio = baseline.rss_ratio;
+
+        if let (Some(current_rss), Some(baseline_rss)) = (current_rss_ratio, baseline_rss_ratio) {
+            if baseline_rss > 0.0 {
+                let rss_ratio_change = current_rss / baseline_rss;
+                let rss_change = (rss_ratio_change - 1.0) * 100.0;
+                rss_change_pct = Some(rss_change);
+
+                if rss_ratio_change <= 1.0 {
+                    let improvement = (1.0 - rss_ratio_change) * 100.0;
+                    rss_reason = Some(format!("{improvement:.1}% lower RSS than baseline"));
+                } else if rss_ratio_change <= config.rss_threshold {
+                    rss_reason = Some(format!(
+                        "{rss_change:.1}% higher RSS (within {:.0}% threshold)",
+                        (config.rss_threshold - 1.0) * 100.0
+                    ));
+                } else {
+                    rss_regression = true;
+                    rss_reason = Some(format!(
+                        "{rss_change:.1}% higher RSS (exceeds {:.0}% threshold)",
+                        (config.rss_threshold - 1.0) * 100.0
+                    ));
+                }
+            }
+        } else if baseline_rss_ratio.is_some() && current_rss_ratio.is_none() {
+            rss_reason = Some("RSS not measured for current run".to_string());
+        } else if baseline_rss_ratio.is_none() && current_rss_ratio.is_some() {
+            rss_reason = Some("RSS baseline missing".to_string());
+        }
+
+        let status = if duration_status == RegressionStatus::Regression || rss_regression {
+            RegressionStatus::Regression
+        } else {
+            RegressionStatus::Ok
+        };
+
+        let reason = if let Some(rss_reason) = rss_reason {
+            format!("{duration_reason}; RSS: {rss_reason}")
+        } else {
+            duration_reason
+        };
+
         Self {
             operation: operation.to_string(),
             dataset: dataset.to_string(),
@@ -330,6 +393,9 @@ impl RegressionResult {
             current_ratio,
             baseline_ratio: Some(baseline_ratio),
             change_pct: Some(change_pct),
+            current_rss_ratio,
+            baseline_rss_ratio,
+            rss_change_pct,
             reason,
         }
     }
@@ -420,8 +486,9 @@ impl RegressionSummary {
         println!("{}", "=".repeat(80));
 
         println!(
-            "Config: duration_threshold={:.0}%, strict_mode={}",
+            "Config: duration_threshold={:.0}%, rss_threshold={:.0}%, strict_mode={}",
             (self.config_summary.duration_threshold - 1.0) * 100.0,
+            (self.config_summary.rss_threshold - 1.0) * 100.0,
             self.config_summary.strict_mode
         );
         println!();
@@ -475,18 +542,18 @@ pub fn update_baselines_from_results(
     store: &mut BaselineStore,
     dataset_name: &str,
     issue_count: usize,
-    comparisons: &[(String, f64, u128, u128)], // (label, ratio, br_ms, bd_ms)
+    comparisons: &[(String, f64, u128, u128, Option<f64>)], // (label, ratio, br_ms, bd_ms, rss_ratio)
 ) {
     let timestamp = chrono::Utc::now().to_rfc3339();
 
-    for (label, ratio, br_ms, bd_ms) in comparisons {
+    for (label, ratio, br_ms, bd_ms, rss_ratio) in comparisons {
         store.set_baseline(
             dataset_name,
             issue_count,
             label,
             OperationBaseline {
                 duration_ratio: *ratio,
-                rss_ratio: None,
+                rss_ratio: *rss_ratio,
                 br_duration_ms: *br_ms,
                 bd_duration_ms: *bd_ms,
                 captured_at: timestamp.clone(),
@@ -517,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_regression_check_no_baseline() {
-        let result = RegressionResult::no_baseline("list", "beads_rust", 0.5);
+        let result = RegressionResult::no_baseline("list", "beads_rust", 0.5, None);
         assert!(!result.is_regression);
         assert_eq!(result.status, RegressionStatus::Ok);
         assert!(result.baseline_ratio.is_none());
@@ -536,7 +603,8 @@ mod tests {
         };
 
         // Current is 0.4 (better than baseline 0.5)
-        let result = RegressionResult::check("list", "beads_rust", 0.4, &baseline, &config);
+        let result =
+            RegressionResult::check("list", "beads_rust", 0.4, None, &baseline, &config);
         assert!(!result.is_regression);
         assert_eq!(result.status, RegressionStatus::Ok);
         assert!(result.reason.contains("faster"));
@@ -555,7 +623,8 @@ mod tests {
         };
 
         // Current is 0.55 (10% worse than baseline 0.5, within 20% threshold)
-        let result = RegressionResult::check("list", "beads_rust", 0.55, &baseline, &config);
+        let result =
+            RegressionResult::check("list", "beads_rust", 0.55, None, &baseline, &config);
         assert!(!result.is_regression);
         assert_eq!(result.status, RegressionStatus::Ok);
     }
@@ -573,7 +642,8 @@ mod tests {
         };
 
         // Current is 0.7 (40% worse than baseline 0.5, exceeds 20% threshold)
-        let result = RegressionResult::check("list", "beads_rust", 0.7, &baseline, &config);
+        let result =
+            RegressionResult::check("list", "beads_rust", 0.7, None, &baseline, &config);
         assert!(result.is_regression);
         assert_eq!(result.status, RegressionStatus::Regression);
     }
@@ -606,7 +676,7 @@ mod tests {
     fn test_regression_summary() {
         let config = RegressionConfig::default();
         let results = vec![
-            RegressionResult::no_baseline("list", "ds1", 0.5),
+            RegressionResult::no_baseline("list", "ds1", 0.5, None),
             RegressionResult {
                 operation: "ready".to_string(),
                 dataset: "ds1".to_string(),
@@ -615,6 +685,9 @@ mod tests {
                 current_ratio: 0.4,
                 baseline_ratio: Some(0.5),
                 change_pct: Some(-20.0),
+                current_rss_ratio: None,
+                baseline_rss_ratio: None,
+                rss_change_pct: None,
                 reason: "Improved".to_string(),
             },
             RegressionResult {
@@ -625,6 +698,9 @@ mod tests {
                 current_ratio: 0.8,
                 baseline_ratio: Some(0.5),
                 change_pct: Some(60.0),
+                current_rss_ratio: None,
+                baseline_rss_ratio: None,
+                rss_change_pct: None,
                 reason: "60% slower".to_string(),
             },
         ];
@@ -652,6 +728,9 @@ mod tests {
             current_ratio: 0.8,
             baseline_ratio: Some(0.5),
             change_pct: Some(60.0),
+            current_rss_ratio: None,
+            baseline_rss_ratio: None,
+            rss_change_pct: None,
             reason: "Regression".to_string(),
         }];
 

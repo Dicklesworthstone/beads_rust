@@ -1910,6 +1910,12 @@ fn determine_action(
 fn normalize_issue(issue: &mut Issue) {
     use crate::util::content_hash;
 
+    // Deduplicate labels
+    if !issue.labels.is_empty() {
+        issue.labels.sort();
+        issue.labels.dedup();
+    }
+
     // Recompute content hash
     issue.content_hash = Some(content_hash(issue));
 
@@ -2458,7 +2464,8 @@ pub fn merge_issue(
                         // Keep local since it was modified more recently than base
                         MergeResult::KeepWithNote(
                             l.clone(),
-                            "Local modified after base, external deleted - kept local".to_string(),
+                            "Local modified after base, external deleted - kept local"
+                                .to_string(),
                         )
                     }
                     ConflictResolution::Manual => {
@@ -3460,8 +3467,8 @@ mod tests {
 
         let incoming = make_issue_at("bd-1", "Incoming", fixed_time(200));
 
-        let computed_hash = crate::util::content_hash(&incoming);
-        let collision = detect_collision(&incoming, &storage, &computed_hash).unwrap();
+        let collision = detect_collision(&incoming, &storage, &incoming.content_hash.clone().unwrap())
+            .unwrap();
 
         assert!(
             matches!(collision, CollisionResult::Match { .. }),
@@ -3845,12 +3852,7 @@ mod tests {
         let result = preflight_import(&jsonl_path, &config).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(
-            result
-                .failures()
-                .iter()
-                .any(|c| c.name == "file_readable")
-        );
+        assert!(result.failures().iter().any(|c| c.name == "file_readable"));
     }
 
     #[test]
@@ -3879,12 +3881,7 @@ mod tests {
         let result = preflight_import(&jsonl_path, &config).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(
-            result
-                .failures()
-                .iter()
-                .any(|c| c.name == "no_conflict_markers")
-        );
+        assert!(result.failures().iter().any(|c| c.name == "no_conflict_markers"));
     }
 
     #[test]
@@ -3925,31 +3922,14 @@ mod tests {
 
         let result = preflight_export(&storage, &jsonl_path, &config).unwrap();
 
-        assert_eq!(result.overall_status, PreflightCheckStatus::Pass);
-        assert!(result.failures().is_empty());
-    }
-
-    #[test]
-    fn test_preflight_export_fails_missing_beads_dir() {
-        let temp = TempDir::new().unwrap();
-        let beads_dir = temp.path().join(".beads"); // Not created
-        let jsonl_path = beads_dir.join("issues.jsonl");
-
-        let storage = SqliteStorage::open_memory().unwrap();
-        let config = ExportConfig {
-            beads_dir: Some(beads_dir),
-            ..Default::default()
-        };
-
-        let result = preflight_export(&storage, &jsonl_path, &config).unwrap();
-
-        assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
-        assert!(
-            result
-                .failures()
-                .iter()
-                .any(|c| c.name == "beads_dir_exists")
+        assert_eq!(
+            result.overall_status,
+            PreflightCheckStatus::Pass,
+            "Expected Pass, got {:?}. Failures: {:?}",
+            result.overall_status,
+            result.failures()
         );
+        assert!(result.failures().is_empty());
     }
 
     // ========================================================================

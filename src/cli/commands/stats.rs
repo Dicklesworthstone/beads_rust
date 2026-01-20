@@ -27,7 +27,7 @@ use tracing::{debug, info};
 /// Returns an error if the database cannot be opened or queries fail.
 pub fn execute(
     args: &StatsArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -84,9 +84,8 @@ pub fn execute(
     if args.robot {
         // Robot mode: key=value format for script consumption
         print_robot_output(&output);
-    } else if json {
-        let json_str = serde_json::to_string_pretty(&output)?;
-        println!("{json_str}");
+    } else if ctx.is_json() {
+        ctx.json_pretty(&output);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_stats_rich(&output, ctx);
     } else {

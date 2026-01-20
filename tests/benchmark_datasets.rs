@@ -16,7 +16,9 @@
 mod common;
 
 use common::{
-    DatasetIntegrityGuard, DatasetMetadata, DatasetRegistry, KnownDataset, init_test_logging,
+    BaselineStore, DatasetIntegrityGuard, DatasetMetadata, DatasetRegistry, KnownDataset,
+    RegressionConfig, RegressionResult, RegressionSummary, init_test_logging,
+    should_update_baseline, update_baselines_from_results,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -1051,6 +1053,119 @@ impl DatasetBenchmarkReport {
 }
 
 // ============================================================================
+// BASELINE + REGRESSION CHECKS
+// ============================================================================
+
+fn workload_duration_ms(stats: &TimingStats) -> u128 {
+    if stats.median_ms.is_finite() && stats.median_ms > 0.0 {
+        stats.median_ms.round() as u128
+    } else {
+        0
+    }
+}
+
+fn workload_ratio(br_stats: &TimingStats, bd_stats: &TimingStats) -> f64 {
+    if bd_stats.median_ms > 0.0 {
+        br_stats.median_ms / bd_stats.median_ms
+    } else {
+        1.0
+    }
+}
+
+fn workload_rss_ratio(br_rss_kb: Option<u64>, bd_rss_kb: Option<u64>) -> Option<f64> {
+    match (br_rss_kb, bd_rss_kb) {
+        (Some(br), Some(bd)) if bd > 0 => Some(br as f64 / bd as f64),
+        _ => None,
+    }
+}
+
+fn collect_comparisons(
+    result: &DatasetBenchmarkResult,
+) -> Vec<(String, f64, u128, u128, Option<f64>)> {
+    let mut comparisons = Vec::new();
+
+    for workload in result
+        .read_workloads
+        .iter()
+        .chain(result.write_workloads.iter())
+    {
+        let ratio = workload_ratio(&workload.br_stats, &workload.bd_stats);
+        let br_ms = workload_duration_ms(&workload.br_stats);
+        let bd_ms = workload_duration_ms(&workload.bd_stats);
+        let rss_ratio = workload_rss_ratio(workload.br_rss_kb, workload.bd_rss_kb);
+
+        comparisons.push((workload.name.clone(), ratio, br_ms, bd_ms, rss_ratio));
+    }
+
+    comparisons
+}
+
+fn run_regression_checks(results: &[DatasetBenchmarkResult]) {
+    if results.is_empty() {
+        return;
+    }
+
+    let config = RegressionConfig::from_env();
+    let mut baselines = BaselineStore::load_or_default(&config.baseline_file);
+    let update_baseline = should_update_baseline();
+    let mut regression_results: Vec<RegressionResult> = Vec::new();
+
+    for result in results {
+        let comparisons = collect_comparisons(result);
+
+        if update_baseline {
+            update_baselines_from_results(
+                &mut baselines,
+                &result.dataset_name,
+                result.issue_count,
+                &comparisons,
+            );
+        }
+
+        for (label, ratio, _br_ms, _bd_ms, rss_ratio) in comparisons {
+            if let Some(baseline) = baselines.get_baseline(&result.dataset_name, &label) {
+                regression_results.push(RegressionResult::check(
+                    &label,
+                    &result.dataset_name,
+                    ratio,
+                    rss_ratio,
+                    baseline,
+                    &config,
+                ));
+            } else {
+                regression_results.push(RegressionResult::no_baseline(
+                    &label,
+                    &result.dataset_name,
+                    ratio,
+                    rss_ratio,
+                ));
+            }
+        }
+    }
+
+    if update_baseline {
+        if let Err(e) = baselines.save(&config.baseline_file) {
+            eprintln!(
+                "Warning: Failed to save baseline file {}: {e}",
+                config.baseline_file.display()
+            );
+        } else {
+            println!(
+                "Benchmark baselines updated: {}",
+                config.baseline_file.display()
+            );
+        }
+    }
+
+    let summary = RegressionSummary::from_results(regression_results, &config);
+    summary.print_table();
+
+    if config.strict_mode && !summary.passed {
+        panic!("Benchmark regressions detected (strict mode)");
+    }
+}
+
+// ============================================================================
 // TEST FUNCTIONS
 // ============================================================================
 
@@ -1085,6 +1200,7 @@ fn benchmark_dataset_full() {
 
     let report = DatasetBenchmarkReport::new(&config, results);
     report.print_summary();
+    run_regression_checks(&report.results);
 
     // Save JSON report
     let json_report = report.to_json();
@@ -1129,6 +1245,7 @@ fn benchmark_dataset_quick() {
 
     // Print results
     result.print_table();
+    run_regression_checks(std::slice::from_ref(&result));
 
     info!("benchmark_dataset_quick: completed successfully");
 }

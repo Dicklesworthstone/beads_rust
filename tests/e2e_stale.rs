@@ -29,7 +29,10 @@ fn e2e_stale_basic() {
     let stale1 = run_br(&workspace, ["stale", "--days", "1"], "stale1");
     assert!(stale1.status.success());
     let count1 = stale1.stdout.lines().filter(|l| l.contains(". [")).count();
-    assert_eq!(count1, 0, "No issues should be stale with days=1 (freshly created)");
+    assert_eq!(
+        count1, 0,
+        "No issues should be stale with days=1 (freshly created)"
+    );
 }
 
 #[test]
@@ -57,14 +60,31 @@ fn e2e_stale_with_status_filter() {
     run_br(&workspace, ["init"], "init");
 
     run_br(&workspace, ["create", "Open Issue"], "create1");
-    
+
     let create2 = run_br(&workspace, ["create", "InProgress Issue"], "create2");
-    let id2 = create2.stdout.split_whitespace().find(|w| w.starts_with("bd-")).unwrap().trim_end_matches(':');
-    run_br(&workspace, ["update", id2, "--status", "in_progress"], "update2");
+    let id2 = create2
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("bd-"))
+        .unwrap()
+        .trim_end_matches(':');
+    run_br(
+        &workspace,
+        ["update", id2, "--status", "in_progress"],
+        "update2",
+    );
 
     // Filter by status=open
-    let stale_open = run_br(&workspace, ["stale", "--days", "0", "--status", "open"], "stale_open");
-    let count_open = stale_open.stdout.lines().filter(|l| l.contains("Open Issue")).count();
+    let stale_open = run_br(
+        &workspace,
+        ["stale", "--days", "0", "--status", "open"],
+        "stale_open",
+    );
+    let count_open = stale_open
+        .stdout
+        .lines()
+        .filter(|l| l.contains("Open Issue"))
+        .count();
     assert_eq!(count_open, 1);
     assert!(!stale_open.stdout.contains("InProgress Issue"));
 }

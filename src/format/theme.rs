@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn test_default_theme() {
-        let theme = Theme::new();
+        let theme = Theme::default();
         // Verify status styles exist
         let _ = theme.status_style(&Status::Open);
         let _ = theme.status_style(&Status::InProgress);
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_priority_styles() {
-        let theme = Theme::new();
+        let theme = Theme::default();
         let _ = theme.priority_style(&Priority::CRITICAL);
         let _ = theme.priority_style(&Priority::HIGH);
         let _ = theme.priority_style(&Priority::MEDIUM);
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_type_styles() {
-        let theme = Theme::new();
+        let theme = Theme::default();
         let _ = theme.type_style(&IssueType::Bug);
         let _ = theme.type_style(&IssueType::Feature);
         let _ = theme.type_style(&IssueType::Task);

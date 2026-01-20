@@ -12,11 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 /// # Errors
 ///
 /// Returns an error if filters are invalid or the database query fails.
-pub fn execute(
-    args: &StaleArgs,
-    cli: &config::CliOverrides,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(args: &StaleArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     if args.days < 0 {
         return Err(BeadsError::validation("days", "must be >= 0"));
     }

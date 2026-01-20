@@ -8,6 +8,7 @@ use tracing::info;
 
 pub mod artifact_validator;
 pub mod assertions;
+pub mod baseline;
 pub mod binary_discovery;
 pub mod cli;
 pub mod dataset_registry;
@@ -18,6 +19,10 @@ pub mod report_indexer;
 pub mod scenarios;
 
 pub use artifact_validator::ArtifactValidator;
+pub use baseline::{
+    BaselineStore, RegressionConfig, RegressionResult, RegressionSummary, RegressionStatus,
+    should_update_baseline, update_baselines_from_results,
+};
 pub use binary_discovery::{BinaryVersion, DiscoveredBinaries, discover_binaries};
 pub use dataset_registry::{
     DatasetIntegrityGuard, DatasetMetadata, DatasetOverride, DatasetProvenance, DatasetRegistry,

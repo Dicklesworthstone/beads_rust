@@ -80,7 +80,7 @@ const EPIC_SECTIONS: [RequiredSection; 1] = [RequiredSection {
 /// Returns an error if database access fails or filters are invalid.
 pub fn execute(
     args: &LintArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -97,13 +97,13 @@ pub fn execute(
 
     let summary = lint_issues(&issues);
 
-    if json {
+    if ctx.is_json() {
         let output = LintOutput {
             total: summary.warnings,
             issues: summary.results.len(),
             results: summary.results,
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 

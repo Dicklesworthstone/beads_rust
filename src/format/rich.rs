@@ -22,7 +22,7 @@
 //! let ctx = OutputContext::detect();
 //! match ctx.mode() {
 //!     OutputMode::Rich => {
-//!         let table = RichIssueTable::new(&issues, &Theme::new());
+//!         let table = RichIssueTable::new(&issues, &Theme::default());
 //!         console.print_renderable(&table.build_table());
 //!     }
 //!     OutputMode::Plain => {
@@ -36,8 +36,8 @@
 //! ```
 
 use crate::format::text::{format_priority, format_status_icon, truncate_title};
-use crate::output::Theme;
 use crate::model::{Issue, Status};
+use crate::output::Theme;
 use rich_rust::prelude::*;
 
 /// Rich table display for a list of issues.
@@ -185,7 +185,7 @@ impl<'a> RichIssuePanel<'a> {
 
         Panel::new(content_lines)
             .title(self.issue.id.clone())
-            .border_style(status_style.clone())
+            .border_style(status_style)
     }
 }
 
@@ -257,7 +257,7 @@ pub fn format_status_badge(status: &Status, theme: &Theme) -> Text {
     let style = theme.status_style(status);
 
     let mut text = Text::new("");
-    text.append_styled(&format!("{icon} {label}"), style.clone());
+    text.append_styled(&format!("{icon} {label}"), style);
     text
 }
 
@@ -373,7 +373,7 @@ mod tests {
             make_test_issue("test-1", "First issue"),
             make_test_issue("test-2", "Second issue"),
         ];
-        let theme = Theme::new();
+        let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme);
         let _ = table.build_table();
     }
@@ -381,34 +381,34 @@ mod tests {
     #[test]
     fn test_rich_issue_panel() {
         let issue = make_test_issue("test-1", "Test issue");
-        let theme = Theme::new();
+        let theme = Theme::default();
         let panel = RichIssuePanel::new(&issue, &theme);
         let _ = panel.build_panel();
     }
 
     #[test]
     fn test_format_status_badge() {
-        let theme = Theme::new();
+        let theme = Theme::default();
         let _ = format_status_badge(&Status::Open, &theme);
         let _ = format_status_badge(&Status::Blocked, &theme);
     }
 
     #[test]
     fn test_format_count_badges() {
-        let theme = Theme::new();
+        let theme = Theme::default();
         let _ = format_count_badges(5, 2, 1, 3, &theme);
     }
 
     #[test]
     fn test_build_completion_bar() {
-        let theme = Theme::new();
+        let theme = Theme::default();
         let _ = build_completion_bar(7, 10, &theme);
     }
 
     #[test]
     fn test_table_without_type_column() {
         let issues = vec![make_test_issue("test-1", "Issue")];
-        let theme = Theme::new();
+        let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme).show_type(false);
         let _ = table.build_table();
     }
@@ -419,7 +419,7 @@ mod tests {
             "test-1",
             "A very long title that should be truncated",
         )];
-        let theme = Theme::new();
+        let theme = Theme::default();
         let table = RichIssueTable::new(&issues, &theme).max_title_width(20);
         let _ = table.build_table();
     }

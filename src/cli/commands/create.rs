@@ -223,8 +223,9 @@ pub fn create_issue_impl(
 fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
     // Validate Labels
     for label in &args.labels {
-        if !label.trim().is_empty() {
-            LabelValidator::validate(label)
+        let trimmed = label.trim();
+        if !trimmed.is_empty() {
+            LabelValidator::validate(trimmed)
                 .map_err(|e| BeadsError::validation("label", e.message))?;
         }
     }
@@ -538,7 +539,7 @@ fn execute_import(
 
 fn parse_optional_date(s: Option<&str>) -> Result<Option<DateTime<Utc>>> {
     match s {
-        Some(s) if !s.is_empty() => parse_flexible_timestamp(s, "date").map(Some),
+        Some(s) if !s.trim().is_empty() => parse_flexible_timestamp(s, "date").map(Some),
         _ => Ok(None),
     }
 }
@@ -873,10 +874,26 @@ mod tests {
     fn test_parse_optional_date_whitespace_only() {
         init_test_logging();
         info!("test_parse_optional_date_whitespace_only: starting");
-        // Should be treated as non-empty by the string check, but may fail parsing
+        // Should be treated as empty/None
         let result = parse_optional_date(Some("   "));
-        // Behavior depends on implementation - just ensure no panic
-        let _ = result;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
         info!("test_parse_optional_date_whitespace_only: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_trims_labels() {
+        init_test_logging();
+        info!("test_create_issue_trims_labels: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+        let mut args = default_args();
+        args.labels = vec!["  trimmed  ".to_string()];
+
+        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+
+        let labels = storage.get_labels(&issue.id).expect("get labels");
+        assert_eq!(labels, vec!["trimmed"]);
+        info!("test_create_issue_trims_labels: assertions passed");
     }
 }
