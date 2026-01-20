@@ -1056,4 +1056,70 @@ mod tests {
             assert!(json.contains(&format!("\"status\":\"{status}\"")));
         }
     }
+
+    #[test]
+    fn test_graph_all_cycle_robustness() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let t1 = chrono::Utc::now();
+
+            let root = Issue {
+                id: "root".to_string(),
+                title: "Root".to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            let i1 = Issue {
+                id: "bd-1".to_string(),
+                title: "A".to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            let i2 = Issue {
+                id: "bd-2".to_string(),
+                title: "B".to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+
+            storage.create_issue(&root, "test").unwrap();
+            storage.create_issue(&i1, "test").unwrap();
+            storage.create_issue(&i2, "test").unwrap();
+
+            // Root blocks A
+            storage.add_dependency("bd-1", "root", "waits-for", "test").unwrap();
+            // A blocks B
+            storage.add_dependency("bd-2", "bd-1", "waits-for", "test").unwrap();
+            // B blocks A (cycle)
+            storage.add_dependency("bd-1", "bd-2", "waits-for", "test").unwrap();
+
+            let ctx = OutputContext::from_flags(true, false, true); // JSON mode
+            
+            let result = graph_all(&storage, false, &ctx);
+            assert!(result.is_ok());
+            tx.send(()).unwrap();
+        });
+
+        if rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            panic!("graph_all timed out (likely infinite loop on cycle)");
+        }
+    }
 }

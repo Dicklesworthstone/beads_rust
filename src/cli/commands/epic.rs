@@ -32,7 +32,7 @@ pub fn execute(
 
 fn execute_status(
     args: &EpicStatusArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -47,8 +47,8 @@ fn execute_status(
         epics.retain(|e| e.eligible_for_close);
     }
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&epics)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&epics);
         return Ok(());
     }
 
@@ -80,7 +80,7 @@ struct CloseEligibleResult {
 
 fn execute_close_eligible(
     args: &EpicCloseEligibleArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -94,8 +94,8 @@ fn execute_close_eligible(
     epics.retain(|e| e.eligible_for_close);
 
     if epics.is_empty() {
-        if json {
-            println!("[]");
+        if ctx.is_json() {
+            ctx.json(&Vec::<EpicStatus>::new());
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_no_eligible_rich(ctx);
         } else {
@@ -105,8 +105,8 @@ fn execute_close_eligible(
     }
 
     if args.dry_run {
-        if json {
-            println!("{}", serde_json::to_string_pretty(&epics)?);
+        if ctx.is_json() {
+            ctx.json_pretty(&epics);
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_dry_run_rich(&epics, ctx);
         } else {
@@ -138,12 +138,12 @@ fn execute_close_eligible(
         storage.rebuild_blocked_cache(true)?;
     }
 
-    if json {
+    if ctx.is_json() {
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),
         };
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        ctx.json_pretty(&result);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_close_result_rich(&closed_ids, ctx);
     } else {
