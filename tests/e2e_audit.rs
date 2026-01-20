@@ -703,17 +703,31 @@ fn e2e_audit_log_for_issue() {
     assert!(create.status.success());
     // Parse ID from output: "Created bd-123: Test Issue" or similar
     let output = create.stdout.trim();
-    let id = if let Some(word) = output.split_whitespace().find(|word| word.starts_with("bd-")) {
-        word.trim_end_matches(':').to_string() // Remove trailing colon
-    } else {
-        // Fallback
-        output.split(':').next().unwrap_or("").replace("Created ", "").trim().to_string()
-    };
+    let id = output
+        .split_whitespace()
+        .find(|word| word.starts_with("bd-"))
+        .map_or_else(
+            || {
+                // Fallback: parse from "Created bd-xxx: Title" format
+                output
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .replace("Created ", "")
+                    .trim()
+                    .to_string()
+            },
+            |word| word.trim_end_matches(':').to_string(),
+        );
 
     // Update it to generate events
-    let update = run_br(&workspace, ["update", &id, "--priority", "0"], "update_priority");
+    let update = run_br(
+        &workspace,
+        ["update", &id, "--priority", "0"],
+        "update_priority",
+    );
     assert!(update.status.success(), "update failed: {}", update.stderr);
-    
+
     let close = run_br(&workspace, ["close", &id, "--reason", "Done"], "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
@@ -770,7 +784,10 @@ fn e2e_audit_summary() {
         "audit summary failed: {}",
         summary.stderr
     );
-    assert!(summary.stdout.contains("Audit Summary"), "should show title");
+    assert!(
+        summary.stdout.contains("Audit Summary"),
+        "should show title"
+    );
     assert!(summary.stdout.contains("TOTAL"), "should show totals");
 
     // Check JSON summary

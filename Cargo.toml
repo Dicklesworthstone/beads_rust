@@ -41,7 +41,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Terminal
-colored = "3.1"
 indicatif = "0.18"
 crossterm = "0.28"
 

@@ -179,7 +179,8 @@ impl OutputContext {
     pub fn success(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console().print(&format!("[bold green]✓[/] {}", message));
+                self.console()
+                    .print(&format!("[bold green]✓[/] {}", message));
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json => {} //

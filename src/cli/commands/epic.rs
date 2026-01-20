@@ -7,7 +7,7 @@ use crate::model::{EpicStatus, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use chrono::Utc;
-use colored::Colorize;
+use crossterm::style::Stylize;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::cmp::Ordering;
@@ -206,13 +206,13 @@ fn render_epic_status(epic_status: &EpicStatus, use_color: bool) {
     let status_icon = render_status_icon(epic_status.eligible_for_close, percentage, use_color);
 
     let id = if use_color {
-        epic_status.epic.id.cyan().to_string()
+        epic_status.epic.id.clone().cyan().to_string()
     } else {
         epic_status.epic.id.clone()
     };
 
     let title = if use_color {
-        epic_status.epic.title.bold().to_string()
+        epic_status.epic.title.clone().bold().to_string()
     } else {
         epic_status.epic.title.clone()
     };

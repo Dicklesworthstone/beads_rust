@@ -67,23 +67,12 @@ struct InfoOutput {
 /// # Errors
 ///
 /// Returns an error if configuration or storage access fails.
-pub fn execute(
-    args: &InfoArgs,
-    json: bool,
-    cli: &config::CliOverrides,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     if args.whats_new {
-        return print_message(
-            json,
-            ctx,
-            "No whats-new data available for br.",
-            "whats_new",
-        );
+        return print_message(ctx, "No whats-new data available for br.", "whats_new");
     }
     if args.thanks {
         return print_message(
-            json,
             ctx,
             "Thanks for using br. See README for project acknowledgements.",
             "thanks",
@@ -133,8 +122,8 @@ pub fn execute(
         jsonl_size,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -211,10 +200,11 @@ fn print_human(info: &InfoOutput) {
     }
 }
 
-fn print_message(json: bool, ctx: &OutputContext, message: &str, key: &str) -> Result<()> {
-    if json {
+#[allow(clippy::unnecessary_wraps)]
+fn print_message(ctx: &OutputContext, message: &str, key: &str) -> Result<()> {
+    if ctx.is_json() {
         let payload = serde_json::json!({ key: message });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        ctx.json_pretty(&payload);
     } else if ctx.is_rich() {
         let console = Console::default();
         let theme = ctx.theme();

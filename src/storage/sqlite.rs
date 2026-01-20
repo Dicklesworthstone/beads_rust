@@ -349,7 +349,7 @@ impl SqliteStorage {
 
                 // Record Closed event if status is now Closed
                 if *status == Status::Closed {
-                    let reason = updates.close_reason.as_ref().and_then(|r| r.clone());
+                    let reason = updates.close_reason.as_ref().and_then(Clone::clone);
                     ctx.record_event(EventType::Closed, id, reason);
                 }
 
@@ -898,9 +898,6 @@ impl SqliteStorage {
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
-        // Get blocked issue IDs from cache
-        let blocked_ids = self.get_blocked_ids()?;
-
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -920,6 +917,9 @@ impl SqliteStorage {
         } else {
             sql.push_str(" AND status IN ('open', 'in_progress')");
         }
+
+        // Ready condition 2: NOT in blocked_issues_cache (optimized: filter in SQL)
+        sql.push_str(" AND id NOT IN (SELECT issue_id FROM blocked_issues_cache)");
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
         if !filters.include_deferred {
@@ -1009,9 +1009,6 @@ impl SqliteStorage {
         let mut issues: Vec<Issue> = stmt
             .query_map(params_refs.as_slice(), |row| self.issue_from_row(row))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        // Ready condition 2: NOT in blocked_issues_cache (filter in memory)
-        issues.retain(|issue| !blocked_ids.contains(&issue.id));
 
         // Apply limit after all filtering
         if let Some(limit) = filters.limit {
@@ -1110,9 +1107,7 @@ impl SqliteStorage {
         conn.execute("DELETE FROM blocked_issues_cache", [])?;
 
         // Find all issues that are blocked by a dependency
-        // An issue is blocked if:
-        // 1. It has a blocking-type dependency (blocks, conditional-blocks, waits-for)
-        // 2. The blocker issue has a blocking status (anything NOT closed/tombstone)
+        // An issue is blocked if it has a blocking-type dependency on an issue that is not closed/tombstone
         //
         // Note: parent-child is NOT included here. A child is not blocked just because
         // its parent epic is open. However, if the parent is blocked by something else,
@@ -1131,8 +1126,9 @@ impl SqliteStorage {
                     AND (
                       -- The blocker is in a blocking state (anything not terminal)
                       i.status NOT IN ('closed', 'tombstone')
-                      -- Or it's an external dependency (not in our DB)
-                      OR i.id IS NULL
+                      -- Or it's a missing local dependency (orphan)
+                      -- External dependencies are resolved at runtime in the CLI
+                      OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
                     )",
             )?;
 
@@ -2265,7 +2261,7 @@ impl SqliteStorage {
 
             for row in rows {
                 let (issue_id, count) = row?;
-                map.insert(issue_id, count as usize);
+                map.insert(issue_id, usize::try_from(count).unwrap_or(0));
             }
         }
 
@@ -2306,7 +2302,7 @@ impl SqliteStorage {
 
             for row in rows {
                 let (issue_id, count) = row?;
-                map.insert(issue_id, count as usize);
+                map.insert(issue_id, usize::try_from(count).unwrap_or(0));
             }
         }
 
@@ -2795,7 +2791,7 @@ impl SqliteStorage {
             status: parse_status(row.get::<_, Option<String>>(7)?.as_deref()),
             priority: Priority(row.get::<_, Option<i32>>(8)?.unwrap_or(2)),
             issue_type: parse_issue_type(row.get::<_, Option<String>>(9)?.as_deref()),
-            assignee: row.get::<_, Option<String>>(10)?,
+            assignee: Self::empty_to_none(row.get::<_, Option<String>>(10)?),
             owner: Self::empty_to_none(row.get::<_, Option<String>>(11)?),
             estimated_minutes: row.get::<_, Option<i32>>(12)?,
             created_at: parse_datetime(&row.get::<_, String>(13)?),
@@ -3197,14 +3193,14 @@ impl SqliteStorage {
         let query = format!(
             r"
             WITH RECURSIVE transitive_deps(id) AS (
-                -- Base case: direct dependencies of depends_on_id
+                -- Base case: direct dependencies of starting point
                 SELECT depends_on_id FROM dependencies 
                 WHERE issue_id = ?1 {type_filter}
                 UNION
-                -- Recursive step: dependencies of dependencies
-                SELECT d.issue_id
+                -- Recursive step: follow dependencies forward
+                SELECT d.depends_on_id
                 FROM dependencies d
-                JOIN transitive_deps td ON d.depends_on_id = td.id
+                JOIN transitive_deps td ON d.issue_id = td.id
                 WHERE 1=1 {type_filter}
             )
             SELECT 1 FROM transitive_deps WHERE id = ?2 LIMIT 1;
@@ -3774,20 +3770,7 @@ mod tests {
 
         let mut filters = ListFilters {
             statuses: Some(vec![Status::Open]),
-            types: None,
-            priorities: None,
-            assignee: None,
-            unassigned: false,
-            include_closed: false,
-            include_templates: false,
-            title_contains: None,
-            limit: None,
-            sort: None,
-            reverse: false,
-            labels: None,
-            labels_or: None,
-            updated_before: None,
-            updated_after: None,
+            ..ListFilters::default()
         };
 
         let issues = storage.list_issues(&filters).unwrap();
@@ -4628,7 +4611,11 @@ mod tests {
 
         let issues = storage.list_issues(&filters).unwrap();
 
-        assert_eq!(issues.len(), 1, "Should find one issue with 'bug' in title");
+        assert_eq!(
+            issues.len(),
+            1,
+            "Should find one issue matching 'bug' in title"
+        );
         assert_eq!(issues[0].id, "bd-s1");
     }
 
@@ -4796,8 +4783,10 @@ mod tests {
         storage.create_issue(&issue, "tester").unwrap();
 
         // Add a dependency on an ID containing a quote (e.g. from bad import)
-        // This is valid in DB but tricky for manual JSON building
-        let tricky_id = "external:foo\"bar";
+        // This is valid in DB but tricky for manual JSON building.
+        // Note: We use "orphan:" prefix instead of "external:" because external
+        // dependencies are excluded from the blocked cache (resolved at runtime).
+        let tricky_id = "orphan:foo\"bar";
         storage
             .add_dependency("bd-x1", tricky_id, "blocks", "tester")
             .unwrap();
@@ -4812,8 +4801,8 @@ mod tests {
 
         let blockers = &blocked[0].1;
         assert_eq!(blockers.len(), 1);
-        // ID + ":unknown" (since external doesn't have status in our DB)
-        assert_eq!(blockers[0], "external:foo\"bar:unknown");
+        // ID + ":unknown" (since orphan doesn't have status in our DB)
+        assert_eq!(blockers[0], "orphan:foo\"bar:unknown");
     }
 
     #[test]

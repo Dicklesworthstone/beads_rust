@@ -27,7 +27,7 @@ struct VersionOutput<'a> {
 /// # Errors
 ///
 /// Returns an error if JSON serialization fails.
-pub fn execute(json: bool, ctx: &OutputContext) -> Result<()> {
+pub fn execute(ctx: &OutputContext) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let build = if cfg!(debug_assertions) {
         "dev"
@@ -46,7 +46,7 @@ pub fn execute(json: bool, ctx: &OutputContext) -> Result<()> {
         features.push("self_update");
     }
 
-    if json {
+    if ctx.is_json() {
         let output = VersionOutput {
             version,
             build,
@@ -56,8 +56,7 @@ pub fn execute(json: bool, ctx: &OutputContext) -> Result<()> {
             target,
             features,
         };
-        let payload = serde_json::to_string(&output)?;
-        println!("{payload}");
+        ctx.json(&output);
         return Ok(());
     }
 

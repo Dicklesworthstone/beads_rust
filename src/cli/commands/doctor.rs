@@ -61,9 +61,10 @@ fn has_error(checks: &[CheckResult]) -> bool {
         .any(|check| matches!(check.status, CheckStatus::Error))
 }
 
-fn print_report(report: &DoctorReport, json: bool, ctx: &OutputContext) -> Result<()> {
-    if json || ctx.is_json() {
-        println!("{}", serde_json::to_string(&report)?);
+#[allow(clippy::unnecessary_wraps)]
+fn print_report(report: &DoctorReport, ctx: &OutputContext) -> Result<()> {
+    if ctx.is_json() {
+        ctx.json(report);
         return Ok(());
     }
     if ctx.is_quiet() {
@@ -790,7 +791,7 @@ fn check_sync_metadata(
 ///
 /// Returns an error if report serialization fails or if IO operations fail.
 #[allow(clippy::too_many_lines)]
-pub fn execute(json: bool, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let mut checks = Vec::new();
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
         push_check(
@@ -804,7 +805,7 @@ pub fn execute(json: bool, cli: &config::CliOverrides, ctx: &OutputContext) -> R
             ok: !has_error(&checks),
             checks,
         };
-        print_report(&report, json, ctx)?;
+        print_report(&report, ctx)?;
         std::process::exit(1);
     };
 
@@ -822,7 +823,7 @@ pub fn execute(json: bool, cli: &config::CliOverrides, ctx: &OutputContext) -> R
                 ok: !has_error(&checks),
                 checks,
             };
-            print_report(&report, json, ctx)?;
+            print_report(&report, ctx)?;
             std::process::exit(1);
         }
     };
@@ -901,7 +902,7 @@ pub fn execute(json: bool, cli: &config::CliOverrides, ctx: &OutputContext) -> R
         ok: !has_error(&checks),
         checks,
     };
-    print_report(&report, json, ctx)?;
+    print_report(&report, ctx)?;
 
     if !report.ok {
         std::process::exit(1);

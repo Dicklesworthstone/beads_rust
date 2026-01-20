@@ -323,15 +323,13 @@ fn render_defer_rich(deferred: &[DeferredIssue], skipped: &[SkippedIssue], ctx: 
             content.append(" \u{2192} ");
             content.append_styled("deferred", theme.warning.clone());
             content.append("\n");
+            content.append_styled("  Until:  ", theme.dimmed.clone());
             if let Some(ref until) = item.defer_until {
-                content.append_styled("  Until:  ", theme.dimmed.clone());
                 content.append_styled(until, theme.accent.clone());
-                content.append("\n");
             } else {
-                content.append_styled("  Until:  ", theme.dimmed.clone());
                 content.append_styled("indefinitely", theme.dimmed.clone());
-                content.append("\n");
             }
+            content.append("\n");
         }
 
         for item in skipped {

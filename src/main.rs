@@ -75,13 +75,13 @@ fn main() {
             commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
-        Commands::Doctor => commands::doctor::execute(cli.json, &overrides, &output_ctx),
-        Commands::Info(args) => commands::info::execute(&args, cli.json, &overrides, &output_ctx),
-        Commands::Where => commands::r#where::execute(cli.json, &overrides, &output_ctx),
-        Commands::Version => commands::version::execute(cli.json, &output_ctx),
+        Commands::Doctor => commands::doctor::execute(&overrides, &output_ctx),
+        Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
+        Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
+        Commands::Version => commands::version::execute(&output_ctx),
 
         #[cfg(feature = "self_update")]
-        Commands::Upgrade(args) => commands::upgrade::execute(&args, cli.json, &output_ctx),
+        Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),
         Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
         Commands::Audit { command } => {
             commands::audit::execute(&command, cli.json, &overrides, &output_ctx)
@@ -118,7 +118,7 @@ fn main() {
                 dry_run: args.dry_run,
                 force: args.force,
             };
-            commands::agents::execute(&agents_args, cli.json, &output_ctx)
+            commands::agents::execute(&agents_args, &output_ctx)
         }
     };
 

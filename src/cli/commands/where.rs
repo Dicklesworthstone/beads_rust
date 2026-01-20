@@ -54,8 +54,8 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
         jsonl_path: Some(jsonl_path),
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&output)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&output);
     } else if ctx.is_rich() {
         render_where_rich(&output, ctx);
     } else {
@@ -131,10 +131,10 @@ fn print_human(output: &WhereOutput) {
     }
 }
 
-fn handle_missing_beads(json: bool, ctx: &OutputContext) -> Result<()> {
-    if json {
+fn handle_missing_beads(ctx: &OutputContext) -> Result<()> {
+    if ctx.is_json() {
         let payload = serde_json::json!({ "error": "no beads directory found" });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        ctx.json_pretty(&payload);
     } else if ctx.is_rich() {
         let console = Console::default();
         let theme = ctx.theme();

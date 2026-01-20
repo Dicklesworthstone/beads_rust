@@ -361,12 +361,12 @@ pub struct AgentsArgs {
 /// # Errors
 ///
 /// Returns an error if file operations fail.
-pub fn execute(args: &AgentsArgs, json: bool, ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     let work_dir = std::env::current_dir()?;
     let detection = detect_agent_file_in_parents(&work_dir, 3);
 
-    if json {
-        return execute_json(&detection, args);
+    if ctx.is_json() {
+        return execute_json(&detection, args, ctx);
     }
 
     // Default to check mode if no action specified
@@ -391,7 +391,12 @@ pub fn execute(args: &AgentsArgs, json: bool, ctx: &OutputContext) -> Result<()>
     Ok(())
 }
 
-fn execute_json(detection: &AgentFileDetection, _args: &AgentsArgs) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+fn execute_json(
+    detection: &AgentFileDetection,
+    _args: &AgentsArgs,
+    ctx: &OutputContext,
+) -> Result<()> {
     let output = serde_json::json!({
         "found": detection.found(),
         "file_path": detection.file_path,
@@ -403,7 +408,7 @@ fn execute_json(detection: &AgentFileDetection, _args: &AgentsArgs) -> Result<()
         "needs_blurb": detection.needs_blurb(),
         "needs_upgrade": detection.needs_upgrade(),
     });
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    ctx.json_pretty(&output);
     Ok(())
 }
 

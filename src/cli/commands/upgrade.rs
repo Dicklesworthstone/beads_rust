@@ -45,22 +45,22 @@ struct UpdateResult {
 /// # Errors
 ///
 /// Returns an error if the update check or download fails.
-pub fn execute(args: &UpgradeArgs, json: bool, ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &UpgradeArgs, ctx: &OutputContext) -> Result<()> {
     let current_version = cargo_crate_version!();
 
     if args.dry_run {
-        return execute_dry_run(args, current_version, json, ctx);
+        return execute_dry_run(args, current_version, ctx);
     }
 
     if args.check {
-        return execute_check(current_version, json, ctx);
+        return execute_check(current_version, ctx);
     }
 
-    execute_upgrade(args, current_version, json, ctx)
+    execute_upgrade(args, current_version, ctx)
 }
 
 /// Execute check-only mode.
-fn execute_check(current_version: &str, json: bool, ctx: &OutputContext) -> Result<()> {
+fn execute_check(current_version: &str, ctx: &OutputContext) -> Result<()> {
     tracing::info!("Checking for updates...");
 
     let updater = build_updater(current_version)?;
@@ -79,8 +79,8 @@ fn execute_check(current_version: &str, json: bool, ctx: &OutputContext) -> Resu
         download_url,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    if ctx.is_json() {
+        ctx.json_pretty(&result);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_check_rich(&result, ctx);
     } else {
@@ -98,12 +98,7 @@ fn execute_check(current_version: &str, json: bool, ctx: &OutputContext) -> Resu
 }
 
 /// Execute dry-run mode.
-fn execute_dry_run(
-    args: &UpgradeArgs,
-    current_version: &str,
-    json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn execute_dry_run(args: &UpgradeArgs, current_version: &str, ctx: &OutputContext) -> Result<()> {
     tracing::info!("Dry-run mode: checking what would happen...");
 
     let target_version = args.version.as_deref();
@@ -120,7 +115,7 @@ fn execute_dry_run(
         .first()
         .map_or_else(|| "N/A".to_string(), |a| a.download_url.clone());
 
-    if json {
+    if ctx.is_json() {
         let result = serde_json::json!({
             "dry_run": true,
             "current_version": current_version,
@@ -128,7 +123,7 @@ fn execute_dry_run(
             "would_download": download_url,
             "would_update": would_update,
         });
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        ctx.json_pretty(&result);
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_dry_run_rich(
             current_version,
@@ -157,17 +152,13 @@ fn execute_dry_run(
 }
 
 /// Execute the actual upgrade.
-fn execute_upgrade(
-    args: &UpgradeArgs,
-    current_version: &str,
-    json: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContext) -> Result<()> {
     tracing::info!(current = %current_version, "Starting upgrade...");
 
+    let is_json = ctx.is_json();
     let is_rich = matches!(ctx.mode(), OutputMode::Rich);
 
-    if !json && !is_rich {
+    if !is_json && !is_rich {
         println!("Checking for updates...");
         println!("Current version: {current_version}");
     } else if is_rich {
@@ -177,7 +168,7 @@ fn execute_upgrade(
     }
 
     let updater = if let Some(ref target_version) = args.version {
-        build_updater_with_target(target_version, current_version, !json && !is_rich)?
+        build_updater_with_target(target_version, current_version, !is_json && !is_rich)?
     } else {
         build_updater(current_version)?
     };
@@ -186,7 +177,7 @@ fn execute_upgrade(
     let latest = updater.get_latest_release().map_err(map_update_error)?;
     let latest_version = &latest.version;
 
-    if !json && !is_rich {
+    if !is_json && !is_rich {
         println!("Latest version:  {latest_version}");
     }
 
@@ -200,8 +191,8 @@ fn execute_upgrade(
             message: Some("Already up to date".to_string()),
         };
 
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+        if is_json {
+            ctx.json_pretty(&result);
         } else if is_rich {
             render_up_to_date_rich(current_version, latest_version, ctx);
         } else {
@@ -210,7 +201,7 @@ fn execute_upgrade(
         return Ok(());
     }
 
-    if !json && !is_rich {
+    if !is_json && !is_rich {
         println!("\nDownloading {latest_version}...");
     } else if is_rich {
         ctx.info(&format!("Downloading {latest_version}..."));
@@ -230,8 +221,8 @@ fn execute_upgrade(
         },
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    if is_json {
+        ctx.json_pretty(&result);
     } else if is_rich {
         render_upgrade_result_rich(&result, current_version, ctx);
     } else if status.updated() {
@@ -431,9 +422,9 @@ fn render_upgrade_result_rich(result: &UpdateResult, current_version: &str, ctx:
     let width = ctx.width();
 
     let mut content = Text::new("");
+    content.append_styled("✓ ", theme.success.clone());
 
     if result.updated {
-        content.append_styled("✓ ", theme.success.clone());
         content.append_styled("Upgraded ", theme.success.clone());
         content.append("br from ");
         content.append_styled(current_version, theme.dimmed.clone());
@@ -441,7 +432,6 @@ fn render_upgrade_result_rich(result: &UpdateResult, current_version: &str, ctx:
         content.append_styled(&result.new_version, theme.success.clone());
         content.append("\n");
     } else {
-        content.append_styled("✓ ", theme.success.clone());
         content.append("Already up to date\n");
     }
 

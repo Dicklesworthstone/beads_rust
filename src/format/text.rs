@@ -7,7 +7,7 @@
 //! - Issue line formatting
 
 use crate::model::{Issue, IssueType, Priority, Status};
-use colored::Colorize;
+use crossterm::style::Stylize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Status icon characters.
@@ -81,9 +81,9 @@ pub fn format_status_label(status: &Status, use_color: bool) -> String {
         Status::InProgress => label.yellow().to_string(),
         Status::Blocked => label.red().to_string(),
         Status::Deferred => label.blue().to_string(),
-        Status::Closed | Status::Tombstone => label.bright_black().to_string(),
+        Status::Closed | Status::Tombstone => label.grey().to_string(),
         Status::Pinned => label.magenta().bold().to_string(),
-        Status::Custom(_) => label.normal().to_string(),
+        Status::Custom(_) => label.to_string(),
     }
 }
 
@@ -100,9 +100,9 @@ pub fn format_status_icon_colored(status: &Status, use_color: bool) -> String {
         Status::InProgress => icon.yellow().to_string(),
         Status::Blocked => icon.red().to_string(),
         Status::Deferred => icon.blue().to_string(),
-        Status::Closed | Status::Tombstone => icon.bright_black().to_string(),
+        Status::Closed | Status::Tombstone => icon.grey().to_string(),
         Status::Pinned => icon.magenta().bold().to_string(),
-        Status::Custom(_) => icon.normal().to_string(),
+        Status::Custom(_) => icon.to_string(),
     }
 }
 
@@ -118,8 +118,8 @@ pub fn format_priority_label(priority: &Priority, use_color: bool) -> String {
         0 => label.red().bold().to_string(),
         1 => label.red().to_string(),
         2 => label.yellow().to_string(),
-        3 | 4 => label.bright_black().to_string(),
-        _ => label.normal().to_string(),
+        3 | 4 => label.grey().to_string(),
+        _ => label,
     }
 }
 
@@ -148,10 +148,10 @@ pub fn format_type_badge_colored(issue_type: &IssueType, use_color: bool) -> Str
     let colored = match issue_type {
         IssueType::Bug => label.red().to_string(),
         IssueType::Feature => label.cyan().to_string(),
-        IssueType::Task | IssueType::Custom(_) => label.normal().to_string(),
+        IssueType::Task | IssueType::Custom(_) => label.to_string(),
         IssueType::Epic => label.magenta().bold().to_string(),
         IssueType::Docs | IssueType::Question => label.blue().to_string(),
-        IssueType::Chore => label.bright_black().to_string(),
+        IssueType::Chore => label.grey().to_string(),
     };
 
     format!("[{colored}]")

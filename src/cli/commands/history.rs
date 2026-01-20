@@ -8,6 +8,9 @@ use rich_rust::prelude::*;
 use serde_json::json;
 use std::path::Path;
 
+/// Result type for diff status: (status_string, diff_available, optional_size_tuple).
+type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
+
 /// Execute the history command.
 ///
 /// # Errors
@@ -56,7 +59,7 @@ fn list_backups(history_dir: &Path, ctx: &OutputContext) -> Result<()> {
             "count": backups.len(),
             "backups": items,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -157,7 +160,7 @@ fn diff_backup(
             "current_size_bytes": size_fallback.map(|sizes| sizes.0),
             "backup_size_bytes": size_fallback.map(|sizes| sizes.1),
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -259,7 +262,7 @@ fn restore_backup(
             "restored": true,
             "next_step": "br sync --import-only --force",
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -300,7 +303,7 @@ fn prune_backups(
             "keep": keep,
             "older_than_days": older_than_days,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        ctx.json_pretty(&output);
         return Ok(());
     }
 
@@ -329,10 +332,7 @@ fn prune_backups(
     Ok(())
 }
 
-fn diff_status_for_json(
-    current_path: &Path,
-    backup_path: &Path,
-) -> Result<(&'static str, bool, Option<(u64, u64)>)> {
+fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffStatusResult> {
     let output = std::process::Command::new("diff")
         .arg("-u")
         .arg(current_path)

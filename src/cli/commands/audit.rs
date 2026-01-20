@@ -5,13 +5,13 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::EventType;
 use crate::output::{OutputContext, Theme};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -176,7 +176,7 @@ fn execute_summary(
     let storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     let events = storage_ctx.storage.get_all_events(0)?;
 
-    let cutoff = Utc::now() - chrono::Duration::days(args.days as i64);
+    let cutoff = Utc::now() - chrono::Duration::days(i64::from(args.days));
     let filtered_events: Vec<_> = events
         .into_iter()
         .filter(|e| e.created_at >= cutoff)
@@ -254,16 +254,7 @@ fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
 }
 
 fn record_entry(args: &AuditRecordArgs, beads_dir: &Path, actor: &str, json: bool) -> Result<()> {
-    let stdin_piped = !io::stdin().is_terminal();
-    let no_fields = no_fields_provided(args);
-
-    let use_stdin = if args.stdin {
-        true
-    } else if stdin_piped && no_fields {
-        false
-    } else {
-        false
-    };
+    let use_stdin = args.stdin;
 
     let mut entry = if use_stdin {
         let mut input = String::new();
@@ -366,6 +357,7 @@ fn label_entry(args: &AuditLabelArgs, beads_dir: &Path, actor: &str, json: bool)
     Ok(())
 }
 
+#[allow(dead_code)]
 fn no_fields_provided(args: &AuditRecordArgs) -> bool {
     is_empty_opt(args.kind.as_deref())
         && is_empty_opt(args.issue_id.as_deref())
