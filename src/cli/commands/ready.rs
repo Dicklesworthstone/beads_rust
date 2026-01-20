@@ -22,9 +22,9 @@ use unicode_width::UnicodeWidthStr;
 /// Returns an error if the database cannot be opened or the query fails.
 pub fn execute(
     args: &ReadyArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    outer_ctx: &OutputContext,
 ) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
@@ -40,7 +40,7 @@ pub fn execute(
         None
     };
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(json || args.robot, quiet, !use_color);
+    let ctx = OutputContext::from_flags(outer_ctx.is_json() || args.robot, quiet, !use_color);
 
     let filters = ReadyFilters {
         assignee: args.assignee.clone(),

@@ -25,9 +25,9 @@ use std::str::FromStr;
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &SearchArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    outer_ctx: &OutputContext,
 ) -> Result<()> {
     let query = args.query.trim();
     if query.is_empty() {
@@ -96,7 +96,7 @@ pub fn execute(
     }
 
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(json, quiet, !use_color);
+    let ctx = OutputContext::from_flags(outer_ctx.is_json(), quiet, !use_color);
 
     if ctx.is_json() {
         ctx.json_pretty(&issues_with_counts);
@@ -465,6 +465,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

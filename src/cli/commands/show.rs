@@ -14,9 +14,9 @@ use std::fmt::Write as FmtWrite;
 /// Returns an error if the database cannot be opened or issues are not found.
 pub fn execute(
     ids: Vec<String>,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(None)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -39,7 +39,7 @@ pub fn execute(
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let use_color = config::should_use_color(&config_layer);
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(json, quiet, !use_color);
+    let ctx = OutputContext::from_flags(outer_ctx.is_json(), quiet, !use_color);
 
     let mut details_list = Vec::new();
     for id_input in target_ids {
@@ -204,6 +204,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

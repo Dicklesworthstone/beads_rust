@@ -40,19 +40,19 @@ pub struct OrphanIssue {
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &OrphansArgs,
-    json: bool,
+    _json: bool,
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
     // Try to discover beads directory - return empty if not found
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
-        output_empty(json || args.robot, ctx);
+        output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     };
 
     // Try to open storage - return empty if not found
     let Ok(storage_ctx) = config::open_storage_with_cli(&beads_dir, cli) else {
-        output_empty(json || args.robot, ctx);
+        output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     };
     let storage = &storage_ctx.storage;
@@ -63,13 +63,13 @@ pub fn execute(
 
     // Check if we're in a git repo by running git rev-parse
     if !is_git_repo() {
-        output_empty(json || args.robot, ctx);
+        output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     }
 
     // Get git log and extract issue references
     let Ok(commit_refs) = get_git_commit_refs(&prefix) else {
-        output_empty(json || args.robot, ctx);
+        output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     };
 
@@ -79,7 +79,7 @@ pub fn execute(
     );
 
     if commit_refs.is_empty() {
-        output_empty(json || args.robot, ctx);
+        output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     }
 
