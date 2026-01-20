@@ -8,6 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -54,7 +55,7 @@ pub fn execute(
     args: &DeleteArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     // 1. Collect IDs from args and/or file
     let mut ids: Vec<String> = args.ids.clone();
@@ -105,40 +106,58 @@ pub fn execute(
 
     if !all_dependents.is_empty() && !args.force && !args.cascade {
         // Preview mode: show what would happen
-        println!("The following issues depend on issues being deleted:");
-        for dep in &all_dependents {
-            println!("  - {dep}");
+        if ctx.is_rich() {
+            render_dependents_warning_rich(&all_dependents, storage, ctx);
+        } else {
+            println!("The following issues depend on issues being deleted:");
+            for dep in &all_dependents {
+                println!("  - {dep}");
+            }
+            println!();
+            println!(
+                "Use --force to orphan these dependents, or --cascade to delete them recursively."
+            );
+            println!("No changes made (preview mode).");
         }
-        println!();
-        println!(
-            "Use --force to orphan these dependents, or --cascade to delete them recursively."
-        );
-        println!("No changes made (preview mode).");
         return Ok(());
     }
 
     // 5. Dry-run mode
     if args.dry_run {
-        println!("Dry-run: Would delete {} issue(s):", ids.len());
-        for id in &ids {
-            let issue = storage
-                .get_issue(id)?
-                .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
-            println!("  - {}: {}", id, issue.title);
-        }
-        if args.cascade && !all_dependents.is_empty() {
-            println!(
-                "Would also cascade delete {} dependent(s):",
-                all_dependents.len()
-            );
-            for dep in &all_dependents {
-                println!("  - {dep}");
+        if ctx.is_rich() {
+            let cascade_ids: Vec<String> = if args.cascade {
+                all_dependents.clone()
+            } else {
+                vec![]
+            };
+            let orphan_ids: Vec<String> = if args.force && !args.cascade {
+                all_dependents.clone()
+            } else {
+                vec![]
+            };
+            render_dry_run_rich(&ids, &cascade_ids, &orphan_ids, storage, ctx);
+        } else {
+            println!("Dry-run: Would delete {} issue(s):", ids.len());
+            for id in &ids {
+                let issue = storage
+                    .get_issue(id)?
+                    .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+                println!("  - {}: {}", id, issue.title);
             }
-        }
-        if args.force && !all_dependents.is_empty() {
-            println!("Would orphan {} dependent(s):", all_dependents.len());
-            for dep in &all_dependents {
-                println!("  - {dep}");
+            if args.cascade && !all_dependents.is_empty() {
+                println!(
+                    "Would also cascade delete {} dependent(s):",
+                    all_dependents.len()
+                );
+                for dep in &all_dependents {
+                    println!("  - {dep}");
+                }
+            }
+            if args.force && !all_dependents.is_empty() {
+                println!("Would orphan {} dependent(s):", all_dependents.len());
+                for dep in &all_dependents {
+                    println!("  - {dep}");
+                }
             }
         }
         return Ok(());
@@ -185,19 +204,24 @@ pub fn execute(
     }
 
     result.deleted.sort();
-    println!("Deleted {} issue(s):", result.deleted_count);
-    for id in &result.deleted {
-        println!("  - {id}");
-    }
 
-    if result.dependencies_removed > 0 {
-        println!("Removed {} dependency link(s)", result.dependencies_removed);
-    }
-
-    if !result.orphaned_issues.is_empty() {
-        println!("Orphaned {} issue(s):", result.orphaned_issues.len());
-        for id in &result.orphaned_issues {
+    if ctx.is_rich() {
+        render_delete_result_rich(&result, storage, ctx);
+    } else {
+        println!("Deleted {} issue(s):", result.deleted_count);
+        for id in &result.deleted {
             println!("  - {id}");
+        }
+
+        if result.dependencies_removed > 0 {
+            println!("Removed {} dependency link(s)", result.dependencies_removed);
+        }
+
+        if !result.orphaned_issues.is_empty() {
+            println!("Orphaned {} issue(s):", result.orphaned_issues.len());
+            for id in &result.orphaned_issues {
+                println!("  - {id}");
+            }
         }
     }
 
@@ -252,6 +276,191 @@ fn collect_cascade_dependents(
     }
 
     Ok(all_ids)
+}
+
+/// Render the dependents warning panel in rich format.
+fn render_dependents_warning_rich(
+    dependents: &[String],
+    storage: &SqliteStorage,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled(
+        "The following issues depend on issues being deleted:\n\n",
+        theme.warning.clone(),
+    );
+
+    for dep_id in dependents {
+        content.append_styled("  \u{2022} ", theme.dimmed.clone());
+        content.append_styled(dep_id, theme.issue_id.clone());
+        // Try to get title
+        if let Ok(Some(issue)) = storage.get_issue(dep_id) {
+            content.append_styled(": ", theme.dimmed.clone());
+            content.append(&issue.title);
+        }
+        content.append("\n");
+    }
+
+    content.append("\n");
+    content.append_styled(
+        "Use --force to orphan these dependents, or --cascade to delete them recursively.\n",
+        theme.dimmed.clone(),
+    );
+    content.append_styled("No changes made (preview mode).", theme.muted.clone());
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(
+            "\u{26a0} Blocked by Dependents",
+            theme.warning.clone(),
+        ))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render the dry-run preview in rich format.
+fn render_dry_run_rich(
+    ids: &[String],
+    cascade_ids: &[String],
+    orphan_ids: &[String],
+    storage: &SqliteStorage,
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    // Main issues to delete
+    content.append_styled("Would delete ", theme.dimmed.clone());
+    content.append_styled(&format!("{}", ids.len()), theme.emphasis.clone());
+    content.append_styled(" issue(s):\n\n", theme.dimmed.clone());
+
+    for id in ids {
+        content.append_styled("  \u{2717} ", theme.error.clone());
+        content.append_styled(id, theme.issue_id.clone());
+        if let Ok(Some(issue)) = storage.get_issue(id) {
+            content.append_styled(": ", theme.dimmed.clone());
+            content.append(&issue.title);
+        }
+        content.append("\n");
+    }
+
+    // Cascade section
+    if !cascade_ids.is_empty() {
+        content.append("\n");
+        content.append_styled("Would cascade delete ", theme.dimmed.clone());
+        content.append_styled(&format!("{}", cascade_ids.len()), theme.emphasis.clone());
+        content.append_styled(" dependent(s):\n\n", theme.dimmed.clone());
+
+        for id in cascade_ids {
+            content.append_styled("  \u{21b3} ", theme.warning.clone());
+            content.append_styled(id, theme.issue_id.clone());
+            if let Ok(Some(issue)) = storage.get_issue(id) {
+                content.append_styled(": ", theme.dimmed.clone());
+                content.append(&issue.title);
+            }
+            content.append("\n");
+        }
+    }
+
+    // Orphan section
+    if !orphan_ids.is_empty() {
+        content.append("\n");
+        content.append_styled("Would orphan ", theme.dimmed.clone());
+        content.append_styled(&format!("{}", orphan_ids.len()), theme.emphasis.clone());
+        content.append_styled(" dependent(s):\n\n", theme.dimmed.clone());
+
+        for id in orphan_ids {
+            content.append_styled("  \u{26a0} ", theme.warning.clone());
+            content.append_styled(id, theme.issue_id.clone());
+            if let Ok(Some(issue)) = storage.get_issue(id) {
+                content.append_styled(": ", theme.dimmed.clone());
+                content.append(&issue.title);
+            }
+            content.append("\n");
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(
+            "\u{1f4cb} Dry Run Preview",
+            theme.info.clone(),
+        ))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Render the delete result in rich format.
+fn render_delete_result_rich(result: &DeleteResult, storage: &SqliteStorage, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    // Deleted items
+    content.append_styled("Deleted ", theme.success.clone());
+    content.append_styled(&format!("{}", result.deleted_count), theme.emphasis.clone());
+    content.append_styled(" issue(s):\n\n", theme.success.clone());
+
+    for id in &result.deleted {
+        content.append_styled("  \u{2713} ", theme.success.clone());
+        content.append_styled(id, theme.issue_id.clone());
+        if let Ok(Some(issue)) = storage.get_issue(id) {
+            content.append_styled(": ", theme.dimmed.clone());
+            content.append(&issue.title);
+        }
+        content.append("\n");
+    }
+
+    // Dependencies removed
+    if result.dependencies_removed > 0 {
+        content.append("\n");
+        content.append_styled("Removed ", theme.dimmed.clone());
+        content.append_styled(
+            &format!("{}", result.dependencies_removed),
+            theme.emphasis.clone(),
+        );
+        content.append_styled(" dependency link(s)", theme.dimmed.clone());
+    }
+
+    // Orphaned issues
+    if !result.orphaned_issues.is_empty() {
+        content.append("\n\n");
+        content.append_styled("Orphaned ", theme.warning.clone());
+        content.append_styled(
+            &format!("{}", result.orphaned_issues.len()),
+            theme.emphasis.clone(),
+        );
+        content.append_styled(" issue(s):\n\n", theme.warning.clone());
+
+        for id in &result.orphaned_issues {
+            content.append_styled("  \u{26a0} ", theme.warning.clone());
+            content.append_styled(id, theme.issue_id.clone());
+            if let Ok(Some(issue)) = storage.get_issue(id) {
+                content.append_styled(": ", theme.dimmed.clone());
+                content.append(&issue.title);
+            }
+            content.append("\n");
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled(
+            "\u{1f5d1} Delete Complete",
+            theme.success.clone(),
+        ))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
 }
 
 #[cfg(test)]
