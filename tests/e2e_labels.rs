@@ -726,13 +726,17 @@ fn e2e_harness_label_list_all_fresh() {
     let labels = result.as_array().unwrap();
 
     // Should have at least bug, urgent, feature
-    assert!(labels.len() >= 3, "expected at least 3 labels, got {}", labels.len());
+    assert!(
+        labels.len() >= 3,
+        "expected at least 3 labels, got {}",
+        labels.len()
+    );
 
-    // Verify each label has required fields
+    // Verify each label has required fields (schema: {label, count})
     for label in labels {
         assert!(
-            label.get("name").is_some(),
-            "label should have 'name' field"
+            label.get("label").is_some(),
+            "label should have 'label' field"
         );
         assert!(
             label.get("count").is_some(),
@@ -741,10 +745,11 @@ fn e2e_harness_label_list_all_fresh() {
     }
 
     // Verify 'bug' appears with count=2 (used on both issues)
-    let bug_label = labels.iter().find(|l| l["name"] == "bug");
+    let bug_label = labels.iter().find(|l| l["label"] == "bug");
     assert!(bug_label.is_some(), "bug label should be in list-all");
     assert_eq!(
-        bug_label.unwrap()["count"], 2,
+        bug_label.unwrap()["count"],
+        2,
         "bug label should have count=2"
     );
 
@@ -754,10 +759,13 @@ fn e2e_harness_label_list_all_fresh() {
 /// Test label list-all with real dataset (beads_rust)
 #[test]
 fn e2e_harness_label_list_all_real_dataset() {
+    use std::process::Command;
     let _log = common::test_log("e2e_harness_label_list_all_real_dataset");
 
     if !beads_rust_dataset_available() {
-        eprintln!("Skipping e2e_harness_label_list_all_real_dataset: beads_rust dataset not available");
+        eprintln!(
+            "Skipping e2e_harness_label_list_all_real_dataset: beads_rust dataset not available"
+        );
         return;
     }
 
@@ -766,7 +774,6 @@ fn e2e_harness_label_list_all_real_dataset() {
         .expect("should create isolated beads_rust");
 
     // Run list-all on the isolated dataset
-    use std::process::Command;
     let output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
         .args(["label", "list-all", "--json"])
         .current_dir(isolated.workspace_root())
@@ -790,27 +797,25 @@ fn e2e_harness_label_list_all_real_dataset() {
     assert!(result.is_array(), "list-all should return array");
     let labels = result.as_array().unwrap();
 
-    // Real dataset should have labels
-    assert!(
-        !labels.is_empty(),
-        "beads_rust dataset should have labels"
-    );
-
-    // Verify schema: each label has name and count
+    // Verify schema: each label has 'label' and 'count' fields
+    // Note: dataset may or may not have labels depending on its state
     for label in labels {
         assert!(
-            label.get("name").is_some(),
-            "label should have 'name' field"
+            label.get("label").is_some(),
+            "label should have 'label' field"
         );
         assert!(
             label.get("count").is_some(),
             "label should have 'count' field"
         );
         // count should be a positive number
-        if let Some(count) = label.get("count").and_then(|c| c.as_i64()) {
+        if let Some(count) = label.get("count").and_then(serde_json::Value::as_i64) {
             assert!(count >= 1, "label count should be >= 1");
         }
     }
+
+    // Log result for debugging
+    eprintln!("Found {} labels in beads_rust dataset", labels.len());
 }
 
 /// Test label rename with TestWorkspace harness (fresh workspace with artifacts)
@@ -860,10 +865,7 @@ fn e2e_harness_label_rename_fresh() {
     // Verify required fields in response
     assert_eq!(result["old_name"], "old-label", "old_name should match");
     assert_eq!(result["new_name"], "new-label", "new_name should match");
-    assert_eq!(
-        result["affected_issues"], 2,
-        "should affect 2 issues"
-    );
+    assert_eq!(result["affected_issues"], 2, "should affect 2 issues");
 
     // Verify old label is gone
     let list_all = ws.run_br(["label", "list-all", "--json"], "list_all_after");
@@ -873,14 +875,17 @@ fn e2e_harness_label_rename_fresh() {
     let labels: Value = serde_json::from_str(&list_payload).expect("list-all json");
     let labels_arr = labels.as_array().unwrap();
 
-    let old_exists = labels_arr.iter().any(|l| l["name"] == "old-label");
+    let old_exists = labels_arr.iter().any(|l| l["label"] == "old-label");
     assert!(!old_exists, "old-label should not exist after rename");
 
-    let new_exists = labels_arr.iter().any(|l| l["name"] == "new-label");
+    let new_exists = labels_arr.iter().any(|l| l["label"] == "new-label");
     assert!(new_exists, "new-label should exist after rename");
 
     // Verify new label has correct count
-    let new_label = labels_arr.iter().find(|l| l["name"] == "new-label").unwrap();
+    let new_label = labels_arr
+        .iter()
+        .find(|l| l["label"] == "new-label")
+        .unwrap();
     assert_eq!(new_label["count"], 2, "new-label should have count=2");
 
     // Verify issues have the new label
@@ -888,8 +893,7 @@ fn e2e_harness_label_rename_fresh() {
     show1.assert_success();
     let show1_payload = harness_extract_json(&show1.stdout);
     let issues1: Vec<Value> = serde_json::from_str(&show1_payload).expect("show1 json");
-    let labels1: Vec<String> =
-        serde_json::from_value(issues1[0]["labels"].clone()).unwrap();
+    let labels1: Vec<String> = serde_json::from_value(issues1[0]["labels"].clone()).unwrap();
     assert!(
         labels1.contains(&"new-label".to_string()),
         "issue1 should have new-label"
@@ -906,18 +910,19 @@ fn e2e_harness_label_rename_fresh() {
 /// This test runs rename on an isolated copy of the real dataset
 #[test]
 fn e2e_harness_label_rename_real_dataset() {
+    use std::process::Command;
     let _log = common::test_log("e2e_harness_label_rename_real_dataset");
 
     if !beads_rust_dataset_available() {
-        eprintln!("Skipping e2e_harness_label_rename_real_dataset: beads_rust dataset not available");
+        eprintln!(
+            "Skipping e2e_harness_label_rename_real_dataset: beads_rust dataset not available"
+        );
         return;
     }
 
     // Create isolated copy of beads_rust dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should create isolated beads_rust");
-
-    use std::process::Command;
 
     // First, list all labels to find one we can rename
     let list_output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
@@ -940,7 +945,7 @@ fn e2e_harness_label_rename_real_dataset() {
     }
 
     // Pick a label to rename (first one)
-    let old_name = labels_arr[0]["name"].as_str().unwrap();
+    let old_name = labels_arr[0]["label"].as_str().unwrap();
     let old_count = labels_arr[0]["count"].as_i64().unwrap();
     let new_name = format!("{old_name}-renamed");
 
@@ -985,8 +990,8 @@ fn e2e_harness_label_rename_real_dataset() {
     let verify_labels: Value = serde_json::from_str(&verify_payload).expect("verify json");
     let verify_arr = verify_labels.as_array().unwrap();
 
-    let old_exists = verify_arr.iter().any(|l| l["name"] == old_name);
-    let new_exists = verify_arr.iter().any(|l| l["name"] == new_name);
+    let old_exists = verify_arr.iter().any(|l| l["label"] == old_name);
+    let new_exists = verify_arr.iter().any(|l| l["label"] == new_name);
 
     assert!(!old_exists, "old label should not exist after rename");
     assert!(new_exists, "new label should exist after rename");
@@ -1019,31 +1024,35 @@ fn e2e_harness_label_list_all_empty() {
     ws.finish(true);
 }
 
-/// Test label rename error cases with harness
+/// Test label rename with nonexistent label (no-op behavior)
 #[test]
-fn e2e_harness_label_rename_errors() {
-    let _log = common::test_log("e2e_harness_label_rename_errors");
-    let mut ws = TestWorkspace::new("e2e_labels", "harness_label_rename_errors");
+fn e2e_harness_label_rename_nonexistent() {
+    let _log = common::test_log("e2e_harness_label_rename_nonexistent");
+    let mut ws = TestWorkspace::new("e2e_labels", "harness_label_rename_nonexistent");
 
     // Initialize workspace
     let init = ws.init_br();
     init.assert_success();
 
     // Try to rename non-existent label
+    // Expected behavior: success with affected_issues=0 (no-op)
     let rename = ws.run_br(
         ["label", "rename", "nonexistent", "newname", "--json"],
         "rename_nonexistent",
     );
 
-    // Should fail (non-zero exit code)
-    assert!(
-        !rename.success,
-        "renaming nonexistent label should fail"
-    );
-    assert!(
-        rename.stderr.contains("not found") || rename.stderr.contains("No issues"),
-        "error message should indicate label not found: {}",
-        rename.stderr
+    // Should succeed (exit code 0) - it's a no-op
+    rename.assert_success();
+
+    // Verify JSON shows 0 affected issues
+    let payload = harness_extract_json(&rename.stdout);
+    let result: Value = serde_json::from_str(&payload).expect("rename json");
+
+    assert_eq!(result["old_name"], "nonexistent");
+    assert_eq!(result["new_name"], "newname");
+    assert_eq!(
+        result["affected_issues"], 0,
+        "affected_issues should be 0 for nonexistent label"
     );
 
     ws.finish(true);

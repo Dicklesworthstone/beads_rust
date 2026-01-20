@@ -572,11 +572,23 @@ fn e2e_history_restore_verifies_content() {
     create_issue(&workspace, "Known issue for restore", "create_known");
     sync_flush(&workspace);
 
-    let backups = list_backup_files(&workspace);
-    assert!(!backups.is_empty(), "should have backup");
-    let backup_file = &backups[0];
+    // Wait to ensure different timestamp for next backup
+    thread::sleep(Duration::from_millis(1100));
 
-    // Read backup content
+    // Create a different issue to change current state (this creates a backup)
+    create_issue(&workspace, "Different issue", "create_different");
+    sync_flush(&workspace);
+
+    // Now we have backups - get the most recent one (it has Known + Initial)
+    let backups = list_backup_files(&workspace);
+    assert!(
+        backups.len() >= 2,
+        "should have at least 2 backups: {backups:?}"
+    );
+    // Get the newest backup (last in sorted list) - it contains the state before "Different"
+    let backup_file = &backups[backups.len() - 1];
+
+    // Read backup content BEFORE restore
     let backup_path = workspace
         .root
         .join(".beads")
@@ -584,17 +596,17 @@ fn e2e_history_restore_verifies_content() {
         .join(backup_file);
     let backup_content = fs::read_to_string(&backup_path).expect("read backup");
 
-    // Create a different issue to change current state
-    create_issue(&workspace, "Different issue", "create_different");
-    sync_flush(&workspace);
-
     // Restore the backup
     let restore = run_br(
         &workspace,
         ["history", "restore", backup_file, "--force"],
         "history_restore_verify",
     );
-    assert!(restore.status.success(), "restore failed: {}", restore.stderr);
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        restore.stderr
+    );
 
     // Verify restored content matches backup
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
@@ -719,11 +731,13 @@ fn e2e_history_list_json_output() {
     assert!(list.status.success(), "list failed: {}", list.stderr);
 
     // Parse JSON output
-    let json: serde_json::Value =
-        serde_json::from_str(&list.stdout).expect("should be valid JSON");
+    let json: serde_json::Value = serde_json::from_str(&list.stdout).expect("should be valid JSON");
 
     // Verify JSON structure
-    assert!(json.get("directory").is_some(), "should have directory field");
+    assert!(
+        json.get("directory").is_some(),
+        "should have directory field"
+    );
     assert!(json.get("count").is_some(), "should have count field");
     assert!(json.get("backups").is_some(), "should have backups array");
 
@@ -776,7 +790,11 @@ fn e2e_history_restore_json_output() {
 
     // Verify JSON structure
     assert_eq!(json["action"], "restore", "action should be restore");
-    assert_eq!(json["backup"], backup_file, "backup field should match");
+    assert_eq!(
+        json["backup"].as_str(),
+        Some(backup_file.as_str()),
+        "backup field should match"
+    );
     assert_eq!(json["restored"], true, "restored should be true");
     assert!(json.get("next_step").is_some(), "should have next_step");
 }

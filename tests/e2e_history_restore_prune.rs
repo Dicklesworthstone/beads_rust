@@ -13,6 +13,9 @@
 //! - Error handling tested (corrupt backup, missing files)
 //! - Full artifacts logged for debugging
 
+// Allow naive bytecount in tests - performance is not critical here
+#![allow(clippy::naive_bytecount)]
+
 mod common;
 
 use common::cli::{BrWorkspace, run_br};
@@ -100,10 +103,23 @@ fn e2e_history_restore_verifies_content_integrity() {
     create_issue(&workspace, "Issue before backup", "create_before");
     sync_flush(&workspace);
 
-    // Capture backup content
+    // Wait to ensure backup timestamp differs
+    thread::sleep(Duration::from_millis(1100));
+
+    // Create more issues to change current state and trigger another backup
+    create_issue(&workspace, "Issue after backup 1", "create_after_1");
+    create_issue(&workspace, "Issue after backup 2", "create_after_2");
+    sync_flush(&workspace);
+
+    // Get the latest backup (which contains state before the last sync)
     let backups = list_backup_files(&workspace);
-    assert!(!backups.is_empty(), "should have backup");
-    let backup_file = &backups[0];
+    assert!(
+        backups.len() >= 2,
+        "should have at least 2 backups: {backups:?}"
+    );
+
+    // Get the LATEST backup (last in sorted list) - this contains Initial + Before
+    let backup_file = backups.last().unwrap();
 
     let backup_path = workspace
         .root
@@ -112,16 +128,16 @@ fn e2e_history_restore_verifies_content_integrity() {
         .join(backup_file);
     let original_backup_content = fs::read(&backup_path).expect("read backup");
 
-    // Create more issues to change current state
-    create_issue(&workspace, "Issue after backup 1", "create_after_1");
-    create_issue(&workspace, "Issue after backup 2", "create_after_2");
-    sync_flush(&workspace);
-
-    // Verify issues.jsonl is different from backup
+    // Verify issues.jsonl has MORE lines than the backup (4 vs 2)
     let current_content = read_file_bytes(&workspace, ".beads/issues.jsonl");
-    assert_ne!(
-        current_content, original_backup_content,
-        "current content should differ from backup"
+    let current_lines = current_content.iter().filter(|&&b| b == b'\n').count();
+    let backup_lines = original_backup_content
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    assert!(
+        current_lines > backup_lines,
+        "current should have more lines: current={current_lines}, backup={backup_lines}"
     );
 
     // Restore the backup
@@ -203,8 +219,7 @@ fn e2e_history_restore_json_output() {
     assert!(restore.status.success());
 
     // Parse JSON output
-    let json: serde_json::Value =
-        serde_json::from_str(&restore.stdout).expect("should parse JSON");
+    let json: serde_json::Value = serde_json::from_str(&restore.stdout).expect("should parse JSON");
 
     assert_eq!(json["action"], "restore");
     assert_eq!(json["backup"], backup_file.as_str());
@@ -554,8 +569,8 @@ fn e2e_history_restore_with_real_dataset() {
     );
 
     // Verify content matches
-    let restored_content = fs::read(workspace.root.join(".beads").join("issues.jsonl"))
-        .expect("read restored");
+    let restored_content =
+        fs::read(workspace.root.join(".beads").join("issues.jsonl")).expect("read restored");
     assert_eq!(
         restored_content, original_content,
         "restored content should match backup"
@@ -567,9 +582,7 @@ fn e2e_history_prune_with_real_dataset() {
     let _log = common::test_log("e2e_history_prune_with_real_dataset");
 
     if !is_dataset_available() {
-        eprintln!(
-            "Skipping e2e_history_prune_with_real_dataset: beads_rust dataset not available"
-        );
+        eprintln!("Skipping e2e_history_prune_with_real_dataset: beads_rust dataset not available");
         return;
     }
 

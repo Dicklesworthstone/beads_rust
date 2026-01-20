@@ -11,14 +11,14 @@ fn test_create_with_title_flag() {
     let bin = assert_cmd::cargo::cargo_bin!("br");
 
     // Init
-    Command::new(&bin)
+    Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("init")
         .assert()
         .success();
 
     // Create issue using --title flag (not positional argument)
-    let output = Command::new(&bin)
+    let output = Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("create")
         .arg("--title")
@@ -49,14 +49,14 @@ fn test_create_positional_vs_title_flag() {
     let bin = assert_cmd::cargo::cargo_bin!("br");
 
     // Init
-    Command::new(&bin)
+    Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("init")
         .assert()
         .success();
 
     // Create with positional
-    let output1 = Command::new(&bin)
+    let output1 = Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("create")
         .arg("Positional Title")
@@ -68,7 +68,7 @@ fn test_create_positional_vs_title_flag() {
     let json1: serde_json::Value = serde_json::from_slice(&output1.stdout).unwrap();
 
     // Create with --title flag
-    let output2 = Command::new(&bin)
+    let output2 = Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("create")
         .arg("--title")
@@ -93,14 +93,14 @@ fn test_create_json_output_includes_labels_and_deps() {
     let bin = assert_cmd::cargo::cargo_bin!("br");
 
     // Init
-    Command::new(bin)
+    Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("init")
         .assert()
         .success();
 
     // Create blocking issue first
-    let output = Command::new(bin)
+    let output = Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("create")
         .arg("Blocker")
@@ -117,7 +117,7 @@ fn test_create_json_output_includes_labels_and_deps() {
     let blocker_id = blocker_json["id"].as_str().unwrap();
 
     // Create issue with label and dep
-    let output = Command::new(bin)
+    let output = Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("create")
         .arg("My Issue")
