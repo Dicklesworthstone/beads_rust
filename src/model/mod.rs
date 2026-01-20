@@ -438,6 +438,10 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_system: Option<String>,
 
+    /// Source repository for multi-repo support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo: Option<String>,
+
     // Tombstone fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
@@ -507,6 +511,7 @@ impl Default for Issue {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -693,6 +698,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -1142,6 +1148,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

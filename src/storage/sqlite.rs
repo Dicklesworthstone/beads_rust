@@ -213,12 +213,12 @@ impl SqliteStorage {
                     status, priority, issue_type, assignee, owner, estimated_minutes,
                     created_at, created_by, updated_at, closed_at, close_reason,
                     closed_by_session, due_at, defer_until, external_ref, source_system,
-                    deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                    compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                    pinned, is_template
+                    source_repo, deleted_at, deleted_by, delete_reason, original_type,
+                    compaction_level, compacted_at, compacted_at_commit, original_size,
+                    sender, ephemeral, pinned, is_template
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
                     issue.id,
@@ -244,6 +244,7 @@ impl SqliteStorage {
                     defer_until_str,
                     issue.external_ref,
                     issue.source_system.as_deref().unwrap_or(""),
+                    issue.source_repo.as_deref().unwrap_or("."),
                     deleted_at_str,
                     issue.deleted_by.as_deref().unwrap_or(""),
                     issue.delete_reason.as_deref().unwrap_or(""),
@@ -550,7 +551,7 @@ impl SqliteStorage {
             SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                    status, priority, issue_type, assignee, owner, estimated_minutes,
                    created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                   due_at, defer_until, external_ref, source_system,
+                   due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
                    sender, ephemeral, pinned, is_template
@@ -587,7 +588,7 @@ impl SqliteStorage {
                 r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                          status, priority, issue_type, assignee, owner, estimated_minutes,
                          created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                         due_at, defer_until, external_ref, source_system,
+                         due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
                          sender, ephemeral, pinned, is_template
@@ -619,7 +620,7 @@ impl SqliteStorage {
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system,
+                     due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template
@@ -783,7 +784,7 @@ impl SqliteStorage {
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system,
+                     due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template
@@ -912,7 +913,7 @@ impl SqliteStorage {
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system,
+                     due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template
@@ -1249,7 +1250,7 @@ impl SqliteStorage {
             r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
                      i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
                      i.created_at, i.created_by, i.updated_at, i.closed_at, i.close_reason, i.closed_by_session,
-                     i.due_at, i.defer_until, i.external_ref, i.source_system,
+                     i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
                      i.pinned, i.is_template,
@@ -1263,7 +1264,7 @@ impl SqliteStorage {
         let results = stmt
             .query_map([], |row| {
                 let issue = self.issue_from_row(row)?;
-                let blockers_json: String = row.get(35)?;
+                let blockers_json: String = row.get(36)?;
                 Ok((issue, blockers_json))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2419,7 +2420,7 @@ impl SqliteStorage {
         let sql = r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                            status, priority, issue_type, assignee, owner, estimated_minutes,
                            created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                           due_at, defer_until, external_ref, source_system,
+                           due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                            pinned, is_template
@@ -2822,24 +2823,25 @@ impl SqliteStorage {
                 .map(parse_datetime),
             external_ref: row.get::<_, Option<String>>(21)?,
             source_system: Self::empty_to_none(row.get::<_, Option<String>>(22)?),
+            source_repo: Self::empty_to_none(row.get::<_, Option<String>>(23)?),
             deleted_at: row
-                .get::<_, Option<String>>(23)?
+                .get::<_, Option<String>>(24)?
                 .as_deref()
                 .map(parse_datetime),
-            deleted_by: Self::empty_to_none(row.get::<_, Option<String>>(24)?),
-            delete_reason: Self::empty_to_none(row.get::<_, Option<String>>(25)?),
-            original_type: Self::empty_to_none(row.get::<_, Option<String>>(26)?),
-            compaction_level: row.get::<_, Option<i32>>(27)?,
+            deleted_by: Self::empty_to_none(row.get::<_, Option<String>>(25)?),
+            delete_reason: Self::empty_to_none(row.get::<_, Option<String>>(26)?),
+            original_type: Self::empty_to_none(row.get::<_, Option<String>>(27)?),
+            compaction_level: row.get::<_, Option<i32>>(28)?,
             compacted_at: row
-                .get::<_, Option<String>>(28)?
+                .get::<_, Option<String>>(29)?
                 .as_deref()
                 .map(parse_datetime),
-            compacted_at_commit: row.get::<_, Option<String>>(29)?,
-            original_size: row.get::<_, Option<i32>>(30)?,
-            sender: Self::empty_to_none(row.get::<_, Option<String>>(31)?),
-            ephemeral: row.get::<_, Option<i32>>(32)?.unwrap_or(0) != 0,
-            pinned: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
-            is_template: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+            compacted_at_commit: row.get::<_, Option<String>>(30)?,
+            original_size: row.get::<_, Option<i32>>(31)?,
+            sender: Self::empty_to_none(row.get::<_, Option<String>>(32)?),
+            ephemeral: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
+            pinned: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
+            is_template: row.get::<_, Option<i32>>(35)?.unwrap_or(0) != 0,
             labels: vec![],       // Loaded separately if needed
             dependencies: vec![], // Loaded separately if needed
             comments: vec![],     // Loaded separately if needed
@@ -3326,7 +3328,7 @@ impl SqliteStorage {
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system,
+                     due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                      pinned, is_template
@@ -3351,7 +3353,7 @@ impl SqliteStorage {
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                     due_at, defer_until, external_ref, source_system,
+                     due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                      pinned, is_template
@@ -3409,7 +3411,7 @@ impl SqliteStorage {
                 id, content_hash, title, description, design, acceptance_criteria, notes,
                 status, priority, issue_type, assignee, owner, estimated_minutes,
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
-                due_at, defer_until, external_ref, source_system,
+                due_at, defer_until, external_ref, source_system, source_repo,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                 pinned, is_template
@@ -3441,6 +3443,7 @@ impl SqliteStorage {
                 defer_until_str,
                 issue.external_ref,
                 issue.source_system,
+                issue.source_repo.as_deref().unwrap_or("."),
                 deleted_at_str,
                 issue.deleted_by,
                 issue.delete_reason,
@@ -3646,6 +3649,7 @@ mod tests {
             due_at: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -3697,6 +3701,7 @@ mod tests {
             due_at: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -4168,6 +4173,7 @@ mod tests {
             due_at: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -4236,6 +4242,7 @@ mod tests {
             due_at: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -4296,6 +4303,7 @@ mod tests {
             due_at: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

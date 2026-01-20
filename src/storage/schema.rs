@@ -33,6 +33,7 @@ pub const SCHEMA_SQL: &str = r"
         defer_until TEXT,
         external_ref TEXT,
         source_system TEXT NOT NULL DEFAULT '',
+        source_repo TEXT NOT NULL DEFAULT '.',
         deleted_at TEXT,
         deleted_by TEXT NOT NULL DEFAULT '',
         delete_reason TEXT NOT NULL DEFAULT '',
@@ -207,6 +208,19 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if has_compaction_level {
         conn.execute(
             "UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL",
+            [],
+        )?;
+    }
+
+    // Migration: ensure source_repo column exists (bd compatibility)
+    let has_source_repo: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='source_repo'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_source_repo {
+        conn.execute(
+            "ALTER TABLE issues ADD COLUMN source_repo TEXT NOT NULL DEFAULT '.'",
             [],
         )?;
     }
