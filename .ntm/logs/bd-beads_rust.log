@@ -1,0 +1,42 @@
+error: unrecognized subcommand 'daemon'
+
+Usage: bd [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+[supervisor] daemon exited with error: exit status 2
+[supervisor] restarting in 1s (attempt 1/5)
+error: unrecognized subcommand 'daemon'
+
+Usage: bd [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+[supervisor] daemon exited with error: exit status 2
+[supervisor] restarting in 2s (attempt 2/5)
+error: unrecognized subcommand 'daemon'
+
+Usage: bd [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+[supervisor] daemon exited with error: exit status 2
+[supervisor] restarting in 4s (attempt 3/5)
+error: unrecognized subcommand 'daemon'
+
+Usage: bd [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+[supervisor] daemon exited with error: exit status 2
+[supervisor] restarting in 8s (attempt 4/5)
+error: unrecognized subcommand 'daemon'
+
+Usage: bd [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+[supervisor] daemon exited with error: exit status 2
+[supervisor] restarting in 16s (attempt 5/5)
+error: unrecognized subcommand 'daemon'
+
+Usage: bd [OPTIONS] <COMMAND>
+
+For more information, try '--help'.
+[supervisor] daemon exited with error: exit status 2
+[supervisor] max restarts (5) exceeded, not restarting

@@ -6,6 +6,7 @@
 use crate::cli::SyncArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
@@ -78,7 +79,12 @@ struct SyncPathPolicy {
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or the sync operation fails.
-pub fn execute(args: &SyncArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &SyncArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let config::OpenStorageResult {

@@ -6,6 +6,7 @@
 use crate::cli::DeleteArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -49,7 +50,12 @@ impl DeleteResult {
 /// - Has dependents without --force or --cascade
 /// - Database operation fails
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &DeleteArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &DeleteArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     // 1. Collect IDs from args and/or file
     let mut ids: Vec<String> = args.ids.clone();
 

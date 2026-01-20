@@ -3,6 +3,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::StaleIssue;
 use crate::model::{Issue, Status};
+use crate::output::OutputContext;
 use crate::storage::ListFilters;
 use chrono::{DateTime, Duration, Utc};
 
@@ -11,7 +12,12 @@ use chrono::{DateTime, Duration, Utc};
 /// # Errors
 ///
 /// Returns an error if filters are invalid or the database query fails.
-pub fn execute(args: &StaleArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &StaleArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     if args.days < 0 {
         return Err(BeadsError::validation("days", "must be >= 0"));
     }

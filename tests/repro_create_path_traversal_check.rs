@@ -1,6 +1,7 @@
 use beads_rust::cli::CreateArgs;
 use beads_rust::cli::commands::create;
 use beads_rust::config::CliOverrides;
+use beads_rust::output::OutputContext;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -34,9 +35,10 @@ fn test_create_from_file_rejects_parent_dir() {
     };
 
     let overrides = CliOverrides::default();
+    let ctx = OutputContext::from_flags(false, false, true);
 
     // We expect this to SUCCEED now (path traversal check removed for CLI input)
-    let result = create::execute(&args, &overrides);
+    let result = create::execute(&args, &overrides, &ctx);
 
     if let Err(e) = result {
         // If it fails for other reasons (e.g. invalid markdown), that's fine,

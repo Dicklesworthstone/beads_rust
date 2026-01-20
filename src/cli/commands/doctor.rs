@@ -4,6 +4,7 @@
 
 use crate::config;
 use crate::error::Result;
+use crate::output::OutputContext;
 use crate::sync::{
     PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
 };
@@ -707,7 +708,7 @@ fn check_sync_metadata(
 ///
 /// Returns an error if report serialization fails or if IO operations fail.
 #[allow(clippy::too_many_lines)]
-pub fn execute(json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(json: bool, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     let mut checks = Vec::new();
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
         push_check(

@@ -21,7 +21,13 @@ use std::path::Path;
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or the query fails.
-pub fn execute(args: &ListArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+#[allow(clippy::too_many_lines)]
+pub fn execute(
+    args: &ListArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;

@@ -2,6 +2,7 @@ use beads_rust::cli::commands;
 use beads_rust::cli::{Cli, Commands};
 use beads_rust::config;
 use beads_rust::logging::init_logging;
+use beads_rust::output::OutputContext;
 use beads_rust::sync::{auto_flush, auto_import_if_stale};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::Parser;
@@ -9,8 +10,10 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use tracing::debug;
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
+    let output_ctx = OutputContext::from_args(&cli);
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
@@ -34,60 +37,78 @@ fn main() {
             prefix,
             force,
             backend: _,
-        } => commands::init::execute(prefix, force, None),
-        Commands::Create(args) => commands::create::execute(&args, &overrides),
-        Commands::Update(args) => commands::update::execute(&args, &overrides),
-        Commands::Delete(args) => commands::delete::execute(&args, cli.json, &overrides),
-        Commands::List(args) => commands::list::execute(&args, cli.json, &overrides),
-        Commands::Comments(args) => commands::comments::execute(&args, cli.json, &overrides),
-        Commands::Search(args) => commands::search::execute(&args, cli.json, &overrides),
-        Commands::Show { ids } => commands::show::execute(ids, cli.json, &overrides),
+        } => commands::init::execute(prefix, force, None, &output_ctx),
+        Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
+        Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
+        Commands::Delete(args) => {
+            commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
+        }
+        Commands::List(args) => commands::list::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Comments(args) => {
+            commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
+        }
+        Commands::Search(args) => {
+            commands::search::execute(&args, cli.json, &overrides, &output_ctx)
+        }
+        Commands::Show { ids } => commands::show::execute(ids, cli.json, &overrides, &output_ctx),
         Commands::Close(args) => {
-            commands::close::execute_cli(&args, cli.json || args.robot, &overrides)
+            commands::close::execute_cli(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Reopen(args) => {
-            commands::reopen::execute(&args, cli.json || args.robot, &overrides)
+            commands::reopen::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
-        Commands::Q(args) => commands::q::execute(args, &overrides),
-        Commands::Dep { command } => commands::dep::execute(&command, cli.json, &overrides),
-        Commands::Epic { command } => commands::epic::execute(&command, cli.json, &overrides),
-        Commands::Label { command } => commands::label::execute(&command, cli.json, &overrides),
-        Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides),
-        Commands::Stale(args) => commands::stale::execute(&args, cli.json, &overrides),
-        Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides),
-        Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides),
+        Commands::Q(args) => commands::q::execute(args, &overrides, &output_ctx),
+        Commands::Dep { command } => {
+            commands::dep::execute(&command, cli.json, &overrides, &output_ctx)
+        }
+        Commands::Epic { command } => {
+            commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
+        }
+        Commands::Label { command } => {
+            commands::label::execute(&command, cli.json, &overrides, &output_ctx)
+        }
+        Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Stale(args) => commands::stale::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Blocked(args) => {
-            commands::blocked::execute(&args, cli.json || args.robot, &overrides)
+            commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
-        Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides),
-        Commands::Doctor => commands::doctor::execute(cli.json, &overrides),
-        Commands::Info(args) => commands::info::execute(&args, cli.json, &overrides),
-        Commands::Where => commands::r#where::execute(cli.json, &overrides),
-        Commands::Version => commands::version::execute(cli.json),
+        Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Doctor => commands::doctor::execute(cli.json, &overrides, &output_ctx),
+        Commands::Info(args) => commands::info::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Where => commands::r#where::execute(cli.json, &overrides, &output_ctx),
+        Commands::Version => commands::version::execute(cli.json, &output_ctx),
 
         #[cfg(feature = "self_update")]
-        Commands::Upgrade(args) => commands::upgrade::execute(&args, cli.json),
-        Commands::Completions(args) => commands::completions::execute(&args),
-        Commands::Audit { command } => commands::audit::execute(&command, cli.json, &overrides),
-        Commands::Stats(args) | Commands::Status(args) => {
-            commands::stats::execute(&args, cli.json || args.robot, &overrides)
+        Commands::Upgrade(args) => commands::upgrade::execute(&args, cli.json, &output_ctx),
+        Commands::Completions(args) => commands::completions::execute(&args, &output_ctx),
+        Commands::Audit { command } => {
+            commands::audit::execute(&command, cli.json, &overrides, &output_ctx)
         }
-        Commands::Config { command } => commands::config::execute(&command, cli.json, &overrides),
-        Commands::History(args) => commands::history::execute(args, &overrides),
+        Commands::Stats(args) | Commands::Status(args) => {
+            commands::stats::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
+        }
+        Commands::Config { command } => {
+            commands::config::execute(&command, cli.json, &overrides, &output_ctx)
+        }
+        Commands::History(args) => commands::history::execute(args, &overrides, &output_ctx),
         Commands::Defer(args) => {
-            commands::defer::execute_defer(&args, cli.json || args.robot, &overrides)
+            commands::defer::execute_defer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Undefer(args) => {
-            commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides)
+            commands::defer::execute_undefer(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Orphans(args) => {
-            commands::orphans::execute(&args, cli.json || args.robot, &overrides)
+            commands::orphans::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Changelog(args) => {
-            commands::changelog::execute(&args, cli.json || args.robot, &overrides)
+            commands::changelog::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
-        Commands::Query { command } => commands::query::execute(&command, cli.json, &overrides),
-        Commands::Graph(args) => commands::graph::execute(&args, cli.json, &overrides),
+        Commands::Query { command } => {
+            commands::query::execute(&command, cli.json, &overrides, &output_ctx)
+        }
+        Commands::Graph(args) => commands::graph::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Agents(args) => {
             let agents_args = commands::agents::AgentsArgs {
                 add: args.add,
@@ -97,7 +118,7 @@ fn main() {
                 dry_run: args.dry_run,
                 force: args.force,
             };
-            commands::agents::execute(&agents_args, cli.json)
+            commands::agents::execute(&agents_args, cli.json, &output_ctx)
         }
     };
 

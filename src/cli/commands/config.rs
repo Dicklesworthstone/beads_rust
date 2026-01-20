@@ -15,6 +15,7 @@ use crate::config::{
     load_project_config, load_user_config, resolve_actor,
 };
 use crate::error::Result;
+use crate::output::OutputContext;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::env;
@@ -27,7 +28,12 @@ use std::process::Command;
 /// # Errors
 ///
 /// Returns an error if config cannot be loaded or operations fail.
-pub fn execute(command: &ConfigCommands, json_mode: bool, overrides: &CliOverrides) -> Result<()> {
+pub fn execute(
+    command: &ConfigCommands,
+    json_mode: bool,
+    overrides: &CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     match command {
         ConfigCommands::Path => show_paths(json_mode),
         ConfigCommands::Edit => edit_config(),

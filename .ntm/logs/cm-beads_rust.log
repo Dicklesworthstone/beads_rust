@@ -1,0 +1,2 @@
+[cm] MCP HTTP server listening on http://127.0.0.1:36547
+[cm] WARNING: Transport is HTTP-only; stdio/SSE are intentionally disabled.

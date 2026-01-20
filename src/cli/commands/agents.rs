@@ -4,6 +4,7 @@
 //! beads workflow instructions in AGENTS.md or CLAUDE.md files.
 
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use regex::Regex;
 use std::fs;
 use std::io::{self, Write};
@@ -359,7 +360,7 @@ pub struct AgentsArgs {
 /// # Errors
 ///
 /// Returns an error if file operations fail.
-pub fn execute(args: &AgentsArgs, json: bool) -> Result<()> {
+pub fn execute(args: &AgentsArgs, json: bool, _ctx: &OutputContext) -> Result<()> {
     let work_dir = std::env::current_dir()?;
     let detection = detect_agent_file_in_parents(&work_dir, 3);
 

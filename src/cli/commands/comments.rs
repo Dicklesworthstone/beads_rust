@@ -3,6 +3,7 @@
 use crate::cli::{CommentAddArgs, CommentCommands, CommentListArgs, CommentsArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use std::fs;
@@ -15,7 +16,12 @@ use std::process::Command;
 /// # Errors
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
-pub fn execute(args: &CommentsArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &CommentsArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 

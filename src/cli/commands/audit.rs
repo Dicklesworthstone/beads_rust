@@ -3,6 +3,7 @@
 use crate::cli::{AuditCommands, AuditLabelArgs, AuditRecordArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,7 +69,12 @@ struct AuditLabelOutput {
 /// # Errors
 ///
 /// Returns an error if audit entry creation fails or file IO fails.
-pub fn execute(command: &AuditCommands, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    command: &AuditCommands,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let layer = config::load_config(&beads_dir, None, cli)?;
     let actor = config::resolve_actor(&layer);

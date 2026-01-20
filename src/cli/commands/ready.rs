@@ -19,7 +19,12 @@ use tracing::{debug, info, trace};
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or the query fails.
-pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &ReadyArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -90,36 +95,34 @@ pub fn execute(args: &ReadyArgs, json: bool, cli: &config::CliOverrides) -> Resu
     } else if ready_issues.is_empty() {
         // Match bd empty output format
         println!("✨ No open issues");
-    } else {
-        if matches!(ctx.mode(), OutputMode::Rich) {
-            let columns = IssueTableColumns {
-                id: true,
-                priority: true,
-                status: true,
-                issue_type: true,
-                title: true,
-                ..Default::default()
-            };
-            let table = IssueTable::new(&ready_issues, ctx.theme())
-                .columns(columns)
-                .title(format!(
-                    "Ready work ({} issue{} with no blockers)",
-                    ready_issues.len(),
-                    if ready_issues.len() == 1 { "" } else { "s" }
-                ))
-                .build();
-            ctx.render(&table);
-        } else {
-            // Match bd header format: 📋 Ready work (N issues with no blockers):
-            println!(
-                "📋 Ready work ({} issue{} with no blockers):\n",
+    } else if matches!(ctx.mode(), OutputMode::Rich) {
+        let columns = IssueTableColumns {
+            id: true,
+            priority: true,
+            status: true,
+            issue_type: true,
+            title: true,
+            ..Default::default()
+        };
+        let table = IssueTable::new(&ready_issues, ctx.theme())
+            .columns(columns)
+            .title(format!(
+                "Ready work ({} issue{} with no blockers)",
                 ready_issues.len(),
                 if ready_issues.len() == 1 { "" } else { "s" }
-            );
-            for (i, issue) in ready_issues.iter().enumerate() {
-                let line = format_ready_line(i + 1, issue, use_color, max_width);
-                println!("{line}");
-            }
+            ))
+            .build();
+        ctx.render(&table);
+    } else {
+        // Match bd header format: 📋 Ready work (N issues with no blockers):
+        println!(
+            "📋 Ready work ({} issue{} with no blockers):\n",
+            ready_issues.len(),
+            if ready_issues.len() == 1 { "" } else { "s" }
+        );
+        for (i, issue) in ready_issues.iter().enumerate() {
+            let line = format_ready_line(i + 1, issue, use_color, max_width);
+            println!("{line}");
         }
     }
 

@@ -8,6 +8,7 @@ use crate::config;
 use crate::error::Result;
 use crate::format::{Breakdown, BreakdownEntry, RecentActivity, Statistics, StatsSummary};
 use crate::model::{IssueType, Status};
+use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::BTreeMap;
@@ -21,7 +22,12 @@ use tracing::{debug, info};
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or queries fail.
-pub fn execute(args: &StatsArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &StatsArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;

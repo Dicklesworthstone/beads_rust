@@ -4,6 +4,7 @@
 
 use crate::cli::UpgradeArgs;
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use self_update::backends::github;
 use self_update::cargo_crate_version;
 use self_update::update::ReleaseUpdate;
@@ -43,7 +44,7 @@ struct UpdateResult {
 /// # Errors
 ///
 /// Returns an error if the update check or download fails.
-pub fn execute(args: &UpgradeArgs, json: bool) -> Result<()> {
+pub fn execute(args: &UpgradeArgs, json: bool, _ctx: &OutputContext) -> Result<()> {
     let current_version = cargo_crate_version!();
 
     if args.dry_run {

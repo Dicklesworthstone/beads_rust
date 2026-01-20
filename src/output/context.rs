@@ -1,7 +1,7 @@
+use super::Theme;
 use crate::cli::Cli;
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
-use super::Theme;
 use std::io::IsTerminal;
 
 /// Central output coordinator that respects robot/json/quiet modes.
@@ -30,6 +30,7 @@ pub enum OutputMode {
 
 impl OutputContext {
     /// Create from CLI global args
+    #[must_use]
     pub fn from_args(args: &Cli) -> Self {
         let mode = Self::detect_mode(args);
         let console = Self::create_console(mode);
@@ -43,18 +44,20 @@ impl OutputContext {
         }
     }
 
-    /// Create from explicit flags (legacy/partial migration support)
-    pub fn from_flags(json: bool, quiet: bool, plain: bool) -> Self {
+    /// Create from CLI-style flags.
+    #[must_use]
+    pub fn from_flags(json: bool, quiet: bool, no_color: bool) -> Self {
         let mode = if json {
             OutputMode::Json
         } else if quiet {
             OutputMode::Quiet
-        } else if plain || !std::io::stdout().is_terminal() {
+        } else if no_color || std::env::var("NO_COLOR").is_ok() || !std::io::stdout().is_terminal()
+        {
             OutputMode::Plain
         } else {
             OutputMode::Rich
         };
-        
+
         let console = Self::create_console(mode);
         let width = console.width();
 
@@ -86,17 +89,9 @@ impl OutputContext {
         match mode {
             OutputMode::Rich => Console::new(),
             OutputMode::Plain | OutputMode::Quiet => {
-                Console::builder()
-                    .color_system(ColorSystem::Standard)
-                    .force_terminal(false)
-                    .build()
+                Console::builder().no_color().force_terminal(false).build()
             }
-            OutputMode::Json => {
-                Console::builder()
-                    .color_system(ColorSystem::Standard)
-                    .force_terminal(false)
-                    .build()
-            }
+            OutputMode::Json => Console::builder().no_color().force_terminal(false).build(),
         }
     }
 
@@ -104,13 +99,27 @@ impl OutputContext {
     // Mode Checks
     // ─────────────────────────────────────────────────────────────
 
-    pub fn mode(&self) -> OutputMode { self.mode }
-    pub fn is_rich(&self) -> bool { self.mode == OutputMode::Rich }
-    pub fn is_json(&self) -> bool { self.mode == OutputMode::Json }
-    pub fn is_quiet(&self) -> bool { self.mode == OutputMode::Quiet }
-    pub fn is_plain(&self) -> bool { self.mode == OutputMode::Plain }
-    pub fn width(&self) -> usize { self.width }
-    pub fn theme(&self) -> &Theme { &self.theme }
+    pub fn mode(&self) -> OutputMode {
+        self.mode
+    }
+    pub fn is_rich(&self) -> bool {
+        self.mode == OutputMode::Rich
+    }
+    pub fn is_json(&self) -> bool {
+        self.mode == OutputMode::Json
+    }
+    pub fn is_quiet(&self) -> bool {
+        self.mode == OutputMode::Quiet
+    }
+    pub fn is_plain(&self) -> bool {
+        self.mode == OutputMode::Plain
+    }
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
 
     // ─────────────────────────────────────────────────────────────
     // Output Methods
@@ -122,8 +131,7 @@ impl OutputContext {
             OutputMode::Plain => {
                 self.console.print(content);
             }
-            OutputMode::Quiet => { } //
-            OutputMode::Json => { } //
+            OutputMode::Quiet | OutputMode::Json => {} //
         }
     }
 
@@ -133,17 +141,21 @@ impl OutputContext {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if serialization fails.
     pub fn json<T: serde::Serialize>(&self, value: &T) {
         if self.is_json() {
             println!("{}", serde_json::to_string(value).unwrap());
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if serialization fails.
     pub fn json_pretty<T: serde::Serialize>(&self, value: &T) {
         if self.is_rich() {
-            let json = rich_rust::renderables::Json::new(
-                serde_json::to_value(value).unwrap()
-            );
+            let json = rich_rust::renderables::Json::new(serde_json::to_value(value).unwrap());
             self.console.print_renderable(&json);
         } else if self.is_json() {
             println!("{}", serde_json::to_string_pretty(value).unwrap());
@@ -157,10 +169,7 @@ impl OutputContext {
     pub fn success(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console.print(&format!(
-                    "[bold green]✓[/] {}",
-                    message
-                ));
+                self.console.print(&format!("[bold green]✓[/] {}", message));
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json => {} //
@@ -170,13 +179,11 @@ impl OutputContext {
     pub fn error(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                let panel = Panel::from_text(message)
-                    .title(Text::new("Error"));
-                    // .border_style(self.theme.error.clone()); // border_style missing?
+                let panel = Panel::from_text(message).title(Text::new("Error"));
+                // .border_style(self.theme.error.clone()); // border_style missing?
                 self.console.print_renderable(&panel);
             }
-            OutputMode::Plain => eprintln!("Error: {}", message),
-            OutputMode::Quiet => eprintln!("Error: {}", message),
+            OutputMode::Plain | OutputMode::Quiet => eprintln!("Error: {}", message),
             OutputMode::Json => {} //
         }
     }
@@ -184,24 +191,18 @@ impl OutputContext {
     pub fn warning(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console.print(&format!(
-                    "[bold yellow]⚠[/] [yellow]{}[/]",
-                    message
-                ));
+                self.console
+                    .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]", message));
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
-            OutputMode::Quiet => {} //
-            OutputMode::Json => {}  //
+            OutputMode::Quiet | OutputMode::Json => {} //
         }
     }
 
     pub fn info(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console.print(&format!(
-                    "[blue]ℹ[/] {}",
-                    message
-                ));
+                self.console.print(&format!("[blue]ℹ[/] {}", message));
             }
             OutputMode::Plain => println!("{}", message),
             OutputMode::Quiet | OutputMode::Json => {} //
@@ -224,29 +225,28 @@ impl OutputContext {
             println!();
         }
     }
-    
+
     pub fn error_panel(&self, title: &str, description: &str, suggestions: &[&str]) {
-         match self.mode {
+        match self.mode {
             OutputMode::Rich => {
                 let mut text = Text::from(description);
                 text.append("\n\nSuggestions:\n");
                 for suggestion in suggestions {
-                     text.append(&format!("• {}\n", suggestion));
+                    text.append(&format!("• {}\n", suggestion));
                 }
-                
-                let panel = Panel::from_rich_text(&text, self.width)
-                    .title(Text::new(title));
-                    // .border_style(self.theme.error.clone());
+
+                let panel = Panel::from_rich_text(&text, self.width).title(Text::new(title));
+                // .border_style(self.theme.error.clone());
                 self.console.print_renderable(&panel);
             }
-             OutputMode::Plain => {
-                 eprintln!("Error: {} - {}", title, description);
-                 for suggestion in suggestions {
-                     eprintln!("  Suggestion: {}", suggestion);
-                 }
-             }
-             OutputMode::Quiet => eprintln!("Error: {}", description),
-             OutputMode::Json => {} //
-         }
+            OutputMode::Plain => {
+                eprintln!("Error: {} - {}", title, description);
+                for suggestion in suggestions {
+                    eprintln!("  Suggestion: {}", suggestion);
+                }
+            }
+            OutputMode::Quiet => eprintln!("Error: {}", description),
+            OutputMode::Json => {} //
+        }
     }
 }

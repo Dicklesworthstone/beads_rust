@@ -4,6 +4,7 @@ use crate::cli::ReopenArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
+use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use serde::Serialize;
@@ -39,7 +40,12 @@ pub struct ReopenResult {
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &ReopenArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &ReopenArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let use_json = json || args.robot;
 
     tracing::info!("Executing reopen command");

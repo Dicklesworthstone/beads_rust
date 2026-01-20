@@ -17,6 +17,7 @@
 
 use crate::cli::{Cli, CompletionsArgs, ShellType};
 use crate::error::Result;
+use crate::output::OutputContext;
 use clap::CommandFactory;
 use clap_complete::{Shell, generate};
 use std::io;
@@ -27,7 +28,7 @@ use tracing::info;
 /// # Errors
 ///
 /// Returns an error if file I/O fails.
-pub fn execute(args: &CompletionsArgs) -> Result<()> {
+pub fn execute(args: &CompletionsArgs, _ctx: &OutputContext) -> Result<()> {
     info!(shell = ?args.shell, output = ?args.output, "Generating shell completions");
 
     let mut cmd = Cli::command();

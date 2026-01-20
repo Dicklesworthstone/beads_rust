@@ -3,6 +3,7 @@
 use crate::cli::InfoArgs;
 use crate::config;
 use crate::error::Result;
+use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::util::parse_id;
@@ -58,7 +59,12 @@ struct InfoOutput {
 /// # Errors
 ///
 /// Returns an error if configuration or storage access fails.
-pub fn execute(args: &InfoArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &InfoArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     if args.whats_new {
         return print_message(json, "No whats-new data available for br.", "whats_new");
     }

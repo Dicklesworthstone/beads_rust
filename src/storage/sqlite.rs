@@ -1090,10 +1090,11 @@ impl SqliteStorage {
         //
         // For conditional-blocks, we also need to check if the blocker closed with failure
         // but for simplicity in this initial implementation, we treat it like blocks.
-        let blocked_issues: Vec<(String, String)> = {
+        let mut blocked_issues_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        {
             let mut stmt = conn.prepare(
-                r"SELECT DISTINCT d.issue_id,
-                         COALESCE(GROUP_CONCAT(d.depends_on_id || ':' || COALESCE(i.status, 'unknown'), ','), '')
+                r"SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
                   FROM dependencies d
                   LEFT JOIN issues i ON d.depends_on_id = i.id
                   WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
@@ -1103,16 +1104,21 @@ impl SqliteStorage {
                       i.status NOT IN ('closed', 'tombstone')
                       -- Or it's an external dependency (not in our DB)
                       OR i.id IS NULL
-                    )
-                  GROUP BY d.issue_id
-                  HAVING COUNT(*) > 0",
+                    )",
             )?;
 
-            stmt.query_map([], |row| {
+            let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+            })?;
+
+            for row in rows {
+                let (issue_id, blocker_ref) = row?;
+                blocked_issues_map
+                    .entry(issue_id)
+                    .or_default()
+                    .push(blocker_ref);
+            }
+        }
 
         // Insert blocked issues into cache
         let mut count = 0;
@@ -1121,25 +1127,13 @@ impl SqliteStorage {
                 "INSERT INTO blocked_issues_cache (issue_id, blocked_by_json) VALUES (?, ?)",
             )?;
 
-            for (issue_id, blockers) in &blocked_issues {
-                // Skip if blockers is empty (shouldn't happen with HAVING COUNT(*) > 0)
+            for (issue_id, blockers) in blocked_issues_map {
                 if blockers.is_empty() {
                     continue;
                 }
-                // Convert blockers string to JSON array
-                let blockers_json = format!(
-                    "[{}]",
-                    blockers
-                        .split(',')
-                        .filter(|b| !b.is_empty())
-                        .map(|b| format!("\"{b}\""))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                // Don't insert if json array is empty
-                if blockers_json == "[]" {
-                    continue;
-                }
+                // Convert blockers list to JSON array using serde_json for safety
+                let blockers_json =
+                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
                 insert_stmt.execute(rusqlite::params![issue_id, blockers_json])?;
                 count += 1;
             }
@@ -4730,5 +4724,34 @@ mod tests {
         assert!(ids.contains(&"bd-old"));
         assert!(ids.contains(&"bd-new"));
         assert!(!ids.contains(&"bd-older"));
+    }
+
+    #[test]
+    fn test_blocked_cache_handles_quotes_in_ids() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc::now();
+
+        let issue = make_issue("bd-x1", "Blocked", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Add a dependency on an ID containing a quote (e.g. from bad import)
+        // This is valid in DB but tricky for manual JSON building
+        let tricky_id = "external:foo\"bar";
+        storage
+            .add_dependency("bd-x1", tricky_id, "blocks", "tester")
+            .unwrap();
+
+        // Cache should be rebuilt and handle the quote correctly
+        // (rebuild happens automatically on add_dependency via mutation context)
+
+        // Verify we can read it back without error
+        let blocked = storage.get_blocked_issues().unwrap();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0.id, "bd-x1");
+
+        let blockers = &blocked[0].1;
+        assert_eq!(blockers.len(), 1);
+        // ID + ":unknown" (since external doesn't have status in our DB)
+        assert_eq!(blockers[0], "external:foo\"bar:unknown");
     }
 }

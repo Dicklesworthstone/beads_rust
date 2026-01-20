@@ -7,6 +7,7 @@ use crate::cli::ChangelogArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, Status};
+use crate::output::OutputContext;
 use crate::storage::ListFilters;
 use crate::util::time::{parse_flexible_timestamp, parse_relative_time};
 use chrono::{DateTime, Utc};
@@ -53,7 +54,12 @@ pub struct ChangelogEntry {
 /// # Errors
 ///
 /// Returns an error if config loading, git lookup, or storage access fails.
-pub fn execute(args: &ChangelogArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &ChangelogArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(None)?;
     let config::OpenStorageResult { storage, .. } = config::open_storage_with_cli(&beads_dir, cli)?;
 

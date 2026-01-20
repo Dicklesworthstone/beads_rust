@@ -2,6 +2,7 @@ use crate::cli::QuickArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, IssueType, Priority, Status};
+use crate::output::OutputContext;
 use crate::util::id::IdGenerator;
 use crate::validation::LabelValidator;
 use chrono::Utc;
@@ -26,7 +27,7 @@ fn split_labels(values: &[String]) -> Vec<String> {
 /// # Errors
 ///
 /// Returns an error if validation fails, the database cannot be opened, or creation fails.
-pub fn execute(args: QuickArgs, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(args: QuickArgs, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     let title = args.title.join(" ").trim().to_string();
     if title.is_empty() {
         return Err(BeadsError::validation("title", "cannot be empty"));

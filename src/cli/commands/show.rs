@@ -9,16 +9,19 @@ use crate::output::{OutputContext, OutputMode};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use rich_rust::segment::Segment;
-use rich_rust::renderables::Renderable; // For Panel? Panel is struct.
 use std::fmt::Write as FmtWrite;
-use std::borrow::Cow;
 
 /// Execute the show command.
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened or issues are not found.
-pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    ids: Vec<String>,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(None)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
@@ -179,20 +182,22 @@ impl ContentBuilder {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn append(&mut self, text: impl Into<String>, style: Style) {
         let text = text.into();
         let parts: Vec<&str> = text.split('\n').collect();
-        
+
         for (i, part) in parts.iter().enumerate() {
             if i > 0 {
                 self.flush_line();
             }
             if !part.is_empty() {
-                self.current_line.push(Segment::new(part.to_string(), Some(style.clone())));
+                self.current_line
+                    .push(Segment::new(part.to_string(), Some(style.clone())));
             }
         }
     }
-    
+
     fn flush_line(&mut self) {
         // If current line is empty, push empty vec to represent blank line?
         // Or if we just flushed, we are at start of new line.
@@ -203,7 +208,7 @@ impl ContentBuilder {
         let line = std::mem::take(&mut self.current_line);
         self.lines.push(line);
     }
-    
+
     fn finish(mut self) -> Vec<Vec<Segment<'static>>> {
         if !self.current_line.is_empty() {
             self.lines.push(self.current_line);
@@ -212,6 +217,7 @@ impl ContentBuilder {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_issue_details_rich(details: &crate::format::IssueDetails, ctx: &OutputContext) {
     let theme = ctx.theme();
     let issue = &details.issue;
@@ -219,10 +225,7 @@ fn render_issue_details_rich(details: &crate::format::IssueDetails, ctx: &Output
 
     // Header: status icon + id + title + priority/status badge
     let status_icon = format_status_icon(&issue.status);
-    builder.append(
-        format!("{status_icon} "),
-        theme.status_style(&issue.status),
-    );
+    builder.append(format!("{status_icon} "), theme.status_style(&issue.status));
     builder.append(format!("{} · ", issue.id), theme.issue_id.clone());
     builder.append(issue.title.clone(), theme.issue_title.clone());
     builder.append("   [● ", Style::new());
@@ -346,9 +349,9 @@ fn render_issue_details_rich(details: &crate::format::IssueDetails, ctx: &Output
     }
 
     let panel = Panel::new(builder.finish())
-        .title(Text::new(&issue.id));
-        // .border_style(theme.panel_border.clone()) // Method likely missing
-        // .title_style(theme.panel_title.clone());  // Method likely missing
+        .title(Text::styled(issue.id.clone(), theme.panel_title.clone()))
+        .box_style(theme.box_style)
+        .border_style(theme.panel_border.clone());
     ctx.render(&panel);
 }
 

@@ -1,6 +1,7 @@
 //! Version command implementation.
 
 use crate::error::Result;
+use crate::output::OutputContext;
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -19,7 +20,7 @@ struct VersionOutput<'a> {
 /// # Errors
 ///
 /// Returns an error if JSON serialization fails.
-pub fn execute(json: bool) -> Result<()> {
+pub fn execute(json: bool, _ctx: &OutputContext) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let build = if cfg!(debug_assertions) {
         "dev"

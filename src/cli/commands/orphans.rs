@@ -8,6 +8,7 @@ use crate::cli::commands::close::{self, CloseArgs};
 use crate::config;
 use crate::error::Result;
 use crate::model::Status;
+use crate::output::OutputContext;
 use crate::storage::ListFilters;
 use regex::Regex;
 use serde::Serialize;
@@ -35,7 +36,12 @@ pub struct OrphanIssue {
 /// Returns an error only for unexpected failures. Returns empty list
 /// (not error) when git/DB is unavailable.
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &OrphansArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &OrphansArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     // Try to discover beads directory - return empty if not found
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
         output_empty(json);
@@ -155,7 +161,7 @@ pub fn execute(args: &OrphansArgs, json: bool, cli: &config::CliOverrides) -> Re
                         suggest_next: false,
                     };
 
-                    if let Err(e) = close::execute_with_args(&close_args, false, cli) {
+                    if let Err(e) = close::execute_with_args(&close_args, false, cli, ctx) {
                         eprintln!("  Failed to close {}: {}", orphan.issue_id, e);
                     }
                 } else {

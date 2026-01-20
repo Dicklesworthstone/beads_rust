@@ -2,6 +2,7 @@ use crate::cli::{CountArgs, CountBy};
 use crate::config;
 use crate::error::Result;
 use crate::model::{IssueType, Priority, Status};
+use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -28,7 +29,12 @@ struct CountGroupedOutput {
 /// # Errors
 ///
 /// Returns an error if filters are invalid or the database query fails.
-pub fn execute(args: &CountArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &CountArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(None)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;

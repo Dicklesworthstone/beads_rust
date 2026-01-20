@@ -9,6 +9,7 @@ use crate::config::{
 use crate::error::{BeadsError, Result};
 use crate::format::{BlockedIssue, BlockedIssueOutput};
 use crate::model::{IssueType, Priority};
+use crate::output::OutputContext;
 use std::str::FromStr;
 
 /// Execute the blocked command.
@@ -19,7 +20,12 @@ use std::str::FromStr;
 /// - The beads directory cannot be found
 /// - The database cannot be opened
 /// - Querying blocked issues fails
-pub fn execute(args: &BlockedArgs, json: bool, overrides: &CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &BlockedArgs,
+    json: bool,
+    overrides: &CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     tracing::info!("Fetching blocked issues from cache");
 
     let beads_dir = discover_beads_dir(None)?;

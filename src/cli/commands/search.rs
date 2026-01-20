@@ -7,6 +7,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
 use crate::model::{IssueType, Priority, Status};
+use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::HashSet;
@@ -20,7 +21,12 @@ use std::str::FromStr;
 ///
 /// Returns an error if the query is empty, the database cannot be opened,
 /// or the query fails.
-pub fn execute(args: &SearchArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &SearchArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let query = args.query.trim();
     if query.is_empty() {
         return Err(BeadsError::Validation {

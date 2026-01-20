@@ -2,6 +2,7 @@ use crate::cli::CreateArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
+use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::util::id::IdGenerator;
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
@@ -25,7 +26,7 @@ pub struct CreateConfig {
 ///
 /// Returns an error if validation fails, the database cannot be opened, or the issue cannot be created.
 #[allow(clippy::too_many_lines)]
-pub fn execute(args: &CreateArgs, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     if let Some(ref file_path) = args.file {
         if args.title.is_some() || args.title_flag.is_some() {
             return Err(BeadsError::validation(

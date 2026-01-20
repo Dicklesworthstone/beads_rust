@@ -4,6 +4,7 @@ use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
 use crate::model::{EpicStatus, IssueType, Status};
+use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use chrono::Utc;
 use colored::Colorize;
@@ -16,14 +17,24 @@ use std::path::Path;
 /// # Errors
 ///
 /// Returns an error if database operations fail.
-pub fn execute(command: &EpicCommands, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    command: &EpicCommands,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     match command {
-        EpicCommands::Status(args) => execute_status(args, json, cli),
-        EpicCommands::CloseEligible(args) => execute_close_eligible(args, json, cli),
+        EpicCommands::Status(args) => execute_status(args, json, cli, ctx),
+        EpicCommands::CloseEligible(args) => execute_close_eligible(args, json, cli, ctx),
     }
 }
 
-fn execute_status(args: &EpicStatusArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+fn execute_status(
+    args: &EpicStatusArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
@@ -62,6 +73,7 @@ fn execute_close_eligible(
     args: &EpicCloseEligibleArgs,
     json: bool,
     cli: &config::CliOverrides,
+    _ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;

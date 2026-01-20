@@ -5,6 +5,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::ReadyIssue;
 use crate::model::{Issue, Status};
+use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use crate::util::time::parse_flexible_timestamp;
@@ -32,7 +33,12 @@ pub struct SkippedIssue {
 /// # Errors
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
-pub fn execute_defer(args: &DeferArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute_defer(
+    args: &DeferArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let use_json = json || args.robot;
 
     tracing::info!("Executing defer command");
@@ -164,7 +170,12 @@ pub fn execute_defer(args: &DeferArgs, json: bool, cli: &config::CliOverrides) -
 /// # Errors
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
-pub fn execute_undefer(args: &UndeferArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute_undefer(
+    args: &UndeferArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let use_json = json || args.robot;
 
     tracing::info!("Executing undefer command");
@@ -457,7 +468,8 @@ mod tests {
     fn execute_defer_sets_status_and_until() {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");
-        commands::init::execute(None, false, Some(temp.path())).expect("init");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -470,7 +482,7 @@ mod tests {
             until: Some("+1d".to_string()),
             robot: true,
         };
-        execute_defer(&args, true, &CliOverrides::default()).expect("defer");
+        execute_defer(&args, true, &CliOverrides::default(), &ctx).expect("defer");
 
         let updated = storage.get_issue("bd-defer-1").expect("get").unwrap();
         assert_eq!(updated.status, Status::Deferred);
@@ -481,7 +493,8 @@ mod tests {
     fn execute_defer_without_until_sets_indefinite() {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");
-        commands::init::execute(None, false, Some(temp.path())).expect("init");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -494,7 +507,7 @@ mod tests {
             until: None,
             robot: true,
         };
-        execute_defer(&args, true, &CliOverrides::default()).expect("defer");
+        execute_defer(&args, true, &CliOverrides::default(), &ctx).expect("defer");
 
         let updated = storage.get_issue("bd-defer-2").expect("get").unwrap();
         assert_eq!(updated.status, Status::Deferred);
@@ -505,7 +518,8 @@ mod tests {
     fn execute_undefer_clears_defer_until() {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");
-        commands::init::execute(None, false, Some(temp.path())).expect("init");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -518,13 +532,13 @@ mod tests {
             until: Some("+1d".to_string()),
             robot: true,
         };
-        execute_defer(&defer_args, true, &CliOverrides::default()).expect("defer");
+        execute_defer(&defer_args, true, &CliOverrides::default(), &ctx).expect("defer");
 
         let undefer_args = UndeferArgs {
             ids: vec!["bd-defer-3".to_string()],
             robot: true,
         };
-        execute_undefer(&undefer_args, true, &CliOverrides::default()).expect("undefer");
+        execute_undefer(&undefer_args, true, &CliOverrides::default(), &ctx).expect("undefer");
 
         let updated = storage.get_issue("bd-defer-3").expect("get").unwrap();
         assert_eq!(updated.status, Status::Open);

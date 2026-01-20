@@ -6,6 +6,7 @@ use crate::cli::LintArgs;
 use crate::config;
 use crate::error::Result;
 use crate::model::{Issue, IssueType, Status};
+use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use serde::Serialize;
@@ -75,7 +76,12 @@ const EPIC_SECTIONS: [RequiredSection; 1] = [RequiredSection {
 /// # Errors
 ///
 /// Returns an error if database access fails or filters are invalid.
-pub fn execute(args: &LintArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    args: &LintArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;

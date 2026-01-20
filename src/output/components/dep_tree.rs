@@ -11,6 +11,7 @@ pub struct DependencyTree<'a> {
 }
 
 impl<'a> DependencyTree<'a> {
+    #[must_use]
     pub fn new(root: &'a Issue, all: &'a [Issue], theme: &'a Theme) -> Self {
         Self {
             root_issue: root,
@@ -20,16 +21,19 @@ impl<'a> DependencyTree<'a> {
         }
     }
 
+    #[must_use]
     pub fn max_depth(mut self, depth: usize) -> Self {
         self.max_depth = depth;
         self
     }
 
+    #[must_use]
     pub fn build(&self) -> Tree {
         let root_node = self.build_node(self.root_issue, 0);
 
-        Tree::new(root_node).guides(TreeGuides::Rounded)
-        // .style(self.theme.dimmed.clone())
+        Tree::new(root_node)
+            .guides(TreeGuides::Rounded)
+            .guide_style(self.theme.dimmed.clone())
     }
 
     fn build_node(&self, issue: &Issue, depth: usize) -> TreeNode {

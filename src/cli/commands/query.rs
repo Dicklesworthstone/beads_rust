@@ -7,6 +7,7 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::output::OutputContext;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -228,13 +229,20 @@ struct QueryActionOutput {
 /// # Errors
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
-pub fn execute(command: &QueryCommands, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    command: &QueryCommands,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     match command {
         QueryCommands::Save(args) => query_save(args, &mut storage_ctx.storage, json),
-        QueryCommands::Run(args) => query_run(args, &storage_ctx.storage, json, cli, &beads_dir),
+        QueryCommands::Run(args) => {
+            query_run(args, &storage_ctx.storage, json, cli, &beads_dir, ctx)
+        }
         QueryCommands::List => query_list(&storage_ctx.storage, json),
         QueryCommands::Delete(args) => query_delete(args, &mut storage_ctx.storage, json),
     }
@@ -300,6 +308,7 @@ fn query_run(
     json: bool,
     cli: &config::CliOverrides,
     _beads_dir: &Path,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let name = args.name.trim();
     let key = format!("{QUERY_KEY_PREFIX}{name}");
@@ -321,7 +330,7 @@ fn query_run(
 
     // Execute list command with merged args
     // We call the list execute function directly
-    super::list::execute(&merged_args, json, cli)
+    super::list::execute(&merged_args, json, cli, ctx)
 }
 
 fn query_list(storage: &crate::storage::SqliteStorage, json: bool) -> Result<()> {

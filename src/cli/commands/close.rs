@@ -4,6 +4,7 @@ use crate::cli::CloseArgs as CliCloseArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::Status;
+use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use chrono::Utc;
@@ -41,9 +42,14 @@ impl From<&CliCloseArgs> for CloseArgs {
 /// # Errors
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
-pub fn execute_cli(cli_args: &CliCloseArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute_cli(
+    cli_args: &CliCloseArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let args = CloseArgs::from(cli_args);
-    execute_with_args(&args, json, cli)
+    execute_with_args(&args, json, cli, ctx)
 }
 
 /// Result of a close operation for JSON output.
@@ -92,7 +98,12 @@ pub struct SkippedIssue {
 /// # Errors
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
-pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(
+    ids: Vec<String>,
+    json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let args = CloseArgs {
         ids,
         reason: None,
@@ -101,7 +112,7 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
         suggest_next: false,
     };
 
-    execute_with_args(&args, json, cli)
+    execute_with_args(&args, json, cli, ctx)
 }
 
 /// Execute the close command with full arguments.
@@ -110,7 +121,12 @@ pub fn execute(ids: Vec<String>, json: bool, cli: &config::CliOverrides) -> Resu
 ///
 /// Returns an error if database operations fail or IDs cannot be resolved.
 #[allow(clippy::too_many_lines)]
-pub fn execute_with_args(args: &CloseArgs, json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute_with_args(
+    args: &CloseArgs,
+    json: bool,
+    cli: &config::CliOverrides,
+    _ctx: &OutputContext,
+) -> Result<()> {
     tracing::info!("Executing close command");
 
     let beads_dir = config::discover_beads_dir(None)?;

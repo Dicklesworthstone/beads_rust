@@ -3,6 +3,7 @@
 use crate::config;
 use crate::config::routing::follow_redirects;
 use crate::error::Result;
+use crate::output::OutputContext;
 use crate::util::parse_id;
 use serde::Serialize;
 use std::fs::File;
@@ -25,7 +26,7 @@ struct WhereOutput {
 /// # Errors
 ///
 /// Returns an error if redirect resolution fails.
-pub fn execute(json: bool, cli: &config::CliOverrides) -> Result<()> {
+pub fn execute(json: bool, cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     let Ok(beads_dir) = config::discover_beads_dir(Some(Path::new("."))) else {
         return handle_missing_beads(json);
     };
