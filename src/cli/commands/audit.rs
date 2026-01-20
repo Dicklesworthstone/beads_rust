@@ -487,12 +487,12 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
         let mut details = String::new();
         if let Some(old) = &event.old_value {
             if let Some(new) = &event.new_value {
-                details.push_str(&format!("   {} → {}", old, new));
+                details.push_str(&format!("   {old} → {new}"));
             } else {
-                details.push_str(&format!("   Removed: {}", old));
+                details.push_str(&format!("   Removed: {old}"));
             }
         } else if let Some(new) = &event.new_value {
-            details.push_str(&format!("   Set: {}", new));
+            details.push_str(&format!("   Set: {new}"));
         }
 
         if !details.is_empty() {
@@ -501,7 +501,7 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
         }
 
         if let Some(comment) = &event.comment {
-            content.append_styled(&format!("   \"{}\"\n", comment), theme.comment.clone());
+            content.append_styled(&format!("   \"{comment}\"\n"), theme.comment.clone());
         }
 
         content.append("\n");
