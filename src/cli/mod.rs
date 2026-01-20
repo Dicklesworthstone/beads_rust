@@ -283,7 +283,7 @@ pub struct CreateArgs {
     pub title: Option<String>,
 
     /// Issue title (alternative flag)
-    #[arg(long)]
+    #[arg(long = "title")]
     pub title_flag: Option<String>, // Handled in logic
 
     /// Issue type (task, bug, feature, etc.)

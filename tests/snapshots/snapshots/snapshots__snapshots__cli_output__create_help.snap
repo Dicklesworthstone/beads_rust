@@ -10,7 +10,7 @@ Arguments:
   [TITLE]  Issue title
 
 Options:
-      --ID-REDACTED <TITLE_FLAG>      Issue title (alternative flag)
+      --title <TITLE_FLAG>           Issue title (alternative flag)
   -t, --type <TYPE>                  Issue type (task, bug, feature, etc.)
   -p, --priority <PRIORITY>          Priority (0-4 or P0-P4)
   -d, --description <DESCRIPTION>    Description

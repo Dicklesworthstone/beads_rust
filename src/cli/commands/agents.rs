@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 
 /// Current version of the agent instructions blurb.
 /// Increment this when making breaking changes to the blurb format.
-pub const BLURB_VERSION: u8 = 1;
+pub const BLURB_VERSION: u8 = 2;
 
 /// Start marker for the blurb (includes version).
-pub const BLURB_START_MARKER: &str = "<!-- br-agent-instructions-v1 -->";
+pub const BLURB_START_MARKER: &str = "<!-- br-agent-instructions-v2 -->";
 
 /// End marker for the blurb.
 pub const BLURB_END_MARKER: &str = "<!-- end-br-agent-instructions -->";
@@ -24,7 +24,7 @@ pub const BLURB_END_MARKER: &str = "<!-- end-br-agent-instructions -->";
 pub const SUPPORTED_AGENT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md", "agents.md", "claude.md"];
 
 /// The agent instructions blurb to append to AGENTS.md files.
-pub const AGENT_BLURB: &str = r#"<!-- br-agent-instructions-v1 -->
+pub const AGENT_BLURB: &str = r#"<!-- br-agent-instructions-v2 -->
 
 ---
 
@@ -66,7 +66,7 @@ br sync --status      # Check sync status
 
 - **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers 0-4, not words)
-- **Types**: task, bug, feature, epic, question, docs
+- **Types**: task, bug, feature, epic, chore
 - **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
 
 ### Session Protocol
@@ -726,7 +726,7 @@ mod tests {
         let detection = detect_agent_file(temp_dir.path());
         assert!(detection.found());
         assert!(detection.has_blurb);
-        assert_eq!(detection.blurb_version, 1);
+        assert_eq!(detection.blurb_version, 2);
         assert!(!detection.needs_blurb());
         assert!(!detection.needs_upgrade());
     }
