@@ -249,11 +249,23 @@ log_debug() {
 }
 
 # Spinner wrapper for long operations
+# Note: gum spin can only execute external binaries, not shell functions.
+# We work around this by checking if the command is a function and using bash -c.
 run_with_spinner() {
     local title="$1"
     shift
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
-        gum spin --spinner dot --title "$title" -- "$@"
+        # Check if first argument is a shell function
+        if declare -f "$1" >/dev/null 2>&1; then
+            # Export the function and run via bash -c
+            local func_name="$1"
+            shift
+            # Can't easily export functions to gum subshell, so fall back to no-spinner
+            log_step "$title"
+            "$func_name" "$@"
+        else
+            gum spin --spinner dot --title "$title" -- "$@"
+        fi
     else
         log_step "$title"
         "$@"
@@ -919,10 +931,12 @@ build_from_source() {
     # Build with explicit target dir to avoid conflicts
     local target_dir="$TMP/target"
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
-        gum spin --spinner dot --title "Compiling br (release mode)..." -- \
-            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release 2>&1"
+        if ! gum spin --spinner dot --title "Compiling br (release mode)..." -- \
+            bash -c "cd '$build_dir' && CARGO_TARGET_DIR='$target_dir' cargo build --release"; then
+            die "Build failed"
+        fi
     else
-        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release 2>&1) || die "Build failed"
+        (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release) || die "Build failed"
     fi
 
     # Find the binary

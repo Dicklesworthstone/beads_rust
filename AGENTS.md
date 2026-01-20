@@ -297,52 +297,89 @@ A mail-like layer that lets coding agents coordinate asynchronously via MCP tool
 
 ---
 
-## Beads (bd) — Dependency-Aware Issue Tracking
+## Beads Rust (br) — Dependency-Aware Issue Tracking
 
-Beads provides a lightweight, dependency-aware issue database and CLI (`bd`) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
+br (beads_rust) provides a lightweight, dependency-aware issue database and CLI for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
 ### Conventions
 
 - **Single source of truth:** Beads for task status/priority/dependencies; Agent Mail for conversation and audit
-- **Shared identifiers:** Use Beads issue ID (e.g., `bd-123`) as Mail `thread_id` and prefix subjects with `[bd-123]`
+- **Shared identifiers:** Use Beads issue ID (e.g., `proj-abc12`) as Mail `thread_id` and prefix subjects with `[proj-abc12]`
 - **Reservations:** When starting a task, call `file_reservation_paths()` with the issue ID in `reason`
 
 ### Typical Agent Flow
 
 1. **Pick ready work (Beads):**
    ```bash
-   bd ready --json  # Choose highest priority, no blockers
+   br ready --json  # Choose highest priority, no blockers
    ```
 
 2. **Reserve edit surface (Mail):**
    ```
-   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="bd-123")
+   file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true, reason="proj-abc12")
    ```
 
 3. **Announce start (Mail):**
    ```
-   send_message(..., thread_id="bd-123", subject="[bd-123] Start: <title>", ack_required=true)
+   send_message(..., thread_id="proj-abc12", subject="[proj-abc12] Start: <title>", ack_required=true)
    ```
 
 4. **Work and update:** Reply in-thread with progress
 
 5. **Complete and release:**
    ```bash
-   bd close bd-123 --reason "Completed"
+   br close proj-abc12 --reason "Completed"
    ```
    ```
    release_file_reservations(project_key, agent_name, paths=["src/**"])
    ```
-   Final Mail reply: `[bd-123] Completed` with summary
+   Final Mail reply: `[proj-abc12] Completed` with summary
 
 ### Mapping Cheat Sheet
 
 | Concept | Value |
 |---------|-------|
-| Mail `thread_id` | `bd-###` |
-| Mail subject | `[bd-###] ...` |
-| File reservation `reason` | `bd-###` |
-| Commit messages | Include `bd-###` for traceability |
+| Mail `thread_id` | `<issue-id>` (e.g., `proj-abc12`) |
+| Mail subject | `[<issue-id>] ...` |
+| File reservation `reason` | `<issue-id>` |
+| Commit messages | Include `<issue-id>` for traceability |
+
+### Copyable AGENTS.md Blurb
+
+Add this section to your project's AGENTS.md to enable br-aware agents:
+
+```markdown
+## Beads Rust (br) — Dependency-Aware Issue Tracking
+
+br provides a lightweight, dependency-aware issue database and CLI for selecting "ready work," setting priorities, and tracking status.
+
+### Essential Commands
+
+\`\`\`bash
+br ready              # Show issues ready to work (no blockers)
+br list --status open # All open issues
+br show <id>          # Full issue details with dependencies
+br create --title "Fix bug" --type bug --priority 2 --description "Details here"
+br update <id> --status in_progress
+br close <id> --reason "Completed"
+br sync               # Export to JSONL for git sync
+\`\`\`
+
+### Workflow Pattern
+
+1. **Start**: Run `br ready --json` to find actionable work
+2. **Claim**: Use `br update <id> --status in_progress`
+3. **Work**: Implement the task
+4. **Complete**: Use `br close <id> --reason "Done"`
+5. **Sync**: Always run `br sync` at session end
+
+### Key Concepts
+
+- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
+- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog
+- **Types**: task, bug, feature, epic, question, docs
+- **JSON output**: Always use `--json` or `--robot` when parsing programmatically
+```
 
 ---
 
@@ -576,7 +613,7 @@ The original Go implementation is in `./legacy_beads/` for reference (gitignored
 
 ## Beads Workflow Integration
 
-This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust (br)](https://github.com/Dicklesworthstone/beads_rust) for issue tracking. Issues are stored in `.beads/` and tracked in git.
 
 ### Essential Commands
 
@@ -585,30 +622,30 @@ This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_view
 bv
 
 # CLI commands for agents (use these instead)
-bd ready              # Show issues ready to work (no blockers)
-bd list --status=open # All open issues
-bd show <id>          # Full issue details with dependencies
-bd create --title="..." --type=task --priority=2
-bd update <id> --status=in_progress
-bd close <id> --reason="Completed"
-bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+br ready              # Show issues ready to work (no blockers)
+br list --status=open # All open issues
+br show <id>          # Full issue details with dependencies
+br create --title "..." --type task --priority 2
+br update <id> --status in_progress
+br close <id> --reason "Completed"
+br close <id1> <id2>  # Close multiple issues at once
+br sync               # Export to JSONL for git sync
 ```
 
 ### Workflow Pattern
 
-1. **Start**: Run `bd ready` to find actionable work
-2. **Claim**: Use `bd update <id> --status=in_progress`
+1. **Start**: Run `br ready` to find actionable work
+2. **Claim**: Use `br update <id> --status in_progress`
 3. **Work**: Implement the task
-4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
+4. **Complete**: Use `br close <id>`
+5. **Sync**: Always run `br sync` at session end
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. `bd ready` shows only unblocked work.
+- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
 - **Types**: task, bug, feature, epic, question, docs
-- **Blocking**: `bd dep add <issue> <depends-on>` to add dependencies
+- **Blocking**: `br dep add <issue> <depends-on>` to add dependencies
 
 <!-- end-bv-agent-instructions -->
 
@@ -624,7 +661,7 @@ bd sync               # Commit and push changes
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd sync
+   br sync
    git push
    git status  # MUST show "up to date with origin"
    ```

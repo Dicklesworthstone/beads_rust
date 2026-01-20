@@ -2915,7 +2915,7 @@ dependencies = [
 [[package]]
 name = "rich_rust"
 version = "0.1.0"
-source = "git+https://github.com/Dicklesworthstone/rich_rust.git#70b1712b70658c0e5e9db20d5404bbee4de5133e"
+source = "git+https://github.com/Dicklesworthstone/rich_rust.git?rev=dd3dcdb#dd3dcdb80bff2b4f544f88ed3147dd28e8d5e7d7"
 dependencies = [
  "bitflags",
  "crossterm 0.29.0",

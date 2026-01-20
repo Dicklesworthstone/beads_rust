@@ -45,7 +45,8 @@ indicatif = "0.18"
 crossterm = "0.28"
 
 # Rich terminal output (sibling project)
-rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust.git", features = ["full"] }
+# Pinned to commit with let_chains fix for Rust 1.88+ compatibility
+rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust.git", rev = "dd3dcdb", features = ["full"] }
 
 # Utilities
 once_cell = "1.19"
