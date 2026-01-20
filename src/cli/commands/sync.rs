@@ -16,6 +16,7 @@ use crate::sync::{
     load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
     save_base_snapshot, three_way_merge,
 };
+use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -83,7 +84,7 @@ pub fn execute(
     args: &SyncArgs,
     json: bool,
     cli: &config::CliOverrides,
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
 ) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
@@ -106,7 +107,7 @@ pub fn execute(
 
     // Handle --status flag
     if args.status {
-        return execute_status(&storage, &path_policy, use_json);
+        return execute_status(&storage, &path_policy, use_json, ctx);
     }
 
     // Validate mutually exclusive modes
@@ -128,6 +129,7 @@ pub fn execute(
             use_json,
             show_progress,
             retention_days,
+            ctx,
         )
     } else if args.merge {
         execute_merge(
@@ -138,11 +140,19 @@ pub fn execute(
             show_progress,
             retention_days,
             cli,
+            ctx,
         )
     } else {
         // Default to import-only if no flag is specified (consistent with existing behavior)
         // or explicitly import-only
-        execute_import(&mut storage, &path_policy, args, use_json, show_progress)
+        execute_import(
+            &mut storage,
+            &path_policy,
+            args,
+            use_json,
+            show_progress,
+            ctx,
+        )
     }
 }
 
@@ -256,6 +266,7 @@ fn execute_status(
     storage: &crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
     json: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     let dirty_ids = storage.get_dirty_issue_ids()?;
     let dirty_count = dirty_ids.len();
@@ -342,6 +353,8 @@ fn execute_status(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
+    } else if ctx.is_rich() {
+        render_status_rich(&status, ctx);
     } else {
         println!("Sync Status:");
         println!("  Dirty issues: {}", status.dirty_count);
@@ -364,8 +377,91 @@ fn execute_status(
     Ok(())
 }
 
+/// Render sync status with rich formatting.
+fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    // Determine sync state and color
+    let (state_icon, state_text, state_style) = if status.jsonl_newer {
+        (
+            "⬇",
+            "JSONL is newer (import recommended)",
+            theme.info.clone(),
+        )
+    } else if status.db_newer {
+        (
+            "⬆",
+            "Database is newer (export recommended)",
+            theme.warning.clone(),
+        )
+    } else {
+        ("✓", "In sync", theme.success.clone())
+    };
+
+    // Build status content
+    let mut text = Text::new("");
+
+    // State line
+    text.append_styled(state_icon, state_style.clone());
+    text.append(" ");
+    text.append_styled(state_text, state_style);
+    text.append("\n\n");
+
+    // Dirty count
+    text.append_styled("Dirty issues: ", theme.dimmed.clone());
+    if status.dirty_count > 0 {
+        text.append_styled(&status.dirty_count.to_string(), theme.warning.clone());
+    } else {
+        text.append_styled("0", theme.success.clone());
+    }
+    text.append("\n");
+
+    // JSONL exists
+    text.append_styled("JSONL exists: ", theme.dimmed.clone());
+    text.append_styled(
+        if status.jsonl_exists { "yes" } else { "no" },
+        if status.jsonl_exists {
+            theme.success.clone()
+        } else {
+            theme.muted.clone()
+        },
+    );
+    text.append("\n");
+
+    // Last export time
+    if let Some(ref t) = status.last_export_time {
+        text.append_styled("Last export:  ", theme.dimmed.clone());
+        text.append_styled(t, theme.timestamp.clone());
+        text.append("\n");
+    }
+
+    // Last import time
+    if let Some(ref t) = status.last_import_time {
+        text.append_styled("Last import:  ", theme.dimmed.clone());
+        text.append_styled(t, theme.timestamp.clone());
+        text.append("\n");
+    }
+
+    // Content hash (truncated)
+    if let Some(ref hash) = status.jsonl_content_hash {
+        text.append_styled("Content hash: ", theme.dimmed.clone());
+        let display_hash = if hash.len() > 12 {
+            format!("{}…", &hash[..12])
+        } else {
+            hash.clone()
+        };
+        text.append_styled(&display_hash, theme.muted.clone());
+    }
+
+    let panel = Panel::from_rich_text(&text, ctx.width())
+        .title(Text::new("Sync Status"))
+        .box_style(theme.box_style);
+    console.print_renderable(&panel);
+}
+
 /// Execute the --flush-only (export) operation.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_flush(
     storage: &mut crate::storage::SqliteStorage,
     _beads_dir: &Path,
@@ -374,6 +470,7 @@ fn execute_flush(
     json: bool,
     show_progress: bool,
     retention_days: Option<u64>,
+    ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL export");
     let export_policy = parse_export_policy(args)?;
@@ -545,6 +642,8 @@ fn execute_flush(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if ctx.is_rich() {
+        render_flush_result_rich(&result, &report.errors, ctx);
     } else {
         if report.policy_used != ExportErrorPolicy::Strict || report.has_errors() {
             println!("Export completed with policy: {}", report.policy_used);
@@ -604,6 +703,112 @@ fn execute_flush(
     Ok(())
 }
 
+/// Render flush (export) result with rich formatting.
+fn render_flush_result_rich(result: &FlushResult, errors: &[ExportError], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+
+    // Success indicator
+    if errors.is_empty() {
+        text.append_styled("✓ ", theme.success.clone());
+        text.append_styled("Export Complete", theme.success.clone());
+    } else {
+        text.append_styled("⚠ ", theme.warning.clone());
+        text.append_styled("Export Complete (with errors)", theme.warning.clone());
+    }
+    text.append("\n\n");
+
+    // Direction indicator
+    text.append_styled("Direction     ", theme.dimmed.clone());
+    text.append_styled("SQLite → JSONL", theme.info.clone());
+    text.append("\n");
+
+    // Exported counts
+    text.append_styled("Issues        ", theme.dimmed.clone());
+    text.append_styled(&result.exported_issues.to_string(), theme.accent.clone());
+    text.append("\n");
+
+    text.append_styled("Dependencies  ", theme.dimmed.clone());
+    text.append(&result.exported_dependencies.to_string());
+    text.append("\n");
+
+    text.append_styled("Labels        ", theme.dimmed.clone());
+    text.append(&result.exported_labels.to_string());
+    text.append("\n");
+
+    text.append_styled("Comments      ", theme.dimmed.clone());
+    text.append(&result.exported_comments.to_string());
+    text.append("\n");
+
+    // Dirty flags cleared
+    if result.cleared_dirty > 0 {
+        text.append_styled("Dirty cleared ", theme.dimmed.clone());
+        text.append_styled(&result.cleared_dirty.to_string(), theme.success.clone());
+        text.append("\n");
+    }
+
+    // Content hash (truncated)
+    if !result.content_hash.is_empty() {
+        text.append("\n");
+        text.append_styled("Content hash  ", theme.dimmed.clone());
+        let display_hash = if result.content_hash.len() > 12 {
+            format!("{}…", &result.content_hash[..12])
+        } else {
+            result.content_hash.clone()
+        };
+        text.append_styled(&display_hash, theme.muted.clone());
+    }
+
+    // Manifest path
+    if let Some(ref path) = result.manifest_path {
+        text.append("\n");
+        text.append_styled("Manifest      ", theme.dimmed.clone());
+        text.append_styled(path, theme.muted.clone());
+    }
+
+    let panel = Panel::from_rich_text(&text, ctx.width())
+        .title(Text::new("Flush (Export)"))
+        .box_style(theme.box_style);
+    console.print_renderable(&panel);
+
+    // Errors section if any
+    if !errors.is_empty() {
+        console.print("");
+        render_errors_rich(errors, ctx);
+    }
+}
+
+/// Render export errors with rich formatting.
+fn render_errors_rich(errors: &[ExportError], ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled(
+        &format!("{} error(s) during export:\n\n", errors.len()),
+        theme.error.clone(),
+    );
+
+    for (i, err) in errors.iter().enumerate() {
+        let prefix = if i == errors.len() - 1 {
+            "└──"
+        } else {
+            "├──"
+        };
+        text.append_styled(prefix, theme.muted.clone());
+        text.append(" ");
+        text.append_styled(&err.summary(), theme.error.clone());
+        text.append("\n");
+    }
+
+    let panel = Panel::from_rich_text(&text, ctx.width())
+        .title(Text::new("⚠ Errors"))
+        .box_style(theme.box_style);
+    console.print_renderable(&panel);
+}
+
 fn parse_export_policy(args: &SyncArgs) -> Result<ExportErrorPolicy> {
     args.error_policy.as_deref().map_or_else(
         || Ok(ExportErrorPolicy::Strict),
@@ -640,6 +845,7 @@ fn execute_import(
     args: &SyncArgs,
     json: bool,
     show_progress: bool,
+    ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting JSONL import");
     let jsonl_path = &path_policy.jsonl_path;
@@ -771,6 +977,8 @@ fn execute_import(
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if ctx.is_rich() {
+        render_import_result_rich(&result, ctx);
     } else {
         println!("Imported from JSONL:");
         println!("  Processed: {} issues", result.created);
@@ -784,6 +992,55 @@ fn execute_import(
     }
 
     Ok(())
+}
+
+/// Render import result with rich formatting.
+fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+
+    // Success indicator
+    text.append_styled("✓ ", theme.success.clone());
+    text.append_styled("Import Complete", theme.success.clone());
+    text.append("\n\n");
+
+    // Direction indicator
+    text.append_styled("Direction          ", theme.dimmed.clone());
+    text.append_styled("JSONL → SQLite", theme.info.clone());
+    text.append("\n");
+
+    // Processed count
+    text.append_styled("Processed          ", theme.dimmed.clone());
+    text.append_styled(&result.created.to_string(), theme.accent.clone());
+    text.append_styled(" issues", theme.dimmed.clone());
+    text.append("\n");
+
+    // Skipped count
+    if result.skipped > 0 {
+        text.append_styled("Skipped            ", theme.dimmed.clone());
+        text.append(&result.skipped.to_string());
+        text.append_styled(" (up-to-date)", theme.muted.clone());
+        text.append("\n");
+    }
+
+    // Tombstone protected
+    if result.tombstone_skipped > 0 {
+        text.append_styled("Tombstone protected ", theme.dimmed.clone());
+        text.append(&result.tombstone_skipped.to_string());
+        text.append("\n");
+    }
+
+    // Cache rebuilt
+    text.append("\n");
+    text.append_styled("✓ ", theme.success.clone());
+    text.append_styled("Blocked cache rebuilt", theme.muted.clone());
+
+    let panel = Panel::from_rich_text(&text, ctx.width())
+        .title(Text::new("Import"))
+        .box_style(theme.box_style);
+    console.print_renderable(&panel);
 }
 
 /// Detect the issue ID prefix from the first non-tombstone issue in a JSONL file.
@@ -833,7 +1090,7 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
 }
 
 /// Execute the --merge operation.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_merge(
     storage: &mut crate::storage::SqliteStorage,
     path_policy: &SyncPathPolicy,
@@ -842,6 +1099,7 @@ fn execute_merge(
     show_progress: bool,
     retention_days: Option<u64>,
     cli: &config::CliOverrides,
+    ctx: &OutputContext,
 ) -> Result<()> {
     info!("Starting 3-way merge");
     let beads_dir = &path_policy.beads_dir;
@@ -902,6 +1160,9 @@ fn execute_merge(
 
     if report.has_conflicts() {
         // For now, fail on conflicts. Future: interactive resolution or force flags.
+        if ctx.is_rich() {
+            render_merge_conflicts_rich(&report.conflicts, ctx);
+        }
         let mut msg = String::from("Merge conflicts detected:\n");
         for (id, kind) in &report.conflicts {
             use std::fmt::Write;
@@ -963,6 +1224,8 @@ fn execute_merge(
             "notes": report.notes,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if ctx.is_rich() {
+        render_merge_result_rich(&report, ctx);
     } else {
         println!("Merge complete:");
         println!("  Kept/Updated: {} issues", report.kept.len());
@@ -978,6 +1241,105 @@ fn execute_merge(
     }
 
     Ok(())
+}
+
+/// Render merge conflicts with rich formatting.
+fn render_merge_conflicts_rich(
+    conflicts: &[(String, crate::sync::ConflictType)],
+    ctx: &OutputContext,
+) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+    text.append_styled("⚠ ", theme.error.clone());
+    text.append_styled(
+        &format!("{} merge conflict(s) detected:\n\n", conflicts.len()),
+        theme.error.clone(),
+    );
+
+    for (i, (id, kind)) in conflicts.iter().enumerate() {
+        let prefix = if i == conflicts.len() - 1 {
+            "└──"
+        } else {
+            "├──"
+        };
+        text.append_styled(prefix, theme.muted.clone());
+        text.append(" ");
+        text.append_styled(id, theme.issue_id.clone());
+        text.append(": ");
+        text.append_styled(&format!("{kind:?}"), theme.error.clone());
+        text.append("\n");
+    }
+
+    text.append("\n");
+    text.append_styled("Hint: ", theme.dimmed.clone());
+    text.append("Use --force to override or resolve manually.");
+
+    let panel = Panel::from_rich_text(&text, ctx.width())
+        .title(Text::new("Merge Conflicts"))
+        .box_style(theme.box_style);
+    console.print_renderable(&panel);
+}
+
+/// Render merge result with rich formatting.
+fn render_merge_result_rich(report: &crate::sync::MergeReport, ctx: &OutputContext) {
+    let console = Console::default();
+    let theme = ctx.theme();
+
+    let mut text = Text::new("");
+
+    // Success indicator
+    text.append_styled("✓ ", theme.success.clone());
+    text.append_styled("3-Way Merge Complete", theme.success.clone());
+    text.append("\n\n");
+
+    // Kept/Updated count
+    text.append_styled("Kept/Updated  ", theme.dimmed.clone());
+    text.append_styled(&report.kept.len().to_string(), theme.accent.clone());
+    text.append_styled(" issues", theme.dimmed.clone());
+    text.append("\n");
+
+    // Deleted count
+    text.append_styled("Deleted       ", theme.dimmed.clone());
+    if report.deleted.is_empty() {
+        text.append("0");
+    } else {
+        text.append_styled(&report.deleted.len().to_string(), theme.warning.clone());
+    }
+    text.append_styled(" issues", theme.dimmed.clone());
+    text.append("\n");
+
+    // Notes section
+    if !report.notes.is_empty() {
+        text.append("\n");
+        text.append_styled("Notes:\n", theme.dimmed.clone());
+        for (i, (id, note)) in report.notes.iter().enumerate() {
+            let prefix = if i == report.notes.len() - 1 {
+                "└──"
+            } else {
+                "├──"
+            };
+            text.append_styled(prefix, theme.muted.clone());
+            text.append(" ");
+            text.append_styled(id, theme.issue_id.clone());
+            text.append(": ");
+            text.append_styled(note, theme.muted.clone());
+            text.append("\n");
+        }
+    }
+
+    // Final status
+    text.append("\n");
+    text.append_styled("✓ ", theme.success.clone());
+    text.append_styled("Base snapshot updated\n", theme.muted.clone());
+    text.append_styled("✓ ", theme.success.clone());
+    text.append_styled("JSONL exported", theme.muted.clone());
+
+    let panel = Panel::from_rich_text(&text, ctx.width())
+        .title(Text::new("Merge"))
+        .box_style(theme.box_style);
+    console.print_renderable(&panel);
 }
 
 #[cfg(test)]
