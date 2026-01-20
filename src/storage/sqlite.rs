@@ -3763,24 +3763,32 @@ mod tests {
         let t3 = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
 
         let issue1 = make_issue(
-            "bd-l1",
-            "Open assigned",
+            "bd-s1",
+            "Fix authentication bug",
             Status::Open,
             2,
-            Some("alice"),
+            None,
             t1,
             None,
         );
         let issue2 = make_issue(
-            "bd-l2",
-            "In progress",
-            Status::InProgress,
+            "bd-s2",
+            "Add user registration",
+            Status::Open,
             2,
             None,
             t2,
             None,
         );
-        let issue3 = make_issue("bd-l3", "Closed", Status::Closed, 0, None, t3, None);
+        let issue3 = make_issue(
+            "bd-s3",
+            "Update documentation",
+            Status::Open,
+            2,
+            None,
+            t3,
+            None,
+        );
 
         storage.create_issue(&issue1, "tester").unwrap();
         storage.create_issue(&issue2, "tester").unwrap();
@@ -3793,19 +3801,19 @@ mod tests {
 
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "bd-l1");
+        assert_eq!(issues[0].id, "bd-s1");
 
         filters.statuses = None;
         filters.assignee = Some("alice".to_string());
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "bd-l1");
+        assert_eq!(issues[0].id, "bd-s1");
 
         filters.assignee = None;
         filters.unassigned = true;
         let issues = storage.list_issues(&filters).unwrap();
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "bd-l2");
+        assert_eq!(issues[0].id, "bd-s2");
 
         filters.unassigned = false;
         filters.limit = Some(1);
