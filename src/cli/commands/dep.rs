@@ -607,20 +607,22 @@ fn dep_tree(
 
     // Mermaid format output
     if args.format.eq_ignore_ascii_case("mermaid") {
-        ctx.print("graph TD");
+        // Use println! directly to avoid rich_rust markup interpretation
+        println!("graph TD");
         // Output node definitions
         for node in &nodes {
             // Escape quotes in title for mermaid
             let escaped_title = node.title.replace('"', "'");
-            ctx.print(&format!(
+            println!(
                 "    {}[\"{}: {} [P{}]\"]",
                 node.id, node.id, escaped_title, node.priority
-            ));
+            );
         }
-        // Output edges (child --> parent means child depends on parent)
+        // Output edges (parent --> child shows dependency direction)
         for node in &nodes {
             if let Some(ref parent_id) = node.parent_id {
-                ctx.print(&format!("    {} --> {}", node.id, parent_id));
+                // parent_id depends on node.id, so show parent_id --> node.id
+                println!("    {} --> {}", parent_id, node.id);
             }
         }
         return Ok(());
@@ -859,6 +861,7 @@ mod tests {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
