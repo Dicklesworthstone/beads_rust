@@ -18,7 +18,7 @@ pub fn execute(
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir(None)?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
 

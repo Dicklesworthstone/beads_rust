@@ -44,7 +44,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     // 1. Open storage (unless dry run without DB)
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
 
     // We open storage even for dry-run to check ID collisions.
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -341,7 +341,7 @@ fn execute_import(
         return Ok(());
     }
 
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
 

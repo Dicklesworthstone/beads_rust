@@ -232,6 +232,60 @@ fn discover_beads_dir_with_env(
     Err(BeadsError::NotInitialized)
 }
 
+/// Discover beads directory, using `--db` path if provided.
+///
+/// When `--db` is explicitly provided, derives the beads_dir from that path
+/// (e.g., `/path/to/.beads/beads.db` → `/path/to/.beads/`), allowing br to work
+/// from any directory. Falls back to normal discovery when `--db` is not set.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `--db` path doesn't contain `.beads/` component
+/// - No beads directory found (when `--db` not provided)
+pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
+    if let Some(db_path) = &cli.db {
+        // Derive beads_dir from explicit --db path
+        derive_beads_dir_from_db_path(db_path)
+    } else {
+        // Fall back to normal discovery
+        discover_beads_dir(None)
+    }
+}
+
+/// Extract the `.beads/` directory from a database path.
+///
+/// E.g., `/path/to/.beads/beads.db` → `/path/to/.beads/`
+fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
+    // Walk up the path looking for a component named ".beads"
+    let mut current = db_path.to_path_buf();
+
+    // If the path points to a file, start from its parent
+    if current.is_file() {
+        current.pop();
+    }
+
+    // Check if current directory is .beads
+    if current.file_name().map(|n| n == ".beads").unwrap_or(false) {
+        return Ok(current);
+    }
+
+    // Walk up looking for .beads
+    for ancestor in db_path.ancestors() {
+        if ancestor.file_name().map(|n| n == ".beads").unwrap_or(false) {
+            return Ok(ancestor.to_path_buf());
+        }
+    }
+
+    Err(BeadsError::validation(
+        "db",
+        format!(
+            "Cannot derive beads directory from path '{}': expected path to contain '.beads/' component",
+            db_path.display()
+        ),
+    ))
+}
+
 /// Open storage using resolved config paths, returning the storage and paths used.
 ///
 /// # Errors
