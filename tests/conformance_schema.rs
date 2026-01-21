@@ -716,20 +716,20 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
 /// This is acceptable as br can be a superset of bd's schema.
 const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
     // Gastown/agent features br has implemented
-    "agent_state",     // Agent state tracking
-    "await_id",        // Await coordination
-    "await_type",      // Await type classification
-    "ephemeral",       // Ephemeral issues (agent coordination)
-    "hook_bead",       // Hook bead reference
-    "is_template",     // Template issues
-    "last_activity",   // Last activity tracking
-    "pinned",          // Pinning support
-    "rig",             // Rig reference
-    "role_bead",       // Role bead reference
-    "role_type",       // Role-based typing
-    "source_repo",     // Multi-repo source tracking
-    "timeout_ns",      // Timeout configuration
-    "waiters",         // Waiter list for coordination
+    "agent_state",   // Agent state tracking
+    "await_id",      // Await coordination
+    "await_type",    // Await type classification
+    "ephemeral",     // Ephemeral issues (agent coordination)
+    "hook_bead",     // Hook bead reference
+    "is_template",   // Template issues
+    "last_activity", // Last activity tracking
+    "pinned",        // Pinning support
+    "rig",           // Rig reference
+    "role_bead",     // Role bead reference
+    "role_type",     // Role-based typing
+    "source_repo",   // Multi-repo source tracking
+    "timeout_ns",    // Timeout configuration
+    "waiters",       // Waiter list for coordination
 ];
 
 /// Known type differences between br and bd that are acceptable.

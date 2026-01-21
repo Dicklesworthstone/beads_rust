@@ -208,16 +208,23 @@ fn e2e_sync_export_guards() {
     );
 
     let mut contents = fs::read_to_string(&issues_path).expect("read jsonl");
-    contents.push_str("{\"id\":\"bd-missing\"}\n");
+    // Use a complete Issue JSON (not just {"id":"bd-missing"}) to avoid parse errors during auto-import
+    contents.push_str("{\"id\":\"bd-missing\",\"title\":\"Ghost issue\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"2026-01-01T00:00:00Z\",\"updated_at\":\"2026-01-01T00:00:00Z\"}\n");
     fs::write(&issues_path, contents).expect("append jsonl");
 
-    let create2 = run_br(&workspace, ["create", "Dirty issue"], "create_dirty");
+    // Use --no-auto-import and --allow-stale to prevent bd-missing from being imported into DB
+    let create2 = run_br(
+        &workspace,
+        ["create", "Dirty issue", "--no-auto-import", "--allow-stale"],
+        "create_dirty",
+    );
     assert!(
         create2.status.success(),
         "create failed: {}",
         create2.stderr
     );
 
+    // The flush should fail because JSONL has bd-missing but DB doesn't
     let flush_stale = run_br(&workspace, ["sync", "--flush-only"], "sync_flush_stale");
     assert!(
         !flush_stale.status.success(),
@@ -789,34 +796,31 @@ fn e2e_structured_error_conflict_markers() {
 }
 
 #[test]
-fn e2e_structured_error_invalid_type() {
-    let _log = common::test_log("e2e_structured_error_invalid_type");
+fn e2e_custom_type_accepted() {
+    let _log = common::test_log("e2e_custom_type_accepted");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success());
 
-    // Test invalid type on create
+    // Custom types are accepted (not rejected as invalid)
     let result = run_br(
         &workspace,
-        ["create", "Test issue", "--type", "not_a_type", "--json"],
-        "create_invalid_type_json",
+        ["create", "Test issue", "--type", "custom_type", "--json"],
+        "create_custom_type_json",
     );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-
-    let error = &json["error"];
-    assert_eq!(error["code"], "INVALID_TYPE");
-    assert!(error["retryable"].as_bool().unwrap());
-    // Should suggest valid types
     assert!(
-        error["hint"].as_str().unwrap().contains("task")
-            || error["hint"].as_str().unwrap().contains("bug")
-            || error["hint"].as_str().unwrap().contains("feature"),
-        "hint should list valid types"
+        result.status.success(),
+        "custom types should be accepted: {}",
+        result.stderr
+    );
+
+    // Verify the custom type is stored correctly
+    let json: serde_json::Value =
+        serde_json::from_str(&result.stdout).expect("should be valid JSON");
+    assert_eq!(
+        json["issue_type"], "custom_type",
+        "custom type should be preserved"
     );
 }
 
@@ -929,16 +933,12 @@ fn e2e_error_multiple_errors_same_exit_code() {
     assert!(create.status.success());
     let id = parse_created_id(&create.stdout);
 
-    // All validation errors should return exit code 4
+    // Validation errors should return exit code 4
+    // Note: invalid type is NOT tested here because custom types are allowed
     let invalid_status = run_br(
         &workspace,
         ["update", &id, "--status", "bad_status", "--json"],
         "invalid_status",
-    );
-    let invalid_type = run_br(
-        &workspace,
-        ["create", "Test", "--type", "bad_type", "--json"],
-        "invalid_type",
     );
     let invalid_priority = run_br(
         &workspace,
@@ -950,11 +950,6 @@ fn e2e_error_multiple_errors_same_exit_code() {
         invalid_status.status.code(),
         Some(4),
         "invalid status should be exit 4"
-    );
-    assert_eq!(
-        invalid_type.status.code(),
-        Some(4),
-        "invalid type should be exit 4"
     );
     assert_eq!(
         invalid_priority.status.code(),

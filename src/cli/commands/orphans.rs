@@ -133,8 +133,9 @@ pub fn execute(
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
     if ctx.is_json() || args.robot {
-        let json = serde_json::to_string_pretty(&orphans)
-            .map_err(|e| crate::error::BeadsError::Config(format!("JSON serialization error: {e}")))?;
+        let json = serde_json::to_string_pretty(&orphans).map_err(|e| {
+            crate::error::BeadsError::Config(format!("JSON serialization error: {e}"))
+        })?;
         println!("{json}");
         return Ok(());
     }
@@ -271,7 +272,10 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
     // although matching bd-123a is technically valid if 123a is the hash.
     // The previous regex forced parens: r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)"
     // Use (?i) for case-insensitive matching (user input in commits varies)
-    let pattern = format!(r"(?i)\b({}-[a-z0-9]+(?:\.[0-9]+)?)\b", regex::escape(prefix));
+    let pattern = format!(
+        r"(?i)\b({}-[a-z0-9]+(?:\.[0-9]+)?)\b",
+        regex::escape(prefix)
+    );
     let re = Regex::new(&pattern)
         .map_err(|e| crate::error::BeadsError::Config(format!("Invalid regex pattern: {e}")))?;
 

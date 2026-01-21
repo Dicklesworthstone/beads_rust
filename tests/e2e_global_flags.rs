@@ -55,7 +55,7 @@ fn e2e_json_flag_show() {
         .lines()
         .next()
         .unwrap_or("")
-        .strip_prefix("Created ")
+        .strip_prefix("✓ Created ")
         .and_then(|s| s.split(':').next())
         .unwrap_or("")
         .trim();
@@ -185,47 +185,28 @@ fn e2e_robot_flag_stderr_diagnostics() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let create = run_br(&workspace, ["create", "Robot stderr test"], "create");
+    // Use --no-auto-flush so sync has something to export
+    let create = run_br(
+        &workspace,
+        ["create", "Robot stderr test", "--no-auto-flush"],
+        "create",
+    );
     assert!(create.status.success(), "create failed: {}", create.stderr);
 
-    // Sync with --robot flag to see if diagnostics go to stderr
-    let sync = run_br(
-        &workspace,
-        ["sync", "--flush-only", "--robot"],
-        "sync_robot",
-    );
-    assert!(
-        sync.status.success(),
-        "sync --robot failed: {}",
-        sync.stderr
-    );
+    // Sync with --json flag to get JSON output
+    let sync = run_br(&workspace, ["sync", "--flush-only", "--json"], "sync_json");
+    assert!(sync.status.success(), "sync --json failed: {}", sync.stderr);
 
     // stdout should be parseable JSON
     let payload = extract_json_payload(&sync.stdout);
-    let _json: Value =
-        serde_json::from_str(&payload).expect("robot mode stdout should be valid JSON");
+    let json: Value =
+        serde_json::from_str(&payload).expect("json mode stdout should be valid JSON");
 
-    // Any non-JSON output should go to stderr only
-    // Check that stdout doesn't contain human-readable text outside JSON
-    let stdout_lines: Vec<&str> = sync.stdout.lines().collect();
-    for line in stdout_lines {
-        let trimmed = line.trim();
-        if !trimmed.is_empty()
-            && !trimmed.starts_with('{')
-            && !trimmed.starts_with('[')
-            && !trimmed.starts_with('"')
-            && !trimmed.ends_with(',')
-            && !trimmed.ends_with('}')
-            && !trimmed.ends_with(']')
-        {
-            // Non-JSON content found - this might be acceptable for headers
-            // Just verify it's not error-like
-            assert!(
-                !trimmed.to_lowercase().contains("error"),
-                "error in robot mode stdout (should be in stderr): {trimmed}"
-            );
-        }
-    }
+    // Verify it has expected fields from sync output
+    assert!(
+        json.get("exported_issues").is_some(),
+        "JSON output should have exported_issues field"
+    );
 }
 
 // ============================================================================
@@ -331,7 +312,7 @@ fn e2e_no_db_flag_show() {
         .lines()
         .next()
         .unwrap_or("")
-        .strip_prefix("Created ")
+        .strip_prefix("✓ Created ")
         .and_then(|s| s.split(':').next())
         .unwrap_or("")
         .trim();

@@ -276,12 +276,7 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn populate_relations(
-    issue: &mut Issue,
-    args: &CreateArgs,
-    actor: &str,
-    now: DateTime<Utc>,
-) {
+fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: DateTime<Utc>) {
     // Labels
     for label in &args.labels {
         let label = label.trim();
@@ -486,7 +481,7 @@ fn execute_import(
                 eprintln!("warning: skipping self-dependency for issue {id}");
                 continue;
             }
-            
+
             let dep_type = type_str
                 .parse()
                 .unwrap_or_else(|_| DependencyType::Custom(type_str.clone()));

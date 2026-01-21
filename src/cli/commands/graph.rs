@@ -420,11 +420,14 @@ fn calculate_depths(
                 .map(|d| d.depends_on_id.clone())
                 .filter(|d| component_set.contains(d))
                 .collect();
-            
+
             for dep_id in &filtered {
-                dependents_map.entry(dep_id.clone()).or_default().push(node_id.clone());
+                dependents_map
+                    .entry(dep_id.clone())
+                    .or_default()
+                    .push(node_id.clone());
             }
-            
+
             deps_map.insert(node_id.clone(), filtered);
         } else {
             deps_map.insert(node_id.clone(), Vec::new());
