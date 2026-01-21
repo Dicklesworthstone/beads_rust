@@ -8,11 +8,12 @@ fn test_comments_add_from_stdin() {
     run_br(&workspace, ["init"], "init");
 
     let create = run_br(&workspace, ["create", "Issue"], "create");
-    // Extract ID from "Created bd-1: Issue"
+    // Extract ID from "✓ Created bd-1: Issue"
+    // Word 0: "✓", Word 1: "Created", Word 2: "bd-1:"
     let id = create
         .stdout
         .split_whitespace()
-        .nth(1)
+        .nth(2)
         .unwrap()
         .trim_end_matches(':');
 

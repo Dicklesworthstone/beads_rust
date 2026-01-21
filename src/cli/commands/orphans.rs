@@ -133,7 +133,9 @@ pub fn execute(
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
     if ctx.is_json() || args.robot {
-        println!("{}", serde_json::to_string_pretty(&orphans).unwrap());
+        let json = serde_json::to_string_pretty(&orphans)
+            .map_err(|e| crate::error::BeadsError::Config(format!("JSON serialization error: {e}")))?;
+        println!("{json}");
         return Ok(());
     }
 
