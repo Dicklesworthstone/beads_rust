@@ -138,7 +138,7 @@ pub fn execute(
     }
 
     if orphans.is_empty() {
-        output_empty(false, ctx);
+        output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     }
 
@@ -268,7 +268,8 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
     // We use word boundaries \b to avoid matching suffix/prefix (e.g. abd-123 or bd-123a)
     // although matching bd-123a is technically valid if 123a is the hash.
     // The previous regex forced parens: r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)"
-    let pattern = format!(r"\b({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\b", regex::escape(prefix));
+    // Use (?i) for case-insensitive matching (user input in commits varies)
+    let pattern = format!(r"(?i)\b({}-[a-z0-9]+(?:\.[0-9]+)?)\b", regex::escape(prefix));
     let re = Regex::new(&pattern)
         .map_err(|e| crate::error::BeadsError::Config(format!("Invalid regex pattern: {e}")))?;
 
@@ -302,8 +303,8 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
 }
 
 /// Output empty result in appropriate format.
-fn output_empty(_json: bool, ctx: &OutputContext) {
-    if ctx.is_json() {
+fn output_empty(json: bool, ctx: &OutputContext) {
+    if json || ctx.is_json() {
         ctx.json(&Vec::<OrphanIssue>::new());
         return;
     }
