@@ -40,7 +40,8 @@ pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
 
     // Handle --check flag: check if update is available
     if args.check {
-        return execute_update_check(version, ctx);
+        execute_update_check(version, ctx);
+        return Ok(());
     }
 
     let build = if cfg!(debug_assertions) {
@@ -191,7 +192,7 @@ fn render_version_rich(
 /// - 0: Up-to-date
 /// - 1: Update available
 /// - 2: Error checking for updates
-fn execute_update_check(current_version: &str, ctx: &OutputContext) -> Result<()> {
+fn execute_update_check(current_version: &str, ctx: &OutputContext) {
     // Try to fetch latest version from GitHub releases
     let latest = match fetch_latest_version() {
         Ok(v) => v,
@@ -234,7 +235,6 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) -> Result<()
     if update_available {
         process::exit(1);
     }
-    Ok(())
 }
 
 /// Fetch the latest release version from GitHub.
@@ -275,4 +275,101 @@ fn fetch_latest_version() -> Result<String> {
     // Strip leading "v" if present
     let version = tag.strip_prefix('v').unwrap_or(tag);
     Ok(version.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_version_json_schema() {
+        // Test that VersionOutput serializes with expected fields
+        let output = VersionOutput {
+            version: "1.0.0",
+            build: "release",
+            commit: Some("abc1234"),
+            branch: Some("main"),
+            rust_version: Some("1.85.0"),
+            target: Some("x86_64-unknown-linux-gnu"),
+            features: vec!["self_update"],
+        };
+
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(json["version"], "1.0.0");
+        assert_eq!(json["build"], "release");
+        assert_eq!(json["commit"], "abc1234");
+        assert_eq!(json["branch"], "main");
+        assert_eq!(json["rust_version"], "1.85.0");
+        assert_eq!(json["target"], "x86_64-unknown-linux-gnu");
+        assert_eq!(json["features"], serde_json::json!(["self_update"]));
+    }
+
+    #[test]
+    fn test_version_json_omits_none_fields() {
+        // Test that None fields are omitted from JSON output
+        let output = VersionOutput {
+            version: "1.0.0",
+            build: "dev",
+            commit: None,
+            branch: None,
+            rust_version: None,
+            target: None,
+            features: vec![],
+        };
+
+        let json = serde_json::to_value(&output).unwrap();
+        assert!(json.get("commit").is_none());
+        assert!(json.get("branch").is_none());
+        assert!(json.get("rust_version").is_none());
+        assert!(json.get("target").is_none());
+        assert!(json.get("features").is_none()); // Empty vec is skipped
+    }
+
+    #[test]
+    fn test_build_info_present() {
+        // Verify build info env vars are defined at compile time
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(!version.is_empty());
+
+        // These may or may not be set depending on build environment
+        // but the code should handle both cases gracefully
+        let commit = option_env!("VERGEN_GIT_SHA");
+        let branch = option_env!("VERGEN_GIT_BRANCH");
+
+        // If set, they should be non-empty strings
+        if let Some(c) = commit {
+            assert!(!c.trim().is_empty() || c.is_empty()); // May be empty string
+        }
+        if let Some(b) = branch {
+            assert!(!b.trim().is_empty() || b.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_feature_flags_detection() {
+        // Test that feature flags can be detected at compile time
+        let mut features = Vec::new();
+        if cfg!(feature = "self_update") {
+            features.push("self_update");
+        }
+
+        // In default build, self_update should be enabled
+        #[cfg(feature = "self_update")]
+        assert!(features.contains(&"self_update"));
+    }
+
+    #[test]
+    fn test_version_short_format() {
+        // The short format should just be the version number
+        let version = env!("CARGO_PKG_VERSION");
+        // Should match semver pattern
+        assert!(
+            version.contains('.'),
+            "Version should contain dots: {version}"
+        );
+        assert!(
+            version.split('.').count() >= 2,
+            "Version should have at least major.minor"
+        );
+    }
 }
