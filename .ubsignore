@@ -27,3 +27,6 @@ Thumbs.db
 SESSION_STATUS.md
 a.out
 rustc-ice-*.txt
+
+# Dependencies
+.cargo/
