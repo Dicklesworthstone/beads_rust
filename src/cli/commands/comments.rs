@@ -82,10 +82,11 @@ fn add_comment(
 
     let comment = storage.add_comment(&issue_id, &author, &text)?;
 
-    ctx.json_pretty(&comment);
-    if ctx.is_rich() {
+    if ctx.is_json() {
+        ctx.json_pretty(&comment);
+    } else if ctx.is_rich() {
         render_comment_added_rich(&issue_id, &comment, ctx);
-    } else if !ctx.is_json() {
+    } else {
         println!("Comment added to {issue_id}");
     }
 
