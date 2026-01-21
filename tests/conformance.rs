@@ -53,7 +53,10 @@ pub fn bd_available() -> bool {
 macro_rules! skip_if_no_bd {
     () => {
         if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+            eprintln!(
+                "Skipping test: 'bd' binary missing or aliased to br. \
+                 Set BD_BINARY to a Go bd path for conformance runs."
+            );
             return;
         }
     };
