@@ -78,7 +78,7 @@ fn main() {
         Commands::Doctor => commands::doctor::execute(&overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
-        Commands::Version => commands::version::execute(&output_ctx),
+        Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
         #[cfg(feature = "self_update")]
         Commands::Upgrade(args) => commands::upgrade::execute(&args, &output_ctx),

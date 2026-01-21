@@ -259,14 +259,16 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     if !has_hook_bead {
-        conn.execute_batch(r"
+        conn.execute_batch(
+            r"
             ALTER TABLE issues ADD COLUMN hook_bead TEXT DEFAULT '';
             ALTER TABLE issues ADD COLUMN role_bead TEXT DEFAULT '';
             ALTER TABLE issues ADD COLUMN agent_state TEXT DEFAULT '';
             ALTER TABLE issues ADD COLUMN last_activity DATETIME;
             ALTER TABLE issues ADD COLUMN role_type TEXT DEFAULT '';
             ALTER TABLE issues ADD COLUMN rig TEXT DEFAULT '';
-        ")?;
+        ",
+        )?;
     }
 
     Ok(())

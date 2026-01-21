@@ -149,6 +149,17 @@ fn discover_bd() -> Option<BinaryVersion> {
 
 /// Probe a binary to extract version information.
 fn probe_binary(name: &str, path: &Path) -> Result<BinaryVersion, String> {
+    if name == "bd" {
+        if let Some(output) = run_version_command(path, &["version"]) {
+            if looks_like_br(&output) {
+                return Err(format!(
+                    "bd binary at {} appears to be br; set BD_BINARY to real bd",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     // Try `--version --json` first
     let json_output = run_version_command(path, &["version", "--json"]);
     if let Some(output) = json_output {
@@ -195,6 +206,10 @@ fn probe_binary(name: &str, path: &Path) -> Result<BinaryVersion, String> {
         "Binary at {} does not respond to version commands",
         path.display()
     ))
+}
+
+fn looks_like_br(output: &str) -> bool {
+    output.trim_start().starts_with("br ")
 }
 
 /// Run a version command and capture output.

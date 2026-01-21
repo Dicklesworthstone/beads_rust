@@ -212,7 +212,7 @@ EXAMPLES:
     Where,
 
     /// Show version information
-    Version,
+    Version(VersionArgs),
 
     /// Upgrade br to the latest version
     #[cfg(feature = "self_update")]
@@ -1335,6 +1335,18 @@ pub enum HistoryCommands {
         #[arg(long)]
         older_than: Option<u32>,
     },
+}
+
+/// Arguments for the version command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct VersionArgs {
+    /// Check if a newer version is available (exit 0=up-to-date, 1=update-available)
+    #[arg(long, short = 'c')]
+    pub check: bool,
+
+    /// Output only the version number (for scripts)
+    #[arg(long, short = 's')]
+    pub short: bool,
 }
 
 /// Arguments for the upgrade command.
