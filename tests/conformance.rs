@@ -45,7 +45,14 @@ pub fn bd_available() -> bool {
             // Go bd outputs "bd version X" or "beads version X".
             // Rust br outputs "br version X".
             let stdout = String::from_utf8_lossy(&o.stdout);
-            !stdout.starts_with("br ")
+            let Some(first_token) = stdout.split_whitespace().next() else {
+                return false;
+            };
+            match first_token.to_ascii_lowercase().as_str() {
+                "bd" | "beads" => true,
+                "br" => false,
+                _ => false,
+            }
         })
 }
 
