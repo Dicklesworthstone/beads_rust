@@ -87,7 +87,7 @@ pub fn execute(
     ctx: &OutputContext,
 ) -> Result<()> {
     // Open storage
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let config::OpenStorageResult {
         mut storage, paths, ..
     } = config::open_storage_with_cli(&beads_dir, cli)?;
