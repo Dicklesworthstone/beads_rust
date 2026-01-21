@@ -50,6 +50,12 @@ pub const SCHEMA_SQL: &str = r"
         await_id TEXT,
         timeout_ns INTEGER,
         waiters TEXT,
+        hook_bead TEXT DEFAULT '',
+        role_bead TEXT DEFAULT '',
+        agent_state TEXT DEFAULT '',
+        last_activity DATETIME,
+        role_type TEXT DEFAULT '',
+        rig TEXT DEFAULT '',
         CHECK (length(title) >= 1 AND length(title) <= 500),
         CHECK (priority >= 0 AND priority <= 4)
     );
@@ -151,7 +157,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Child Counters
     CREATE TABLE IF NOT EXISTS child_counters (
         parent_id TEXT PRIMARY KEY,
-        next_child_number INTEGER NOT NULL DEFAULT 1
+        last_child INTEGER NOT NULL DEFAULT 0
     );
 ";
 
@@ -244,6 +250,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             ALTER TABLE issues ADD COLUMN waiters TEXT;
         ",
         )?;
+    }
+
+    // Migration: ensure Gastown columns exist (bd compatibility)
+    let has_hook_bead: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='hook_bead'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_hook_bead {
+        conn.execute_batch(r"
+            ALTER TABLE issues ADD COLUMN hook_bead TEXT DEFAULT '';
+            ALTER TABLE issues ADD COLUMN role_bead TEXT DEFAULT '';
+            ALTER TABLE issues ADD COLUMN agent_state TEXT DEFAULT '';
+            ALTER TABLE issues ADD COLUMN last_activity DATETIME;
+            ALTER TABLE issues ADD COLUMN role_type TEXT DEFAULT '';
+            ALTER TABLE issues ADD COLUMN rig TEXT DEFAULT '';
+        ")?;
     }
 
     Ok(())

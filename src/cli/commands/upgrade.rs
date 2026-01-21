@@ -239,12 +239,14 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
 
 /// Build the self-update updater.
 fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
+    let public_key = include_bytes!("../../release_public_key.pem").to_vec();
     github::Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
         .show_download_progress(true)
         .current_version(current_version)
+        // .verifying_keys(vec![public_key])
         .build()
         .map_err(map_update_error)
 }
@@ -255,6 +257,7 @@ fn build_updater_with_target(
     current_version: &str,
     show_progress: bool,
 ) -> Result<Box<dyn ReleaseUpdate>> {
+    let public_key = include_bytes!("../../release_public_key.pem").to_vec();
     github::Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
@@ -262,6 +265,7 @@ fn build_updater_with_target(
         .show_download_progress(show_progress)
         .current_version(current_version)
         .target_version_tag(target_version)
+        // .verifying_keys(vec![public_key])
         .build()
         .map_err(map_update_error)
 }

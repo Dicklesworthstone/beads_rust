@@ -153,10 +153,21 @@ jobs:
           Compress-Archive -Path br.exe -DestinationPath ../../../br-${{ github.ref_name }}-${{ matrix.name }}.zip
           cd ../../..
 
+      - name: Install minisign (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sL https://github.com/jedisct1/minisign/releases/download/0.11/minisign-0.11-linux.tar.gz | tar xz
+          sudo mv minisign-linux/x86_64/minisign /usr/local/bin/
+
       - name: Generate checksum (Linux)
         if: runner.os == 'Linux'
         run: |
           sha256sum br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} > br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+
+      - name: Install minisign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install minisign
 
       - name: Generate checksum (macOS)
         if: runner.os == 'macOS'
@@ -178,6 +189,15 @@ jobs:
         if: runner.os == 'macOS'
         run: shasum -a 256 -c br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
 
+      - name: Sign archive with Ed25519 (Linux/macOS)
+        if: runner.os != 'Windows' && env.MINISIGN_SECRET_KEY != ''
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          echo "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          minisign -Sm br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }} -s /tmp/minisign.key -t "br ${{ github.ref_name }} ${{ matrix.name }}"
+          rm -f /tmp/minisign.key
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -185,6 +205,7 @@ jobs:
           path: |
             br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}
             br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.sha256
+            br-${{ github.ref_name }}-${{ matrix.name }}.${{ matrix.archive }}.minisig
           retention-days: 7
 
   create-release:
@@ -233,14 +254,39 @@ jobs:
           if [ -n "$PREV_TAG" ]; then
             echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
             COMMITS=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD)
+            PREV_TAG_DATE=$(git log -1 --format=%ci "$PREV_TAG" 2>/dev/null | cut -d' ' -f1 || echo "")
           else
             echo "No previous tag found, generating changelog from start"
             COMMITS=$(git log --pretty=format:"- %s (%h)" HEAD~20..HEAD 2>/dev/null || git log --pretty=format:"- %s (%h)")
+            PREV_TAG_DATE=""
+          fi
+
+          # Extract closed beads from JSONL since last release
+          BEADS_SECTION=""
+          if [ -f ".beads/issues.jsonl" ]; then
+            echo "Extracting closed beads from issues.jsonl..."
+            # Filter beads closed after the previous tag date
+            if [ -n "$PREV_TAG_DATE" ]; then
+              CLOSED_BEADS=$(cat .beads/issues.jsonl | jq -r --arg date "$PREV_TAG_DATE" \
+                'select(.status == "closed" and (.closed_at // .updated_at) > $date) | "- \(.id): \(.title)"' 2>/dev/null | head -50 || echo "")
+            else
+              CLOSED_BEADS=$(cat .beads/issues.jsonl | jq -r \
+                'select(.status == "closed") | "- \(.id): \(.title)"' 2>/dev/null | tail -20 || echo "")
+            fi
+            if [ -n "$CLOSED_BEADS" ]; then
+              BEADS_SECTION="### Closed Beads
+
+          $CLOSED_BEADS
+
+          "
+            fi
           fi
 
           # Create changelog file
-          cat << 'EOF' > CHANGELOG.md
+          cat << EOF > CHANGELOG.md
           ## What's Changed
+
+          ${BEADS_SECTION}### Commits
 
           EOF
           echo "$COMMITS" >> CHANGELOG.md
@@ -282,6 +328,16 @@ jobs:
           sha256sum -c checksums.sha256 --ignore-missing
           ```
 
+          **Verify signature (optional):**
+
+          Binaries are signed with Ed25519 using minisign. Install minisign and verify:
+
+          ```bash
+          # Download the .minisig file for your binary
+          # Public key: RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
+          minisign -Vm br-${{ github.ref_name }}-*.tar.gz -P RWSp4vEOdKsY8e95W9/4eLrSJ2B2GHv4U+CKMBXqRX3JhPrPn8J0DWBG
+          ```
+
           ## Full Changelog
 
           See [CHANGELOG.md](https://github.com/Dicklesworthstone/beads_rust/blob/main/CHANGELOG.md) for the complete history.
@@ -301,6 +357,7 @@ jobs:
             artifacts/br-${{ github.ref_name }}-*.tar.gz
             artifacts/br-${{ github.ref_name }}-*.zip
             artifacts/br-${{ github.ref_name }}-*.sha256
+            artifacts/br-${{ github.ref_name }}-*.minisig
             artifacts/checksums.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

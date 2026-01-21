@@ -397,7 +397,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     Ok(())
 }
 
-/// Calculate depths for nodes using longest path from roots.
+// Calculate depths for nodes using longest path from roots.
 ///
 /// Roots are issues with no dependencies within the component.
 /// Depth is the longest path from any root to the node.
@@ -430,12 +430,20 @@ fn calculate_depths(
         .filter(|n| deps_map.get(*n).is_none_or(Vec::is_empty))
         .collect();
 
+    // Max depth to prevent infinite loops in cycles
+    let max_depth = nodes.len();
+
     // BFS from each root, tracking maximum depth
     for root in &roots {
         let mut queue: VecDeque<(&String, usize)> = VecDeque::new();
         queue.push_back((root, 0));
 
         while let Some((current, depth)) = queue.pop_front() {
+            // Prevent infinite loops in cycles
+            if depth > max_depth {
+                continue;
+            }
+
             // Update depth if this path is longer
             let entry = depths.entry(current.clone()).or_insert(0);
             if depth > *entry {
