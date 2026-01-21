@@ -3753,214 +3753,37 @@ mod tests {
     #[test]
     fn test_transaction_rollback_on_error() {
         let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
-        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
-        let t3 = Utc.with_ymd_and_hms(2025, 1, 3, 0, 0, 0).unwrap();
-
-        let issue1 = make_issue(
-            "bd-s1",
-            "Fix authentication bug",
+        let issue = make_issue(
+            "bd-tx1",
+            "Tx Test",
             Status::Open,
             2,
             None,
-            t1,
+            Utc::now(),
             None,
         );
-        let issue2 = make_issue(
-            "bd-s2",
-            "Add user registration",
-            Status::Open,
-            2,
-            None,
-            t2,
-            None,
-        );
-        let issue3 = make_issue(
-            "bd-s3",
-            "Update documentation",
-            Status::Open,
-            2,
-            None,
-            t3,
-            None,
-        );
-
-        storage.create_issue(&issue1, "tester").unwrap();
-        storage.create_issue(&issue2, "tester").unwrap();
-        storage.create_issue(&issue3, "tester").unwrap();
-
-        let mut filters = ListFilters {
-            statuses: Some(vec![Status::Open]),
-            ..ListFilters::default()
-        };
-
-        let issues = storage.list_issues(&filters).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "bd-s1");
-
-        filters.statuses = None;
-        filters.assignee = Some("alice".to_string());
-        let issues = storage.list_issues(&filters).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "bd-s1");
-
-        filters.assignee = None;
-        filters.unassigned = true;
-        let issues = storage.list_issues(&filters).unwrap();
-        assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].id, "bd-s2");
-
-        filters.unassigned = false;
-        filters.limit = Some(1);
-        let issues = storage.list_issues(&filters).unwrap();
-        assert_eq!(issues.len(), 1);
-    }
-
-    #[test]
-    fn test_get_ready_issues_excludes_deferred_pinned_ephemeral_wisp() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let base = Utc.with_ymd_and_hms(2025, 2, 1, 0, 0, 0).unwrap();
-        let future = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
-        let past = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
-
-        let ready = make_issue("bd-r1", "Ready", Status::Open, 2, None, base, None);
-        let deferred_future = make_issue(
-            "bd-r2",
-            "Deferred",
-            Status::Open,
-            2,
-            None,
-            base,
-            Some(future),
-        );
-        let deferred_past = make_issue(
-            "bd-r3",
-            "Deferred past",
-            Status::Open,
-            2,
-            None,
-            base,
-            Some(past),
-        );
-        let pinned = make_issue("bd-r4", "Pinned", Status::Open, 2, None, base, None);
-        let ephemeral = make_issue("bd-r5", "Ephemeral", Status::Open, 2, None, base, None);
-        let wisp = make_issue("bd-wisp-1", "Wisp", Status::Open, 2, None, base, None);
-
-        for issue in [
-            ready,
-            deferred_future,
-            deferred_past,
-            pinned,
-            ephemeral,
-            wisp,
-        ] {
-            storage.create_issue(&issue, "tester").unwrap();
-        }
-
-        storage
-            .conn
-            .execute("UPDATE issues SET pinned = 1 WHERE id = ?", ["bd-r4"])
-            .unwrap();
-        storage
-            .conn
-            .execute("UPDATE issues SET ephemeral = 1 WHERE id = ?", ["bd-r5"])
-            .unwrap();
-
-        let filters = ReadyFilters {
-            assignee: None,
-            unassigned: false,
-            labels_and: vec![],
-            labels_or: vec![],
-            types: None,
-            priorities: None,
-            include_deferred: false,
-            limit: None,
-        };
-
-        let issues = storage
-            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
-            .unwrap();
-        let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
-        assert!(ids.contains(&"bd-r1"));
-        assert!(ids.contains(&"bd-r3"));
-        assert!(!ids.contains(&"bd-r2"));
-        assert!(!ids.contains(&"bd-r4"));
-        assert!(!ids.contains(&"bd-r5"));
-        assert!(!ids.contains(&"bd-wisp-1"));
-    }
-
-    #[test]
-    fn test_ready_excludes_blocked_issue() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 3, 1, 0, 0, 0).unwrap();
-        let t2 = Utc.with_ymd_and_hms(2025, 3, 2, 0, 0, 0).unwrap();
-
-        let blocker = make_issue("bd-blocker", "Blocker", Status::Open, 1, None, t1, None);
-        let blocked = make_issue("bd-blocked", "Blocked", Status::Open, 2, None, t2, None);
-        storage.create_issue(&blocker, "tester").unwrap();
-        storage.create_issue(&blocked, "tester").unwrap();
-
-        // bd-blocked depends on bd-blocker (bd-blocker blocks bd-blocked)
-        storage
-            .add_dependency("bd-blocked", "bd-blocker", "blocks", "tester")
-            .unwrap();
-
-        let filters = ReadyFilters {
-            assignee: None,
-            unassigned: false,
-            labels_and: vec![],
-            labels_or: vec![],
-            types: None,
-            priorities: None,
-            include_deferred: false,
-            limit: None,
-        };
-
-        let issues = storage
-            .get_ready_issues(&filters, ReadySortPolicy::Oldest)
-            .unwrap();
-        let ids: Vec<_> = issues.iter().map(|i| i.id.as_str()).collect();
-        // blocker is ready (not blocked by anything)
-        assert!(ids.contains(&"bd-blocker"));
-        // blocked is NOT ready (blocked by blocker)
-        assert!(!ids.contains(&"bd-blocked"));
-    }
-
-    #[test]
-    fn test_external_dependency_satisfied_not_blocking() {
-        let temp = TempDir::new().unwrap();
-        let external_root = temp.path().join("extproj");
-        let beads_dir = external_root.join(".beads");
-        fs::create_dir_all(&beads_dir).unwrap();
-
-        let db_path = beads_dir.join("beads.db");
-        let mut external_storage = SqliteStorage::open(&db_path).unwrap();
-
-        let t1 = Utc.with_ymd_and_hms(2025, 3, 2, 0, 0, 0).unwrap();
-        let provider = make_issue("ext-1", "Provider", Status::Closed, 2, None, t1, None);
-        external_storage.create_issue(&provider, "tester").unwrap();
-        external_storage
-            .add_label("ext-1", "provides:capability", "tester")
-            .unwrap();
-
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let t1 = Utc.with_ymd_and_hms(2025, 3, 3, 0, 0, 0).unwrap();
-        let issue = make_issue("bd-1", "Needs cap", Status::Open, 2, None, t1, None);
         storage.create_issue(&issue, "tester").unwrap();
-        storage
-            .add_dependency("bd-1", "external:extproj:capability", "blocks", "tester")
-            .unwrap();
 
-        let mut external_db_paths = HashMap::new();
-        external_db_paths.insert("extproj".to_string(), db_path);
+        // Attempt a mutation that fails
+        let result: Result<()> = storage.mutate("fail_op", "tester", |_tx, ctx| {
+            // Do something valid first (record an event)
+            ctx.record_event(
+                EventType::Updated,
+                "bd-tx1",
+                Some("Should be rolled back".to_string()),
+            );
 
-        let statuses = storage
-            .resolve_external_dependency_statuses(&external_db_paths, true)
-            .unwrap();
-        assert_eq!(statuses.get("external:extproj:capability"), Some(&true));
+            // Return error to trigger rollback
+            Err(BeadsError::Config("Planned failure".to_string()))
+        });
 
-        let blockers = storage.external_blockers(&statuses).unwrap();
-        assert!(!blockers.contains_key("bd-1"));
+        assert!(result.is_err());
+
+        // Verify side effects (event) are gone
+        let events = storage.get_events("bd-tx1", 100).unwrap();
+        // Should only have the creation event
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::Created);
     }
 
     #[test]
@@ -3979,7 +3802,13 @@ mod tests {
         let child = make_issue("bd-c1", "Child", Status::Open, 2, None, t1, None);
         storage.create_issue(&parent, "tester").unwrap();
         storage.create_issue(&child, "tester").unwrap();
+
         // Parent (bd-p1) depends on external capability
+        storage
+            .add_dependency("bd-p1", "external:extproj:capability", "blocks", "tester")
+            .unwrap();
+
+        // Child (bd-c1) depends on Parent (bd-p1) via parent-child
         storage
             .add_dependency("bd-c1", "bd-p1", "parent-child", "tester")
             .unwrap();
