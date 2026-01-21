@@ -458,6 +458,17 @@ impl SqliteStorage {
                 if *status == Status::Closed {
                     let reason = updates.close_reason.as_ref().and_then(Clone::clone);
                     ctx.record_event(EventType::Closed, id, reason);
+
+                    // Auto-set closed_at if not provided
+                    if updates.closed_at.is_none() && issue.closed_at.is_none() {
+                        let now = Utc::now();
+                        issue.closed_at = Some(now);
+                        add_update("closed_at", Box::new(Some(now.to_rfc3339())));
+                    }
+                } else if issue.closed_at.is_some() && updates.closed_at.is_none() {
+                    // Reopening (or fixing state): Clear closed_at if it was set
+                    issue.closed_at = None;
+                    add_update("closed_at", Box::new(None::<String>));
                 }
 
                 if !updates.skip_cache_rebuild {

@@ -186,7 +186,7 @@ fn dep_add(
                 issue_id, depends_on_id
             ));
             let relationship = match dep_type {
-                DependencyType::Blocks => format!("  {} now blocks {}", issue_id, depends_on_id),
+                DependencyType::Blocks => format!("  {} now blocks {}", depends_on_id, issue_id),
                 DependencyType::ParentChild => {
                     format!("  {} is parent of {}", depends_on_id, issue_id)
                 }

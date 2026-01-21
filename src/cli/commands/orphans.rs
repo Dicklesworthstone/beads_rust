@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext};
 use crate::storage::ListFilters;
+use crate::util::id::normalize_id;
 use regex::Regex;
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -291,7 +292,7 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
                 results.push((
                     commit_hash.clone(),
                     commit_msg.clone(),
-                    issue_id.as_str().to_string(),
+                    normalize_id(issue_id.as_str()),
                 ));
             }
         }
@@ -389,5 +390,12 @@ ccc Oldest (bd-1)";
         // Second occurrence of bd-1 is from oldest
         assert_eq!(refs[2].0, "ccc");
         assert_eq!(refs[2].2, "bd-1");
+    }
+
+    #[test]
+    fn test_parse_git_log_normalizes_case() {
+        let log = "abc1234 Fix bug (BD-ABC)";
+        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
+        assert_eq!(refs[0].2, "bd-abc");
     }
 }
