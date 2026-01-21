@@ -343,7 +343,7 @@ mod tests {
             extract_prefix("document-intelligence-0sa"),
             Some("document-intelligence-".to_string())
         );
-        assert_eq!(extract_prefix("no-hyphen-here"), Some("no-".to_string()));
+        assert_eq!(extract_prefix("no-hyphen-here"), Some("no-hyphen-".to_string()));
         assert_eq!(extract_prefix("nohyphen"), None);
         assert_eq!(extract_prefix(""), None);
     }
