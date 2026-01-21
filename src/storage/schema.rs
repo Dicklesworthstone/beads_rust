@@ -23,29 +23,33 @@ pub const SCHEMA_SQL: &str = r"
         assignee TEXT,
         owner TEXT NOT NULL DEFAULT '',
         estimated_minutes INTEGER,
-        created_at TEXT NOT NULL,
+        created_at DATETIME NOT NULL,
         created_by TEXT NOT NULL DEFAULT '',
-        updated_at TEXT NOT NULL,
-        closed_at TEXT,
+        updated_at DATETIME NOT NULL,
+        closed_at DATETIME,
         close_reason TEXT NOT NULL DEFAULT '',
         closed_by_session TEXT NOT NULL DEFAULT '',
-        due_at TEXT,
-        defer_until TEXT,
+        due_at DATETIME,
+        defer_until DATETIME,
         external_ref TEXT,
         source_system TEXT NOT NULL DEFAULT '',
         source_repo TEXT NOT NULL DEFAULT '.',
-        deleted_at TEXT,
+        deleted_at DATETIME,
         deleted_by TEXT NOT NULL DEFAULT '',
         delete_reason TEXT NOT NULL DEFAULT '',
         original_type TEXT NOT NULL DEFAULT '',
         compaction_level INTEGER DEFAULT 0,
-        compacted_at TEXT,
+        compacted_at DATETIME,
         compacted_at_commit TEXT,
         original_size INTEGER DEFAULT 0,
         sender TEXT NOT NULL DEFAULT '',
         ephemeral INTEGER DEFAULT 0,
         pinned INTEGER DEFAULT 0,
         is_template INTEGER DEFAULT 0,
+        await_type TEXT,
+        await_id TEXT,
+        timeout_ns INTEGER,
+        waiters TEXT,
         CHECK (length(title) >= 1 AND length(title) <= 500),
         CHECK (priority >= 0 AND priority <= 4)
     );
@@ -63,7 +67,7 @@ pub const SCHEMA_SQL: &str = r"
         issue_id TEXT NOT NULL,
         depends_on_id TEXT NOT NULL,
         type TEXT NOT NULL,
-        created_at TEXT NOT NULL,
+        created_at DATETIME NOT NULL,
         created_by TEXT,
         metadata TEXT,
         thread_id TEXT,
@@ -89,7 +93,7 @@ pub const SCHEMA_SQL: &str = r"
         issue_id TEXT NOT NULL,
         author TEXT NOT NULL,
         text TEXT NOT NULL,
-        created_at TEXT NOT NULL,
+        created_at DATETIME NOT NULL,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_comments_issue_id ON comments(issue_id);
@@ -104,7 +108,7 @@ pub const SCHEMA_SQL: &str = r"
         old_value TEXT,
         new_value TEXT,
         comment TEXT,
-        created_at TEXT NOT NULL,
+        created_at DATETIME NOT NULL,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_events_issue_id ON events(issue_id);
@@ -127,7 +131,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Dirty Issues (for export)
     CREATE TABLE IF NOT EXISTS dirty_issues (
         issue_id TEXT PRIMARY KEY,
-        marked_at TEXT NOT NULL
+        marked_at DATETIME NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_dirty_issues_marked_at ON dirty_issues(marked_at);
 
@@ -135,7 +139,7 @@ pub const SCHEMA_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS export_hashes (
         issue_id TEXT PRIMARY KEY,
         content_hash TEXT NOT NULL,
-        exported_at TEXT NOT NULL
+        exported_at DATETIME NOT NULL
     );
 
     -- Blocked Issues Cache (Materialized view)
@@ -222,6 +226,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute(
             "ALTER TABLE issues ADD COLUMN source_repo TEXT NOT NULL DEFAULT '.'",
             [],
+        )?;
+    }
+
+    // Migration: ensure gate columns exist (bd compatibility)
+    let has_await_type: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='await_type'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_await_type {
+        conn.execute_batch(
+            r"
+            ALTER TABLE issues ADD COLUMN await_type TEXT;
+            ALTER TABLE issues ADD COLUMN await_id TEXT;
+            ALTER TABLE issues ADD COLUMN timeout_ns INTEGER;
+            ALTER TABLE issues ADD COLUMN waiters TEXT;
+        ",
         )?;
     }
 
