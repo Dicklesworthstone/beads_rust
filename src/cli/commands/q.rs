@@ -34,7 +34,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         return Err(BeadsError::validation("title", "cannot be empty"));
     }
 
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let id_config = config::id_config_from_layer(&layer);

@@ -59,7 +59,7 @@ struct AllGraphOutput {
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;

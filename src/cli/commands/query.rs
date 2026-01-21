@@ -235,7 +235,7 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     match command {
