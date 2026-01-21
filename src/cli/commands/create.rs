@@ -207,16 +207,16 @@ pub fn create_issue_impl(
     // 5b. Validate Relations (fail fast before DB writes)
     validate_relations(args, &id)?;
 
-    // 6. Dry Run check - return early
+    // 6. Populate Relations (labels & dependencies)
+    populate_relations(&mut issue, args, &config.actor, now)?;
+
+    // 7. Dry Run check - return early
     if args.dry_run {
         return Ok(issue);
     }
 
-    // 7. Create
+    // 8. Create (atomic)
     storage.create_issue(&issue, &config.actor)?;
-
-    // 8. Add auxiliary data
-    add_relations(storage, &id, args, &config.actor, &mut issue, now)?;
 
     Ok(issue)
 }
@@ -276,31 +276,24 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_relations(
-    storage: &mut SqliteStorage,
-    id: &str,
+fn populate_relations(
+    issue: &mut Issue,
     args: &CreateArgs,
     actor: &str,
-    issue: &mut Issue,
     now: DateTime<Utc>,
 ) -> Result<()> {
     // Labels
     for label in &args.labels {
         let label = label.trim();
         if !label.is_empty() {
-            // Validation already done in validate_relations
-            storage.add_label(id, label, actor)?;
             issue.labels.push(label.to_string());
         }
     }
 
     // Parent
     if let Some(parent_id) = &args.parent {
-        // Validation already done
-        storage.add_dependency(id, parent_id, "parent-child", actor)?;
-
         issue.dependencies.push(Dependency {
-            issue_id: id.to_string(),
+            issue_id: issue.id.clone(),
             depends_on_id: parent_id.clone(),
             dep_type: DependencyType::ParentChild,
             created_at: now,
@@ -318,14 +311,11 @@ fn add_relations(
             ("blocks", dep_str.as_str())
         };
 
-        // Validation already done
-        storage.add_dependency(id, dep_id, type_str, actor)?;
-
         let dep_type = type_str
             .parse()
             .unwrap_or_else(|_| DependencyType::Custom(type_str.to_string()));
         issue.dependencies.push(Dependency {
-            issue_id: id.to_string(),
+            issue_id: issue.id.clone(),
             depends_on_id: dep_id.to_string(),
             dep_type,
             created_at: now,
@@ -464,11 +454,7 @@ fn execute_import(
             continue;
         }
 
-        if let Err(err) = storage.create_issue(&issue, &actor) {
-            eprintln!("✗ Failed to create {title}: {err}");
-            continue;
-        }
-
+        // Populate Labels (with validation)
         let mut labels = parsed.labels;
         labels.extend(args.labels.clone());
         for label in labels {
@@ -483,11 +469,10 @@ fn execute_import(
                 );
                 continue;
             }
-            if let Err(err) = storage.add_label(&id, &label, &actor) {
-                eprintln!("warning: failed to add label '{label}' for issue {id}: {err}");
-            }
+            issue.labels.push(label);
         }
 
+        // Populate Dependencies (with validation)
         let mut deps = parsed.dependencies;
         deps.extend(args.deps.clone());
         for dep_str in deps {
@@ -503,11 +488,25 @@ fn execute_import(
                 eprintln!("warning: skipping self-dependency for issue {id}");
                 continue;
             }
-            if let Err(err) = storage.add_dependency(&id, &dep_id, &type_str, &actor) {
-                eprintln!(
-                    "warning: failed to add dependency '{type_str}:{dep_id}' for issue {id}: {err}"
-                );
-            }
+            
+            let dep_type = type_str
+                .parse()
+                .unwrap_or_else(|_| DependencyType::Custom(type_str.to_string()));
+
+            issue.dependencies.push(Dependency {
+                issue_id: id.clone(),
+                depends_on_id: dep_id,
+                dep_type,
+                created_at: now,
+                created_by: Some(actor.clone()),
+                metadata: None,
+                thread_id: None,
+            });
+        }
+
+        if let Err(err) = storage.create_issue(&issue, &actor) {
+            eprintln!("✗ Failed to create {title}: {err}");
+            continue;
         }
 
         if ctx.is_json() {

@@ -256,6 +256,74 @@ impl SqliteStorage {
                 ],
             )?;
 
+            // Insert Labels
+            for label in &issue.labels {
+                tx.execute(
+                    "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                    rusqlite::params![issue.id, label],
+                )?;
+                ctx.record_event(
+                    EventType::LabelAdded,
+                    &issue.id,
+                    Some(format!("Added label {label}")),
+                );
+            }
+
+            // Insert Dependencies
+            for dep in &issue.dependencies {
+                // Check cycle if blocking
+                if dep.dep_type.is_blocking()
+                    && Self::check_cycle(tx, &issue.id, &dep.depends_on_id, true)?
+                {
+                    return Err(BeadsError::DependencyCycle {
+                        path: format!(
+                            "Adding dependency {} -> {} would create a cycle",
+                            issue.id, dep.depends_on_id
+                        ),
+                    });
+                }
+
+                tx.execute(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
+                     VALUES (?, ?, ?, ?, ?)",
+                    rusqlite::params![
+                        issue.id,
+                        dep.depends_on_id,
+                        dep.dep_type.as_str(),
+                        dep.created_at.to_rfc3339(),
+                        dep.created_by.as_deref().unwrap_or(actor)
+                    ],
+                )?;
+
+                ctx.record_event(
+                    EventType::DependencyAdded,
+                    &issue.id,
+                    Some(format!(
+                        "Added dependency on {} ({})",
+                        dep.depends_on_id, dep.dep_type
+                    )),
+                );
+                ctx.invalidate_cache();
+            }
+
+            // Insert Comments
+            for comment in &issue.comments {
+                tx.execute(
+                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    rusqlite::params![
+                        issue.id,
+                        comment.author,
+                        comment.body,
+                        comment.created_at.to_rfc3339()
+                    ],
+                )?;
+                ctx.record_event(
+                    EventType::Commented,
+                    &issue.id,
+                    Some(comment.body.clone()),
+                );
+            }
+
             ctx.record_event(
                 EventType::Created,
                 &issue.id,
@@ -266,6 +334,47 @@ impl SqliteStorage {
 
             Ok(())
         })
+    }
+
+    // Helper for cycle detection (refactored from would_create_cycle)
+    fn check_cycle(
+        conn: &Connection,
+        issue_id: &str,
+        depends_on_id: &str,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        // Construct filter clause
+        let type_filter = if blocking_only {
+            "AND type IN ('blocks', 'parent-child', 'conditional-blocks')"
+        } else {
+            "" // No filter, follow all edges
+        };
+
+        let query = format!(
+            r"
+            WITH RECURSIVE transitive_deps(id) AS (
+                -- Base case: direct dependencies of starting point
+                SELECT depends_on_id FROM dependencies 
+                WHERE issue_id = ?1 {type_filter}
+                UNION
+                -- Recursive step: follow dependencies forward
+                SELECT d.depends_on_id
+                FROM dependencies d
+                JOIN transitive_deps td ON d.issue_id = td.id
+                WHERE 1=1 {type_filter}
+            )
+            SELECT 1 FROM transitive_deps WHERE id = ?2 LIMIT 1;
+            "
+        );
+
+        let exists: bool = conn
+            .query_row(&query, rusqlite::params![depends_on_id, issue_id], |_| {
+                Ok(true)
+            })
+            .optional()?
+            .unwrap_or(false);
+
+        Ok(exists)
     }
 
     /// Update an issue's fields.
@@ -2609,7 +2718,7 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database update fails.
+    /// Returns an error if the database operation fails.
     pub fn set_export_hashes(&mut self, exports: &[(String, String)]) -> Result<usize> {
         if exports.is_empty() {
             return Ok(0);
@@ -3191,42 +3300,7 @@ impl SqliteStorage {
         depends_on_id: &str,
         blocking_only: bool,
     ) -> Result<bool> {
-        // If A depends on B, a cycle exists if B can reach A through existing dependencies.
-        // We check if `issue_id` is reachable from `depends_on_id`.
-
-        // Construct filter clause
-        let type_filter = if blocking_only {
-            "AND type IN ('blocks', 'parent-child', 'conditional-blocks')"
-        } else {
-            "" // No filter, follow all edges
-        };
-
-        let query = format!(
-            r"
-            WITH RECURSIVE transitive_deps(id) AS (
-                -- Base case: direct dependencies of starting point
-                SELECT depends_on_id FROM dependencies 
-                WHERE issue_id = ?1 {type_filter}
-                UNION
-                -- Recursive step: follow dependencies forward
-                SELECT d.depends_on_id
-                FROM dependencies d
-                JOIN transitive_deps td ON d.issue_id = td.id
-                WHERE 1=1 {type_filter}
-            )
-            SELECT 1 FROM transitive_deps WHERE id = ?2 LIMIT 1;
-            "
-        );
-
-        let exists: bool = self
-            .conn
-            .query_row(&query, rusqlite::params![depends_on_id, issue_id], |_| {
-                Ok(true)
-            })
-            .optional()?
-            .unwrap_or(false);
-
-        Ok(exists)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, blocking_only)
     }
 
     /// Detect all cycles in the dependency graph.
@@ -3554,7 +3628,7 @@ impl crate::validation::DependencyStore for SqliteStorage {
         issue_id: &str,
         depends_on_id: &str,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
-        Self::would_create_cycle(self, issue_id, depends_on_id, true)
+        Self::check_cycle(&self.conn, issue_id, depends_on_id, true)
     }
 }
 
