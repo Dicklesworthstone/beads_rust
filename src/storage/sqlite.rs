@@ -3753,15 +3753,7 @@ mod tests {
     #[test]
     fn test_transaction_rollback_on_error() {
         let mut storage = SqliteStorage::open_memory().unwrap();
-        let issue = make_issue(
-            "bd-tx1",
-            "Tx Test",
-            Status::Open,
-            2,
-            None,
-            Utc::now(),
-            None,
-        );
+        let issue = make_issue("bd-tx1", "Tx Test", Status::Open, 2, None, Utc::now(), None);
         storage.create_issue(&issue, "tester").unwrap();
 
         // Attempt a mutation that fails
