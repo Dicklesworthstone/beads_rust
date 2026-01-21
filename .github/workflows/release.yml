@@ -23,6 +23,8 @@ env:
 
 permissions:
   contents: write
+  id-token: write      # Required for SLSA provenance
+  attestations: write  # Required for artifact attestations
 
 jobs:
   # Pre-flight checks before building release
@@ -31,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -40,7 +42,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
 
       - name: Verify formatting
         run: cargo fmt --all -- --check
@@ -103,7 +105,7 @@ jobs:
             name: windows_amd64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           fetch-depth: 0  # Full history for vergen
 
@@ -120,9 +122,9 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -199,7 +201,7 @@ jobs:
           rm -f /tmp/minisign.key
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: br-${{ matrix.name }}
           path: |
@@ -214,12 +216,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           path: artifacts
           merge-multiple: true
@@ -346,8 +348,14 @@ jobs:
           echo "=== Generated changelog ==="
           cat CHANGELOG.md
 
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft dir:. -o cyclonedx-json > artifacts/sbom.cdx.json
+          syft dir:. -o spdx-json > artifacts/sbom.spdx.json
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
         with:
           name: br ${{ github.ref_name }}
           body_path: CHANGELOG.md
@@ -359,8 +367,17 @@ jobs:
             artifacts/br-${{ github.ref_name }}-*.sha256
             artifacts/br-${{ github.ref_name }}-*.minisig
             artifacts/checksums.sha256
+            artifacts/sbom.cdx.json
+            artifacts/sbom.spdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SLSA provenance attestations
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018  # v2
+        with:
+          subject-path: |
+            artifacts/br-${{ github.ref_name }}-*.tar.gz
+            artifacts/br-${{ github.ref_name }}-*.zip
 
   update-crates-io:
     name: Publish to crates.io
@@ -369,7 +386,7 @@ jobs:
     timeout-minutes: 15
     if: "!contains(github.ref_name, '-')"  # Skip pre-releases
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master

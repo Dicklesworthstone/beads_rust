@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -35,7 +35,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -54,10 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@0bc4cd8a3e21db4cb9519857377b0c8c5e150de5  # v2
         with:
           tool: cargo-audit
 
@@ -74,7 +74,7 @@ jobs:
     timeout-minutes: 20
     needs: check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -82,7 +82,7 @@ jobs:
           toolchain: nightly
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
 
       - name: Run all tests (all features)
         run: cargo test --all-features -- --nocapture
@@ -101,7 +101,7 @@ jobs:
     timeout-minutes: 30
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -110,17 +110,19 @@ jobs:
           components: llvm-tools-preview
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@0bc4cd8a3e21db4cb9519857377b0c8c5e150de5  # v2
+        with:
+          tool: cargo-llvm-cov
 
       - name: Generate coverage report
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
         continue-on-error: true
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238  # v4
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -157,7 +159,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -166,9 +168,9 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -183,14 +185,14 @@ jobs:
 
       - name: Upload artifact (Unix)
         if: runner.os != 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: br-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/br
 
       - name: Upload artifact (Windows)
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: br-${{ matrix.name }}
           path: target/${{ matrix.target }}/release/br.exe
@@ -202,7 +204,7 @@ jobs:
     needs: check
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -210,15 +212,15 @@ jobs:
           toolchain: nightly
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
 
       - name: Restore criterion baseline cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: target/criterion/
-          key: ${{ runner.os }}-criterion-${{ github.run_id }}
+          key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
           restore-keys: |
-            ${{ runner.os }}-criterion-
+            ${{ runner.os }}-${{ runner.arch }}-criterion-
 
       - name: Snapshot benchmark baseline (if present)
         run: |
@@ -286,7 +288,7 @@ jobs:
           PY
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: benchmark-results
           path: target/criterion/
@@ -294,10 +296,10 @@ jobs:
 
       - name: Save criterion baseline cache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
           path: target/criterion/
-          key: ${{ runner.os }}-criterion-${{ github.run_id }}
+          key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
 
   # Verify version auditing info is correctly embedded
   version-audit:
@@ -306,10 +308,10 @@ jobs:
     timeout-minutes: 10
     needs: build
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: br-linux-x64
           path: ./bin
@@ -336,7 +338,7 @@ jobs:
     timeout-minutes: 10
     needs: check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -344,7 +346,7 @@ jobs:
           toolchain: nightly
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db  # v2
 
       - name: Run quick E2E tests
         run: scripts/e2e.sh
@@ -354,7 +356,7 @@ jobs:
 
       - name: Upload E2E summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: e2e-quick-summary
           path: target/test-artifacts/e2e_quick_summary.json

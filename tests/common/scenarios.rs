@@ -11,6 +11,7 @@
 
 #![allow(dead_code, clippy::similar_names)]
 
+use super::binary_discovery::{check_bd_version, discover_binaries};
 use super::dataset_registry::{IsolatedDataset, KnownDataset};
 use super::harness::{
     CommandResult, ConformanceWorkspace as HarnessConformanceWorkspace, TestWorkspace,
@@ -708,6 +709,27 @@ impl BenchmarkRunner {
         let started_at = Utc::now().to_rfc3339();
         let mut all_runs: Vec<BenchmarkMetrics> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
+        let mut include_bd = self.config.include_bd;
+
+        if include_bd {
+            match discover_binaries() {
+                Ok(binaries) => {
+                    if let Some(bd) = binaries.bd {
+                        if let Err(err) = check_bd_version(&bd) {
+                            notes.push(format!("bd benchmarks disabled: {err}"));
+                            include_bd = false;
+                        }
+                    } else {
+                        notes.push("bd benchmarks disabled: bd binary not found".to_string());
+                        include_bd = false;
+                    }
+                }
+                Err(err) => {
+                    notes.push(format!("bd benchmarks disabled: {err}"));
+                    include_bd = false;
+                }
+            }
+        }
 
         let total_iterations = self.config.warmup_iterations + self.config.measured_iterations;
 
@@ -716,52 +738,135 @@ impl BenchmarkRunner {
             let is_warmup = i < self.config.warmup_iterations;
             let iteration = i + 1;
 
-            // Create fresh workspace for each iteration
-            let mut workspace =
-                TestWorkspace::new("benchmark", &format!("{}_{}", scenario.name, iteration));
+            // Create fresh workspace(s) for each iteration
+            if include_bd {
+                let mut workspace = HarnessConformanceWorkspace::new(
+                    "benchmark",
+                    &format!("{}_{}", scenario.name, iteration),
+                );
 
-            // Setup
-            if matches!(scenario.setup, ScenarioSetup::Fresh) {
-                let _ = workspace.init_br();
-            }
+                if let ScenarioSetup::Dataset(dataset) = scenario.setup {
+                    if let Err(err) = populate_conformance_with_dataset(&workspace, dataset) {
+                        notes.push(format!(
+                            "Dataset setup failed for iteration {iteration}: {err}"
+                        ));
+                        continue;
+                    }
+                }
 
-            // Run setup commands
-            for cmd in &scenario.setup_commands {
-                workspace.run_br(&cmd.args, &cmd.label);
-            }
+                if matches!(scenario.setup, ScenarioSetup::Fresh) {
+                    let _ = workspace.init_both();
+                }
 
-            // Run the benchmark command and measure
-            let br_start = std::time::Instant::now();
-            let br_result =
-                workspace.run_br(&scenario.test_command.args, &scenario.test_command.label);
-            let br_duration = br_start.elapsed();
+                let setup_commands = collect_setup_commands(scenario);
+                for cmd in &setup_commands {
+                    let label = format!("setup_{}", cmd.label);
+                    run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Br);
+                    run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Bd);
+                }
 
-            // Measure IO sizes
-            let (db_size, jsonl_size) = if self.config.measure_io {
-                measure_io_sizes(&workspace.root)
+                let br_start = std::time::Instant::now();
+                let br_result = run_conformance_command(
+                    &mut workspace,
+                    &scenario.test_command,
+                    &scenario.test_command.label,
+                    BinaryTarget::Br,
+                );
+                let br_duration = br_start.elapsed();
+
+                let bd_start = std::time::Instant::now();
+                let bd_result = run_conformance_command(
+                    &mut workspace,
+                    &scenario.test_command,
+                    &scenario.test_command.label,
+                    BinaryTarget::Bd,
+                );
+                let bd_duration = bd_start.elapsed();
+
+                if !bd_result.success {
+                    notes.push(format!(
+                        "bd benchmark failed for iteration {iteration} (exit {})",
+                        bd_result.exit_code
+                    ));
+                }
+
+                let (db_size, jsonl_size) = if self.config.measure_io {
+                    measure_io_sizes(&workspace.br_workspace)
+                } else {
+                    (None, None)
+                };
+
+                let speedup_ratio = if br_duration.as_millis() > 0 {
+                    Some(bd_duration.as_millis() as f64 / br_duration.as_millis() as f64)
+                } else {
+                    None
+                };
+
+                let metrics = BenchmarkMetrics {
+                    br_duration_ms: br_duration.as_millis(),
+                    bd_duration_ms: Some(bd_duration.as_millis()),
+                    speedup_ratio,
+                    br_peak_rss_bytes: None,
+                    bd_peak_rss_bytes: None,
+                    br_cpu_time_ms: None,
+                    bd_cpu_time_ms: None,
+                    db_size_bytes: db_size,
+                    jsonl_size_bytes: jsonl_size,
+                    iteration: Some(iteration),
+                    is_warmup,
+                };
+
+                all_runs.push(metrics);
+                workspace.finish(br_result.success && bd_result.success);
             } else {
-                (None, None)
-            };
+                let mut workspace =
+                    TestWorkspace::new("benchmark", &format!("{}_{}", scenario.name, iteration));
 
-            // Build metrics for this run
-            let metrics = BenchmarkMetrics {
-                br_duration_ms: br_duration.as_millis(),
-                bd_duration_ms: None, // TODO: Add bd support in future iteration
-                speedup_ratio: None,
-                br_peak_rss_bytes: None, // RSS measurement requires running process PID
-                bd_peak_rss_bytes: None,
-                br_cpu_time_ms: None, // CPU time requires more instrumentation
-                bd_cpu_time_ms: None,
-                db_size_bytes: db_size,
-                jsonl_size_bytes: jsonl_size,
-                iteration: Some(iteration),
-                is_warmup,
-            };
+                if let ScenarioSetup::Dataset(dataset) = scenario.setup {
+                    if let Err(err) = populate_workspace_with_dataset(&workspace, dataset) {
+                        notes.push(format!(
+                            "Dataset setup failed for iteration {iteration}: {err}"
+                        ));
+                        continue;
+                    }
+                }
 
-            all_runs.push(metrics);
+                if matches!(scenario.setup, ScenarioSetup::Fresh) {
+                    let _ = workspace.init_br();
+                }
 
-            // Cleanup workspace
-            workspace.finish(br_result.success);
+                let setup_commands = collect_setup_commands(scenario);
+                for cmd in &setup_commands {
+                    run_scenario_command(&mut workspace, cmd, None);
+                }
+
+                let br_start = std::time::Instant::now();
+                let br_result = run_scenario_command(&mut workspace, &scenario.test_command, None);
+                let br_duration = br_start.elapsed();
+
+                let (db_size, jsonl_size) = if self.config.measure_io {
+                    measure_io_sizes(&workspace.root)
+                } else {
+                    (None, None)
+                };
+
+                let metrics = BenchmarkMetrics {
+                    br_duration_ms: br_duration.as_millis(),
+                    bd_duration_ms: None,
+                    speedup_ratio: None,
+                    br_peak_rss_bytes: None,
+                    bd_peak_rss_bytes: None,
+                    br_cpu_time_ms: None,
+                    bd_cpu_time_ms: None,
+                    db_size_bytes: db_size,
+                    jsonl_size_bytes: jsonl_size,
+                    iteration: Some(iteration),
+                    is_warmup,
+                };
+
+                all_runs.push(metrics);
+                workspace.finish(br_result.success);
+            }
         }
 
         // Separate warmup from measured runs
@@ -772,6 +877,28 @@ impl BenchmarkRunner {
         let br_durations: Vec<u128> = measured_runs.iter().map(|m| m.br_duration_ms).collect();
         let br_rss: Vec<Option<u64>> = measured_runs.iter().map(|m| m.br_peak_rss_bytes).collect();
         let br_stats = compute_statistics(&br_durations, &br_rss);
+
+        let bd_durations: Vec<u128> = measured_runs
+            .iter()
+            .filter_map(|m| m.bd_duration_ms)
+            .collect();
+        let bd_stats = if include_bd && !bd_durations.is_empty() {
+            let bd_rss: Vec<Option<u64>> = vec![None; bd_durations.len()];
+            Some(compute_statistics(&bd_durations, &bd_rss))
+        } else {
+            if include_bd {
+                notes.push("bd benchmarks produced no measurable runs".to_string());
+            }
+            None
+        };
+
+        let speedup_ratio = bd_stats.as_ref().and_then(|stats| {
+            if br_stats.median_ms > 0 {
+                Some(stats.median_ms as f64 / br_stats.median_ms as f64)
+            } else {
+                None
+            }
+        });
 
         // Check for high variance
         if br_stats.cv > 0.15 {
@@ -791,8 +918,8 @@ impl BenchmarkRunner {
             completed_at,
             total_runs: total_iterations,
             br_stats,
-            bd_stats: None, // TODO: Add when bd benchmarking is implemented
-            speedup_ratio: None,
+            bd_stats,
+            speedup_ratio,
             runs: all_runs.into_iter().filter(|m| !m.is_warmup).collect(),
             notes,
         }
