@@ -11,7 +11,6 @@ use crossterm::style::Stylize;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::path::Path;
 
 /// Execute the epic command.
 ///

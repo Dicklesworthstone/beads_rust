@@ -10,7 +10,6 @@ use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::path::Path;
 use tracing::{debug, info};
 
 /// Execute the label command.

@@ -16,7 +16,7 @@ type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
 /// # Errors
 ///
 /// Returns an error if history operations fail (e.g. IO error, invalid path).
-pub fn execute(args: HistoryArgs, _cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: HistoryArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let history_dir = beads_dir.join(".br_history");
 

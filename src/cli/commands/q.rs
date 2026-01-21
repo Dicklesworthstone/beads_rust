@@ -7,7 +7,6 @@ use crate::util::id::IdGenerator;
 use crate::validation::LabelValidator;
 use chrono::Utc;
 use rich_rust::prelude::*;
-use std::path::Path;
 use std::str::FromStr;
 
 fn split_labels(values: &[String]) -> Vec<String> {

@@ -14,7 +14,6 @@ use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::path::Path;
 
 /// Execute the list command.
 ///

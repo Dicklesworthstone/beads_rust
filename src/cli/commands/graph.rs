@@ -15,7 +15,6 @@ use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
 use tracing::debug;
 
 /// JSON output for a single node in the graph.

@@ -13,7 +13,7 @@ use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Execute the dep command.
 ///

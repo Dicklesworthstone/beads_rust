@@ -13,7 +13,6 @@ use chrono::Utc;
 use regex::{Regex, RegexBuilder};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::Path;
 use std::str::FromStr;
 
 /// Execute the search command.

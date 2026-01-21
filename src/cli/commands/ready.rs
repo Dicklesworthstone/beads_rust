@@ -10,7 +10,6 @@ use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ReadyFilters, ReadySortPolicy};
 use std::io::IsTerminal;
-use std::path::Path;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
 use unicode_width::UnicodeWidthStr;
