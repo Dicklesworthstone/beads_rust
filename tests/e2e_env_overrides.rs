@@ -303,12 +303,13 @@ fn e2e_actor_flag_overrides_env() {
     let create = run_br(&workspace, ["create", "Flag override test"], "create");
     assert!(create.status.success(), "create failed: {}", create.stderr);
 
+    // Output is "✓ Created bd-abc123: Flag override test"
     let id = create
         .stdout
         .lines()
         .next()
         .unwrap_or("")
-        .strip_prefix("Created ")
+        .strip_prefix("✓ Created ")
         .and_then(|s| s.split(':').next())
         .unwrap_or("")
         .trim();
