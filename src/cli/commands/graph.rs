@@ -410,6 +410,9 @@ fn calculate_depths(
 
     // Get dependencies for each node (filtered to component)
     let mut deps_map: HashMap<String, Vec<String>> = HashMap::new();
+    // Also build reverse map (dependents) for efficient traversal
+    let mut dependents_map: HashMap<String, Vec<String>> = HashMap::new();
+
     for node_id in nodes {
         if let Some(deps) = all_dependencies.get(node_id) {
             let filtered: Vec<String> = deps
@@ -418,6 +421,11 @@ fn calculate_depths(
                 .map(|d| d.depends_on_id.clone())
                 .filter(|d| component_set.contains(d))
                 .collect();
+            
+            for dep_id in &filtered {
+                dependents_map.entry(dep_id.clone()).or_default().push(node_id.clone());
+            }
+            
             deps_map.insert(node_id.clone(), filtered);
         } else {
             deps_map.insert(node_id.clone(), Vec::new());
@@ -450,12 +458,10 @@ fn calculate_depths(
                 *entry = depth;
             }
 
-            // Find dependents (nodes that depend on current)
-            for node_id in nodes {
-                if let Some(node_deps) = deps_map.get(node_id) {
-                    if node_deps.contains(current) {
-                        queue.push_back((node_id, depth + 1));
-                    }
+            // Find dependents (nodes that depend on current) using the reverse map
+            if let Some(dependents) = dependents_map.get(current) {
+                for dependent_id in dependents {
+                    queue.push_back((dependent_id, depth + 1));
                 }
             }
         }

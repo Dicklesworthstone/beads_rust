@@ -79,7 +79,7 @@ const STRUCTURAL_FIELDS: &[&str] = &[
 
 /// Fields that br includes but bd may omit (implementation-specific extras).
 /// These are ignored when comparing JSONL outputs to allow for minor serialization differences.
-const IGNORABLE_BR_ONLY_FIELDS: &[&str] = &["compaction_level", "original_size"];
+const IGNORABLE_BR_ONLY_FIELDS: &[&str] = &["compaction_level", "original_size", "source_repo"];
 
 /// Fields where br and bd have different implementation-specific defaults.
 /// These are audit/actor fields that vary between implementations but don't affect semantics.
