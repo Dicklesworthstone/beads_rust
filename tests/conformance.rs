@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
@@ -757,6 +757,56 @@ fn normalize_value(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+fn normalize_path_fields(value: &mut Value, workspace_root: &Path) {
+    let root = workspace_root_string(workspace_root);
+    normalize_path_fields_inner(value, &root);
+}
+
+fn workspace_root_string(root: &Path) -> String {
+    root.canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string()
+}
+
+fn normalize_path_fields_inner(value: &mut Value, root: &str) {
+    match value {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if is_path_key(key) {
+                    if let Some(s) = val.as_str() {
+                        *val = Value::String(normalize_path_value(s, root));
+                    }
+                } else {
+                    normalize_path_fields_inner(val, root);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                normalize_path_fields_inner(item, root);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_path_value(value: &str, root: &str) -> String {
+    let mut normalized = value.replace('\\', "/");
+    let root_norm = root.replace('\\', "/");
+    if normalized.starts_with(&root_norm) {
+        normalized = format!("<WORKSPACE>{}", &normalized[root_norm.len()..]);
+    }
+    normalized
+}
+
+fn is_path_key(key: &str) -> bool {
+    matches!(
+        key,
+        "path" | "database_path" | "beads_dir" | "jsonl_path" | "redirected_from" | "socket_path"
+    )
 }
 
 /// Compare two JSON outputs
@@ -9659,6 +9709,114 @@ fn conformance_doctor_with_issues() {
     log_timings("doctor_with_issues", &br_doctor, &bd_doctor);
 
     info!("conformance_doctor_with_issues passed");
+}
+
+// === INFO COMMAND TESTS ===
+
+#[test]
+fn conformance_info_json_parity() {
+    skip_if_no_bd!();
+    common::init_test_logging();
+    info!("Starting conformance_info_json_parity test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_info = workspace.run_br(["info", "--json"], "info");
+    let bd_info = workspace.run_bd(["info", "--json"], "info");
+
+    assert!(
+        br_info.status.success(),
+        "br info failed: {}",
+        br_info.stderr
+    );
+    assert!(
+        bd_info.status.success(),
+        "bd info failed: {}",
+        bd_info.stderr
+    );
+
+    let br_json = extract_json_payload(&br_info.stdout);
+    let bd_json = extract_json_payload(&bd_info.stdout);
+
+    let mut br_val: Value = serde_json::from_str(&br_json).expect("br info json");
+    let mut bd_val: Value = serde_json::from_str(&bd_json).expect("bd info json");
+
+    normalize_path_fields(&mut br_val, &workspace.br_root);
+    normalize_path_fields(&mut bd_val, &workspace.bd_root);
+
+    let excluded = vec![
+        "beads_dir".to_string(),
+        "db_size".to_string(),
+        "jsonl_path".to_string(),
+        "jsonl_size".to_string(),
+        "daemon_detail".to_string(),
+        "daemon_fallback_reason".to_string(),
+    ];
+
+    let br_filtered = filter_fields(&br_val, &excluded);
+    let bd_filtered = filter_fields(&bd_val, &excluded);
+
+    assert_eq!(
+        br_filtered,
+        bd_filtered,
+        "info JSON mismatch after normalization\nbr: {}\nbd: {}",
+        serde_json::to_string_pretty(&br_filtered).unwrap_or_default(),
+        serde_json::to_string_pretty(&bd_filtered).unwrap_or_default()
+    );
+
+    log_timings("info_json_parity", &br_info, &bd_info);
+    info!("conformance_info_json_parity passed");
+}
+
+// === WHERE COMMAND TESTS ===
+
+#[test]
+fn conformance_where_json_parity() {
+    skip_if_no_bd!();
+    common::init_test_logging();
+    info!("Starting conformance_where_json_parity test");
+
+    let workspace = ConformanceWorkspace::new();
+    workspace.init_both();
+
+    let br_where = workspace.run_br(["where", "--json"], "where");
+    let bd_where = workspace.run_bd(["where", "--json"], "where");
+
+    assert!(
+        br_where.status.success(),
+        "br where failed: {}",
+        br_where.stderr
+    );
+    assert!(
+        bd_where.status.success(),
+        "bd where failed: {}",
+        bd_where.stderr
+    );
+
+    let br_json = extract_json_payload(&br_where.stdout);
+    let bd_json = extract_json_payload(&bd_where.stdout);
+
+    let mut br_val: Value = serde_json::from_str(&br_json).expect("br where json");
+    let mut bd_val: Value = serde_json::from_str(&bd_json).expect("bd where json");
+
+    normalize_path_fields(&mut br_val, &workspace.br_root);
+    normalize_path_fields(&mut bd_val, &workspace.bd_root);
+
+    let excluded = vec!["jsonl_path".to_string()];
+    let br_filtered = filter_fields(&br_val, &excluded);
+    let bd_filtered = filter_fields(&bd_val, &excluded);
+
+    assert_eq!(
+        br_filtered,
+        bd_filtered,
+        "where JSON mismatch after normalization\nbr: {}\nbd: {}",
+        serde_json::to_string_pretty(&br_filtered).unwrap_or_default(),
+        serde_json::to_string_pretty(&bd_filtered).unwrap_or_default()
+    );
+
+    log_timings("where_json_parity", &br_where, &bd_where);
+    info!("conformance_where_json_parity passed");
 }
 
 // === VERSION COMMAND TESTS ===
