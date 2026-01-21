@@ -270,7 +270,7 @@ fn issue_id_separator(id: &str) -> Option<usize> {
         return Some(last_dash);
     }
 
-    id.find('-')
+    id.rfind('-')
 }
 
 pub(crate) fn split_prefix_remainder(id: &str) -> Option<(&str, &str)> {
@@ -935,6 +935,15 @@ mod tests {
         assert_eq!(child.prefix, "document-intelligence");
         assert_eq!(child.hash, "0sa");
         assert_eq!(child.child_path, vec![2]);
+    }
+
+    #[test]
+    fn test_parse_id_hyphenated_prefix_word_like_hash() {
+        // "my-proj" is prefix. "abcd" is hash (4 chars, no digits).
+        // Previously failed because "abcd" was deemed unlikely hash, causing split at first dash.
+        let parsed = parse_id("my-proj-abcd").unwrap();
+        assert_eq!(parsed.prefix, "my-proj");
+        assert_eq!(parsed.hash, "abcd");
     }
 
     #[test]
