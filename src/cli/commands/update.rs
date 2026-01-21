@@ -53,7 +53,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let has_updates = !update.is_empty()
         || !args.add_label.is_empty()
         || !args.remove_label.is_empty()
-        || args.set_labels.is_some()
+        || !args.set_labels.is_empty()
         || args.parent.is_some();
 
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
@@ -91,10 +91,12 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         for label in &args.remove_label {
             storage.remove_label(id, label, &actor)?;
         }
-        if let Some(ref labels_str) = args.set_labels {
+        if !args.set_labels.is_empty() {
             // Remove all then add new
             storage.remove_all_labels(id, &actor)?;
-            for label in labels_str.split(',') {
+            // Join all flag values, then split by comma (handles both --set-labels a,b and --set-labels a --set-labels b)
+            let combined = args.set_labels.join(",");
+            for label in combined.split(',') {
                 let label = label.trim();
                 if !label.is_empty() {
                     LabelValidator::validate(label)

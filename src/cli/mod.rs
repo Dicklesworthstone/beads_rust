@@ -439,9 +439,9 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub remove_label: Vec<String>,
 
-    /// Set label(s) (replaces all)
+    /// Set label(s) (replaces all) - repeatable like bd
     #[arg(long)]
-    pub set_labels: Option<String>,
+    pub set_labels: Vec<String>,
 
     /// Reparent to new parent (empty string removes parent)
     #[arg(long)]
