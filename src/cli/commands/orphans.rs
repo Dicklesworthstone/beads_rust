@@ -132,8 +132,8 @@ pub fn execute(
     orphan_issues.sort_by(|a, b| a.id.cmp(&b.id));
     debug!(orphan_count = orphans.len(), "Scanning for orphaned issues");
 
-    if ctx.is_json() {
-        ctx.json_pretty(&orphans);
+    if ctx.is_json() || args.robot {
+        println!("{}", serde_json::to_string_pretty(&orphans).unwrap());
         return Ok(());
     }
 
@@ -305,7 +305,7 @@ fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, Str
 /// Output empty result in appropriate format.
 fn output_empty(json: bool, ctx: &OutputContext) {
     if json || ctx.is_json() {
-        ctx.json(&Vec::<OrphanIssue>::new());
+        println!("[]");
         return;
     }
     if ctx.is_quiet() {
