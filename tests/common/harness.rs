@@ -23,6 +23,12 @@ fn br_binary_path() -> PathBuf {
     assert_cmd::cargo::cargo_bin!("br").to_path_buf()
 }
 
+/// Get the path to the bd (Go beads) binary.
+/// Checks `BD_BINARY` environment variable first, falls back to "bd" for PATH lookup.
+fn bd_binary_path() -> String {
+    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+}
+
 /// Global mutex for artifact logging to prevent interleaving
 fn artifact_mutex() -> &'static Mutex<()> {
     static MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -707,12 +713,13 @@ impl TestWorkspace {
     }
 
     /// Run bd (Go beads) command
+    /// Respects `BD_BINARY` environment variable for custom binary path
     pub fn run_bd<I, S>(&mut self, args: I, label: &str) -> CommandResult
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        self.run_system_binary("bd", args, label)
+        self.run_system_binary(&bd_binary_path(), args, label)
     }
 
     /// Run any binary from the cargo build
@@ -1003,13 +1010,14 @@ impl ConformanceWorkspace {
     }
 
     /// Run bd command
+    /// Respects `BD_BINARY` environment variable for custom binary path
     pub fn run_bd<I, S>(&mut self, args: I, label: &str) -> CommandResult
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         self.run_in_workspace_system(
-            "bd",
+            &bd_binary_path(),
             &self.bd_workspace.clone(),
             args,
             &format!("bd_{label}"),
@@ -1077,6 +1085,7 @@ impl ConformanceWorkspace {
     }
 
     /// Run bd command with environment variables
+    /// Respects `BD_BINARY` environment variable for custom binary path
     pub fn run_bd_env<I, S, E, K, V>(&mut self, args: I, env_vars: E, label: &str) -> CommandResult
     where
         I: IntoIterator<Item = S>,
@@ -1086,7 +1095,7 @@ impl ConformanceWorkspace {
         V: AsRef<OsStr>,
     {
         self.run_in_workspace_system_env(
-            "bd",
+            &bd_binary_path(),
             &self.bd_workspace.clone(),
             args,
             env_vars,
@@ -1096,13 +1105,14 @@ impl ConformanceWorkspace {
     }
 
     /// Run bd command with stdin input
+    /// Respects `BD_BINARY` environment variable for custom binary path
     pub fn run_bd_stdin<I, S>(&mut self, args: I, input: &str, label: &str) -> CommandResult
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
         self.run_in_workspace_system_env(
-            "bd",
+            &bd_binary_path(),
             &self.bd_workspace.clone(),
             args,
             std::iter::empty::<(String, String)>(),
@@ -1112,6 +1122,7 @@ impl ConformanceWorkspace {
     }
 
     /// Run bd command with env vars and stdin
+    /// Respects `BD_BINARY` environment variable for custom binary path
     pub fn run_bd_env_stdin<I, S, E, K, V>(
         &mut self,
         args: I,
@@ -1127,7 +1138,7 @@ impl ConformanceWorkspace {
         V: AsRef<OsStr>,
     {
         self.run_in_workspace_system_env(
-            "bd",
+            &bd_binary_path(),
             &self.bd_workspace.clone(),
             args,
             env_vars,

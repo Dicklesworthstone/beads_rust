@@ -131,12 +131,8 @@ impl<'a> IssueTable<'a> {
             .as_deref()
             .and_then(build_highlight_regex);
 
-        let title_max_width = if let Some(w) = self.width {
-            // Reserve ~100 chars for other columns (conservative) or min 60
-            w.saturating_sub(100).max(60)
-        } else {
-            60
-        };
+        // Reserve ~100 chars for other columns (conservative) or min 60.
+        let title_max_width = self.width.map_or(60, |w| w.saturating_sub(100).max(60));
 
         let mut table = Table::new()
             .box_style(self.theme.box_style)
