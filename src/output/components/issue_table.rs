@@ -14,6 +14,7 @@ pub struct IssueTable<'a> {
     title: Option<String>,
     highlight_query: Option<String>,
     context_snippets: Option<HashMap<String, String>>,
+    width: Option<usize>,
 }
 
 #[derive(Default, Clone)]
@@ -83,7 +84,14 @@ impl<'a> IssueTable<'a> {
             title: None,
             highlight_query: None,
             context_snippets: None,
+            width: None,
         }
+    }
+
+    #[must_use]
+    pub fn width(mut self, width: Option<usize>) -> Self {
+        self.width = width;
+        self
     }
 
     #[must_use]
@@ -123,6 +131,13 @@ impl<'a> IssueTable<'a> {
             .as_deref()
             .and_then(build_highlight_regex);
 
+        let title_max_width = if let Some(w) = self.width {
+            // Reserve ~100 chars for other columns (conservative) or min 60
+            w.saturating_sub(100).max(60)
+        } else {
+            60
+        };
+
         let mut table = Table::new()
             .box_style(self.theme.box_style)
             .border_style(self.theme.table_border.clone())
@@ -146,7 +161,11 @@ impl<'a> IssueTable<'a> {
             table = table.with_column(Column::new("Type").min_width(7));
         }
         if self.columns.title {
-            table = table.with_column(Column::new("Title").min_width(20).max_width(60));
+            table = table.with_column(
+                Column::new("Title")
+                    .min_width(20)
+                    .max_width(title_max_width),
+            );
         }
         if self.columns.assignee {
             table = table.with_column(Column::new("Assignee").max_width(20));
@@ -190,7 +209,7 @@ impl<'a> IssueTable<'a> {
                 );
             }
             if self.columns.title {
-                let title = truncate_title(&issue.title, 60);
+                let title = truncate_title(&issue.title, title_max_width);
                 let title_text = highlight_text(&title, highlight_regex.as_ref(), self.theme);
                 cells.push(Cell::new(title_text).style(self.theme.issue_title.clone()));
             }
