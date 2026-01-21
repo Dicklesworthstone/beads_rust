@@ -1278,7 +1278,7 @@ impl SqliteStorage {
         let mut count = 0;
         {
             let mut insert_stmt = conn.prepare(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by_json) VALUES (?, ?)",
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
             )?;
 
             for (issue_id, blockers) in blocked_issues_map {
@@ -1334,7 +1334,7 @@ impl SqliteStorage {
 
             {
                 let mut insert_stmt = conn.prepare(
-                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by_json) VALUES (?, ?)",
+                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
                 )?;
 
                 for (issue_id, parents) in issue_blockers {
@@ -1371,7 +1371,7 @@ impl SqliteStorage {
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
                      i.pinned, i.is_template,
-                     bc.blocked_by_json
+                     bc.blocked_by
               FROM issues i
               INNER JOIN blocked_issues_cache bc ON i.id = bc.issue_id
               WHERE i.status IN ('open', 'in_progress')
@@ -4306,7 +4306,7 @@ mod tests {
         storage
             .conn
             .execute(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by_json) VALUES (?, ?)",
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
                 ["bd-c1", r#"["bd-b1"]"#],
             )
             .unwrap();
