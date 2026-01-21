@@ -1,10 +1,12 @@
 //! Version command implementation.
 
+use crate::cli::VersionArgs;
 use crate::error::Result;
 use crate::output::{OutputContext, OutputMode};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fmt::Write as _;
+use std::process;
 
 #[derive(Serialize)]
 struct VersionOutput<'a> {
@@ -26,9 +28,21 @@ struct VersionOutput<'a> {
 ///
 /// # Errors
 ///
-/// Returns an error if JSON serialization fails.
-pub fn execute(ctx: &OutputContext) -> Result<()> {
+/// Returns an error if JSON serialization fails or update check fails.
+pub fn execute(args: &VersionArgs, ctx: &OutputContext) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
+
+    // Handle --short flag: output only version number
+    if args.short {
+        println!("{version}");
+        return Ok(());
+    }
+
+    // Handle --check flag: check if update is available
+    if args.check {
+        return execute_update_check(version, ctx);
+    }
+
     let build = if cfg!(debug_assertions) {
         "dev"
     } else {
@@ -169,4 +183,96 @@ fn render_version_rich(
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+}
+
+/// Check for updates and exit with appropriate code.
+///
+/// Exit codes:
+/// - 0: Up-to-date
+/// - 1: Update available
+/// - 2: Error checking for updates
+fn execute_update_check(current_version: &str, ctx: &OutputContext) -> Result<()> {
+    // Try to fetch latest version from GitHub releases
+    let latest = match fetch_latest_version() {
+        Ok(v) => v,
+        Err(e) => {
+            if ctx.is_json() {
+                ctx.json(&serde_json::json!({
+                    "current": current_version,
+                    "latest": null,
+                    "update_available": null,
+                    "error": e.to_string()
+                }));
+            } else {
+                eprintln!("Error checking for updates: {e}");
+            }
+            process::exit(2);
+        }
+    };
+
+    let current = semver::Version::parse(current_version).ok();
+    let latest_ver = semver::Version::parse(&latest).ok();
+
+    let update_available = match (&current, &latest_ver) {
+        (Some(c), Some(l)) => l > c,
+        _ => false,
+    };
+
+    if ctx.is_json() {
+        ctx.json(&serde_json::json!({
+            "current": current_version,
+            "latest": latest,
+            "update_available": update_available
+        }));
+    } else if update_available {
+        println!("Update available: {current_version} → {latest}");
+        println!("Run `br upgrade` to update.");
+    } else {
+        println!("br {current_version} is up to date (latest: {latest})");
+    }
+
+    if update_available {
+        process::exit(1);
+    }
+    Ok(())
+}
+
+/// Fetch the latest release version from GitHub.
+fn fetch_latest_version() -> Result<String> {
+    use std::io::Read;
+
+    // Use GitHub API to get latest release
+    let url = "https://api.github.com/repos/Dicklesworthstone/beads_rust/releases/latest";
+
+    // Build request with User-Agent (required by GitHub)
+    let mut handle = std::process::Command::new("curl")
+        .args(["-sS", "-H", "User-Agent: br-cli", url])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn curl: {e}"))?;
+
+    let mut output = String::new();
+    if let Some(ref mut stdout) = handle.stdout {
+        stdout.read_to_string(&mut output)?;
+    }
+
+    let status = handle.wait()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("curl failed with status {status}").into());
+    }
+
+    // Parse JSON response
+    let json: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|e| anyhow::anyhow!("Failed to parse GitHub response: {e}"))?;
+
+    // Extract tag_name (e.g., "v0.1.7")
+    let tag = json
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No tag_name in GitHub response"))?;
+
+    // Strip leading "v" if present
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    Ok(version.to_string())
 }
