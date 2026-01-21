@@ -725,12 +725,10 @@ impl BenchmarkRunner {
                 {
                     all_runs.push(metrics);
                 }
-            } else {
-                if let Some(metrics) =
-                    self.run_benchmark_iteration_br_only(scenario, iteration, is_warmup, &mut notes)
-                {
-                    all_runs.push(metrics);
-                }
+            } else if let Some(metrics) =
+                self.run_benchmark_iteration_br_only(scenario, iteration, is_warmup, &mut notes)
+            {
+                all_runs.push(metrics);
             }
         }
 
@@ -913,6 +911,7 @@ impl BenchmarkRunner {
         Some(metrics)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_benchmark_summary(
         &self,
         scenario: &Scenario,
