@@ -489,7 +489,7 @@ fn execute_import(
             
             let dep_type = type_str
                 .parse()
-                .unwrap_or_else(|_| DependencyType::Custom(type_str.to_string()));
+                .unwrap_or_else(|_| DependencyType::Custom(type_str.clone()));
 
             issue.dependencies.push(Dependency {
                 issue_id: id.clone(),

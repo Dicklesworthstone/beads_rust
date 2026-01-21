@@ -56,6 +56,10 @@ pub struct ChangelogEntry {
 /// # Errors
 ///
 /// Returns an error if config loading, git lookup, or storage access fails.
+///
+/// # Panics
+///
+/// Panics if JSON serialization of the output fails (should never happen with valid data).
 pub fn execute(
     args: &ChangelogArgs,
     json: bool,

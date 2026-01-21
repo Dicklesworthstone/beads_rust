@@ -244,13 +244,12 @@ fn discover_beads_dir_with_env(
 /// - `--db` path doesn't contain `.beads/` component
 /// - No beads directory found (when `--db` not provided)
 pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
-    if let Some(db_path) = &cli.db {
+    cli.db.as_ref().map_or_else(
+        // Fall back to normal discovery when --db is not set
+        || discover_beads_dir(None),
         // Derive beads_dir from explicit --db path
-        derive_beads_dir_from_db_path(db_path)
-    } else {
-        // Fall back to normal discovery
-        discover_beads_dir(None)
-    }
+        |db_path| derive_beads_dir_from_db_path(db_path),
+    )
 }
 
 /// Extract the `.beads/` directory from a database path.
@@ -266,13 +265,13 @@ fn derive_beads_dir_from_db_path(db_path: &Path) -> Result<PathBuf> {
     }
 
     // Check if current directory is .beads
-    if current.file_name().map(|n| n == ".beads").unwrap_or(false) {
+    if current.file_name().is_some_and(|n| n == ".beads") {
         return Ok(current);
     }
 
     // Walk up looking for .beads
     for ancestor in db_path.ancestors() {
-        if ancestor.file_name().map(|n| n == ".beads").unwrap_or(false) {
+        if ancestor.file_name().is_some_and(|n| n == ".beads") {
             return Ok(ancestor.to_path_buf());
         }
     }
