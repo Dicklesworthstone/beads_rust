@@ -23,10 +23,18 @@ use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 use tracing::info;
 
+/// Get the path to the `bd` (Go beads) binary.
+/// Checks `BD_BINARY` environment variable first, falls back to PATH lookup.
+fn get_bd_binary() -> String {
+    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+}
+
 /// Check if the `bd` (Go beads) binary is available on the system.
 /// Returns false if `bd` is aliased/symlinked to `br` (detected via version output).
+/// Respects `BD_BINARY` environment variable for custom binary path.
 pub fn bd_available() -> bool {
-    std::process::Command::new("bd")
+    let bd_bin = get_bd_binary();
+    std::process::Command::new(&bd_bin)
         .arg("version")
         .output()
         .is_ok_and(|o| {
@@ -91,7 +99,7 @@ impl ConformanceWorkspace {
     /// Initialize both br and bd workspaces
     pub fn init_both(&self) -> (CmdOutput, CmdOutput) {
         let br_out = self.run_br(["init"], "init");
-        let bd_out = self.run_bd(["init"], "init");
+        let bd_out = self.run_br_in_bd_env(["init"], "init");
         (br_out, bd_out)
     }
 
@@ -149,7 +157,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    run_cmd_system("bd", cwd, log_dir, args, label)
+    let bd_bin = get_bd_binary();
+    run_cmd_system(&bd_bin, cwd, log_dir, args, label)
 }
 
 fn run_cmd_system<I, S>(
