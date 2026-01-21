@@ -1,0 +1,182 @@
+name: Update Package Manifests
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to update manifests for (e.g., 0.1.7)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  update-manifests:
+    name: Update Package Manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Download release checksums
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}"
+
+          echo "Downloading checksums from release v${VERSION}..."
+
+          # Download individual checksum files
+          for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
+            if [ "$platform" = "windows_amd64" ]; then
+              ext="zip"
+            else
+              ext="tar.gz"
+            fi
+            FILE="br-v${VERSION}-${platform}.${ext}.sha256"
+            echo "Downloading $FILE..."
+            curl -sL "${RELEASE_URL}/${FILE}" -o "$FILE" || echo "Warning: Could not download $FILE"
+          done
+
+          echo "=== Downloaded checksums ==="
+          cat *.sha256 2>/dev/null || echo "No checksum files found"
+
+      - name: Extract SHA256 hashes
+        id: hashes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Extract hashes from checksum files
+          for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
+            if [ "$platform" = "windows_amd64" ]; then
+              ext="zip"
+            else
+              ext="tar.gz"
+            fi
+            FILE="br-v${VERSION}-${platform}.${ext}.sha256"
+            if [ -f "$FILE" ]; then
+              HASH=$(cat "$FILE" | awk '{print $1}')
+              VAR_NAME=$(echo "${platform}" | tr '[:lower:]' '[:upper:]')
+              echo "${VAR_NAME}_SHA256=$HASH" >> "$GITHUB_OUTPUT"
+              echo "${platform}: $HASH"
+            else
+              echo "Warning: No checksum for $platform"
+            fi
+          done
+
+      - name: Update Homebrew formula
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Update version
+          sed -i "s/version \"[^\"]*\"/version \"${VERSION}\"/" packaging/homebrew/br.rb
+
+          # Update SHA256 hashes
+          if [ -n "${{ steps.hashes.outputs.DARWIN_ARM64_SHA256 }}" ]; then
+            sed -i "s/PLACEHOLDER_DARWIN_ARM64_SHA256/${{ steps.hashes.outputs.DARWIN_ARM64_SHA256 }}/" packaging/homebrew/br.rb
+            # Also update if already has a real hash
+            sed -i "s/sha256 \"[a-f0-9]\{64\}\"  # darwin_arm64/sha256 \"${{ steps.hashes.outputs.DARWIN_ARM64_SHA256 }}\"  # darwin_arm64/" packaging/homebrew/br.rb
+          fi
+
+          if [ -n "${{ steps.hashes.outputs.DARWIN_AMD64_SHA256 }}" ]; then
+            sed -i "s/PLACEHOLDER_DARWIN_AMD64_SHA256/${{ steps.hashes.outputs.DARWIN_AMD64_SHA256 }}/" packaging/homebrew/br.rb
+          fi
+
+          if [ -n "${{ steps.hashes.outputs.LINUX_ARM64_SHA256 }}" ]; then
+            sed -i "s/PLACEHOLDER_LINUX_ARM64_SHA256/${{ steps.hashes.outputs.LINUX_ARM64_SHA256 }}/" packaging/homebrew/br.rb
+          fi
+
+          if [ -n "${{ steps.hashes.outputs.LINUX_AMD64_SHA256 }}" ]; then
+            sed -i "s/PLACEHOLDER_LINUX_AMD64_SHA256/${{ steps.hashes.outputs.LINUX_AMD64_SHA256 }}/" packaging/homebrew/br.rb
+          fi
+
+          echo "=== Updated Homebrew formula ==="
+          cat packaging/homebrew/br.rb
+
+      - name: Update Scoop manifest
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          HASH="${{ steps.hashes.outputs.WINDOWS_AMD64_SHA256 }}"
+
+          # Use jq to update the manifest
+          jq --arg version "$VERSION" --arg hash "$HASH" '
+            .version = $version |
+            .architecture."64bit".url = "https://github.com/Dicklesworthstone/beads_rust/releases/download/v\($version)/br-v\($version)-windows_amd64.zip" |
+            .architecture."64bit".hash = $hash
+          ' packaging/scoop/br.json > packaging/scoop/br.json.tmp
+
+          mv packaging/scoop/br.json.tmp packaging/scoop/br.json
+
+          echo "=== Updated Scoop manifest ==="
+          cat packaging/scoop/br.json
+
+      - name: Update AUR PKGBUILD
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          AMD64_HASH="${{ steps.hashes.outputs.LINUX_AMD64_SHA256 }}"
+          ARM64_HASH="${{ steps.hashes.outputs.LINUX_ARM64_SHA256 }}"
+
+          # Update version
+          sed -i "s/pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+
+          # Reset pkgrel for new version
+          sed -i "s/pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+
+          # Update SHA256 hashes
+          if [ -n "$AMD64_HASH" ]; then
+            sed -i "s/sha256sums_x86_64=.*/sha256sums_x86_64=('${AMD64_HASH}')/" packaging/aur/PKGBUILD
+          fi
+
+          if [ -n "$ARM64_HASH" ]; then
+            sed -i "s/sha256sums_aarch64=.*/sha256sums_aarch64=('${ARM64_HASH}')/" packaging/aur/PKGBUILD
+          fi
+
+          echo "=== Updated AUR PKGBUILD ==="
+          cat packaging/aur/PKGBUILD
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(packaging): update manifests for v${{ steps.version.outputs.version }}"
+          title: "chore(packaging): update manifests for v${{ steps.version.outputs.version }}"
+          body: |
+            Automated update of package manager manifests for release v${{ steps.version.outputs.version }}.
+
+            ## Updated Files
+            - `packaging/homebrew/br.rb` - Homebrew formula
+            - `packaging/scoop/br.json` - Scoop manifest
+            - `packaging/aur/PKGBUILD` - AUR package
+
+            ## Checksums
+            - Linux AMD64: `${{ steps.hashes.outputs.LINUX_AMD64_SHA256 }}`
+            - Linux ARM64: `${{ steps.hashes.outputs.LINUX_ARM64_SHA256 }}`
+            - macOS AMD64: `${{ steps.hashes.outputs.DARWIN_AMD64_SHA256 }}`
+            - macOS ARM64: `${{ steps.hashes.outputs.DARWIN_ARM64_SHA256 }}`
+            - Windows AMD64: `${{ steps.hashes.outputs.WINDOWS_AMD64_SHA256 }}`
+
+            ---
+            Auto-generated by [update-package-manifests](.github/workflows/update-package-manifests.yml)
+          branch: "packaging/v${{ steps.version.outputs.version }}"
+          delete-branch: true
+          labels: |
+            packaging
+            automated

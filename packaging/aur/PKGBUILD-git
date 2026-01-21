@@ -1,0 +1,43 @@
+# Maintainer: Jeffrey Emanuel <jeff141421@gmail.com>
+# br-git - Build from source package for br (agent-first issue tracker)
+#
+# To build: makepkg -si
+# To install from AUR: yay -S br-git
+
+pkgname=br-git
+pkgver=0.1.7.r0.g0000000
+pkgrel=1
+pkgdesc="Agent-first issue tracker (SQLite + JSONL) - git version"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Dicklesworthstone/beads_rust"
+license=('MIT')
+provides=('br')
+conflicts=('br' 'br-bin')
+makedepends=('rust' 'cargo' 'git')
+
+source=("${pkgname}::git+https://github.com/Dicklesworthstone/beads_rust.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "${pkgname}"
+    git describe --long --tags 2>/dev/null | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' || \
+        printf "0.0.0.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "${pkgname}"
+    export CARGO_HOME="${srcdir}/cargo"
+    cargo build --release --locked
+}
+
+check() {
+    cd "${pkgname}"
+    export CARGO_HOME="${srcdir}/cargo"
+    cargo test --release --locked
+}
+
+package() {
+    cd "${pkgname}"
+    install -Dm755 "target/release/br" "${pkgdir}/usr/bin/br"
+    install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" 2>/dev/null || true
+}

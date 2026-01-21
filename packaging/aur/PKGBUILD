@@ -1,0 +1,51 @@
+# Maintainer: Jeffrey Emanuel <jeff141421@gmail.com>
+# br-bin - Pre-built binary package for br (agent-first issue tracker)
+#
+# To build: makepkg -si
+# To install from AUR: yay -S br-bin
+
+pkgname=br-bin
+pkgver=0.1.7
+pkgrel=1
+pkgdesc="Agent-first issue tracker (SQLite + JSONL)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Dicklesworthstone/beads_rust"
+license=('MIT')
+provides=('br')
+conflicts=('br' 'br-git')
+depends=('gcc-libs')
+
+source_x86_64=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-v${pkgver}-linux_amd64.tar.gz")
+source_aarch64=("${pkgname}-${pkgver}-aarch64.tar.gz::https://github.com/Dicklesworthstone/beads_rust/releases/download/v${pkgver}/br-v${pkgver}-linux_arm64.tar.gz")
+
+sha256sums_x86_64=('PLACEHOLDER_LINUX_AMD64_SHA256')
+sha256sums_aarch64=('PLACEHOLDER_LINUX_ARM64_SHA256')
+
+package() {
+    install -Dm755 "${srcdir}/br" "${pkgdir}/usr/bin/br"
+
+    # Install license
+    install -Dm644 /dev/stdin "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE" << 'EOF'
+MIT License
+
+Copyright (c) 2026 Jeffrey Emanuel
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+}
