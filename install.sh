@@ -1214,5 +1214,8 @@ main() {
     print_summary
 }
 
-# Run main - handles both direct execution and piped input (curl | bash)
-main "$@"
+# Run main only when executed directly (not when sourced for tests).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # Handles both direct execution and piped input (curl | bash).
+    main "$@"
+fi
