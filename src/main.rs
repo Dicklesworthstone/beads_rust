@@ -154,11 +154,8 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
 }
 
 const fn should_auto_import(cmd: &Commands) -> bool {
-    use beads_rust::cli::{
-        CommentCommands, DepCommands, EpicCommands, LabelCommands, QueryCommands,
-    };
-
     match cmd {
+        // Read-only commands
         Commands::List(_)
         | Commands::Show { .. }
         | Commands::Search(_)
@@ -172,22 +169,37 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Orphans(_)
         | Commands::Changelog(_)
         | Commands::Graph(_) => true,
-        Commands::Comments(args) => matches!(args.command, Some(CommentCommands::List(_)) | None),
-        Commands::Dep { command } => matches!(
-            command,
-            DepCommands::List(_) | DepCommands::Tree(_) | DepCommands::Cycles(_)
-        ),
-        Commands::Label { command } => {
-            matches!(command, LabelCommands::List(_) | LabelCommands::ListAll)
-        }
-        Commands::Epic { command } => match command {
-            EpicCommands::Status(_) => true,
-            EpicCommands::CloseEligible(args) => args.dry_run,
-        },
-        Commands::Query { command } => {
-            matches!(command, QueryCommands::Run(_) | QueryCommands::List)
-        }
-        _ => false,
+
+        // Mutating commands (should import to avoid overwriting external changes)
+        Commands::Create(_)
+        | Commands::Update(_)
+        | Commands::Delete(_)
+        | Commands::Close(_)
+        | Commands::Reopen(_)
+        | Commands::Q(_)
+        | Commands::Defer(_)
+        | Commands::Undefer(_) => true,
+
+        // Subcommands
+        Commands::Comments(_) => true, // Covers Add and List
+        Commands::Dep { .. } => true,  // Covers Add, Remove, List, Tree, Cycles
+        Commands::Label { .. } => true,// Covers Add, Remove, List, ListAll, Rename
+        Commands::Epic { .. } => true, // Covers Status, CloseEligible
+        Commands::Query { .. } => true,// Covers Save, Run, List, Delete
+
+        // Explicitly excluded
+        Commands::Init { .. }
+        | Commands::Sync(_)
+        | Commands::Doctor
+        | Commands::Info(_)
+        | Commands::Where
+        | Commands::Version(_)
+        | Commands::Upgrade(_)
+        | Commands::Completions(_)
+        | Commands::Audit { .. } // Audit is append-only JSONL, usually local
+        | Commands::Config { .. }
+        | Commands::History(_)
+        | Commands::Agents(_) => false,
     }
 }
 
