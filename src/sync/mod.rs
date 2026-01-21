@@ -22,7 +22,7 @@ use crate::storage::SqliteStorage;
 use crate::sync::history::HistoryConfig;
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
@@ -976,38 +976,51 @@ pub fn ensure_no_conflict_markers(path: &Path) -> Result<()> {
     )))
 }
 
-/// Count issues in an existing JSONL file.
+#[derive(Deserialize)]
+struct PartialId {
+    id: String,
+}
+
+/// Analyze JSONL to get line count and unique issue IDs efficiently.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or contains invalid JSON.
-pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
+pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, HashSet::new())),
         Err(e) => return Err(BeadsError::Io(e)),
     };
 
     let reader = BufReader::new(file);
     let mut count = 0;
+    let mut ids = HashSet::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        // Validate JSON without fully deserializing
-        if serde_json::from_str::<serde_json::Value>(&line).is_err() {
-            return Err(BeadsError::Config(format!(
-                "Invalid JSON at line {}: {}",
-                line_num + 1,
-                line.chars().take(50).collect::<String>()
-            )));
-        }
+
+        let partial: PartialId = serde_json::from_str(&line).map_err(|e| {
+            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
+        })?;
+
+        ids.insert(partial.id);
         count += 1;
     }
 
-    Ok(count)
+    Ok((count, ids))
+}
+
+/// Count issues in an existing JSONL file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or contains invalid JSON.
+pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
+    Ok(analyze_jsonl(path)?.0)
 }
 
 /// Get issue IDs from an existing JSONL file.
@@ -1016,31 +1029,7 @@ pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
 ///
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn get_issue_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
-        Err(e) => return Err(BeadsError::Io(e)),
-    };
-
-    let reader = BufReader::new(file);
-    let mut ids = HashSet::new();
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        // Parse just enough to get the ID
-        let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
-        })?;
-
-        if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
-            ids.insert(id.to_string());
-        }
-    }
-
-    Ok(ids)
+    Ok(analyze_jsonl(path)?.1)
 }
 
 /// Export issues from `SQLite` to JSONL format.
@@ -1112,22 +1101,21 @@ pub fn export_to_jsonl_with_policy(
     // Get all issues for export (sorted by ID, excludes ephemerals/wisps)
     let mut issues = storage.get_all_issues_for_export()?;
 
-    // Safety check: prevent exporting empty database over non-empty JSONL
-    if issues.is_empty() && !config.force {
-        let existing_count = count_issues_in_jsonl(output_path)?;
-        if existing_count > 0 {
+    // Safety checks
+    if !config.force && output_path.exists() {
+        let (jsonl_count, jsonl_ids) = analyze_jsonl(output_path)?;
+
+        // Check 1: prevent exporting empty database over non-empty JSONL
+        if issues.is_empty() && jsonl_count > 0 {
             return Err(BeadsError::Config(format!(
                 "Refusing to export empty database over non-empty JSONL file.\n\
-                 Database has 0 issues, JSONL has {existing_count} issues.\n\
+                 Database has 0 issues, JSONL has {jsonl_count} lines.\n\
                  This would result in data loss!\n\
                  Hint: Use --force to override this safety check."
             )));
         }
-    }
 
-    // Safety check: prevent exporting stale database that would lose issues
-    if !config.force && output_path.exists() {
-        let jsonl_ids = get_issue_ids_from_jsonl(output_path)?;
+        // Check 2: prevent exporting stale database that would lose issues
         if !jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
             let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
@@ -1145,7 +1133,7 @@ pub fn export_to_jsonl_with_policy(
 
                 return Err(BeadsError::Config(format!(
                     "Refusing to export stale database that would lose issues.\n\
-                     Database has {} issues, JSONL has {} issues.\n\
+                     Database has {} issues, JSONL has {} unique issues.\n\
                      Export would lose {} issue(s): {}{}\n\
                      Hint: Run import first, or use --force to override.",
                     issues.len(),

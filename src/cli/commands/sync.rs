@@ -17,7 +17,7 @@ use crate::sync::{
     save_base_snapshot, three_way_merge,
 };
 use rich_rust::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, IsTerminal};
@@ -1048,6 +1048,12 @@ fn render_import_result_rich(result: &ImportResultOutput, ctx: &OutputContext) {
 /// Returns `None` if the file is empty or contains no issues with a recognizable prefix.
 /// A prefix is the part before the first hyphen in the issue ID (e.g., "mcp" from "mcp-015c").
 fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct PrefixProbe {
+        id: String,
+        status: Option<String>,
+    }
+
     let file = File::open(jsonl_path).ok()?;
     let reader = BufReader::new(file);
 
@@ -1062,24 +1068,20 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Option<String> {
         }
 
         // Parse as JSON to get the issue ID (skip malformed lines)
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
-
-        let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+        let Ok(probe) = serde_json::from_str::<PrefixProbe>(trimmed) else {
             continue;
         };
 
         // Skip tombstones (deleted issues)
-        if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+        if let Some(status) = probe.status {
             if status == "tombstone" {
                 continue;
             }
         }
 
         // Extract prefix (part before first hyphen)
-        if let Some(hyphen_pos) = id.find('-') {
-            let prefix = &id[..hyphen_pos];
+        if let Some(hyphen_pos) = probe.id.find('-') {
+            let prefix = &probe.id[..hyphen_pos];
             if !prefix.is_empty() {
                 return Some(prefix.to_string());
             }
