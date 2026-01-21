@@ -695,34 +695,41 @@ const KNOWN_BD_ONLY_TABLES: &[&str] = &[
 /// These are Gastown/advanced features excluded from the br port per AGENTS.md.
 /// When br implements these, remove them from this list.
 const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
-    // Gastown/agent features (excluded per AGENTS.md)
+    // Gastown/agent features in bd that br hasn't ported
     "actor",           // Actor reference for agent coordination
-    "agent_state",     // Agent state tracking
-    "await_id",        // Await coordination
-    "await_type",      // Await type classification
     "crystallizes",    // Crystallization flag
-    "ephemeral",       // Ephemeral issues (agent coordination)
     "event_kind",      // Event kind classification
     "gate_status",     // Gate/workflow status
-    "hook_bead",       // Hook bead reference
     "hook_name",       // Hook automation
-    "is_template",     // Template issues
-    "last_activity",   // Last activity tracking
     "mol_type",        // Molecule type classification
     "molecule_id",     // Molecule grouping
     "payload",         // Payload data
-    "pinned",          // Pinning support
     "priority_origin", // Priority inheritance tracking
     "quality_score",   // Quality scoring
     "retry_count",     // Retry automation
+    "target",          // Target system reference
+    "work_type",       // Work type classification (mutex, etc.)
+];
+
+/// Columns in the issues table that br has but bd doesn't have.
+/// These are features br has implemented ahead of bd or internal to br.
+/// This is acceptable as br can be a superset of bd's schema.
+const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
+    // Gastown/agent features br has implemented
+    "agent_state",     // Agent state tracking
+    "await_id",        // Await coordination
+    "await_type",      // Await type classification
+    "ephemeral",       // Ephemeral issues (agent coordination)
+    "hook_bead",       // Hook bead reference
+    "is_template",     // Template issues
+    "last_activity",   // Last activity tracking
+    "pinned",          // Pinning support
     "rig",             // Rig reference
     "role_bead",       // Role bead reference
     "role_type",       // Role-based typing
     "source_repo",     // Multi-repo source tracking
-    "target",          // Target system reference
     "timeout_ns",      // Timeout configuration
     "waiters",         // Waiter list for coordination
-    "work_type",       // Work type classification (mutex, etc.)
 ];
 
 /// Known type differences between br and bd that are acceptable.
@@ -1115,8 +1122,9 @@ const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[
     ("blocked_issues_cache", "blocked_by_json", "missing_in_bd"),
     ("blocked_issues_cache", "issue_id", "notnull_mismatch"),
     // child_counters: different column names for same purpose
-    ("child_counters", "next_child_number", "missing_in_bd"),
-    ("child_counters", "last_child", "missing_in_br"),
+    // br uses last_child, bd uses next_child_number
+    ("child_counters", "last_child", "missing_in_bd"),
+    ("child_counters", "next_child_number", "missing_in_br"),
     // comments: type difference for timestamps
     ("comments", "created_at", "type_mismatch"),
     // dependencies: schema differences
@@ -1139,6 +1147,7 @@ fn is_known_column_diff(diff: &ColumnDiff) -> bool {
     if diff.table == "issues" {
         return match diff.diff_type.as_str() {
             "missing_in_br" => KNOWN_BD_ONLY_COLUMNS.contains(&diff.column.as_str()),
+            "missing_in_bd" => KNOWN_BR_ONLY_COLUMNS.contains(&diff.column.as_str()),
             "type_mismatch" => KNOWN_TYPE_DIFFERENCES.contains(&diff.column.as_str()),
             "notnull_mismatch" => KNOWN_NOTNULL_DIFFERENCES.contains(&diff.column.as_str()),
             _ => false,
