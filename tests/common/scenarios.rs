@@ -709,27 +709,7 @@ impl BenchmarkRunner {
         let started_at = Utc::now().to_rfc3339();
         let mut all_runs: Vec<BenchmarkMetrics> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
-        let mut include_bd = self.config.include_bd;
-
-        if include_bd {
-            match discover_binaries() {
-                Ok(binaries) => {
-                    if let Some(bd) = binaries.bd {
-                        if let Err(err) = check_bd_version(&bd) {
-                            notes.push(format!("bd benchmarks disabled: {err}"));
-                            include_bd = false;
-                        }
-                    } else {
-                        notes.push("bd benchmarks disabled: bd binary not found".to_string());
-                        include_bd = false;
-                    }
-                }
-                Err(err) => {
-                    notes.push(format!("bd benchmarks disabled: {err}"));
-                    include_bd = false;
-                }
-            }
-        }
+        let include_bd = self.resolve_include_bd(&mut notes);
 
         let total_iterations = self.config.warmup_iterations + self.config.measured_iterations;
 
@@ -740,135 +720,212 @@ impl BenchmarkRunner {
 
             // Create fresh workspace(s) for each iteration
             if include_bd {
-                let mut workspace = HarnessConformanceWorkspace::new(
-                    "benchmark",
-                    &format!("{}_{}", scenario.name, iteration),
-                );
-
-                if let ScenarioSetup::Dataset(dataset) = scenario.setup {
-                    if let Err(err) = populate_conformance_with_dataset(&workspace, dataset) {
-                        notes.push(format!(
-                            "Dataset setup failed for iteration {iteration}: {err}"
-                        ));
-                        continue;
-                    }
+                if let Some(metrics) =
+                    self.run_benchmark_iteration_with_bd(scenario, iteration, is_warmup, &mut notes)
+                {
+                    all_runs.push(metrics);
                 }
-
-                if matches!(scenario.setup, ScenarioSetup::Fresh) {
-                    let _ = workspace.init_both();
-                }
-
-                let setup_commands = collect_setup_commands(scenario);
-                for cmd in &setup_commands {
-                    let label = format!("setup_{}", cmd.label);
-                    run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Br);
-                    run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Bd);
-                }
-
-                let br_start = std::time::Instant::now();
-                let br_result = run_conformance_command(
-                    &mut workspace,
-                    &scenario.test_command,
-                    &scenario.test_command.label,
-                    BinaryTarget::Br,
-                );
-                let br_duration = br_start.elapsed();
-
-                let bd_start = std::time::Instant::now();
-                let bd_result = run_conformance_command(
-                    &mut workspace,
-                    &scenario.test_command,
-                    &scenario.test_command.label,
-                    BinaryTarget::Bd,
-                );
-                let bd_duration = bd_start.elapsed();
-
-                if !bd_result.success {
-                    notes.push(format!(
-                        "bd benchmark failed for iteration {iteration} (exit {})",
-                        bd_result.exit_code
-                    ));
-                }
-
-                let (db_size, jsonl_size) = if self.config.measure_io {
-                    measure_io_sizes(&workspace.br_workspace)
-                } else {
-                    (None, None)
-                };
-
-                let speedup_ratio = if br_duration.as_millis() > 0 {
-                    Some(bd_duration.as_millis() as f64 / br_duration.as_millis() as f64)
-                } else {
-                    None
-                };
-
-                let metrics = BenchmarkMetrics {
-                    br_duration_ms: br_duration.as_millis(),
-                    bd_duration_ms: Some(bd_duration.as_millis()),
-                    speedup_ratio,
-                    br_peak_rss_bytes: None,
-                    bd_peak_rss_bytes: None,
-                    br_cpu_time_ms: None,
-                    bd_cpu_time_ms: None,
-                    db_size_bytes: db_size,
-                    jsonl_size_bytes: jsonl_size,
-                    iteration: Some(iteration),
-                    is_warmup,
-                };
-
-                all_runs.push(metrics);
-                workspace.finish(br_result.success && bd_result.success);
             } else {
-                let mut workspace =
-                    TestWorkspace::new("benchmark", &format!("{}_{}", scenario.name, iteration));
-
-                if let ScenarioSetup::Dataset(dataset) = scenario.setup {
-                    if let Err(err) = populate_workspace_with_dataset(&workspace, dataset) {
-                        notes.push(format!(
-                            "Dataset setup failed for iteration {iteration}: {err}"
-                        ));
-                        continue;
-                    }
+                if let Some(metrics) =
+                    self.run_benchmark_iteration_br_only(scenario, iteration, is_warmup, &mut notes)
+                {
+                    all_runs.push(metrics);
                 }
-
-                if matches!(scenario.setup, ScenarioSetup::Fresh) {
-                    let _ = workspace.init_br();
-                }
-
-                let setup_commands = collect_setup_commands(scenario);
-                for cmd in &setup_commands {
-                    run_scenario_command(&mut workspace, cmd, None);
-                }
-
-                let br_start = std::time::Instant::now();
-                let br_result = run_scenario_command(&mut workspace, &scenario.test_command, None);
-                let br_duration = br_start.elapsed();
-
-                let (db_size, jsonl_size) = if self.config.measure_io {
-                    measure_io_sizes(&workspace.root)
-                } else {
-                    (None, None)
-                };
-
-                let metrics = BenchmarkMetrics {
-                    br_duration_ms: br_duration.as_millis(),
-                    bd_duration_ms: None,
-                    speedup_ratio: None,
-                    br_peak_rss_bytes: None,
-                    bd_peak_rss_bytes: None,
-                    br_cpu_time_ms: None,
-                    bd_cpu_time_ms: None,
-                    db_size_bytes: db_size,
-                    jsonl_size_bytes: jsonl_size,
-                    iteration: Some(iteration),
-                    is_warmup,
-                };
-
-                all_runs.push(metrics);
-                workspace.finish(br_result.success);
             }
         }
 
+        let completed_at = Utc::now().to_rfc3339();
+
+        self.build_benchmark_summary(
+            scenario,
+            started_at,
+            completed_at,
+            total_iterations,
+            include_bd,
+            all_runs,
+            notes,
+        )
+    }
+
+    fn resolve_include_bd(&self, notes: &mut Vec<String>) -> bool {
+        if !self.config.include_bd {
+            return false;
+        }
+
+        match discover_binaries() {
+            Ok(binaries) => {
+                if let Some(bd) = binaries.bd {
+                    if let Err(err) = check_bd_version(&bd) {
+                        notes.push(format!("bd benchmarks disabled: {err}"));
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    notes.push("bd benchmarks disabled: bd binary not found".to_string());
+                    false
+                }
+            }
+            Err(err) => {
+                notes.push(format!("bd benchmarks disabled: {err}"));
+                false
+            }
+        }
+    }
+
+    fn run_benchmark_iteration_with_bd(
+        &self,
+        scenario: &Scenario,
+        iteration: u32,
+        is_warmup: bool,
+        notes: &mut Vec<String>,
+    ) -> Option<BenchmarkMetrics> {
+        let mut workspace = HarnessConformanceWorkspace::new(
+            "benchmark",
+            &format!("{}_{}", scenario.name, iteration),
+        );
+
+        if let ScenarioSetup::Dataset(dataset) = scenario.setup {
+            if let Err(err) = populate_conformance_with_dataset(&workspace, dataset) {
+                notes.push(format!(
+                    "Dataset setup failed for iteration {iteration}: {err}"
+                ));
+                return None;
+            }
+        }
+
+        if matches!(scenario.setup, ScenarioSetup::Fresh) {
+            let _ = workspace.init_both();
+        }
+
+        let setup_commands = collect_setup_commands(scenario);
+        for cmd in &setup_commands {
+            let label = format!("setup_{}", cmd.label);
+            run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Br);
+            run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Bd);
+        }
+
+        let br_start = std::time::Instant::now();
+        let br_result = run_conformance_command(
+            &mut workspace,
+            &scenario.test_command,
+            &scenario.test_command.label,
+            BinaryTarget::Br,
+        );
+        let br_duration = br_start.elapsed();
+
+        let bd_start = std::time::Instant::now();
+        let bd_result = run_conformance_command(
+            &mut workspace,
+            &scenario.test_command,
+            &scenario.test_command.label,
+            BinaryTarget::Bd,
+        );
+        let bd_duration = bd_start.elapsed();
+
+        if !bd_result.success {
+            notes.push(format!(
+                "bd benchmark failed for iteration {iteration} (exit {})",
+                bd_result.exit_code
+            ));
+        }
+
+        let (db_size, jsonl_size) = if self.config.measure_io {
+            measure_io_sizes(&workspace.br_workspace)
+        } else {
+            (None, None)
+        };
+
+        let speedup_ratio = if br_duration.as_millis() > 0 {
+            Some(bd_duration.as_millis() as f64 / br_duration.as_millis() as f64)
+        } else {
+            None
+        };
+
+        let metrics = BenchmarkMetrics {
+            br_duration_ms: br_duration.as_millis(),
+            bd_duration_ms: Some(bd_duration.as_millis()),
+            speedup_ratio,
+            br_peak_rss_bytes: None,
+            bd_peak_rss_bytes: None,
+            br_cpu_time_ms: None,
+            bd_cpu_time_ms: None,
+            db_size_bytes: db_size,
+            jsonl_size_bytes: jsonl_size,
+            iteration: Some(iteration),
+            is_warmup,
+        };
+
+        workspace.finish(br_result.success && bd_result.success);
+        Some(metrics)
+    }
+
+    fn run_benchmark_iteration_br_only(
+        &self,
+        scenario: &Scenario,
+        iteration: u32,
+        is_warmup: bool,
+        notes: &mut Vec<String>,
+    ) -> Option<BenchmarkMetrics> {
+        let mut workspace =
+            TestWorkspace::new("benchmark", &format!("{}_{}", scenario.name, iteration));
+
+        if let ScenarioSetup::Dataset(dataset) = scenario.setup {
+            if let Err(err) = populate_workspace_with_dataset(&workspace, dataset) {
+                notes.push(format!(
+                    "Dataset setup failed for iteration {iteration}: {err}"
+                ));
+                return None;
+            }
+        }
+
+        if matches!(scenario.setup, ScenarioSetup::Fresh) {
+            let _ = workspace.init_br();
+        }
+
+        let setup_commands = collect_setup_commands(scenario);
+        for cmd in &setup_commands {
+            run_scenario_command(&mut workspace, cmd, None);
+        }
+
+        let br_start = std::time::Instant::now();
+        let br_result = run_scenario_command(&mut workspace, &scenario.test_command, None);
+        let br_duration = br_start.elapsed();
+
+        let (db_size, jsonl_size) = if self.config.measure_io {
+            measure_io_sizes(&workspace.root)
+        } else {
+            (None, None)
+        };
+
+        let metrics = BenchmarkMetrics {
+            br_duration_ms: br_duration.as_millis(),
+            bd_duration_ms: None,
+            speedup_ratio: None,
+            br_peak_rss_bytes: None,
+            bd_peak_rss_bytes: None,
+            br_cpu_time_ms: None,
+            bd_cpu_time_ms: None,
+            db_size_bytes: db_size,
+            jsonl_size_bytes: jsonl_size,
+            iteration: Some(iteration),
+            is_warmup,
+        };
+
+        workspace.finish(br_result.success);
+        Some(metrics)
+    }
+
+    fn build_benchmark_summary(
+        &self,
+        scenario: &Scenario,
+        started_at: String,
+        completed_at: String,
+        total_iterations: u32,
+        include_bd: bool,
+        all_runs: Vec<BenchmarkMetrics>,
+        mut notes: Vec<String>,
+    ) -> BenchmarkSummary {
         // Separate warmup from measured runs
         let measured_runs: Vec<&BenchmarkMetrics> =
             all_runs.iter().filter(|m| !m.is_warmup).collect();
@@ -907,8 +964,6 @@ impl BenchmarkRunner {
                 br_stats.cv * 100.0
             ));
         }
-
-        let completed_at = Utc::now().to_rfc3339();
 
         // Build summary
         BenchmarkSummary {
