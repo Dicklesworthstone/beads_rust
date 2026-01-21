@@ -125,7 +125,7 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let layer = config::load_config(&beads_dir, None, cli)?;
     let actor = config::resolve_actor(&layer);
 

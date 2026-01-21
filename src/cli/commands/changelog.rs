@@ -62,7 +62,7 @@ pub fn execute(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir(None)?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let config::OpenStorageResult { storage, .. } = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let (since_dt, since_label) = resolve_since(args)?;

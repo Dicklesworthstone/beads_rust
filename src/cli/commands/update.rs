@@ -41,7 +41,7 @@ impl From<&Issue> for UpdatedIssueOutput {
 /// Returns an error if database operations fail or validation errors occur.
 pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let _json = cli.json.unwrap_or(false);
-    let beads_dir = config::discover_beads_dir(None)?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
