@@ -195,6 +195,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the issue cannot be inserted (e.g. ID collision).
+    #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         self.mutate("create_issue", actor, |tx, ctx| {
             let status_str = issue.status.as_str();

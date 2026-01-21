@@ -208,7 +208,7 @@ pub fn create_issue_impl(
     validate_relations(args, &id)?;
 
     // 6. Populate Relations (labels & dependencies)
-    populate_relations(&mut issue, args, &config.actor, now)?;
+    populate_relations(&mut issue, args, &config.actor, now);
 
     // 7. Dry Run check - return early
     if args.dry_run {
@@ -281,7 +281,7 @@ fn populate_relations(
     args: &CreateArgs,
     actor: &str,
     now: DateTime<Utc>,
-) -> Result<()> {
+) {
     // Labels
     for label in &args.labels {
         let label = label.trim();
@@ -313,7 +313,7 @@ fn populate_relations(
 
         let dep_type = type_str
             .parse()
-            .unwrap_or_else(|_| DependencyType::Custom(type_str.to_string()));
+            .unwrap_or_else(|_| DependencyType::Custom(type_str.to_owned()));
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: dep_id.to_string(),
@@ -324,8 +324,6 @@ fn populate_relations(
             thread_id: None,
         });
     }
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
