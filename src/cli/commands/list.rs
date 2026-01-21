@@ -28,8 +28,8 @@ pub fn execute(
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
 ) -> Result<()> {
-    // Open storage
-    let beads_dir = config::discover_beads_dir(Some(Path::new(".")))?;
+    // Open storage (--db flag allows working from any directory)
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
