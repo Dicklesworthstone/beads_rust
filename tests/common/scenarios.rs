@@ -805,23 +805,21 @@ impl BenchmarkRunner {
             run_conformance_command(&mut workspace, cmd, &label, BinaryTarget::Bd);
         }
 
-        let br_start = std::time::Instant::now();
         let br_result = run_conformance_command(
             &mut workspace,
             &scenario.test_command,
             &scenario.test_command.label,
             BinaryTarget::Br,
         );
-        let br_duration = br_start.elapsed();
+        let br_duration_ms = br_result.duration.as_millis();
 
-        let bd_start = std::time::Instant::now();
         let bd_result = run_conformance_command(
             &mut workspace,
             &scenario.test_command,
             &scenario.test_command.label,
             BinaryTarget::Bd,
         );
-        let bd_duration = bd_start.elapsed();
+        let bd_duration_ms = bd_result.duration.as_millis();
 
         if !bd_result.success {
             notes.push(format!(
@@ -836,15 +834,15 @@ impl BenchmarkRunner {
             (None, None)
         };
 
-        let speedup_ratio = if br_duration.as_millis() > 0 {
-            Some(bd_duration.as_millis() as f64 / br_duration.as_millis() as f64)
+        let speedup_ratio = if br_duration_ms > 0 {
+            Some(bd_duration_ms as f64 / br_duration_ms as f64)
         } else {
             None
         };
 
         let metrics = BenchmarkMetrics {
-            br_duration_ms: br_duration.as_millis(),
-            bd_duration_ms: Some(bd_duration.as_millis()),
+            br_duration_ms: br_duration_ms,
+            bd_duration_ms: Some(bd_duration_ms),
             speedup_ratio,
             br_peak_rss_bytes: None,
             bd_peak_rss_bytes: None,
@@ -888,9 +886,8 @@ impl BenchmarkRunner {
             run_scenario_command(&mut workspace, cmd, None);
         }
 
-        let br_start = std::time::Instant::now();
         let br_result = run_scenario_command(&mut workspace, &scenario.test_command, None);
-        let br_duration = br_start.elapsed();
+        let br_duration_ms = br_result.duration.as_millis();
 
         let (db_size, jsonl_size) = if self.config.measure_io {
             measure_io_sizes(&workspace.root)
@@ -899,7 +896,7 @@ impl BenchmarkRunner {
         };
 
         let metrics = BenchmarkMetrics {
-            br_duration_ms: br_duration.as_millis(),
+            br_duration_ms: br_duration_ms,
             bd_duration_ms: None,
             speedup_ratio: None,
             br_peak_rss_bytes: None,
