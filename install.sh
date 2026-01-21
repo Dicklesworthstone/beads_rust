@@ -11,6 +11,9 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
+#   --artifact-url URL Use a custom release artifact URL
+#   --checksum SHA     Provide expected SHA256 checksum
+#   --checksum-url URL Provide a custom checksum URL
 #   --from-source      Build from source instead of downloading binary
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
@@ -306,6 +309,9 @@ usage() {
         gum style --faint "    --version vX.Y.Z   Install specific version (default: latest)"
         gum style --faint "    --dest DIR         Install to DIR (default: ~/.local/bin)"
         gum style --faint "    --system           Install to /usr/local/bin (requires sudo)"
+        gum style --faint "    --artifact-url URL Use a custom release artifact URL"
+        gum style --faint "    --checksum SHA     Provide expected SHA256 checksum"
+        gum style --faint "    --checksum-url URL Provide a custom checksum URL"
         gum style --faint "    --from-source      Build from source instead of binary"
         echo ""
         gum style --foreground 39 "  Behavior"
@@ -321,7 +327,8 @@ usage() {
         echo ""
 
         gum style --foreground 214 --bold "ENVIRONMENT"
-        gum style --faint "  HTTPS_PROXY        Use HTTP proxy for downloads"
+        gum style --faint "  HTTPS_PROXY        Use HTTPS proxy for downloads"
+        gum style --faint "  HTTP_PROXY         Use HTTP proxy for downloads"
         gum style --faint "  BR_INSTALL_DIR     Override default install directory"
         gum style --faint "  VERSION            Override version to install"
         echo ""
@@ -362,6 +369,9 @@ Options:
   --version vX.Y.Z   Install specific version (default: latest)
   --dest DIR         Install to DIR (default: ~/.local/bin)
   --system           Install to /usr/local/bin (requires sudo)
+  --artifact-url URL Use a custom release artifact URL
+  --checksum SHA     Provide expected SHA256 checksum
+  --checksum-url URL Provide a custom checksum URL
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
@@ -371,7 +381,8 @@ Options:
   --uninstall        Remove br and clean up
 
 Environment Variables:
-  HTTPS_PROXY        Use HTTP proxy for downloads
+  HTTPS_PROXY        Use HTTPS proxy for downloads
+  HTTP_PROXY         Use HTTP proxy for downloads
   BR_INSTALL_DIR     Override default install directory
   VERSION            Override version to install
 
@@ -869,27 +880,67 @@ download_file() {
     local url="$1"
     local dest="$2"
     local attempt=0
+    local partial="${dest}.part"
+
+    local proxy_env=()
+    local proxy_http="${HTTP_PROXY:-${http_proxy:-}}"
+    local proxy_https="${HTTPS_PROXY:-${https_proxy:-}}"
+    [ -n "$proxy_http" ] && proxy_env+=(HTTP_PROXY="$proxy_http" http_proxy="$proxy_http")
+    [ -n "$proxy_https" ] && proxy_env+=(HTTPS_PROXY="$proxy_https" https_proxy="$proxy_https")
+
+    local show_progress=0
+    if [ "$QUIET" -eq 0 ] && [ -t 2 ]; then
+        show_progress=1
+    fi
 
     while [ $attempt -lt $MAX_RETRIES ]; do
         attempt=$((attempt + 1))
         log_debug "Download attempt $attempt for $url"
 
+        local use_resume=0
+        if [ -s "$partial" ]; then
+            use_resume=1
+        fi
+
         if command -v curl &>/dev/null; then
-            if curl -fsSL \
-                ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} \
-                --connect-timeout 30 \
-                --max-time "$DOWNLOAD_TIMEOUT" \
-                --retry 2 \
-                -o "$dest" \
-                "$url" 2>/dev/null; then
+            local curl_args=(
+                -fL
+                --connect-timeout 30
+                --max-time "$DOWNLOAD_TIMEOUT"
+                --retry 2
+                -o "$partial"
+                "$url"
+            )
+            if [ "$use_resume" -eq 1 ]; then
+                curl_args=(--continue-at - "${curl_args[@]}")
+            fi
+            if [ "$show_progress" -eq 1 ]; then
+                curl_args=(--progress-bar "${curl_args[@]}")
+            else
+                curl_args=(-sS "${curl_args[@]}")
+            fi
+
+            if env "${proxy_env[@]}" curl "${curl_args[@]}"; then
+                mv -f "$partial" "$dest"
                 return 0
             fi
         elif command -v wget &>/dev/null; then
-            if wget -q \
-                ${HTTPS_PROXY:+--proxy "$HTTPS_PROXY"} \
-                --timeout="$DOWNLOAD_TIMEOUT" \
-                -O "$dest" \
-                "$url" 2>/dev/null; then
+            local wget_args=(
+                --timeout="$DOWNLOAD_TIMEOUT"
+                -O "$partial"
+                "$url"
+            )
+            if [ "$use_resume" -eq 1 ]; then
+                wget_args=(--continue "${wget_args[@]}")
+            fi
+            if [ "$show_progress" -eq 1 ]; then
+                wget_args=(--show-progress "${wget_args[@]}")
+            else
+                wget_args=(--quiet "${wget_args[@]}")
+            fi
+
+            if env "${proxy_env[@]}" wget "${wget_args[@]}"; then
+                mv -f "$partial" "$dest"
                 return 0
             fi
         else
@@ -903,6 +954,21 @@ download_file() {
     done
 
     return 1
+}
+
+# ============================================================================
+# Atomic binary install
+# ============================================================================
+install_binary_atomic() {
+    local src="$1"
+    local dest="$2"
+    local tmp_dest="${dest}.tmp.$$"
+
+    install -m 0755 "$src" "$tmp_dest"
+    if ! mv -f "$tmp_dest" "$dest"; then
+        rm -f "$tmp_dest" 2>/dev/null || true
+        die "Failed to move binary into place"
+    fi
 }
 
 # ============================================================================
@@ -949,7 +1015,7 @@ build_from_source() {
         die "Binary not found after build"
     fi
 
-    install -m 0755 "$bin" "$DEST/$BINARY_NAME"
+    install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
     log_success "Installed to $DEST/$BINARY_NAME (source build)"
 }
 
@@ -960,8 +1026,15 @@ download_release() {
     local platform="$1"
 
     # Map platform to release asset name
-    local archive_name="br-${VERSION}-${platform}.tar.gz"
-    local url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
+    local archive_name=""
+    local url=""
+    if [ -n "$ARTIFACT_URL" ]; then
+        url="$ARTIFACT_URL"
+        archive_name="$(basename "$ARTIFACT_URL")"
+    else
+        archive_name="br-${VERSION}-${platform}.tar.gz"
+        url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
+    fi
 
     run_with_spinner "Downloading $archive_name..." \
         download_file "$url" "$TMP/$archive_name"
@@ -971,18 +1044,25 @@ download_release() {
     fi
 
     # Download and verify checksum
-    local checksum_url=""
-    if [ -n "$CHECKSUM_URL" ]; then
-        checksum_url="$CHECKSUM_URL"
+    local expected=""
+    if [ -n "$CHECKSUM" ]; then
+        expected="${CHECKSUM%% *}"
     else
-        checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
+        local checksum_url=""
+        if [ -n "$CHECKSUM_URL" ]; then
+            checksum_url="$CHECKSUM_URL"
+        else
+            checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
+        fi
+
+        if download_file "$checksum_url" "$TMP/checksum.sha256"; then
+            expected=$(awk '{print $1}' "$TMP/checksum.sha256")
+        fi
     fi
 
-    log_step "Verifying checksum..."
-    if download_file "$checksum_url" "$TMP/checksum.sha256"; then
-        local expected actual
-        expected=$(awk '{print $1}' "$TMP/checksum.sha256")
-
+    if [ -n "$expected" ]; then
+        log_step "Verifying checksum..."
+        local actual
         if command -v sha256sum &>/dev/null; then
             actual=$(sha256sum "$TMP/$archive_name" | awk '{print $1}')
         elif command -v shasum &>/dev/null; then
@@ -1019,7 +1099,7 @@ download_release() {
         return 1
     fi
 
-    install -m 0755 "$bin" "$DEST/$BINARY_NAME"
+    install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
     log_success "Installed to $DEST/$BINARY_NAME"
     return 0
 }
