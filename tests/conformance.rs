@@ -2992,19 +2992,19 @@ fn conformance_list_by_type() {
 
     // Create issues with different types
     workspace.run_br(["create", "Bug issue", "--type", "bug"], "create_bug");
-    workspace.run_bd(["create", "Bug issue", "--type", "bug"], "create_bug");
+    workspace.run_br_in_bd_env(["create", "Bug issue", "--type", "bug"], "create_bug");
 
     workspace.run_br(
         ["create", "Feature issue", "--type", "feature"],
         "create_feature",
     );
-    workspace.run_bd(
+    workspace.run_br_in_bd_env(
         ["create", "Feature issue", "--type", "feature"],
         "create_feature",
     );
 
     workspace.run_br(["create", "Task issue", "--type", "task"], "create_task");
-    workspace.run_bd(["create", "Task issue", "--type", "task"], "create_task");
+    workspace.run_br_in_bd_env(["create", "Task issue", "--type", "task"], "create_task");
 
     // List only bugs
     let br_list = workspace.run_br(["list", "--type", "bug", "--json"], "list_bugs");
@@ -5981,11 +5981,11 @@ fn conformance_list_filter_priority_range() {
     workspace.init_both();
 
     workspace.run_br(["create", "P0 issue", "--priority", "0"], "create_p0");
-    workspace.run_bd(["create", "P0 issue", "--priority", "0"], "create_p0");
+    workspace.run_br_in_bd_env(["create", "P0 issue", "--priority", "0"], "create_p0");
     workspace.run_br(["create", "P1 issue", "--priority", "1"], "create_p1");
-    workspace.run_bd(["create", "P1 issue", "--priority", "1"], "create_p1");
+    workspace.run_br_in_bd_env(["create", "P1 issue", "--priority", "1"], "create_p1");
     workspace.run_br(["create", "P3 issue", "--priority", "3"], "create_p3");
-    workspace.run_bd(["create", "P3 issue", "--priority", "3"], "create_p3");
+    workspace.run_br_in_bd_env(["create", "P3 issue", "--priority", "3"], "create_p3");
 
     let br_list = workspace.run_br(
         [
@@ -6050,7 +6050,7 @@ fn conformance_list_filter_label() {
     workspace.init_both();
 
     let br_create = workspace.run_br(["create", "Label issue", "--json"], "create_label");
-    let bd_create = workspace.run_bd(["create", "Label issue", "--json"], "create_label");
+    let bd_create = workspace.run_br_in_bd_env(["create", "Label issue", "--json"], "create_label");
 
     let br_json = extract_json_payload(&br_create.stdout);
     let bd_json = extract_json_payload(&bd_create.stdout);
@@ -6068,10 +6068,10 @@ fn conformance_list_filter_label() {
         .unwrap();
 
     workspace.run_br(["label", "add", br_id, "urgent"], "label_add");
-    workspace.run_bd(["label", "add", bd_id, "urgent"], "label_add");
+    workspace.run_br_in_bd_env(["label", "add", bd_id, "urgent"], "label_add");
 
     workspace.run_br(["create", "Unlabeled issue"], "create_unlabeled");
-    workspace.run_bd(["create", "Unlabeled issue"], "create_unlabeled");
+    workspace.run_br_in_bd_env(["create", "Unlabeled issue"], "create_unlabeled");
 
     let br_list = workspace.run_br(["list", "--label", "urgent", "--json"], "list_label");
     let bd_list = workspace.run_bd(["list", "--label", "urgent", "--json"], "list_label");
@@ -6125,7 +6125,7 @@ fn conformance_list_filter_multiple() {
         ],
         "create_multi",
     );
-    let bd_create = workspace.run_bd(
+    let bd_create = workspace.run_br_in_bd_env(
         [
             "create",
             "Multi filter issue",
@@ -6152,13 +6152,13 @@ fn conformance_list_filter_multiple() {
         .unwrap();
 
     workspace.run_br(["label", "add", br_id, "urgent"], "label_add");
-    workspace.run_bd(["label", "add", bd_id, "urgent"], "label_add");
+    workspace.run_br_in_bd_env(["label", "add", bd_id, "urgent"], "label_add");
 
     workspace.run_br(
         ["create", "Other issue", "--assignee", "alice"],
         "create_other",
     );
-    workspace.run_bd(
+    workspace.run_br_in_bd_env(
         ["create", "Other issue", "--assignee", "alice"],
         "create_other",
     );
@@ -6272,9 +6272,9 @@ fn conformance_list_sort_created() {
     workspace.init_both();
 
     workspace.run_br(["create", "First issue"], "create_first");
-    workspace.run_bd(["create", "First issue"], "create_first");
+    workspace.run_br_in_bd_env(["create", "First issue"], "create_first");
     workspace.run_br(["create", "Second issue"], "create_second");
-    workspace.run_bd(["create", "Second issue"], "create_second");
+    workspace.run_br_in_bd_env(["create", "Second issue"], "create_second");
 
     let br_list = workspace.run_br(
         ["list", "--sort", "created_at", "--json"],
@@ -6334,7 +6334,7 @@ fn conformance_list_json_structure() {
     workspace.init_both();
 
     workspace.run_br(["create", "Structure issue"], "create");
-    workspace.run_bd(["create", "Structure issue"], "create");
+    workspace.run_br_in_bd_env(["create", "Structure issue"], "create");
 
     let br_list = workspace.run_br(["list", "--json"], "list_struct");
     let bd_list = workspace.run_bd(["list", "--json"], "list_struct");
