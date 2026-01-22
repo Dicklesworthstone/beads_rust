@@ -1215,7 +1215,8 @@ main() {
 }
 
 # Run main only when executed directly (not when sourced for tests).
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    # Handles both direct execution and piped input (curl | bash).
+# When piped (curl | bash), BASH_SOURCE[0] is empty - we want to run in that case too.
+# The :- syntax provides a default empty string to avoid "unbound variable" with set -u.
+if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]] || [[ -z "${BASH_SOURCE[0]:-}" ]]; then
     main "$@"
 fi
