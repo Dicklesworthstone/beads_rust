@@ -132,7 +132,7 @@ struct InitStep {
     status: InitStepStatus,
 }
 
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 fn build_init_steps(
     created_dir: bool,
     db_existed: bool,

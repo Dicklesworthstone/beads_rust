@@ -47,16 +47,6 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER DEFAULT 0,
         pinned INTEGER DEFAULT 0,
         is_template INTEGER DEFAULT 0,
-        await_type TEXT,
-        await_id TEXT,
-        timeout_ns INTEGER,
-        waiters TEXT,
-        hook_bead TEXT DEFAULT '',
-        role_bead TEXT DEFAULT '',
-        agent_state TEXT DEFAULT '',
-        last_activity DATETIME,
-        role_type TEXT DEFAULT '',
-        rig TEXT DEFAULT '',
         -- Closed-at invariant: closed issues MUST have closed_at timestamp
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
@@ -107,9 +97,15 @@ pub const SCHEMA_SQL: &str = r"
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
         -- Note: depends_on_id FK intentionally removed to allow external issue references
     );
-    CREATE INDEX IF NOT EXISTS idx_dependencies_issue_id ON dependencies(issue_id);
-    CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_id ON dependencies(depends_on_id);
+    CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);
+    CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);
     CREATE INDEX IF NOT EXISTS idx_dependencies_type ON dependencies(type);
+    CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+    CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';
+    -- Composite for blocking lookups
+    CREATE INDEX IF NOT EXISTS idx_dependencies_blocking
+        ON dependencies(depends_on_id, issue_id)
+        WHERE type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for');
 
     -- Labels
     CREATE TABLE IF NOT EXISTS labels (
@@ -119,7 +115,7 @@ pub const SCHEMA_SQL: &str = r"
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
-    CREATE INDEX IF NOT EXISTS idx_labels_issue_id ON labels(issue_id);
+    CREATE INDEX IF NOT EXISTS idx_labels_issue ON labels(issue_id);
 
     -- Comments
     CREATE TABLE IF NOT EXISTS comments (
@@ -219,6 +215,19 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn table_exists(conn: &Connection, table: &str) -> bool {
+    conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?")
+        .and_then(|mut stmt| stmt.exists([table]))
+        .unwrap_or(false)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}'");
+    conn.prepare(&sql)
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false)
+}
+
 /// Run schema migrations for existing databases.
 ///
 /// This handles upgrades for tables that may have been created with older schemas.
@@ -280,42 +289,6 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
-    // Migration: ensure gate columns exist (bd compatibility)
-    let has_await_type: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='await_type'")
-        .and_then(|mut stmt| stmt.exists([]))
-        .unwrap_or(false);
-
-    if !has_await_type {
-        conn.execute_batch(
-            r"
-            ALTER TABLE issues ADD COLUMN await_type TEXT;
-            ALTER TABLE issues ADD COLUMN await_id TEXT;
-            ALTER TABLE issues ADD COLUMN timeout_ns INTEGER;
-            ALTER TABLE issues ADD COLUMN waiters TEXT;
-        ",
-        )?;
-    }
-
-    // Migration: ensure Gastown columns exist (bd compatibility)
-    let has_hook_bead: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='hook_bead'")
-        .and_then(|mut stmt| stmt.exists([]))
-        .unwrap_or(false);
-
-    if !has_hook_bead {
-        conn.execute_batch(
-            r"
-            ALTER TABLE issues ADD COLUMN hook_bead TEXT DEFAULT '';
-            ALTER TABLE issues ADD COLUMN role_bead TEXT DEFAULT '';
-            ALTER TABLE issues ADD COLUMN agent_state TEXT DEFAULT '';
-            ALTER TABLE issues ADD COLUMN last_activity DATETIME;
-            ALTER TABLE issues ADD COLUMN role_type TEXT DEFAULT '';
-            ALTER TABLE issues ADD COLUMN rig TEXT DEFAULT '';
-        ",
-        )?;
-    }
-
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     conn.execute_batch(
@@ -341,18 +314,65 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             AND ephemeral = 0
             AND pinned = 0;
 
-        -- Dependency composite index
-        CREATE INDEX IF NOT EXISTS idx_dependencies_composite ON dependencies(issue_id, depends_on_id, type);
-
-        -- Comments index with canonical name
-        CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id);
-
-        -- Events indexes with canonical names
-        CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
-        CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
-        CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor) WHERE actor != '';
     ",
     )?;
+
+    // Drop legacy index names (safe if absent)
+    conn.execute_batch(
+        r"
+        DROP INDEX IF EXISTS idx_dependencies_issue_id;
+        DROP INDEX IF EXISTS idx_dependencies_depends_on_id;
+        DROP INDEX IF EXISTS idx_dependencies_composite;
+        DROP INDEX IF EXISTS idx_labels_issue_id;
+    ",
+    )?;
+
+    if table_exists(conn, "dependencies") {
+        conn.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_dependencies_issue ON dependencies(issue_id);
+            CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on ON dependencies(depends_on_id);
+            CREATE INDEX IF NOT EXISTS idx_dependencies_type ON dependencies(type);
+            CREATE INDEX IF NOT EXISTS idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+            CREATE INDEX IF NOT EXISTS idx_dependencies_blocking
+                ON dependencies(depends_on_id, issue_id)
+                WHERE type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for');
+        ",
+        )?;
+
+        if column_exists(conn, "dependencies", "thread_id") {
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != ''",
+                [],
+            )?;
+        }
+    }
+
+    if table_exists(conn, "labels") {
+        conn.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_labels_label ON labels(label);
+            CREATE INDEX IF NOT EXISTS idx_labels_issue ON labels(issue_id);
+        ",
+        )?;
+    }
+
+    if table_exists(conn, "comments") {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_comments_issue ON comments(issue_id)",
+            [],
+        )?;
+    }
+
+    if table_exists(conn, "events") {
+        conn.execute_batch(
+            r"
+            CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
+            CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor) WHERE actor != '';
+        ",
+        )?;
+    }
 
     Ok(())
 }
@@ -564,6 +584,42 @@ mod tests {
             deps_map.get("metadata").cloned().flatten().as_deref(),
             Some("'{}'"),
             "dependencies.metadata should default to '{{}}'"
+        );
+
+        // Dependency indexes (bd parity)
+        assert!(
+            indexes.contains("idx_dependencies_issue"),
+            "missing idx_dependencies_issue"
+        );
+        assert!(
+            indexes.contains("idx_dependencies_depends_on"),
+            "missing idx_dependencies_depends_on"
+        );
+        assert!(
+            indexes.contains("idx_dependencies_type"),
+            "missing idx_dependencies_type"
+        );
+        assert!(
+            indexes.contains("idx_dependencies_depends_on_type"),
+            "missing idx_dependencies_depends_on_type"
+        );
+        assert!(
+            indexes.contains("idx_dependencies_thread"),
+            "missing idx_dependencies_thread"
+        );
+        assert!(
+            indexes.contains("idx_dependencies_blocking"),
+            "missing idx_dependencies_blocking"
+        );
+
+        // Labels indexes
+        assert!(
+            indexes.contains("idx_labels_label"),
+            "missing idx_labels_label"
+        );
+        assert!(
+            indexes.contains("idx_labels_issue"),
+            "missing idx_labels_issue"
         );
 
         // === BLOCKED_ISSUES_CACHE TABLE ===

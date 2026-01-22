@@ -701,6 +701,19 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
     "event_kind",      // Event kind classification
     "gate_status",     // Gate/workflow status
     "hook_name",       // Hook automation
+    "hook_bead",       // Hook bead reference
+    "role_bead",       // Role bead reference
+    "agent_state",     // Agent state tracking
+    "last_activity",   // Last activity tracking
+    "role_type",       // Role-based typing
+    "rig",             // Rig reference
+    "await_type",      // Await coordination
+    "await_id",        // Await coordination
+    "timeout",         // Await timeout (legacy name)
+    "timeout_ns",      // Await timeout (ns)
+    "waiters",         // Await waiters list
+    "holder",          // Coordination holder
+    "creator",         // Entity creator ref
     "mol_type",        // Molecule type classification
     "molecule_id",     // Molecule grouping
     "payload",         // Payload data
@@ -712,25 +725,8 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
 ];
 
 /// Columns in the issues table that br has but bd doesn't have.
-/// These are features br has implemented ahead of bd or internal to br.
-/// This is acceptable as br can be a superset of bd's schema.
-const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
-    // Gastown/agent features br has implemented
-    "agent_state",   // Agent state tracking
-    "await_id",      // Await coordination
-    "await_type",    // Await type classification
-    "ephemeral",     // Ephemeral issues (agent coordination)
-    "hook_bead",     // Hook bead reference
-    "is_template",   // Template issues
-    "last_activity", // Last activity tracking
-    "pinned",        // Pinning support
-    "rig",           // Rig reference
-    "role_bead",     // Role bead reference
-    "role_type",     // Role-based typing
-    "source_repo",   // Multi-repo source tracking
-    "timeout_ns",    // Timeout configuration
-    "waiters",       // Waiter list for coordination
-];
+/// Keep this list minimal; unexpected extras should fail conformance.
+const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[];
 
 /// Known type differences between br and bd that are acceptable.
 /// SQLite is flexible with types; these differences don't affect functionality.
@@ -1117,29 +1113,7 @@ fn conformance_jsonl_compaction_level_serialization() {
 
 /// Known schema differences in tables other than issues.
 /// These are implementation differences between br and bd that are acceptable.
-const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[
-    // blocked_issues_cache: br has blocked_by_json, bd doesn't
-    ("blocked_issues_cache", "blocked_by_json", "missing_in_bd"),
-    ("blocked_issues_cache", "issue_id", "notnull_mismatch"),
-    // child_counters: different column names for same purpose
-    // br uses last_child, bd uses next_child_number
-    ("child_counters", "last_child", "missing_in_bd"),
-    ("child_counters", "next_child_number", "missing_in_br"),
-    // comments: type difference for timestamps
-    ("comments", "created_at", "type_mismatch"),
-    // dependencies: schema differences
-    ("dependencies", "created_at", "type_mismatch"),
-    ("dependencies", "created_at", "notnull_mismatch"),
-    ("dependencies", "created_by", "notnull_mismatch"),
-    ("dependencies", "type", "pk_mismatch"),
-    // dirty_issues: schema differences
-    ("dirty_issues", "content_hash", "missing_in_br"),
-    ("dirty_issues", "marked_at", "type_mismatch"),
-    // events: type difference for timestamps
-    ("events", "created_at", "type_mismatch"),
-    // export_hashes: type difference for timestamps
-    ("export_hashes", "exported_at", "type_mismatch"),
-];
+const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[];
 
 /// Check if a column diff is a known/expected difference
 fn is_known_column_diff(diff: &ColumnDiff) -> bool {
