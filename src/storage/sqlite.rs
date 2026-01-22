@@ -1277,9 +1277,8 @@ impl SqliteStorage {
         // Insert blocked issues into cache
         let mut count = 0;
         {
-            let mut insert_stmt = conn.prepare(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-            )?;
+            let mut insert_stmt = conn
+                .prepare("INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)")?;
 
             for (issue_id, blockers) in blocked_issues_map {
                 if blockers.is_empty() {
@@ -2377,6 +2376,41 @@ impl SqliteStorage {
         // count is always non-negative from COUNT(*), safe to cast
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Ok(count as usize)
+    }
+
+    /// Find the next available child number for a parent issue.
+    ///
+    /// Looks for existing issues with IDs like `{parent_id}.N` and returns the next
+    /// available number. For example, if `bd-abc.1` and `bd-abc.2` exist, returns 3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn next_child_number(&self, parent_id: &str) -> Result<u32> {
+        // Find all existing child IDs matching the pattern {parent_id}.N
+        let pattern = format!("{parent_id}.%");
+        let mut stmt = self.conn.prepare("SELECT id FROM issues WHERE id LIKE ?")?;
+        let ids: Vec<String> = stmt
+            .query_map([&pattern], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Extract child numbers and find the maximum
+        let prefix_with_dot = format!("{parent_id}.");
+        let max_child = ids
+            .iter()
+            .filter_map(|id| {
+                id.strip_prefix(&prefix_with_dot)
+                    .and_then(|suffix| {
+                        // Handle both simple children (parent.1) and nested (parent.1.2)
+                        // We only care about direct children, so take the first segment
+                        suffix.split('.').next()
+                    })
+                    .and_then(|num_str| num_str.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+
+        Ok(max_child + 1)
     }
 
     /// Count dependencies for multiple issues efficiently.
@@ -4782,5 +4816,61 @@ mod tests {
             .get_ready_issues(&filters_or_backend, ReadySortPolicy::Oldest)
             .unwrap();
         assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn test_next_child_number() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        // Create parent issue
+        let parent = make_issue("bd-parent", "Parent Epic", Status::Open, 2, None, t1, None);
+        storage.create_issue(&parent, "tester").unwrap();
+
+        // No children yet - should return 1
+        let next = storage.next_child_number("bd-parent").unwrap();
+        assert_eq!(next, 1, "First child should be .1");
+
+        // Create first child
+        let child1 = make_issue("bd-parent.1", "Child 1", Status::Open, 2, None, t1, None);
+        storage.create_issue(&child1, "tester").unwrap();
+
+        // Should now return 2
+        let next = storage.next_child_number("bd-parent").unwrap();
+        assert_eq!(next, 2, "After .1 exists, next should be .2");
+
+        // Create child with .3 (skip .2)
+        let child3 = make_issue("bd-parent.3", "Child 3", Status::Open, 2, None, t1, None);
+        storage.create_issue(&child3, "tester").unwrap();
+
+        // Should return 4 (max is 3, so next is 4)
+        let next = storage.next_child_number("bd-parent").unwrap();
+        assert_eq!(next, 4, "After .3 exists (skipping .2), next should be .4");
+
+        // Create grandchild - should not affect parent's next child number
+        let grandchild = make_issue(
+            "bd-parent.1.1",
+            "Grandchild",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&grandchild, "tester").unwrap();
+
+        // Parent's next child should still be 4
+        let next = storage.next_child_number("bd-parent").unwrap();
+        assert_eq!(
+            next, 4,
+            "Grandchild should not affect parent's next child number"
+        );
+
+        // Check grandchild's parent (bd-parent.1) next child number
+        let next_for_child1 = storage.next_child_number("bd-parent.1").unwrap();
+        assert_eq!(
+            next_for_child1, 2,
+            "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
+        );
     }
 }

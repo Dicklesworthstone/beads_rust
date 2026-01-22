@@ -222,6 +222,7 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
 /// Run schema migrations for existing databases.
 ///
 /// This handles upgrades for tables that may have been created with older schemas.
+#[allow(clippy::too_many_lines)]
 fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration: Ensure blocked_issues_cache has correct schema (blocked_by, blocked_at)
     // Check for old column name (blocked_by_json) or missing columns
@@ -231,9 +232,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     let has_blocked_at: bool = conn
-        .prepare(
-            "SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='blocked_at'",
-        )
+        .prepare("SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='blocked_at'")
         .and_then(|mut stmt| stmt.exists([]))
         .unwrap_or(false);
 
@@ -410,9 +409,9 @@ mod tests {
             .unwrap()
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(1)?, // name
-                    row.get::<_, String>(2)?, // type
-                    row.get::<_, i32>(3)?,    // notnull
+                    row.get::<_, String>(1)?,         // name
+                    row.get::<_, String>(2)?,         // type
+                    row.get::<_, i32>(3)?,            // notnull
                     row.get::<_, Option<String>>(4)?, // dflt_value
                 ))
             })
@@ -423,7 +422,9 @@ mod tests {
         // Check required defaults for bd parity
         let col_map: std::collections::HashMap<_, _> = issues_cols
             .iter()
-            .map(|(name, typ, notnull, dflt)| (name.as_str(), (typ.as_str(), *notnull, dflt.clone())))
+            .map(|(name, typ, notnull, dflt)| {
+                (name.as_str(), (typ.as_str(), *notnull, dflt.clone()))
+            })
             .collect();
 
         // status must default to 'open'
@@ -469,30 +470,67 @@ mod tests {
             .unwrap();
 
         // Core indexes
-        assert!(indexes.contains("idx_issues_status"), "missing idx_issues_status");
-        assert!(indexes.contains("idx_issues_priority"), "missing idx_issues_priority");
-        assert!(indexes.contains("idx_issues_issue_type"), "missing idx_issues_issue_type");
-        assert!(indexes.contains("idx_issues_created_at"), "missing idx_issues_created_at");
-        assert!(indexes.contains("idx_issues_updated_at"), "missing idx_issues_updated_at");
+        assert!(
+            indexes.contains("idx_issues_status"),
+            "missing idx_issues_status"
+        );
+        assert!(
+            indexes.contains("idx_issues_priority"),
+            "missing idx_issues_priority"
+        );
+        assert!(
+            indexes.contains("idx_issues_issue_type"),
+            "missing idx_issues_issue_type"
+        );
+        assert!(
+            indexes.contains("idx_issues_created_at"),
+            "missing idx_issues_created_at"
+        );
+        assert!(
+            indexes.contains("idx_issues_updated_at"),
+            "missing idx_issues_updated_at"
+        );
 
         // Export/sync indexes
-        assert!(indexes.contains("idx_issues_content_hash"), "missing idx_issues_content_hash");
         assert!(
-            indexes.contains("idx_issues_external_ref") || indexes.contains("idx_issues_external_ref_unique"),
+            indexes.contains("idx_issues_content_hash"),
+            "missing idx_issues_content_hash"
+        );
+        assert!(
+            indexes.contains("idx_issues_external_ref")
+                || indexes.contains("idx_issues_external_ref_unique"),
             "missing external_ref index"
         );
 
         // Special state indexes
-        assert!(indexes.contains("idx_issues_ephemeral"), "missing idx_issues_ephemeral");
-        assert!(indexes.contains("idx_issues_pinned"), "missing idx_issues_pinned");
-        assert!(indexes.contains("idx_issues_tombstone"), "missing idx_issues_tombstone");
+        assert!(
+            indexes.contains("idx_issues_ephemeral"),
+            "missing idx_issues_ephemeral"
+        );
+        assert!(
+            indexes.contains("idx_issues_pinned"),
+            "missing idx_issues_pinned"
+        );
+        assert!(
+            indexes.contains("idx_issues_tombstone"),
+            "missing idx_issues_tombstone"
+        );
 
         // Time-based indexes
-        assert!(indexes.contains("idx_issues_due_at"), "missing idx_issues_due_at");
-        assert!(indexes.contains("idx_issues_defer_until"), "missing idx_issues_defer_until");
+        assert!(
+            indexes.contains("idx_issues_due_at"),
+            "missing idx_issues_due_at"
+        );
+        assert!(
+            indexes.contains("idx_issues_defer_until"),
+            "missing idx_issues_defer_until"
+        );
 
         // Ready work composite index (critical for performance)
-        assert!(indexes.contains("idx_issues_ready"), "missing idx_issues_ready composite index");
+        assert!(
+            indexes.contains("idx_issues_ready"),
+            "missing idx_issues_ready composite index"
+        );
 
         // === DEPENDENCIES TABLE ===
         let deps_cols: Vec<(String, Option<String>)> = conn
@@ -500,7 +538,7 @@ mod tests {
             .unwrap()
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(1)?, // name
+                    row.get::<_, String>(1)?,         // name
                     row.get::<_, Option<String>>(4)?, // dflt_value
                 ))
             })
@@ -618,8 +656,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
-        assert!(cols.contains(&"blocked_by".to_string()), "Should have blocked_by");
-        assert!(cols.contains(&"blocked_at".to_string()), "Should have blocked_at");
+        assert!(
+            cols.contains(&"blocked_by".to_string()),
+            "Should have blocked_by"
+        );
+        assert!(
+            cols.contains(&"blocked_at".to_string()),
+            "Should have blocked_at"
+        );
         assert!(
             !cols.contains(&"blocked_by_json".to_string()),
             "Should not have blocked_by_json"
