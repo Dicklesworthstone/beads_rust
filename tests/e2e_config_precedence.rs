@@ -45,7 +45,7 @@ fn e2e_config_precedence_env_project_user_db() {
         get_project.stderr
     );
     assert!(
-        get_project.stdout.contains("PROJECT"),
+        get_project.stdout.trim() == "PROJECT",
         "expected PROJECT, got stdout='{}', stderr='{}'",
         get_project.stdout,
         get_project.stderr
@@ -63,22 +63,26 @@ fn e2e_config_precedence_env_project_user_db() {
         get_user.stderr
     );
     assert!(
-        get_user.stdout.contains('2'),
+        get_user.stdout.trim() == "2",
         "expected default_priority=2 from user config, got stdout='{}'",
         get_user.stdout
     );
 
     // Env overrides project/user/DB
     let env_vars = vec![("BD_ISSUE_PREFIX", "ENV")];
-    let get_env =
-        run_br_with_env(&workspace, ["config", "get", "issue_prefix"], env_vars, "get_env");
+    let get_env = run_br_with_env(
+        &workspace,
+        ["config", "get", "issue_prefix"],
+        env_vars,
+        "get_env",
+    );
     assert!(
         get_env.status.success(),
         "config get with env failed: {}",
         get_env.stderr
     );
     assert!(
-        get_env.stdout.contains("ENV"),
+        get_env.stdout.trim() == "ENV",
         "expected ENV override, got stdout='{}'",
         get_env.stdout
     );
@@ -110,7 +114,7 @@ fn e2e_config_precedence_cli_over_env_project() {
         get_env.stderr
     );
     assert!(
-        get_env.stdout.contains("3000"),
+        get_env.stdout.trim() == "3000",
         "expected env lock-timeout=3000, got stdout='{}'",
         get_env.stdout
     );
@@ -128,7 +132,7 @@ fn e2e_config_precedence_cli_over_env_project() {
         get_cli.stderr
     );
     assert!(
-        get_cli.stdout.contains("1234"),
+        get_cli.stdout.trim() == "1234",
         "expected CLI lock-timeout=1234, got stdout='{}'",
         get_cli.stdout
     );

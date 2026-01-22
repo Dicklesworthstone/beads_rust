@@ -199,6 +199,53 @@ fn e2e_beads_jsonl_external_path() {
 }
 
 #[test]
+fn e2e_beads_jsonl_env_overrides_metadata() {
+    let _log = common::test_log("e2e_beads_jsonl_env_overrides_metadata");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Create an issue but keep it dirty to avoid writing the default JSONL
+    let create = run_br(
+        &workspace,
+        ["create", "Env JSONL override test", "--no-auto-flush"],
+        "create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    // Force metadata to point at a different JSONL path
+    let metadata_path = workspace.root.join(".beads").join("metadata.json");
+    let metadata_json = r#"{"database":"beads.db","jsonl_export":"custom.jsonl"}"#;
+    fs::write(&metadata_path, metadata_json).expect("write metadata");
+
+    // Env should override metadata
+    let env_jsonl = workspace.root.join(".beads").join("env.jsonl");
+    let env_vars = vec![("BEADS_JSONL", env_jsonl.to_str().unwrap())];
+
+    let sync = run_br_with_env(
+        &workspace,
+        ["sync", "--flush-only"],
+        env_vars,
+        "sync_env_jsonl",
+    );
+    assert!(sync.status.success(), "sync failed: {}", sync.stderr);
+
+    assert!(env_jsonl.exists(), "env JSONL should be created");
+    let contents = fs::read_to_string(&env_jsonl).expect("read env jsonl");
+    assert!(
+        contents.contains("Env JSONL override test"),
+        "env JSONL should contain the issue"
+    );
+
+    let metadata_jsonl = workspace.root.join(".beads").join("custom.jsonl");
+    assert!(
+        !metadata_jsonl.exists(),
+        "metadata JSONL should not be created when BEADS_JSONL is set"
+    );
+}
+
+#[test]
 fn e2e_beads_jsonl_without_allow_flag_warns() {
     let _log = common::test_log("e2e_beads_jsonl_without_allow_flag_warns");
     let workspace = BrWorkspace::new();
@@ -440,6 +487,41 @@ fn e2e_no_db_with_beads_jsonl() {
             .iter()
             .any(|item| item["title"] == "Custom JSONL Location"),
         "issue from BEADS_JSONL should be visible"
+    );
+}
+
+#[test]
+fn e2e_no_db_ignores_lock_timeout_flag() {
+    let _log = common::test_log("e2e_no_db_ignores_lock_timeout_flag");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "No-DB lock-timeout"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync failed: {}", sync.stderr);
+
+    let list = run_br(
+        &workspace,
+        ["--no-db", "--lock-timeout", "1", "list", "--json"],
+        "list_no_db_lock_timeout",
+    );
+    assert!(
+        list.status.success(),
+        "list --no-db --lock-timeout failed: {}",
+        list.stderr
+    );
+
+    let payload = extract_json_payload(&list.stdout);
+    let list_json: Vec<Value> = serde_json::from_str(&payload).expect("list json");
+    assert!(
+        list_json
+            .iter()
+            .any(|item| item["title"] == "No-DB lock-timeout"),
+        "issue should be visible in no-db mode even with lock-timeout flag"
     );
 }
 

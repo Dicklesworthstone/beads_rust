@@ -1435,15 +1435,8 @@ labels:
         cli.runtime
             .insert("issue_prefix".to_string(), "cli".to_string());
 
-        let merged = ConfigLayer::merge_layers(&[
-            defaults,
-            db,
-            legacy,
-            user,
-            project,
-            env_layer,
-            cli,
-        ]);
+        let merged =
+            ConfigLayer::merge_layers(&[defaults, db, legacy, user, project, env_layer, cli]);
 
         assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "cli");
     }
