@@ -1405,6 +1405,50 @@ labels:
     }
 
     #[test]
+    fn precedence_chain_includes_legacy_and_user_layers() {
+        let defaults = default_config_layer();
+
+        let mut db = ConfigLayer::default();
+        db.runtime
+            .insert("issue_prefix".to_string(), "db".to_string());
+
+        let mut legacy = ConfigLayer::default();
+        legacy
+            .runtime
+            .insert("issue_prefix".to_string(), "legacy".to_string());
+
+        let mut user = ConfigLayer::default();
+        user.runtime
+            .insert("issue_prefix".to_string(), "user".to_string());
+
+        let mut project = ConfigLayer::default();
+        project
+            .runtime
+            .insert("issue_prefix".to_string(), "project".to_string());
+
+        let mut env_layer = ConfigLayer::default();
+        env_layer
+            .runtime
+            .insert("issue_prefix".to_string(), "env".to_string());
+
+        let mut cli = ConfigLayer::default();
+        cli.runtime
+            .insert("issue_prefix".to_string(), "cli".to_string());
+
+        let merged = ConfigLayer::merge_layers(&[
+            defaults,
+            db,
+            legacy,
+            user,
+            project,
+            env_layer,
+            cli,
+        ]);
+
+        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "cli");
+    }
+
+    #[test]
     fn precedence_full_chain_with_different_keys() {
         // Each layer sets a different key, all should be preserved
         let mut defaults = default_config_layer();
