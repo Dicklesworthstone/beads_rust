@@ -192,12 +192,26 @@ pub fn create_issue_impl(
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
 
+    // Parse status (default to Open if not provided)
+    let status = if let Some(s) = &args.status {
+        Status::from_str(s)?
+    } else {
+        Status::Open
+    };
+
+    // Set closed_at if status is Closed or Tombstone
+    let closed_at = if matches!(status, Status::Closed | Status::Tombstone) {
+        Some(now)
+    } else {
+        None
+    };
+
     // 4. Construct Issue
     let mut issue = Issue {
         id: id.clone(),
         title: title.clone(),
         description: args.description.clone(),
-        status: Status::Open,
+        status,
         priority,
         issue_type,
         created_at: now,
@@ -215,7 +229,7 @@ pub fn create_issue_impl(
         acceptance_criteria: None,
         notes: None,
         created_by: Some(config.actor.clone()),
-        closed_at: None,
+        closed_at,
         close_reason: None,
         closed_by_session: None,
         source_system: None,
@@ -387,6 +401,20 @@ fn execute_import(
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
 
+    // Parse status (default to Open if not provided)
+    let import_status = if let Some(s) = &args.status {
+        Status::from_str(s)?
+    } else {
+        Status::Open
+    };
+
+    // Set closed_at if status is Closed or Tombstone
+    let import_closed_at = if matches!(import_status, Status::Closed | Status::Tombstone) {
+        Some(now)
+    } else {
+        None
+    };
+
     let storage = &mut storage_ctx.storage;
     let id_gen = IdGenerator::new(id_config);
 
@@ -439,7 +467,7 @@ fn execute_import(
             id: id.clone(),
             title: title.clone(),
             description: parsed.description,
-            status: Status::Open,
+            status: import_status.clone(),
             priority,
             issue_type,
             created_at: now,
@@ -456,7 +484,7 @@ fn execute_import(
             content_hash: None,
             notes: None,
             created_by: None,
-            closed_at: None,
+            closed_at: import_closed_at,
             close_reason: None,
             closed_by_session: None,
             source_system: None,
@@ -600,6 +628,7 @@ mod tests {
             due: None,
             defer: None,
             external_ref: None,
+            status: None,
             ephemeral: false,
             dry_run: false,
             silent: false,

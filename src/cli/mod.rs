@@ -338,6 +338,10 @@ pub struct CreateArgs {
     #[arg(long)]
     pub ephemeral: bool,
 
+    /// Initial status (open, deferred, in_progress, closed)
+    #[arg(long, short = 's')]
+    pub status: Option<String>,
+
     /// Preview without creating
     #[arg(long)]
     pub dry_run: bool,
