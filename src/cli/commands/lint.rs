@@ -4,7 +4,7 @@
 
 use crate::cli::LintArgs;
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
@@ -236,6 +236,12 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
 
     if let Some(ref type_str) = args.type_ {
         let issue_type: IssueType = type_str.parse()?;
+        // bd conformance: CLI rejects custom/unknown types
+        if !issue_type.is_standard() {
+            return Err(BeadsError::InvalidType {
+                issue_type: type_str.clone(),
+            });
+        }
         filters.types = Some(vec![issue_type]);
     }
 

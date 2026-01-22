@@ -161,6 +161,13 @@ impl IssueType {
             Self::Custom(value) => value,
         }
     }
+
+    /// Returns true if this is a standard (non-custom) issue type.
+    /// Used for bd conformance validation in CLI commands.
+    #[must_use]
+    pub const fn is_standard(&self) -> bool {
+        !matches!(self, Self::Custom(_))
+    }
 }
 
 impl fmt::Display for IssueType {

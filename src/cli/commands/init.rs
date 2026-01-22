@@ -86,6 +86,14 @@ last-touched
         fs::write(gitignore_path, gitignore)?;
     }
 
+    // Write empty issues.jsonl for compatibility with bv (beads_viewer)
+    // bv expects this file to exist even if there are no issues yet
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let jsonl_existed = jsonl_path.exists();
+    if !jsonl_existed {
+        fs::write(&jsonl_path, "")?;
+    }
+
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
@@ -98,6 +106,7 @@ last-touched
             force,
             config_existed,
             gitignore_existed,
+            jsonl_existed,
             prefix_set.as_deref(),
         );
         render_init_rich(&beads_dir, &steps, prefix_set.as_deref(), ctx);
@@ -131,6 +140,7 @@ fn build_init_steps(
     force: bool,
     config_existed: bool,
     gitignore_existed: bool,
+    jsonl_existed: bool,
     prefix: Option<&str>,
 ) -> Vec<InitStep> {
     let mut steps = Vec::new();
@@ -183,6 +193,15 @@ fn build_init_steps(
         },
     });
 
+    steps.push(InitStep {
+        label: "issues.jsonl (for bv compatibility)".to_string(),
+        status: if jsonl_existed {
+            InitStepStatus::Existing
+        } else {
+            InitStepStatus::Created
+        },
+    });
+
     if let Some(prefix) = prefix {
         steps.push(InitStep {
             label: format!("Issue prefix set to '{prefix}'"),
@@ -221,7 +240,7 @@ fn render_init_rich(
     content.append("    |-- metadata.json\n");
     content.append("    |-- config.yaml\n");
     content.append("    |-- .gitignore\n");
-    content.append("    `-- issues.jsonl (created on first sync)\n");
+    content.append("    `-- issues.jsonl\n");
 
     content.append("\n");
     content.append_styled("Next steps:\n", theme.emphasis.clone());
@@ -279,6 +298,7 @@ mod tests {
         assert!(temp_dir.path().join(".beads/metadata.json").exists());
         assert!(temp_dir.path().join(".beads/config.yaml").exists());
         assert!(temp_dir.path().join(".beads/.gitignore").exists());
+        assert!(temp_dir.path().join(".beads/issues.jsonl").exists());
         info!("test_init_creates_beads_directory: assertions passed");
     }
 
