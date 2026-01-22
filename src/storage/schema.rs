@@ -634,9 +634,38 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
 
         // Create old-style blocked_issues_cache with blocked_by_json
+        // Using a complete issues table schema so index migrations succeed
         conn.execute_batch(
             r"
-            CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL);
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                priority INTEGER NOT NULL DEFAULT 2,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                content_hash TEXT,
+                external_ref TEXT,
+                ephemeral INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0,
+                due_at DATETIME,
+                defer_until DATETIME
+            );
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                PRIMARY KEY (issue_id, depends_on_id)
+            );
+            CREATE TABLE comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT ''
+            );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
                 blocked_by_json TEXT NOT NULL
