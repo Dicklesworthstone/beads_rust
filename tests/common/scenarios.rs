@@ -839,7 +839,7 @@ impl BenchmarkRunner {
         };
 
         let metrics = BenchmarkMetrics {
-            br_duration_ms: br_duration_ms,
+            br_duration_ms,
             bd_duration_ms: Some(bd_duration_ms),
             speedup_ratio,
             br_peak_rss_bytes: None,
@@ -894,7 +894,7 @@ impl BenchmarkRunner {
         };
 
         let metrics = BenchmarkMetrics {
-            br_duration_ms: br_duration_ms,
+            br_duration_ms,
             bd_duration_ms: None,
             speedup_ratio: None,
             br_peak_rss_bytes: None,

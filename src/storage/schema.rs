@@ -398,6 +398,7 @@ mod tests {
     /// Conformance test: Verify schema matches bd (Go) for interoperability.
     /// Tests table structure, defaults, constraints, and indexes.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_schema_parity_conformance() {
         let conn = Connection::open_in_memory().unwrap();
         apply_schema(&conn).expect("Failed to apply schema");
