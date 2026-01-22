@@ -4,7 +4,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
-use crate::util::id::IdGenerator;
+use crate::util::id::{IdGenerator, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
@@ -108,6 +108,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 /// - ID generation fails
 /// - Validation fails
 /// - Storage write fails
+#[allow(clippy::too_many_lines)]
 pub fn create_issue_impl(
     storage: &mut SqliteStorage,
     args: &CreateArgs,
@@ -125,18 +126,55 @@ pub fn create_issue_impl(
     }
 
     // 2. Generate ID
-    let id_gen = IdGenerator::new(config.id_config.clone());
     let now = Utc::now();
-    let count = storage.count_issues()?;
 
-    let id = id_gen.generate(
-        title,
-        None, // description
-        None, // creator
-        now,
-        count,
-        |id| storage.id_exists(id).unwrap_or(false),
-    );
+    // When a parent is specified, generate a child ID (parent.1, parent.2, etc.)
+    // instead of a random hash-based ID
+    let id = if let Some(parent_id) = &args.parent {
+        // Verify parent exists
+        if !storage.id_exists(parent_id).unwrap_or(false) {
+            return Err(BeadsError::IssueNotFound {
+                id: parent_id.clone(),
+            });
+        }
+
+        // Find next available child number
+        let next_num = storage.next_child_number(parent_id)?;
+        let candidate = child_id(parent_id, next_num);
+
+        // Double-check the ID doesn't exist (race condition safety)
+        if storage.id_exists(&candidate).unwrap_or(false) {
+            // Extremely unlikely, but handle by incrementing
+            let mut num = next_num + 1;
+            loop {
+                let alt = child_id(parent_id, num);
+                if !storage.id_exists(&alt).unwrap_or(false) {
+                    break alt;
+                }
+                num += 1;
+                if num > next_num + 100 {
+                    return Err(BeadsError::validation(
+                        "parent",
+                        "could not find available child ID",
+                    ));
+                }
+            }
+        } else {
+            candidate
+        }
+    } else {
+        // Standard ID generation for non-child issues
+        let id_gen = IdGenerator::new(config.id_config.clone());
+        let count = storage.count_issues()?;
+        id_gen.generate(
+            title,
+            None, // description
+            None, // creator
+            now,
+            count,
+            |id| storage.id_exists(id).unwrap_or(false),
+        )
+    };
 
     // 3. Parse fields
     let priority = if let Some(p) = &args.priority {
@@ -711,6 +749,80 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0], parent.id);
         info!("test_create_parent_dependency: assertions passed");
+    }
+
+    #[test]
+    fn test_create_child_generates_hierarchical_id() {
+        init_test_logging();
+        info!("test_create_child_generates_hierarchical_id: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+
+        // Create parent (epic)
+        let mut parent_args = default_args();
+        parent_args.title = Some("Epic Parent".to_string());
+        let parent = create_issue_impl(&mut storage, &parent_args, &config).expect("parent");
+
+        // Create first child - should get parent.1
+        let mut child1_args = default_args();
+        child1_args.title = Some("First Child".to_string());
+        child1_args.parent = Some(parent.id.clone());
+        let child1 = create_issue_impl(&mut storage, &child1_args, &config).expect("child1");
+
+        // Verify child ID has the correct format: parent_id.1
+        let expected_child1_id = format!("{}.1", parent.id);
+        assert_eq!(
+            child1.id, expected_child1_id,
+            "First child should have ID {expected_child1_id}, got {}",
+            child1.id
+        );
+
+        // Create second child - should get parent.2
+        let mut child2_args = default_args();
+        child2_args.title = Some("Second Child".to_string());
+        child2_args.parent = Some(parent.id.clone());
+        let child2 = create_issue_impl(&mut storage, &child2_args, &config).expect("child2");
+
+        let expected_child2_id = format!("{}.2", parent.id);
+        assert_eq!(
+            child2.id, expected_child2_id,
+            "Second child should have ID {expected_child2_id}, got {}",
+            child2.id
+        );
+
+        // Verify dependencies are set correctly
+        let deps1 = storage.get_dependencies(&child1.id).expect("get deps1");
+        assert_eq!(deps1.len(), 1);
+        assert_eq!(deps1[0], parent.id);
+
+        let deps2 = storage.get_dependencies(&child2.id).expect("get deps2");
+        assert_eq!(deps2.len(), 1);
+        assert_eq!(deps2[0], parent.id);
+
+        info!("test_create_child_generates_hierarchical_id: assertions passed");
+    }
+
+    #[test]
+    fn test_create_child_with_nonexistent_parent_fails() {
+        init_test_logging();
+        info!("test_create_child_with_nonexistent_parent_fails: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+
+        // Try to create child with non-existent parent
+        let mut args = default_args();
+        args.parent = Some("bd-nonexistent".to_string());
+
+        let result = create_issue_impl(&mut storage, &args, &config);
+        assert!(result.is_err(), "Should fail when parent doesn't exist");
+
+        if let Err(BeadsError::IssueNotFound { id }) = result {
+            assert_eq!(id, "bd-nonexistent");
+        } else {
+            panic!("Expected IssueNotFound error");
+        }
+
+        info!("test_create_child_with_nonexistent_parent_fails: assertions passed");
     }
 
     #[test]
