@@ -153,6 +153,35 @@ scripts/bench.sh --compare          # Compare br and bd
 - `BENCH_TIMEOUT=600` - Per-benchmark timeout
 - `BENCH_DATASET=beads_rust` - Dataset to benchmark
 
+### Benchmark Suites (Cold/Warm, Synthetic Scale, Real Datasets)
+
+In addition to Criterion, the repo includes benchmark suites under `tests/` that
+produce structured JSON in `target/benchmark-results/`. These are opt-in and
+use isolated workspaces so source datasets are never mutated.
+
+**Cold/Warm start**
+```bash
+cargo test --test bench_cold_warm_start -- --nocapture --ignored
+HARNESS_ARTIFACTS=1 cargo test --test bench_cold_warm_start -- --nocapture --ignored
+```
+Outputs: `target/benchmark-results/cold_warm_*_latest.json`,
+`target/benchmark-results/cold_warm_all_<timestamp>.json`
+
+**Synthetic scale (10k–250k issues)**
+```bash
+BR_E2E_STRESS=1 cargo test --test bench_synthetic_scale -- --nocapture --ignored
+```
+Outputs: `target/benchmark-results/synthetic_*_latest.json`,
+`target/benchmark-results/synthetic_all_<timestamp>.json`
+
+**Real datasets**
+```bash
+cargo test --test bench_real_datasets -- --nocapture --ignored
+HARNESS_ARTIFACTS=1 cargo test --test bench_real_datasets -- --nocapture --ignored
+```
+Outputs: `target/benchmark-results/real_datasets_latest.json`,
+`target/benchmark-results/real_datasets_<timestamp>.json`
+
 ### Benchmark Output
 
 - `target/test-artifacts/benchmark_summary.json` - Summary
