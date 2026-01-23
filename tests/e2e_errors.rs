@@ -508,8 +508,23 @@ fn e2e_lint_skips_types_without_required_sections() {
 // === Structured JSON Error Output Tests ===
 
 /// Parse structured error JSON from stderr.
+/// This handles the case where log lines may precede the JSON output.
 fn parse_error_json(stderr: &str) -> Option<Value> {
-    serde_json::from_str(stderr).ok()
+    // First try parsing the whole stderr as JSON
+    if let Ok(json) = serde_json::from_str(stderr) {
+        return Some(json);
+    }
+
+    // If that fails, look for a JSON object starting with '{'
+    // This handles cases where log lines precede the JSON output
+    if let Some(start) = stderr.find('{') {
+        let json_part = &stderr[start..];
+        if let Ok(json) = serde_json::from_str(json_part) {
+            return Some(json);
+        }
+    }
+
+    None
 }
 
 /// Verify error JSON has required fields.

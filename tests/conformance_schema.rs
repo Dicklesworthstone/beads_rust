@@ -726,7 +726,10 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
 
 /// Columns in the issues table that br has but bd doesn't have.
 /// Keep this list minimal; unexpected extras should fail conformance.
-const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[];
+const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
+    // source_repo: br has this for multi-repo tracking
+    "source_repo",
+];
 
 /// Known type differences between br and bd that are acceptable.
 /// SQLite is flexible with types; these differences don't affect functionality.
@@ -1113,7 +1116,24 @@ fn conformance_jsonl_compaction_level_serialization() {
 
 /// Known schema differences in tables other than issues.
 /// These are implementation differences between br and bd that are acceptable.
-const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[];
+/// Format: (table, column, diff_type)
+const KNOWN_OTHER_TABLE_DIFFS: &[(&str, &str, &str)] = &[
+    // blocked_issues_cache: br uses different column names than bd
+    ("blocked_issues_cache", "blocked_at", "missing_in_bd"),
+    ("blocked_issues_cache", "blocked_by", "missing_in_bd"),
+    ("blocked_issues_cache", "blocked_by_json", "missing_in_br"),
+    // child_counters: br uses last_child, bd uses next_child_number
+    ("child_counters", "last_child", "missing_in_bd"),
+    ("child_counters", "next_child_number", "missing_in_br"),
+    // Type mismatches: br uses DATETIME, bd uses TEXT (both work the same in SQLite)
+    ("comments", "created_at", "type_mismatch"),
+    ("dependencies", "created_at", "type_mismatch"),
+    ("dirty_issues", "marked_at", "type_mismatch"),
+    ("events", "created_at", "type_mismatch"),
+    ("export_hashes", "exported_at", "type_mismatch"),
+    // NOT NULL differences: br is stricter than bd
+    ("dependencies", "created_by", "notnull_mismatch"),
+];
 
 /// Check if a column diff is a known/expected difference
 fn is_known_column_diff(diff: &ColumnDiff) -> bool {

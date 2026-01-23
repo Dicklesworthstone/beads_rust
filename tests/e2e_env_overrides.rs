@@ -273,24 +273,70 @@ fn e2e_beads_jsonl_without_allow_flag_warns() {
         "sync_no_allow",
     );
 
-    // Should either fail or warn about external path without flag
-    // The exact behavior depends on implementation
-    if sync.status.success() {
-        // If it succeeds, it should have used the default path, not external
-        assert!(
-            !external_jsonl.exists(),
-            "external JSONL should NOT be created without --allow-external-jsonl"
-        );
-    } else {
-        // If it fails, error message should be about external path
-        assert!(
-            sync.stderr.contains("external")
-                || sync.stderr.contains("allow")
-                || sync.stderr.contains("outside"),
-            "error should mention external path: {}",
-            sync.stderr
-        );
-    }
+    assert!(
+        !sync.status.success(),
+        "sync should fail without --allow-external-jsonl (stdout={}, stderr={})",
+        sync.stdout,
+        sync.stderr
+    );
+    let combined = format!("{}{}", sync.stdout, sync.stderr);
+    assert!(
+        combined.contains("external")
+            || combined.contains("allow-external-jsonl")
+            || combined.contains("outside"),
+        "error should mention external path restriction: {combined}"
+    );
+    assert!(
+        !external_jsonl.exists(),
+        "external JSONL should NOT be created without --allow-external-jsonl"
+    );
+}
+
+#[test]
+fn e2e_beads_jsonl_metadata_external_without_allow_fails() {
+    let _log = common::test_log("e2e_beads_jsonl_metadata_external_without_allow_fails");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Metadata external JSONL"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let external_dir = workspace.root.join("external-jsonl");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("metadata.jsonl");
+
+    let metadata_path = workspace.root.join(".beads").join("metadata.json");
+    let metadata_json = format!(
+        r#"{{"database":"beads.db","jsonl_export":"{}"}}"#,
+        external_jsonl.display()
+    );
+    fs::write(&metadata_path, metadata_json).expect("write metadata");
+
+    let sync = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "sync_metadata_external",
+    );
+    assert!(
+        !sync.status.success(),
+        "sync should fail for external metadata jsonl without allow flag (stdout={}, stderr={})",
+        sync.stdout,
+        sync.stderr
+    );
+
+    let combined = format!("{}{}", sync.stdout, sync.stderr);
+    assert!(
+        combined.contains("external")
+            || combined.contains("allow-external-jsonl")
+            || combined.contains("outside"),
+        "error should mention external path restriction: {combined}"
+    );
+    assert!(
+        !external_jsonl.exists(),
+        "external JSONL should NOT be created without --allow-external-jsonl"
+    );
 }
 
 // ============================================================================

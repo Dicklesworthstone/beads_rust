@@ -155,7 +155,7 @@ fn preflight_import_rejects_conflict_markers() {
         ..Default::default()
     };
 
-    let preflight_result = preflight_import(&jsonl_path, &config).expect("preflight should run");
+    let preflight_result = preflight_import(&jsonl_path, &config, None).expect("preflight should run");
 
     // Log for postmortem
     let log = format!(
@@ -252,7 +252,7 @@ fn preflight_import_conflict_markers_shows_line_numbers() {
         ..Default::default()
     };
 
-    let result = preflight_import(&jsonl_path, &config).expect("preflight should run");
+    let result = preflight_import(&jsonl_path, &config, None).expect("preflight should run");
 
     // ASSERTION: Should fail
     assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
@@ -297,7 +297,7 @@ fn preflight_import_rejects_outside_beads_dir() {
         ..Default::default()
     };
 
-    let result = preflight_import(&outside_path, &config).expect("preflight should run");
+    let result = preflight_import(&outside_path, &config, None).expect("preflight should run");
 
     // Log for postmortem
     let log = format!(
@@ -363,7 +363,7 @@ fn preflight_import_rejects_git_paths() {
         ..Default::default()
     };
 
-    let result = preflight_import(&git_path, &config).expect("preflight should run");
+    let result = preflight_import(&git_path, &config, None).expect("preflight should run");
 
     // ASSERTION: Preflight should fail
     assert_eq!(
@@ -413,7 +413,7 @@ fn preflight_import_rejects_path_traversal() {
         ..Default::default()
     };
 
-    let result = preflight_import(&traversal_path, &config).expect("preflight should run");
+    let result = preflight_import(&traversal_path, &config, None).expect("preflight should run");
 
     // ASSERTION: Preflight should fail
     assert_eq!(
@@ -518,7 +518,7 @@ fn preflight_results_are_actionable() {
         ..Default::default()
     };
 
-    let result = preflight_import(&jsonl_path, &config).expect("preflight should run");
+    let result = preflight_import(&jsonl_path, &config, None).expect("preflight should run");
 
     // ASSERTION: All checks should have names
     for check in &result.checks {
