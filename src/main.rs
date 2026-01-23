@@ -193,12 +193,14 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Info(_)
         | Commands::Where
         | Commands::Version(_)
-        | Commands::Upgrade(_)
         | Commands::Completions(_)
         | Commands::Audit { .. }
         | Commands::Config { .. }
         | Commands::History(_)
         | Commands::Agents(_) => false,
+
+        #[cfg(feature = "self_update")]
+        Commands::Upgrade(_) => false,
     }
 }
 
