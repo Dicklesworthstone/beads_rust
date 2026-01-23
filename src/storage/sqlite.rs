@@ -1048,7 +1048,7 @@ impl SqliteStorage {
         }
 
         // Ready condition 2: NOT in blocked_issues_cache (optimized: filter in SQL)
-        sql.push_str(" AND blocked_issues_cache.issue_id IS NULL");
+        sql.push_str(" AND id NOT IN (SELECT issue_id FROM blocked_issues_cache)");
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
         if !filters.include_deferred {
