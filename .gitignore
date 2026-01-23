@@ -35,6 +35,10 @@ a.out
 temp_test*/
 rustc-ice-*.txt
 
+# Profiling data
+perf.data
+perf.data.old
+
 # Large source images (webp versions are committed)
 *.png
 
