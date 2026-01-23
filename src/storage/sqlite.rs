@@ -1595,7 +1595,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn find_ids_by_hash(&self, hash_suffix: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM issues WHERE id LIKE ?")?;
         let pattern = format!("%-%{hash_suffix}%");
         let ids = stmt
             .query_map([pattern], |row| row.get(0))?
@@ -1622,7 +1624,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare_cached("SELECT id FROM issues ORDER BY id")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM issues ORDER BY id")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2393,7 +2397,9 @@ impl SqliteStorage {
     pub fn next_child_number(&self, parent_id: &str) -> Result<u32> {
         // Find all existing child IDs matching the pattern {parent_id}.N
         let pattern = format!("{parent_id}.%");
-        let mut stmt = self.conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?")?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT id FROM issues WHERE id LIKE ?")?;
         let ids: Vec<String> = stmt
             .query_map([&pattern], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;

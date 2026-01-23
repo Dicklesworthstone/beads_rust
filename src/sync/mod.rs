@@ -1018,9 +1018,8 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
             continue;
         }
 
-        let partial: PartialId = serde_json::from_str(trimmed).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e))
-        })?;
+        let partial: PartialId = serde_json::from_str(trimmed)
+            .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e)))?;
 
         ids.insert(partial.id);
         count += 1;
@@ -1715,10 +1714,7 @@ pub fn auto_flush(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<AutoF
         return Ok(AutoFlushResult::default());
     }
 
-    tracing::debug!(
-        dirty_count,
-        "Auto-flush: exporting dirty issues"
-    );
+    tracing::debug!(dirty_count, "Auto-flush: exporting dirty issues");
 
     // Default JSONL path
     let jsonl_path = beads_dir.join("issues.jsonl");

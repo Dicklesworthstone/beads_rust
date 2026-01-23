@@ -277,11 +277,7 @@ fn snapshot_stale_json() {
     let workspace = init_workspace();
     create_issue(&workspace, "Stale issue", "create_stale");
 
-    let output = run_br(
-        &workspace,
-        ["stale", "--days", "0", "--json"],
-        "stale_json",
-    );
+    let output = run_br(&workspace, ["stale", "--days", "0", "--json"], "stale_json");
     assert!(
         output.status.success(),
         "stale json failed: {}",
@@ -371,10 +367,7 @@ fn snapshot_label_json() {
     );
 
     let list_all_json: Value = serde_json::from_str(&list_all.stdout).expect("parse json");
-    assert_json_snapshot!(
-        "label_list_all_json_output",
-        normalize_json(&list_all_json)
-    );
+    assert_json_snapshot!("label_list_all_json_output", normalize_json(&list_all_json));
 }
 
 #[test]

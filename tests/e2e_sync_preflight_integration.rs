@@ -155,7 +155,8 @@ fn preflight_import_rejects_conflict_markers() {
         ..Default::default()
     };
 
-    let preflight_result = preflight_import(&jsonl_path, &config, None).expect("preflight should run");
+    let preflight_result =
+        preflight_import(&jsonl_path, &config, None).expect("preflight should run");
 
     // Log for postmortem
     let log = format!(

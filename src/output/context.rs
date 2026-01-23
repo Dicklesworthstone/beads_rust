@@ -173,7 +173,8 @@ impl OutputContext {
     pub fn json_pretty<T: serde::Serialize>(&self, value: &T) {
         if self.is_rich() {
             let json = rich_rust::renderables::Json::new(
-                serde_json::to_value(value).expect("JSON conversion failed - value is not serializable"),
+                serde_json::to_value(value)
+                    .expect("JSON conversion failed - value is not serializable"),
             );
             self.console().print_renderable(&json);
         } else if self.is_json() {
