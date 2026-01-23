@@ -85,6 +85,9 @@ br sync --flush-only                 # Export for git commit
 cd my-project
 br init
 
+# Add agent instructions to AGENTS.md (creates file if needed)
+br agents --add --force
+
 # Create issues with priority (0=critical, 4=backlog)
 br create "Implement user auth" --type feature --priority 1
 # Created: bd-7f3a2c
