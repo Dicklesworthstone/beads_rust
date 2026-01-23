@@ -920,7 +920,7 @@ download_file() {
                 curl_args=(-sS "${curl_args[@]}")
             fi
 
-            if env "${proxy_env[@]}" curl "${curl_args[@]}"; then
+            if env ${proxy_env[@]+"${proxy_env[@]}"} curl "${curl_args[@]}"; then
                 mv -f "$partial" "$dest"
                 return 0
             fi
@@ -939,7 +939,7 @@ download_file() {
                 wget_args=(--quiet "${wget_args[@]}")
             fi
 
-            if env "${proxy_env[@]}" wget "${wget_args[@]}"; then
+            if env ${proxy_env[@]+"${proxy_env[@]}"} wget "${wget_args[@]}"; then
                 mv -f "$partial" "$dest"
                 return 0
             fi
