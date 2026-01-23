@@ -326,8 +326,7 @@ impl OpenStorageResult {
             return Ok(());
         }
 
-        let dirty_ids = self.storage.get_dirty_issue_ids()?;
-        if dirty_ids.is_empty() {
+        if self.storage.get_dirty_issue_count()? == 0 {
             return Ok(());
         }
 

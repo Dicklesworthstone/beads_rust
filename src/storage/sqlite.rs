@@ -664,7 +664,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_issue(&self, id: &str) -> Result<Option<Issue>> {
-        let sql = r" 
+        let sql = r"
             SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                    status, priority, issue_type, assignee, owner, estimated_minutes,
                    created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
@@ -675,7 +675,7 @@ impl SqliteStorage {
             FROM issues WHERE id = ?
         ";
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let result = stmt.query_row([id], |row| self.issue_from_row(row));
 
         match result {
@@ -905,7 +905,8 @@ impl SqliteStorage {
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
                      sender, ephemeral, pinned, is_template
-              FROM issues WHERE 1=1",
+              FROM issues
+              WHERE 1=1",
         );
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1047,7 +1048,7 @@ impl SqliteStorage {
         }
 
         // Ready condition 2: NOT in blocked_issues_cache (optimized: filter in SQL)
-        sql.push_str(" AND id NOT IN (SELECT issue_id FROM blocked_issues_cache)");
+        sql.push_str(" AND blocked_issues_cache.issue_id IS NULL");
 
         // Ready condition 3: `defer_until` is NULL or <= now (unless `include_deferred`)
         if !filters.include_deferred {
@@ -1133,18 +1134,20 @@ impl SqliteStorage {
             }
         }
 
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
-        let mut issues: Vec<Issue> = stmt
-            .query_map(params_refs.as_slice(), |row| self.issue_from_row(row))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        // Apply limit after all filtering
+        // Apply limit in SQL to avoid fetching extra rows.
         if let Some(limit) = filters.limit {
-            if limit > 0 && issues.len() > limit {
-                issues.truncate(limit);
+            if limit > 0 {
+                sql.push_str(" LIMIT ?");
+                let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+                params.push(Box::new(limit_i64));
             }
         }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(AsRef::as_ref).collect();
+        let issues: Vec<Issue> = stmt
+            .query_map(params_refs.as_slice(), |row| self.issue_from_row(row))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(issues)
     }
@@ -1157,7 +1160,7 @@ impl SqliteStorage {
     pub fn get_blocked_ids(&self) -> Result<HashSet<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT issue_id FROM blocked_issues_cache")?;
+            .prepare_cached("SELECT issue_id FROM blocked_issues_cache")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<HashSet<String>, _>>()?;
@@ -1177,7 +1180,7 @@ impl SqliteStorage {
         // 1. Have a 'blocks' type dependency
         // 2. Where the blocker is not closed/tombstone
         // 3. AND the blocked issue itself is not closed/tombstone
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             r"SELECT DISTINCT d.issue_id
               FROM dependencies d
               LEFT JOIN issues blocker ON d.depends_on_id = blocker.id
@@ -1198,12 +1201,12 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn is_blocked(&self, issue_id: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM blocked_issues_cache WHERE issue_id = ?",
-            [issue_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        // Use EXISTS for efficiency (stops at first match)
+        let exists: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM blocked_issues_cache WHERE issue_id = ?)")?
+            .query_row([issue_id], |row| row.get(0))?;
+        Ok(exists)
     }
 
     /// Rebuild the blocked issues cache from scratch.
@@ -1578,12 +1581,12 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn id_exists(&self, id: &str) -> Result<bool> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT count(*) FROM issues WHERE id = ?", [id], |row| {
-                    row.get(0)
-                })?;
-        Ok(count > 0)
+        // Use EXISTS for efficiency (stops at first match)
+        let exists: bool = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM issues WHERE id = ?)")?
+            .query_row([id], |row| row.get(0))?;
+        Ok(exists)
     }
 
     /// Find issue IDs that end with the given hash substring.
@@ -1592,7 +1595,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn find_ids_by_hash(&self, hash_suffix: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM issues WHERE id LIKE ?")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?")?;
         let pattern = format!("%-%{hash_suffix}%");
         let ids = stmt
             .query_map([pattern], |row| row.get(0))?
@@ -1608,7 +1611,8 @@ impl SqliteStorage {
     pub fn count_issues(&self) -> Result<usize> {
         let count: i64 = self
             .conn
-            .query_row("SELECT count(*) FROM issues", [], |row| row.get(0))?;
+            .prepare_cached("SELECT count(*) FROM issues")?
+            .query_row([], |row| row.get(0))?;
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
@@ -1618,7 +1622,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM issues ORDER BY id")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM issues ORDER BY id")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2023,7 +2027,7 @@ impl SqliteStorage {
     pub fn get_labels(&self, issue_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT label FROM labels WHERE issue_id = ? ORDER BY label")?;
+            .prepare_cached("SELECT label FROM labels WHERE issue_id = ? ORDER BY label")?;
         let labels = stmt
             .query_map([issue_id], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2082,7 +2086,7 @@ impl SqliteStorage {
     pub fn get_all_labels(&self) -> Result<HashMap<String, Vec<String>>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
+            .prepare_cached("SELECT issue_id, label FROM labels ORDER BY issue_id, label")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -2104,7 +2108,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_unique_labels_with_counts(&self) -> Result<Vec<(String, i64)>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             r"SELECT l.label, COUNT(*) as count
               FROM labels l
               JOIN issues i ON l.issue_id = i.id
@@ -2238,7 +2242,7 @@ impl SqliteStorage {
         &self,
         issue_id: &str,
     ) -> Result<Vec<IssueWithDependencyMetadata>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT d.depends_on_id, i.title, i.status, i.priority, d.type
              FROM dependencies d
              LEFT JOIN issues i ON d.depends_on_id = i.id
@@ -2272,7 +2276,7 @@ impl SqliteStorage {
         &self,
         issue_id: &str,
     ) -> Result<Vec<IssueWithDependencyMetadata>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT d.issue_id, i.title, i.status, i.priority, d.type
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
@@ -2324,7 +2328,7 @@ impl SqliteStorage {
     pub fn get_dependents(&self, issue_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT issue_id FROM dependencies WHERE depends_on_id = ?")?;
+            .prepare_cached("SELECT issue_id FROM dependencies WHERE depends_on_id = ?")?;
         let ids = stmt
             .query_map([issue_id], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2339,7 +2343,7 @@ impl SqliteStorage {
     pub fn get_dependencies(&self, issue_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT depends_on_id FROM dependencies WHERE issue_id = ?")?;
+            .prepare_cached("SELECT depends_on_id FROM dependencies WHERE issue_id = ?")?;
         let ids = stmt
             .query_map([issue_id], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2389,7 +2393,7 @@ impl SqliteStorage {
     pub fn next_child_number(&self, parent_id: &str) -> Result<u32> {
         // Find all existing child IDs matching the pattern {parent_id}.N
         let pattern = format!("{parent_id}.%");
-        let mut stmt = self.conn.prepare("SELECT id FROM issues WHERE id LIKE ?")?;
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?")?;
         let ids: Vec<String> = stmt
             .query_map([&pattern], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2516,7 +2520,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_config(&self) -> Result<HashMap<String, String>> {
-        let mut stmt = self.conn.prepare("SELECT key, value FROM config")?;
+        let mut stmt = self.conn.prepare_cached("SELECT key, value FROM config")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
 
         let mut map = HashMap::new();
@@ -2580,7 +2584,7 @@ impl SqliteStorage {
                       AND id NOT LIKE '%-wisp-%'
                     ORDER BY id ASC";
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let issues = stmt
             .query_map([], |row| self.issue_from_row(row))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2601,7 +2605,7 @@ impl SqliteStorage {
     ) -> Result<HashMap<String, Vec<crate::model::Dependency>>> {
         use crate::model::{Dependency, DependencyType};
 
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
              FROM dependencies
              ORDER BY issue_id, depends_on_id",
@@ -2642,7 +2646,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_all_comments(&self) -> Result<HashMap<String, Vec<Comment>>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT id, issue_id, author, text, created_at
              FROM comments
              ORDER BY issue_id, created_at ASC",
@@ -2668,6 +2672,18 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Get the count of dirty issues (issues modified since last export).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_dirty_issue_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(1) FROM dirty_issues", [], |row| row.get(0))?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// Get IDs of all dirty issues (issues modified since last export).
     ///
     /// # Errors
@@ -2676,7 +2692,7 @@ impl SqliteStorage {
     pub fn get_dirty_issue_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT issue_id FROM dirty_issues ORDER BY marked_at")?;
+            .prepare_cached("SELECT issue_id FROM dirty_issues ORDER BY marked_at")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2770,7 +2786,7 @@ impl SqliteStorage {
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
         )?;
         let mut count = 0;
@@ -3243,7 +3259,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_dependencies_full(&self, issue_id: &str) -> Result<Vec<crate::model::Dependency>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
              FROM dependencies
              WHERE issue_id = ?
@@ -3364,7 +3380,7 @@ impl SqliteStorage {
         let mut graph: HashMap<String, Vec<String>> = HashMap::new();
         let mut stmt = self
             .conn
-            .prepare("SELECT issue_id, depends_on_id FROM dependencies")?;
+            .prepare_cached("SELECT issue_id, depends_on_id FROM dependencies")?;
 
         let edges = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

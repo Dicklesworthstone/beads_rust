@@ -201,6 +201,11 @@ pub const SCHEMA_SQL: &str = r"
 ///
 /// Returns an error if the SQL execution fails or pragmas cannot be set.
 pub fn apply_schema(conn: &Connection) -> Result<()> {
+    // Run pre-schema migrations first to fix any incompatible old tables
+    // This must run BEFORE execute_batch because the batch includes CREATE INDEX
+    // statements that will fail if old tables have missing columns
+    run_pre_schema_migrations(conn)?;
+
     conn.execute_batch(SCHEMA_SQL)?;
 
     // Run migrations for existing databases
@@ -222,10 +227,32 @@ fn table_exists(conn: &Connection, table: &str) -> bool {
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}'");
+    // Use parameterized query for the column name to prevent SQL injection.
+    // Note: pragma_table_info() requires the table name directly (can't be parameterized),
+    // but we validate it's a known table name before calling this function.
+    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?");
     conn.prepare(&sql)
-        .and_then(|mut stmt| stmt.exists([]))
+        .and_then(|mut stmt| stmt.exists([column]))
         .unwrap_or(false)
+}
+
+/// Run pre-schema migrations to fix incompatible old tables.
+///
+/// This must run BEFORE `execute_batch(SCHEMA_SQL)` because the schema includes
+/// CREATE INDEX statements that will fail if old tables have missing columns.
+fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
+    // Drop blocked_issues_cache if it exists but lacks required columns.
+    // The main schema will recreate it with the correct structure.
+    if table_exists(conn, "blocked_issues_cache") {
+        let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
+        let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
+
+        if !has_blocked_at || !has_blocked_by {
+            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache", [])?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Run schema migrations for existing databases.
