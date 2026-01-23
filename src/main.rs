@@ -354,6 +354,7 @@ mod tests {
             due: None,
             defer: None,
             external_ref: None,
+            status: None,
             ephemeral: false,
             dry_run: false,
             silent: false,

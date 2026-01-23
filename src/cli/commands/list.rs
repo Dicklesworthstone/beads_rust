@@ -90,7 +90,7 @@ pub fn execute(
         OutputFormat::Json => {
             // Fetch relations for all issues
             let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-            let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+            let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
 
             // Use batch counting
             let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
@@ -100,8 +100,8 @@ pub fn execute(
             let issues_with_counts: Vec<IssueWithCounts> = issues
                 .into_iter()
                 .map(|mut issue| {
-                    if let Some(labels) = labels_map.get(&issue.id) {
-                        issue.labels = labels.clone();
+                    if let Some(labels) = labels_map.remove(&issue.id) {
+                        issue.labels = labels;
                     }
 
                     let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);

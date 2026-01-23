@@ -305,11 +305,16 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
             return Err(BeadsError::validation("deps", "cannot depend on itself"));
         }
 
+        // Accept "blocked-by" as alias for "blocks" (consistent with import path)
+        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
+            "blocks"
+        } else {
+            type_str
+        };
+
         // Strict dependency type validation
-        let dep_type: DependencyType = type_str.parse().map_err(|_| BeadsError::Validation {
-            field: "deps".to_string(),
-            reason: format!("Invalid dependency type: {type_str}"),
-        })?;
+        // Note: DependencyType::from_str always returns Ok, so map_err is for clarity
+        let dep_type: DependencyType = normalized_type.parse().expect("from_str is infallible");
 
         // Disallow accidental custom types from typos
         if let DependencyType::Custom(_) = dep_type {
@@ -317,7 +322,7 @@ fn validate_relations(args: &CreateArgs, id: &str) -> Result<()> {
                 field: "deps".to_string(),
                 reason: format!(
                     "Unknown dependency type: '{type_str}'. \
-                     Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
+                     Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
                      related, discovered-from, replies-to, relates-to, duplicates, \
                      supersedes, caused-by"
                 ),
@@ -358,9 +363,15 @@ fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: Da
             ("blocks", dep_str.as_str())
         };
 
-        let dep_type = type_str
-            .parse()
-            .unwrap_or_else(|_| DependencyType::Custom(type_str.to_owned()));
+        // Normalize "blocked-by" to "blocks" (consistent with validation and import)
+        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
+            "blocks"
+        } else {
+            type_str
+        };
+
+        // from_str is infallible - Custom types are rejected by validate_relations above
+        let dep_type: DependencyType = normalized_type.parse().expect("validated above");
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: dep_id.to_string(),

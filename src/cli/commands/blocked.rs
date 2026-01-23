@@ -197,9 +197,14 @@ fn filter_by_labels(
     labels: &[String],
 ) -> Result<()> {
     let mut filtered = Vec::with_capacity(issues.len());
+    let issue_ids: Vec<String> = issues.iter().map(|bi| bi.issue.id.clone()).collect();
+    let labels_map = storage.get_labels_for_issues(&issue_ids)?;
+
     for issue in issues.drain(..) {
-        let issue_labels = storage.get_labels(&issue.issue.id)?;
-        if labels.iter().all(|l| issue_labels.contains(l)) {
+        let matches = labels_map
+            .get(&issue.issue.id)
+            .is_some_and(|issue_labels| labels.iter().all(|l| issue_labels.contains(l)));
+        if matches {
             filtered.push(issue);
         }
     }

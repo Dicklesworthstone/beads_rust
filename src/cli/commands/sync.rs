@@ -268,8 +268,7 @@ fn execute_status(
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let dirty_ids = storage.get_dirty_issue_ids()?;
-    let dirty_count = dirty_ids.len();
+    let dirty_count = storage.get_dirty_issue_count()?;
 
     let last_export_time = storage.get_metadata(METADATA_LAST_EXPORT_TIME)?;
     let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;

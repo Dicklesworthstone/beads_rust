@@ -66,10 +66,16 @@ pub fn execute(
         issues
     };
 
-    // Batch count dependencies/dependents
+    // Batch count dependencies/dependents (JSON output only).
     let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-    let dep_counts = storage.count_dependencies_for_issues(&issue_ids)?;
-    let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
+    let (dep_counts, dependent_counts) = if outer_ctx.is_json() {
+        (
+            storage.count_dependencies_for_issues(&issue_ids)?,
+            storage.count_dependents_for_issues(&issue_ids)?,
+        )
+    } else {
+        (HashMap::new(), HashMap::new())
+    };
 
     let mut issues_with_counts: Vec<IssueWithCounts> = issues
         .into_iter()
@@ -411,12 +417,7 @@ fn apply_sort(issues: &mut [IssueWithCounts], sort: Option<&str>) -> Result<()> 
         "priority" => issues.sort_by_key(|iwc| iwc.issue.priority),
         "created_at" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.created_at)),
         "updated_at" => issues.sort_by_key(|iwc| std::cmp::Reverse(iwc.issue.updated_at)),
-        "title" => issues.sort_by(|a, b| {
-            a.issue
-                .title
-                .to_lowercase()
-                .cmp(&b.issue.title.to_lowercase())
-        }),
+        "title" => issues.sort_by_cached_key(|iwc| iwc.issue.title.to_lowercase()),
         _ => {
             return Err(BeadsError::Validation {
                 field: "sort".to_string(),

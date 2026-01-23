@@ -303,18 +303,27 @@ fn compute_label_breakdown(
     issues: &[crate::model::Issue],
 ) -> Result<Breakdown> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let issue_ids: Vec<String> = issues
+        .iter()
+        .filter(|issue| issue.status != Status::Tombstone)
+        .map(|issue| issue.id.clone())
+        .collect();
+    let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
 
     for issue in issues {
         if issue.status == Status::Tombstone {
             continue;
         }
-        let labels = storage.get_labels(&issue.id)?;
-        if labels.is_empty() {
-            *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
-        } else {
-            for label in labels {
-                *counts.entry(label).or_insert(0) += 1;
+        if let Some(labels) = labels_map.remove(&issue.id) {
+            if labels.is_empty() {
+                *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
+            } else {
+                for label in labels {
+                    *counts.entry(label).or_insert(0) += 1;
+                }
             }
+        } else {
+            *counts.entry("(no labels)".to_string()).or_insert(0) += 1;
         }
     }
 
