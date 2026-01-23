@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 rust-version = "1.85"
 description = "Agent-first issue tracker (SQLite + JSONL)"
