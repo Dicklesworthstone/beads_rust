@@ -787,6 +787,18 @@ mod tests {
     }
 
     #[test]
+    fn test_rejected_git_path_component() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let path = beads_dir.join(".git").join("config");
+
+        let result = validate_sync_path(&path, &beads_dir);
+        assert!(
+            matches!(result, PathValidation::GitPathAttempt { .. }),
+            ".git paths should be rejected"
+        );
+    }
+
+    #[test]
     fn test_new_file_in_beads_dir() {
         let (_temp, beads_dir) = setup_test_beads_dir();
         // File doesn't exist yet but is in beads_dir with allowed extension

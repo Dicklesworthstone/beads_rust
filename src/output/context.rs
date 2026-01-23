@@ -2,7 +2,7 @@ use super::Theme;
 use crate::cli::Cli;
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
 
 /// Central output coordinator that respects robot/json/quiet modes.
@@ -151,24 +151,42 @@ impl OutputContext {
 
     /// # Panics
     ///
-    /// Panics if serialization fails.
+    /// Panics if serialization fails (e.g., non-string map keys, recursive structures).
     pub fn json<T: serde::Serialize>(&self, value: &T) {
         if self.is_json() {
-            // Direct println - no console/theme initialization needed
-            println!("{}", serde_json::to_string(value).unwrap());
+            // Stream to stdout to avoid allocating large JSON strings.
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::new(stdout.lock());
+            if let Err(err) = serde_json::to_writer(&mut out, value) {
+                assert!(
+                    err.is_io(),
+                    "JSON serialization failed - value is not serializable"
+                );
+            }
+            let _ = out.write_all(b"\n");
         }
     }
 
     /// # Panics
     ///
-    /// Panics if serialization fails.
+    /// Panics if serialization fails (e.g., non-string map keys, recursive structures).
     pub fn json_pretty<T: serde::Serialize>(&self, value: &T) {
         if self.is_rich() {
-            let json = rich_rust::renderables::Json::new(serde_json::to_value(value).unwrap());
+            let json = rich_rust::renderables::Json::new(
+                serde_json::to_value(value).expect("JSON conversion failed - value is not serializable"),
+            );
             self.console().print_renderable(&json);
         } else if self.is_json() {
-            // Direct println - no console/theme initialization needed
-            println!("{}", serde_json::to_string_pretty(value).unwrap());
+            // Stream to stdout to avoid allocating large JSON strings.
+            let stdout = io::stdout();
+            let mut out = io::BufWriter::new(stdout.lock());
+            if let Err(err) = serde_json::to_writer_pretty(&mut out, value) {
+                assert!(
+                    err.is_io(),
+                    "JSON serialization failed - value is not serializable"
+                );
+            }
+            let _ = out.write_all(b"\n");
         }
     }
 

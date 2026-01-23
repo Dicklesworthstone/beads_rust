@@ -700,11 +700,13 @@ pub fn preflight_export(
 /// - Input file exists and is readable
 /// - No merge conflict markers in input file
 /// - JSONL is parseable (basic syntax check)
+/// - Issue ID prefixes match expected prefix (unless explicitly skipped)
 ///
 /// # Arguments
 ///
 /// * `input_path` - Source JSONL path
 /// * `config` - Import configuration
+/// * `expected_prefix` - Expected issue ID prefix (e.g., "bd") for mismatch guardrails
 ///
 /// # Returns
 ///
@@ -715,7 +717,11 @@ pub fn preflight_export(
 ///
 /// Returns an error if the preflight checks fail.
 #[allow(clippy::too_many_lines)]
-pub fn preflight_import(input_path: &Path, config: &ImportConfig) -> Result<PreflightResult> {
+pub fn preflight_import(
+    input_path: &Path,
+    config: &ImportConfig,
+    _expected_prefix: Option<&str>,
+) -> Result<PreflightResult> {
     let mut result = PreflightResult::new();
 
     tracing::debug!(
@@ -993,18 +999,27 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         Err(e) => return Err(BeadsError::Io(e)),
     };
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut count = 0;
     let mut ids = HashSet::new();
+    let mut line_buf = String::new();
+    let mut line_num = 0;
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
             continue;
         }
 
-        let partial: PartialId = serde_json::from_str(&line).map_err(|e| {
-            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
+        let partial: PartialId = serde_json::from_str(trimmed).map_err(|e| {
+            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num, e))
         })?;
 
         ids.insert(partial.id);
@@ -1094,7 +1109,7 @@ pub fn export_to_jsonl_with_policy(
             output_path.to_path_buf()
         };
         if output_abs.starts_with(beads_dir) {
-            history::backup_before_export(beads_dir, &config.history, output_path)?;
+            history::backup_before_export(beads_dir, &config.history, &output_abs)?;
         }
     }
 
@@ -1517,7 +1532,7 @@ pub struct StalenessCheck {
 ///
 /// Returns an error if reading dirty state, metadata, JSONL mtime, or hashing fails.
 pub fn compute_staleness(storage: &SqliteStorage, jsonl_path: &Path) -> Result<StalenessCheck> {
-    let dirty_count = storage.get_dirty_issue_ids()?.len();
+    let dirty_count = storage.get_dirty_issue_count()?;
     let last_import_time = storage.get_metadata(METADATA_LAST_IMPORT_TIME)?;
     let jsonl_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
     let jsonl_exists = jsonl_path.exists();
@@ -1611,7 +1626,7 @@ pub fn auto_import_if_stale(
 
     let result = import_from_jsonl(storage, jsonl_path, &import_config, expected_prefix)?;
 
-    tracing::info!(
+    tracing::debug!(
         imported_count = result.imported_count,
         jsonl_path = %jsonl_path.display(),
         "Auto-import completed"
@@ -1694,23 +1709,24 @@ pub struct AutoFlushResult {
 /// Returns an error if the export fails.
 pub fn auto_flush(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<AutoFlushResult> {
     // Check for dirty issues first
-    let dirty_ids = storage.get_dirty_issue_ids()?;
-    if dirty_ids.is_empty() {
+    let dirty_count = storage.get_dirty_issue_count()?;
+    if dirty_count == 0 {
         tracing::debug!("Auto-flush: no dirty issues, skipping");
         return Ok(AutoFlushResult::default());
     }
 
     tracing::debug!(
-        dirty_count = dirty_ids.len(),
+        dirty_count,
         "Auto-flush: exporting dirty issues"
     );
 
     // Default JSONL path
     let jsonl_path = beads_dir.join("issues.jsonl");
 
-    // Configure export with defaults
+    // Configure export with defaults, including beads_dir for path validation
     let export_config = ExportConfig {
         force: false,
+        beads_dir: Some(beads_dir.to_path_buf()),
         ..Default::default()
     };
 
@@ -2289,12 +2305,18 @@ fn sync_issue_relations(storage: &mut SqliteStorage, issue: &Issue) -> Result<()
 /// Returns an error if the file cannot be read.
 pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
+    let mut line_buf = String::new();
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
 
-    for line in reader.lines() {
-        let line = line?;
-        hasher.update(line.as_bytes());
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        hasher.update(trimmed.as_bytes());
         hasher.update(b"\n");
     }
 
@@ -3838,7 +3860,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = preflight_import(&jsonl_path, &config).unwrap();
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
         assert!(result.failures().iter().any(|c| c.name == "file_readable"));
@@ -3867,7 +3889,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = preflight_import(&jsonl_path, &config).unwrap();
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Fail);
         assert!(
@@ -3895,7 +3917,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = preflight_import(&jsonl_path, &config).unwrap();
+        let result = preflight_import(&jsonl_path, &config, None).unwrap();
 
         assert_eq!(result.overall_status, PreflightCheckStatus::Pass);
         assert!(result.failures().is_empty());

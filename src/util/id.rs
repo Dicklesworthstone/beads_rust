@@ -266,11 +266,15 @@ fn issue_id_separator(id: &str) -> Option<usize> {
     let suffix = &id[last_dash + 1..];
     let base = suffix.split('.').next().unwrap_or("");
 
+    // If the suffix looks like a valid hash/number, return this position.
+    // Otherwise, still return the last dash as a fallback to handle edge cases
+    // where the hash doesn't contain digits (e.g., "my-proj-abcd").
     if is_numeric_segment(base) || is_likely_hash_segment(base) {
         return Some(last_dash);
     }
 
-    id.rfind('-')
+    // Fallback: return last dash position for edge cases like word-like hashes
+    Some(last_dash)
 }
 
 pub(crate) fn split_prefix_remainder(id: &str) -> Option<(&str, &str)> {
