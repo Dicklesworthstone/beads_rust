@@ -504,6 +504,7 @@ pub fn normalize_json(json: &Value) -> Value {
                     "id" | "issue_id" | "depends_on_id" | "blocks_id" => {
                         Value::String("ISSUE_ID".to_string())
                     }
+                    "root" => Value::String("ISSUE_ID".to_string()),
                     "created_at" | "updated_at" | "closed_at" | "due_at" | "defer_until"
                     | "deleted_at" | "marked_at" | "exported_at" => {
                         Value::String("TIMESTAMP".to_string())
@@ -537,6 +538,49 @@ pub fn normalize_json(json: &Value) -> Value {
                                         } else {
                                             normalize_json(v)
                                         }
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            normalize_json(value)
+                        }
+                    }
+                    "roots" => {
+                        if let Value::Array(items) = value {
+                            Value::Array(
+                                items
+                                    .iter()
+                                    .map(|v| {
+                                        if matches!(v, Value::String(_)) {
+                                            Value::String("ISSUE_ID".to_string())
+                                        } else {
+                                            normalize_json(v)
+                                        }
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            normalize_json(value)
+                        }
+                    }
+                    "edges" => {
+                        if let Value::Array(items) = value {
+                            Value::Array(
+                                items
+                                    .iter()
+                                    .map(|edge| match edge {
+                                        Value::Array(pair) => Value::Array(
+                                            pair.iter()
+                                                .map(|v| {
+                                                    if matches!(v, Value::String(_)) {
+                                                        Value::String("ISSUE_ID".to_string())
+                                                    } else {
+                                                        normalize_json(v)
+                                                    }
+                                                })
+                                                .collect(),
+                                        ),
+                                        _ => normalize_json(edge),
                                     })
                                     .collect(),
                             )

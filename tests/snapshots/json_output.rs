@@ -211,3 +211,206 @@ fn snapshot_dep_list_json() {
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
     assert_json_snapshot!("dep_list_json_output", normalize_json(&json));
 }
+
+#[test]
+fn snapshot_search_json() {
+    let workspace = init_workspace();
+    create_issue(&workspace, "Search target", "create_search_target");
+    create_issue(&workspace, "Other issue", "create_search_other");
+
+    let output = run_br(&workspace, ["search", "target", "--json"], "search_json");
+    assert!(
+        output.status.success(),
+        "search json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    assert_json_snapshot!("search_json_output", normalize_json(&json));
+}
+
+#[test]
+fn snapshot_count_json() {
+    let workspace = init_workspace();
+    create_issue(&workspace, "Count one", "create_count_one");
+    create_issue(&workspace, "Count two", "create_count_two");
+
+    let output = run_br(&workspace, ["count", "--json"], "count_json");
+    assert!(
+        output.status.success(),
+        "count json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    assert_json_snapshot!("count_json_output", normalize_json(&json));
+}
+
+#[test]
+fn snapshot_count_grouped_json() {
+    let workspace = init_workspace();
+    let id = create_issue(&workspace, "Grouped one", "create_grouped_one");
+    let _ = run_br(
+        &workspace,
+        ["update", &id, "--status", "in_progress"],
+        "update_grouped_one",
+    );
+    create_issue(&workspace, "Grouped two", "create_grouped_two");
+
+    let output = run_br(
+        &workspace,
+        ["count", "--by", "status", "--json"],
+        "count_grouped_json",
+    );
+    assert!(
+        output.status.success(),
+        "count grouped json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    assert_json_snapshot!("count_grouped_json_output", normalize_json(&json));
+}
+
+#[test]
+fn snapshot_stale_json() {
+    let workspace = init_workspace();
+    create_issue(&workspace, "Stale issue", "create_stale");
+
+    let output = run_br(
+        &workspace,
+        ["stale", "--days", "0", "--json"],
+        "stale_json",
+    );
+    assert!(
+        output.status.success(),
+        "stale json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    assert_json_snapshot!("stale_json_output", normalize_json(&json));
+}
+
+#[test]
+fn snapshot_comments_json() {
+    let workspace = init_workspace();
+    let id = create_issue(&workspace, "Commented issue", "create_commented");
+
+    let add = run_br(
+        &workspace,
+        ["comments", "add", &id, "First comment", "--json"],
+        "comments_add_json",
+    );
+    assert!(
+        add.status.success(),
+        "comments add json failed: {}",
+        add.stderr
+    );
+
+    let add_json: Value = serde_json::from_str(&add.stdout).expect("parse json");
+    assert_json_snapshot!("comments_add_json_output", normalize_json(&add_json));
+
+    let list = run_br(
+        &workspace,
+        ["comments", "list", &id, "--json"],
+        "comments_list_json",
+    );
+    assert!(
+        list.status.success(),
+        "comments list json failed: {}",
+        list.stderr
+    );
+
+    let list_json: Value = serde_json::from_str(&list.stdout).expect("parse json");
+    assert_json_snapshot!("comments_list_json_output", normalize_json(&list_json));
+}
+
+#[test]
+fn snapshot_label_json() {
+    let workspace = init_workspace();
+    let id = create_issue(&workspace, "Labeled issue", "create_labeled");
+
+    let add = run_br(
+        &workspace,
+        ["label", "add", &id, "backend", "--json"],
+        "label_add_json",
+    );
+    assert!(
+        add.status.success(),
+        "label add json failed: {}",
+        add.stderr
+    );
+
+    let add_json: Value = serde_json::from_str(&add.stdout).expect("parse json");
+    assert_json_snapshot!("label_add_json_output", normalize_json(&add_json));
+
+    let list = run_br(
+        &workspace,
+        ["label", "list", &id, "--json"],
+        "label_list_json",
+    );
+    assert!(
+        list.status.success(),
+        "label list json failed: {}",
+        list.stderr
+    );
+
+    let list_json: Value = serde_json::from_str(&list.stdout).expect("parse json");
+    assert_json_snapshot!("label_list_json_output", normalize_json(&list_json));
+
+    let list_all = run_br(
+        &workspace,
+        ["label", "list-all", "--json"],
+        "label_list_all_json",
+    );
+    assert!(
+        list_all.status.success(),
+        "label list-all json failed: {}",
+        list_all.stderr
+    );
+
+    let list_all_json: Value = serde_json::from_str(&list_all.stdout).expect("parse json");
+    assert_json_snapshot!(
+        "label_list_all_json_output",
+        normalize_json(&list_all_json)
+    );
+}
+
+#[test]
+fn snapshot_orphans_json() {
+    let workspace = init_workspace();
+
+    let output = run_br(&workspace, ["orphans", "--json"], "orphans_json");
+    assert!(
+        output.status.success(),
+        "orphans json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    assert_json_snapshot!("orphans_json_output", normalize_json(&json));
+}
+
+#[test]
+fn snapshot_graph_json() {
+    let workspace = init_workspace();
+    let root = create_issue(&workspace, "Graph root", "create_graph_root");
+    let child = create_issue(&workspace, "Graph child", "create_graph_child");
+
+    let _ = run_br(
+        &workspace,
+        ["dep", "add", &child, &root],
+        "graph_dep_add_json",
+    );
+
+    let output = run_br(&workspace, ["graph", &root, "--json"], "graph_json");
+    assert!(
+        output.status.success(),
+        "graph json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    assert_json_snapshot!("graph_json_output", normalize_json(&json));
+}
