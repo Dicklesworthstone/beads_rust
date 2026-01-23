@@ -356,6 +356,10 @@ mod tests {
         // In default build, self_update should be enabled
         #[cfg(feature = "self_update")]
         assert!(features.contains(&"self_update"));
+
+        // Without the feature, the list should be empty
+        #[cfg(not(feature = "self_update"))]
+        assert!(features.is_empty());
     }
 
     #[test]
