@@ -3,7 +3,7 @@
 //! Primary discovery interface with classic filter semantics and
 //! `IssueWithCounts` JSON output. Supports text, JSON, and CSV formats.
 
-use crate::cli::{ListArgs, OutputFormat};
+use crate::cli::{ListArgs, OutputFormat, resolve_output_format};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
@@ -70,24 +70,16 @@ pub fn execute(
     }
 
     // Determine output format: --json flag overrides --format
-    let output_format = if outer_ctx.is_json() {
-        OutputFormat::Json
-    } else {
-        args.format
-    };
+    let output_format = resolve_output_format(args.format, outer_ctx.is_json(), false);
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(
-        matches!(output_format, OutputFormat::Json),
-        quiet,
-        !use_color,
-    );
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
 
     // Output
     match output_format {
-        OutputFormat::Json => {
+        OutputFormat::Json | OutputFormat::Toon => {
             // Fetch relations for all issues
             let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
             let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
@@ -96,7 +88,7 @@ pub fn execute(
             let dependency_counts = storage.count_dependencies_for_issues(&issue_ids)?;
             let dependent_counts = storage.count_dependents_for_issues(&issue_ids)?;
 
-            // Convert to IssueWithCounts only for JSON
+            // Convert to IssueWithCounts
             let issues_with_counts: Vec<IssueWithCounts> = issues
                 .into_iter()
                 .map(|mut issue| {
@@ -114,7 +106,12 @@ pub fn execute(
                     }
                 })
                 .collect();
-            ctx.json_pretty(&issues_with_counts);
+
+            if matches!(output_format, OutputFormat::Toon) {
+                ctx.toon_with_stats(&issues_with_counts, args.stats);
+            } else {
+                ctx.json_pretty(&issues_with_counts);
+            }
         }
         OutputFormat::Csv => {
             let fields = csv::parse_fields(args.fields.as_deref());
@@ -206,8 +203,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
 
+    // Deferred issues are included by default (consistent with "open" status semantics).
+    // They are only excluded when explicitly filtering by status that doesn't include deferred.
     let include_deferred = args.deferred
         || args.all
+        || statuses.is_none()
         || statuses
             .as_ref()
             .is_some_and(|parsed| parsed.contains(&Status::Deferred));
@@ -279,7 +279,9 @@ fn apply_client_filters(
     let max_priority = args.priority_max.map(i32::from);
     let desc_needle = args.desc_contains.as_deref().map(str::to_lowercase);
     let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
+    // Deferred issues are included by default when no status filter is specified
     let include_deferred = args.deferred
+        || args.status.is_empty()
         || args
             .status
             .iter()

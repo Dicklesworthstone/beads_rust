@@ -3,7 +3,7 @@
 //! Shows project statistics including issue counts by status, type, priority,
 //! assignee, and label. Also supports recent activity tracking via git.
 
-use crate::cli::StatsArgs;
+use crate::cli::{OutputFormat, StatsArgs, resolve_output_format_basic};
 use crate::config;
 use crate::error::Result;
 use crate::format::{
@@ -29,11 +29,16 @@ pub fn execute(
     args: &StatsArgs,
     _json: bool,
     cli: &config::CliOverrides,
-    ctx: &OutputContext,
+    outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
+    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
+    let quiet = cli.quiet.unwrap_or(false);
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     info!("Computing project statistics");
 
@@ -84,12 +89,27 @@ pub fn execute(
     if args.robot {
         // Robot mode: key=value format for script consumption
         print_robot_output(&output);
-    } else if ctx.is_json() {
-        ctx.json_pretty(&output);
-    } else if matches!(ctx.mode(), OutputMode::Rich) {
-        render_stats_rich(&output, ctx);
-    } else {
-        print_text_output(&output);
+        return Ok(());
+    }
+
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
+    match output_format {
+        OutputFormat::Json => {
+            ctx.json_pretty(&output);
+        }
+        OutputFormat::Toon => {
+            ctx.toon_with_stats(&output, args.stats);
+        }
+        OutputFormat::Text | OutputFormat::Csv => {
+            if matches!(ctx.mode(), OutputMode::Rich) {
+                render_stats_rich(&output, &ctx);
+            } else {
+                print_text_output(&output);
+            }
+        }
     }
 
     Ok(())

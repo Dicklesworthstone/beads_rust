@@ -2,7 +2,7 @@
 //!
 //! Shows issues ready to work on: unblocked, not deferred, not pinned, not ephemeral.
 
-use crate::cli::{ReadyArgs, SortPolicy};
+use crate::cli::{OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic};
 use crate::config;
 use crate::error::Result;
 use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_title};
@@ -38,8 +38,9 @@ pub fn execute(
     } else {
         None
     };
+    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(outer_ctx.is_json() || args.robot, quiet, !use_color);
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     let filters = ReadyFilters {
         assignee: args.assignee.clone(),
@@ -86,41 +87,49 @@ pub fn execute(
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
-    if ctx.is_json() {
-        // Use ReadyIssue for bd parity (excludes compaction_level, original_size, dependency_count, dependent_count)
-        let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
-        ctx.json_pretty(&ready_output);
-    } else if ready_issues.is_empty() {
-        // Match bd empty output format
-        println!("✨ No open issues");
-    } else if matches!(ctx.mode(), OutputMode::Rich) {
-        let columns = IssueTableColumns {
-            id: true,
-            priority: true,
-            status: true,
-            issue_type: true,
-            title: true,
-            ..Default::default()
-        };
-        let table = IssueTable::new(&ready_issues, ctx.theme())
-            .columns(columns)
-            .title(format!(
-                "Ready work ({} issue{} with no blockers)",
-                ready_issues.len(),
-                if ready_issues.len() == 1 { "" } else { "s" }
-            ))
-            .build();
-        ctx.render(&table);
-    } else {
-        // Match bd header format: 📋 Ready work (N issues with no blockers):
-        println!(
-            "📋 Ready work ({} issue{} with no blockers):\n",
-            ready_issues.len(),
-            if ready_issues.len() == 1 { "" } else { "s" }
-        );
-        for (i, issue) in ready_issues.iter().enumerate() {
-            let line = format_ready_line(i + 1, issue, use_color, max_width);
-            println!("{line}");
+    match output_format {
+        OutputFormat::Json => {
+            let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
+            ctx.json_pretty(&ready_output);
+        }
+        OutputFormat::Toon => {
+            let ready_output: Vec<ReadyIssue> = ready_issues.iter().map(ReadyIssue::from).collect();
+            ctx.toon_with_stats(&ready_output, args.stats);
+        }
+        OutputFormat::Text | OutputFormat::Csv => {
+            if ready_issues.is_empty() {
+                // Match bd empty output format
+                println!("✨ No open issues");
+            } else if matches!(ctx.mode(), OutputMode::Rich) {
+                let columns = IssueTableColumns {
+                    id: true,
+                    priority: true,
+                    status: true,
+                    issue_type: true,
+                    title: true,
+                    ..Default::default()
+                };
+                let table = IssueTable::new(&ready_issues, ctx.theme())
+                    .columns(columns)
+                    .title(format!(
+                        "Ready work ({} issue{} with no blockers)",
+                        ready_issues.len(),
+                        if ready_issues.len() == 1 { "" } else { "s" }
+                    ))
+                    .build();
+                ctx.render(&table);
+            } else {
+                // Match bd header format: 📋 Ready work (N issues with no blockers):
+                println!(
+                    "📋 Ready work ({} issue{} with no blockers):\n",
+                    ready_issues.len(),
+                    if ready_issues.len() == 1 { "" } else { "s" }
+                );
+                for (i, issue) in ready_issues.iter().enumerate() {
+                    let line = format_ready_line(i + 1, issue, use_color, max_width);
+                    println!("{line}");
+                }
+            }
         }
     }
 

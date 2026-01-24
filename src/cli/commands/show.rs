@@ -1,5 +1,6 @@
 //! Show command implementation.
 
+use crate::cli::{ShowArgs, resolve_output_format_basic};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{format_priority_label, format_status_icon_colored};
@@ -13,7 +14,7 @@ use std::fmt::Write as FmtWrite;
 ///
 /// Returns an error if the database cannot be opened or issues are not found.
 pub fn execute(
-    ids: Vec<String>,
+    args: &ShowArgs,
     _json: bool,
     cli: &config::CliOverrides,
     outer_ctx: &OutputContext,
@@ -22,7 +23,7 @@ pub fn execute(
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let storage = &storage_ctx.storage;
 
-    let mut target_ids = ids;
+    let mut target_ids = args.ids.clone();
     if target_ids.is_empty() {
         let last_touched = crate::util::get_last_touched_id(&beads_dir);
         if last_touched.is_empty() {
@@ -38,8 +39,9 @@ pub fn execute(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let use_color = config::should_use_color(&config_layer);
+    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), false);
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(outer_ctx.is_json(), quiet, !use_color);
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     let mut details_list = Vec::new();
     for id_input in target_ids {
@@ -60,19 +62,24 @@ pub fn execute(
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
     }
-    if ctx.is_json() {
-        // Output full details as JSON
-        ctx.json_pretty(&details_list);
-    } else {
-        for (i, details) in details_list.iter().enumerate() {
-            if i > 0 {
-                println!(); // Separate multiple issues
-            }
-            if matches!(ctx.mode(), OutputMode::Rich) {
-                let panel = IssuePanel::from_details(details, ctx.theme());
-                panel.print(&ctx);
-            } else {
-                print_issue_details(details, use_color);
+    match output_format {
+        crate::cli::OutputFormat::Json => {
+            ctx.json_pretty(&details_list);
+        }
+        crate::cli::OutputFormat::Toon => {
+            ctx.toon_with_stats(&details_list, args.stats);
+        }
+        crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => {
+            for (i, details) in details_list.iter().enumerate() {
+                if i > 0 {
+                    println!(); // Separate multiple issues
+                }
+                if matches!(ctx.mode(), OutputMode::Rich) {
+                    let panel = IssuePanel::from_details(details, ctx.theme());
+                    panel.print(&ctx);
+                } else {
+                    print_issue_details(details, use_color);
+                }
             }
         }
     }

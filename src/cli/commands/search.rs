@@ -2,10 +2,12 @@
 //!
 //! Classic bd-style LIKE search across title/description/id with list-like filters.
 
-use crate::cli::{ListArgs, SearchArgs};
+use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
+use crate::format::{
+    IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
+};
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -66,9 +68,12 @@ pub fn execute(
         issues
     };
 
-    // Batch count dependencies/dependents (JSON output only).
+    let output_format = resolve_output_format(args.filters.format, outer_ctx.is_json(), false);
+    let needs_counts = matches!(output_format, OutputFormat::Json | OutputFormat::Toon);
+
+    // Batch count dependencies/dependents (JSON/TOON output only).
     let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-    let (dep_counts, dependent_counts) = if outer_ctx.is_json() {
+    let (dep_counts, dependent_counts) = if needs_counts {
         (
             storage.count_dependencies_for_issues(&issue_ids)?,
             storage.count_dependents_for_issues(&issue_ids)?,
@@ -101,11 +106,32 @@ pub fn execute(
     }
 
     let quiet = cli.quiet.unwrap_or(false);
-    let ctx = OutputContext::from_flags(outer_ctx.is_json(), quiet, !use_color);
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
-    if ctx.is_json() {
-        ctx.json_pretty(&issues_with_counts);
+    if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
+    }
+
+    match output_format {
+        OutputFormat::Json => {
+            ctx.json_pretty(&issues_with_counts);
+            return Ok(());
+        }
+        OutputFormat::Toon => {
+            ctx.toon_with_stats(&issues_with_counts, args.filters.stats);
+            return Ok(());
+        }
+        OutputFormat::Csv => {
+            let issues: Vec<_> = issues_with_counts
+                .iter()
+                .map(|iwc| iwc.issue.clone())
+                .collect();
+            let fields = csv::parse_fields(args.filters.fields.as_deref());
+            let csv_output = csv::format_csv(&issues, &fields);
+            print!("{csv_output}");
+            return Ok(());
+        }
+        OutputFormat::Text => {}
     }
 
     if matches!(ctx.mode(), OutputMode::Rich) {
@@ -266,6 +292,14 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
 
+    // Deferred issues are included by default (consistent with "open" status semantics).
+    let include_deferred = args.deferred
+        || args.all
+        || statuses.is_none()
+        || statuses
+            .as_ref()
+            .is_some_and(|parsed| parsed.contains(&Status::Deferred));
+
     Ok(ListFilters {
         statuses,
         types,
@@ -273,7 +307,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
         include_closed,
-        include_deferred: args.deferred,
+        include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
         limit: args.limit,
@@ -329,7 +363,9 @@ fn apply_client_filters(
     let max_priority = args.priority_max.map(i32::from);
     let desc_needle = args.desc_contains.as_deref().map(str::to_lowercase);
     let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
+    // Deferred issues are included by default when no status filter is specified
     let include_deferred = args.deferred
+        || args.status.is_empty()
         || args
             .status
             .iter()

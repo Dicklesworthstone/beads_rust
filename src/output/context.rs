@@ -1,9 +1,11 @@
 use super::Theme;
-use crate::cli::Cli;
+use crate::cli::{Cli, OutputFormat};
 use rich_rust::prelude::*;
 use rich_rust::renderables::Renderable;
 use std::io::{self, IsTerminal, Write};
 use std::sync::OnceLock;
+use toon_rust::options::KeyFoldingMode;
+use toon_rust::{EncodeOptions, JsonValue, encode};
 
 /// Central output coordinator that respects robot/json/quiet modes.
 ///
@@ -28,6 +30,8 @@ pub enum OutputMode {
     Plain,
     /// JSON output only
     Json,
+    /// TOON format (token-optimized object notation)
+    Toon,
     /// Minimal output (quiet mode)
     Quiet,
 }
@@ -72,6 +76,34 @@ impl OutputContext {
         }
     }
 
+    /// Create from an explicit output format.
+    #[must_use]
+    pub fn from_output_format(format: OutputFormat, quiet: bool, no_color: bool) -> Self {
+        let mode = match format {
+            OutputFormat::Json => OutputMode::Json,
+            OutputFormat::Toon => OutputMode::Toon,
+            OutputFormat::Text | OutputFormat::Csv => {
+                if quiet {
+                    OutputMode::Quiet
+                } else if no_color
+                    || std::env::var("NO_COLOR").is_ok()
+                    || !std::io::stdout().is_terminal()
+                {
+                    OutputMode::Plain
+                } else {
+                    OutputMode::Rich
+                }
+            }
+        };
+
+        Self {
+            mode,
+            width: OnceLock::new(),
+            console: OnceLock::new(),
+            theme: OnceLock::new(),
+        }
+    }
+
     fn detect_mode(args: &Cli) -> OutputMode {
         if args.json {
             return OutputMode::Json;
@@ -92,7 +124,7 @@ impl OutputContext {
     fn console(&self) -> &Console {
         self.console.get_or_init(|| match self.mode {
             OutputMode::Rich => Console::new(),
-            OutputMode::Plain | OutputMode::Quiet | OutputMode::Json => {
+            OutputMode::Plain | OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {
                 Console::builder().no_color().force_terminal(false).build()
             }
         })
@@ -110,6 +142,9 @@ impl OutputContext {
     }
     pub fn is_json(&self) -> bool {
         self.mode == OutputMode::Json
+    }
+    pub fn is_toon(&self) -> bool {
+        self.mode == OutputMode::Toon
     }
     pub fn is_quiet(&self) -> bool {
         self.mode == OutputMode::Quiet
@@ -139,7 +174,7 @@ impl OutputContext {
             OutputMode::Rich | OutputMode::Plain => {
                 self.console().print(content);
             }
-            OutputMode::Quiet | OutputMode::Json => {} // No console access - zero overhead
+            OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} // No console access - zero overhead
         }
     }
 
@@ -191,6 +226,68 @@ impl OutputContext {
         }
     }
 
+    /// Output value as TOON format (token-optimized object notation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization to JSON fails.
+    pub fn toon<T: serde::Serialize>(&self, value: &T) {
+        if self.is_toon() {
+            let json_value = serde_json::to_value(value)
+                .expect("JSON conversion failed - value is not serializable");
+            let toon_value: JsonValue = json_value.into();
+            let options = Some(EncodeOptions {
+                indent: Some(2),
+                delimiter: None,
+                key_folding: Some(KeyFoldingMode::Safe),
+                flatten_depth: None,
+                replacer: None,
+            });
+            let toon_output = encode(toon_value, options);
+            println!("{toon_output}");
+        }
+    }
+
+    /// Output value as TOON format with optional stats on stderr.
+    ///
+    /// # Panics
+    ///
+    /// Panics if serialization to JSON fails.
+    pub fn toon_with_stats<T: serde::Serialize>(&self, value: &T, show_stats: bool) {
+        if self.is_toon() {
+            let json_value = serde_json::to_value(value)
+                .expect("JSON conversion failed - value is not serializable");
+            let json_str =
+                serde_json::to_string_pretty(&json_value).expect("JSON serialization failed");
+            let toon_value: JsonValue = json_value.into();
+            let options = Some(EncodeOptions {
+                indent: Some(2),
+                delimiter: None,
+                key_folding: Some(KeyFoldingMode::Safe),
+                flatten_depth: None,
+                replacer: None,
+            });
+            let toon_output = encode(toon_value, options);
+
+            if show_stats || std::env::var("TOON_STATS").is_ok() {
+                let json_chars = json_str.len();
+                let toon_chars = toon_output.len();
+                let savings = if json_chars > 0 {
+                    let diff = json_chars.saturating_sub(toon_chars);
+                    diff * 100 / json_chars
+                } else {
+                    0
+                };
+                eprintln!(
+                    "[stats] JSON: {} chars, TOON: {} chars ({}% savings)",
+                    json_chars, toon_chars, savings
+                );
+            }
+
+            println!("{toon_output}");
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────
     // Semantic Output Methods
     // ─────────────────────────────────────────────────────────────
@@ -202,7 +299,7 @@ impl OutputContext {
                     .print(&format!("[bold green]✓[/] {}", message));
             }
             OutputMode::Plain => println!("✓ {}", message),
-            OutputMode::Quiet | OutputMode::Json => {} //
+            OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 
@@ -214,7 +311,7 @@ impl OutputContext {
                 self.console().print_renderable(&panel);
             }
             OutputMode::Plain | OutputMode::Quiet => eprintln!("Error: {}", message),
-            OutputMode::Json => {} //
+            OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 
@@ -225,7 +322,7 @@ impl OutputContext {
                     .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]", message));
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
-            OutputMode::Quiet | OutputMode::Json => {} //
+            OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 
@@ -235,7 +332,7 @@ impl OutputContext {
                 self.console().print(&format!("[blue]ℹ[/] {}", message));
             }
             OutputMode::Plain => println!("{}", message),
-            OutputMode::Quiet | OutputMode::Json => {} //
+            OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 
@@ -251,7 +348,7 @@ impl OutputContext {
     }
 
     pub fn newline(&self) {
-        if !self.is_quiet() && !self.is_json() {
+        if !self.is_quiet() && !self.is_json() && !self.is_toon() {
             println!();
         }
     }
@@ -276,7 +373,7 @@ impl OutputContext {
                 }
             }
             OutputMode::Quiet => eprintln!("Error: {}", description),
-            OutputMode::Json => {} //
+            OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 }

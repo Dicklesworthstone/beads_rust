@@ -2,12 +2,13 @@
 
 use crate::cli::{
     DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
+    OutputFormat, resolve_output_format_basic,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::truncate_title;
 use crate::model::DependencyType;
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 use rich_rust::prelude::*;
@@ -30,6 +31,8 @@ pub fn execute(
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let use_color = config::should_use_color(&config_layer);
+    let quiet = cli.quiet.unwrap_or(false);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let all_ids = storage_ctx.storage.get_all_ids()?;
@@ -51,7 +54,8 @@ pub fn execute(
             &all_ids,
             &external_db_paths,
             json,
-            ctx,
+            quiet,
+            !use_color,
         ),
         DepCommands::Tree(args) => dep_tree(
             args,
@@ -169,7 +173,7 @@ fn dep_add(
 
     let added = storage.add_dependency(&issue_id, &depends_on_id, dep_type.as_str(), actor)?;
 
-    if ctx.is_json() {
+    if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
             status: if added { "ok" } else { "exists" }.to_string(),
             issue_id: issue_id.clone(),
@@ -177,7 +181,11 @@ fn dep_add(
             dep_type: dep_type.as_str().to_string(),
             action: if added { "added" } else { "already_exists" }.to_string(),
         };
-        ctx.json_pretty(&result);
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
     } else if added {
         if ctx.is_rich() {
             // Rich mode: Show detailed visual feedback
@@ -233,7 +241,7 @@ fn dep_remove(
 
     let removed = storage.remove_dependency(&issue_id, &depends_on_id, actor)?;
 
-    if ctx.is_json() {
+    if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
             status: if removed { "ok" } else { "not_found" }.to_string(),
             issue_id: issue_id.clone(),
@@ -241,7 +249,11 @@ fn dep_remove(
             dep_type: "unknown".to_string(),
             action: if removed { "removed" } else { "not_found" }.to_string(),
         };
-        ctx.json_pretty(&result);
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
     } else if removed {
         if ctx.is_rich() {
             ctx.success(&format!(
@@ -266,15 +278,19 @@ fn dep_remove(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dep_list(
     args: &DepListArgs,
     storage: &SqliteStorage,
     resolver: &IdResolver,
     all_ids: &[String],
     external_db_paths: &HashMap<String, PathBuf>,
-    _json: bool,
-    ctx: &OutputContext,
+    json: bool,
+    quiet: bool,
+    no_color: bool,
 ) -> Result<()> {
+    let output_format = resolve_output_format_basic(args.format, json, false);
+    let ctx = OutputContext::from_output_format(output_format, quiet, no_color);
     let issue_id = resolve_issue_id(storage, resolver, all_ids, &args.issue)?;
 
     let mut items = Vec::new();
@@ -329,9 +345,20 @@ fn dep_list(
         apply_external_dep_list_metadata(&mut items, &external_statuses);
     }
 
-    if ctx.is_json() {
-        ctx.json_pretty(&items);
+    if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
+    }
+
+    match output_format {
+        OutputFormat::Json => {
+            ctx.json_pretty(&items);
+            return Ok(());
+        }
+        OutputFormat::Toon => {
+            ctx.toon_with_stats(&items, args.stats);
+            return Ok(());
+        }
+        OutputFormat::Text | OutputFormat::Csv => {}
     }
 
     if items.is_empty() {
@@ -346,7 +373,7 @@ fn dep_list(
 
     if ctx.is_rich() {
         // Rich mode: Use panel with tree-like display
-        render_dep_list_rich(ctx, &issue_id, &items, args.direction);
+        render_dep_list_rich(&ctx, &issue_id, &items, args.direction);
     } else {
         // Plain mode: Simple text output
         let header = match args.direction {
@@ -600,8 +627,12 @@ fn dep_tree(
         }
     }
 
-    if ctx.is_json() {
-        ctx.json_pretty(&nodes);
+    if ctx.is_json() || ctx.is_toon() {
+        if ctx.is_toon() {
+            ctx.toon(&nodes);
+        } else {
+            ctx.json_pretty(&nodes);
+        }
         return Ok(());
     }
 
@@ -756,9 +787,13 @@ fn dep_cycles(
     let cycles = storage.detect_all_cycles()?;
     let count = cycles.len();
 
-    if ctx.is_json() {
+    if ctx.is_json() || ctx.is_toon() {
         let result = CyclesResult { cycles, count };
-        ctx.json_pretty(&result);
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
         return Ok(());
     }
 

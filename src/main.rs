@@ -50,7 +50,7 @@ fn main() {
         Commands::Search(args) => {
             commands::search::execute(&args, cli.json, &overrides, &output_ctx)
         }
-        Commands::Show { ids } => commands::show::execute(ids, cli.json, &overrides, &output_ctx),
+        Commands::Show(args) => commands::show::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Close(args) => {
             commands::close::execute_cli(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
@@ -160,7 +160,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         // - Mutating commands (to avoid overwriting external changes)
         // - Subcommands (Comments, Dep, Label, Epic, Query)
         Commands::List(_)
-        | Commands::Show { .. }
+        | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Ready(_)
         | Commands::Blocked(_)

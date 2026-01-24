@@ -246,8 +246,9 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
     if table_exists(conn, "blocked_issues_cache") {
         let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
         let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
+        let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
 
-        if !has_blocked_at || !has_blocked_by {
+        if !has_blocked_at || !has_blocked_by || !has_issue_id {
             conn.execute("DROP TABLE IF EXISTS blocked_issues_cache", [])?;
         }
     }
@@ -272,7 +273,12 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .and_then(|mut stmt| stmt.exists([]))
         .unwrap_or(false);
 
-    if !has_blocked_by || !has_blocked_at {
+    let has_issue_id: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='issue_id'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_blocked_by || !has_blocked_at || !has_issue_id {
         // Table needs update - drop and recreate (it's a cache, data is regenerated)
         conn.execute("DROP TABLE IF EXISTS blocked_issues_cache", [])?;
         conn.execute(
@@ -658,6 +664,11 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
 
+        assert!(
+            cache_cols.contains(&"issue_id".to_string()),
+            "blocked_issues_cache should have 'issue_id' column"
+        );
+
         // Must have blocked_by (not blocked_by_json) and blocked_at
         assert!(
             cache_cols.contains(&"blocked_by".to_string()),
@@ -780,6 +791,96 @@ mod tests {
         assert!(
             !cols.contains(&"blocked_by_json".to_string()),
             "Should not have blocked_by_json"
+        );
+    }
+
+    /// Migration: drop old blocked_issues_cache missing issue_id column.
+    #[test]
+    fn test_migration_blocked_cache_missing_issue_id() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Old-style cache table with 'id' column instead of 'issue_id'
+        // Using a complete issues table schema so index migrations succeed
+        conn.execute_batch(
+            r"
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                priority INTEGER NOT NULL DEFAULT 2,
+                issue_type TEXT NOT NULL DEFAULT 'task',
+                assignee TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                content_hash TEXT,
+                external_ref TEXT,
+                ephemeral INTEGER DEFAULT 0,
+                pinned INTEGER DEFAULT 0,
+                due_at DATETIME,
+                defer_until DATETIME
+            );
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id)
+            );
+            CREATE TABLE comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                old_value TEXT,
+                new_value TEXT,
+                comment TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE blocked_issues_cache (
+                id TEXT PRIMARY KEY,
+                blocked_by TEXT NOT NULL,
+                blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+        ",
+        )
+        .unwrap();
+
+        // Apply full schema (includes pre-migrations)
+        apply_schema(&conn).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(blocked_issues_cache)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            cols.contains(&"issue_id".to_string()),
+            "issue_id column should exist after migration"
+        );
+        assert!(
+            cols.contains(&"blocked_by".to_string()),
+            "blocked_by column should exist after migration"
+        );
+        assert!(
+            cols.contains(&"blocked_at".to_string()),
+            "blocked_at column should exist after migration"
+        );
+        assert!(
+            !cols.contains(&"id".to_string()),
+            "legacy id column should be removed"
         );
     }
 }

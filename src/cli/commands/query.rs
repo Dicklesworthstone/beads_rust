@@ -2,9 +2,7 @@
 //!
 //! Provides named, reusable filters for issue listing.
 
-use crate::cli::{
-    ListArgs, OutputFormat, QueryCommands, QueryDeleteArgs, QueryRunArgs, QuerySaveArgs,
-};
+use crate::cli::{ListArgs, QueryCommands, QueryDeleteArgs, QueryRunArgs, QuerySaveArgs};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
@@ -135,7 +133,8 @@ impl SavedFilters {
             // Output-related fields use defaults
             long: false,
             pretty: false,
-            format: OutputFormat::default(),
+            format: None,
+            stats: false,
             fields: None,
         }
     }
@@ -195,6 +194,7 @@ impl SavedFilters {
             long: cli.long,
             pretty: cli.pretty,
             format: cli.format,
+            stats: cli.stats,
             fields: cli.fields.clone(),
         }
     }
@@ -510,6 +510,7 @@ fn render_query_delete_rich(name: &str, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::OutputFormat;
 
     #[test]
     fn test_saved_filters_from_list_args() {
@@ -880,7 +881,7 @@ mod tests {
         // Output-related fields should have defaults
         assert!(!args.long);
         assert!(!args.pretty);
-        assert_eq!(args.format, OutputFormat::default());
+        assert!(args.format.is_none());
         assert!(args.fields.is_none());
     }
 
@@ -890,7 +891,7 @@ mod tests {
             status: vec!["open".to_string()],
             long: true,
             pretty: true,
-            format: OutputFormat::Json,
+            format: Some(OutputFormat::Json),
             fields: Some("id,title".to_string()),
             ..Default::default()
         };

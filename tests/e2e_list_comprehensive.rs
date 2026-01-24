@@ -470,9 +470,9 @@ fn e2e_list_priority_min() {
     let payload = extract_json_payload(&list.stdout);
     let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
 
-    // Should have issues with priority >= 2 (feature1 P2, task3 P4)
-    // Note: deferred epic1 P2 is excluded by default
-    assert_eq!(issues.len(), 2);
+    // Should have issues with priority >= 2 (feature1 P2, epic1 P2 deferred, task3 P4)
+    // Note: deferred issues ARE included by default
+    assert_eq!(issues.len(), 3);
     for issue in &issues {
         let priority = issue["priority"].as_u64().unwrap();
         assert!(priority >= 2, "priority should be >= 2, got {priority}");
@@ -526,8 +526,9 @@ fn e2e_list_priority_range() {
     let payload = extract_json_payload(&list.stdout);
     let issues: Vec<Value> = serde_json::from_str(&payload).expect("json parse");
 
-    // Should have P1 and P2 issues (task1 P1, feature1 P2)
-    assert_eq!(issues.len(), 2);
+    // Should have P1 and P2 issues (task1 P1, feature1 P2, epic1 P2 deferred)
+    // Note: deferred issues ARE included by default
+    assert_eq!(issues.len(), 3);
     for issue in &issues {
         let priority = issue["priority"].as_u64().unwrap();
         assert!(
@@ -1026,14 +1027,26 @@ fn e2e_list_invalid_status() {
 }
 
 #[test]
-fn e2e_list_invalid_type() {
-    let _log = common::test_log("e2e_list_invalid_type");
+fn e2e_list_custom_type() {
+    // Custom types are allowed (see IssueType::from_str which accepts any string as Custom variant)
+    let _log = common::test_log("e2e_list_custom_type");
     let (workspace, _ids) = setup_diverse_workspace();
 
     let list = run_br(
         &workspace,
-        ["list", "--type", "invalid_type"],
-        "list_invalid_type",
+        ["list", "--type", "custom_type", "--json"],
+        "list_custom_type",
     );
-    assert!(!list.status.success(), "list with invalid type should fail");
+    assert!(
+        list.status.success(),
+        "list with custom type should succeed (custom types are allowed)"
+    );
+
+    // Since no issues have type "custom_type", result should be empty
+    let payload = extract_json_payload(&list.stdout);
+    let issues: Vec<serde_json::Value> = serde_json::from_str(&payload).expect("json parse");
+    assert!(
+        issues.is_empty(),
+        "no issues should match custom type filter"
+    );
 }

@@ -89,10 +89,7 @@ pub enum Commands {
     List(ListArgs),
 
     /// Show issue details
-    Show {
-        /// Issue IDs
-        ids: Vec<String>,
-    },
+    Show(ShowArgs),
 
     /// Update an issue
     Update(UpdateArgs),
@@ -517,6 +514,90 @@ pub enum OutputFormat {
     Json,
     /// CSV output with configurable fields
     Csv,
+    /// TOON format (token-optimized object notation)
+    Toon,
+}
+
+impl OutputFormat {
+    /// Resolve output format from environment variables.
+    ///
+    /// Precedence: BR_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT.
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        if let Ok(value) = std::env::var("BR_OUTPUT_FORMAT") {
+            if let Some(format) = Self::parse_env_value(&value) {
+                return Some(format);
+            }
+        }
+        if let Ok(value) = std::env::var("TOON_DEFAULT_FORMAT") {
+            if let Some(format) = Self::parse_env_value(&value) {
+                return Some(format);
+            }
+        }
+        None
+    }
+
+    fn parse_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "text" | "plain" => Some(Self::Text),
+            "json" => Some(Self::Json),
+            "csv" => Some(Self::Csv),
+            "toon" => Some(Self::Toon),
+            _ => None,
+        }
+    }
+}
+
+/// Output format for commands that don't support CSV.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum OutputFormatBasic {
+    /// Human-readable text (default)
+    #[default]
+    Text,
+    /// JSON output
+    Json,
+    /// TOON format (token-optimized object notation)
+    Toon,
+}
+
+impl From<OutputFormatBasic> for OutputFormat {
+    fn from(format: OutputFormatBasic) -> Self {
+        match format {
+            OutputFormatBasic::Text => Self::Text,
+            OutputFormatBasic::Json => Self::Json,
+            OutputFormatBasic::Toon => Self::Toon,
+        }
+    }
+}
+
+/// Resolve effective output format with CLI/env precedence.
+#[must_use]
+pub fn resolve_output_format(
+    requested: Option<OutputFormat>,
+    json: bool,
+    robot: bool,
+) -> OutputFormat {
+    if json || robot {
+        OutputFormat::Json
+    } else if let Some(requested) = requested {
+        requested
+    } else {
+        OutputFormat::from_env().unwrap_or(OutputFormat::Text)
+    }
+}
+
+/// Resolve effective output format for commands without CSV support.
+#[must_use]
+pub fn resolve_output_format_basic(
+    requested: Option<OutputFormatBasic>,
+    json: bool,
+    robot: bool,
+) -> OutputFormat {
+    let resolved = resolve_output_format(requested.map(Into::into), json, robot);
+    match resolved {
+        OutputFormat::Csv => OutputFormat::Text,
+        other => other,
+    }
 }
 
 /// Arguments for the list command.
@@ -608,8 +689,12 @@ pub struct ListArgs {
     pub pretty: bool,
 
     /// Output format (text, json, csv)
-    #[arg(long, value_enum, default_value = "text")]
-    pub format: OutputFormat,
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormat>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 
     /// CSV fields to include (comma-separated)
     ///
@@ -630,6 +715,21 @@ pub struct SearchArgs {
 
     #[command(flatten)]
     pub filters: ListArgs,
+}
+
+/// Arguments for the show command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct ShowArgs {
+    /// Issue IDs
+    pub ids: Vec<String>,
+
+    /// Output format (text, json, toon)
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -711,6 +811,14 @@ pub struct DepListArgs {
     /// Filter by dependency type
     #[arg(long = "type", short = 't')]
     pub dep_type: Option<String>,
+
+    /// Output format (text, json, toon)
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
@@ -1076,6 +1184,14 @@ pub struct ReadyArgs {
     #[arg(long)]
     pub include_deferred: bool,
 
+    /// Output format (text, json, toon)
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
@@ -1103,6 +1219,14 @@ pub struct BlockedArgs {
     /// Filter by label (AND logic, can be repeated)
     #[arg(long, short = 'l')]
     pub label: Vec<String>,
+
+    /// Output format (text, json, toon)
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 
     /// Machine-readable output (alias for --json)
     #[arg(long)]
@@ -1301,6 +1425,14 @@ pub struct StatsArgs {
     /// Activity window in hours (default: 24)
     #[arg(long, default_value_t = 24)]
     pub activity_hours: u32,
+
+    /// Output format (text, json, toon)
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
 
     /// Machine-readable output (alias for --json)
     #[arg(long)]

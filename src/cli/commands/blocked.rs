@@ -2,9 +2,10 @@
 //!
 //! Lists blocked issues from the `blocked_issues_cache`.
 
-use crate::cli::BlockedArgs;
+use crate::cli::{BlockedArgs, OutputFormat, resolve_output_format_basic};
 use crate::config::{
-    CliOverrides, discover_beads_dir, external_project_db_paths, load_config, open_storage_with_cli,
+    CliOverrides, discover_beads_dir, external_project_db_paths, load_config,
+    open_storage_with_cli, should_use_color,
 };
 use crate::error::Result;
 use crate::format::{BlockedIssue, BlockedIssueOutput};
@@ -20,11 +21,12 @@ use std::str::FromStr;
 /// - The beads directory cannot be found
 /// - The database cannot be opened
 /// - Querying blocked issues fails
+#[allow(clippy::too_many_lines)]
 pub fn execute(
     args: &BlockedArgs,
     _json: bool,
     overrides: &CliOverrides,
-    ctx: &OutputContext,
+    outer_ctx: &OutputContext,
 ) -> Result<()> {
     tracing::info!("Fetching blocked issues from cache");
 
@@ -34,6 +36,10 @@ pub fn execute(
 
     let config_layer = load_config(&beads_dir, Some(storage), overrides)?;
     let external_db_paths = external_project_db_paths(&config_layer, &beads_dir);
+    let use_color = should_use_color(&config_layer);
+    let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
+    let quiet = overrides.quiet.unwrap_or(false);
+    let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
     // Get blocked issues from cache
     let blocked_raw = storage.get_blocked_issues()?;
@@ -118,34 +124,64 @@ pub fn execute(
     }
 
     // Output
-    if matches!(ctx.mode(), OutputMode::Rich) {
-        render_blocked_rich(&blocked_issues, args.detailed, storage);
-    } else if ctx.is_json() {
-        // Use BlockedIssueOutput for bd parity (excludes compaction_level, original_size)
-        // Also strip status suffix from blocked_by entries (bd uses bare IDs)
-        let output: Vec<BlockedIssueOutput> = blocked_issues
-            .iter()
-            .map(|bi| BlockedIssueOutput {
-                blocked_by: bi
-                    .blocked_by
-                    .iter()
-                    .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
-                    .collect(),
-                blocked_by_count: bi.blocked_by_count,
-                created_at: bi.issue.created_at,
-                created_by: bi.issue.created_by.clone(),
-                description: bi.issue.description.clone(),
-                id: bi.issue.id.clone(),
-                issue_type: bi.issue.issue_type.clone(),
-                priority: bi.issue.priority,
-                status: bi.issue.status.clone(),
-                title: bi.issue.title.clone(),
-                updated_at: bi.issue.updated_at,
-            })
-            .collect();
-        ctx.json_pretty(&output);
-    } else {
-        print_text_output(&blocked_issues, args.detailed, storage);
+    if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    }
+
+    match output_format {
+        OutputFormat::Json => {
+            let output: Vec<BlockedIssueOutput> = blocked_issues
+                .iter()
+                .map(|bi| BlockedIssueOutput {
+                    blocked_by: bi
+                        .blocked_by
+                        .iter()
+                        .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
+                        .collect(),
+                    blocked_by_count: bi.blocked_by_count,
+                    created_at: bi.issue.created_at,
+                    created_by: bi.issue.created_by.clone(),
+                    description: bi.issue.description.clone(),
+                    id: bi.issue.id.clone(),
+                    issue_type: bi.issue.issue_type.clone(),
+                    priority: bi.issue.priority,
+                    status: bi.issue.status.clone(),
+                    title: bi.issue.title.clone(),
+                    updated_at: bi.issue.updated_at,
+                })
+                .collect();
+            ctx.json_pretty(&output);
+        }
+        OutputFormat::Toon => {
+            let output: Vec<BlockedIssueOutput> = blocked_issues
+                .iter()
+                .map(|bi| BlockedIssueOutput {
+                    blocked_by: bi
+                        .blocked_by
+                        .iter()
+                        .map(|blocker_ref| blocker_id_from_ref(blocker_ref).to_string())
+                        .collect(),
+                    blocked_by_count: bi.blocked_by_count,
+                    created_at: bi.issue.created_at,
+                    created_by: bi.issue.created_by.clone(),
+                    description: bi.issue.description.clone(),
+                    id: bi.issue.id.clone(),
+                    issue_type: bi.issue.issue_type.clone(),
+                    priority: bi.issue.priority,
+                    status: bi.issue.status.clone(),
+                    title: bi.issue.title.clone(),
+                    updated_at: bi.issue.updated_at,
+                })
+                .collect();
+            ctx.toon_with_stats(&output, args.stats);
+        }
+        OutputFormat::Text | OutputFormat::Csv => {
+            if matches!(ctx.mode(), OutputMode::Rich) {
+                render_blocked_rich(&blocked_issues, args.detailed, storage);
+            } else {
+                print_text_output(&blocked_issues, args.detailed, storage);
+            }
+        }
     }
 
     Ok(())
