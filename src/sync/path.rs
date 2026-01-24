@@ -952,4 +952,117 @@ mod tests {
             "Manifest overwrite should be allowed inside .beads"
         );
     }
+
+    // =========================================================================
+    // Tests for validate_temp_file_path (PC-4 safety invariant)
+    // =========================================================================
+
+    #[test]
+    fn test_temp_file_valid_same_directory() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        let temp = beads_dir.join("issues.jsonl.tmp");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_ok(),
+            "Temp file in same directory with .tmp extension should be valid"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_rejects_different_directory() {
+        let (temp_dir, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        let temp = temp_dir.path().join("issues.jsonl.tmp"); // Parent dir, not beads_dir
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_err(),
+            "Temp file in different directory should be rejected (PC-4)"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("same directory") || err.contains("PC-4"),
+            "Error should mention same directory requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_rejects_missing_tmp_extension() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let target = beads_dir.join("issues.jsonl");
+        let temp = beads_dir.join("issues.jsonl.bak"); // Wrong extension
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_err(),
+            "Temp file without .tmp extension should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(".tmp"),
+            "Error should mention .tmp extension requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_rejects_git_path() {
+        let (temp_dir, beads_dir) = setup_test_beads_dir();
+        let git_dir = temp_dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("create .git dir");
+        let target = git_dir.join("config");
+        let temp = git_dir.join("config.tmp");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, true);
+        assert!(
+            result.is_err(),
+            "Temp file in .git directory should always be rejected"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_allows_external_with_flag() {
+        let (temp_dir, beads_dir) = setup_test_beads_dir();
+        let external_dir = temp_dir.path().join("external");
+        std::fs::create_dir_all(&external_dir).expect("create external dir");
+        let target = external_dir.join("issues.jsonl");
+        let temp = external_dir.join("issues.jsonl.tmp");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, true);
+        assert!(
+            result.is_ok(),
+            "External temp file should be allowed when allow_external is true"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_rejects_external_without_flag() {
+        let (temp_dir, beads_dir) = setup_test_beads_dir();
+        let external_dir = temp_dir.path().join("external");
+        std::fs::create_dir_all(&external_dir).expect("create external dir");
+        let target = external_dir.join("issues.jsonl");
+        let temp = external_dir.join("issues.jsonl.tmp");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_err(),
+            "External temp file should be rejected when allow_external is false"
+        );
+    }
+
+    #[test]
+    fn test_temp_file_nested_beads_subdir() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let subdir = beads_dir.join("history");
+        std::fs::create_dir_all(&subdir).expect("create history subdir");
+        let target = subdir.join("backup.jsonl");
+        let temp = subdir.join("backup.jsonl.tmp");
+
+        let result = validate_temp_file_path(&temp, &target, &beads_dir, false);
+        assert!(
+            result.is_ok(),
+            "Temp file in nested .beads subdir should be valid"
+        );
+    }
 }
