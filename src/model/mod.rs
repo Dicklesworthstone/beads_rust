@@ -9,6 +9,7 @@
 //! - `Event` - Audit log entries
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
@@ -28,7 +29,7 @@ where
 }
 
 /// Issue lifecycle status.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     #[default]
@@ -97,7 +98,9 @@ impl FromStr for Status {
 }
 
 /// Issue priority (0=Critical, 4=Backlog).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Priority(pub i32);
 
@@ -131,7 +134,7 @@ impl FromStr for Priority {
 }
 
 /// Issue type category.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueType {
     #[default]
@@ -193,7 +196,7 @@ impl FromStr for IssueType {
 }
 
 /// Dependency relationship type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum DependencyType {
     Blocks,
@@ -350,8 +353,19 @@ impl<'de> Deserialize<'de> for EventType {
     }
 }
 
+impl JsonSchema for EventType {
+    fn schema_name() -> String {
+        "EventType".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        // EventType serializes as a string (see custom Serialize/Deserialize above).
+        generator.subschema_for::<String>()
+    }
+}
+
 /// The primary issue entity.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Issue {
     /// Unique ID (e.g., "bd-abc123").
     pub id: String,
@@ -573,7 +587,7 @@ impl Issue {
 }
 
 /// Epic completion status with child counts.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct EpicStatus {
     pub epic: Issue,
     pub total_children: usize,
@@ -582,7 +596,7 @@ pub struct EpicStatus {
 }
 
 /// Relationship between two issues.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Dependency {
     /// The issue that has the dependency (source).
     pub issue_id: String,
@@ -611,7 +625,7 @@ pub struct Dependency {
 }
 
 /// A comment on an issue.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Comment {
     pub id: i64,
     pub issue_id: String,
@@ -622,7 +636,7 @@ pub struct Comment {
 }
 
 /// An event in the issue's history (audit log).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Event {
     pub id: i64,
     pub issue_id: String,

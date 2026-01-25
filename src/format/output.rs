@@ -1,10 +1,11 @@
 use crate::model::{Comment, Event, Issue, IssueType, Priority, Status};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Minimal issue output for stale command (bd parity).
 /// Contains only the fields that bd's stale command outputs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StaleIssue {
     pub created_at: DateTime<Utc>,
     pub id: String,
@@ -19,7 +20,7 @@ pub struct StaleIssue {
 ///
 /// Contains only the fields that bd's ready command outputs.
 /// Does NOT include: `compaction_level`, `original_size`, `dependency_count`, `dependent_count`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadyIssue {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acceptance_criteria: Option<String>,
@@ -69,7 +70,7 @@ impl From<&Issue> for ReadyIssue {
 ///
 /// Contains only the fields that bd's blocked command outputs, plus `blocked_by` info.
 /// Does NOT include: `compaction_level`, `original_size`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BlockedIssueOutput {
     pub blocked_by: Vec<String>,
     pub blocked_by_count: usize,
@@ -101,7 +102,7 @@ impl From<&Issue> for StaleIssue {
 }
 
 /// Issue with counts for list/search views.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IssueWithCounts {
     #[serde(flatten)]
     pub issue: Issue,
@@ -110,7 +111,7 @@ pub struct IssueWithCounts {
 }
 
 /// Issue details with full relations for show view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IssueDetails {
     #[serde(flatten)]
     pub issue: Issue,
@@ -128,7 +129,7 @@ pub struct IssueDetails {
     pub parent: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IssueWithDependencyMetadata {
     pub id: String,
     pub title: String,
@@ -139,7 +140,7 @@ pub struct IssueWithDependencyMetadata {
 }
 
 /// Blocked issue for blocked view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BlockedIssue {
     #[serde(flatten)]
     pub issue: Issue,
@@ -148,7 +149,7 @@ pub struct BlockedIssue {
 }
 
 /// Tree node for dependency tree view.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TreeNode {
     #[serde(flatten)]
     pub issue: Issue,
@@ -158,7 +159,7 @@ pub struct TreeNode {
 }
 
 /// Summary statistics for the project.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatsSummary {
     pub total_issues: usize,
     pub open_issues: usize,
@@ -175,21 +176,21 @@ pub struct StatsSummary {
 }
 
 /// Breakdown statistics by a dimension.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Breakdown {
     pub dimension: String,
     pub counts: Vec<BreakdownEntry>,
 }
 
 /// A single entry in a breakdown.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BreakdownEntry {
     pub key: String,
     pub count: usize,
 }
 
 /// Recent activity statistics from git history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RecentActivity {
     pub hours_tracked: u32,
     pub commit_count: usize,
@@ -201,7 +202,7 @@ pub struct RecentActivity {
 }
 
 /// Aggregate statistics output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Statistics {
     pub summary: StatsSummary,
     #[serde(skip_serializing_if = "Vec::is_empty")]

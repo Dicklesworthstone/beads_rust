@@ -739,6 +739,13 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - Robot mode flags
 - Best practices
 
+You can also emit machine-readable JSON Schema documents directly:
+
+```bash
+br schema all --format json | jq '.schemas.Issue'
+br schema issue-details --format toon
+```
+
 ---
 
 ## VCS Integration

@@ -26,6 +26,7 @@ pub mod query;
 pub mod ready;
 pub mod reopen;
 pub mod search;
+pub mod schema;
 pub mod show;
 pub mod stale;
 pub mod stats;

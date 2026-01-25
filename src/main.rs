@@ -77,6 +77,7 @@ fn main() {
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Doctor => commands::doctor::execute(&overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
+        Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
         Commands::Version(args) => commands::version::execute(&args, &output_ctx),
 
@@ -191,6 +192,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Sync(_)
         | Commands::Doctor
         | Commands::Info(_)
+        | Commands::Schema(_)
         | Commands::Where
         | Commands::Version(_)
         | Commands::Completions(_)

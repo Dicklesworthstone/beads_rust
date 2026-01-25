@@ -205,6 +205,9 @@ EXAMPLES:
     /// Show diagnostic metadata about the workspace
     Info(InfoArgs),
 
+    /// Emit JSON Schemas for br output types (for agent/tooling integration)
+    Schema(SchemaArgs),
+
     /// Show the active .beads directory
     Where,
 
@@ -502,6 +505,48 @@ pub struct InfoArgs {
     /// Show acknowledgements and exit
     #[arg(long, conflicts_with = "whats_new")]
     pub thanks: bool,
+}
+
+/// Arguments for the schema command.
+#[derive(Args, Debug, Default, Clone)]
+pub struct SchemaArgs {
+    /// Which schema to emit
+    #[arg(value_enum, default_value_t)]
+    pub target: SchemaTarget,
+
+    /// Output format (text, json, toon)
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+
+    /// Show token savings stats when using TOON output
+    #[arg(long)]
+    pub stats: bool,
+}
+
+/// Schema targets for `br schema`.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum SchemaTarget {
+    /// Emit a bundle containing all schemas
+    #[default]
+    All,
+    /// Core Issue object (used by many commands)
+    Issue,
+    /// List/search row: Issue + dependency/dependent counts
+    IssueWithCounts,
+    /// Show view: Issue + relations/comments/events
+    IssueDetails,
+    /// Ready list row
+    ReadyIssue,
+    /// Stale list row
+    StaleIssue,
+    /// Blocked list row
+    BlockedIssue,
+    /// Dependency tree node
+    TreeNode,
+    /// Stats output
+    Statistics,
+    /// Structured error envelope (stderr JSON when robot mode or non-TTY)
+    Error,
 }
 
 /// Output format for list command.
