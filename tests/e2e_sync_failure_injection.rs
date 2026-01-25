@@ -786,7 +786,10 @@ fn atomic_write_pipeline_produces_valid_output() {
     let hash2 = compute_file_hash(&jsonl_path).unwrap();
     artifacts.log("file_hash", &hash2);
 
-    artifacts.log("verification", "PASSED: Atomic pipeline produced valid output");
+    artifacts.log(
+        "verification",
+        "PASSED: Atomic pipeline produced valid output",
+    );
     artifacts.save();
 }
 
@@ -818,7 +821,10 @@ fn stale_temp_file_handled_gracefully() {
         ..Default::default()
     };
     let result = export_to_jsonl(&storage, &jsonl_path, &config);
-    assert!(result.is_ok(), "Export should succeed despite stale temp file");
+    assert!(
+        result.is_ok(),
+        "Export should succeed despite stale temp file"
+    );
 
     // Verify temp file is gone
     assert!(
@@ -870,8 +876,10 @@ fn export_empty_db_produces_empty_jsonl() {
             assert_eq!(export_result.exported_count, 0, "Should export 0 issues");
             if jsonl_path.exists() {
                 let content = fs::read_to_string(&jsonl_path).unwrap();
-                assert!(content.is_empty() || content.trim().is_empty(),
-                    "JSONL should be empty for empty DB");
+                assert!(
+                    content.is_empty() || content.trim().is_empty(),
+                    "JSONL should be empty for empty DB"
+                );
             }
             artifacts.log("outcome", "Empty export succeeded");
         }
