@@ -51,3 +51,12 @@ claude-upgrade-progress.json
 # Local Cargo and Rustup caches (agent workspace artifacts)
 .cargo/
 .rustup/
+
+# Ephemeral/temporary files (agent workflow artifacts)
+RESEARCH_FINDINGS.md
+TOON_INTEGRATION_BRIEF.md
+cov_*.out
+rustc-ice-*.txt
+*.snap.new
+sweep_*.png
+test_screenshot.png
