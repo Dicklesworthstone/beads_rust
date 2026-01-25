@@ -44,7 +44,11 @@ struct SchemaOutput {
     schemas: BTreeMap<&'static str, RootSchema>,
 }
 
-pub fn execute(args: &SchemaArgs, cli: &config::CliOverrides, outer_ctx: &OutputContext) -> Result<()> {
+pub fn execute(
+    args: &SchemaArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+) -> Result<()> {
     let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), false);
     let quiet = cli.quiet.unwrap_or(false);
 
