@@ -76,7 +76,7 @@ pub fn execute(
                 }
                 if matches!(ctx.mode(), OutputMode::Rich) {
                     let panel = IssuePanel::from_details(details, ctx.theme());
-                    panel.print(&ctx);
+                    panel.print(&ctx, args.wrap);
                 } else {
                     print_issue_details(details, use_color);
                 }

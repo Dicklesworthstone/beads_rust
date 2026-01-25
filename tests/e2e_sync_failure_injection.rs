@@ -755,7 +755,7 @@ fn atomic_write_pipeline_produces_valid_output() {
         beads_dir: Some(beads_dir.clone()),
         ..Default::default()
     };
-    let (result, _report) = export_to_jsonl(&storage, &jsonl_path, &config).unwrap();
+    let result = export_to_jsonl(&storage, &jsonl_path, &config).unwrap();
 
     artifacts.log("export_count", &result.exported_count.to_string());
     artifacts.log("content_hash", &result.content_hash);
@@ -872,7 +872,7 @@ fn export_empty_db_produces_empty_jsonl() {
     // Empty DB export may fail or produce empty file depending on config
     // The important thing is it doesn't crash and handles gracefully
     match result {
-        Ok((export_result, _)) => {
+        Ok(export_result) => {
             assert_eq!(export_result.exported_count, 0, "Should export 0 issues");
             if jsonl_path.exists() {
                 let content = fs::read_to_string(&jsonl_path).unwrap();

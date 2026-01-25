@@ -109,14 +109,18 @@ pub fn execute(
                     title: true,
                     ..Default::default()
                 };
-                let table = IssueTable::new(&ready_issues, ctx.theme())
+                let mut table = IssueTable::new(&ready_issues, ctx.theme())
                     .columns(columns)
                     .title(format!(
                         "Ready work ({} issue{} with no blockers)",
                         ready_issues.len(),
                         if ready_issues.len() == 1 { "" } else { "s" }
                     ))
-                    .build();
+                    .wrap(args.wrap);
+                if args.wrap {
+                    table = table.width(Some(ctx.width()));
+                }
+                let table = table.build();
                 ctx.render(&table);
             } else {
                 // Match bd header format: 📋 Ready work (N issues with no blockers):
@@ -126,7 +130,7 @@ pub fn execute(
                     if ready_issues.len() == 1 { "" } else { "s" }
                 );
                 for (i, issue) in ready_issues.iter().enumerate() {
-                    let line = format_ready_line(i + 1, issue, use_color, max_width);
+                    let line = format_ready_line(i + 1, issue, use_color, max_width, args.wrap);
                     println!("{line}");
                 }
             }
@@ -141,6 +145,7 @@ fn format_ready_line(
     issue: &crate::model::Issue,
     use_color: bool,
     max_width: Option<usize>,
+    wrap: bool,
 ) -> String {
     // Match bd format: {index}. [● P{n}] [{type}] {id}: {title}
     let priority_badge_plain = format!("[● {}]", crate::format::format_priority(&issue.priority));
@@ -149,13 +154,17 @@ fn format_ready_line(
         "{index}. {priority_badge_plain} {type_badge_plain} {}: ",
         issue.id
     );
-    let title = max_width.map_or_else(
-        || issue.title.clone(),
-        |width| {
-            let max_title = width.saturating_sub(UnicodeWidthStr::width(prefix_plain.as_str()));
-            truncate_title(&issue.title, max_title)
-        },
-    );
+    let title = if wrap {
+        issue.title.clone()
+    } else {
+        max_width.map_or_else(
+            || issue.title.clone(),
+            |width| {
+                let max_title = width.saturating_sub(UnicodeWidthStr::width(prefix_plain.as_str()));
+                truncate_title(&issue.title, max_title)
+            },
+        )
+    };
 
     let priority_badge = format_priority_badge(&issue.priority, use_color);
     let type_badge = crate::format::format_type_badge_colored(&issue.issue_type, use_color);

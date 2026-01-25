@@ -15,6 +15,7 @@ pub struct IssueTable<'a> {
     highlight_query: Option<String>,
     context_snippets: Option<HashMap<String, String>>,
     width: Option<usize>,
+    wrap: bool,
 }
 
 #[derive(Default, Clone)]
@@ -85,12 +86,19 @@ impl<'a> IssueTable<'a> {
             highlight_query: None,
             context_snippets: None,
             width: None,
+            wrap: false,
         }
     }
 
     #[must_use]
     pub fn width(mut self, width: Option<usize>) -> Self {
         self.width = width;
+        self
+    }
+
+    #[must_use]
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
         self
     }
 
@@ -205,7 +213,11 @@ impl<'a> IssueTable<'a> {
                 );
             }
             if self.columns.title {
-                let title = truncate_title(&issue.title, title_max_width);
+                let title = if self.wrap {
+                    issue.title.clone()
+                } else {
+                    truncate_title(&issue.title, title_max_width)
+                };
                 let title_text = highlight_text(&title, highlight_regex.as_ref(), self.theme);
                 cells.push(Cell::new(title_text).style(self.theme.issue_title.clone()));
             }

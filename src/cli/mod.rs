@@ -733,6 +733,10 @@ pub struct ListArgs {
     #[arg(long)]
     pub pretty: bool,
 
+    /// Wrap long lines instead of truncating in text output
+    #[arg(long)]
+    pub wrap: bool,
+
     /// Output format (text, json, csv)
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
@@ -771,6 +775,10 @@ pub struct ShowArgs {
     /// Output format (text, json, toon)
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
+
+    /// Wrap long lines instead of truncating in text output
+    #[arg(long)]
+    pub wrap: bool,
 
     /// Show token savings stats when using TOON output
     #[arg(long)]
@@ -955,6 +963,10 @@ pub struct CommentsArgs {
 
     /// Issue ID (for listing comments)
     pub id: Option<String>,
+
+    /// Wrap long lines instead of truncating in text output
+    #[arg(long)]
+    pub wrap: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -988,6 +1000,10 @@ pub struct CommentAddArgs {
 pub struct CommentListArgs {
     /// Issue ID
     pub id: String,
+
+    /// Wrap long lines instead of truncating in text output
+    #[arg(long)]
+    pub wrap: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1228,6 +1244,10 @@ pub struct ReadyArgs {
     /// Include deferred issues
     #[arg(long)]
     pub include_deferred: bool,
+
+    /// Wrap long lines instead of truncating in text output
+    #[arg(long)]
+    pub wrap: bool,
 
     /// Output format (text, json, toon)
     #[arg(long, value_enum)]

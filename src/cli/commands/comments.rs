@@ -44,15 +44,21 @@ pub fn execute(
             json,
             ctx,
         ),
-        Some(CommentCommands::List(list_args)) => {
-            list_comments(list_args, storage, &resolver, &all_ids, json, ctx)
-        }
+        Some(CommentCommands::List(list_args)) => list_comments(
+            list_args,
+            storage,
+            &resolver,
+            &all_ids,
+            json,
+            ctx,
+            list_args.wrap,
+        ),
         None => {
             let id = args
                 .id
                 .as_deref()
                 .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
-            list_comments_by_id(id, storage, &resolver, &all_ids, json, ctx)
+            list_comments_by_id(id, storage, &resolver, &all_ids, json, ctx, args.wrap)
         }
     }?;
 
@@ -99,8 +105,9 @@ fn list_comments(
     all_ids: &[String],
     json: bool,
     ctx: &OutputContext,
+    wrap: bool,
 ) -> Result<()> {
-    list_comments_by_id(&args.id, storage, resolver, all_ids, json, ctx)
+    list_comments_by_id(&args.id, storage, resolver, all_ids, json, ctx, wrap)
 }
 
 fn list_comments_by_id(
@@ -110,6 +117,7 @@ fn list_comments_by_id(
     all_ids: &[String],
     _json: bool,
     ctx: &OutputContext,
+    wrap: bool,
 ) -> Result<()> {
     let issue_id = resolve_issue_id(storage, resolver, all_ids, id)?;
     let comments = storage.get_comments(&issue_id)?;
@@ -120,7 +128,7 @@ fn list_comments_by_id(
     }
 
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_comments_list_rich(&issue_id, &comments, ctx);
+        render_comments_list_rich(&issue_id, &comments, ctx, wrap);
         return Ok(());
     }
 
@@ -141,7 +149,12 @@ fn list_comments_by_id(
 }
 
 /// Render a list of comments in rich format.
-fn render_comments_list_rich(issue_id: &str, comments: &[Comment], ctx: &OutputContext) {
+fn render_comments_list_rich(
+    issue_id: &str,
+    comments: &[Comment],
+    ctx: &OutputContext,
+    wrap: bool,
+) {
     let console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
@@ -185,11 +198,29 @@ fn render_comments_list_rich(issue_id: &str, comments: &[Comment], ctx: &OutputC
     }
 
     let title = format!("Comments: {} ({})", issue_id, comments.len());
+    let content = if wrap {
+        wrap_rich_text(&content, width)
+    } else {
+        content
+    };
     let panel = Panel::from_rich_text(&content, width)
         .title(Text::styled(&title, theme.panel_title.clone()))
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+}
+
+fn wrap_rich_text(text: &Text, panel_width: usize) -> Text {
+    let content_width = panel_width.saturating_sub(4).max(1);
+    let lines = text.wrap(content_width);
+    let mut wrapped = Text::new("");
+    for (idx, line) in lines.iter().enumerate() {
+        if idx > 0 {
+            wrapped.append("\n");
+        }
+        wrapped.append_text(line);
+    }
+    wrapped
 }
 
 /// Render confirmation for a newly added comment.

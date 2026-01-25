@@ -35,6 +35,7 @@ pub mod icons {
 pub struct TextFormatOptions {
     pub use_color: bool,
     pub max_width: Option<usize>,
+    pub wrap: bool,
 }
 
 impl TextFormatOptions {
@@ -43,6 +44,7 @@ impl TextFormatOptions {
         Self {
             use_color: false,
             max_width: None,
+            wrap: false,
         }
     }
 }
@@ -252,10 +254,14 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
         + visible_len(&type_badge_plain)
         + 3; // " - " separator
 
-    let title = options.max_width.map_or_else(
-        || issue.title.clone(),
-        |width| truncate_title(&issue.title, width.saturating_sub(prefix_len)),
-    );
+    let title = if options.wrap {
+        issue.title.clone()
+    } else {
+        options.max_width.map_or_else(
+            || issue.title.clone(),
+            |width| truncate_title(&issue.title, width.saturating_sub(prefix_len)),
+        )
+    };
 
     let status_icon = format_status_icon_colored(&issue.status, options.use_color);
     let priority_badge = format_priority_badge(&issue.priority, options.use_color);
@@ -439,8 +445,23 @@ mod tests {
         let options = TextFormatOptions {
             use_color: false,
             max_width: Some(30),
+            wrap: false,
         };
         let line = format_issue_line_with(&issue, options);
         assert!(line.contains("..."));
+    }
+
+    #[test]
+    fn test_format_issue_line_with_wrap() {
+        let mut issue = make_test_issue();
+        issue.title = "A very long issue title".to_string();
+        let options = TextFormatOptions {
+            use_color: false,
+            max_width: Some(20),
+            wrap: true,
+        };
+        let line = format_issue_line_with(&issue, options);
+        assert!(!line.contains("..."));
+        assert!(line.contains("A very long issue title"));
     }
 }

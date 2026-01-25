@@ -41,6 +41,7 @@ pub fn execute(
     let format_options = TextFormatOptions {
         use_color,
         max_width,
+        wrap: args.wrap,
     };
 
     // Build filter from args
@@ -142,10 +143,14 @@ pub fn execute(
                         ..Default::default()
                     }
                 };
-                let table = IssueTable::new(&issues, ctx.theme())
+                let mut table = IssueTable::new(&issues, ctx.theme())
                     .columns(columns)
                     .title(format!("Issues ({})", issues.len()))
-                    .build();
+                    .wrap(args.wrap);
+                if args.wrap {
+                    table = table.width(Some(ctx.width()));
+                }
+                let table = table.build();
                 ctx.render(&table);
             } else {
                 // Note: bd outputs nothing when no issues found, matching that for conformance

@@ -60,5 +60,15 @@ fn e2e_schema_toon_decodes() {
 
     assert_eq!(json["tool"], "br");
     assert!(json.get("generated_at").is_some(), "missing generated_at");
-    assert!(json["schemas"].get("IssueDetails").is_some());
+    // TOON output uses key folding, so nested map keys may appear as dotted keys.
+    let has_nested = json
+        .get("schemas")
+        .and_then(|schemas| schemas.get("IssueDetails"))
+        .is_some();
+    let has_folded = json.get("schemas.IssueDetails").is_some();
+    assert!(
+        has_nested || has_folded,
+        "expected IssueDetails schema (nested or folded), got keys: {:?}",
+        json.as_object().map(|o| o.keys().collect::<Vec<_>>())
+    );
 }

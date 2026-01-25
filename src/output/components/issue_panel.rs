@@ -56,7 +56,7 @@ impl<'a> IssuePanel<'a> {
         self
     }
 
-    pub fn print(&self, ctx: &OutputContext) {
+    pub fn print(&self, ctx: &OutputContext, wrap: bool) {
         let mut content = Text::new("");
 
         // Header: ID and Status badges
@@ -166,13 +166,32 @@ impl<'a> IssuePanel<'a> {
         }
 
         // Build and print panel
-        let panel = Panel::from_rich_text(&content, 80)
+        let panel_width = if wrap { ctx.width() } else { 80 };
+        let content = if wrap {
+            wrap_rich_text(&content, panel_width)
+        } else {
+            content
+        };
+        let panel = Panel::from_rich_text(&content, panel_width)
             .title(Text::styled(&self.issue.id, self.theme.panel_title.clone()))
             .box_style(self.theme.box_style)
             .border_style(self.theme.panel_border.clone());
 
         ctx.render(&panel);
     }
+}
+
+fn wrap_rich_text(text: &Text, panel_width: usize) -> Text {
+    let content_width = panel_width.saturating_sub(4).max(1);
+    let lines = text.wrap(content_width);
+    let mut wrapped = Text::new("");
+    for (idx, line) in lines.iter().enumerate() {
+        if idx > 0 {
+            wrapped.append("\n");
+        }
+        wrapped.append_text(line);
+    }
+    wrapped
 }
 
 fn render_dependency_list(
