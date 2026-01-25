@@ -4,6 +4,7 @@ This file shows small, copy/pasteable flows. For machine-readable examples, also
 
 - `ROBOT_MODE_EXAMPLES.jsonl`
 - `agent_baseline/examples/`
+- `scripts/agent_smoke_test.sh`
 
 ## List work (TOON -> JSON)
 

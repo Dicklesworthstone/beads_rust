@@ -53,6 +53,16 @@ And the machine schema is available via:
 br schema error --format json
 ```
 
+## Interface Modality Decision
+
+Decision: CLI-only (no MCP surface in this repo).
+
+Rationale:
+
+- br is frequently used as a local, composable CLI primitive (shell pipes, git hooks, scripts).
+- MCP would add distribution + auth + permission surface area that is not required for the core value.
+- The existing CLI already covers the key agent needs: triage (`ready`), mutation (`update/close`), and sync (`sync --flush-only`).
+
 ## Gaps / Next Improvements
 
 - No dynamic `--help-json` surface yet; `CLI_SCHEMA.json` is an interim static artifact.

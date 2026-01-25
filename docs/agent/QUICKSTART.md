@@ -44,5 +44,16 @@ br sync --flush-only
 
 ## Common gotchas
 
-- Prefer `--format json` / `--format toon` when available; `--json` always forces JSON.
+- Preferred flags:
+  - Use `--format json` or `--format toon` when the command supports it.
+  - `--json` always forces JSON.
+  - Some commands also accept `--robot` (alias for `--json`).
 - When scripting, route stderr separately; errors may be emitted as structured JSON on stderr.
+
+## Agent smoke test
+
+To sanity-check JSON/TOON outputs and env precedence:
+
+```bash
+./scripts/agent_smoke_test.sh
+```
