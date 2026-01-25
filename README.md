@@ -15,7 +15,7 @@
 
 A Rust port of Steve Yegge's [beads](https://github.com/steveyegge/beads), frozen at the "classic" SQLite + JSONL architecture I built my Agent Flywheel tooling around.
 
-[Quick Start](#quick-start) | [Commands](#commands) | [Configuration](#configuration) | [FAQ](#faq)
+[Quick Start](#quick-start) | [Commands](#commands) | [Configuration](#configuration) | [VCS Integration](#vcs-integration) | [FAQ](#faq)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -738,6 +738,13 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - Integration with MCP Agent Mail
 - Robot mode flags
 - Best practices
+
+---
+
+## VCS Integration
+
+Using non-git version control? See [VCS_INTEGRATION.md](VCS_INTEGRATION.md) for
+equivalent commands and workflows.
 
 Quick example:
 
