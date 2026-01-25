@@ -1,0 +1,61 @@
+Agent-first issue tracker (SQLite + JSONL)
+
+Usage: br [OPTIONS] <COMMAND>
+
+Commands:
+  init         Initialize a beads workspace
+  create       Create a new issue
+  q            Quick capture (create issue, print ID only)
+  list         List issues
+  show         Show issue details
+  update       Update an issue
+  close        Close an issue
+  reopen       Reopen an issue
+  delete       Delete an issue (creates tombstone)
+  ready        List ready issues (unblocked, not deferred)
+  blocked      List blocked issues
+  search       Search issues
+  dep          Manage dependencies
+  label        Manage labels
+  epic         Epic management commands
+  comments     Manage comments
+  stats        Show project statistics
+  status       Alias for stats
+  count        Count issues with optional grouping
+  stale        List stale issues
+  lint         Check issues for missing template sections
+  defer        Defer issues (schedule for later)
+  undefer      Undefer issues (make ready again)
+  config       Configuration management
+  sync         Sync database with JSONL file (export or import)
+  doctor       Run read-only diagnostics
+  info         Show diagnostic metadata about the workspace
+  schema       Emit JSON Schemas for br output types (for agent/tooling integration)
+  where        Show the active .beads directory
+  version      Show version information
+  upgrade      Upgrade br to the latest version
+  completions  Generate shell completions
+  audit        Record and label agent interactions (append-only JSONL)
+  history      Manage local history backups
+  orphans      List orphan issues (referenced in commits but open)
+  changelog    Generate changelog from closed issues
+  query        Manage saved queries
+  graph        Visualize dependency graph
+  agents       Manage AGENTS.md workflow instructions
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --db <DB>                      Database path (auto-discover .beads/*.db if not set)
+      --actor <ACTOR>                Actor name for audit trail
+      --json                         Output as JSON
+      --no-daemon                    Force direct mode (no daemon) - effectively no-op in br v1
+      --no-auto-flush                Skip auto JSONL export
+      --no-auto-import               Skip auto import check
+      --allow-stale                  Allow stale DB (bypass freshness check warning)
+      --lock-timeout <LOCK_TIMEOUT>  `SQLite` busy timeout in ms
+      --no-db                        JSONL-only mode (no DB connection)
+  -v, --verbose...                   Increase logging verbosity (-v, -vv)
+  -q, --quiet                        Quiet mode (no output except errors)
+      --no-color                     Disable colored output
+  -h, --help                         Print help
+  -V, --version                      Print version

@@ -50,7 +50,9 @@ log "Output directory: $FIXTURE_DIR"
 # Create temp workspace for test data
 TESTDIR=$(mktemp -d)
 log "Test workspace: $TESTDIR"
-trap 'rm -rf "$TESTDIR"' EXIT
+# NOTE: We intentionally do not delete this directory automatically.
+# Agents on this machine must not run destructive filesystem commands (including rm -rf)
+# without explicit user approval in-session. Leave the workspace behind for inspection.
 
 cd "$TESTDIR"
 
@@ -195,3 +197,4 @@ fi
 
 log ""
 log "✓ Baseline generation complete!"
+log "NOTE: Test workspace left in place at: $TESTDIR"

@@ -120,8 +120,14 @@ build_target() {
 }
 
 clean_stage() {
-    log "Cleaning staging directory..."
-    rm -rf target/release-stage
+    log "Resetting staging directory..."
+    if [[ -e target/release-stage ]]; then
+        local ts
+        ts="$(date +%Y%m%d_%H%M%S)"
+        local backup="target/release-stage.${ts}"
+        log "NOTE: Not deleting existing staging dir (deletion policy). Moving to: $backup"
+        mv target/release-stage "$backup"
+    fi
     mkdir -p target/release-stage
 }
 

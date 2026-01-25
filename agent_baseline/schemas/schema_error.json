@@ -1,0 +1,53 @@
+{
+  "tool": "br",
+  "generated_at": "2026-01-25T16:38:43.211277279Z",
+  "schemas": {
+    "ErrorEnvelope": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "ErrorEnvelope",
+      "type": "object",
+      "required": [
+        "error"
+      ],
+      "properties": {
+        "error": {
+          "$ref": "#/definitions/ErrorBody"
+        }
+      },
+      "definitions": {
+        "ErrorBody": {
+          "type": "object",
+          "required": [
+            "code",
+            "message",
+            "retryable"
+          ],
+          "properties": {
+            "code": {
+              "description": "Machine-readable error code (SCREAMING_SNAKE_CASE)",
+              "type": "string"
+            },
+            "context": {
+              "description": "Additional context for debugging (arbitrary JSON)"
+            },
+            "hint": {
+              "description": "Optional hint for remediation",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "description": "Human-readable message",
+              "type": "string"
+            },
+            "retryable": {
+              "description": "Whether the operation can be retried",
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    }
+  }
+}

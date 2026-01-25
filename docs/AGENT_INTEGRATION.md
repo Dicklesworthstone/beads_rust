@@ -71,9 +71,43 @@ br list --json
 br show bd-123 --json
 br create "Title" --json
 
+# Equivalent (when the command supports --format)
+br list --format json
+br ready --format json
+
 # Robot mode alias (same as --json)
 br ready --robot
 br close bd-123 --robot
+```
+
+### TOON Output (Token-Efficient)
+
+Many read-style commands support TOON output via `--format toon`:
+
+```bash
+br ready --format toon --limit 10
+br show bd-123 --format toon
+```
+
+Decode TOON to JSON when you need to pipe into JSON tools:
+
+```bash
+br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+```
+
+### Environment Defaults
+
+If you omit `--format` / `--json`, br can default the output format via env vars:
+
+- `BR_OUTPUT_FORMAT` (highest precedence)
+- `TOON_DEFAULT_FORMAT` (fallback)
+
+Example:
+
+```bash
+export TOON_DEFAULT_FORMAT=toon
+br list --limit 5          # defaults to TOON
+br list --json --limit 5   # JSON always wins
 ```
 
 ### JSON Output Characteristics

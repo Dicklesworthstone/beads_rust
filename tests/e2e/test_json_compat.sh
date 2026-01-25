@@ -20,7 +20,9 @@ log "Log file: $LOG_FILE"
 TESTDIR=$(mktemp -d)
 cd "$TESTDIR"
 log "Test directory: $TESTDIR"
-trap 'rm -rf "$TESTDIR"' EXIT
+# NOTE: We intentionally do not delete this directory automatically.
+# Agents on this machine must not run destructive filesystem commands (including rm -rf)
+# without explicit user approval in-session. Leave the workspace behind for inspection.
 
 # Initialize workspace
 br init --prefix jc
@@ -101,8 +103,10 @@ log_section "JSON COMPATIBILITY TEST COMPLETE"
 
 if [ $FAILED -eq 0 ]; then
     log "All tests passed"
+    log "NOTE: Test workspace left in place at: $TESTDIR"
     exit 0
 else
     log "Some tests failed"
+    log "NOTE: Test workspace left in place at: $TESTDIR"
     exit 1
 fi

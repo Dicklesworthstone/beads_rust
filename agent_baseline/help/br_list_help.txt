@@ -1,0 +1,128 @@
+List issues
+
+Usage: br list [OPTIONS]
+
+Options:
+  -s, --status <STATUS>
+          Filter by status (can be repeated)
+
+  -t, --type <TYPE>
+          Filter by issue type (can be repeated)
+
+      --assignee <ASSIGNEE>
+          Filter by assignee
+
+      --unassigned
+          Filter for unassigned issues only
+
+      --id <ID>
+          Filter by specific IDs (can be repeated)
+
+  -l, --label <LABEL>
+          Filter by label (AND logic, can be repeated)
+
+      --label-any <LABEL_ANY>
+          Filter by label (OR logic, can be repeated)
+
+  -p, --priority <PRIORITY>
+          Filter by priority (can be repeated)
+
+      --priority-min <PRIORITY_MIN>
+          Filter by minimum priority (0=critical, 4=backlog)
+
+      --priority-max <PRIORITY_MAX>
+          Filter by maximum priority
+
+      --title-contains <TITLE_CONTAINS>
+          Title contains substring
+
+      --desc-contains <DESC_CONTAINS>
+          Description contains substring
+
+      --notes-contains <NOTES_CONTAINS>
+          Notes contains substring
+
+  -a, --all
+          Include closed issues (default excludes closed)
+
+      --limit <LIMIT>
+          Maximum number of results (0 = unlimited, default: 50)
+
+      --sort <SORT>
+          Sort field (`priority`, `created_at`, `updated_at`, `title`)
+
+  -r, --reverse
+          Reverse sort order
+
+      --deferred
+          Include deferred issues
+
+      --overdue
+          Filter for overdue issues
+
+      --long
+          Use long output format
+
+      --pretty
+          Use tree/pretty output format
+
+      --wrap
+          Wrap long lines instead of truncating in text output
+
+      --format <FORMAT>
+          Output format (text, json, csv)
+
+          Possible values:
+          - text: Human-readable text (default)
+          - json: JSON output
+          - csv:  CSV output with configurable fields
+          - toon: TOON format (token-optimized object notation)
+
+      --stats
+          Show token savings stats when using TOON output
+
+      --fields <FIELDS>
+          CSV fields to include (comma-separated)
+          
+          Available: id, title, description, status, priority, `issue_type`, assignee, owner, `created_at`, `updated_at`, `closed_at`, `due_at`, `defer_until`, notes, `external_ref`
+          
+          Default: id, title, status, priority, `issue_type`, assignee, `created_at`, `updated_at`
+
+      --db <DB>
+          Database path (auto-discover .beads/*.db if not set)
+
+      --actor <ACTOR>
+          Actor name for audit trail
+
+      --json
+          Output as JSON
+
+      --no-daemon
+          Force direct mode (no daemon) - effectively no-op in br v1
+
+      --no-auto-flush
+          Skip auto JSONL export
+
+      --no-auto-import
+          Skip auto import check
+
+      --allow-stale
+          Allow stale DB (bypass freshness check warning)
+
+      --lock-timeout <LOCK_TIMEOUT>
+          `SQLite` busy timeout in ms
+
+      --no-db
+          JSONL-only mode (no DB connection)
+
+  -v, --verbose...
+          Increase logging verbosity (-v, -vv)
+
+  -q, --quiet
+          Quiet mode (no output except errors)
+
+      --no-color
+          Disable colored output
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -1,0 +1,3 @@
+{"name":"ready_toon","cmd":"br ready --format toon --limit 10","stdout_format":"toon","decode_cmd":"tru --decode","schema_cmd":"br schema ready-issue --format json","notes":"Token-efficient list of actionable issues."}
+{"name":"show_json","cmd":"br show bd-XXXX --format json","stdout_format":"json","schema_cmd":"br schema issue-details --format json","notes":"Detailed issue view (relations/comments included when present)."}
+{"name":"error_envelope","cmd":"br show bd-NOTEXIST --format json > /dev/null 2>err.json || true","stdout_format":"(none)","stderr_format":"json","schema_cmd":"br schema error --format json","notes":"Many errors are emitted as a structured JSON envelope on stderr; capture stderr separately."}

@@ -1,0 +1,72 @@
+Emit JSON Schemas for br output types (for agent/tooling integration)
+
+Usage: br schema [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]
+          Which schema to emit
+
+          Possible values:
+          - all:               Emit a bundle containing all schemas
+          - issue:             Core Issue object (used by many commands)
+          - issue-with-counts: List/search row: Issue + dependency/dependent counts
+          - issue-details:     Show view: Issue + relations/comments/events
+          - ready-issue:       Ready list row
+          - stale-issue:       Stale list row
+          - blocked-issue:     Blocked list row
+          - tree-node:         Dependency tree node
+          - statistics:        Stats output
+          - error:             Structured error envelope (stderr JSON when robot mode or non-TTY)
+          
+          [default: all]
+
+Options:
+      --format <FORMAT>
+          Output format (text, json, toon)
+
+          Possible values:
+          - text: Human-readable text (default)
+          - json: JSON output
+          - toon: TOON format (token-optimized object notation)
+
+      --stats
+          Show token savings stats when using TOON output
+
+      --db <DB>
+          Database path (auto-discover .beads/*.db if not set)
+
+      --actor <ACTOR>
+          Actor name for audit trail
+
+      --json
+          Output as JSON
+
+      --no-daemon
+          Force direct mode (no daemon) - effectively no-op in br v1
+
+      --no-auto-flush
+          Skip auto JSONL export
+
+      --no-auto-import
+          Skip auto import check
+
+      --allow-stale
+          Allow stale DB (bypass freshness check warning)
+
+      --lock-timeout <LOCK_TIMEOUT>
+          `SQLite` busy timeout in ms
+
+      --no-db
+          JSONL-only mode (no DB connection)
+
+  -v, --verbose...
+          Increase logging verbosity (-v, -vv)
+
+  -q, --quiet
+          Quiet mode (no output except errors)
+
+      --no-color
+          Disable colored output
+
+  -h, --help
+          Print help (see a summary with '-h')

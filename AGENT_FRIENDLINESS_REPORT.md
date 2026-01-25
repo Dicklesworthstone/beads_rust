@@ -1,175 +1,72 @@
 # Agent-Friendliness Report: br (beads_rust)
 
-**Bead ID**: bd-3s2 (re-underwriting)
-**Date**: 2026-01-25
-**Agent**: Claude Opus 4.5
+Bead: bd-3s2 (re-underwriting)
+Audit date: 2026-01-25
+Auditor: WildAnchor (Codex / GPT-5)
 
 ## Executive Summary
 
-**Status: EXCELLENT AGENT-FRIENDLINESS MATURITY**
+br is already strongly agent-friendly (non-invasive CLI + machine outputs), and now has a clear
+schema surface plus token-efficient TOON output for many read commands.
 
-br is the agent-first issue tracker optimized for AI coding agents:
-- `--format json` flag across all commands
-- `--robot` alias for JSON output
-- Comprehensive subcommand structure with 30+ commands
-- Comprehensive AGENTS.md documentation (26KB)
+Recent work (this repo):
 
-## 1. Current State Assessment
+- Added agent-first doc entrypoints: `docs/agent/`
+- Captured a baseline snapshot pack: `agent_baseline/`
+- Added machine-readable artifacts: `ROBOT_MODE_EXAMPLES.jsonl`, `CLI_SCHEMA.json`
+- Added agent smoke tests: `scripts/agent_smoke_test.sh`
+- Removed `rm -rf` usage from local scripts/tests to comply with the no-deletion policy in `AGENTS.md`
 
-### 1.1 Robot Mode Support
+## Current Agent Surfaces
 
-| Feature | Status | Details |
-|---------|--------|---------|
-| `--format` flag | YES | json output format |
-| `--robot` alias | YES | Alias for `--format json` |
-| `--json` flag | YES | Some commands support this |
-| JSONL export | YES | `sync` command for JSONL |
-| TOON integration | NO | Planned in TOON_INTEGRATION_BRIEF |
+### Machine output formats
 
-### 1.2 Key Commands
+- JSON: `--json` (global) or `--format json` (command-level when supported)
+- TOON: `--format toon` (decode via `tru --decode`)
+- Default format (if you omit `--format`/`--json`): `BR_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT`
 
-| Command | Purpose |
-|---------|---------|
-| `create` | Create a new issue |
-| `q` | Quick capture (minimal output) |
-| `list` | List issues |
-| `show` | Show issue details |
-| `update` | Update an issue |
-| `close` | Close an issue |
-| `ready` | List ready (unblocked) issues |
-| `blocked` | List blocked issues |
-| `search` | Search issues |
-| `stats` | Show project statistics |
-| `doctor` | Run diagnostics |
-| `sync` | Sync with JSONL file |
-| `audit` | Record agent interactions |
+### Schema surface
 
-### 1.3 Output Structure (list)
+br can emit JSON Schemas for primary machine outputs:
 
-```json
-[
-  {
-    "id": "bd-xxx",
-    "title": "Issue title",
-    "description": "...",
-    "status": "open",
-    "priority": 1,
-    "issue_type": "task",
-    "created_at": "2026-01-22T18:20:47Z",
-    "created_by": "ubuntu",
-    "labels": ["label1", "label2"]
-  }
-]
-```
-
-### 1.4 Agent-Focused Features
-
-- `q` command: Quick capture with minimal output
-- `audit` command: Record agent interactions
-- `ready`/`blocked`: Filter issues by actionability
-- `sync --flush-only`: Export without import
-
-## 2. Documentation Assessment
-
-### 2.1 AGENTS.md
-
-**Status**: EXISTS and comprehensive (26KB)
-
-Contains:
-- Rule 1: Absolute file deletion protection
-- Rust toolchain guidelines
-- SQLite + JSONL sync patterns
-- Dependency management
-- VCS integration
-
-### 2.2 Additional Documentation
-
-- README.md: 23KB comprehensive guide
-- TOON_INTEGRATION_BRIEF.md: 13KB integration plan
-- RESEARCH_FINDINGS.md: 5KB TOON analysis
-- VCS_INTEGRATION.md: Git integration
-
-## 3. Scorecard
-
-| Dimension | Score (1-5) | Notes |
-|-----------|-------------|-------|
-| Documentation | 5 | Comprehensive AGENTS.md |
-| CLI Ergonomics | 5 | 30+ focused commands |
-| Robot Mode | 5 | Excellent JSON support |
-| Error Handling | 5 | Structured errors |
-| Consistency | 5 | Unified output format |
-| Zero-shot Usability | 5 | Doctor + ready commands |
-| **Overall** | **5.0** | Exceptional maturity |
-
-## 4. TOON Integration Status
-
-**Status: PLANNED, NOT YET IMPLEMENTED**
-
-From TOON_INTEGRATION_BRIEF.md:
-- `--format toon` flag planned
-- `BR_OUTPUT_FORMAT` env variable planned
-- Expected significant token savings
-
-## 5. Recommendations
-
-### 5.1 High Priority (P1)
-
-None - br is already exceptionally agent-friendly
-
-### 5.2 Medium Priority (P2)
-
-1. Implement TOON integration
-2. Add `BR_OUTPUT_FORMAT` environment variable
-
-### 5.3 Low Priority (P3)
-
-1. Add schema export option
-2. Document exit codes
-
-## 6. Agent Usage Patterns
-
-### List Issues with JSON
 ```bash
-br list --format json
+br schema all --format json
+br schema issue-details --format json
+br schema error --format json
 ```
 
-### Create Issue (Quick)
+TOON is also supported:
+
 ```bash
-br q "Fix the bug"  # Returns just the ID
+br schema all --format toon
 ```
 
-### Show Ready Issues
+### Error envelope
+
+Many failures emit a structured JSON error object on stderr. A canonical example is captured in:
+
+- `agent_baseline/errors/show_not_found.json`
+
+And the machine schema is available via:
+
 ```bash
-br ready --format json
+br schema error --format json
 ```
 
-### Update Status
-```bash
-br update bd-xxx --status in_progress --format json
-```
+## Gaps / Next Improvements
 
-### Run Diagnostics
-```bash
-br doctor --format json
-```
+- No dynamic `--help-json` surface yet; `CLI_SCHEMA.json` is an interim static artifact.
+- Many commands return bare arrays/objects rather than a consistent `{data, metadata, errors}` envelope.
+- Schema outputs include `generated_at` (useful, but not deterministic byte-for-byte).
 
-## 7. Unique Agent-Friendly Features
+## Scorecard (1-5)
 
-1. **Quick Capture**: `br q` for minimal output
-2. **Ready/Blocked**: Filter by actionability
-3. **Audit Trail**: Record agent interactions
-4. **JSONL Sync**: Git-syncable storage
-5. **Tombstones**: Soft deletes preserve history
-
-## 8. Conclusion
-
-br demonstrates exceptional agent-friendliness as the foundational issue tracker for agents:
-- Comprehensive JSON output
-- Quick capture for automation
-- Ready/blocked filtering
-- Audit trail for accountability
-
-Score: **5.0/5** - Exceptional maturity, gold standard for agent task tracking.
-
----
-*Generated by Claude Opus 4.5 during agent-friendly re-underwriting*
+| Dimension | Score | Notes |
+|----------:|:-----:|-------|
+| Documentation | 5 | Root `AGENTS.md` + agent-first entrypoints under `docs/agent/` |
+| CLI ergonomics | 5 | Task-focused commands; consistent flags across major read flows |
+| Robot/machine mode | 5 | JSON everywhere; TOON for many read commands |
+| Schemas | 4 | `br schema` exists; TOON key folding is documented |
+| Errors | 4 | Structured envelope w/ hints; stderr routing needs care when piping |
+| Consistency | 4 | Some commands also have `--robot`; others rely on `--json`/`--format` |
+| Overall | 4.5 | High maturity; remaining work is mostly polish/consistency |

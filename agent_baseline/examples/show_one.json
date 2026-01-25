@@ -1,0 +1,15 @@
+[
+  {
+    "id": "bd-vgf",
+    "title": "Two",
+    "status": "open",
+    "priority": 0,
+    "issue_type": "bug",
+    "created_at": "2026-01-25T16:39:26.217202643Z",
+    "created_by": "ubuntu",
+    "updated_at": "2026-01-25T16:39:26.217202643Z",
+    "source_repo": ".",
+    "compaction_level": 0,
+    "original_size": 0
+  }
+]

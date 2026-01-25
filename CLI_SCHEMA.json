@@ -1,0 +1,78 @@
+{
+  "tool": "br",
+  "repo": "beads_rust",
+  "purpose": "Agent-first issue tracker (SQLite + JSONL).",
+  "entrypoints": {
+    "binary": "br",
+    "agent_docs": [
+      "AGENTS.md",
+      "docs/agent/QUICKSTART.md",
+      "docs/agent/ROBOT_MODE.md",
+      "docs/agent/SCHEMA.md",
+      "docs/agent/ERRORS.md",
+      "docs/agent/EXAMPLES.md"
+    ],
+    "deep_docs": [
+      "docs/CLI_REFERENCE.md",
+      "docs/AGENT_INTEGRATION.md"
+    ]
+  },
+  "global_flags": [
+    {
+      "flag": "--json",
+      "type": "bool",
+      "notes": "Force machine-readable JSON output (overrides --format)."
+    },
+    {
+      "flag": "--no-color",
+      "type": "bool",
+      "notes": "Disable ANSI styling in text output."
+    },
+    {
+      "flag": "--quiet",
+      "type": "bool",
+      "notes": "Minimize output (errors only)."
+    }
+  ],
+  "format_env": {
+    "BR_OUTPUT_FORMAT": {
+      "values": [
+        "text",
+        "json",
+        "toon",
+        "csv"
+      ],
+      "notes": "Highest precedence default output format when --format/--json not provided."
+    },
+    "TOON_DEFAULT_FORMAT": {
+      "values": [
+        "text",
+        "json",
+        "toon",
+        "csv"
+      ],
+      "notes": "Fallback default output format when BR_OUTPUT_FORMAT is not set."
+    }
+  },
+  "schema_surface": {
+    "supported": true,
+    "command": "br schema all --format json",
+    "targets": [
+      "all",
+      "issue",
+      "issue-with-counts",
+      "issue-details",
+      "ready-issue",
+      "stale-issue",
+      "blocked-issue",
+      "tree-node",
+      "statistics",
+      "error"
+    ]
+  },
+  "output_notes": [
+    "Prefer `--format json` (or `--json`) for parsing.",
+    "Prefer `--format toon` for token-efficient outputs; decode with `tru --decode` when needed.",
+    "Errors may be emitted as structured JSON on stderr."
+  ]
+}

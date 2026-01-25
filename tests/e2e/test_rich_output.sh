@@ -29,7 +29,9 @@ log "br version: $(br version --json 2>/dev/null | jq -r '.version' || br versio
 TESTDIR=$(mktemp -d)
 cd "$TESTDIR"
 log "Test directory: $TESTDIR"
-trap 'rm -rf "$TESTDIR"' EXIT
+# NOTE: We intentionally do not delete this directory automatically.
+# Agents on this machine must not run destructive filesystem commands (including rm -rf)
+# without explicit user approval in-session. Leave the workspace behind for inspection.
 
 # Test 1: Init
 log_section "TEST 1: Initialize workspace"
@@ -95,4 +97,5 @@ log "✓ Stats command works"
 
 log_section "E2E TEST COMPLETE"
 log "All tests passed"
+log "NOTE: Test workspace left in place at: $TESTDIR"
 log "Full log: $LOG_FILE"

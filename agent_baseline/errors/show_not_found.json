@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "ISSUE_NOT_FOUND",
+    "message": "Issue not found: bd-NOTEXIST",
+    "hint": "Run 'br list' to see available issues.",
+    "retryable": false,
+    "context": {
+      "searched_id": "bd-NOTEXIST"
+    }
+  }
+}
