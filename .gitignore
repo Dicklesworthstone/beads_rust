@@ -60,3 +60,8 @@ rustc-ice-*.txt
 *.snap.new
 sweep_*.png
 test_screenshot.png
+
+# Nix build outputs (keep flake.lock - it should be committed)
+result
+result-*
+.direnv/
