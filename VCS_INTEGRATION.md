@@ -51,6 +51,18 @@ br sync --import-only
 
 For more detail, see the README FAQ on JSONL conflicts.
 
+## Ignore Files (Equivalents)
+
+These are the usual ignore mechanisms for each VCS. Verify in your environment.
+
+| VCS | Ignore file |
+|-----|-------------|
+| Git | `.gitignore` |
+| Mercurial | `.hgignore` |
+| Jujutsu | `.gitignore` (git-compatible working copy) |
+| Perforce | `.p4ignore` (or `P4IGNORE` env) |
+| Sapling | `.gitignore` / `.hgignore` (Sapling honors git/hg ignore files) |
+
 ---
 
 ## Mercurial (hg)
@@ -60,11 +72,11 @@ For more detail, see the README FAQ on JSONL conflicts.
 | Stage `.beads/` changes | `hg add .beads/` |
 | Check status | `hg status .beads/` |
 | Inspect JSONL diff | `hg diff .beads/issues.jsonl` |
-| Resolve JSONL conflicts | edit file → `hg resolve -m .beads/issues.jsonl` |
+| Resolve JSONL conflicts | edit file -> `hg resolve -m .beads/issues.jsonl` |
 
 ## Jujutsu (jj)
 
-jj is snapshot-based; there is no explicit “add” step for tracked files.
+jj is snapshot-based; there is no explicit "add" step for tracked files.
 
 | Task | Command |
 |------|---------|
@@ -79,7 +91,7 @@ jj is snapshot-based; there is no explicit “add” step for tracked files.
 | Open/add/edit `.beads/` | `p4 reconcile //.../.beads/...` |
 | Check status | `p4 status //.../.beads/...` |
 | Inspect JSONL diff | `p4 diff //.../.beads/issues.jsonl` |
-| Resolve JSONL conflicts | edit file → `p4 resolve //.../.beads/issues.jsonl` |
+| Resolve JSONL conflicts | edit file -> `p4 resolve //.../.beads/issues.jsonl` |
 
 ## Sapling (sl)
 
@@ -90,4 +102,4 @@ Sapling uses hg-like commands via the `sl` CLI.
 | Stage `.beads/` changes | `sl add .beads/` |
 | Check status | `sl status .beads/` |
 | Inspect JSONL diff | `sl diff .beads/issues.jsonl` |
-| Resolve JSONL conflicts | edit file → `sl resolve -m .beads/issues.jsonl` |
+| Resolve JSONL conflicts | edit file -> `sl resolve -m .beads/issues.jsonl` |
