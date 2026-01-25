@@ -159,6 +159,10 @@ JSON mode guarantees:
 - Clean stdout (diagnostics go to stderr)
 - Exit codes for success/failure
 
+Schema discovery:
+- `br schema all --format json` emits JSON Schema documents for the main robot outputs
+- `br schema issue-details --format toon` for token-efficient schema viewing
+
 ### Rich Output Features
 
 In Rich mode, br provides enhanced terminal output:
