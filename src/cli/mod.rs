@@ -514,7 +514,7 @@ pub struct SchemaArgs {
     #[arg(value_enum, default_value_t)]
     pub target: SchemaTarget,
 
-    /// Output format (text, json, toon)
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
@@ -737,7 +737,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub wrap: bool,
 
-    /// Output format (text, json, csv)
+    /// Output format (text, json, csv, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
 
@@ -772,7 +772,7 @@ pub struct ShowArgs {
     /// Issue IDs
     pub ids: Vec<String>,
 
-    /// Output format (text, json, toon)
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
@@ -865,7 +865,7 @@ pub struct DepListArgs {
     #[arg(long = "type", short = 't')]
     pub dep_type: Option<String>,
 
-    /// Output format (text, json, toon)
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
@@ -1249,7 +1249,7 @@ pub struct ReadyArgs {
     #[arg(long)]
     pub wrap: bool,
 
-    /// Output format (text, json, toon)
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
@@ -1285,7 +1285,7 @@ pub struct BlockedArgs {
     #[arg(long, short = 'l')]
     pub label: Vec<String>,
 
-    /// Output format (text, json, toon)
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
@@ -1491,7 +1491,7 @@ pub struct StatsArgs {
     #[arg(long, default_value_t = 24)]
     pub activity_hours: u32,
 
-    /// Output format (text, json, toon)
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
