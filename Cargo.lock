@@ -3728,6 +3728,7 @@ dependencies = [
 [[package]]
 name = "toon_rust"
 version = "0.1.1"
+source = "git+https://github.com/Dicklesworthstone/toon_rust.git?rev=788589d#788589d7b11a8bf2c88e364befe63d87eb890eba"
 dependencies = [
  "anyhow",
  "chrono",
