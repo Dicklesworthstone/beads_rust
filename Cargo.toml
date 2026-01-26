@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 # Terminal
 indicatif = "0.18"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Rich terminal output (sibling project)
 # Pinned to commit with let_chains fix for Rust 1.88+ compatibility
