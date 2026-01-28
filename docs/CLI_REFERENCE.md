@@ -328,6 +328,33 @@ br claim bd-abc123 --ttl 900
 
 ---
 
+### lease-sweep
+
+Sweep expired leases and mark stale/orphaned states.
+
+```bash
+br lease-sweep [OPTIONS]
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--daemon` | Run continuously on an interval |
+| `--interval <SECONDS>` | Sweep interval in seconds (default: 300) |
+| `--stale-after <MINUTES>` | Minutes after expiration to mark `stale:heartbeat` (default: 30) |
+| `--orphan-after <MINUTES>` | Minutes after expiration to mark `orphaned` and release lease (default: 60) |
+
+**Examples:**
+```bash
+# Run once (default thresholds)
+br lease-sweep
+
+# Run every 5 minutes
+br lease-sweep --daemon --interval 300
+```
+
+---
+
 ### close
 
 Close one or more issues.

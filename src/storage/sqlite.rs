@@ -5,7 +5,7 @@ use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
 use crate::storage::events::get_events;
 use crate::storage::schema::apply_schema;
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -16,6 +16,21 @@ use std::time::Duration;
 #[derive(Debug)]
 pub struct SqliteStorage {
     conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeaseSweepCandidate {
+    pub id: String,
+    pub assignee: Option<String>,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LeaseSweepSummary {
+    pub expired: usize,
+    pub stale_marked: usize,
+    pub orphaned_marked: usize,
+    pub reclaimed_leases: usize,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -1839,6 +1854,82 @@ impl SqliteStorage {
 
             Ok(())
         })
+    }
+
+    /// List issues with expired leases.
+    fn list_expired_leases(&self, now: DateTime<Utc>) -> Result<Vec<LeaseSweepCandidate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, assignee, lease_expires_at
+             FROM issues
+             WHERE lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?
+               AND status NOT IN ('closed', 'tombstone')",
+        )?;
+
+        let rows = stmt
+            .query_map([now.to_rfc3339()], |row| {
+                let expires_at: String = row.get(2)?;
+                Ok(LeaseSweepCandidate {
+                    id: row.get(0)?,
+                    assignee: Self::empty_to_none(row.get::<_, Option<String>>(1)?),
+                    lease_expires_at: parse_datetime(&expires_at),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
+    /// Sweep expired leases and mark stale/orphaned states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if database operations fail.
+    pub fn sweep_expired_leases(
+        &mut self,
+        actor: &str,
+        now: DateTime<Utc>,
+        stale_after: ChronoDuration,
+        orphan_after: ChronoDuration,
+    ) -> Result<LeaseSweepSummary> {
+        let candidates = self.list_expired_leases(now)?;
+        let mut summary = LeaseSweepSummary {
+            expired: candidates.len(),
+            ..LeaseSweepSummary::default()
+        };
+
+        for candidate in candidates {
+            let age = now - candidate.lease_expires_at;
+
+            if age < stale_after {
+                continue;
+            }
+
+            if age >= orphan_after {
+                let update = IssueUpdate {
+                    assignee: if candidate.assignee.is_some() {
+                        Some(None)
+                    } else {
+                        None
+                    },
+                    lease_owner: Some(None),
+                    lease_id: Some(None),
+                    lease_expires_at: Some(None),
+                    lease_heartbeat_at: Some(None),
+                    ..Default::default()
+                };
+
+                self.update_issue(&candidate.id, &update, actor)?;
+                let _ = self.add_label(&candidate.id, "orphaned", actor)?;
+
+                summary.orphaned_marked += 1;
+                summary.reclaimed_leases += 1;
+            } else if self.add_label(&candidate.id, "stale:heartbeat", actor)? {
+                summary.stale_marked += 1;
+            }
+        }
+
+        Ok(summary)
     }
 
     /// Remove a dependency link.

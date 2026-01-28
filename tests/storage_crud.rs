@@ -8,7 +8,7 @@ mod common;
 
 use beads_rust::error::BeadsError;
 use beads_rust::model::{DependencyType, EventType, Issue, IssueType, Priority, Status};
-use beads_rust::storage::{IssueUpdate, SqliteStorage};
+use beads_rust::storage::{IssueUpdate, LeaseSweepSummary, SqliteStorage};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
 
@@ -425,6 +425,123 @@ fn claim_issue_conflict_when_lease_active_for_other_owner() {
         }
         _ => panic!("expected LeaseConflict"),
     }
+}
+
+// ============================================================================
+// LEASE SWEEP TESTS
+// ============================================================================
+
+#[test]
+fn sweep_expired_leases_marks_stale() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("lease-sweep-stale");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let now = Utc::now();
+    let expired_at = now - Duration::minutes(31);
+    let update = IssueUpdate {
+        lease_owner: Some(Some("alice".to_string())),
+        lease_id: Some(Some("lease-stale".to_string())),
+        lease_expires_at: Some(Some(expired_at)),
+        lease_heartbeat_at: Some(Some(expired_at)),
+        ..Default::default()
+    };
+    storage.update_issue(&issue.id, &update, "tester").unwrap();
+
+    let summary = storage
+        .sweep_expired_leases("sweeper", now, Duration::minutes(30), Duration::minutes(60))
+        .unwrap();
+    assert_eq!(
+        summary,
+        LeaseSweepSummary {
+            expired: 1,
+            stale_marked: 1,
+            orphaned_marked: 0,
+            reclaimed_leases: 0
+        }
+    );
+
+    let details = storage
+        .get_issue_details(&issue.id, false, false, 0)
+        .unwrap()
+        .expect("issue exists");
+    assert!(details.labels.contains(&"stale:heartbeat".to_string()));
+}
+
+#[test]
+fn sweep_expired_leases_marks_orphaned_and_reclaims() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("lease-sweep-orphaned");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let now = Utc::now();
+    let expired_at = now - Duration::minutes(70);
+    let update = IssueUpdate {
+        assignee: Some(Some("bob".to_string())),
+        lease_owner: Some(Some("bob".to_string())),
+        lease_id: Some(Some("lease-orphan".to_string())),
+        lease_expires_at: Some(Some(expired_at)),
+        lease_heartbeat_at: Some(Some(expired_at)),
+        ..Default::default()
+    };
+    storage.update_issue(&issue.id, &update, "tester").unwrap();
+
+    let summary = storage
+        .sweep_expired_leases("sweeper", now, Duration::minutes(30), Duration::minutes(60))
+        .unwrap();
+    assert_eq!(
+        summary,
+        LeaseSweepSummary {
+            expired: 1,
+            stale_marked: 0,
+            orphaned_marked: 1,
+            reclaimed_leases: 1
+        }
+    );
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert!(retrieved.assignee.is_none());
+    assert!(retrieved.lease_owner.is_none());
+    assert!(retrieved.lease_id.is_none());
+    assert!(retrieved.lease_expires_at.is_none());
+    assert!(retrieved.lease_heartbeat_at.is_none());
+
+    let details = storage
+        .get_issue_details(&issue.id, false, false, 0)
+        .unwrap()
+        .expect("issue exists");
+    assert!(details.labels.contains(&"orphaned".to_string()));
+}
+
+#[test]
+fn sweep_expired_leases_skips_recent_expiry() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("lease-sweep-recent");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let now = Utc::now();
+    let expired_at = now - Duration::minutes(10);
+    let update = IssueUpdate {
+        lease_owner: Some(Some("alice".to_string())),
+        lease_id: Some(Some("lease-recent".to_string())),
+        lease_expires_at: Some(Some(expired_at)),
+        lease_heartbeat_at: Some(Some(expired_at)),
+        ..Default::default()
+    };
+    storage.update_issue(&issue.id, &update, "tester").unwrap();
+
+    let summary = storage
+        .sweep_expired_leases("sweeper", now, Duration::minutes(30), Duration::minutes(60))
+        .unwrap();
+    assert_eq!(summary.expired, 1);
+    assert_eq!(summary.stale_marked, 0);
+    assert_eq!(summary.orphaned_marked, 0);
+
+    let details = storage
+        .get_issue_details(&issue.id, false, false, 0)
+        .unwrap()
+        .expect("issue exists");
+    assert!(details.labels.is_empty());
 }
 
 #[test]

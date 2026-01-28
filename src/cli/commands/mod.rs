@@ -19,6 +19,7 @@ pub mod history;
 pub mod info;
 pub mod init;
 pub mod label;
+pub mod lease_sweep;
 pub mod lint;
 pub mod list;
 pub mod orphans;

@@ -13,8 +13,7 @@ pub const DEFAULT_LEASE_TTL_SECS: i64 = 30 * 60;
 pub fn generate_lease_id() -> String {
     let mut bytes = [0_u8; 16];
     let mut rng = OsRng;
-    rng.try_fill_bytes(&mut bytes)
-        .expect("OS RNG unavailable");
+    rng.try_fill_bytes(&mut bytes).expect("OS RNG unavailable");
 
     let mut out = String::with_capacity(32);
     for b in bytes {

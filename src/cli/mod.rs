@@ -97,6 +97,8 @@ pub enum Commands {
 
     /// Claim an issue lease
     Claim(ClaimArgs),
+    /// Sweep expired leases and mark stale/orphaned
+    LeaseSweep(LeaseSweepArgs),
 
     /// Close an issue
     Close(CloseArgs),
@@ -477,6 +479,26 @@ pub struct ClaimArgs {
     /// Optional lease ID override (single-issue only)
     #[arg(long)]
     pub lease_id: Option<String>,
+}
+
+/// Sweep expired leases and mark stale/orphaned.
+#[derive(Args, Debug, Default)]
+pub struct LeaseSweepArgs {
+    /// Run continuously on an interval
+    #[arg(long)]
+    pub daemon: bool,
+
+    /// Sweep interval in seconds (daemon mode)
+    #[arg(long = "interval", default_value_t = 300)]
+    pub interval_seconds: u64,
+
+    /// Minutes after expiration to mark stale
+    #[arg(long = "stale-after", default_value_t = 30)]
+    pub stale_after_minutes: i64,
+
+    /// Minutes after expiration to mark orphaned
+    #[arg(long = "orphan-after", default_value_t = 60)]
+    pub orphan_after_minutes: i64,
 }
 
 #[derive(Args, Debug)]

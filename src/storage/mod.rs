@@ -16,4 +16,6 @@ pub mod events;
 pub mod schema;
 pub mod sqlite;
 
-pub use sqlite::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+pub use sqlite::{
+    IssueUpdate, LeaseSweepSummary, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage,
+};
