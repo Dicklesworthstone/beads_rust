@@ -134,7 +134,7 @@ impl FullReport {
 
     pub fn slowest_tests(&self, limit: usize) -> Vec<&TestReport> {
         let mut all_tests: Vec<_> = self.suites.iter().flat_map(|s| s.tests.iter()).collect();
-        all_tests.sort_by(|a, b| b.total_duration_ms.cmp(&a.total_duration_ms));
+        all_tests.sort_by_key(|b| std::cmp::Reverse(b.total_duration_ms));
         all_tests.into_iter().take(limit).collect()
     }
 

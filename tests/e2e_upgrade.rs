@@ -361,9 +361,7 @@ fn e2e_upgrade_feature_enabled() {
 
 /// Helper to check if full upgrade tests are enabled via environment variable.
 fn full_upgrade_tests_enabled() -> bool {
-    std::env::var("BR_TEST_FULL_UPGRADE")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
-        .unwrap_or(false)
+    std::env::var("BR_TEST_FULL_UPGRADE").is_ok_and(|v| v == "1" || v.to_lowercase() == "true")
 }
 
 /// Helper to copy the br binary to an isolated temp directory.

@@ -237,9 +237,7 @@ impl Default for RunnerPolicy {
             // Default to number of CPUs, capped at 8
             max_parallel_workers: parse_env_usize(
                 "HARNESS_PARALLEL_WORKERS",
-                std::thread::available_parallelism()
-                    .map(|p| p.get().min(8))
-                    .unwrap_or(4),
+                std::thread::available_parallelism().map_or(4, |p| p.get().min(8)),
             ),
             guardrails: ResourceGuardrails::default(),
             fail_fast: std::env::var("HARNESS_FAIL_FAST").is_ok_and(|v| v == "1"),

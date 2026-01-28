@@ -220,7 +220,7 @@ fn execute_summary(
     }
 
     let mut actors: Vec<_> = actor_map.into_values().collect();
-    actors.sort_by(|a, b| b.total.cmp(&a.total));
+    actors.sort_by_key(|b| std::cmp::Reverse(b.total));
 
     if ctx.is_json() {
         let output = AuditSummaryOutput {

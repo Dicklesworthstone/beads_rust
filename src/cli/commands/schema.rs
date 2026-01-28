@@ -44,6 +44,12 @@ struct SchemaOutput {
     schemas: BTreeMap<&'static str, RootSchema>,
 }
 
+/// Execute the schema command to generate JSON Schema documents.
+///
+/// # Errors
+///
+/// Returns an error if output cannot be written.
+#[allow(clippy::missing_panics_doc)]
 pub fn execute(
     args: &SchemaArgs,
     cli: &config::CliOverrides,

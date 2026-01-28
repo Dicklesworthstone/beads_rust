@@ -204,7 +204,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
     }
 
     // Sort newest first
-    backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    backups.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
     Ok(backups)
 }
@@ -275,7 +275,7 @@ pub fn prune_backups(
     let mut backups = list_backups(history_dir, None)?;
 
     // Sort by timestamp descending (newest first)
-    backups.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    backups.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
 
     let mut deleted_count = 0;
 

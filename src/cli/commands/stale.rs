@@ -234,7 +234,7 @@ mod tests {
             .filter(|i| i.updated_at < threshold)
             .collect();
         // Sort by updated_at ascending (oldest first)
-        stale.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        stale.sort_by_key(|a| a.updated_at);
         stale
     }
 

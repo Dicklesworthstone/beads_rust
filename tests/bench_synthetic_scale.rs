@@ -308,8 +308,8 @@ impl SyntheticDataset {
         let jsonl_path = beads_dir.join("issues.jsonl");
         let db_path = beads_dir.join("beads.db");
 
-        let jsonl_size_bytes = fs::metadata(&jsonl_path).map(|m| m.len()).unwrap_or(0);
-        let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let jsonl_size_bytes = fs::metadata(&jsonl_path).map_or(0, |m| m.len());
+        let db_size_bytes = fs::metadata(&db_path).map_or(0, |m| m.len());
 
         let metrics = GenerationMetrics {
             issue_count: created_count,
@@ -563,7 +563,7 @@ fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticB
     ));
 
     // Measure export size (captured for future use in metrics)
-    let _export_size = fs::metadata(&export_path).map(|m| m.len()).unwrap_or(0);
+    let _export_size = fs::metadata(&export_path).map_or(0, |m| m.len());
 
     // Calculate summary
     let total_duration_ms = start.elapsed().as_millis();

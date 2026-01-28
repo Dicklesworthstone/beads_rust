@@ -341,7 +341,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     }
 
     // Sort components by size (largest first)
-    components.sort_by(|a, b| b.nodes.len().cmp(&a.nodes.len()));
+    components.sort_by_key(|b| std::cmp::Reverse(b.nodes.len()));
 
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
 

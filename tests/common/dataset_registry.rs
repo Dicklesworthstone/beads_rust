@@ -170,8 +170,8 @@ impl DatasetRegistry {
             ));
         }
 
-        let jsonl_size_bytes = fs::metadata(&jsonl_path).map(|m| m.len()).unwrap_or(0);
-        let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let jsonl_size_bytes = fs::metadata(&jsonl_path).map_or(0, |m| m.len());
+        let db_size_bytes = fs::metadata(&db_path).map_or(0, |m| m.len());
 
         let issue_count = count_jsonl_lines(&jsonl_path).unwrap_or(0);
         let dependency_count = count_dependencies(&jsonl_path).unwrap_or(0);
@@ -267,8 +267,8 @@ impl IsolatedDataset {
         let jsonl_path = beads_dir.join("issues.jsonl");
         let db_path = beads_dir.join("beads.db");
 
-        let jsonl_size_bytes = fs::metadata(&jsonl_path).map(|m| m.len()).unwrap_or(0);
-        let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let jsonl_size_bytes = fs::metadata(&jsonl_path).map_or(0, |m| m.len());
+        let db_size_bytes = fs::metadata(&db_path).map_or(0, |m| m.len());
         let issue_count = count_jsonl_lines(&jsonl_path).unwrap_or(0);
         let dependency_count = count_dependencies(&jsonl_path).unwrap_or(0);
         let content_hash = hash_beads_directory(&beads_dir)?;
@@ -533,8 +533,8 @@ pub fn isolated_from_override(
     let jsonl_path = beads_dir.join("issues.jsonl");
     let db_path = beads_dir.join("beads.db");
 
-    let jsonl_size_bytes = fs::metadata(&jsonl_path).map(|m| m.len()).unwrap_or(0);
-    let db_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let jsonl_size_bytes = fs::metadata(&jsonl_path).map_or(0, |m| m.len());
+    let db_size_bytes = fs::metadata(&db_path).map_or(0, |m| m.len());
     let issue_count = count_jsonl_lines(&jsonl_path).unwrap_or(0);
     let dependency_count = count_dependencies(&jsonl_path).unwrap_or(0);
     let content_hash = hash_beads_directory(&beads_dir)?;

@@ -594,9 +594,7 @@ pub fn update_baselines_from_results(
 
 /// Check if baseline update is requested via environment.
 pub fn should_update_baseline() -> bool {
-    env::var("BENCH_UPDATE_BASELINE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env::var("BENCH_UPDATE_BASELINE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 #[cfg(test)]

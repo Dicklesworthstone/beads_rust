@@ -201,7 +201,7 @@ fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
 fn render_epic_status(epic_status: &EpicStatus, use_color: bool) {
     let total = epic_status.total_children;
     let closed = epic_status.closed_children;
-    let percentage = if total > 0 { (closed * 100) / total } else { 0 };
+    let percentage = (closed * 100).checked_div(total).unwrap_or(0);
     let status_icon = render_status_icon(epic_status.eligible_for_close, percentage, use_color);
 
     let id = if use_color {
@@ -266,7 +266,7 @@ fn render_epic_status_list_rich(epics: &[EpicStatus], ctx: &OutputContext) {
 
         let total = epic_status.total_children;
         let closed = epic_status.closed_children;
-        let percentage = if total > 0 { (closed * 100) / total } else { 0 };
+        let percentage = (closed * 100).checked_div(total).unwrap_or(0);
 
         // Status icon
         if epic_status.eligible_for_close {
@@ -312,11 +312,7 @@ fn render_progress_bar(
     theme: &crate::output::Theme,
 ) {
     let bar_width = 20;
-    let filled = if total > 0 {
-        (closed * bar_width) / total
-    } else {
-        0
-    };
+    let filled = (closed * bar_width).checked_div(total).unwrap_or(0);
     let empty = bar_width - filled;
 
     content.append_styled("[", theme.dimmed.clone());

@@ -302,7 +302,7 @@ fn try_drop_caches() -> bool {
             .arg("echo 3 > /proc/sys/vm/drop_caches 2>/dev/null")
             .output();
 
-        drop.map(|o| o.status.success()).unwrap_or(false)
+        drop.is_ok_and(|o| o.status.success())
     }
 
     #[cfg(not(target_os = "linux"))]

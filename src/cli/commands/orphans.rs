@@ -234,8 +234,7 @@ fn is_git_repo() -> bool {
     Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Get git commit references containing issue IDs.
