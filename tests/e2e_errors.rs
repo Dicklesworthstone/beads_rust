@@ -1249,20 +1249,17 @@ fn e2e_validation_special_characters_in_label() {
         );
     }
 
-    // Remove labels for next test
-    let clear = run_br(
-        &workspace,
-        ["update", &id, "--clear-labels"],
-        "clear_labels",
-    );
-    assert!(clear.status.success());
+    // Create a new issue for testing invalid labels (to avoid label conflict)
+    let create2 = run_br(&workspace, ["create", "Test issue 2"], "create2");
+    assert!(create2.status.success());
+    let id2 = parse_created_id(&create2.stdout);
 
     // Invalid labels (special characters not allowed)
     let invalid_labels = ["@mention", "has/slash", "with.dot", "emoji🎉"];
     for label in invalid_labels {
         let result = run_br(
             &workspace,
-            ["update", &id, "--add-label", label, "--json"],
+            ["update", &id2, "--add-label", label, "--json"],
             &format!("add_invalid_label_{}", label.len()),
         );
         assert!(

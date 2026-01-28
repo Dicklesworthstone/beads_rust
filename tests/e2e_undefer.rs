@@ -8,11 +8,11 @@ fn test_soft_defer_behavior() {
 
     // Create issue
     let create = run_br(&workspace, ["create", "Soft Defer"], "create");
-    // Extract ID (e.g. "Created bd-1: Soft Defer")
+    // Extract ID (e.g. "✓ Created bd-1: Soft Defer" - ID is the 3rd word)
     let id_line = create.stdout.lines().next().unwrap();
     let id = id_line
         .split_whitespace()
-        .nth(1)
+        .nth(2)
         .unwrap()
         .trim_end_matches(':');
 
