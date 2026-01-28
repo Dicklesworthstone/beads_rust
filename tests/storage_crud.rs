@@ -83,6 +83,8 @@ fn create_issue_all_fields_populated() {
         compacted_at: None,
         compacted_at_commit: None,
         original_size: None,
+        retry_count: 0,
+        max_retries: 0,
         sender: None,
     };
 
@@ -620,6 +622,8 @@ fn update_issue_clear_optional_fields() {
         compacted_at: None,
         compacted_at_commit: None,
         original_size: None,
+        retry_count: 0,
+        max_retries: 0,
         sender: None,
         ephemeral: false,
         pinned: false,
@@ -904,6 +908,8 @@ fn upsert_issue_stores_all_fields() {
         compacted_at: None,
         compacted_at_commit: None,
         original_size: None,
+        retry_count: 0,
+        max_retries: 0,
         sender: None,
     };
 

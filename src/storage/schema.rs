@@ -47,6 +47,8 @@ pub const SCHEMA_SQL: &str = r"
         compacted_at DATETIME,
         compacted_at_commit TEXT,
         original_size INTEGER,
+        retry_count INTEGER NOT NULL DEFAULT 0,
+        max_retries INTEGER NOT NULL DEFAULT 0,
         sender TEXT DEFAULT '',
         ephemeral INTEGER DEFAULT 0,
         pinned INTEGER DEFAULT 0,
@@ -322,6 +324,31 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     if !has_source_repo {
         conn.execute(
             "ALTER TABLE issues ADD COLUMN source_repo TEXT NOT NULL DEFAULT '.'",
+            [],
+        )?;
+    }
+
+    // Migration: ensure retry tracking columns exist
+    let has_retry_count: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='retry_count'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_retry_count {
+        conn.execute(
+            "ALTER TABLE issues ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    let has_max_retries: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='max_retries'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_max_retries {
+        conn.execute(
+            "ALTER TABLE issues ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

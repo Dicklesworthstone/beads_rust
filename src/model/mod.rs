@@ -19,6 +19,11 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero_i32(value: &i32) -> bool {
+    *value == 0
+}
+
 /// Serialize Option<i32> as 0 when None (for bd conformance - bd expects integer, not null)
 #[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
 fn serialize_compaction_level<S>(value: &Option<i32>, serializer: S) -> Result<S::Ok, S::Error>
@@ -496,6 +501,12 @@ pub struct Issue {
     pub compacted_at_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_size: Option<i32>,
+    /// Number of retry attempts recorded for this issue.
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub retry_count: i32,
+    /// Maximum retries before escalation (0 = disabled).
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub max_retries: i32,
 
     // Messaging
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -557,6 +568,8 @@ impl Default for Issue {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -748,6 +761,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -1207,6 +1222,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,

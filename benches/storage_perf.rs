@@ -78,6 +78,8 @@ fn create_test_issue(i: usize) -> Issue {
         compacted_at: None,
         compacted_at_commit: None,
         original_size: None,
+        retry_count: 0,
+        max_retries: 0,
         sender: None,
         ephemeral: false,
         pinned: false,
@@ -297,6 +299,8 @@ fn bench_update_issue(c: &mut Criterion) {
                 deleted_at: None,
                 deleted_by: None,
                 delete_reason: None,
+                retry_count: None,
+                max_retries: None,
                 skip_cache_rebuild: false,
             };
             let _ = storage.update_issue(black_box(&id), black_box(&update), "benchmark");

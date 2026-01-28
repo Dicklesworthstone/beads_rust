@@ -444,6 +444,14 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub estimate: Option<i32>,
 
+    /// Set retry count (>= 0)
+    #[arg(long)]
+    pub retry_count: Option<i32>,
+
+    /// Set max retries before escalation (0 = disabled)
+    #[arg(long)]
+    pub max_retries: Option<i32>,
+
     /// Add label(s)
     #[arg(long)]
     pub add_label: Vec<String>,

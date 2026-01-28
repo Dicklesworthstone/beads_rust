@@ -719,7 +719,6 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
     "payload",         // Payload data
     "priority_origin", // Priority inheritance tracking
     "quality_score",   // Quality scoring
-    "retry_count",     // Retry automation
     "target",          // Target system reference
     "work_type",       // Work type classification (mutex, etc.)
 ];

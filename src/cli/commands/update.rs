@@ -64,6 +64,9 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     for id in &resolved_ids {
         // Get issue before update for change tracking
         let issue_before = storage.get_issue(id)?;
+        let was_escalated = issue_before
+            .as_ref()
+            .is_some_and(|issue| issue.max_retries > 0 && issue.retry_count >= issue.max_retries);
 
         if args.claim {
             if let Some(ref issue) = issue_before {
@@ -74,6 +77,21 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                             format!("issue already assigned to {current_assignee}"),
                         ));
                     }
+                }
+
+                if issue.max_retries > 0 && issue.retry_count >= issue.max_retries {
+                    return Err(BeadsError::validation(
+                        "claim",
+                        "issue exceeded max retries; escalate:human required",
+                    ));
+                }
+
+                let labels = storage.get_labels(id)?;
+                if labels.iter().any(|label| label == "escalate:human") {
+                    return Err(BeadsError::validation(
+                        "claim",
+                        "issue escalated for human review",
+                    ));
                 }
             }
 
@@ -128,6 +146,14 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 print_update_summary(id, &issue.title, issue_before.as_ref(), &issue);
             } else {
                 println!("No updates specified for {id}");
+            }
+
+            let is_escalated = issue.max_retries > 0 && issue.retry_count >= issue.max_retries;
+            if is_escalated && !was_escalated {
+                eprintln!(
+                    "ESCALATE: {id} failed {} times (max_retries={})",
+                    issue.retry_count, issue.max_retries
+                );
             }
         }
     }
@@ -223,6 +249,18 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
 
     let issue_type = args.type_.as_ref().map(|t| t.parse()).transpose()?;
 
+    if let Some(count) = args.retry_count {
+        if count < 0 {
+            return Err(BeadsError::validation("retry_count", "must be >= 0"));
+        }
+    }
+
+    if let Some(max) = args.max_retries {
+        if max < 0 {
+            return Err(BeadsError::validation("max_retries", "must be >= 0"));
+        }
+    }
+
     let assignee = if args.claim {
         Some(Some(actor.to_string()))
     } else {
@@ -256,6 +294,8 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
         lease_expires_at: None,
         lease_heartbeat_at: None,
         estimated_minutes: args.estimate.map(Some),
+        retry_count: args.retry_count,
+        max_retries: args.max_retries,
         due_at,
         defer_until,
         external_ref: optional_string_field(args.external_ref.as_deref()),

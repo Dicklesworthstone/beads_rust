@@ -234,8 +234,9 @@ impl SqliteStorage {
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",                rusqlite::params![
+                    retry_count, max_retries, sender, ephemeral, pinned, is_template
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
                     issue.id,
                     issue.content_hash,
                     issue.title,
@@ -272,6 +273,8 @@ impl SqliteStorage {
                     compacted_at_str,
                     issue.compacted_at_commit,
                     issue.original_size.unwrap_or(0),
+                    issue.retry_count,
+                    issue.max_retries,
                     issue.sender.as_deref().unwrap_or(""),
                     i32::from(issue.ephemeral),
                     i32::from(issue.pinned),
@@ -608,6 +611,52 @@ impl SqliteStorage {
                 );
             }
 
+            if let Some(val) = updates.retry_count {
+                issue.retry_count = val;
+                add_update("retry_count", Box::new(val));
+            }
+            if let Some(val) = updates.max_retries {
+                issue.max_retries = val;
+                add_update("max_retries", Box::new(val));
+            }
+
+            let should_escalate = issue.max_retries > 0 && issue.retry_count >= issue.max_retries;
+            if should_escalate {
+                let label = "escalate:human";
+                let exists: i64 = tx.query_row(
+                    "SELECT count(*) FROM labels WHERE issue_id = ? AND label = ?",
+                    rusqlite::params![id, label],
+                    |row| row.get(0),
+                )?;
+                if exists == 0 {
+                    tx.execute(
+                        "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                        rusqlite::params![id, label],
+                    )?;
+                    ctx.record_event(
+                        EventType::LabelAdded,
+                        id,
+                        Some(format!("Added label {label}")),
+                    );
+                }
+
+                if matches!(issue.status, Status::Open | Status::InProgress) {
+                    let old_status = issue.status.as_str().to_string();
+                    issue.status = Status::Blocked;
+                    add_update("status", Box::new(Status::Blocked.as_str().to_string()));
+                    ctx.record_field_change(
+                        EventType::StatusChanged,
+                        id,
+                        Some(old_status),
+                        Some(Status::Blocked.as_str().to_string()),
+                        Some("Auto-blocked after exceeding retry limit".to_string()),
+                    );
+                    if !updates.skip_cache_rebuild {
+                        ctx.invalidate_cache();
+                    }
+                }
+            }
+
             // Date fields
             if let Some(ref val) = updates.due_at {
                 issue.due_at = *val;
@@ -715,7 +764,7 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template,
+                   retry_count, max_retries, sender, ephemeral, pinned, is_template,
                    lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
             FROM issues WHERE id = ?
         ";
@@ -753,7 +802,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template,
+                         retry_count, max_retries, sender, ephemeral, pinned, is_template,
                          lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
@@ -786,7 +835,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template,
+                     retry_count, max_retries, sender, ephemeral, pinned, is_template,
                      lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
             FROM issues WHERE 1=1",
         );
@@ -951,7 +1000,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template,
+                     retry_count, max_retries, sender, ephemeral, pinned, is_template,
                      lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
               FROM issues
               WHERE 1=1",
@@ -1082,7 +1131,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template,
+                     retry_count, max_retries, sender, ephemeral, pinned, is_template,
                      lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
               FROM issues WHERE 1=1",
         );
@@ -2784,8 +2833,8 @@ impl SqliteStorage {
                            created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                           compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
+                           compacted_at, compacted_at_commit, original_size, retry_count, max_retries,
+                           sender, ephemeral, pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -3212,18 +3261,20 @@ impl SqliteStorage {
                 .map(parse_datetime),
             compacted_at_commit: row.get::<_, Option<String>>(30)?,
             original_size: row.get::<_, Option<i32>>(31)?,
-            sender: Self::empty_to_none(row.get::<_, Option<String>>(32)?),
-            ephemeral: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
-            pinned: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
-            is_template: row.get::<_, Option<i32>>(35)?.unwrap_or(0) != 0,
-            lease_owner: Self::empty_to_none(row.get::<_, Option<String>>(36)?),
-            lease_id: Self::empty_to_none(row.get::<_, Option<String>>(37)?),
+            retry_count: row.get::<_, Option<i32>>(32)?.unwrap_or(0),
+            max_retries: row.get::<_, Option<i32>>(33)?.unwrap_or(0),
+            sender: Self::empty_to_none(row.get::<_, Option<String>>(34)?),
+            ephemeral: row.get::<_, Option<i32>>(35)?.unwrap_or(0) != 0,
+            pinned: row.get::<_, Option<i32>>(36)?.unwrap_or(0) != 0,
+            is_template: row.get::<_, Option<i32>>(37)?.unwrap_or(0) != 0,
+            lease_owner: Self::empty_to_none(row.get::<_, Option<String>>(38)?),
+            lease_id: Self::empty_to_none(row.get::<_, Option<String>>(39)?),
             lease_expires_at: row
-                .get::<_, Option<String>>(38)?
+                .get::<_, Option<String>>(40)?
                 .as_deref()
                 .map(parse_datetime),
             lease_heartbeat_at: row
-                .get::<_, Option<String>>(39)?
+                .get::<_, Option<String>>(41)?
                 .as_deref()
                 .map(parse_datetime),
             labels: vec![],       // Loaded separately if needed
@@ -3311,6 +3362,8 @@ pub struct IssueUpdate {
     pub deleted_at: Option<Option<DateTime<Utc>>>,
     pub deleted_by: Option<Option<String>>,
     pub delete_reason: Option<Option<String>>,
+    pub retry_count: Option<i32>,
+    pub max_retries: Option<i32>,
     /// If true, do not rebuild the blocked cache after update.
     /// Caller is responsible for rebuilding cache if needed.
     pub skip_cache_rebuild: bool,
@@ -3343,6 +3396,8 @@ impl IssueUpdate {
             && self.deleted_at.is_none()
             && self.deleted_by.is_none()
             && self.delete_reason.is_none()
+            && self.retry_count.is_none()
+            && self.max_retries.is_none()
     }
 }
 
@@ -3687,7 +3742,7 @@ impl SqliteStorage {
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     compacted_at, compacted_at_commit, original_size, retry_count, max_retries, sender, ephemeral,
                      pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                FROM issues WHERE external_ref = ?",
             [external_ref],
@@ -3712,7 +3767,7 @@ impl SqliteStorage {
                      created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                     compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                     compacted_at, compacted_at_commit, original_size, retry_count, max_retries, sender, ephemeral,
                      pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                FROM issues WHERE content_hash = ?",
             [content_hash],
@@ -3773,10 +3828,10 @@ impl SqliteStorage {
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                 due_at, defer_until, external_ref, source_system, source_repo,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
-                compacted_at, compacted_at_commit, original_size, sender, ephemeral,
+                compacted_at, compacted_at_commit, original_size, retry_count, max_retries, sender, ephemeral,
                 pinned, is_template
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             rusqlite::params![
                 issue.id,
@@ -3815,6 +3870,8 @@ impl SqliteStorage {
                 compacted_at_str,
                 issue.compacted_at_commit,
                 issue.original_size.unwrap_or(0),
+                issue.retry_count,
+                issue.max_retries,
                 issue.sender,
                 issue.ephemeral,
                 issue.pinned,
@@ -4025,6 +4082,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -4081,6 +4140,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -4383,6 +4444,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -4456,6 +4519,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,
@@ -4521,6 +4586,8 @@ mod tests {
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
+            retry_count: 0,
+            max_retries: 0,
             sender: None,
             ephemeral: false,
             pinned: false,

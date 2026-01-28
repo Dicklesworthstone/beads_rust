@@ -9,6 +9,10 @@ use std::fmt::Write as _;
 pub const DEFAULT_LEASE_TTL_SECS: i64 = 30 * 60;
 
 /// Generate a random lease ID (32 hex chars).
+///
+/// # Panics
+///
+/// Panics if the OS RNG is unavailable.
 #[must_use]
 pub fn generate_lease_id() -> String {
     let mut bytes = [0_u8; 16];

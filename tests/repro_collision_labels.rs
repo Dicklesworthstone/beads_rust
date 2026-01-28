@@ -44,6 +44,8 @@ fn make_issue(id: &str, title: &str) -> Issue {
         compacted_at: None,
         compacted_at_commit: None,
         original_size: None,
+        retry_count: 0,
+        max_retries: 0,
         sender: None,
         ephemeral: false,
         pinned: false,

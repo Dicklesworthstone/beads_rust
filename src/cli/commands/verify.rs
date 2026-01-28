@@ -107,6 +107,7 @@ impl VerifySummary {
 /// # Errors
 ///
 /// Returns an error if issues are not found or the acceptance criteria are invalid.
+#[allow(clippy::too_many_lines)]
 pub fn execute(args: &VerifyArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -129,8 +130,7 @@ pub fn execute(args: &VerifyArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let repo_root = beads_dir
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| beads_dir.clone());
+        .map_or_else(|| beads_dir.clone(), Path::to_path_buf);
 
     let mut summary = VerifySummary::default();
     let mut issue_reports = Vec::new();
@@ -168,11 +168,11 @@ pub fn execute(args: &VerifyArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let ac = match parse_acceptance_criteria(&raw_ac) {
             Ok(parsed) => parsed,
             Err(err) => {
-            report.status = "error".to_string();
-            report.error = Some(err.to_string());
-            summary.failed += 1;
-            issue_reports.push(report);
-            continue;
+                report.status = "error".to_string();
+                report.error = Some(err.to_string());
+                summary.failed += 1;
+                issue_reports.push(report);
+                continue;
             }
         };
 
@@ -210,12 +210,8 @@ pub fn execute(args: &VerifyArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
             for step in steps {
                 let step_result = match step {
-                    VerifyStep::Command { run } => {
-                        run_command_step(&run, &repo_root)
-                    }
-                    VerifyStep::File { path } => {
-                        run_file_step(&path, &repo_root)
-                    }
+                    VerifyStep::Command { run } => run_command_step(&run, &repo_root),
+                    VerifyStep::File { path } => run_file_step(&path, &repo_root),
                     VerifyStep::Manual { note } => StepResult {
                         step_type: "manual".to_string(),
                         status: "manual".to_string(),
@@ -336,7 +332,7 @@ where
     match value {
         YamlValue::Number(n) => n
             .as_u64()
-            .map(|v| v as u32)
+            .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| serde::de::Error::custom("schema must be a positive integer")),
         YamlValue::String(s) => s
             .parse::<u32>()
@@ -352,10 +348,7 @@ fn run_command_step(run: &str, cwd: &Path) -> StepResult {
         ("sh", vec!["-lc", run])
     };
 
-    let status = Command::new(command)
-        .args(args)
-        .current_dir(cwd)
-        .status();
+    let status = Command::new(command).args(args).current_dir(cwd).status();
 
     match status {
         Ok(status) => {
@@ -427,7 +420,10 @@ fn render_text_report(report: &VerifyReport, ctx: &OutputContext) {
     ctx.newline();
 
     for issue in &report.issues {
-        ctx.info(&format!("{} · {} [{}]", issue.id, issue.title, issue.status));
+        ctx.info(&format!(
+            "{} · {} [{}]",
+            issue.id, issue.title, issue.status
+        ));
         if let Some(error) = &issue.error {
             ctx.warning(error);
         }
