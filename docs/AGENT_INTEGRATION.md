@@ -196,6 +196,9 @@ br update bd-123 --claim --json
 br update bd-123 --status in_progress --assignee "$BD_ACTOR" --json
 ```
 
+Claim metadata is tracked on issues and exported to JSONL:
+- `lease_owner`, `lease_id`, `lease_expires_at`, `lease_heartbeat_at` (nullable by default)
+
 ### Creating Related Issues
 
 ```bash

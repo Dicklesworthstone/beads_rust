@@ -729,6 +729,11 @@ const KNOWN_BD_ONLY_COLUMNS: &[&str] = &[
 const KNOWN_BR_ONLY_COLUMNS: &[&str] = &[
     // source_repo: br has this for multi-repo tracking
     "source_repo",
+    // Lease/claim tracking fields (br-only for now)
+    "lease_owner",
+    "lease_id",
+    "lease_expires_at",
+    "lease_heartbeat_at",
 ];
 
 /// Known type differences between br and bd that are acceptable.

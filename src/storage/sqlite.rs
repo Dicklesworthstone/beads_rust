@@ -207,17 +207,20 @@ impl SqliteStorage {
             let defer_until_str = issue.defer_until.map(|dt| dt.to_rfc3339());
             let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
             let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
+            let lease_expires_at_str = issue.lease_expires_at.map(|dt| dt.to_rfc3339());
+            let lease_heartbeat_at_str = issue.lease_heartbeat_at.map(|dt| dt.to_rfc3339());
 
             tx.execute(
                 "INSERT INTO issues (
                     id, content_hash, title, description, design, acceptance_criteria, notes,
-                    status, priority, issue_type, assignee, owner, estimated_minutes,
+                    status, priority, issue_type, assignee, owner, lease_owner, lease_id,
+                    lease_expires_at, lease_heartbeat_at, estimated_minutes,
                     created_at, created_by, updated_at, closed_at, close_reason,
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
                     sender, ephemeral, pinned, is_template
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",                rusqlite::params![
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",                rusqlite::params![
                     issue.id,
                     issue.content_hash,
                     issue.title,
@@ -230,6 +233,10 @@ impl SqliteStorage {
                     issue_type_str,
                     issue.assignee,
                     issue.owner.as_deref().unwrap_or(""),
+                    issue.lease_owner.as_deref().unwrap_or(""),
+                    issue.lease_id.as_deref().unwrap_or(""),
+                    lease_expires_at_str,
+                    lease_heartbeat_at_str,
                     issue.estimated_minutes,
                     created_at_str,
                     issue.created_by.as_deref().unwrap_or(""),
@@ -519,6 +526,28 @@ impl SqliteStorage {
                 issue.owner.clone_from(val);
                 add_update("owner", Box::new(val.as_deref().unwrap_or("").to_string()));
             }
+            if let Some(ref val) = updates.lease_owner {
+                issue.lease_owner.clone_from(val);
+                add_update(
+                    "lease_owner",
+                    Box::new(val.as_deref().unwrap_or("").to_string()),
+                );
+            }
+            if let Some(ref val) = updates.lease_id {
+                issue.lease_id.clone_from(val);
+                add_update(
+                    "lease_id",
+                    Box::new(val.as_deref().unwrap_or("").to_string()),
+                );
+            }
+            if let Some(ref val) = updates.lease_expires_at {
+                issue.lease_expires_at = *val;
+                add_update("lease_expires_at", Box::new(val.map(|d| d.to_rfc3339())));
+            }
+            if let Some(ref val) = updates.lease_heartbeat_at {
+                issue.lease_heartbeat_at = *val;
+                add_update("lease_heartbeat_at", Box::new(val.map(|d| d.to_rfc3339())));
+            }
             if let Some(ref val) = updates.estimated_minutes {
                 issue.estimated_minutes = *val;
                 add_update("estimated_minutes", Box::new(*val));
@@ -671,7 +700,8 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template
+                   sender, ephemeral, pinned, is_template,
+                   lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
             FROM issues WHERE id = ?
         ";
 
@@ -708,7 +738,8 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template
+                         sender, ephemeral, pinned, is_template,
+                         lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -740,7 +771,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
+                     sender, ephemeral, pinned, is_template,
+                     lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
             FROM issues WHERE 1=1",
         );
 
@@ -904,7 +936,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
+                     sender, ephemeral, pinned, is_template,
+                     lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
               FROM issues
               WHERE 1=1",
         );
@@ -1034,7 +1067,8 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template
+                     sender, ephemeral, pinned, is_template,
+                     lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
               FROM issues WHERE 1=1",
         );
 
@@ -2584,7 +2618,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template
+                           pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -3015,6 +3049,16 @@ impl SqliteStorage {
             ephemeral: row.get::<_, Option<i32>>(33)?.unwrap_or(0) != 0,
             pinned: row.get::<_, Option<i32>>(34)?.unwrap_or(0) != 0,
             is_template: row.get::<_, Option<i32>>(35)?.unwrap_or(0) != 0,
+            lease_owner: Self::empty_to_none(row.get::<_, Option<String>>(36)?),
+            lease_id: Self::empty_to_none(row.get::<_, Option<String>>(37)?),
+            lease_expires_at: row
+                .get::<_, Option<String>>(38)?
+                .as_deref()
+                .map(parse_datetime),
+            lease_heartbeat_at: row
+                .get::<_, Option<String>>(39)?
+                .as_deref()
+                .map(parse_datetime),
             labels: vec![],       // Loaded separately if needed
             dependencies: vec![], // Loaded separately if needed
             comments: vec![],     // Loaded separately if needed
@@ -3086,6 +3130,10 @@ pub struct IssueUpdate {
     pub issue_type: Option<IssueType>,
     pub assignee: Option<Option<String>>,
     pub owner: Option<Option<String>>,
+    pub lease_owner: Option<Option<String>>,
+    pub lease_id: Option<Option<String>>,
+    pub lease_expires_at: Option<Option<DateTime<Utc>>>,
+    pub lease_heartbeat_at: Option<Option<DateTime<Utc>>>,
     pub estimated_minutes: Option<Option<i32>>,
     pub due_at: Option<Option<DateTime<Utc>>>,
     pub defer_until: Option<Option<DateTime<Utc>>>,
@@ -3114,6 +3162,10 @@ impl IssueUpdate {
             && self.issue_type.is_none()
             && self.assignee.is_none()
             && self.owner.is_none()
+            && self.lease_owner.is_none()
+            && self.lease_id.is_none()
+            && self.lease_expires_at.is_none()
+            && self.lease_heartbeat_at.is_none()
             && self.estimated_minutes.is_none()
             && self.due_at.is_none()
             && self.defer_until.is_none()
@@ -3469,7 +3521,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
+                     pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                FROM issues WHERE external_ref = ?",
             [external_ref],
             |row| self.issue_from_row(row),
@@ -3494,7 +3546,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template
+                     pinned, is_template, lease_owner, lease_id, lease_expires_at, lease_heartbeat_at
                FROM issues WHERE content_hash = ?",
             [content_hash],
             |row| self.issue_from_row(row),
@@ -3543,18 +3595,21 @@ impl SqliteStorage {
         let defer_until_str = issue.defer_until.map(|dt| dt.to_rfc3339());
         let deleted_at_str = issue.deleted_at.map(|dt| dt.to_rfc3339());
         let compacted_at_str = issue.compacted_at.map(|dt| dt.to_rfc3339());
+        let lease_expires_at_str = issue.lease_expires_at.map(|dt| dt.to_rfc3339());
+        let lease_heartbeat_at_str = issue.lease_heartbeat_at.map(|dt| dt.to_rfc3339());
 
         let rows = self.conn.execute(
             r"INSERT OR REPLACE INTO issues (
                 id, content_hash, title, description, design, acceptance_criteria, notes,
-                status, priority, issue_type, assignee, owner, estimated_minutes,
+                status, priority, issue_type, assignee, owner, lease_owner, lease_id,
+                lease_expires_at, lease_heartbeat_at, estimated_minutes,
                 created_at, created_by, updated_at, closed_at, close_reason, closed_by_session,
                 due_at, defer_until, external_ref, source_system, source_repo,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
                 pinned, is_template
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             rusqlite::params![
                 issue.id,
@@ -3568,7 +3623,11 @@ impl SqliteStorage {
                 issue.priority.0,
                 issue_type_str,
                 issue.assignee,
-                issue.owner,
+                issue.owner.as_deref().unwrap_or(""),
+                issue.lease_owner.as_deref().unwrap_or(""),
+                issue.lease_id.as_deref().unwrap_or(""),
+                lease_expires_at_str,
+                lease_heartbeat_at_str,
                 issue.estimated_minutes,
                 created_at_str,
                 issue.created_by,
@@ -3778,6 +3837,10 @@ mod tests {
             notes: None,
             assignee: assignee.map(str::to_string),
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_by: None,
             closed_at: None,
@@ -3829,6 +3892,10 @@ mod tests {
             notes: None,
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_by: None,
             closed_at: None,
@@ -4125,6 +4192,10 @@ mod tests {
             issue_type: IssueType::Task,
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_at: t1,
             created_by: None,
@@ -4194,6 +4265,10 @@ mod tests {
             issue_type: IssueType::Task,
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_at: t1,
             created_by: None,
@@ -4255,6 +4330,10 @@ mod tests {
             issue_type: IssueType::Task,
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_at: t1,
             created_by: None,

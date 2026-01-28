@@ -413,6 +413,22 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
 
+    /// Lease owner (claim protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+
+    /// Lease identifier (claim protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+
+    /// Lease expiration timestamp (claim protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<DateTime<Utc>>,
+
+    /// Lease heartbeat timestamp (claim protocol).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_heartbeat_at: Option<DateTime<Utc>>,
+
     /// Estimated effort in minutes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated_minutes: Option<i32>,
@@ -517,6 +533,10 @@ impl Default for Issue {
             issue_type: IssueType::default(),
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_at: Utc::now(),
             created_by: None,
@@ -704,6 +724,10 @@ mod tests {
             issue_type: IssueType::Task,
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: None,
@@ -1159,6 +1183,10 @@ mod tests {
             issue_type: IssueType::Task,
             assignee: None,
             owner: None,
+            lease_owner: None,
+            lease_id: None,
+            lease_expires_at: None,
+            lease_heartbeat_at: None,
             estimated_minutes: None,
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
             created_by: None,

@@ -22,7 +22,11 @@ pub const SCHEMA_SQL: &str = r"
         priority INTEGER NOT NULL DEFAULT 2 CHECK(priority >= 0 AND priority <= 4),
         issue_type TEXT NOT NULL DEFAULT 'task',
         assignee TEXT,
-        owner TEXT DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '',
+        lease_owner TEXT NOT NULL DEFAULT '',
+        lease_id TEXT NOT NULL DEFAULT '',
+        lease_expires_at DATETIME,
+        lease_heartbeat_at DATETIME,
         estimated_minutes INTEGER,
         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         created_by TEXT DEFAULT '',
@@ -403,6 +407,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_events_issue ON events(issue_id);
             CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
             CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor) WHERE actor != '';
+        ",
+        )?;
+    }
+
+    // Migration: ensure lease fields exist (claim protocol)
+    let has_lease_owner: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('issues') WHERE name='lease_owner'")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+
+    if !has_lease_owner {
+        conn.execute_batch(
+            r"
+            ALTER TABLE issues ADD COLUMN lease_owner TEXT NOT NULL DEFAULT '';
+            ALTER TABLE issues ADD COLUMN lease_id TEXT NOT NULL DEFAULT '';
+            ALTER TABLE issues ADD COLUMN lease_expires_at DATETIME;
+            ALTER TABLE issues ADD COLUMN lease_heartbeat_at DATETIME;
         ",
         )?;
     }
