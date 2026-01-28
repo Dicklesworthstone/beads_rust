@@ -74,6 +74,7 @@ fn main() {
         Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Verify(args) => commands::verify::execute(&args, &overrides, &output_ctx),
         Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Blocked(args) => {
             commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
@@ -174,6 +175,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Count(_)
         | Commands::Stale(_)
         | Commands::Lint(_)
+        | Commands::Verify(_)
         | Commands::Stats(_)
         | Commands::Status(_)
         | Commands::Orphans(_)

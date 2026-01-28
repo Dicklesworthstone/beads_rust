@@ -21,6 +21,7 @@ pub mod init;
 pub mod label;
 pub mod lease_sweep;
 pub mod lint;
+pub mod verify;
 pub mod list;
 pub mod orphans;
 pub mod q;

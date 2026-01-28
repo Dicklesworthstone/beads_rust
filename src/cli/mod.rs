@@ -155,6 +155,9 @@ pub enum Commands {
     /// Check issues for missing template sections
     Lint(LintArgs),
 
+    /// Verify acceptance criteria checks
+    Verify(VerifyArgs),
+
     /// Defer issues (schedule for later)
     Defer(DeferArgs),
 
@@ -1218,6 +1221,16 @@ pub struct LintArgs {
     /// Filter by status (default: open, use 'all' for all)
     #[arg(long, short = 's')]
     pub status: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct VerifyArgs {
+    /// Issue IDs to verify (defaults to last touched)
+    pub ids: Vec<String>,
+
+    /// Treat manual checks as pass (exit code ignores manual steps)
+    #[arg(long)]
+    pub allow_manual: bool,
 }
 
 /// Arguments for the defer command.
