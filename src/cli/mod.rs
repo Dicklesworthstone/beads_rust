@@ -1273,6 +1273,10 @@ pub struct BlockedArgs {
     #[arg(long)]
     pub detailed: bool,
 
+    /// Wrap long lines instead of truncating in text output
+    #[arg(long)]
+    pub wrap: bool,
+
     /// Filter by issue type (can be repeated)
     #[arg(long = "type", short = 't')]
     pub type_: Vec<String>,

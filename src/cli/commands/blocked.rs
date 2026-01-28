@@ -176,10 +176,11 @@ pub fn execute(
             ctx.toon_with_stats(&output, args.stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {
+            let max_width = if args.wrap { ctx.width() } else { 0 };
             if matches!(ctx.mode(), OutputMode::Rich) {
-                render_blocked_rich(&blocked_issues, args.detailed, storage);
+                render_blocked_rich(&blocked_issues, args.detailed, storage, max_width);
             } else {
-                print_text_output(&blocked_issues, args.detailed, storage);
+                print_text_output(&blocked_issues, args.detailed, storage, max_width);
             }
         }
     }
@@ -252,7 +253,10 @@ fn print_text_output(
     blocked_issues: &[BlockedIssue],
     verbose: bool,
     storage: &crate::storage::SqliteStorage,
+    max_width: usize,
 ) {
+    use crate::format::truncate_title;
+
     if blocked_issues.is_empty() {
         // Match bd format
         println!("✨ No blocked issues");
@@ -264,8 +268,23 @@ fn print_text_output(
 
     for bi in blocked_issues {
         let priority = bi.issue.priority.0;
+        // Calculate prefix length for title truncation
+        // "[● P2] id: " prefix - estimate ~20 chars for priority badge and ID
+        let prefix_len = 10 + bi.issue.id.len();
+        let title = if max_width > 0 {
+            // Wrap enabled - don't truncate
+            bi.issue.title.clone()
+        } else {
+            bi.issue.title.clone()
+        };
+        let title = if max_width == 0 {
+            title
+        } else {
+            // When wrapping, we still want to fit initial display
+            truncate_title(&title, max_width.saturating_sub(prefix_len))
+        };
         // Match bd format: [● P2] ID: Title
-        println!("[● P{}] {}: {}", priority, bi.issue.id, bi.issue.title);
+        println!("[● P{}] {}: {}", priority, bi.issue.id, title);
 
         if verbose {
             println!("  Blocked by:");
@@ -273,9 +292,14 @@ fn print_text_output(
                 // blocker_ref format is "id:status", extract just the id for lookup
                 let blocker_id = blocker_id_from_ref(blocker_ref);
                 if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
+                    let blocker_title = if max_width > 0 {
+                        truncate_title(&blocker.title, max_width.saturating_sub(30))
+                    } else {
+                        blocker.title.clone()
+                    };
                     println!(
                         "    • {}: {} [P{}] [{}]",
-                        blocker_id, blocker.title, blocker.priority.0, blocker.status
+                        blocker_id, blocker_title, blocker.priority.0, blocker.status
                     );
                 } else {
                     println!("    • {blocker_ref} (not found)");
@@ -311,7 +335,9 @@ fn render_blocked_rich(
     blocked_issues: &[BlockedIssue],
     verbose: bool,
     storage: &crate::storage::SqliteStorage,
+    max_width: usize,
 ) {
+    use crate::format::truncate_title;
     use rich_rust::Text;
     use rich_rust::prelude::*;
 
@@ -351,6 +377,16 @@ fn render_blocked_rich(
             _ => Style::new().color(color("red")),
         };
 
+        // Calculate title width - account for "[P2] id: " prefix and " [N blockers]" suffix
+        let prefix_len = 6 + bi.issue.id.len() + 2; // "[P2] " + id + ": "
+        let suffix_len = 15; // " [N blockers]"
+        let title = if max_width > 0 {
+            let available = max_width.saturating_sub(prefix_len + suffix_len);
+            truncate_title(&bi.issue.title, available)
+        } else {
+            bi.issue.title.clone()
+        };
+
         let mut line = Text::new("");
         line.append_styled(
             &format!("[P{}] ", priority),
@@ -358,7 +394,7 @@ fn render_blocked_rich(
         );
         line.append_styled(&bi.issue.id, Style::new().bold().color(color("cyan")));
         line.append(": ");
-        line.append(&bi.issue.title);
+        line.append(&title);
         line.append_styled(&format!(" [{} blockers]", blocker_count), count_style);
         console.print_renderable(&line);
 
@@ -374,8 +410,13 @@ fn render_blocked_rich(
                 blocker_line.append_styled(blocker_id, Style::new().color(color("cyan")));
 
                 if let Ok(Some(blocker)) = storage.get_issue(blocker_id) {
+                    let blocker_title = if max_width > 0 {
+                        truncate_title(&blocker.title, max_width.saturating_sub(40))
+                    } else {
+                        blocker.title.clone()
+                    };
                     blocker_line.append(": ");
-                    blocker_line.append(&blocker.title);
+                    blocker_line.append(&blocker_title);
                     blocker_line
                         .append_styled(&format!(" [P{}]", blocker.priority.0), Style::new().dim());
                     blocker_line
