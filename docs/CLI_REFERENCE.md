@@ -370,15 +370,16 @@ br close [OPTIONS] [IDS]...
 | `-f, --force` | Close even if blocked by open dependencies |
 | `--suggest-next` | Return newly unblocked issues |
 | `--session <ID>` | Session ID for tracking |
+| `--lease-id <ID>` | Required lease ID for attribution enforcement |
 | `--robot` | Machine-readable output |
 
 **Examples:**
 ```bash
-# Close with reason
-br close bd-abc123 -r "Completed in PR #42"
+# Close with reason (requires lease)
+br close bd-abc123 --lease-id <LEASE_ID> -r "Completed in PR #42"
 
-# Close multiple
-br close bd-abc123 bd-def456 -r "Sprint complete"
+# Close multiple (run one at a time with lease IDs)
+br close bd-abc123 --lease-id <LEASE_ID> -r "Sprint complete"
 
 # Force close blocked issue
 br close bd-abc123 --force

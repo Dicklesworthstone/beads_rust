@@ -50,7 +50,7 @@ br ready --json --limit 5
 # Claim and work
 br claim bd-123 --json
 # ... do the work ...
-br close bd-123 --reason "Implemented feature X" --json
+br close bd-123 --lease-id <LEASE_ID> --reason "Implemented feature X" --json
 
 # Create discovered work
 br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:bd-123 --json
@@ -77,7 +77,7 @@ br ready --format json
 
 # Robot mode alias (same as --json)
 br ready --robot
-br close bd-123 --robot
+br close bd-123 --lease-id <LEASE_ID> --robot
 ```
 
 ### TOON Output (Token-Efficient)
@@ -175,7 +175,7 @@ $ br ready --json --limit 2
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │  4. COMPLETE                                                │
-│     br close <id> --reason "Done" --json                    │
+│     br close <id> --lease-id <LEASE_ID> --reason "Done" --json │
 │     → Optionally: --suggest-next for chained work           │
 └─────────────────────────────────────────────────────────────┘
                               ↓
@@ -223,7 +223,7 @@ br create "Implement auth middleware" \
 
 ```bash
 # Close and get next unblocked work
-br close bd-123 --suggest-next --json
+br close bd-123 --lease-id <LEASE_ID> --suggest-next --json
 ```
 
 Returns:
@@ -374,7 +374,7 @@ br create "New issue" --silent
 # Output: bd-abc123
 
 # Quiet mode with JSON
-br close bd-123 --quiet --json
+br close bd-123 --lease-id <LEASE_ID> --quiet --json
 # Outputs JSON, no status messages
 ```
 
@@ -392,7 +392,7 @@ export BD_ACTOR="claude-agent"
 br ready --json --limit 10
 br claim <id>
 # ... work ...
-br close <id> --reason "Completed by Claude"
+br close <id> --lease-id <LEASE_ID> --reason "Completed by Claude"
 br sync --flush-only
 ```
 

@@ -11,6 +11,7 @@ use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext};
 use crate::storage::ListFilters;
 use crate::util::id::normalize_id;
+use chrono::Utc;
 use regex::Regex;
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -60,6 +61,7 @@ pub fn execute(
 
     // Get issue prefix from config
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let actor = config::resolve_actor(&config_layer);
     let prefix = config::id_config_from_layer(&config_layer).prefix;
 
     // Check if we're in a git repo by running git rev-parse
@@ -207,12 +209,51 @@ pub fn execute(
             if io::stdin().read_line(&mut input).is_ok() {
                 let input = input.trim().to_lowercase();
                 if input == "y" || input == "yes" {
+                    let Some(issue) = storage.get_issue(&orphan.issue_id)? else {
+                        println!("  Skipped {} (issue not found)", orphan.issue_id);
+                        continue;
+                    };
+
+                    let Some(assignee) = issue.assignee.as_deref() else {
+                        println!("  Skipped {} (missing assignee)", orphan.issue_id);
+                        continue;
+                    };
+                    if assignee != actor {
+                        println!("  Skipped {} (assigned to {assignee})", orphan.issue_id);
+                        continue;
+                    }
+
+                    let Some(lease_id) = issue.lease_id.as_deref() else {
+                        println!("  Skipped {} (missing lease_id)", orphan.issue_id);
+                        continue;
+                    };
+                    let Some(lease_owner) = issue.lease_owner.as_deref() else {
+                        println!("  Skipped {} (missing lease owner)", orphan.issue_id);
+                        continue;
+                    };
+                    if lease_owner != actor {
+                        println!(
+                            "  Skipped {} (lease owned by {lease_owner})",
+                            orphan.issue_id
+                        );
+                        continue;
+                    }
+                    let Some(expires_at) = issue.lease_expires_at else {
+                        println!("  Skipped {} (missing lease expiration)", orphan.issue_id);
+                        continue;
+                    };
+                    if expires_at <= Utc::now() {
+                        println!("  Skipped {} (lease expired)", orphan.issue_id);
+                        continue;
+                    }
+
                     // Close the issue directly using internal API
                     let close_args = CloseArgs {
                         ids: vec![orphan.issue_id.clone()],
                         reason: Some("Implemented (detected by orphans scan)".to_string()),
                         force: false,
                         session: None,
+                        lease_id: Some(lease_id.to_string()),
                         suggest_next: false,
                     };
 

@@ -1361,6 +1361,10 @@ pub struct CloseArgs {
     #[arg(long)]
     pub session: Option<String>,
 
+    /// Lease ID for attribution enforcement (single ID only)
+    #[arg(long)]
+    pub lease_id: Option<String>,
+
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,

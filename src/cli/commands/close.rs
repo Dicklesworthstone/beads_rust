@@ -21,6 +21,8 @@ pub struct CloseArgs {
     pub force: bool,
     /// Session ID for `closed_by_session` field
     pub session: Option<String>,
+    /// Lease ID for attribution enforcement
+    pub lease_id: Option<String>,
     /// Return newly unblocked issues (single ID only)
     pub suggest_next: bool,
 }
@@ -32,6 +34,7 @@ impl From<&CliCloseArgs> for CloseArgs {
             reason: cli.reason.clone(),
             force: cli.force,
             session: cli.session.clone(),
+            lease_id: cli.lease_id.clone(),
             suggest_next: cli.suggest_next,
         }
     }
@@ -109,6 +112,7 @@ pub fn execute(
         reason: None,
         force: false,
         session: None,
+        lease_id: None,
         suggest_next: false,
     };
 
@@ -166,6 +170,17 @@ pub fn execute_with_args(
         |id| all_ids.iter().any(|existing| existing == id),
         |hash| find_matching_ids(&all_ids, hash),
     )?;
+
+    if resolved_ids.len() > 1 {
+        return Err(BeadsError::validation(
+            "ids",
+            "close requires a single issue when lease enforcement is enabled",
+        ));
+    }
+
+    let lease_id = args.lease_id.as_deref().ok_or_else(|| {
+        BeadsError::validation("lease-id", "lease-id is required to close an issue")
+    })?;
 
     // Track blocked issues before closing (for suggest-next)
     let blocked_before: Vec<String> = if args.suggest_next {
@@ -227,8 +242,60 @@ pub fn execute_with_args(
             continue;
         }
 
-        // Build update
         let now = Utc::now();
+        let Some(assignee) = issue.assignee.as_deref() else {
+            return Err(BeadsError::validation(
+                "assignee",
+                "close requires an assignee and active lease",
+            ));
+        };
+        if assignee != actor {
+            return Err(BeadsError::validation(
+                "assignee",
+                format!("issue assigned to {assignee}"),
+            ));
+        }
+
+        let Some(issue_lease_id) = issue.lease_id.as_deref() else {
+            return Err(BeadsError::validation(
+                "lease-id",
+                "close requires an active lease",
+            ));
+        };
+        if issue_lease_id != lease_id {
+            return Err(BeadsError::validation(
+                "lease-id",
+                "lease-id does not match active lease",
+            ));
+        }
+
+        let Some(lease_owner) = issue.lease_owner.as_deref() else {
+            return Err(BeadsError::validation(
+                "lease-owner",
+                "close requires an active lease owner",
+            ));
+        };
+        if lease_owner != actor {
+            return Err(BeadsError::validation(
+                "lease-owner",
+                format!("lease owned by {lease_owner}"),
+            ));
+        }
+
+        let Some(expires_at) = issue.lease_expires_at else {
+            return Err(BeadsError::validation(
+                "lease-expires-at",
+                "close requires an active lease",
+            ));
+        };
+        if expires_at <= now {
+            return Err(BeadsError::validation(
+                "lease-expires-at",
+                "lease expired; renew or re-claim before closing",
+            ));
+        }
+
+        // Build update
         let close_reason = args.reason.clone().unwrap_or_else(|| "done".to_string());
         let update = IssueUpdate {
             status: Some(Status::Closed),
@@ -346,6 +413,7 @@ mod tests {
         assert!(args.reason.is_none());
         assert!(!args.force);
         assert!(args.session.is_none());
+        assert!(args.lease_id.is_none());
         assert!(!args.suggest_next);
     }
 
@@ -356,6 +424,7 @@ mod tests {
             reason: Some("Fixed in PR #123".to_string()),
             force: true,
             session: Some("session-456".to_string()),
+            lease_id: Some("lease-789".to_string()),
             suggest_next: true,
         };
         assert_eq!(args.ids.len(), 2);
@@ -363,6 +432,7 @@ mod tests {
         assert_eq!(args.reason.as_deref(), Some("Fixed in PR #123"));
         assert!(args.force);
         assert_eq!(args.session.as_deref(), Some("session-456"));
+        assert_eq!(args.lease_id.as_deref(), Some("lease-789"));
         assert!(args.suggest_next);
     }
 
@@ -643,6 +713,7 @@ mod tests {
             reason: Some("Clone test".to_string()),
             force: true,
             session: Some("sess".to_string()),
+            lease_id: Some("lease-clone".to_string()),
             suggest_next: true,
         };
         let cloned = args.clone();
@@ -650,6 +721,7 @@ mod tests {
         assert_eq!(cloned.reason, args.reason);
         assert_eq!(cloned.force, args.force);
         assert_eq!(cloned.session, args.session);
+        assert_eq!(cloned.lease_id, args.lease_id);
         assert_eq!(cloned.suggest_next, args.suggest_next);
     }
 

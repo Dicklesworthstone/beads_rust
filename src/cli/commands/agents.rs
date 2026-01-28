@@ -46,9 +46,9 @@ br search "keyword"   # Full-text search
 
 # Create and update
 br create --title="..." --description="..." --type=task --priority=2
+br claim <id> --json
 br update <id> --status=in_progress
-br close <id> --reason="Completed"
-br close <id1> <id2>  # Close multiple issues at once
+br close <id> --lease-id <LEASE_ID> --reason="Completed"
 
 # Sync with git
 br sync --flush-only  # Export DB to JSONL
@@ -58,9 +58,9 @@ br sync --status      # Check sync status
 ### Workflow Pattern
 
 1. **Start**: Run `br ready` to find actionable work
-2. **Claim**: Use `br update <id> --status=in_progress`
+2. **Claim**: Use `br claim <id>` (captures `lease_id`)
 3. **Work**: Implement the task
-4. **Complete**: Use `br close <id>`
+4. **Complete**: Use `br close <id> --lease-id <LEASE_ID>`
 5. **Sync**: Always run `br sync --flush-only` at session end
 
 ### Key Concepts
