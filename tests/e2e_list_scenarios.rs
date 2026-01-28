@@ -19,7 +19,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -154,7 +154,7 @@ fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {
     );
     assert!(issue6.status.success());
     let id6 = parse_created_id(&issue6.stdout);
-    run_br(&workspace, ["close", &id6], "close_bug");
+    run_br_close_with_lease(&workspace, &id6, &[], "close_bug");
     ids.push(id6);
 
     // Issue 7: In-progress P1 task

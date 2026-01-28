@@ -510,7 +510,11 @@ fn conformance_text_stats_with_issues() {
     let bd_close = workspace.run_bd(["create", "Issue to close"], "create_close");
     let br_close_id = extract_id_from_create(&br_close.stdout);
     let bd_close_id = extract_id_from_create(&bd_close.stdout);
-    workspace.run_br(["close", &br_close_id], "close");
+    let br_close_lease = workspace.claim_br_lease(&br_close_id, "close_claim");
+    workspace.run_br(
+        ["close", &br_close_id, "--lease-id", &br_close_lease],
+        "close",
+    );
     workspace.run_bd(["close", &bd_close_id], "close");
 
     let br_stats = workspace.run_br(["stats", "--no-activity"], "stats");
@@ -578,7 +582,8 @@ fn conformance_text_list_status_filter() {
     let bd_create = workspace.run_bd(["create", "Issue to close"], "create_close");
     let br_id = extract_id_from_create(&br_create.stdout);
     let bd_id = extract_id_from_create(&bd_create.stdout);
-    workspace.run_br(["close", &br_id], "close");
+    let br_close_lease = workspace.claim_br_lease(&br_id, "close_claim");
+    workspace.run_br(["close", &br_id, "--lease-id", &br_close_lease], "close");
     workspace.run_bd(["close", &bd_id], "close");
 
     // List only open issues

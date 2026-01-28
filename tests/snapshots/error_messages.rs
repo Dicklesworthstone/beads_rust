@@ -1,4 +1,4 @@
-use super::common::cli::{BrWorkspace, run_br};
+use super::common::cli::{BrWorkspace, run_br, run_br_close_with_lease};
 use super::{create_issue, init_workspace, normalize_output};
 use insta::assert_snapshot;
 
@@ -75,7 +75,7 @@ fn snapshot_error_update_closed_issue() {
     let id = create_issue(&workspace, "Will close", "create_for_close");
 
     // Close the issue
-    let close = run_br(&workspace, ["close", &id], "close_issue");
+    let close = run_br_close_with_lease(&workspace, &id, &[], "close_issue");
     assert!(close.status.success(), "close should succeed");
 
     // Try to update it (should still work in br, but status is limited)

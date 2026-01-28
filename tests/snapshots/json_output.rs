@@ -1,4 +1,4 @@
-use super::common::cli::run_br;
+use super::common::cli::{run_br, run_br_close_with_lease};
 use super::{create_issue, init_workspace, normalize_json};
 use insta::assert_json_snapshot;
 use serde_json::Value;
@@ -176,9 +176,10 @@ fn snapshot_close_json() {
     let workspace = init_workspace();
     let id = create_issue(&workspace, "Issue to close", "create_close_json");
 
-    let output = run_br(
+    let output = run_br_close_with_lease(
         &workspace,
-        ["close", &id, "--reason", "Done", "--json"],
+        &id,
+        &["--reason", "Done", "--json"],
         "close_json",
     );
     assert!(

@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use std::thread::sleep;
 use std::time::Duration;
@@ -46,7 +46,7 @@ fn changelog_with_closed_issues() {
         "create1",
     );
     let id1 = parse_created_id(&create1.stdout);
-    run_br(&workspace, ["close", &id1], "close1");
+    run_br_close_with_lease(&workspace, &id1, &[], "close1");
 
     let create2 = run_br(
         &workspace,
@@ -54,7 +54,7 @@ fn changelog_with_closed_issues() {
         "create2",
     );
     let id2 = parse_created_id(&create2.stdout);
-    run_br(&workspace, ["close", &id2], "close2");
+    run_br_close_with_lease(&workspace, &id2, &[], "close2");
 
     // Generate changelog
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
@@ -90,11 +90,11 @@ fn changelog_groups_by_type() {
     // Create issues of different types
     let create1 = run_br(&workspace, ["create", "Bug fix 1", "--type", "bug"], "c1");
     let id1 = parse_created_id(&create1.stdout);
-    run_br(&workspace, ["close", &id1], "close1");
+    run_br_close_with_lease(&workspace, &id1, &[], "close1");
 
     let create2 = run_br(&workspace, ["create", "Bug fix 2", "--type", "bug"], "c2");
     let id2 = parse_created_id(&create2.stdout);
-    run_br(&workspace, ["close", &id2], "close2");
+    run_br_close_with_lease(&workspace, &id2, &[], "close2");
 
     let create3 = run_br(
         &workspace,
@@ -102,7 +102,7 @@ fn changelog_groups_by_type() {
         "c3",
     );
     let id3 = parse_created_id(&create3.stdout);
-    run_br(&workspace, ["close", &id3], "close3");
+    run_br_close_with_lease(&workspace, &id3, &[], "close3");
 
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
     assert!(changelog.status.success());
@@ -150,7 +150,7 @@ fn changelog_sorts_by_priority() {
         "c1",
     );
     let id1 = parse_created_id(&create1.stdout);
-    run_br(&workspace, ["close", &id1], "close1");
+    run_br_close_with_lease(&workspace, &id1, &[], "close1");
 
     let create2 = run_br(
         &workspace,
@@ -165,7 +165,7 @@ fn changelog_sorts_by_priority() {
         "c2",
     );
     let id2 = parse_created_id(&create2.stdout);
-    run_br(&workspace, ["close", &id2], "close2");
+    run_br_close_with_lease(&workspace, &id2, &[], "close2");
 
     let create3 = run_br(
         &workspace,
@@ -173,7 +173,7 @@ fn changelog_sorts_by_priority() {
         "c3",
     );
     let id3 = parse_created_id(&create3.stdout);
-    run_br(&workspace, ["close", &id3], "close3");
+    run_br_close_with_lease(&workspace, &id3, &[], "close3");
 
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
     assert!(changelog.status.success());
@@ -203,7 +203,7 @@ fn changelog_text_output() {
 
     let create = run_br(&workspace, ["create", "Test issue"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(&workspace, ["close", &id], "close");
+    run_br_close_with_lease(&workspace, &id, &[], "close");
 
     let changelog = run_br(&workspace, ["changelog"], "changelog");
     assert!(
@@ -235,7 +235,7 @@ fn changelog_robot_mode() {
 
     let create = run_br(&workspace, ["create", "Test issue"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(&workspace, ["close", &id], "close");
+    run_br_close_with_lease(&workspace, &id, &[], "close");
 
     // --robot should produce JSON output
     let changelog = run_br(&workspace, ["changelog", "--robot"], "changelog");
@@ -263,7 +263,7 @@ fn changelog_since_date() {
     // Create and close an issue
     let create = run_br(&workspace, ["create", "Recent issue"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(&workspace, ["close", &id], "close");
+    run_br_close_with_lease(&workspace, &id, &[], "close");
 
     // Use --since with yesterday to include the issue
     // Note: Use --since=-1d format to avoid clap treating -1d as a flag
@@ -295,7 +295,7 @@ fn changelog_since_future_date() {
 
     let create = run_br(&workspace, ["create", "Old issue"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(&workspace, ["close", &id], "close");
+    run_br_close_with_lease(&workspace, &id, &[], "close");
 
     // Use --since with a future date - should find no issues
     let changelog = run_br(
@@ -322,7 +322,7 @@ fn changelog_all_time() {
 
     let create = run_br(&workspace, ["create", "Test issue"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(&workspace, ["close", &id], "close");
+    run_br_close_with_lease(&workspace, &id, &[], "close");
 
     // No --since should return all closed issues
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
@@ -407,7 +407,8 @@ fn changelog_many_closed_issues() {
         let title = format!("Issue number {i}");
         let create = run_br(&workspace, ["create", &title], &format!("create_{i}"));
         let id = parse_created_id(&create.stdout);
-        run_br(&workspace, ["close", &id], &format!("close_{i}"));
+        let close_label = format!("close_{i}");
+        run_br_close_with_lease(&workspace, &id, &[], &close_label);
     }
 
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
@@ -434,11 +435,7 @@ fn changelog_with_close_reasons() {
 
     let create = run_br(&workspace, ["create", "Bug with reason"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(
-        &workspace,
-        ["close", &id, "--reason", "Fixed in v1.2.3"],
-        "close",
-    );
+    run_br_close_with_lease(&workspace, &id, &["--reason", "Fixed in v1.2.3"], "close");
 
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
     assert!(changelog.status.success());
@@ -466,13 +463,13 @@ fn changelog_reopen_then_close() {
     let create = run_br(&workspace, ["create", "Reopened issue"], "create");
     let id = parse_created_id(&create.stdout);
 
-    run_br(&workspace, ["close", &id], "close1");
+    run_br_close_with_lease(&workspace, &id, &[], "close1");
 
     // Small delay to ensure different timestamp
     sleep(Duration::from_millis(100));
 
     run_br(&workspace, ["reopen", &id], "reopen");
-    run_br(&workspace, ["close", &id], "close2");
+    run_br_close_with_lease(&workspace, &id, &[], "close2");
 
     let changelog = run_br(&workspace, ["changelog", "--json"], "changelog");
     assert!(
@@ -501,7 +498,7 @@ fn changelog_mixed_statuses() {
     // Create issues in different states
     let c1 = run_br(&workspace, ["create", "Closed issue"], "c1");
     let id1 = parse_created_id(&c1.stdout);
-    run_br(&workspace, ["close", &id1], "close1");
+    run_br_close_with_lease(&workspace, &id1, &[], "close1");
 
     let c2 = run_br(&workspace, ["create", "Open issue"], "c2");
     let _id2 = parse_created_id(&c2.stdout);
@@ -537,7 +534,7 @@ fn changelog_since_relative_time() {
 
     let create = run_br(&workspace, ["create", "Recent fix"], "create");
     let id = parse_created_id(&create.stdout);
-    run_br(&workspace, ["close", &id], "close");
+    run_br_close_with_lease(&workspace, &id, &[], "close");
 
     // Test various relative time formats
     // Note: Use --since=VALUE format to avoid clap treating -Xd as a flag

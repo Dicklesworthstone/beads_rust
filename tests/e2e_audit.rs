@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
@@ -728,7 +728,7 @@ fn e2e_audit_log_for_issue() {
     );
     assert!(update.status.success(), "update failed: {}", update.stderr);
 
-    let close = run_br(&workspace, ["close", &id, "--reason", "Done"], "close");
+    let close = run_br_close_with_lease(&workspace, &id, &["--reason", "Done"], "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     // Check log
@@ -775,7 +775,7 @@ fn e2e_audit_summary() {
         .as_str()
         .unwrap();
 
-    run_br(&workspace, ["close", id1], "close");
+    run_br_close_with_lease(&workspace, id1, &[], "close");
 
     // Check summary
     let summary = run_br(&workspace, ["audit", "summary"], "audit_summary");

@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -161,7 +161,7 @@ fn e2e_epic_status_eligible_when_all_children_closed() {
     assert_eq!(epic1["eligible_for_close"], false);
 
     // Close the child task (use --force since parent-child deps are blocking)
-    let close_task = run_br(&workspace, ["close", &task_id, "--force"], "close_task");
+    let close_task = run_br_close_with_lease(&workspace, &task_id, &["--force"], "close_task");
     assert!(
         close_task.status.success(),
         "close task failed: {}",
@@ -216,7 +216,7 @@ fn e2e_epic_close_eligible_closes_epics() {
     assert!(dep.status.success());
 
     // Close the child (use --force since parent-child deps are blocking)
-    let close_task = run_br(&workspace, ["close", &task_id, "--force"], "close_task");
+    let close_task = run_br_close_with_lease(&workspace, &task_id, &["--force"], "close_task");
     assert!(close_task.status.success());
 
     // Verify epic is open before close-eligible
@@ -295,7 +295,7 @@ fn e2e_epic_close_eligible_dry_run() {
     );
     assert!(dep.status.success());
 
-    let close_task = run_br(&workspace, ["close", &task_id, "--force"], "close_task");
+    let close_task = run_br_close_with_lease(&workspace, &task_id, &["--force"], "close_task");
     assert!(close_task.status.success());
 
     // Run dry-run - should show what would be closed
@@ -371,7 +371,7 @@ fn e2e_epic_status_eligible_only_filter() {
     );
     assert!(dep1.status.success());
 
-    let close_task1 = run_br(&workspace, ["close", &task1_id, "--force"], "close_task1");
+    let close_task1 = run_br_close_with_lease(&workspace, &task1_id, &["--force"], "close_task1");
     assert!(close_task1.status.success());
 
     // Add open child to epic2
@@ -538,7 +538,7 @@ fn e2e_epic_nested_epics() {
     );
 
     // Close the task (use --force since parent-child deps are blocking)
-    let close_task = run_br(&workspace, ["close", &task_id, "--force"], "close_task");
+    let close_task = run_br_close_with_lease(&workspace, &task_id, &["--force"], "close_task");
     assert!(close_task.status.success());
 
     // Child epic should now be eligible
@@ -696,7 +696,7 @@ fn e2e_epic_multiple_children_partial_progress() {
 
     // Close 3 tasks (use --force since parent-child deps are blocking)
     for task_id in task_ids.iter().take(3) {
-        let close = run_br(&workspace, ["close", task_id, "--force"], "close_task");
+        let close = run_br_close_with_lease(&workspace, task_id, &["--force"], "close_task");
         assert!(close.status.success());
     }
 
@@ -726,7 +726,7 @@ fn e2e_epic_multiple_children_partial_progress() {
 
     // Close remaining tasks (use --force since parent-child deps are blocking)
     for task_id in task_ids.iter().skip(3) {
-        let close = run_br(&workspace, ["close", task_id, "--force"], "close_remaining");
+        let close = run_br_close_with_lease(&workspace, task_id, &["--force"], "close_remaining");
         assert!(close.status.success());
     }
 
@@ -757,7 +757,7 @@ fn e2e_epic_closed_epic_not_shown() {
     assert!(create_epic.status.success());
     let epic_id = parse_created_id(&create_epic.stdout);
 
-    let close_epic = run_br(&workspace, ["close", &epic_id], "close_epic");
+    let close_epic = run_br_close_with_lease(&workspace, &epic_id, &[], "close_epic");
     assert!(close_epic.status.success());
 
     // Epic status should not show closed epics

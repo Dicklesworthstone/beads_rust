@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use common::harness::{
     TestWorkspace, extract_json_payload as harness_extract_json,
@@ -498,7 +498,7 @@ fn e2e_label_on_closed_issue() {
     let id = parse_created_id(&create.stdout);
 
     // Close the issue
-    let close = run_br(&workspace, ["close", &id], "close");
+    let close = run_br_close_with_lease(&workspace, &id, &[], "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     // Add label to closed issue - should work

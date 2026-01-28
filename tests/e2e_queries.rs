@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -483,9 +483,10 @@ fn e2e_reopen_command() {
     assert!(!issue_id.is_empty(), "failed to parse created ID");
 
     // Close the issue
-    let close = run_br(
+    let close = run_br_close_with_lease(
         &workspace,
-        ["close", &issue_id, "--reason", "Testing reopen"],
+        &issue_id,
+        &["--reason", "Testing reopen"],
         "reopen_close",
     );
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -547,7 +548,7 @@ fn e2e_reopen_command() {
     }
 
     // Test reopen with JSON output
-    let close_again = run_br(&workspace, ["close", &issue_id], "reopen_close_again");
+    let close_again = run_br_close_with_lease(&workspace, &issue_id, &[], "reopen_close_again");
     assert!(
         close_again.status.success(),
         "close again failed: {}",

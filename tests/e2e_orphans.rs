@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -262,11 +262,8 @@ fn e2e_orphans_excludes_closed_issues() {
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let issue_id = parse_created_id(&create.stdout);
 
-    let close = run_br(
-        &workspace,
-        ["close", &issue_id, "--reason", "done"],
-        "close_issue",
-    );
+    let close =
+        run_br_close_with_lease(&workspace, &issue_id, &["--reason", "done"], "close_issue");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     // Make a commit referencing the closed issue
@@ -413,7 +410,7 @@ fn e2e_orphans_multiple_issues_multiple_commits() {
     let id3 = parse_created_id(&create3.stdout);
 
     // Close the third issue
-    let close = run_br(&workspace, ["close", &id3, "--reason", "done"], "close_3");
+    let close = run_br_close_with_lease(&workspace, &id3, &["--reason", "done"], "close_3");
     assert!(close.status.success());
 
     // Make commits referencing all three

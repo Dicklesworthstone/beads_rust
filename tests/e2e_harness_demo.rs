@@ -58,7 +58,18 @@ fn harness_full_workflow() {
     show.assert_success();
 
     // Close the issue
-    let close = ws.run_br(["close", &id, "--reason", "Test complete"], "close");
+    let close_lease = ws.claim_br_lease(&id);
+    let close = ws.run_br(
+        [
+            "close",
+            &id,
+            "--reason",
+            "Test complete",
+            "--lease-id",
+            &close_lease,
+        ],
+        "close",
+    );
     close.assert_success();
 
     // Finalize

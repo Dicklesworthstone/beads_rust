@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use tracing::info;
 fn parse_created_id(stdout: &str) -> String {
@@ -555,7 +555,7 @@ fn defer_closed_issue_error() {
     info!("defer_closed_issue_error: starting");
     let (workspace, id) = setup_workspace_with_issue();
 
-    let close = run_br(&workspace, ["close", &id], "close_first");
+    let close = run_br_close_with_lease(&workspace, &id, &[], "close_first");
     assert!(close.status.success());
 
     // Deferring a closed issue should update status to deferred

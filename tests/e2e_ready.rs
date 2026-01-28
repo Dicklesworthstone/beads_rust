@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use std::fs;
 
@@ -236,7 +236,7 @@ fn ready_respects_external_dependencies() {
         label.stderr
     );
 
-    let close = run_br(&external, ["close", &provider_id], "ext_close");
+    let close = run_br_close_with_lease(&external, &provider_id, &[], "ext_close");
     assert!(
         close.status.success(),
         "external close failed: {}",

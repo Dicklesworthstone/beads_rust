@@ -69,6 +69,63 @@ macro_rules! skip_if_no_bd {
     };
 }
 
+fn br_close_with_lease(
+    workspace: &ConformanceWorkspace,
+    id: &str,
+    extra_args: &[&str],
+    label: &str,
+) -> CmdOutput {
+    let claim_label = format!("claim_{id}");
+    let claim = workspace.run_br(["claim", id, "--json"], &claim_label);
+    assert!(claim.status.success(), "br claim failed: {}", claim.stderr);
+    let payload = extract_json_payload(&claim.stdout);
+    let claim_val: Value = serde_json::from_str(&payload).expect("parse claim json");
+    let lease_id = claim_val["lease_id"]
+        .as_str()
+        .or_else(|| claim_val[0]["lease_id"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut args = vec![
+        "close".to_string(),
+        id.to_string(),
+        "--lease-id".to_string(),
+        lease_id,
+    ];
+    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+    workspace.run_br(args, label)
+}
+
+fn br_close_with_lease_in_bd_env(
+    workspace: &ConformanceWorkspace,
+    id: &str,
+    extra_args: &[&str],
+    label: &str,
+) -> CmdOutput {
+    let claim_label = format!("claim_{id}");
+    let claim = workspace.run_br_in_bd_env(["claim", id, "--json"], &claim_label);
+    assert!(
+        claim.status.success(),
+        "br claim (bd env) failed: {}",
+        claim.stderr
+    );
+    let payload = extract_json_payload(&claim.stdout);
+    let claim_val: Value = serde_json::from_str(&payload).expect("parse claim json");
+    let lease_id = claim_val["lease_id"]
+        .as_str()
+        .or_else(|| claim_val[0]["lease_id"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let mut args = vec![
+        "close".to_string(),
+        id.to_string(),
+        "--lease-id".to_string(),
+        lease_id,
+    ];
+    args.extend(extra_args.iter().map(|arg| (*arg).to_string()));
+    workspace.run_br_in_bd_env(args, label)
+}
+
 /// Output from running a command
 #[derive(Debug)]
 pub struct CmdOutput {
@@ -2840,7 +2897,7 @@ fn conformance_close_issue() {
         .unwrap();
 
     // Close issues
-    let br_close = workspace.run_br(["close", br_id, "--json"], "close");
+    let br_close = br_close_with_lease(&workspace, br_id, &["--json"], "close");
     let bd_close = workspace.run_bd(["close", bd_id, "--json"], "close");
 
     assert!(
@@ -3008,7 +3065,7 @@ fn conformance_reopen_basic() {
         .unwrap();
 
     // Close issues
-    workspace.run_br(["close", br_id], "close");
+    br_close_with_lease(&workspace, br_id, &[], "close");
     workspace.run_bd(["close", bd_id], "close");
 
     // Reopen issues
@@ -3459,7 +3516,7 @@ fn conformance_count_basic() {
         .or_else(|| bd_val[0]["id"].as_str())
         .unwrap();
 
-    workspace.run_br(["close", br_id], "close");
+    br_close_with_lease(&workspace, br_id, &[], "close");
     workspace.run_bd(["close", bd_id], "close");
 
     // Run count
@@ -5764,8 +5821,8 @@ fn conformance_list_filter_status_closed() {
         .or_else(|| bd_val[0]["id"].as_str())
         .unwrap();
 
-    workspace.run_br(["close", br_id], "close_one");
-    workspace.run_br_in_bd_env(["close", bd_id], "close_one");
+    br_close_with_lease(&workspace, br_id, &[], "close_one");
+    br_close_with_lease_in_bd_env(&workspace, bd_id, &[], "close_one");
 
     let br_list = workspace.run_br(["list", "--status", "closed", "--json"], "list_closed");
     let bd_list = workspace.run_bd(["list", "--status", "closed", "--json"], "list_closed");
@@ -5954,7 +6011,7 @@ fn conformance_list_filter_status_open() {
         .or_else(|| bd_closed_val[0]["id"].as_str())
         .unwrap();
 
-    workspace.run_br(["close", br_closed_id], "close_closed");
+    br_close_with_lease(&workspace, br_closed_id, &[], "close_closed");
     workspace.run_bd(["close", bd_closed_id], "close_closed");
 
     let br_list = workspace.run_br(["list", "--status", "open", "--json"], "list_open");
@@ -7504,8 +7561,10 @@ fn conformance_close_with_reason() {
         .or_else(|| bd_val[0]["id"].as_str())
         .unwrap();
 
-    let br_close = workspace.run_br(
-        ["close", br_id, "--reason", "done", "--json"],
+    let br_close = br_close_with_lease(
+        &workspace,
+        br_id,
+        &["--reason", "done", "--json"],
         "close_reason",
     );
     let bd_close = workspace.run_bd(
@@ -9001,7 +9060,7 @@ fn conformance_stats_mixed() {
     let br_id = extract_issue_id(&extract_json_payload(&br_create2.stdout));
     let bd_id = extract_issue_id(&extract_json_payload(&bd_create2.stdout));
 
-    workspace.run_br(["close", &br_id], "close");
+    br_close_with_lease(&workspace, &br_id, &[], "close");
     workspace.run_bd(["close", &bd_id], "close");
 
     // Get stats
@@ -9140,7 +9199,7 @@ fn conformance_count_by_status() {
     let br_id = extract_issue_id(&extract_json_payload(&br_create2.stdout));
     let bd_id = extract_issue_id(&extract_json_payload(&bd_create2.stdout));
 
-    workspace.run_br(["close", &br_id], "close");
+    br_close_with_lease(&workspace, &br_id, &[], "close");
     workspace.run_bd(["close", &bd_id], "close");
 
     // Count by status
@@ -9497,7 +9556,7 @@ fn conformance_stale_excludes_closed() {
     let br_id = extract_issue_id(&extract_json_payload(&br_create.stdout));
     let bd_id = extract_issue_id(&extract_json_payload(&bd_create.stdout));
 
-    workspace.run_br(["close", &br_id], "close");
+    br_close_with_lease(&workspace, &br_id, &[], "close");
     workspace.run_bd(["close", &bd_id], "close");
 
     // Stale should not include closed issues
@@ -10224,11 +10283,11 @@ fn conformance_close_already_closed() {
     let br_id = extract_id_from_json(&br_create.stdout);
     let bd_id = extract_id_from_json(&bd_create.stdout);
 
-    workspace.run_br(["close", &br_id], "close1");
+    br_close_with_lease(&workspace, &br_id, &[], "close1");
     workspace.run_bd(["close", &bd_id], "close1");
 
     // Try to close again
-    let br_close2 = workspace.run_br(["close", &br_id], "close2");
+    let br_close2 = br_close_with_lease(&workspace, &br_id, &[], "close2");
     let bd_close2 = workspace.run_bd(["close", &bd_id], "close2");
 
     // Both should handle double-close consistently
@@ -10258,7 +10317,7 @@ fn conformance_close_sets_closed_at() {
     let bd_id = extract_id_from_json(&bd_create.stdout);
 
     // Close it
-    workspace.run_br(["close", &br_id, "--json"], "close");
+    br_close_with_lease(&workspace, &br_id, &["--json"], "close");
     workspace.run_bd(["close", &bd_id, "--json"], "close");
 
     // Show and verify closed_at is set
@@ -10318,7 +10377,7 @@ fn conformance_close_blocked_issue() {
     workspace.run_bd(["dep", "add", &bd_b_id, &bd_a_id], "dep_add");
 
     // Try to close B (which is blocked)
-    let br_close = workspace.run_br(["close", &br_b_id], "close_blocked");
+    let br_close = br_close_with_lease(&workspace, &br_b_id, &[], "close_blocked");
     let bd_close = workspace.run_bd(["close", &bd_b_id], "close_blocked");
 
     // Both should handle closing blocked issue consistently
@@ -10362,7 +10421,7 @@ fn conformance_close_updates_dependents() {
     assert!(bd_blocked.status.success(), "bd blocked failed");
 
     // Close A (the blocker)
-    workspace.run_br(["close", &br_a_id], "close_blocker");
+    br_close_with_lease(&workspace, &br_a_id, &[], "close_blocker");
     workspace.run_bd(["close", &bd_a_id], "close_blocker");
 
     // B should now be unblocked (appear in ready list)
@@ -10418,8 +10477,10 @@ fn conformance_close_preserves_fields() {
     let bd_id = extract_id_from_json(&bd_create.stdout);
 
     // Close with reason
-    workspace.run_br(
-        ["close", &br_id, "--reason", "Completed successfully"],
+    br_close_with_lease(
+        &workspace,
+        &br_id,
+        &["--reason", "Completed successfully"],
         "close",
     );
     workspace.run_bd(
@@ -10481,7 +10542,7 @@ fn conformance_reopen_clears_closed_at() {
     let br_id = extract_id_from_json(&br_create.stdout);
     let bd_id = extract_id_from_json(&bd_create.stdout);
 
-    workspace.run_br(["close", &br_id], "close");
+    br_close_with_lease(&workspace, &br_id, &[], "close");
     workspace.run_bd(["close", &bd_id], "close");
 
     workspace.run_br(["reopen", &br_id], "reopen");
@@ -10559,7 +10620,7 @@ fn conformance_reopen_preserves_fields() {
     let bd_id = extract_id_from_json(&bd_create.stdout);
 
     // Close and reopen
-    workspace.run_br(["close", &br_id, "--reason", "Done"], "close");
+    br_close_with_lease(&workspace, &br_id, &["--reason", "Done"], "close");
     workspace.run_bd(["close", &bd_id, "--reason", "Done"], "close");
 
     workspace.run_br(["reopen", &br_id], "reopen");
@@ -10981,7 +11042,7 @@ fn conformance_epic_close_eligible_all_closed() {
     );
 
     // Close the child
-    workspace.run_br(["close", &br_child_id], "close_child");
+    br_close_with_lease(&workspace, &br_child_id, &[], "close_child");
     workspace.run_bd(["close", &bd_child_id], "close_child");
 
     // Now close-eligible should close the epic
@@ -12527,7 +12588,7 @@ fn conformance_changelog_with_closed() {
     // Create and close issues (using br only for changelog test)
     let br_create = workspace.run_br(["create", "Changelog entry", "--json"], "create");
     let br_id = extract_issue_id(&extract_json_payload(&br_create.stdout));
-    workspace.run_br(["close", &br_id], "close");
+    br_close_with_lease(&workspace, &br_id, &[], "close");
 
     // changelog is br-only
     let br_changelog = workspace.run_br(["changelog", "--json"], "changelog_with_closed");

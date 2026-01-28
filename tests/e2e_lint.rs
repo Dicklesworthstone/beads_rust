@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 
 // =============================================================================
@@ -339,7 +339,7 @@ fn e2e_lint_filter_by_status_all() {
 
     // Create and close a bug without required sections
     let bug_id = create_issue_with_description(&workspace, "Closed bug", "bug", Some("Closed"));
-    let close = run_br(&workspace, ["close", &bug_id], "close_bug");
+    let close = run_br_close_with_lease(&workspace, &bug_id, &[], "close_bug");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     // Default lint should not include closed

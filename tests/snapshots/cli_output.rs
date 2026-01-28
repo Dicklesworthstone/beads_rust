@@ -1,4 +1,4 @@
-use super::common::cli::{BrWorkspace, run_br};
+use super::common::cli::{BrWorkspace, run_br, run_br_close_with_lease};
 use super::{create_issue, init_workspace, normalize_output};
 use insta::assert_snapshot;
 
@@ -97,7 +97,7 @@ fn snapshot_stats_output() {
     let id3 = create_issue(&workspace, "Will close", "create_close");
 
     // Close one issue
-    let _ = run_br(&workspace, ["close", &id3], "close_issue");
+    let _ = run_br_close_with_lease(&workspace, &id3, &[], "close_issue");
 
     // Add a dependency
     let _ = run_br(&workspace, ["dep", "add", &id2, &id1], "dep_add_stats");
@@ -130,7 +130,7 @@ fn snapshot_reopen_output() {
     let id = create_issue(&workspace, "Issue to reopen", "create_for_reopen");
 
     // Close the issue first
-    let close = run_br(&workspace, ["close", &id], "close_for_reopen");
+    let close = run_br_close_with_lease(&workspace, &id, &[], "close_for_reopen");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     // Now reopen it
@@ -179,7 +179,7 @@ fn snapshot_count_output() {
         ["update", &id3, "--type", "feature"],
         "update_count3",
     );
-    let _ = run_br(&workspace, ["close", &id2], "close_count2");
+    let _ = run_br_close_with_lease(&workspace, &id2, &[], "close_count2");
 
     let output = run_br(&workspace, ["count"], "count_text");
     assert!(output.status.success(), "count failed: {}", output.stderr);

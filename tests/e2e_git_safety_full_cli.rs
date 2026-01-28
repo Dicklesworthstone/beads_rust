@@ -16,7 +16,8 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,6 +31,16 @@ fn hash_file(path: &Path) -> Option<String> {
         hasher.update(&contents);
         format!("{:x}", hasher.finalize())
     })
+}
+
+fn parse_lease_id(stdout: &str) -> String {
+    let payload = extract_json_payload(stdout);
+    let value: Value = serde_json::from_str(&payload).expect("parse claim json");
+    value["lease_id"]
+        .as_str()
+        .or_else(|| value[0]["lease_id"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Recursively collect file hashes from a directory.
@@ -874,12 +885,29 @@ fn regression_full_cli_does_not_touch_git() {
     eprintln!("\n[PHASE 15] Testing changelog...");
 
     // Close an issue first
+    let (git_snap, head, count, claim_out) = check_git_safety!(
+        &workspace,
+        git_snap,
+        head,
+        count,
+        ["claim", &id2, "--json"],
+        "claim_for_changelog"
+    );
+    let close_lease_id = parse_lease_id(&claim_out.stdout);
     let (git_snap, head, count, _) = check_git_safety!(
         &workspace,
         git_snap,
         head,
         count,
-        ["close", &id2, "--reason", "Done", "--no-auto-flush"],
+        [
+            "close",
+            &id2,
+            "--reason",
+            "Done",
+            "--no-auto-flush",
+            "--lease-id",
+            &close_lease_id
+        ],
         "close_for_changelog"
     );
 
@@ -944,12 +972,29 @@ fn regression_full_cli_does_not_touch_git() {
     eprintln!("\n[PHASE 17] Testing close/reopen/delete...");
 
     // close
+    let (git_snap, head, count, claim_out) = check_git_safety!(
+        &workspace,
+        git_snap,
+        head,
+        count,
+        ["claim", &id1, "--json"],
+        "claim_for_close"
+    );
+    let close_lease_id = parse_lease_id(&claim_out.stdout);
     let (git_snap, head, count, _) = check_git_safety!(
         &workspace,
         git_snap,
         head,
         count,
-        ["close", &id1, "--reason", "Completed", "--no-auto-flush"],
+        [
+            "close",
+            &id1,
+            "--reason",
+            "Completed",
+            "--no-auto-flush",
+            "--lease-id",
+            &close_lease_id
+        ],
         "close"
     );
 

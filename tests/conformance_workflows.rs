@@ -477,6 +477,18 @@ impl WorkflowWorkspace {
         }
     }
 
+    pub fn claim_br_lease(&self, id: &str) -> String {
+        let claim = self.run_br(&["claim", id, "--json"]);
+        assert!(claim.status.success(), "br claim failed: {}", claim.stderr);
+        let payload = extract_json_payload(&claim.stdout);
+        let value: Value = serde_json::from_str(&payload).expect("parse claim json");
+        value["lease_id"]
+            .as_str()
+            .or_else(|| value[0]["lease_id"].as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
     /// Run bd command.
     /// Respects `BD_BINARY` environment variable for custom binary path.
     pub fn run_bd(&self, args: &[&str]) -> CmdOutput {
@@ -799,12 +811,14 @@ fn conformance_workflow_close_with_stats() {
     let bd_id2 = WorkflowWorkspace::extract_id(&bd_c2.stdout).expect("id2");
 
     // Close two issues
-    let br_close1 = ws.run_br(&["close", &br_id1]);
+    let br_lease1 = ws.claim_br_lease(&br_id1);
+    let br_close1 = ws.run_br(&["close", &br_id1, "--lease-id", &br_lease1]);
     let bd_close1 = ws.run_bd(&["close", &bd_id1]);
     assert!(br_close1.status.success());
     assert!(bd_close1.status.success());
 
-    let br_close2 = ws.run_br(&["close", &br_id2]);
+    let br_lease2 = ws.claim_br_lease(&br_id2);
+    let br_close2 = ws.run_br(&["close", &br_id2, "--lease-id", &br_lease2]);
     let bd_close2 = ws.run_bd(&["close", &bd_id2]);
     assert!(br_close2.status.success());
     assert!(bd_close2.status.success());
@@ -1012,11 +1026,13 @@ fn conformance_workflow_full_lifecycle() {
     ws.run_bd(&["update", &bd_epic_id, "--status", "in_progress"]);
 
     // Phase 4: Close the epic (this should unblock tasks)
-    ws.run_br(&["close", &br_epic_id]);
+    let br_epic_lease = ws.claim_br_lease(&br_epic_id);
+    ws.run_br(&["close", &br_epic_id, "--lease-id", &br_epic_lease]);
     ws.run_bd(&["close", &bd_epic_id]);
 
     // Phase 5: Close task 1
-    ws.run_br(&["close", &br_task1_id]);
+    let br_task1_lease = ws.claim_br_lease(&br_task1_id);
+    ws.run_br(&["close", &br_task1_id, "--lease-id", &br_task1_lease]);
     ws.run_bd(&["close", &bd_task1_id]);
 
     // Phase 6: Delete the bug (changed requirements)

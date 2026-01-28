@@ -196,6 +196,20 @@ impl DatasetBenchmarkWorkspace {
         run_cmd("br", &self.br_root, args)
     }
 
+    /// Claim a lease for an issue in the br workspace and return the lease_id.
+    pub fn claim_br_lease(&self, id: &str) -> Option<String> {
+        let claim = self.run_br(["claim", id, "--json"]);
+        if !claim.success {
+            return None;
+        }
+        let claim_val = serde_json::from_str::<serde_json::Value>(&claim.stdout).ok()?;
+        claim_val
+            .get("lease_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| claim_val.get(0)?.get("lease_id")?.as_str())
+            .map(|lease_id| lease_id.to_string())
+    }
+
     /// Run bd command
     pub fn run_bd<I, S>(&self, args: I) -> CmdOutput
     where
@@ -780,7 +794,9 @@ fn benchmark_close_reopen(
         let br_out = workspace.run_br(["create", &title, "--type", "task", "--json"]);
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&br_out.stdout) {
             if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
-                let _ = workspace.run_br(["close", id]);
+                if let Some(lease_id) = workspace.claim_br_lease(id) {
+                    let _ = workspace.run_br(["close", id, "--lease-id", &lease_id]);
+                }
             }
         }
 
@@ -799,9 +815,11 @@ fn benchmark_close_reopen(
         let br_create = workspace.run_br(["create", &br_title, "--type", "task", "--json"]);
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&br_create.stdout) {
             if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
-                let start = Instant::now();
-                let _ = workspace.run_br(["close", id]);
-                br_durations.push(start.elapsed());
+                if let Some(lease_id) = workspace.claim_br_lease(id) {
+                    let start = Instant::now();
+                    let _ = workspace.run_br(["close", id, "--lease-id", &lease_id]);
+                    br_durations.push(start.elapsed());
+                }
             }
         }
 
@@ -821,7 +839,15 @@ fn benchmark_close_reopen(
     let br_create = workspace.run_br(["create", "RSS close test br", "--type", "task", "--json"]);
     let br_rss = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&br_create.stdout) {
         if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
-            measure_rss("br", &workspace.br_root, &["close", id])
+            if let Some(lease_id) = workspace.claim_br_lease(id) {
+                measure_rss(
+                    "br",
+                    &workspace.br_root,
+                    &["close", id, "--lease-id", &lease_id],
+                )
+            } else {
+                MemoryStats { max_rss_kb: None }
+            }
         } else {
             MemoryStats { max_rss_kb: None }
         }

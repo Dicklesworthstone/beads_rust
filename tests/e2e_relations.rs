@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use std::fs;
 use tracing::info;
@@ -283,7 +283,7 @@ fn e2e_dep_tree_external_nodes() {
         "external label failed: {}",
         label.stderr
     );
-    let close = run_br(&external, ["close", &provider_id], "ext_close");
+    let close = run_br_close_with_lease(&external, &provider_id, &[], "ext_close");
     assert!(
         close.status.success(),
         "external close failed: {}",
@@ -398,7 +398,7 @@ fn e2e_dep_list_external_nodes() {
         "external label failed: {}",
         label.stderr
     );
-    let close = run_br(&external, ["close", &provider_id], "ext_close");
+    let close = run_br_close_with_lease(&external, &provider_id, &[], "ext_close");
     assert!(
         close.status.success(),
         "external close failed: {}",
@@ -468,9 +468,10 @@ fn e2e_close_suggest_next_unblocks() {
         dep_add.stderr
     );
 
-    let close = run_br(
+    let close = run_br_close_with_lease(
         &workspace,
-        ["close", &blocker_id, "--suggest-next", "--json"],
+        &blocker_id,
+        &["--suggest-next", "--json"],
         "close_suggest_next",
     );
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -524,11 +525,8 @@ fn e2e_close_blocked_requires_force() {
         dep_add.stderr
     );
 
-    let close_skip = run_br(
-        &workspace,
-        ["close", &blocked_id, "--json"],
-        "close_blocked_skip",
-    );
+    let close_skip =
+        run_br_close_with_lease(&workspace, &blocked_id, &["--json"], "close_blocked_skip");
     assert!(
         close_skip.status.success(),
         "close blocked failed: {}",
@@ -551,9 +549,10 @@ fn e2e_close_blocked_requires_force() {
     let issues: Value = serde_json::from_str(&payload).expect("show json");
     assert_eq!(issues[0]["status"].as_str().unwrap(), "open");
 
-    let close_force = run_br(
+    let close_force = run_br_close_with_lease(
         &workspace,
-        ["close", &blocked_id, "--force", "--json"],
+        &blocked_id,
+        &["--force", "--json"],
         "close_blocked_force",
     );
     assert!(

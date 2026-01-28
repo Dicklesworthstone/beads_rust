@@ -10,6 +10,7 @@
 use assert_cmd::Command;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -673,6 +674,13 @@ impl TestWorkspace {
         self.run_binary("br", args, label)
     }
 
+    /// Claim a lease for an issue and return the lease_id.
+    pub fn claim_br_lease(&mut self, id: &str) -> String {
+        let claim = self.run_br(["claim", id, "--json"], "claim");
+        claim.assert_success();
+        parse_lease_id(&claim.stdout)
+    }
+
     /// Run br command with environment variables
     pub fn run_br_env<I, S, E, K, V>(&mut self, args: I, env_vars: E, label: &str) -> CommandResult
     where
@@ -1007,6 +1015,13 @@ impl ConformanceWorkspace {
             args,
             &format!("br_{label}"),
         )
+    }
+
+    /// Claim a lease for an issue in the br workspace and return lease_id.
+    pub fn claim_br_lease(&mut self, id: &str, label: &str) -> String {
+        let claim = self.run_br(["claim", id, "--json"], label);
+        claim.assert_success();
+        parse_lease_id(&claim.stdout)
     }
 
     /// Run bd command
@@ -1462,6 +1477,17 @@ pub fn extract_json_payload(stdout: &str) -> String {
         }
     }
     stdout.trim().to_string()
+}
+
+/// Parse the lease_id from br claim output
+pub fn parse_lease_id(stdout: &str) -> String {
+    let payload = extract_json_payload(stdout);
+    let value: Value = serde_json::from_str(&payload).expect("parse claim json");
+    value["lease_id"]
+        .as_str()
+        .or_else(|| value[0]["lease_id"].as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Parse the created ID from br create output

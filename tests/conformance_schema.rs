@@ -1097,8 +1097,22 @@ fn conformance_jsonl_compaction_level_serialization() {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    // Close the issue
-    let _ = workspace.run_br(&["close", br_id, "--reason", "Testing"]);
+    // Close the issue (lease required)
+    let br_claim = workspace.run_br(&["claim", br_id, "--json"]);
+    assert!(br_claim.success, "br claim failed: {}", br_claim.stderr);
+    let br_claim_json: Value = serde_json::from_str(&br_claim.stdout).unwrap_or_default();
+    let br_lease_id = br_claim_json["lease_id"]
+        .as_str()
+        .or_else(|| br_claim_json[0]["lease_id"].as_str())
+        .unwrap_or("");
+    let _ = workspace.run_br(&[
+        "close",
+        br_id,
+        "--reason",
+        "Testing",
+        "--lease-id",
+        br_lease_id,
+    ]);
     let _ = workspace.run_br(&["sync", "--flush-only"]);
 
     // Read JSONL and check compaction_level serialization

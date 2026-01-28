@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
@@ -404,11 +404,8 @@ fn e2e_lint_status_all_includes_closed() {
         "lint_closed_bug",
     );
 
-    let close = run_br(
-        &workspace,
-        ["close", &id, "--reason", "done"],
-        "lint_closed_close",
-    );
+    let close =
+        run_br_close_with_lease(&workspace, &id, &["--reason", "done"], "lint_closed_close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
 
     let json = run_lint_json(

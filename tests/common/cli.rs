@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::PathBuf;
@@ -46,6 +47,31 @@ where
         std::iter::empty::<(String, String)>(),
         label,
     )
+}
+
+pub fn claim_br_lease(workspace: &BrWorkspace, id: &str, label: &str) -> String {
+    let claim = run_br(workspace, ["claim", id, "--json"], label);
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    parse_lease_id(&claim.stdout)
+}
+
+pub fn run_br_close_with_lease(
+    workspace: &BrWorkspace,
+    id: &str,
+    extra_args: &[&str],
+    label: &str,
+) -> BrRun {
+    let claim_label = format!("{label}_claim");
+    let lease_id = claim_br_lease(workspace, id, &claim_label);
+    let mut args = Vec::with_capacity(3 + extra_args.len());
+    args.push("close".to_string());
+    args.push(id.to_string());
+    for arg in extra_args {
+        args.push((*arg).to_string());
+    }
+    args.push("--lease-id".to_string());
+    args.push(lease_id);
+    run_br(workspace, args, label)
 }
 
 pub fn run_br_with_env<I, S, E, K, V>(
@@ -144,4 +170,14 @@ pub fn extract_json_payload(stdout: &str) -> String {
         }
     }
     stdout.trim().to_string()
+}
+
+fn parse_lease_id(stdout: &str) -> String {
+    let payload = extract_json_payload(stdout);
+    let value: Value = serde_json::from_str(&payload).expect("parse claim json");
+    value["lease_id"]
+        .as_str()
+        .or_else(|| value[0]["lease_id"].as_str())
+        .unwrap_or("")
+        .to_string()
 }

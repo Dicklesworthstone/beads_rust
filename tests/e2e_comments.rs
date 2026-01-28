@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_close_with_lease};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -429,9 +429,10 @@ fn e2e_comments_on_closed_issue() {
     let id = parse_created_id(&create.stdout);
 
     // Close the issue
-    let close = run_br(
+    let close = run_br_close_with_lease(
         &workspace,
-        ["close", &id, "--reason", "Testing closed comments"],
+        &id,
+        &["--reason", "Testing closed comments"],
         "close_issue",
     );
     assert!(close.status.success(), "close failed: {}", close.stderr);
