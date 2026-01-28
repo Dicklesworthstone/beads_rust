@@ -44,6 +44,13 @@ struct SchemaOutput {
     schemas: BTreeMap<&'static str, RootSchema>,
 }
 
+/// Execute the schema command.
+///
+/// # Errors
+/// Returns an error if output initialization fails.
+///
+/// # Panics
+/// Panics if JSON schema serialization fails in text mode (should not happen for valid payloads).
 pub fn execute(
     args: &SchemaArgs,
     cli: &config::CliOverrides,
