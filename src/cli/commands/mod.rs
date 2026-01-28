@@ -2,6 +2,7 @@ pub mod agents;
 pub mod audit;
 pub mod blocked;
 pub mod changelog;
+pub mod claim;
 pub mod close;
 pub mod comments;
 pub mod completions;

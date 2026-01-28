@@ -1765,6 +1765,82 @@ impl SqliteStorage {
         })
     }
 
+    /// Claim an issue lease using an atomic compare-and-set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the issue is already leased by someone else,
+    /// or if database operations fail.
+    pub fn claim_issue(
+        &mut self,
+        id: &str,
+        actor: &str,
+        lease_id: &str,
+        lease_expires_at: DateTime<Utc>,
+        lease_heartbeat_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let now = Utc::now();
+
+        self.mutate("claim_issue", actor, |tx, ctx| {
+            let row = tx
+                .query_row(
+                    "SELECT lease_owner, lease_expires_at FROM issues WHERE id = ?",
+                    [id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            let Some((lease_owner_raw, lease_expires_at_raw)) = row else {
+                return Err(BeadsError::IssueNotFound { id: id.to_string() });
+            };
+
+            let lease_owner = Self::empty_to_none(lease_owner_raw);
+            let current_expires_at = lease_expires_at_raw.as_deref().map(parse_datetime);
+
+            if let (Some(owner), Some(expires_at)) = (lease_owner.as_deref(), current_expires_at) {
+                if !owner.is_empty() && owner != actor && expires_at > now {
+                    return Err(BeadsError::LeaseConflict {
+                        id: id.to_string(),
+                        owner: owner.to_string(),
+                        expires_at: expires_at.to_rfc3339(),
+                    });
+                }
+            }
+
+            tx.execute(
+                "UPDATE issues
+                    SET lease_owner = ?,
+                        lease_id = ?,
+                        lease_expires_at = ?,
+                        lease_heartbeat_at = ?,
+                        updated_at = ?
+                  WHERE id = ?",
+                rusqlite::params![
+                    actor,
+                    lease_id,
+                    lease_expires_at.to_rfc3339(),
+                    lease_heartbeat_at.to_rfc3339(),
+                    now.to_rfc3339(),
+                    id
+                ],
+            )?;
+
+            ctx.record_event(
+                EventType::Custom("lease_claimed".to_string()),
+                id,
+                Some(lease_id.to_string()),
+            );
+            ctx.mark_dirty(id);
+
+            Ok(())
+        })
+    }
+
     /// Remove a dependency link.
     ///
     /// # Errors

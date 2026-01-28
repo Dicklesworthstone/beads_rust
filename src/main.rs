@@ -40,6 +40,7 @@ fn main() {
         } => commands::init::execute(prefix, force, None, &output_ctx),
         Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
+        Commands::Claim(args) => commands::claim::execute(&args, &overrides, &output_ctx),
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
         }
@@ -137,6 +138,7 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
     match cmd {
         Commands::Create(_)
         | Commands::Update(_)
+        | Commands::Claim(_)
         | Commands::Delete(_)
         | Commands::Close(_)
         | Commands::Reopen(_)
@@ -175,6 +177,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Graph(_)
         | Commands::Create(_)
         | Commands::Update(_)
+        | Commands::Claim(_)
         | Commands::Delete(_)
         | Commands::Close(_)
         | Commands::Reopen(_)

@@ -6,6 +6,7 @@
 
 mod common;
 
+use beads_rust::error::BeadsError;
 use beads_rust::model::{DependencyType, EventType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{Duration, Utc};
@@ -366,6 +367,64 @@ fn update_issue_empty_update_is_noop() {
     // Should NOT mark dirty since nothing changed
     let dirty_after = storage.get_dirty_issue_ids().unwrap();
     assert!(dirty_after.is_empty());
+}
+
+// ============================================================================
+// LEASE CLAIM TESTS
+// ============================================================================
+
+#[test]
+fn claim_issue_sets_lease_fields() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("claim-lease-fields");
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let now = Utc::now();
+    let expires_at = now + Duration::minutes(30);
+
+    storage
+        .claim_issue(&issue.id, "alice", "lease-123", expires_at, now)
+        .unwrap();
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert_eq!(retrieved.lease_owner, Some("alice".to_string()));
+    assert_eq!(retrieved.lease_id, Some("lease-123".to_string()));
+    assert_eq!(retrieved.lease_expires_at, Some(expires_at));
+    assert_eq!(retrieved.lease_heartbeat_at, Some(now));
+}
+
+#[test]
+fn claim_issue_conflict_when_lease_active_for_other_owner() {
+    let mut storage = test_db();
+    let issue = fixtures::issue("claim-lease-conflict");
+
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let now = Utc::now();
+    let expires_at = now + Duration::minutes(10);
+
+    let update = IssueUpdate {
+        lease_owner: Some(Some("alice".to_string())),
+        lease_id: Some(Some("lease-a".to_string())),
+        lease_expires_at: Some(Some(expires_at)),
+        lease_heartbeat_at: Some(Some(now)),
+        ..Default::default()
+    };
+
+    storage.update_issue(&issue.id, &update, "system").unwrap();
+
+    let err = storage
+        .claim_issue(&issue.id, "bob", "lease-b", expires_at, now)
+        .unwrap_err();
+
+    match err {
+        BeadsError::LeaseConflict { id, owner, .. } => {
+            assert_eq!(id, issue.id);
+            assert_eq!(owner, "alice");
+        }
+        _ => panic!("expected LeaseConflict"),
+    }
 }
 
 #[test]

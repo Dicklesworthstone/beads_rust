@@ -7,6 +7,7 @@ use crate::model::{DependencyType, Issue, Status};
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::lease::{DEFAULT_LEASE_TTL_SECS, generate_lease_id, lease_expires_at};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
 use chrono::{DateTime, Utc};
@@ -75,6 +76,11 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     }
                 }
             }
+
+            let now = Utc::now();
+            let lease_id = generate_lease_id();
+            let expires_at = lease_expires_at(now, DEFAULT_LEASE_TTL_SECS);
+            storage.claim_issue(id, &actor, &lease_id, expires_at, now)?;
         }
 
         // Apply basic field updates

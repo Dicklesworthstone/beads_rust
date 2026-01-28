@@ -53,6 +53,8 @@ pub enum ErrorCode {
     IdCollision,
     /// Invalid issue ID format
     InvalidId,
+    /// Lease conflict when claiming
+    LeaseConflict,
 
     // === Validation Errors (exit code 4) ===
     /// Field validation failed
@@ -128,6 +130,7 @@ impl ErrorCode {
             Self::AmbiguousId => "AMBIGUOUS_ID",
             Self::IdCollision => "ID_COLLISION",
             Self::InvalidId => "INVALID_ID",
+            Self::LeaseConflict => "LEASE_CONFLICT",
             // Validation
             Self::ValidationFailed => "VALIDATION_FAILED",
             Self::InvalidStatus => "INVALID_STATUS",
@@ -175,6 +178,7 @@ impl ErrorCode {
                 | Self::InvalidPriority
                 | Self::RequiredField
                 | Self::AmbiguousId
+                | Self::LeaseConflict
         )
     }
 
@@ -200,7 +204,11 @@ impl ErrorCode {
             | Self::NotInitialized
             | Self::AlreadyInitialized => 2,
             // Issue (3)
-            Self::IssueNotFound | Self::AmbiguousId | Self::IdCollision | Self::InvalidId => 3,
+            Self::IssueNotFound
+            | Self::AmbiguousId
+            | Self::IdCollision
+            | Self::InvalidId
+            | Self::LeaseConflict => 3,
             // Validation (4)
             Self::ValidationFailed
             | Self::InvalidStatus
@@ -508,6 +516,18 @@ impl StructuredError {
             ),
             BeadsError::IdCollision { id } => (ErrorCode::IdCollision, Some(json!({"id": id}))),
             BeadsError::InvalidId { id } => (ErrorCode::InvalidId, Some(json!({"id": id}))),
+            BeadsError::LeaseConflict {
+                id,
+                owner,
+                expires_at,
+            } => (
+                ErrorCode::LeaseConflict,
+                Some(json!({
+                    "id": id,
+                    "owner": owner,
+                    "expires_at": expires_at,
+                })),
+            ),
             BeadsError::Validation { field, reason } => (
                 ErrorCode::ValidationFailed,
                 Some(json!({"field": field, "reason": reason})),
@@ -643,6 +663,11 @@ impl StructuredError {
             }
             BeadsError::JsonlParse { line, .. } => Some(format!(
                 "Check line {line} of the JSONL file for syntax errors."
+            )),
+            BeadsError::LeaseConflict {
+                owner, expires_at, ..
+            } => Some(format!(
+                "Wait for the lease held by {owner} to expire at {expires_at} or ask them to release it."
             )),
             _ => None,
         }

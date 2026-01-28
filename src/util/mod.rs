@@ -10,6 +10,7 @@
 
 mod hash;
 pub mod id;
+pub mod lease;
 pub mod markdown_import;
 pub mod progress;
 pub mod time;

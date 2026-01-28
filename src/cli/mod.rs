@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 pub mod commands;
+use crate::util::lease::DEFAULT_LEASE_TTL_SECS;
 
 /// Agent-first issue tracker (`SQLite` + JSONL)
 #[derive(Parser, Debug)]
@@ -93,6 +94,9 @@ pub enum Commands {
 
     /// Update an issue
     Update(UpdateArgs),
+
+    /// Claim an issue lease
+    Claim(ClaimArgs),
 
     /// Close an issue
     Close(CloseArgs),
@@ -458,6 +462,21 @@ pub struct UpdateArgs {
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,
+}
+
+/// Claim an issue lease (CAS on lease fields).
+#[derive(Args, Debug, Default)]
+pub struct ClaimArgs {
+    /// Issue IDs to claim
+    pub ids: Vec<String>,
+
+    /// Lease TTL in seconds
+    #[arg(long = "ttl", default_value_t = DEFAULT_LEASE_TTL_SECS)]
+    pub ttl_seconds: i64,
+
+    /// Optional lease ID override (single-issue only)
+    #[arg(long)]
+    pub lease_id: Option<String>,
 }
 
 #[derive(Args, Debug)]

@@ -48,7 +48,7 @@ br init --prefix myproj
 br ready --json --limit 5
 
 # Claim and work
-br update bd-123 --claim --json
+br claim bd-123 --json
 # ... do the work ...
 br close bd-123 --reason "Implemented feature X" --json
 
@@ -162,7 +162,7 @@ $ br ready --json --limit 2
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │  2. CLAIM                                                   │
-│     br update <id> --claim --json                           │
+│     br claim <id> --json                                    │
 │     → Sets assignee + status=in_progress atomically         │
 └─────────────────────────────────────────────────────────────┘
                               ↓
@@ -189,7 +189,10 @@ $ br ready --json --limit 2
 ### Claiming Work
 
 ```bash
-# Atomic claim (recommended)
+# Atomic lease claim (recommended)
+br claim bd-123 --json
+
+# Atomic status+assignee claim (CAS + update)
 br update bd-123 --claim --json
 
 # Manual claim (equivalent)
@@ -260,7 +263,7 @@ for issue in ready:
 
 # Claim first issue
 if ready:
-    br_command('update', ready[0]['id'], '--claim')
+    br_command('claim', ready[0]['id'])
 ```
 
 ### JavaScript/Node Example
@@ -282,7 +285,7 @@ console.log(`Found ${ready.length} ready issues`);
 
 // Claim and work
 if (ready.length > 0) {
-  br('update', ready[0].id, '--claim');
+  br('claim', ready[0].id);
 }
 ```
 
@@ -387,7 +390,7 @@ export BD_ACTOR="claude-agent"
 
 # Workflow
 br ready --json --limit 10
-br update <id> --claim
+br claim <id>
 # ... work ...
 br close <id> --reason "Completed by Claude"
 br sync --flush-only
@@ -431,7 +434,7 @@ br update <id> --status in_progress --assignee copilot
 1. **Always use `--json`** for programmatic access
 2. **Check exit codes** before parsing output
 3. **Set `BD_ACTOR`** for audit trail attribution
-4. **Use `--claim`** for atomic status+assignee updates
+4. **Use `br claim`** for atomic lease claims (CAS)
 5. **Create discovered issues** with `--deps discovered-from:<id>`
 6. **Sync at session end** with `br sync --flush-only`
 7. **Use `br ready`** to find actionable work

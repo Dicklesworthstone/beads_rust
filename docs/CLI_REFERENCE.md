@@ -276,7 +276,7 @@ br update [OPTIONS] [IDS]...
 | `-t, --type <TYPE>` | Change issue type |
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
-| `--claim` | Atomic claim (assignee=actor + status=in_progress) |
+| `--claim` | Atomic claim (CAS lease + assignee=actor + status=in_progress) |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set defer date (empty string clears) |
 | `--estimate <MINUTES>` | Set time estimate |
@@ -299,6 +299,31 @@ br update bd-abc123 bd-def456 -p 1
 
 # Add labels
 br update bd-abc123 --add-label "urgent,reviewed"
+```
+
+---
+
+### claim
+
+Claim an issue lease using compare-and-set (CAS).
+
+```bash
+br claim [OPTIONS] [IDS]...
+```
+
+**Options:**
+| Option | Description |
+|--------|-------------|
+| `--ttl <SECONDS>` | Lease TTL in seconds (default: 1800) |
+| `--lease-id <ID>` | Optional lease ID override (single-issue only) |
+
+**Examples:**
+```bash
+# Claim a lease for 30 minutes (default)
+br claim bd-abc123
+
+# Claim with a custom TTL
+br claim bd-abc123 --ttl 900
 ```
 
 ---

@@ -63,6 +63,14 @@ pub enum BeadsError {
     #[error("Invalid issue ID format: {id}")]
     InvalidId { id: String },
 
+    /// Lease conflict during claim.
+    #[error("Lease conflict: issue {id} is leased by {owner} until {expires_at}")]
+    LeaseConflict {
+        id: String,
+        owner: String,
+        expires_at: String,
+    },
+
     // === Validation Errors ===
     /// Field validation failed.
     #[error("Validation failed: {field}: {reason}")]
@@ -234,6 +242,9 @@ impl BeadsError {
                 Some("Valid statuses: open, in_progress, blocked, deferred, closed")
             }
             Self::InvalidType { .. } => Some("Valid types: task, bug, feature, epic, chore"),
+            Self::LeaseConflict { .. } => {
+                Some("Wait for the lease to expire or ask the owner to release it")
+            }
             _ => None,
         }
     }
