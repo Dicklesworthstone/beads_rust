@@ -6,12 +6,12 @@ use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, 
 use crate::storage::events::get_events;
 use crate::storage::schema::apply_schema;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use tracing::warn;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tracing::warn;
 
 /// SQLite-based storage backend.
 #[derive(Debug)]
