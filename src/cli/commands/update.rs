@@ -50,10 +50,11 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         config::resolve_actor(&config_layer)
     };
+    let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;
 
-    let update = build_update(args, &actor)?;
+    let update = build_update(args, &actor, claim_exclusive)?;
     let has_updates = !update.is_empty()
         || !args.add_label.is_empty()
         || !args.remove_label.is_empty()
@@ -68,13 +69,14 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // Get issue before update for change tracking
         let issue_before = storage.get_issue(id)?;
 
-        // Fast-path rejection: fail early if already claimed by someone else.
+        // Fast-path rejection: fail early if already claimed by someone else
+        // (or by anyone when claim.exclusive is set).
         // The authoritative check is inside the IMMEDIATE transaction
         // (via expect_unassigned on IssueUpdate) to prevent TOCTOU races.
         if args.claim {
             if let Some(ref issue) = issue_before {
                 if let Some(ref current_assignee) = issue.assignee {
-                    if current_assignee != &actor {
+                    if claim_exclusive || current_assignee != &actor {
                         return Err(BeadsError::validation(
                             "claim",
                             format!("issue already assigned to {current_assignee}"),
@@ -234,7 +236,7 @@ fn resolve_target_ids(
     Ok(resolved_ids.into_iter().map(|r| r.id).collect())
 }
 
-fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
+fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result<IssueUpdate> {
     let status = if args.claim {
         Some(Status::InProgress)
     } else {
@@ -285,6 +287,7 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
         delete_reason: None,
         skip_cache_rebuild: false,
         expect_unassigned: args.claim,
+        claim_exclusive: args.claim && claim_exclusive,
     })
 }
 
@@ -491,7 +494,7 @@ mod tests {
             claim: true,
             ..Default::default()
         };
-        let update = build_update(&args, "test_actor").unwrap();
+        let update = build_update(&args, "test_actor", false).unwrap();
         assert_eq!(update.status, Some(Status::InProgress));
         assert_eq!(update.assignee, Some(Some("test_actor".to_string())));
         info!("test_build_update_with_claim: assertions passed");
@@ -505,7 +508,7 @@ mod tests {
             status: Some("closed".to_string()),
             ..Default::default()
         };
-        let update = build_update(&args, "test_actor").unwrap();
+        let update = build_update(&args, "test_actor", false).unwrap();
         assert_eq!(update.status, Some(Status::Closed));
         // closed_at should be set
         assert!(update.closed_at.is_some());
@@ -520,7 +523,7 @@ mod tests {
             priority: Some("1".to_string()),
             ..Default::default()
         };
-        let update = build_update(&args, "test_actor").unwrap();
+        let update = build_update(&args, "test_actor", false).unwrap();
         assert_eq!(update.priority, Some(Priority(1)));
         info!("test_build_update_with_priority: assertions passed");
     }
@@ -530,8 +533,32 @@ mod tests {
         init_test_logging();
         info!("test_build_update_empty: starting");
         let args = UpdateArgs::default();
-        let update = build_update(&args, "test_actor").unwrap();
+        let update = build_update(&args, "test_actor", false).unwrap();
         assert!(update.is_empty());
         info!("test_build_update_empty: assertions passed");
+    }
+
+    #[test]
+    fn test_build_update_claim_with_exclusive_true() {
+        init_test_logging();
+        let args = UpdateArgs {
+            claim: true,
+            ..Default::default()
+        };
+        let update = build_update(&args, "test_actor", true).unwrap();
+        assert!(update.expect_unassigned);
+        assert!(update.claim_exclusive);
+    }
+
+    #[test]
+    fn test_build_update_claim_with_exclusive_false() {
+        init_test_logging();
+        let args = UpdateArgs {
+            claim: true,
+            ..Default::default()
+        };
+        let update = build_update(&args, "test_actor", false).unwrap();
+        assert!(update.expect_unassigned);
+        assert!(!update.claim_exclusive);
     }
 }

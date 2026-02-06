@@ -699,6 +699,143 @@ fn e2e_claim_auto_disambiguates_actor() {
     drop(temp_dir);
 }
 
+/// Test that `claim.exclusive: true` rejects same-actor re-claim.
+///
+/// When the exclusive flag is set, a second claim by the SAME actor must fail.
+#[test]
+fn e2e_claim_exclusive_rejects_same_actor_reclaim() {
+    let _log = common::test_log("e2e_claim_exclusive_rejects_same_actor_reclaim");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    // Initialize workspace
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    // Set claim.exclusive in project config
+    let config_path = root.join(".beads").join("config.yaml");
+    std::fs::write(&config_path, "claim.exclusive: true\n").expect("write config");
+
+    // Create an unassigned issue
+    let create = run_br_in_dir(&root, ["create", "Exclusive claim target"]);
+    assert!(create.success, "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    // First claim as actor-A should succeed
+    let claim1 = run_br_in_dir(
+        &root,
+        ["update", &issue_id, "--claim", "--actor", "actor-A"],
+    );
+    assert!(claim1.success, "first claim failed: {}", claim1.stderr);
+
+    // Second claim by the SAME actor should fail in exclusive mode
+    let claim2 = run_br_in_dir(
+        &root,
+        ["update", &issue_id, "--claim", "--actor", "actor-A"],
+    );
+    assert!(
+        !claim2.success,
+        "second same-actor claim should fail with claim.exclusive=true"
+    );
+    let combined = format!("{} {}", claim2.stdout, claim2.stderr).to_lowercase();
+    assert!(
+        combined.contains("claim") || combined.contains("assigned") || combined.contains("already"),
+        "expected claim-related error, got: stdout={}, stderr={}",
+        claim2.stdout,
+        claim2.stderr
+    );
+
+    drop(temp_dir);
+}
+
+/// Test that `claim.exclusive: true` with concurrent same-actor claims
+/// results in exactly one winner.
+///
+/// This is the core scenario: two processes with the same actor identity
+/// race to claim the same issue. With exclusive mode, exactly one must win.
+#[test]
+fn e2e_claim_exclusive_concurrent_same_actor() {
+    let _log = common::test_log("e2e_claim_exclusive_concurrent_same_actor");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    // Initialize workspace
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    // Set claim.exclusive in project config
+    let config_path = root.join(".beads").join("config.yaml");
+    std::fs::write(&config_path, "claim.exclusive: true\n").expect("write config");
+
+    // Create an unassigned issue
+    let create = run_br_in_dir(&root, ["create", "Exclusive race target"]);
+    assert!(create.success, "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    let mut both_succeeded_count = 0;
+    const ITERATIONS: usize = 10;
+
+    for iteration in 0..ITERATIONS {
+        // Reset: reopen + unassign the issue before each iteration
+        let reset = run_br_in_dir(
+            &root,
+            ["update", &issue_id, "--status", "open", "--assignee", ""],
+        );
+        assert!(
+            reset.success,
+            "iteration {iteration}: reset failed: {}",
+            reset.stderr
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let root1 = Arc::new(root.clone());
+        let root2 = Arc::new(root.clone());
+        let id1 = issue_id.clone();
+        let id2 = issue_id.clone();
+
+        let barrier1 = Arc::clone(&barrier);
+        let barrier2 = Arc::clone(&barrier);
+
+        // Both threads claim as the SAME actor
+        let handle1 = thread::spawn(move || {
+            barrier1.wait();
+            run_br_in_dir(&root1, ["update", &id1, "--claim", "--actor", "same-actor"])
+        });
+
+        let handle2 = thread::spawn(move || {
+            barrier2.wait();
+            run_br_in_dir(&root2, ["update", &id2, "--claim", "--actor", "same-actor"])
+        });
+
+        let result1 = handle1.join().expect("thread 1 panicked");
+        let result2 = handle2.join().expect("thread 2 panicked");
+
+        let successes = usize::from(result1.success) + usize::from(result2.success);
+
+        if successes == 2 {
+            both_succeeded_count += 1;
+        }
+
+        eprintln!(
+            "iteration {iteration}: t1={}, t2={}",
+            if result1.success { "won" } else { "lost" },
+            if result2.success { "won" } else { "lost" },
+        );
+    }
+
+    eprintln!("Results: both_succeeded={both_succeeded_count} (out of {ITERATIONS})");
+
+    // With claim.exclusive, both should never succeed — even with the same actor
+    assert_eq!(
+        both_succeeded_count, 0,
+        "exclusive mode violated: both same-actor claims won in {both_succeeded_count}/{ITERATIONS} iterations"
+    );
+
+    drop(temp_dir);
+}
+
 /// Test that BD_SESSION_ID produces a unique actor name and suppresses the warning.
 ///
 /// When BD_SESSION_ID is set, `br update --claim` should:

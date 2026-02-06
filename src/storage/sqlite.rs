@@ -407,10 +407,14 @@ impl SqliteStorage {
                     .unwrap_or(None)
                     .and_then(|s: String| {
                         let trimmed = s.trim().to_string();
-                        if trimmed.is_empty() { None } else { Some(trimmed) }
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
                     });
                 if let Some(ref current) = current_assignee {
-                    if current != actor {
+                    if updates.claim_exclusive || current != actor {
                         return Err(BeadsError::validation(
                             "claim",
                             format!("issue already claimed by {current}"),
@@ -3202,6 +3206,9 @@ pub struct IssueUpdate {
     /// This prevents the TOCTOU race where two concurrent `--claim` calls
     /// both read "unassigned" and then both write their own claim.
     pub expect_unassigned: bool,
+    /// If true (via `claim.exclusive` config), reject any claim on an
+    /// already-assigned issue even when the assignee matches the current actor.
+    pub claim_exclusive: bool,
 }
 
 impl IssueUpdate {

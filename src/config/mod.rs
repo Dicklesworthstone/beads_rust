@@ -850,6 +850,22 @@ pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
         .map_or_else(|| Ok(IssueType::Task), |value| IssueType::from_str(value))
 }
 
+/// Resolve `claim.exclusive` flag from config.
+///
+/// When `true`, `--claim` rejects any already-assigned issue even if the
+/// current assignee matches the claiming actor.  Default: `false`.
+///
+/// Accepts keys: `claim.exclusive`, `claim-exclusive`, `claim_exclusive`.
+#[must_use]
+pub fn claim_exclusive_from_layer(layer: &ConfigLayer) -> bool {
+    get_value(
+        layer,
+        &["claim.exclusive", "claim-exclusive", "claim_exclusive"],
+    )
+    .and_then(|value| parse_bool(value))
+    .unwrap_or(false)
+}
+
 /// Resolve display color preference from a merged config layer.
 ///
 /// Accepts keys: `display.color`, `display-color`, `display_color`.
@@ -1662,6 +1678,33 @@ labels:
         assert_eq!(normalize_key("issue-prefix"), "issue-prefix");
         assert_eq!(normalize_key("issue_prefix"), "issue-prefix");
         assert_eq!(normalize_key("  ISSUE_PREFIX  "), "issue-prefix");
+    }
+
+    #[test]
+    fn claim_exclusive_defaults_to_false() {
+        let layer = ConfigLayer::default();
+        assert!(!claim_exclusive_from_layer(&layer));
+    }
+
+    #[test]
+    fn claim_exclusive_returns_true_when_set() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("claim.exclusive".to_string(), "true".to_string());
+        assert!(claim_exclusive_from_layer(&layer));
+    }
+
+    #[test]
+    fn claim_exclusive_accepts_all_key_aliases() {
+        for key in &["claim.exclusive", "claim-exclusive", "claim_exclusive"] {
+            let mut layer = ConfigLayer::default();
+            layer.runtime.insert((*key).to_string(), "true".to_string());
+            assert!(
+                claim_exclusive_from_layer(&layer),
+                "key alias {key} should work"
+            );
+        }
     }
 
     #[test]
