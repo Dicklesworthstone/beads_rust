@@ -552,9 +552,14 @@ fn e2e_concurrent_claim_exactly_one_wins() {
 
     for iteration in 0..ITERATIONS {
         // Reset: reopen + unassign the issue before each iteration
-        run_br_in_dir(
+        let reset = run_br_in_dir(
             &root,
             ["update", &issue_id, "--status", "open", "--assignee", ""],
+        );
+        assert!(
+            reset.success,
+            "iteration {iteration}: reset failed: {}",
+            reset.stderr
         );
 
         let barrier = Arc::new(Barrier::new(2));
@@ -634,7 +639,11 @@ fn e2e_concurrent_claim_exactly_one_wins() {
 /// When no explicit actor or BD_SESSION_ID is set, `br update --claim`
 /// should auto-detect the grandparent PID and append it to the actor name,
 /// producing something like "runner-12345" instead of bare "runner".
+///
+/// This test is Unix-only because `grandparent_pid()` shells out to `ps`,
+/// which is unavailable on Windows and some minimal containers.
 #[test]
+#[cfg(unix)]
 fn e2e_claim_auto_disambiguates_actor() {
     let _log = common::test_log("e2e_claim_auto_disambiguates_actor");
 

@@ -404,7 +404,11 @@ impl SqliteStorage {
                         row.get(0)
                     })
                     .optional()?
-                    .unwrap_or(None);
+                    .unwrap_or(None)
+                    .and_then(|s: String| {
+                        let trimmed = s.trim().to_string();
+                        if trimmed.is_empty() { None } else { Some(trimmed) }
+                    });
                 if let Some(ref current) = current_assignee {
                     if current != actor {
                         return Err(BeadsError::validation(
