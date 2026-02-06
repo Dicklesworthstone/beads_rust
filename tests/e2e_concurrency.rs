@@ -591,9 +591,16 @@ fn e2e_concurrent_claim_exactly_one_wins() {
 
         let successes = usize::from(result1.success) + usize::from(result2.success);
 
+        assert!(
+            successes >= 1,
+            "iteration {iteration}: both claims failed — neither agent won. \
+             t1: stdout={}, stderr={} | t2: stdout={}, stderr={}",
+            result1.stdout, result1.stderr, result2.stdout, result2.stderr
+        );
+
         if successes == 2 {
             both_succeeded_count += 1;
-        } else if successes == 1 {
+        } else {
             exactly_one_won_count += 1;
 
             // Verify the loser got a claim-related error
@@ -813,6 +820,13 @@ fn e2e_claim_exclusive_concurrent_same_actor() {
         let result2 = handle2.join().expect("thread 2 panicked");
 
         let successes = usize::from(result1.success) + usize::from(result2.success);
+
+        assert!(
+            successes >= 1,
+            "iteration {iteration}: both claims failed — neither agent won. \
+             t1: stdout={}, stderr={} | t2: stdout={}, stderr={}",
+            result1.stdout, result1.stderr, result2.stdout, result2.stderr
+        );
 
         if successes == 2 {
             both_succeeded_count += 1;
