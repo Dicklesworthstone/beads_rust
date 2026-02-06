@@ -519,3 +519,298 @@ fn e2e_lock_error_reporting() {
 
     drop(temp_dir);
 }
+
+/// Test that concurrent --claim on the same issue is safe.
+///
+/// This test:
+/// 1. Creates an unassigned issue
+/// 2. Spawns two threads that race to claim it with different actor names
+/// 3. Verifies exactly one succeeds and the other fails
+///
+/// Before the atomic claim fix, both would succeed (last-write-wins).
+#[test]
+fn e2e_concurrent_claim_exactly_one_wins() {
+    let _log = common::test_log("e2e_concurrent_claim_exactly_one_wins");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    // Initialize workspace
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    // Create an unassigned issue
+    let create = run_br_in_dir(&root, ["create", "Race condition target"]);
+    assert!(create.success, "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(!issue_id.is_empty(), "failed to parse created issue ID");
+
+    // Run the race multiple times to increase chance of hitting the window
+    let mut both_succeeded_count = 0;
+    let mut exactly_one_won_count = 0;
+    const ITERATIONS: usize = 10;
+
+    for iteration in 0..ITERATIONS {
+        // Reset: reopen + unassign the issue before each iteration
+        run_br_in_dir(
+            &root,
+            ["update", &issue_id, "--status", "open", "--assignee", ""],
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let root1 = Arc::new(root.clone());
+        let root2 = Arc::new(root.clone());
+        let id1 = issue_id.clone();
+        let id2 = issue_id.clone();
+
+        let barrier1 = Arc::clone(&barrier);
+        let barrier2 = Arc::clone(&barrier);
+
+        // Thread 1: claim as "agent-alpha"
+        let handle1 = thread::spawn(move || {
+            barrier1.wait();
+            run_br_in_dir(
+                &root1,
+                ["update", &id1, "--claim", "--actor", "agent-alpha"],
+            )
+        });
+
+        // Thread 2: claim as "agent-beta"
+        let handle2 = thread::spawn(move || {
+            barrier2.wait();
+            run_br_in_dir(&root2, ["update", &id2, "--claim", "--actor", "agent-beta"])
+        });
+
+        let result1 = handle1.join().expect("thread 1 panicked");
+        let result2 = handle2.join().expect("thread 2 panicked");
+
+        let successes = usize::from(result1.success) + usize::from(result2.success);
+
+        if successes == 2 {
+            both_succeeded_count += 1;
+        } else if successes == 1 {
+            exactly_one_won_count += 1;
+
+            // Verify the loser got a claim-related error
+            let loser = if result1.success { &result2 } else { &result1 };
+            let combined = format!("{} {}", loser.stdout, loser.stderr).to_lowercase();
+            assert!(
+                combined.contains("claim")
+                    || combined.contains("assigned")
+                    || combined.contains("already"),
+                "iteration {iteration}: loser should get a claim error, got: stdout={}, stderr={}",
+                loser.stdout,
+                loser.stderr
+            );
+        }
+
+        eprintln!(
+            "iteration {iteration}: agent-alpha={}, agent-beta={}",
+            if result1.success { "won" } else { "lost" },
+            if result2.success { "won" } else { "lost" },
+        );
+    }
+
+    eprintln!(
+        "Results: exactly_one_won={exactly_one_won_count}, both_succeeded={both_succeeded_count} (out of {ITERATIONS})"
+    );
+
+    // With the fix, both should never succeed when they truly race.
+    // Due to timing, some iterations may not actually race (one finishes
+    // before the other starts), which is fine — those will show as
+    // exactly_one_won (the second sees the first's claim via fast-path).
+    // The key assertion: we should NEVER see both succeed in a true race.
+    // If both_succeeded_count > 0, the atomic guard isn't working.
+    assert_eq!(
+        both_succeeded_count, 0,
+        "TOCTOU race detected: both agents claimed the same issue in {both_succeeded_count}/{ITERATIONS} iterations"
+    );
+
+    drop(temp_dir);
+}
+
+/// Test that --claim without --actor auto-appends a session disambiguator.
+///
+/// When no explicit actor or BD_SESSION_ID is set, `br update --claim`
+/// should auto-detect the grandparent PID and append it to the actor name,
+/// producing something like "runner-12345" instead of bare "runner".
+#[test]
+fn e2e_claim_auto_disambiguates_actor() {
+    let _log = common::test_log("e2e_claim_auto_disambiguates_actor");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    // Initialize workspace
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    // Create an unassigned issue
+    let create = run_br_in_dir(&root, ["create", "Auto-disambiguate test"]);
+    assert!(create.success, "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    // Claim without --actor and without BD_SESSION_ID
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .current_dir(&root)
+        .args(["update", &issue_id, "--claim"])
+        .env("NO_COLOR", "1")
+        .env("RUST_BACKTRACE", "1")
+        .env("HOME", &root)
+        .env_remove("BD_ACTOR")
+        .env_remove("BD_SESSION_ID")
+        .output()
+        .expect("run br");
+    assert!(
+        output.status.success(),
+        "claim failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify the assignee has a numeric suffix (grandparent PID)
+    let show = run_br_in_dir(&root, ["show", &issue_id, "--json"]);
+    assert!(show.success, "show failed: {}", show.stderr);
+    let json: serde_json::Value = serde_json::from_str(&show.stdout).expect("parse show output");
+    let json = if json.is_array() { &json[0] } else { &json };
+    let assignee = json["assignee"].as_str().unwrap_or("");
+    eprintln!("assignee: {assignee}");
+
+    // Should contain a hyphen followed by digits (the grandparent PID).
+    // Format: "<user>-<pid>" e.g. "runner-12345"
+    assert!(
+        assignee.contains('-'),
+        "expected auto-disambiguated actor with PID suffix, got bare: {assignee}"
+    );
+    let suffix = assignee.rsplit('-').next().unwrap_or("");
+    assert!(
+        suffix.chars().all(|c| c.is_ascii_digit()) && !suffix.is_empty(),
+        "expected numeric PID suffix after hyphen, got: {assignee}"
+    );
+
+    drop(temp_dir);
+}
+
+/// Test that BD_SESSION_ID produces a unique actor name and suppresses the warning.
+///
+/// When BD_SESSION_ID is set, `br update --claim` should:
+/// 1. Use the session ID as a suffix on the actor name (e.g. "user-17240")
+/// 2. NOT emit the disambiguation warning
+#[test]
+fn e2e_session_id_disambiguates_actor() {
+    let _log = common::test_log("e2e_session_id_disambiguates_actor");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    // Initialize workspace
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    // Create an unassigned issue
+    let create = run_br_in_dir(&root, ["create", "Session ID test"]);
+    assert!(create.success, "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+
+    // Claim WITH BD_SESSION_ID set — should succeed without warning
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .current_dir(&root)
+        .args(["update", &issue_id, "--claim"])
+        .env("NO_COLOR", "1")
+        .env("RUST_BACKTRACE", "1")
+        .env("HOME", &root)
+        .env_remove("BD_ACTOR")
+        .env("BD_SESSION_ID", "99999")
+        .output()
+        .expect("run br");
+    let _claim_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let claim_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "claim failed: {claim_stderr}");
+
+    // Should NOT contain the disambiguation warning
+    let stderr_lower = claim_stderr.to_lowercase();
+    assert!(
+        !stderr_lower.contains("claiming without"),
+        "should not warn when BD_SESSION_ID is set, got: {claim_stderr}"
+    );
+
+    // Verify the assignee includes the session suffix
+    let show = run_br_in_dir(&root, ["show", &issue_id, "--json"]);
+    assert!(show.success, "show failed: {}", show.stderr);
+    let json: serde_json::Value = serde_json::from_str(&show.stdout).expect("parse show output");
+    let json = if json.is_array() { &json[0] } else { &json };
+    let assignee = json["assignee"].as_str().unwrap_or("");
+    eprintln!("assignee: {assignee}");
+    assert!(
+        assignee.ends_with("-99999"),
+        "expected assignee to end with session suffix -99999, got: {assignee}"
+    );
+
+    drop(temp_dir);
+}
+
+/// Test that two sessions with different BD_SESSION_ID can both claim and be distinguished.
+///
+/// Simulates two Claude Code sessions by using different BD_SESSION_ID values.
+/// Both claim different issues; the assignees should have different suffixes.
+#[test]
+fn e2e_session_id_concurrent_sessions() {
+    let _log = common::test_log("e2e_session_id_concurrent_sessions");
+
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+
+    // Create two issues
+    let create1 = run_br_in_dir(&root, ["create", "Session A target"]);
+    assert!(create1.success, "create1 failed: {}", create1.stderr);
+    let id1 = parse_created_id(&create1.stdout);
+
+    let create2 = run_br_in_dir(&root, ["create", "Session B target"]);
+    assert!(create2.success, "create2 failed: {}", create2.stderr);
+    let id2 = parse_created_id(&create2.stdout);
+
+    // Session A claims issue 1
+    let out_a = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .current_dir(&root)
+        .args(["update", &id1, "--claim"])
+        .env("NO_COLOR", "1")
+        .env("HOME", &root)
+        .env_remove("BD_ACTOR")
+        .env("BD_SESSION_ID", "11111")
+        .output()
+        .expect("run br session A");
+    assert!(out_a.status.success(), "session A claim failed");
+
+    // Session B claims issue 2
+    let out_b = Command::new(assert_cmd::cargo::cargo_bin!("br"))
+        .current_dir(&root)
+        .args(["update", &id2, "--claim"])
+        .env("NO_COLOR", "1")
+        .env("HOME", &root)
+        .env_remove("BD_ACTOR")
+        .env("BD_SESSION_ID", "22222")
+        .output()
+        .expect("run br session B");
+    assert!(out_b.status.success(), "session B claim failed");
+
+    // Verify they have different assignees
+    let show1 = run_br_in_dir(&root, ["show", &id1, "--json"]);
+    let show2 = run_br_in_dir(&root, ["show", &id2, "--json"]);
+    let j1: serde_json::Value = serde_json::from_str(&show1.stdout).expect("parse");
+    let j2: serde_json::Value = serde_json::from_str(&show2.stdout).expect("parse");
+    let j1 = if j1.is_array() { &j1[0] } else { &j1 };
+    let j2 = if j2.is_array() { &j2[0] } else { &j2 };
+    let assignee1 = j1["assignee"].as_str().unwrap_or("");
+    let assignee2 = j2["assignee"].as_str().unwrap_or("");
+
+    eprintln!("session A assignee: {assignee1}");
+    eprintln!("session B assignee: {assignee2}");
+
+    assert!(assignee1.ends_with("-11111"), "session A: {assignee1}");
+    assert!(assignee2.ends_with("-22222"), "session B: {assignee2}");
+    assert_ne!(assignee1, assignee2, "sessions must have different actors");
+
+    drop(temp_dir);
+}

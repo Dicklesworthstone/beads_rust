@@ -982,6 +982,88 @@ pub fn resolve_actor(layer: &ConfigLayer) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Resolve actor for `--claim`, appending a session disambiguator when the
+/// actor name was not explicitly set.
+///
+/// Resolution order for the disambiguator:
+/// 1. `BD_SESSION_ID` env var (explicit override)
+/// 2. Grandparent PID auto-detection (works for any agent: Claude, Codex, etc.)
+///
+/// The grandparent PID is stable per agent session because the process tree
+/// is always `agent(stable) → shell(ephemeral) → br`.  Two concurrent agent
+/// sessions get different grandparent PIDs and therefore different actor names,
+/// preventing the TOCTOU claim race even when they share the same `$USER`.
+#[must_use]
+pub fn resolve_actor_for_claim(layer: &ConfigLayer) -> String {
+    let explicit = actor_from_layer(layer);
+    let base = explicit
+        .clone()
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // If actor was explicitly set, respect it as-is.
+    if explicit.is_some() {
+        return base;
+    }
+
+    // Try BD_SESSION_ID first (explicit override).
+    if let Ok(sid) = std::env::var("BD_SESSION_ID") {
+        let sid = sid.trim();
+        if !sid.is_empty() {
+            return format!("{base}-{sid}");
+        }
+    }
+
+    // Auto-detect grandparent PID as session disambiguator.
+    if let Some(gppid) = grandparent_pid() {
+        return format!("{base}-{gppid}");
+    }
+
+    base
+}
+
+/// Returns true if the actor was explicitly set (via --actor, BD_ACTOR, or config).
+#[must_use]
+pub fn actor_is_explicit(layer: &ConfigLayer) -> bool {
+    actor_from_layer(layer).is_some()
+}
+
+/// Detect the grandparent PID (parent of parent process).
+///
+/// Returns `None` if detection fails (e.g. permission denied, PID 1 ancestor).
+fn grandparent_pid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        let ppid = std::os::unix::process::parent_id();
+        // Skip if our parent is init/launchd — no meaningful grandparent.
+        if ppid <= 1 {
+            return None;
+        }
+        let output = std::process::Command::new("ps")
+            .args(["-o", "ppid=", "-p", &ppid.to_string()])
+            .output()
+            .ok()?;
+        let gppid: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .ok()?;
+        // Skip if grandparent is init/launchd.
+        if gppid <= 1 {
+            return None;
+        }
+        Some(gppid)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
 /// Determine if a key is startup-only.
 ///
 /// Startup-only keys can only be set in YAML config files, not in the database.

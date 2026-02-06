@@ -45,7 +45,11 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let actor = config::resolve_actor(&config_layer);
+    let actor = if args.claim {
+        config::resolve_actor_for_claim(&config_layer)
+    } else {
+        config::resolve_actor(&config_layer)
+    };
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;
 
@@ -64,6 +68,9 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // Get issue before update for change tracking
         let issue_before = storage.get_issue(id)?;
 
+        // Fast-path rejection: fail early if already claimed by someone else.
+        // The authoritative check is inside the IMMEDIATE transaction
+        // (via expect_unassigned on IssueUpdate) to prevent TOCTOU races.
         if args.claim {
             if let Some(ref issue) = issue_before {
                 if let Some(ref current_assignee) = issue.assignee {
@@ -277,6 +284,7 @@ fn build_update(args: &UpdateArgs, actor: &str) -> Result<IssueUpdate> {
         deleted_by: None,
         delete_reason: None,
         skip_cache_rebuild: false,
+        expect_unassigned: args.claim,
     })
 }
 

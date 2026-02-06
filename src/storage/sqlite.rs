@@ -395,6 +395,26 @@ impl SqliteStorage {
         }
 
         self.mutate("update_issue", actor, |tx, ctx| {
+            // Atomic claim guard: re-read assignee inside the IMMEDIATE transaction
+            // to prevent TOCTOU race where two concurrent --claim calls both see
+            // "unassigned" and then both overwrite each other.
+            if updates.expect_unassigned {
+                let current_assignee: Option<String> = tx
+                    .query_row("SELECT assignee FROM issues WHERE id = ?", [id], |row| {
+                        row.get(0)
+                    })
+                    .optional()?
+                    .unwrap_or(None);
+                if let Some(ref current) = current_assignee {
+                    if current != actor {
+                        return Err(BeadsError::validation(
+                            "claim",
+                            format!("issue already claimed by {current}"),
+                        ));
+                    }
+                }
+            }
+
             let mut set_clauses: Vec<String> = vec![];
             let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
 
@@ -3173,6 +3193,11 @@ pub struct IssueUpdate {
     /// If true, do not rebuild the blocked cache after update.
     /// Caller is responsible for rebuilding cache if needed.
     pub skip_cache_rebuild: bool,
+    /// If true, verify inside the IMMEDIATE transaction that the issue is
+    /// not already assigned to a different actor before applying the update.
+    /// This prevents the TOCTOU race where two concurrent `--claim` calls
+    /// both read "unassigned" and then both write their own claim.
+    pub expect_unassigned: bool,
 }
 
 impl IssueUpdate {

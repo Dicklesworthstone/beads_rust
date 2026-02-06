@@ -86,7 +86,7 @@ fn e2e_completions_bash_contains_subcommands() {
         completions.stderr
     );
 
-    assert_contains_dynamic_markers(&completions.stdout,"bash");
+    assert_contains_dynamic_markers(&completions.stdout, "bash");
     info!("e2e_completions_bash_contains_subcommands: done");
 }
 
@@ -154,7 +154,7 @@ fn e2e_completions_zsh_contains_subcommands() {
         completions.stderr
     );
 
-    assert_contains_dynamic_markers(&completions.stdout,"zsh");
+    assert_contains_dynamic_markers(&completions.stdout, "zsh");
     info!("e2e_completions_zsh_contains_subcommands: done");
 }
 
@@ -201,7 +201,7 @@ fn e2e_completions_fish_contains_subcommands() {
         completions.stderr
     );
 
-    assert_contains_dynamic_markers(&completions.stdout,"fish");
+    assert_contains_dynamic_markers(&completions.stdout, "fish");
     info!("e2e_completions_fish_contains_subcommands: done");
 }
 
@@ -253,7 +253,7 @@ fn e2e_completions_powershell_contains_subcommands() {
         completions.stderr
     );
 
-    assert_contains_dynamic_markers(&completions.stdout,"powershell");
+    assert_contains_dynamic_markers(&completions.stdout, "powershell");
     info!("e2e_completions_powershell_contains_subcommands: done");
 }
 
@@ -553,8 +553,7 @@ fn e2e_completions_powershell_file_output() {
     assert!(output_file.exists(), "completion file should exist");
     let file_content = fs::read_to_string(&output_file).expect("read completion file");
     assert!(
-        file_content.contains("Register-ArgumentCompleter")
-            || file_content.contains("COMPLETE"),
+        file_content.contains("Register-ArgumentCompleter") || file_content.contains("COMPLETE"),
         "powershell completions file should have argument completer or COMPLETE registration"
     );
     info!("e2e_completions_powershell_file_output: done");
