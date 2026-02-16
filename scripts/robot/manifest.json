@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "commands": [
+    {
+      "id": "scripts.inventory",
+      "summary": "List available scripts in beads_rust",
+      "command": [
+        "find",
+        "scripts",
+        "-maxdepth",
+        "2",
+        "-type",
+        "f"
+      ],
+      "risk": "safe"
+    },
+    {
+      "id": "scripts.sample",
+      "summary": "Run a sample script in beads_rust (scripts/agent_smoke_test.sh)",
+      "command": [
+        "bash",
+        "scripts/agent_smoke_test.sh"
+      ],
+      "risk": "ask-first"
+    }
+  ]
+}
