@@ -1,3 +1,0 @@
-{"id":"int-667446e7","kind":"llm_call","created_at":"2026-01-17T07:11:41.978284603Z","actor":"ubuntu","model":"gpt-4","prompt":"test prompt"}
-{"id":"int-35559c4e","kind":"label","created_at":"2026-01-17T07:12:01.418274462Z","actor":"ubuntu","parent_id":"int-667446e7","label":"good","reason":"test label"}
-{"id":"int-47b9e78f","kind":"tool_call","created_at":"2026-01-17T07:12:10.679878127Z","actor":"ubuntu","tool_name":"read_file","exit_code":0}
