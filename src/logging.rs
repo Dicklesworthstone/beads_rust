@@ -76,7 +76,7 @@ fn default_filter(verbosity: u8, quiet: bool) -> String {
             if cfg!(debug_assertions) {
                 "beads_rust=debug".to_string()
             } else {
-                "beads_rust=info".to_string()
+                "beads_rust=warn".to_string()
             }
         }
         1 => "beads_rust=debug".to_string(),
