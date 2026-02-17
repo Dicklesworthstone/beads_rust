@@ -90,7 +90,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
 
         // Warn if the target status matches the current status (redundant transition)
-        if let (Some(ref issue_before), Some(ref target_status)) =
+        if let (Some(issue_before), Some(target_status)) =
             (&issue_before, &update.status)
         {
             if issue_before.status == *target_status {
