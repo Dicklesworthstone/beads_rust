@@ -89,6 +89,15 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ));
         }
 
+        // Warn if the target status matches the current status (redundant transition)
+        if let (Some(ref issue_before), Some(ref target_status)) =
+            (&issue_before, &update.status)
+        {
+            if issue_before.status == *target_status {
+                warn_redundant_status(id, target_status, storage);
+            }
+        }
+
         // Apply basic field updates
         if !update.is_empty() {
             storage.update_issue(id, &update, &actor)?;
@@ -349,6 +358,45 @@ fn apply_parent_update(
 
 fn parse_date(s: &str) -> Result<DateTime<Utc>> {
     parse_flexible_timestamp(s, "date")
+}
+
+/// Emit an stderr warning when an issue is being transitioned to a status it already has.
+///
+/// This warns AI agents (and humans) that another process may have already claimed or
+/// modified the issue. The warning is non-blocking — the operation still proceeds.
+pub(crate) fn warn_redundant_status(
+    id: &str,
+    current_status: &Status,
+    storage: &crate::storage::SqliteStorage,
+) {
+    use crate::model::EventType;
+    use crate::util::time::format_duration_ago;
+
+    let status_str = current_status.as_str();
+    // Find the most recent status_changed event to report who and when
+    if let Ok(events) = storage.get_events(id, 20) {
+        if let Some(evt) = events
+            .iter()
+            .find(|e| e.event_type == EventType::StatusChanged)
+        {
+            let ago = format_duration_ago(evt.created_at, Utc::now());
+            let actor_info = if evt.actor.is_empty() {
+                String::new()
+            } else {
+                format!(" by '{}'", evt.actor)
+            };
+            eprintln!(
+                "warning: {id} is already '{status_str}' (set {ago}{actor_info}) — \
+                 another agent may be working on this issue; consider re-checking before proceeding"
+            );
+            return;
+        }
+    }
+    // Fallback if no event found
+    eprintln!(
+        "warning: {id} is already '{status_str}' — \
+         another agent may be working on this issue; consider re-checking before proceeding"
+    );
 }
 
 #[cfg(test)]

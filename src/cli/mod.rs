@@ -745,7 +745,7 @@ pub enum Commands {
     /// Delete an issue (creates tombstone)
     Delete(DeleteArgs),
 
-    /// List ready issues (unblocked, not deferred)
+    /// List ready issues (unblocked, not in-progress, not deferred)
     Ready(ReadyArgs),
 
     /// List blocked issues

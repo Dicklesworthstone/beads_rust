@@ -196,6 +196,7 @@ pub fn execute_with_args(
 
         // Check if already closed
         if issue.status.is_terminal() {
+            crate::cli::commands::update::warn_redundant_status(id, &issue.status, storage);
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: format!("already {}", issue.status.as_str()),

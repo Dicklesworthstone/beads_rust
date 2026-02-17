@@ -1074,11 +1074,11 @@ impl SqliteStorage {
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        // Ready condition 1: status is `open` OR `in_progress`
+        // Ready condition 1: status is `open` (not in_progress, not blocked, not deferred)
         if filters.include_deferred {
-            sql.push_str(" AND status IN ('open', 'in_progress', 'deferred')");
+            sql.push_str(" AND status IN ('open', 'deferred')");
         } else {
-            sql.push_str(" AND status IN ('open', 'in_progress')");
+            sql.push_str(" AND status = 'open'");
         }
 
         // Ready condition 2: NOT in blocked_issues_cache (NOT EXISTS is faster than NOT IN)

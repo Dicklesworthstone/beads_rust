@@ -1,6 +1,6 @@
 //! Ready command implementation.
 //!
-//! Shows issues ready to work on: unblocked, not deferred, not pinned, not ephemeral.
+//! Shows issues ready to work on: unblocked, not in-progress, not deferred, not pinned, not ephemeral.
 
 use crate::cli::{OutputFormat, ReadyArgs, SortPolicy, resolve_output_format_basic};
 use crate::config;

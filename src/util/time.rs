@@ -150,6 +150,23 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
     }
 }
 
+/// Format a duration as a human-readable "time ago" string.
+///
+/// Returns strings like "3s ago", "5m ago", "2h ago", "1d ago".
+#[must_use]
+pub fn format_duration_ago(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
+    let secs = (to - from).num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

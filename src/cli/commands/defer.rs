@@ -102,12 +102,18 @@ pub fn execute_defer(
 
         // Check if already deferred (with same time)
         if issue.status == Status::Deferred && issue.defer_until == defer_until {
+            crate::cli::commands::update::warn_redundant_status(id, &issue.status, storage);
             tracing::debug!(id = %id, "Issue already deferred with same time");
             skipped_issues.push(SkippedIssue {
                 id: id.clone(),
                 reason: "already deferred".to_string(),
             });
             continue;
+        }
+
+        // Warn if already deferred but with a different time (will be overwritten)
+        if issue.status == Status::Deferred {
+            crate::cli::commands::update::warn_redundant_status(id, &issue.status, storage);
         }
 
         // Build update: set status=deferred, set defer_until
