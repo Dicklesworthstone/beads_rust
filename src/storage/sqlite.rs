@@ -1398,6 +1398,37 @@ impl SqliteStorage {
             }
         }
 
+        // Block children of deferred parents.
+        // A deferred epic signals "not yet", so its children should not appear as ready.
+        // We insert only the children (not the deferred parent itself) to avoid
+        // polluting `br blocked` with the deferred epic.
+        {
+            let mut stmt = conn.prepare(
+                r"SELECT DISTINCT d.issue_id, d.depends_on_id
+                  FROM dependencies d
+                  INNER JOIN issues i ON d.depends_on_id = i.id
+                  WHERE d.type = 'parent-child'
+                    AND i.status = 'deferred'
+                    AND NOT EXISTS (SELECT 1 FROM blocked_issues_cache WHERE issue_id = d.issue_id)",
+            )?;
+
+            let deferred_children: Vec<(String, String)> = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            let mut insert_stmt = conn
+                .prepare("INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)")?;
+
+            for (child_id, parent_id) in deferred_children {
+                let blockers_json = serde_json::to_string(&[format!("{parent_id}:parent-deferred")])
+                    .unwrap_or_else(|_| "[]".to_string());
+                insert_stmt.execute(rusqlite::params![child_id, blockers_json])?;
+                count += 1;
+            }
+        }
+
         // Now handle transitive blocking via parent-child relationships
         // Children inherit parent's blocked state (up to depth 50)
         let mut depth = 0;
