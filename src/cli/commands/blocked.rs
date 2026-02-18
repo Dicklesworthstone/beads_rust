@@ -176,7 +176,7 @@ pub fn execute(
             ctx.toon_with_stats(&output, args.stats);
         }
         OutputFormat::Text | OutputFormat::Csv => {
-            let max_width = if args.wrap { ctx.width() } else { 0 };
+            let max_width = if args.no_wrap { 0 } else { ctx.width() };
             if matches!(ctx.mode(), OutputMode::Rich) {
                 render_blocked_rich(&blocked_issues, args.detailed, storage, max_width);
             } else {

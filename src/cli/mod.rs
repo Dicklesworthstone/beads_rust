@@ -1381,9 +1381,9 @@ pub struct ListArgs {
     #[arg(long)]
     pub pretty: bool,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
-    pub wrap: bool,
+    pub no_wrap: bool,
 
     /// Output format (text, json, csv, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
@@ -1425,9 +1425,9 @@ pub struct ShowArgs {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
-    pub wrap: bool,
+    pub no_wrap: bool,
 
     /// Show token savings stats when using TOON output
     #[arg(long)]
@@ -1624,9 +1624,9 @@ pub struct CommentsArgs {
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub id: Option<String>,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
-    pub wrap: bool,
+    pub no_wrap: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1663,9 +1663,9 @@ pub struct CommentListArgs {
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub id: String,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
-    pub wrap: bool,
+    pub no_wrap: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1919,9 +1919,9 @@ pub struct ReadyArgs {
     #[arg(long, short = 'r')]
     pub recursive: bool,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
-    pub wrap: bool,
+    pub no_wrap: bool,
 
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
@@ -1948,9 +1948,9 @@ pub struct BlockedArgs {
     #[arg(long)]
     pub detailed: bool,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
-    pub wrap: bool,
+    pub no_wrap: bool,
 
     /// Filter by issue type (can be repeated)
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]

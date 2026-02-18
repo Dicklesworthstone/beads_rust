@@ -41,7 +41,7 @@ pub fn execute(
     let format_options = TextFormatOptions {
         use_color,
         max_width,
-        wrap: args.wrap,
+        wrap: !args.no_wrap,
     };
 
     // Build filter from args
@@ -146,8 +146,8 @@ pub fn execute(
                 let mut table = IssueTable::new(&issues, ctx.theme())
                     .columns(columns)
                     .title(format!("Issues ({})", issues.len()))
-                    .wrap(args.wrap);
-                if args.wrap {
+                    .wrap(!args.no_wrap);
+                if !args.no_wrap {
                     table = table.width(Some(ctx.width()));
                 }
                 let table = table.build();

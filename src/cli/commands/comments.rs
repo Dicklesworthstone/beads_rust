@@ -51,14 +51,14 @@ pub fn execute(
             &all_ids,
             json,
             ctx,
-            list_args.wrap,
+            !list_args.no_wrap,
         ),
         None => {
             let id = args
                 .id
                 .as_deref()
                 .ok_or_else(|| BeadsError::validation("id", "missing issue id"))?;
-            list_comments_by_id(id, storage, &resolver, &all_ids, json, ctx, args.wrap)
+            list_comments_by_id(id, storage, &resolver, &all_ids, json, ctx, !args.no_wrap)
         }
     }?;
 

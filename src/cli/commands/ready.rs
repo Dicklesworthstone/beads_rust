@@ -118,8 +118,8 @@ pub fn execute(
                         ready_issues.len(),
                         if ready_issues.len() == 1 { "" } else { "s" }
                     ))
-                    .wrap(args.wrap);
-                if args.wrap {
+                    .wrap(!args.no_wrap);
+                if !args.no_wrap {
                     table = table.width(Some(ctx.width()));
                 }
                 let table = table.build();
@@ -132,7 +132,7 @@ pub fn execute(
                     if ready_issues.len() == 1 { "" } else { "s" }
                 );
                 for (i, issue) in ready_issues.iter().enumerate() {
-                    let line = format_ready_line(i + 1, issue, use_color, max_width, args.wrap);
+                    let line = format_ready_line(i + 1, issue, use_color, max_width, !args.no_wrap);
                     println!("{line}");
                 }
             }

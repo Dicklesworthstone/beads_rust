@@ -51,7 +51,7 @@ pub fn execute(
     let format_options = TextFormatOptions {
         use_color,
         max_width,
-        wrap: args.filters.wrap,
+        wrap: !args.filters.no_wrap,
     };
 
     let mut filters = build_filters(&args.filters)?;
@@ -161,8 +161,8 @@ pub fn execute(
                 if issues.len() == 1 { "" } else { "s" }
             ))
             .highlight_query(query)
-            .wrap(args.filters.wrap);
-        if args.filters.wrap {
+            .wrap(!args.filters.no_wrap);
+        if !args.filters.no_wrap {
             table = table.width(Some(ctx.width()));
         }
         if show_context {
