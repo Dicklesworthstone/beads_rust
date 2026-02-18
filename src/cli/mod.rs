@@ -937,7 +937,7 @@ pub struct CreateArgs {
     pub priority: Option<String>,
 
     /// Description
-    #[arg(long, short = 'd')]
+    #[arg(long, short = 'd', visible_alias = "body")]
     pub description: Option<String>,
 
     /// Assign to person
@@ -2318,7 +2318,7 @@ pub struct QuerySaveArgs {
     pub name: String,
 
     /// Optional description
-    #[arg(long, short = 'd')]
+    #[arg(long, short = 'd', visible_alias = "body")]
     pub description: Option<String>,
 
     /// Filters to save (same as list command filters)
