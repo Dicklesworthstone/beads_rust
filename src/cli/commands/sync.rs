@@ -11,7 +11,7 @@ use crate::sync::history::HistoryConfig;
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash, count_issues_in_jsonl,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, compute_jsonl_hash,
     export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl, import_from_jsonl,
     load_base_snapshot, read_issues_from_jsonl, require_safe_sync_overwrite_path,
     save_base_snapshot, three_way_merge,
@@ -488,66 +488,8 @@ fn execute_flush(
     let dirty_ids = storage.get_dirty_issue_ids()?;
     debug!(dirty_count = dirty_ids.len(), "Found dirty issues");
 
-    // If no dirty issues and no force, report nothing to do
+    // Fast path: no dirty issues and no --force → nothing to export (no I/O needed)
     if dirty_ids.is_empty() && !args.force {
-        // Guard against empty DB overwriting a non-empty JSONL.
-        let existing_count = count_issues_in_jsonl(jsonl_path)?;
-        if existing_count > 0 {
-            let issues = storage.get_all_issues_for_export()?;
-            if issues.is_empty() {
-                warn!(
-                    jsonl_count = existing_count,
-                    "Refusing export of empty DB over non-empty JSONL"
-                );
-                return Err(BeadsError::Config(format!(
-                    "Refusing to export empty database over non-empty JSONL file.\n\
-                     Database has 0 issues, JSONL has {existing_count} issues.\n\
-                     This would result in data loss!\n\
-                     Hint: Use --force to override this safety check."
-                )));
-            }
-
-            let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
-            if !jsonl_ids.is_empty() {
-                let db_ids: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
-                let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
-
-                if !missing.is_empty() {
-                    warn!(
-                        jsonl_count = jsonl_ids.len(),
-                        db_count = issues.len(),
-                        missing_count = missing.len(),
-                        "Refusing export because DB is stale relative to JSONL"
-                    );
-                    let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
-                    missing_list.sort();
-                    let display_count = missing_list.len().min(10);
-                    let preview: Vec<_> = missing_list.iter().take(display_count).collect();
-                    let more = if missing_list.len() > 10 {
-                        format!(" ... and {} more", missing_list.len() - 10)
-                    } else {
-                        String::new()
-                    };
-
-                    return Err(BeadsError::Config(format!(
-                        "Refusing to export stale database that would lose issues.\n\
-                         Database has {} issues, JSONL has {} issues.\n\
-                         Export would lose {} issue(s): {}{}\n\
-                         Hint: Run import first, or use --force to override.",
-                        issues.len(),
-                        jsonl_ids.len(),
-                        missing_list.len(),
-                        preview
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        more
-                    )));
-                }
-            }
-        }
-
         if use_json {
             let result = FlushResult {
                 exported_issues: 0,
@@ -566,6 +508,70 @@ fn execute_flush(
             println!("Nothing to export (no dirty issues)");
         }
         return Ok(());
+    }
+
+    // Safety guards: prevent data loss from exporting a stale or empty DB.
+    // Only reached when an export will actually happen (dirty issues exist or --force).
+    // Skipped by --force (user explicitly overrides safety checks).
+    if !args.force {
+        let jsonl_ids = get_issue_ids_from_jsonl(jsonl_path)?;
+        if !jsonl_ids.is_empty() {
+            let all_db_ids = storage.get_all_ids()?;
+
+            // Empty DB Guard: refuse to overwrite non-empty JSONL with empty DB
+            if all_db_ids.is_empty() {
+                warn!(
+                    jsonl_count = jsonl_ids.len(),
+                    "Refusing export of empty DB over non-empty JSONL"
+                );
+                return Err(BeadsError::Config(format!(
+                    "Refusing to export empty database over non-empty JSONL file.\n\
+                     Database has 0 issues, JSONL has {} issues.\n\
+                     This would result in data loss!\n\
+                     Hint: Use --force to override this safety check.",
+                    jsonl_ids.len()
+                )));
+            }
+
+            // Stale DB Guard: refuse to export if JSONL has issues missing from DB
+            let db_id_count = all_db_ids.len();
+            let db_ids: HashSet<String> = all_db_ids.into_iter().collect();
+            let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
+
+            if !missing.is_empty() {
+                warn!(
+                    jsonl_count = jsonl_ids.len(),
+                    db_count = db_id_count,
+                    missing_count = missing.len(),
+                    "Refusing export because DB is stale relative to JSONL"
+                );
+                let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
+                missing_list.sort();
+                let display_count = missing_list.len().min(10);
+                let preview: Vec<_> = missing_list.iter().take(display_count).collect();
+                let more = if missing_list.len() > 10 {
+                    format!(" ... and {} more", missing_list.len() - 10)
+                } else {
+                    String::new()
+                };
+
+                return Err(BeadsError::Config(format!(
+                    "Refusing to export stale database that would lose issues.\n\
+                     Database has {} issues, JSONL has {} issues.\n\
+                     Export would lose {} issue(s): {}{}\n\
+                     Hint: Run import first, or use --force to override.",
+                    db_id_count,
+                    jsonl_ids.len(),
+                    missing_list.len(),
+                    preview
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    more
+                )));
+            }
+        }
     }
 
     // Configure export
