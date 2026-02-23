@@ -43,7 +43,7 @@ serde_yml = "0.0.12"
 schemars = { version = "1.0", features = ["derive", "chrono04"] }
 
 # Time
-chrono = { version = "0.4.43", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 
 # Hashing
 sha2 = "0.10.9"
@@ -61,7 +61,7 @@ indicatif = "0.18.4"
 crossterm = "0.29"
 
 # Rich terminal output (sibling project)
-rich_rust = { version = "0.2.0", features = ["full"] }
+rich_rust = { version = "0.2.1", features = ["full"] }
 
 # TOON format support (sibling project)
 toon_rust = { version = "0.2.0", package = "tru" }
