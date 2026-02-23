@@ -1874,26 +1874,32 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn get_epic_counts(&self) -> Result<std::collections::HashMap<String, (usize, usize)>> {
+        // Fetch all parent-child rows with status, then aggregate in Rust.
+        // fsqlite does not support non-column arguments in aggregate functions
+        // (e.g. SUM(CASE WHEN ...)), so we compute closed counts client-side.
         let rows = self.conn.query(
-            "SELECT
-                d.depends_on_id AS epic_id,
-                COUNT(*) AS total,
-                SUM(CASE WHEN i.status = 'closed' OR i.status = 'tombstone' THEN 1 ELSE 0 END) AS closed
+            "SELECT d.depends_on_id, i.status
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
-             WHERE d.type = 'parent-child'
-             GROUP BY d.depends_on_id",
+             WHERE d.type = 'parent-child'",
         )?;
-        let mut counts = std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
         for row in &rows {
             let epic_id = row
                 .get(0)
                 .and_then(SqliteValue::as_text)
                 .unwrap_or("")
                 .to_string();
-            let total = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) as usize;
-            let closed = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0) as usize;
-            counts.insert(epic_id, (total, closed));
+            let status = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("");
+            let entry = counts.entry(epic_id).or_insert((0, 0));
+            entry.0 += 1;
+            if status == "closed" || status == "tombstone" {
+                entry.1 += 1;
+            }
         }
         Ok(counts)
     }
@@ -3072,7 +3078,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_dirty_issue_count(&self) -> Result<usize> {
-        let row = self.conn.query_row("SELECT COUNT(1) FROM dirty_issues")?;
+        let row = self.conn.query_row("SELECT COUNT(*) FROM dirty_issues")?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         Ok(usize::try_from(count).unwrap_or(0))
     }
