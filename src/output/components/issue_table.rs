@@ -165,11 +165,13 @@ impl<'a> IssueTable<'a> {
             table = table.with_column(Column::new("Type").min_width(7));
         }
         if self.columns.title {
-            table = table.with_column(
-                Column::new("Title")
-                    .min_width(20)
-                    .max_width(title_max_width),
-            );
+            let mut title_col = Column::new("Title")
+                .min_width(20)
+                .max_width(title_max_width);
+            if self.wrap {
+                title_col = title_col.overflow(OverflowMethod::Fold);
+            }
+            table = table.with_column(title_col);
         }
         if self.columns.assignee {
             table = table.with_column(Column::new("Assignee").max_width(20));
