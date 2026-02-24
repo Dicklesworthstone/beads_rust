@@ -82,6 +82,15 @@ impl MutationContext {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ImportLookupRow {
+    pub id: String,
+    pub updated_at: DateTime<Utc>,
+    pub status: Status,
+    pub external_ref: Option<String>,
+    pub content_hash: Option<String>,
+}
+
 impl SqliteStorage {
     /// Open a new connection to the database at the given path.
     ///
@@ -1863,6 +1872,53 @@ impl SqliteStorage {
             .iter()
             .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
             .collect())
+    }
+
+    /// Load minimal issue fields required for import collision resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails or a timestamp is invalid.
+    pub fn get_import_lookup_rows(&self) -> Result<Vec<ImportLookupRow>> {
+        let rows = self.conn.query(
+            "SELECT id, updated_at, status, external_ref, content_hash
+             FROM issues",
+        )?;
+
+        let mut lookup_rows = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id = row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .to_string();
+            let updated_at_raw = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
+            let status = row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(Status::Open);
+            let external_ref = row
+                .get(3)
+                .and_then(SqliteValue::as_text)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty());
+            let content_hash = row
+                .get(4)
+                .and_then(SqliteValue::as_text)
+                .map(str::to_string)
+                .filter(|value| !value.is_empty());
+
+            lookup_rows.push(ImportLookupRow {
+                id,
+                updated_at: parse_datetime(updated_at_raw)?,
+                status,
+                external_ref,
+                content_hash,
+            });
+        }
+
+        Ok(lookup_rows)
     }
 
     /// Get epic counts (total children, closed children) for all epics.

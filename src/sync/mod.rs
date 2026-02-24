@@ -24,7 +24,7 @@ use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::IssueValidator;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, hash_map::RandomState};
+use std::collections::{HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -1954,6 +1954,120 @@ pub enum CollisionAction {
     Skip { reason: String },
 }
 
+#[derive(Debug, Default)]
+struct ImportLookupCache {
+    ids: HashSet<String>,
+    updated_at_by_id: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    tombstones: HashSet<String>,
+    by_external_ref: HashMap<String, String>,
+    by_content_hash: HashMap<String, String>,
+}
+
+impl ImportLookupCache {
+    fn build(storage: &SqliteStorage) -> Result<Self> {
+        let mut cache = Self::default();
+        for row in storage.get_import_lookup_rows()? {
+            cache.ids.insert(row.id.clone());
+            cache
+                .updated_at_by_id
+                .insert(row.id.clone(), row.updated_at);
+            if row.status == crate::model::Status::Tombstone {
+                cache.tombstones.insert(row.id.clone());
+            }
+            if let Some(external_ref) = row.external_ref {
+                cache
+                    .by_external_ref
+                    .entry(external_ref)
+                    .or_insert_with(|| row.id.clone());
+            }
+            if let Some(content_hash) = row.content_hash {
+                cache
+                    .by_content_hash
+                    .entry(content_hash)
+                    .or_insert_with(|| row.id.clone());
+            }
+        }
+        Ok(cache)
+    }
+
+    fn detect_collision(&self, incoming: &Issue, computed_hash: &str) -> CollisionResult {
+        if let Some(external_ref) = incoming.external_ref.as_ref() {
+            if let Some(existing_id) = self.by_external_ref.get(external_ref) {
+                return CollisionResult::Match {
+                    existing_id: existing_id.clone(),
+                    match_type: MatchType::ExternalRef,
+                    phase: 1,
+                };
+            }
+        }
+
+        if let Some(existing_id) = self.by_content_hash.get(computed_hash) {
+            return CollisionResult::Match {
+                existing_id: existing_id.clone(),
+                match_type: MatchType::ContentHash,
+                phase: 2,
+            };
+        }
+
+        if self.ids.contains(&incoming.id) {
+            return CollisionResult::Match {
+                existing_id: incoming.id.clone(),
+                match_type: MatchType::Id,
+                phase: 3,
+            };
+        }
+
+        CollisionResult::NewIssue
+    }
+
+    fn determine_action(
+        &self,
+        collision: &CollisionResult,
+        incoming: &Issue,
+        force_upsert: bool,
+    ) -> Result<CollisionAction> {
+        match collision {
+            CollisionResult::NewIssue => Ok(CollisionAction::Insert),
+            CollisionResult::Match { existing_id, .. } => {
+                if self.tombstones.contains(existing_id) {
+                    return Ok(CollisionAction::Skip {
+                        reason: format!("Tombstone protection: {existing_id}"),
+                    });
+                }
+
+                if force_upsert {
+                    return Ok(CollisionAction::Update {
+                        existing_id: existing_id.clone(),
+                    });
+                }
+
+                let existing_updated_at =
+                    self.updated_at_by_id.get(existing_id).ok_or_else(|| {
+                        BeadsError::IssueNotFound {
+                            id: existing_id.clone(),
+                        }
+                    })?;
+
+                match incoming.updated_at.cmp(existing_updated_at) {
+                    std::cmp::Ordering::Greater => Ok(CollisionAction::Update {
+                        existing_id: existing_id.clone(),
+                    }),
+                    std::cmp::Ordering::Equal => Ok(CollisionAction::Skip {
+                        reason: format!("Equal timestamps: {existing_id}"),
+                    }),
+                    std::cmp::Ordering::Less => Ok(CollisionAction::Skip {
+                        reason: format!("Existing is newer: {existing_id}"),
+                    }),
+                }
+            }
+        }
+    }
+}
+
+fn is_fsqlite_oom(err: &BeadsError) -> bool {
+    matches!(err, BeadsError::Database(db_err) if db_err.to_string().contains("out of memory"))
+}
+
 /// Detect collision for an incoming issue using the 4-phase algorithm.
 ///
 /// Phases:
@@ -1961,6 +2075,7 @@ pub enum CollisionAction {
 /// 2. Content hash match
 /// 3. ID match
 /// 4. No match (new issue)
+#[allow(dead_code)] // Retained for unit-test coverage of canonical collision semantics.
 fn detect_collision(
     incoming: &Issue,
     storage: &SqliteStorage,
@@ -2000,6 +2115,7 @@ fn detect_collision(
 }
 
 /// Determine the action to take based on collision result.
+#[allow(dead_code)] // Retained for unit-test coverage of canonical action semantics.
 fn determine_action(
     collision: &CollisionResult,
     incoming: &Issue,
@@ -2187,7 +2303,7 @@ pub fn import_from_jsonl(
     // Step 4: Prefix validation (if enabled and prefix provided)
     if !config.skip_prefix_validation {
         if let Some(prefix) = expected_prefix {
-            let mut mismatches = Vec::new();
+            let mut mismatches = HashSet::new();
             for issue in &issues {
                 // Check if ID starts with expected prefix
                 if !issue.id.starts_with(prefix) {
@@ -2195,7 +2311,7 @@ pub fn import_from_jsonl(
                     if issue.status == crate::model::Status::Tombstone {
                         continue;
                     }
-                    mismatches.push(issue.id.clone());
+                    mismatches.insert(issue.id.clone());
                 }
             }
 
@@ -2235,6 +2351,10 @@ pub fn import_from_jsonl(
                 let mut renames = std::collections::HashMap::new();
                 let existing_ids: std::collections::HashSet<String> =
                     storage.get_all_ids()?.into_iter().collect();
+                let incoming_ids: std::collections::HashSet<String> =
+                    issues.iter().map(|issue| issue.id.clone()).collect();
+                let mut reserved_ids = existing_ids.clone();
+                reserved_ids.extend(incoming_ids);
 
                 for (old_id, title, desc, creator, created_at) in to_rename {
                     let new_id = generator.generate(
@@ -2243,12 +2363,9 @@ pub fn import_from_jsonl(
                         creator.as_deref(),
                         created_at,
                         issues.len(),
-                        |candidate| {
-                            existing_ids.contains(candidate)
-                                || issues.iter().any(|i| i.id == candidate)
-                                || renames.values().any(|v| *v == candidate)
-                        },
+                        |candidate| reserved_ids.contains(candidate),
                     );
+                    reserved_ids.insert(new_id.clone());
                     renames.insert(old_id, new_id);
                 }
 
@@ -2290,8 +2407,7 @@ pub fn import_from_jsonl(
         }
     }
 
-    // Clear export hashes before importing new data.
-    storage.clear_all_export_hashes()?;
+    let import_lookup = ImportLookupCache::build(storage)?;
 
     // Phase 1: Scan and Resolve IDs
     let mut seen_external_refs: HashSet<String> = HashSet::new();
@@ -2333,10 +2449,11 @@ pub fn import_from_jsonl(
         let computed_hash = content_hash(&effective_issue);
 
         // Detect collision
-        let collision = detect_collision(&effective_issue, storage, &computed_hash)?;
+        let collision = import_lookup.detect_collision(&effective_issue, &computed_hash);
 
         // Determine action
-        let action = determine_action(&collision, &effective_issue, storage, config.force_upsert)?;
+        let action =
+            import_lookup.determine_action(&collision, &effective_issue, config.force_upsert)?;
 
         // Determine target ID and record mapping
         let target_id = match &collision {
@@ -2396,18 +2513,64 @@ pub fn import_from_jsonl(
     }
     progress.finish_with_message("Import complete");
 
-    // Restore export hashes for imported issues
-    if !new_export_hashes.is_empty() {
-        storage.set_export_hashes(&new_export_hashes)?;
+    if result.imported_count == 0 {
+        return Ok(result);
+    }
+
+    // Keep export hash table best-effort under fsqlite OOM pressure.
+    let export_hash_result = (|| -> Result<()> {
+        storage.clear_all_export_hashes()?;
+        if !new_export_hashes.is_empty() {
+            storage.set_export_hashes(&new_export_hashes)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = export_hash_result {
+        if is_fsqlite_oom(&err) {
+            tracing::warn!(
+                error = %err,
+                "Failed to refresh export hashes; continuing with stale hash cache"
+            );
+        } else {
+            return Err(err);
+        }
     }
 
     // Step 10: Refresh blocked cache
-    storage.rebuild_blocked_cache(true)?;
+    if let Err(err) = storage.rebuild_blocked_cache(true) {
+        if is_fsqlite_oom(&err) {
+            tracing::warn!(
+                error = %err,
+                "Failed to rebuild blocked cache; continuing with existing cache"
+            );
+        } else {
+            return Err(err);
+        }
+    }
 
-    // Step 11: Update metadata
-    storage.set_metadata(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+    if let Err(err) =
+        storage.set_metadata(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())
+    {
+        if is_fsqlite_oom(&err) {
+            tracing::warn!(
+                error = %err,
+                "Failed to update last-import metadata; continuing without metadata update"
+            );
+        } else {
+            return Err(err);
+        }
+    }
     let jsonl_hash = compute_jsonl_hash(input_path)?;
-    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
+    if let Err(err) = storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &jsonl_hash) {
+        if is_fsqlite_oom(&err) {
+            tracing::warn!(
+                error = %err,
+                "Failed to update JSONL hash metadata; continuing without metadata update"
+            );
+        } else {
+            return Err(err);
+        }
+    }
     Ok(result)
 }
 
