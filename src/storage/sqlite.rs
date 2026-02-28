@@ -3459,20 +3459,20 @@ impl SqliteStorage {
             created_at: parse_datetime(&get_str(13))?,
             created_by: Self::empty_to_none(get_opt_str(14)),
             updated_at: parse_datetime(&get_str(15))?,
-            closed_at: get_opt_str(16).as_deref().map(parse_datetime).transpose()?,
+            closed_at: Self::empty_to_none(get_opt_str(16)).as_deref().map(parse_datetime).transpose()?,
             close_reason: Self::empty_to_none(get_opt_str(17)),
             closed_by_session: Self::empty_to_none(get_opt_str(18)),
-            due_at: get_opt_str(19).as_deref().map(parse_datetime).transpose()?,
-            defer_until: get_opt_str(20).as_deref().map(parse_datetime).transpose()?,
+            due_at: Self::empty_to_none(get_opt_str(19)).as_deref().map(parse_datetime).transpose()?,
+            defer_until: Self::empty_to_none(get_opt_str(20)).as_deref().map(parse_datetime).transpose()?,
             external_ref: get_opt_str(21),
             source_system: Self::empty_to_none(get_opt_str(22)),
             source_repo: Self::empty_to_none(get_opt_str(23)),
-            deleted_at: get_opt_str(24).as_deref().map(parse_datetime).transpose()?,
+            deleted_at: Self::empty_to_none(get_opt_str(24)).as_deref().map(parse_datetime).transpose()?,
             deleted_by: Self::empty_to_none(get_opt_str(25)),
             delete_reason: Self::empty_to_none(get_opt_str(26)),
             original_type: Self::empty_to_none(get_opt_str(27)),
             compaction_level: get_opt_i32(28),
-            compacted_at: get_opt_str(29).as_deref().map(parse_datetime).transpose()?,
+            compacted_at: Self::empty_to_none(get_opt_str(29)).as_deref().map(parse_datetime).transpose()?,
             compacted_at_commit: get_opt_str(30),
             original_size: get_opt_i32(31),
             sender: Self::empty_to_none(get_opt_str(32)),
@@ -3705,6 +3705,11 @@ fn query_external_project_capabilities(
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
+    if s.is_empty() {
+        // NULL/empty columns default to epoch rather than failing
+        return Ok(DateTime::<Utc>::UNIX_EPOCH);
+    }
+
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc));
     }
