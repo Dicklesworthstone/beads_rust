@@ -136,6 +136,36 @@ impl SqliteStorage {
         }
     }
 
+    /// Drop and recreate all data tables, preserving `config` and `metadata`.
+    ///
+    /// Used before force imports to avoid fsqlite btree cursor bugs on DELETE
+    /// operations in large tables. By starting with empty tables, the import
+    /// only performs INSERTs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any DROP/CREATE statement fails.
+    pub fn reset_data_tables(&mut self) -> Result<()> {
+        use crate::storage::schema::{apply_schema, execute_batch};
+        execute_batch(
+            &self.conn,
+            r"
+            DROP TABLE IF EXISTS blocked_issues_cache;
+            DROP TABLE IF EXISTS export_hashes;
+            DROP TABLE IF EXISTS dirty_issues;
+            DROP TABLE IF EXISTS child_counters;
+            DROP TABLE IF EXISTS events;
+            DROP TABLE IF EXISTS comments;
+            DROP TABLE IF EXISTS labels;
+            DROP TABLE IF EXISTS dependencies;
+            DROP TABLE IF EXISTS issues;
+            ",
+        )?;
+        // Recreate with full schema (config/metadata already exist, IF NOT EXISTS is safe)
+        apply_schema(&self.conn)?;
+        Ok(())
+    }
+
     /// Get audit events for a specific issue.
     ///
     /// # Errors

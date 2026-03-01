@@ -974,6 +974,13 @@ fn execute_import(
         id_cfg.prefix
     };
 
+    // For force imports, drop and recreate data tables to avoid fsqlite btree
+    // cursor bugs on DELETE operations in large tables. Config/metadata are preserved.
+    if args.force {
+        debug!("Force import: resetting data tables to avoid btree DELETE bugs");
+        storage.reset_data_tables()?;
+    }
+
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
     let mut import_result = import_from_jsonl(storage, jsonl_path, &import_config, Some(&prefix))?;
