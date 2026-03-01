@@ -178,12 +178,28 @@ fn collect_table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> 
 }
 
 fn required_schema_checks(conn: &Connection, checks: &mut Vec<CheckResult>) -> Result<()> {
-    let rows = conn
-        .query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
+    // fsqlite's sqlite_master may not enumerate tables correctly,
+    // so we probe each required table directly with a lightweight query.
     let mut tables = Vec::new();
-    for row in &rows {
-        if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
-            tables.push(name.to_string());
+    // First try sqlite_master (works on real SQLite)
+    if let Ok(rows) = conn.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'") {
+        for row in &rows {
+            if let Some(name) = row.get(0).and_then(SqliteValue::as_text) {
+                tables.push(name.to_string());
+            }
+        }
+    }
+    // If sqlite_master returned nothing, probe tables directly (fsqlite workaround)
+    if tables.is_empty() {
+        let probe_tables = [
+            "issues", "dependencies", "labels", "comments", "events",
+            "config", "metadata", "dirty_issues", "export_hashes",
+            "blocked_issues_cache", "child_counters",
+        ];
+        for table in &probe_tables {
+            if conn.query(&format!("SELECT 1 FROM {} LIMIT 1", table)).is_ok() {
+                tables.push(table.to_string());
+            }
         }
     }
 
