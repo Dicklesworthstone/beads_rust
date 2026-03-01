@@ -15,7 +15,7 @@ use common::{fixtures, test_db};
 // ============================================================================
 
 fn ready_ids(
-    storage: &SqliteStorage,
+    storage: &mut SqliteStorage,
     filters: &ReadyFilters,
     sort: ReadySortPolicy,
 ) -> Vec<String> {
@@ -52,7 +52,7 @@ fn ready_filter_by_assignee() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&issue1.id));
     assert!(!ids.contains(&issue2.id));
@@ -78,7 +78,7 @@ fn ready_filter_unassigned_only() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 2);
     assert!(!ids.contains(&assigned.id));
     assert!(ids.contains(&unassigned1.id));
@@ -112,7 +112,7 @@ fn ready_filter_by_single_type() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&bug.id));
 }
@@ -140,7 +140,7 @@ fn ready_filter_by_multiple_types() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&bug.id));
     assert!(ids.contains(&feature.id));
@@ -174,7 +174,7 @@ fn ready_filter_by_single_priority() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&p0.id));
 }
@@ -206,7 +206,7 @@ fn ready_filter_by_multiple_priorities() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&p0.id));
     assert!(ids.contains(&p1.id));
@@ -238,7 +238,7 @@ fn ready_filter_by_labels_and_single() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&issue1.id));
 }
@@ -266,7 +266,7 @@ fn ready_filter_by_labels_and_multiple() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&issue1.id));
 }
@@ -292,7 +292,7 @@ fn ready_filter_by_labels_or() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&issue1.id));
     assert!(ids.contains(&issue2.id));
@@ -318,7 +318,7 @@ fn ready_filter_with_limit() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 3);
 }
 
@@ -337,7 +337,7 @@ fn ready_filter_limit_zero_returns_all() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 3);
 }
 
@@ -356,7 +356,7 @@ fn ready_filter_limit_greater_than_total() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 2);
 }
 
@@ -384,7 +384,7 @@ fn ready_sort_policy_priority() {
     storage.create_issue(&p1, "tester").unwrap();
 
     let filters = ReadyFilters::default();
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Priority);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Priority);
 
     // Should be sorted by priority: P0, P1, P2
     assert_eq!(ids.len(), 3);
@@ -407,7 +407,7 @@ fn ready_sort_policy_oldest() {
     storage.create_issue(&third, "tester").unwrap();
 
     let filters = ReadyFilters::default();
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
 
     // Should be sorted by created_at ASC (oldest first)
     assert_eq!(ids.len(), 3);
@@ -441,7 +441,7 @@ fn ready_sort_policy_hybrid() {
     storage.create_issue(&p1, "tester").unwrap();
 
     let filters = ReadyFilters::default();
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Hybrid);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Hybrid);
 
     // Hybrid: P0/P1 first (by created_at), then P2+ (by created_at)
     // P0 and P1 should be in first two positions
@@ -487,7 +487,7 @@ fn ready_combined_assignee_and_type_filter() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&alice_bug.id));
 }
@@ -526,7 +526,7 @@ fn ready_combined_priority_and_label_filter() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&p0_backend.id));
 }
@@ -569,7 +569,7 @@ fn ready_excludes_blocked_issues_with_filters() {
         ..Default::default()
     };
 
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&blocker.id));
     assert!(ids.contains(&unblocked_bug.id));
@@ -603,7 +603,7 @@ fn ready_includes_open_and_in_progress() {
     storage.create_issue(&deferred, "tester").unwrap();
 
     let filters = ReadyFilters::default();
-    let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters, ReadySortPolicy::Oldest);
 
     assert!(ids.contains(&open.id));
     assert!(ids.contains(&in_progress.id));
@@ -635,7 +635,7 @@ fn ready_include_deferred_flag() {
         include_deferred: false,
         ..Default::default()
     };
-    let ids = ready_ids(&storage, &filters_no_deferred, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters_no_deferred, ReadySortPolicy::Oldest);
     assert!(ids.contains(&open_no_defer.id));
     // Open issue with future defer_until should be excluded
     assert!(!ids.contains(&open_with_defer.id));
@@ -645,7 +645,7 @@ fn ready_include_deferred_flag() {
         include_deferred: true,
         ..Default::default()
     };
-    let ids = ready_ids(&storage, &filters_with_deferred, ReadySortPolicy::Oldest);
+    let ids = ready_ids(&mut storage, &filters_with_deferred, ReadySortPolicy::Oldest);
     assert!(ids.contains(&open_no_defer.id));
     assert!(ids.contains(&open_with_defer.id));
 }

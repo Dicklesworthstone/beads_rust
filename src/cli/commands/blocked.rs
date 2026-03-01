@@ -31,18 +31,18 @@ pub fn execute(
     tracing::info!("Fetching blocked issues from cache");
 
     let beads_dir = discover_beads_dir(None)?;
-    let storage_ctx = open_storage_with_cli(&beads_dir, overrides)?;
-    let storage = &storage_ctx.storage;
+    let mut storage_ctx = open_storage_with_cli(&beads_dir, overrides)?;
 
-    let config_layer = load_config(&beads_dir, Some(storage), overrides)?;
+    let config_layer = load_config(&beads_dir, Some(&storage_ctx.storage), overrides)?;
     let external_db_paths = external_project_db_paths(&config_layer, &beads_dir);
     let use_color = should_use_color(&config_layer);
     let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
     let quiet = overrides.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
-    // Get blocked issues from cache
-    let blocked_raw = storage.get_blocked_issues()?;
+    // Get blocked issues from cache (needs &mut for lazy cache rebuild)
+    let blocked_raw = storage_ctx.storage.get_blocked_issues()?;
+    let storage = &storage_ctx.storage;
 
     tracing::debug!(
         count = blocked_raw.len(),

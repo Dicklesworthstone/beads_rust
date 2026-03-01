@@ -2385,22 +2385,44 @@ pub fn import_from_jsonl(
         }
     }
 
-    // Phase 3: Execute Actions
+    // Phase 3: Execute Actions (batched into transactions to avoid per-statement fsyncs)
+    const IMPORT_BATCH_SIZE: usize = 50;
     let progress = create_progress_bar(
         import_ops.len() as u64,
         "Importing issues",
         config.show_progress,
     );
 
-    for (issue, action) in import_ops {
-        process_import_action(storage, &action, &issue, &mut result)?;
-        progress.inc(1);
+    for chunk in import_ops.chunks(IMPORT_BATCH_SIZE) {
+        storage.begin_raw_transaction()?;
+        let batch_result = (|| -> Result<()> {
+            for (issue, action) in chunk {
+                process_import_action(storage, action, issue, &mut result)?;
+                progress.inc(1);
+            }
+            Ok(())
+        })();
+
+        match batch_result {
+            Ok(()) => storage.commit_raw_transaction()?,
+            Err(e) => {
+                storage.rollback_raw_transaction();
+                return Err(e);
+            }
+        }
     }
     progress.finish_with_message("Import complete");
 
-    // Restore export hashes for imported issues
+    // Restore export hashes for imported issues (in its own transaction)
     if !new_export_hashes.is_empty() {
-        storage.set_export_hashes(&new_export_hashes)?;
+        storage.begin_raw_transaction()?;
+        match storage.set_export_hashes(&new_export_hashes) {
+            Ok(_) => storage.commit_raw_transaction()?,
+            Err(e) => {
+                storage.rollback_raw_transaction();
+                return Err(e);
+            }
+        }
     }
 
     // Step 10: Refresh blocked cache

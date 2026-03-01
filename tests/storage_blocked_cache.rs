@@ -19,7 +19,7 @@ use common::{fixtures, test_db};
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn blocked_ids(storage: &SqliteStorage) -> Vec<String> {
+fn blocked_ids(storage: &mut SqliteStorage) -> Vec<String> {
     storage
         .get_blocked_issues()
         .unwrap()
@@ -28,7 +28,7 @@ fn blocked_ids(storage: &SqliteStorage) -> Vec<String> {
         .collect()
 }
 
-fn ready_ids(storage: &SqliteStorage) -> Vec<String> {
+fn ready_ids(storage: &mut SqliteStorage) -> Vec<String> {
     storage
         .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
         .unwrap()
@@ -69,7 +69,7 @@ fn reopen_blocker_re_blocks_dependent() {
 
     // Dependent should be blocked
     assert!(
-        blocked_ids(&storage).contains(&dependent.id),
+        blocked_ids(&mut storage).contains(&dependent.id),
         "dependent should be blocked initially"
     );
 
@@ -78,7 +78,7 @@ fn reopen_blocker_re_blocks_dependent() {
         .update_issue(&blocker.id, &status_update(Status::Closed), "tester")
         .unwrap();
     assert!(
-        !blocked_ids(&storage).contains(&dependent.id),
+        !blocked_ids(&mut storage).contains(&dependent.id),
         "dependent should be unblocked after closing blocker"
     );
 
@@ -87,7 +87,7 @@ fn reopen_blocker_re_blocks_dependent() {
         .update_issue(&blocker.id, &status_update(Status::Open), "tester")
         .unwrap();
     assert!(
-        blocked_ids(&storage).contains(&dependent.id),
+        blocked_ids(&mut storage).contains(&dependent.id),
         "dependent should be re-blocked after reopening blocker"
     );
 }
@@ -118,7 +118,7 @@ fn chain_dependency_blocks_downstream() {
         .add_dependency(&c.id, &b.id, DependencyType::Blocks.as_str(), "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(ids.contains(&b.id), "B should be blocked by A");
     assert!(ids.contains(&c.id), "C should be blocked by B");
 
@@ -127,7 +127,7 @@ fn chain_dependency_blocks_downstream() {
         .update_issue(&a.id, &status_update(Status::Closed), "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(!ids.contains(&b.id), "B should be unblocked after A closed");
     assert!(ids.contains(&c.id), "C should still be blocked by open B");
 
@@ -136,7 +136,7 @@ fn chain_dependency_blocks_downstream() {
         .update_issue(&b.id, &status_update(Status::Closed), "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(!ids.contains(&c.id), "C should be unblocked after B closed");
 }
 
@@ -173,14 +173,14 @@ fn multiple_blockers_partial_close() {
         )
         .unwrap();
 
-    assert!(blocked_ids(&storage).contains(&dependent.id));
+    assert!(blocked_ids(&mut storage).contains(&dependent.id));
 
     // Close only blocker1 → still blocked by blocker2
     storage
         .update_issue(&blocker1.id, &status_update(Status::Closed), "tester")
         .unwrap();
     assert!(
-        blocked_ids(&storage).contains(&dependent.id),
+        blocked_ids(&mut storage).contains(&dependent.id),
         "still blocked by blocker2"
     );
 
@@ -189,7 +189,7 @@ fn multiple_blockers_partial_close() {
         .update_issue(&blocker2.id, &status_update(Status::Closed), "tester")
         .unwrap();
     assert!(
-        !blocked_ids(&storage).contains(&dependent.id),
+        !blocked_ids(&mut storage).contains(&dependent.id),
         "unblocked after all blockers closed"
     );
 }
@@ -222,7 +222,7 @@ fn mixed_dependency_types_all_block() {
         .add_dependency(&target.id, &b3.id, "waits-for", "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(
         ids.contains(&target.id),
         "target should be blocked by all three dependency types"
@@ -236,7 +236,7 @@ fn mixed_dependency_types_all_block() {
     }
 
     assert!(
-        !blocked_ids(&storage).contains(&target.id),
+        !blocked_ids(&mut storage).contains(&target.id),
         "target unblocked after all mixed deps closed"
     );
 }
@@ -264,7 +264,7 @@ fn closing_blocked_issue_removes_from_cache() {
         )
         .unwrap();
 
-    assert!(blocked_ids(&storage).contains(&blocked_issue.id));
+    assert!(blocked_ids(&mut storage).contains(&blocked_issue.id));
 
     // Close the blocked issue itself (not the blocker)
     storage
@@ -273,7 +273,7 @@ fn closing_blocked_issue_removes_from_cache() {
 
     // Closed issues should not appear in blocked cache
     // (blocked cache only tracks open/in_progress issues)
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(
         !ids.contains(&blocked_issue.id),
         "closed issue should not appear in blocked cache"
@@ -303,7 +303,7 @@ fn delete_issue_cleans_cache() {
         )
         .unwrap();
 
-    assert!(blocked_ids(&storage).contains(&blocked_issue.id));
+    assert!(blocked_ids(&mut storage).contains(&blocked_issue.id));
 
     // Delete the blocker → blocked_issue should become unblocked
     // (tombstoned issues are terminal, so dependency no longer active)
@@ -311,7 +311,7 @@ fn delete_issue_cleans_cache() {
         .delete_issue(&blocker.id, "tester", "test cleanup", None)
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(
         !ids.contains(&blocked_issue.id),
         "deleting blocker should unblock dependent"
@@ -351,14 +351,14 @@ fn remove_all_dependencies_clears_cache() {
         )
         .unwrap();
 
-    assert!(blocked_ids(&storage).contains(&target.id));
+    assert!(blocked_ids(&mut storage).contains(&target.id));
 
     storage
         .remove_all_dependencies(&target.id, "tester")
         .unwrap();
 
     assert!(
-        !blocked_ids(&storage).contains(&target.id),
+        !blocked_ids(&mut storage).contains(&target.id),
         "removing all deps should unblock issue"
     );
 }
@@ -394,7 +394,7 @@ fn parent_child_transitive_blocking() {
         .add_dependency(&child.id, &parent.id, "parent-child", "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(ids.contains(&parent.id), "parent blocked by blocker");
     assert!(
         ids.contains(&child.id),
@@ -406,7 +406,7 @@ fn parent_child_transitive_blocking() {
         .update_issue(&blocker.id, &status_update(Status::Closed), "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(!ids.contains(&parent.id), "parent unblocked");
     assert!(!ids.contains(&child.id), "child transitively unblocked");
 }
@@ -440,7 +440,7 @@ fn remove_parent_unblocks_child() {
         .unwrap();
 
     assert!(
-        blocked_ids(&storage).contains(&child.id),
+        blocked_ids(&mut storage).contains(&child.id),
         "child blocked via parent"
     );
 
@@ -450,7 +450,7 @@ fn remove_parent_unblocks_child() {
         .unwrap();
 
     assert!(
-        !blocked_ids(&storage).contains(&child.id),
+        !blocked_ids(&mut storage).contains(&child.id),
         "child should be unblocked after parent link removed"
     );
 }
@@ -480,8 +480,8 @@ fn ready_and_blocked_are_disjoint() {
         )
         .unwrap();
 
-    let ready = ready_ids(&storage);
-    let blocked = blocked_ids(&storage);
+    let ready = ready_ids(&mut storage);
+    let blocked = blocked_ids(&mut storage);
 
     // Blocked issues must not appear in ready list
     for id in &blocked {
@@ -610,7 +610,7 @@ fn in_progress_blocker_still_blocks() {
         .unwrap();
 
     assert!(
-        blocked_ids(&storage).contains(&dependent.id),
+        blocked_ids(&mut storage).contains(&dependent.id),
         "in_progress blocker should still block dependent"
     );
 }
@@ -694,7 +694,7 @@ fn deep_parent_child_chain_blocking() {
         .add_dependency(&leaf.id, &p3.id, "parent-child", "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(ids.contains(&p1.id), "p1 directly blocked");
     assert!(ids.contains(&p2.id), "p2 transitively blocked");
     assert!(ids.contains(&p3.id), "p3 transitively blocked");
@@ -705,7 +705,7 @@ fn deep_parent_child_chain_blocking() {
         .update_issue(&blocker.id, &status_update(Status::Closed), "tester")
         .unwrap();
 
-    let ids = blocked_ids(&storage);
+    let ids = blocked_ids(&mut storage);
     assert!(!ids.contains(&p1.id), "p1 unblocked");
     assert!(!ids.contains(&p2.id), "p2 unblocked");
     assert!(!ids.contains(&p3.id), "p3 unblocked");

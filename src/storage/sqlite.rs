@@ -21,6 +21,8 @@ pub struct SqliteStorage {
     conn: Connection,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
+    /// Lazy rebuild: set when deps change, cleared on next cache read.
+    blocked_cache_dirty: bool,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -113,7 +115,7 @@ impl SqliteStorage {
         if user_version < CURRENT_SCHEMA_VERSION {
             apply_schema(&conn)?;
         }
-        Ok(Self { conn, mutation_count: 0 })
+        Ok(Self { conn, mutation_count: 0, blocked_cache_dirty: false })
     }
 
     /// Open an in-memory database for testing.
@@ -124,7 +126,7 @@ impl SqliteStorage {
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open(":memory:")?;
         apply_schema(&conn)?;
-        Ok(Self { conn, mutation_count: 0 })
+        Ok(Self { conn, mutation_count: 0, blocked_cache_dirty: false })
     }
 
     /// Attempt a WAL checkpoint (TRUNCATE mode) to flush WAL back to the main
@@ -134,6 +136,51 @@ impl SqliteStorage {
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
         }
+    }
+
+    /// Begin a raw (non-IMMEDIATE) transaction for batching many writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database is already in a transaction.
+    pub fn begin_raw_transaction(&mut self) -> Result<()> {
+        self.conn.execute("BEGIN")?;
+        Ok(())
+    }
+
+    /// Commit a raw transaction started with `begin_raw_transaction`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is no active transaction.
+    pub fn commit_raw_transaction(&mut self) -> Result<()> {
+        self.conn.execute("COMMIT")?;
+        Ok(())
+    }
+
+    /// Rollback a raw transaction. Errors are silently ignored.
+    pub fn rollback_raw_transaction(&mut self) {
+        let _ = self.conn.execute("ROLLBACK");
+    }
+
+    /// Rebuild the blocked-issues cache if it has been marked dirty.
+    ///
+    /// Call this before any read that consults `blocked_issues_cache`.
+    fn ensure_blocked_cache(&mut self) -> Result<()> {
+        if self.blocked_cache_dirty {
+            self.conn.execute("BEGIN")?;
+            match Self::rebuild_blocked_cache_impl(&self.conn) {
+                Ok(_) => {
+                    self.conn.execute("COMMIT")?;
+                    self.blocked_cache_dirty = false;
+                }
+                Err(e) => {
+                    let _ = self.conn.execute("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Get audit events for a specific issue.
@@ -206,9 +253,9 @@ impl SqliteStorage {
                         )?;
                     }
 
-                    // Rebuild blocked cache inside the transaction if needed
+                    // Mark blocked cache dirty — rebuilt lazily on next read
                     if ctx.invalidate_blocked_cache {
-                        Self::rebuild_blocked_cache_impl(&self.conn)?;
+                        self.blocked_cache_dirty = true;
                     }
 
                     // Try to commit
@@ -1157,10 +1204,11 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     #[allow(clippy::too_many_lines)]
     pub fn get_ready_issues(
-        &self,
+        &mut self,
         filters: &ReadyFilters,
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
+        self.ensure_blocked_cache()?;
         let mut sql = String::from(
             r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                      status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -1325,7 +1373,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn get_blocked_ids(&self) -> Result<HashSet<String>> {
+    pub fn get_blocked_ids(&mut self) -> Result<HashSet<String>> {
+        self.ensure_blocked_cache()?;
         let rows = self
             .conn
             .query("SELECT issue_id FROM blocked_issues_cache")?;
@@ -1374,7 +1423,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn is_blocked(&self, issue_id: &str) -> Result<bool> {
+    pub fn is_blocked(&mut self, issue_id: &str) -> Result<bool> {
+        self.ensure_blocked_cache()?;
         let rows = self.conn.query_with_params(
             "SELECT 1 FROM blocked_issues_cache WHERE issue_id = ? LIMIT 1",
             &[SqliteValue::from(issue_id)],
@@ -1391,7 +1441,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+    pub fn get_blockers(&mut self, issue_id: &str) -> Result<Vec<String>> {
+        self.ensure_blocked_cache()?;
         let json_opt: Option<String> = self
             .conn
             .query_row_with_params(
@@ -1434,13 +1485,14 @@ impl SqliteStorage {
     /// Returns an error if the database operation fails.
     #[allow(clippy::too_many_lines)]
     pub fn rebuild_blocked_cache(&mut self, force_rebuild: bool) -> Result<usize> {
-        if !force_rebuild {
+        if !force_rebuild && !self.blocked_cache_dirty {
             return Ok(0);
         }
         self.conn.execute("BEGIN")?;
         match Self::rebuild_blocked_cache_impl(&self.conn) {
             Ok(count) => {
                 self.conn.execute("COMMIT")?;
+                self.blocked_cache_dirty = false;
                 Ok(count)
             }
             Err(e) => {
@@ -1452,162 +1504,130 @@ impl SqliteStorage {
 
     #[allow(clippy::too_many_lines)]
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
-        const MAX_DEPTH: i32 = 50;
+        const MAX_DEPTH: usize = 50;
 
         // Clear existing cache
         conn.execute("DELETE FROM blocked_issues_cache")?;
 
-        // Find all issues that are blocked by a dependency
-        let mut blocked_issues_map: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
-        {
-            let rows = conn.query(
-                r"SELECT DISTINCT d.issue_id, d.depends_on_id || ':' || COALESCE(i.status, 'unknown')
-                  FROM dependencies d
-                  LEFT JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
-                    AND (
-                      i.status NOT IN ('closed', 'tombstone')
-                      OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
-                    )",
-            )?;
+        // --- Load all data into Rust for in-memory computation ---
 
+        // Load issue statuses (simple single-table query, no JOINs)
+        let mut issue_status: HashMap<String, String> = HashMap::new();
+        {
+            let rows = conn.query("SELECT id, status FROM issues")?;
             for row in &rows {
-                let issue_id = row
-                    .get(0)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let blocker_ref = row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                blocked_issues_map
-                    .entry(issue_id)
-                    .or_default()
-                    .push(blocker_ref);
+                let id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+                let status = row.get(1).and_then(SqliteValue::as_text).unwrap_or("unknown").to_string();
+                issue_status.insert(id, status);
             }
         }
 
-        // Insert blocked issues into cache
-        let mut count = 0;
-        for (issue_id, blockers) in blocked_issues_map {
-            if blockers.is_empty() {
+        // Load all dependencies (simple single-table query, no JOINs)
+        let mut all_deps: Vec<(String, String, String)> = Vec::new();
+        {
+            let rows = conn.query("SELECT issue_id, depends_on_id, type FROM dependencies")?;
+            for row in &rows {
+                let issue_id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+                let depends_on = row.get(1).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+                let dep_type = row.get(2).and_then(SqliteValue::as_text).unwrap_or("").to_string();
+                all_deps.push((issue_id, depends_on, dep_type));
+            }
+        }
+
+        // --- Phase 1: Direct blocking deps ---
+        let mut blocked_map: HashMap<String, Vec<String>> = HashMap::new();
+        for (issue_id, depends_on, dep_type) in &all_deps {
+            if !matches!(dep_type.as_str(), "blocks" | "conditional-blocks" | "waits-for") {
                 continue;
             }
-            let blockers_json =
-                serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-            conn.execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                &[
-                    SqliteValue::from(issue_id),
-                    SqliteValue::from(blockers_json),
-                ],
-            )?;
-            count += 1;
-        }
-
-        // Mark children of deferred epics as blocked.
-        // A deferred parent effectively blocks all of its children, even though
-        // there is no explicit blocks/waits-for dependency.  We find every
-        // issue whose parent (via a parent-child dependency) has status = 'deferred'
-        // and insert it into the blocked cache so it won't appear as "ready."
-        {
-            let rows = conn.query(
-                r"SELECT DISTINCT d.issue_id, d.depends_on_id
-                  FROM dependencies d
-                  INNER JOIN issues i ON d.depends_on_id = i.id
-                  WHERE d.type = 'parent-child'
-                    AND i.status = 'deferred'
-                    AND NOT EXISTS (
-                        SELECT 1 FROM blocked_issues_cache WHERE issue_id = d.issue_id
-                    )",
-            )?;
-
-            for row in &rows {
-                let issue_id = row
-                    .get(0)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let parent_id = row
-                    .get(1)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let blockers = vec![format!("{parent_id}:deferred")];
-                let blockers_json =
-                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-                conn.execute_with_params(
-                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(blockers_json),
-                    ],
-                )?;
-                count += 1;
-            }
-        }
-
-        // Now handle transitive blocking via parent-child relationships
-        let mut depth = 0;
-        loop {
-            if depth >= MAX_DEPTH {
-                tracing::warn!(
-                    "Transitive blocked cache rebuild hit max depth {}",
-                    MAX_DEPTH
-                );
-                break;
-            }
-
-            let newly_blocked: Vec<(String, String)> = {
-                let rows = conn.query(
-                    r"SELECT DISTINCT d.issue_id, d.depends_on_id
-                      FROM dependencies d
-                      INNER JOIN blocked_issues_cache bc ON d.depends_on_id = bc.issue_id
-                      WHERE d.type = 'parent-child'
-                        AND NOT EXISTS (SELECT 1 FROM blocked_issues_cache WHERE issue_id = d.issue_id)",
-                )?;
-
-                rows.iter()
-                    .filter_map(|row| {
-                        let id = row.get(0).and_then(SqliteValue::as_text)?.to_string();
-                        let parent = row.get(1).and_then(SqliteValue::as_text)?.to_string();
-                        Some((id, parent))
-                    })
-                    .collect()
+            let dep_status = issue_status.get(depends_on).map(String::as_str);
+            let is_blocking = match dep_status {
+                Some("closed" | "tombstone") => false,
+                Some(_) => true,
+                // Unknown dep: blocking unless external
+                None => !depends_on.starts_with("external:"),
             };
+            if is_blocking {
+                let label = format!("{}:{}", depends_on, dep_status.unwrap_or("unknown"));
+                blocked_map.entry(issue_id.clone()).or_default().push(label);
+            }
+        }
+
+        // --- Phase 2: Children of deferred parents ---
+        // Build parent-child map: child_id -> [parent_ids]
+        let mut parent_child: HashMap<String, Vec<String>> = HashMap::new();
+        for (issue_id, depends_on, dep_type) in &all_deps {
+            if dep_type == "parent-child" {
+                parent_child.entry(issue_id.clone()).or_default().push(depends_on.clone());
+            }
+        }
+
+        for (child_id, parents) in &parent_child {
+            if blocked_map.contains_key(child_id) {
+                continue;
+            }
+            for parent_id in parents {
+                if issue_status.get(parent_id).map(String::as_str) == Some("deferred") {
+                    blocked_map
+                        .entry(child_id.clone())
+                        .or_default()
+                        .push(format!("{parent_id}:deferred"));
+                }
+            }
+        }
+
+        // --- Phase 3: Transitive blocking via parent-child ---
+        // If a parent is blocked, its children are transitively blocked
+        let blocked_set: HashSet<String> = blocked_map.keys().cloned().collect();
+        let mut blocked_set = blocked_set;
+
+        for depth in 0..MAX_DEPTH {
+            let mut newly_blocked: HashMap<String, Vec<String>> = HashMap::new();
+
+            for (child_id, parents) in &parent_child {
+                if blocked_set.contains(child_id) {
+                    continue;
+                }
+                for parent_id in parents {
+                    if blocked_set.contains(parent_id) {
+                        newly_blocked
+                            .entry(child_id.clone())
+                            .or_default()
+                            .push(format!("{parent_id}:parent-blocked"));
+                    }
+                }
+            }
 
             if newly_blocked.is_empty() {
                 break;
             }
 
-            let mut issue_blockers: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (issue_id, parent_id) in newly_blocked {
-                issue_blockers.entry(issue_id).or_default().push(parent_id);
+            if depth == MAX_DEPTH - 1 {
+                tracing::warn!("Transitive blocked cache rebuild hit max depth {MAX_DEPTH}");
             }
 
-            for (issue_id, parents) in issue_blockers {
-                let blockers: Vec<String> = parents
-                    .into_iter()
-                    .map(|p| format!("{p}:parent-blocked"))
-                    .collect();
-                let blockers_json =
-                    serde_json::to_string(&blockers).unwrap_or_else(|_| "[]".to_string());
-
-                conn.execute_with_params(
-                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from(issue_id),
-                        SqliteValue::from(blockers_json),
-                    ],
-                )?;
-                count += 1;
+            for (id, blockers) in newly_blocked {
+                blocked_set.insert(id.clone());
+                blocked_map.entry(id).or_default().extend(blockers);
             }
+        }
 
-            depth += 1;
+        // --- Write results to DB in bulk ---
+        let mut count = 0;
+        for (issue_id, blockers) in &blocked_map {
+            if blockers.is_empty() {
+                continue;
+            }
+            let blockers_json =
+                serde_json::to_string(blockers).unwrap_or_else(|_| "[]".to_string());
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(blockers_json),
+                ],
+            )?;
+            count += 1;
         }
 
         tracing::debug!(blocked_count = count, "Rebuilt blocked issues cache");
@@ -1619,7 +1639,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn get_blocked_issues(&self) -> Result<Vec<(Issue, Vec<String>)>> {
+    pub fn get_blocked_issues(&mut self) -> Result<Vec<(Issue, Vec<String>)>> {
+        self.ensure_blocked_cache()?;
         let rows = self.conn.query(
             r"SELECT i.id, i.content_hash, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
                      i.status, i.priority, i.issue_type, i.assignee, i.owner, i.estimated_minutes,
@@ -4989,20 +5010,12 @@ mod tests {
             .add_dependency("bd-c1", "bd-b1", "related", "tester")
             .unwrap();
 
-        // Cache should be rebuilt - since "related" is not a blocking type,
-        // bd-c1 should no longer be in the blocked cache (the manually
-        // inserted entry gets cleared and not replaced)
-        let count = storage
-            .conn
-            .query_row_with_params(
-                "SELECT count(*) FROM blocked_issues_cache WHERE issue_id = ?",
-                &[SqliteValue::from("bd-c1")],
-            )
-            .unwrap()
-            .get(0)
-            .and_then(SqliteValue::as_integer)
-            .unwrap_or(0);
-        assert_eq!(count, 0);
+        // Cache is lazily rebuilt — trigger it by reading blocked status
+        let is_blocked = storage.is_blocked("bd-c1").unwrap();
+
+        // Since "related" is not a blocking type, bd-c1 should no longer be
+        // blocked (the manually inserted entry gets cleared and not replaced)
+        assert!(!is_blocked);
     }
 
     #[test]

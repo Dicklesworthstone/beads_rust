@@ -27,10 +27,9 @@ pub fn execute(
 ) -> Result<()> {
     // Open storage
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
     let use_color = config::should_use_color(&config_layer);
     let max_width = if std::io::stdout().is_terminal() {
@@ -65,8 +64,9 @@ pub fn execute(
     info!("Fetching ready issues");
     debug!(filters = ?filters, sort = ?sort_policy, "Applied ready filters");
 
-    // Get ready issues from storage (blocked cache only)
-    let mut ready_issues = storage.get_ready_issues(&filters, sort_policy)?;
+    // Get ready issues from storage (blocked cache only; needs &mut for lazy cache rebuild)
+    let mut ready_issues = storage_ctx.storage.get_ready_issues(&filters, sort_policy)?;
+    let storage = &storage_ctx.storage;
 
     let external_statuses =
         storage.resolve_external_dependency_statuses(&external_db_paths, true)?;

@@ -12,7 +12,7 @@ use beads_rust::model::{DependencyType, EventType, Status};
 use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use common::{fixtures, test_db};
 
-fn blocked_ids_for(storage: &SqliteStorage) -> Vec<String> {
+fn blocked_ids_for(storage: &mut SqliteStorage) -> Vec<String> {
     storage
         .get_blocked_issues()
         .unwrap()
@@ -685,7 +685,7 @@ fn deep_hierarchy_transitive_blocked() {
     // Need to rebuild blocked cache first
     storage.rebuild_blocked_cache(true).unwrap();
 
-    let blocked_ids = blocked_ids_for(&storage);
+    let blocked_ids = blocked_ids_for(&mut storage);
     // All issues except root should be blocked
     assert!(blocked_ids.contains(&l1.id));
     assert!(blocked_ids.contains(&l2.id));
@@ -783,7 +783,7 @@ fn diamond_pattern_blocked_propagation() {
     // Rebuild blocked cache
     storage.rebuild_blocked_cache(true).unwrap();
 
-    let blocked_ids = blocked_ids_for(&storage);
+    let blocked_ids = blocked_ids_for(&mut storage);
     // A, B, C are all blocked (depend on D which is open)
     assert!(blocked_ids.contains(&a.id));
     assert!(blocked_ids.contains(&b.id));
@@ -807,7 +807,7 @@ fn blocked_cache_invalidated_on_add_dependency() {
 
     // Initially no blocked issues
     storage.rebuild_blocked_cache(true).unwrap();
-    let initial_blocked = blocked_ids_for(&storage);
+    let initial_blocked = blocked_ids_for(&mut storage);
     assert!(!initial_blocked.contains(&blocked.id));
 
     // Add dependency - cache should be invalidated and rebuilt
@@ -821,7 +821,7 @@ fn blocked_cache_invalidated_on_add_dependency() {
         .unwrap();
 
     // After adding dependency, blocked should be in blocked cache
-    let after_blocked = blocked_ids_for(&storage);
+    let after_blocked = blocked_ids_for(&mut storage);
     assert!(after_blocked.contains(&blocked.id));
 }
 
@@ -846,7 +846,7 @@ fn blocked_cache_invalidated_on_remove_dependency() {
         .unwrap();
 
     // Blocked should be in cache
-    let before_blocked = blocked_ids_for(&storage);
+    let before_blocked = blocked_ids_for(&mut storage);
     assert!(before_blocked.contains(&blocked.id));
 
     // Remove dependency - cache should be invalidated
@@ -855,7 +855,7 @@ fn blocked_cache_invalidated_on_remove_dependency() {
         .unwrap();
 
     // After removing, blocked should not be in cache
-    let after_blocked = blocked_ids_for(&storage);
+    let after_blocked = blocked_ids_for(&mut storage);
     assert!(!after_blocked.contains(&blocked.id));
 }
 
@@ -879,7 +879,7 @@ fn blocked_cache_reflects_status_changes() {
         .unwrap();
 
     // Initially blocked (blocker is open)
-    let blocked_ids = blocked_ids_for(&storage);
+    let blocked_ids = blocked_ids_for(&mut storage);
     assert!(blocked_ids.contains(&blocked.id));
 
     // Close the blocker
@@ -892,7 +892,7 @@ fn blocked_cache_reflects_status_changes() {
         .unwrap();
 
     // After closing blocker, blocked should no longer be blocked
-    let blocked_ids = blocked_ids_for(&storage);
+    let blocked_ids = blocked_ids_for(&mut storage);
     assert!(!blocked_ids.contains(&blocked.id));
 }
 

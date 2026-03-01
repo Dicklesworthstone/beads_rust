@@ -32,9 +32,8 @@ pub fn execute(
     outer_ctx: &OutputContext,
 ) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let storage = &storage_ctx.storage;
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let use_color = config::should_use_color(&config_layer);
     let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), args.robot);
     let quiet = cli.quiet.unwrap_or(false);
@@ -48,12 +47,12 @@ pub fn execute(
         include_templates: true,
         ..Default::default()
     };
-    let all_issues = storage.list_issues(&all_filters)?;
+    let all_issues = storage_ctx.storage.list_issues(&all_filters)?;
 
     debug!(total = all_issues.len(), "Loaded all issues for stats");
 
     // Compute summary counts
-    let summary = compute_summary(storage, &all_issues)?;
+    let summary = compute_summary(&mut storage_ctx.storage, &all_issues)?;
 
     // Compute breakdowns if requested
     let mut breakdowns = Vec::new();
@@ -68,7 +67,7 @@ pub fn execute(
         breakdowns.push(compute_assignee_breakdown(&all_issues));
     }
     if args.by_label {
-        breakdowns.push(compute_label_breakdown(storage, &all_issues)?);
+        breakdowns.push(compute_label_breakdown(&storage_ctx.storage, &all_issues)?);
     }
 
     // Compute recent activity by default (matches bd behavior).
@@ -112,7 +111,7 @@ pub fn execute(
 /// Compute summary statistics.
 #[allow(clippy::cast_precision_loss)]
 fn compute_summary(
-    storage: &SqliteStorage,
+    storage: &mut SqliteStorage,
     issues: &[crate::model::Issue],
 ) -> Result<StatsSummary> {
     let mut open = 0;
@@ -820,7 +819,7 @@ mod tests {
         storage.create_issue(&third_issue, "tester").unwrap();
 
         let all_issues = vec![first_issue, second_issue, third_issue];
-        let summary = compute_summary(&storage, &all_issues).unwrap();
+        let summary = compute_summary(&mut storage, &all_issues).unwrap();
 
         assert_eq!(summary.total_issues, 3);
         assert_eq!(summary.open_issues, 1);
