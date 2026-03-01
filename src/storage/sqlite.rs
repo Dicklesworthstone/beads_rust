@@ -4364,7 +4364,7 @@ impl SqliteStorage {
 mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
-    use chrono::{DateTime, TimeZone, Utc};
+    use chrono::{Datelike, DateTime, TimeZone, Utc};
     use std::fs;
     use tempfile::TempDir;
 
@@ -6144,5 +6144,73 @@ mod tests {
             next_for_child1, 2,
             "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
         );
+    }
+
+    #[test]
+    fn test_parse_datetime_empty_string_returns_epoch() {
+        let result = parse_datetime("").unwrap();
+        assert_eq!(result, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339_with_z() {
+        let result = parse_datetime("2026-02-26T19:54:42.715824474Z").unwrap();
+        assert_eq!(result.year(), 2026);
+        assert_eq!(result.month(), 2);
+    }
+
+    #[test]
+    fn test_parse_datetime_rfc3339_with_offset() {
+        let result = parse_datetime("2026-02-26T19:54:42+00:00").unwrap();
+        assert_eq!(result.year(), 2026);
+    }
+
+    #[test]
+    fn test_parse_datetime_naive_format() {
+        let result = parse_datetime("2026-02-26 19:54:42").unwrap();
+        assert_eq!(result.year(), 2026);
+        assert_eq!(result.month(), 2);
+    }
+
+    #[test]
+    fn test_parse_datetime_garbage_returns_error() {
+        let result = parse_datetime("not-a-date");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reset_data_tables_preserves_config() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        // Set config and create some issues
+        storage.set_config("issue_prefix", "test").unwrap();
+        storage.set_metadata("last_import", "2025-01-01").unwrap();
+        let issue = make_issue("test-1", "Issue 1", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        // Verify issue exists
+        assert!(storage.get_issue("test-1").unwrap().is_some());
+
+        // Reset data tables
+        storage.reset_data_tables().unwrap();
+
+        // Config and metadata should be preserved
+        assert_eq!(
+            storage.get_config("issue_prefix").unwrap(),
+            Some("test".to_string()),
+        );
+        assert_eq!(
+            storage.get_metadata("last_import").unwrap(),
+            Some("2025-01-01".to_string()),
+        );
+
+        // Issue data should be gone
+        assert!(storage.get_issue("test-1").unwrap().is_none());
+
+        // Should be able to insert new issues (schema intact)
+        let issue2 = make_issue("test-2", "Issue 2", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue2, "tester").unwrap();
+        assert!(storage.get_issue("test-2").unwrap().is_some());
     }
 }
