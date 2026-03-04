@@ -219,8 +219,8 @@ fn canonical_config_key(key: &str) -> (String, ValueTransform) {
 
 fn parse_bool_like(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
+        "1" | "true" | "yes" | "y" | "on" => Some(true),
+        "0" | "false" | "no" | "n" | "off" => Some(false),
         _ => None,
     }
 }
@@ -1189,6 +1189,14 @@ mod tests {
         );
         assert_eq!(
             apply_transform_to_value("0", ValueTransform::InvertBool),
+            "true"
+        );
+        assert_eq!(
+            apply_transform_to_value("y", ValueTransform::InvertBool),
+            "false"
+        );
+        assert_eq!(
+            apply_transform_to_value("n", ValueTransform::InvertBool),
             "true"
         );
     }
