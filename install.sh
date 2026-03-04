@@ -478,18 +478,21 @@ do_uninstall() {
 # ============================================================================
 detect_platform() {
     local os arch
+
     case "$(uname -s)" in
         Linux*)  os="linux" ;;
         Darwin*) os="darwin" ;;
         MINGW*|MSYS*|CYGWIN*) os="windows" ;;
         *) die "Unsupported OS: $(uname -s)" ;;
     esac
+
     case "$(uname -m)" in
         x86_64|amd64) arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
         armv7*) arch="armv7" ;;
         *) die "Unsupported architecture: $(uname -m)" ;;
     esac
+
     echo "${os}_${arch}"
 }
 
@@ -507,6 +510,7 @@ resolve_version() {
     # Try GitHub API with retries
     while [ $attempts -lt $MAX_RETRIES ] && [ -z "$tag" ]; do
         attempts=$((attempts + 1))
+
         if command -v curl &>/dev/null; then
             tag=$(curl -fsSL \
                 --connect-timeout 10 \
@@ -516,6 +520,7 @@ resolve_version() {
         elif command -v wget &>/dev/null; then
             tag=$(wget -qO- --timeout=30 "$latest_url" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
         fi
+
         [ -z "$tag" ] && [ $attempts -lt $MAX_RETRIES ] && sleep 2
     done
 
@@ -559,6 +564,7 @@ acquire_lock() {
     if [ -f "$LOCK_DIR/pid" ]; then
         local old_pid
         old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+
         # Check if process is still running
         if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
             log_warn "Removing stale lock (PID $old_pid not running)"
@@ -674,6 +680,7 @@ install_skills() {
     fi
 
     log_step "Installing Claude Code / Codex skills..."
+
     local skills_base_url="https://raw.githubusercontent.com/${OWNER}/${REPO}/main/skills"
     local claude_skills_dir="$HOME/.claude/skills"
     local codex_skills_dir="${CODEX_HOME:-$HOME/.codex}/skills"
@@ -687,6 +694,7 @@ install_skills() {
     for skill in "${skills[@]}"; do
         local skill_name="${skill%%:*}"
         local files_str="${skill#*:}"
+
         log_step "Installing skill: $skill_name"
 
         # Create skill directories
@@ -739,7 +747,9 @@ install_skills() {
 print_skills_summary() {
     local claude_dir="$1"
     local codex_dir="$2"
+
     [ "$QUIET" -eq 1 ] && return 0
+
     echo ""
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         gum style \
@@ -750,10 +760,12 @@ print_skills_summary() {
             "$(gum style --foreground 213 --bold '🎯 AI Coding Skills Installed!')" \
             "" \
             "$(gum style --foreground 245 'Skills help AI agents migrate from bd → br')"
+
         echo ""
         gum style --foreground 214 --bold "📍 Installed Locations"
         gum style --foreground 39 "  Claude Code: $(gum style --foreground 82 "$claude_dir")"
         gum style --foreground 39 "  Codex:       $(gum style --foreground 82 "$codex_dir")"
+
         echo ""
         gum style \
             --border rounded \
@@ -766,8 +778,10 @@ print_skills_summary() {
             "" \
             "$(gum style --foreground 214 'Codex') $(gum style --faint '(dollar command):')" \
             "  $(gum style --foreground 82 '$bd-to-br-migration')"
+
         echo ""
         gum style --foreground 245 --italic "Skills auto-trigger when agents detect bd→br migration needs"
+
     else
         echo ""
         echo -e "${MAGENTA}${BOLD}╔════════════════════════════════════════════════════════════╗${NC}"
@@ -801,9 +815,11 @@ ensure_rust() {
         log_step "Skipping rustup (RUSTUP_INIT_SKIP set)"
         return 0
     fi
+
     if command -v cargo >/dev/null 2>&1; then
         return 0
     fi
+
     if [ "$EASY" -ne 1 ] && [ -t 0 ]; then
         if [[ "$GUM_AVAILABLE" == "true" ]]; then
             if ! gum confirm "Rust not found. Install via rustup?"; then
@@ -816,10 +832,12 @@ ensure_rust() {
             case "$ans" in n|N) log_warn "Skipping rustup"; return 1;; esac
         fi
     fi
+
     log_step "Installing Rust via rustup..."
     run_with_spinner "Installing Rust toolchain..." \
         curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     export PATH="$HOME/.cargo/bin:$PATH"
+
     # Source cargo env
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 }
@@ -830,11 +848,14 @@ ensure_rust() {
 prepare_for_build() {
     # Kill any stuck cargo processes
     pkill -9 -f "cargo build" 2>/dev/null || true
+
     # Clear cargo locks
     rm -f ~/.cargo/.package-cache 2>/dev/null || true
     rm -f ~/.cargo/registry/.crate-cache.lock 2>/dev/null || true
+
     # Clean up old br build directories
     rm -rf /tmp/br-build-* 2>/dev/null || true
+
     # Check disk space (need at least 1GB)
     local avail_kb
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -842,11 +863,13 @@ prepare_for_build() {
     else
         avail_kb=$(df -k /tmp | tail -1 | awk '{print $4}')
     fi
+
     if [ "$avail_kb" -lt 1048576 ]; then
         log_warn "Low disk space in /tmp ($(( avail_kb / 1024 ))MB). Cleaning up..."
         rm -rf /tmp/cargo-target 2>/dev/null || true
         rm -rf ~/.cargo/registry/cache 2>/dev/null || true
     fi
+
     sleep 1
 }
 
@@ -858,24 +881,36 @@ download_file() {
     local dest="$2"
     local attempt=0
     local partial="${dest}.part"
+
     local proxy_env=()
     local proxy_http="${HTTP_PROXY:-${http_proxy:-}}"
     local proxy_https="${HTTPS_PROXY:-${https_proxy:-}}"
     [ -n "$proxy_http" ] && proxy_env+=(HTTP_PROXY="$proxy_http" http_proxy="$proxy_http")
     [ -n "$proxy_https" ] && proxy_env+=(HTTPS_PROXY="$proxy_https" https_proxy="$proxy_https")
+
     local show_progress=0
     if [ "$QUIET" -eq 0 ] && [ -t 2 ]; then
         show_progress=1
     fi
+
     while [ $attempt -lt $MAX_RETRIES ]; do
         attempt=$((attempt + 1))
         log_debug "Download attempt $attempt for $url"
+
         local use_resume=0
         if [ -s "$partial" ]; then
             use_resume=1
         fi
+
         if command -v curl &>/dev/null; then
-            local curl_args=(-fL --connect-timeout 30 --max-time "$DOWNLOAD_TIMEOUT" --retry 2 -o "$partial" "$url")
+            local curl_args=(
+                -fL
+                --connect-timeout 30
+                --max-time "$DOWNLOAD_TIMEOUT"
+                --retry 2
+                -o "$partial"
+                "$url"
+            )
             if [ "$use_resume" -eq 1 ]; then
                 curl_args=(--continue-at - "${curl_args[@]}")
             fi
@@ -884,12 +919,17 @@ download_file() {
             else
                 curl_args=(-sS "${curl_args[@]}")
             fi
+
             if env ${proxy_env[@]+"${proxy_env[@]}"} curl "${curl_args[@]}"; then
                 mv -f "$partial" "$dest"
                 return 0
             fi
         elif command -v wget &>/dev/null; then
-            local wget_args=(--timeout="$DOWNLOAD_TIMEOUT" -O "$partial" "$url")
+            local wget_args=(
+                --timeout="$DOWNLOAD_TIMEOUT"
+                -O "$partial"
+                "$url"
+            )
             if [ "$use_resume" -eq 1 ]; then
                 wget_args=(--continue "${wget_args[@]}")
             fi
@@ -898,6 +938,7 @@ download_file() {
             else
                 wget_args=(--quiet "${wget_args[@]}")
             fi
+
             if env ${proxy_env[@]+"${proxy_env[@]}"} wget "${wget_args[@]}"; then
                 mv -f "$partial" "$dest"
                 return 0
@@ -905,11 +946,13 @@ download_file() {
         else
             die "Neither curl nor wget found"
         fi
+
         [ $attempt -lt $MAX_RETRIES ] && {
             log_warn "Download failed, retrying in 3s..."
             sleep 3
         }
     done
+
     return 1
 }
 
@@ -920,6 +963,7 @@ install_binary_atomic() {
     local src="$1"
     local dest="$2"
     local tmp_dest="${dest}.tmp.$$"
+
     install -m 0755 "$src" "$tmp_dest"
     if ! mv -f "$tmp_dest" "$dest"; then
         rm -f "$tmp_dest" 2>/dev/null || true
@@ -932,17 +976,24 @@ install_binary_atomic() {
 # ============================================================================
 build_from_source() {
     log_step "Building from source..."
+
     if ! ensure_rust; then
         die "Rust is required for source builds"
     fi
+
     prepare_for_build
+
     local build_dir="$TMP/src"
+
     run_with_spinner "Cloning repository..." \
         git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$build_dir"
+
     if [ ! -d "$build_dir" ]; then
         die "Failed to clone repository"
     fi
+
     log_step "Building with Cargo (this may take a few minutes)..."
+
     # Build with explicit target dir to avoid conflicts
     local target_dir="$TMP/target"
     if [[ "$GUM_AVAILABLE" == "true" && "$QUIET" -eq 0 ]]; then
@@ -953,14 +1004,17 @@ build_from_source() {
     else
         (cd "$build_dir" && CARGO_TARGET_DIR="$target_dir" cargo build --release) || die "Build failed"
     fi
+
     # Find the binary
     local bin="$target_dir/release/$BINARY_NAME"
     if [ ! -x "$bin" ]; then
         bin=$(find "$target_dir" -name "$BINARY_NAME" -type f -perm -111 2>/dev/null | head -1)
     fi
+
     if [ ! -x "$bin" ]; then
         die "Binary not found after build"
     fi
+
     install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
     log_success "Installed to $DEST/$BINARY_NAME (source build)"
 }
@@ -970,6 +1024,7 @@ build_from_source() {
 # ============================================================================
 download_release() {
     local platform="$1"
+
     # Map platform to release asset name
     local archive_name=""
     local url=""
@@ -980,11 +1035,14 @@ download_release() {
         archive_name="br-${VERSION}-${platform}.tar.gz"
         url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
     fi
+
     run_with_spinner "Downloading $archive_name..." \
         download_file "$url" "$TMP/$archive_name"
+
     if [ ! -f "$TMP/$archive_name" ]; then
         return 1
     fi
+
     # Download and verify checksum
     local expected=""
     if [ -n "$CHECKSUM" ]; then
@@ -996,10 +1054,12 @@ download_release() {
         else
             checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
         fi
+
         if download_file "$checksum_url" "$TMP/checksum.sha256"; then
             expected=$(awk '{print $1}' "$TMP/checksum.sha256")
         fi
     fi
+
     if [ -n "$expected" ]; then
         log_step "Verifying checksum..."
         local actual
@@ -1011,6 +1071,7 @@ download_release() {
             log_warn "No SHA256 tool found, skipping verification"
             actual="$expected"
         fi
+
         if [ "$expected" != "$actual" ]; then
             log_error "Checksum mismatch!"
             log_error "  Expected: $expected"
@@ -1021,19 +1082,23 @@ download_release() {
     else
         log_warn "Checksum not available, skipping verification"
     fi
+
     # Extract
     log_step "Extracting..."
     if ! tar -xzf "$TMP/$archive_name" -C "$TMP" 2>/dev/null; then
         return 1
     fi
+
     # Find binary
     local bin="$TMP/$BINARY_NAME"
     if [ ! -x "$bin" ]; then
         bin=$(find "$TMP" -name "$BINARY_NAME" -type f -perm -111 2>/dev/null | head -1)
     fi
+
     if [ ! -x "$bin" ]; then
         return 1
     fi
+
     install_binary_atomic "$bin" "$DEST/$BINARY_NAME"
     log_success "Installed to $DEST/$BINARY_NAME"
     return 0
@@ -1046,7 +1111,9 @@ check_conflicts() {
     local installed_path="$DEST/$BINARY_NAME"
     local cargo_bin="$HOME/.cargo/bin/$BINARY_NAME"
     local local_bin="$HOME/.local/bin/$BINARY_NAME"
+
     local conflicts=()
+
     # Check for br in other locations
     if [ "$DEST" != "$HOME/.cargo/bin" ] && [ -x "$cargo_bin" ]; then
         conflicts+=("$cargo_bin")
@@ -1054,12 +1121,14 @@ check_conflicts() {
     if [ "$DEST" != "$HOME/.local/bin" ] && [ -x "$local_bin" ]; then
         conflicts+=("$local_bin")
     fi
+
     if [ ${#conflicts[@]} -gt 0 ]; then
         log_warn "Found br in multiple locations:"
         log_step "  Installed: $installed_path"
         for conflict in "${conflicts[@]}"; do
             log_step "  Conflict:  $conflict"
         done
+
         # Check PATH priority
         local active_br
         active_br=$(command -v br 2>/dev/null || echo "")
@@ -1069,6 +1138,7 @@ check_conflicts() {
             log_step "  1. Remove the conflicting binary: rm $active_br"
             log_step "  2. Adjust PATH so $DEST comes first"
         fi
+
         # Offer to remove conflicts in easy mode
         if [ "$EASY" -eq 1 ]; then
             for conflict in "${conflicts[@]}"; do
@@ -1089,6 +1159,7 @@ check_conflicts() {
 print_summary() {
     local installed_version
     installed_version=$("$DEST/$BINARY_NAME" --version 2>/dev/null || echo "unknown")
+
     if [[ "$GUM_AVAILABLE" == "true" ]]; then
         echo ""
         gum style \
@@ -1100,12 +1171,15 @@ print_summary() {
             "" \
             "$(gum style --foreground 245 "Version:  $installed_version")" \
             "$(gum style --foreground 245 "Location: $DEST/$BINARY_NAME")"
+
         echo ""
+
         if [[ ":$PATH:" != *":$DEST:"* ]]; then
             gum style --foreground 214 "To use br, restart your shell or run:"
             gum style --foreground 39 "  export PATH=\"$DEST:\$PATH\""
             echo ""
         fi
+
         gum style --foreground 214 --bold "Quick Start"
         gum style --faint "  br init            Initialize a workspace"
         gum style --faint "  br create          Create an issue"
@@ -1120,11 +1194,13 @@ print_summary() {
         echo "  Version:  $installed_version"
         echo "  Location: $DEST/$BINARY_NAME"
         echo ""
+
         if [[ ":$PATH:" != *":$DEST:"* ]]; then
             echo "  To use br, restart your shell or run:"
             echo "    export PATH=\"$DEST:\$PATH\""
             echo ""
         fi
+
         echo "  Quick Start:"
         echo "    br init            Initialize a workspace"
         echo "    br create          Create an issue"
@@ -1140,18 +1216,24 @@ print_summary() {
 # ============================================================================
 main() {
     acquire_lock
+
     print_banner
+
     TMP=$(mktemp -d)
+
     local platform
     platform=$(detect_platform)
     log_step "Platform: $platform"
     log_step "Install directory: $DEST"
+
     mkdir -p "$DEST"
+
     # Try binary download first (unless --from-source)
     if [ "$FROM_SOURCE" -eq 1 ]; then
         build_from_source
     else
         resolve_version
+
         if [ -n "$VERSION" ]; then
             if download_release "$platform"; then
                 # Success - continue to post-install
@@ -1165,17 +1247,20 @@ main() {
             build_from_source
         fi
     fi
+
     # Post-install steps
     maybe_add_path
     fix_alias_conflicts
     check_conflicts
     install_skills
+
     # Verify installation
     if [ "$VERIFY" -eq 1 ]; then
         log_step "Running self-test..."
         "$DEST/$BINARY_NAME" --version || true
         log_success "Self-test complete"
     fi
+
     print_summary
 }
 
@@ -1183,8 +1268,6 @@ main() {
 # When piped (curl | bash), BASH_SOURCE[0] is empty - we want to run in that case too.
 # The :- syntax provides a default empty string to avoid "unbound variable" with set -u.
 if [[ "${BASH_SOURCE[0]:-}" == "${0:-}" ]] || [[ -z "${BASH_SOURCE[0]:-}" ]]; then
-    # Ensure the whole script is loaded before running main
-    # This helps when the script is piped from curl
     {
         main "$@"
     }
