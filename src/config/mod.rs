@@ -643,24 +643,25 @@ impl ConfigLayer {
             if let Some(stripped) = key.strip_prefix("BD_") {
                 let normalized = stripped.to_lowercase();
                 for variant in env_key_variants(&normalized) {
-                    insert_key_value(&mut layer, &variant, value.clone());
+                    insert_key_value(&mut layer, &variant, &value);
                 }
             }
         }
 
         if let Ok(value) = env::var("BEADS_FLUSH_DEBOUNCE") {
-            insert_key_value(&mut layer, "flush-debounce", value);
+            insert_key_value(&mut layer, "flush-debounce", &value);
         }
         if let Ok(value) = env::var("BEADS_IDENTITY") {
-            insert_key_value(&mut layer, "identity", value);
+            insert_key_value(&mut layer, "identity", &value);
         }
         if let Ok(value) = env::var("BEADS_REMOTE_SYNC_INTERVAL") {
-            insert_key_value(&mut layer, "remote-sync-interval", value);
+            insert_key_value(&mut layer, "remote-sync-interval", &value);
         }
         if let Ok(value) = env::var("BEADS_AUTO_START_DAEMON")
             && let Some(enabled) = parse_bool(&value)
         {
-            insert_key_value(&mut layer, "no-daemon", (!enabled).to_string());
+            let no_daemon = if enabled { "false" } else { "true" };
+            insert_key_value(&mut layer, "no-daemon", no_daemon);
         }
 
         layer
@@ -706,39 +707,39 @@ impl CliOverrides {
         let mut layer = ConfigLayer::default();
 
         if let Some(path) = &self.db {
-            insert_key_value(&mut layer, "db", path.to_string_lossy().to_string());
+            insert_key_value(&mut layer, "db", &path.to_string_lossy());
         }
         if let Some(actor) = &self.actor {
-            insert_key_value(&mut layer, "actor", actor.clone());
+            insert_key_value(&mut layer, "actor", actor);
         }
         if let Some(identity) = &self.identity {
-            insert_key_value(&mut layer, "identity", identity.clone());
+            insert_key_value(&mut layer, "identity", identity);
         }
         if let Some(json) = self.json {
-            insert_key_value(&mut layer, "json", json.to_string());
+            insert_key_value(&mut layer, "json", &json.to_string());
         }
         if let Some(display_color) = self.display_color {
-            insert_key_value(&mut layer, "display.color", display_color.to_string());
+            insert_key_value(&mut layer, "display.color", &display_color.to_string());
         }
         if let Some(no_db) = self.no_db {
-            insert_key_value(&mut layer, "no-db", no_db.to_string());
+            insert_key_value(&mut layer, "no-db", &no_db.to_string());
         }
         if let Some(no_daemon) = self.no_daemon {
-            insert_key_value(&mut layer, "no-daemon", no_daemon.to_string());
+            insert_key_value(&mut layer, "no-daemon", &no_daemon.to_string());
         }
         if let Some(no_auto_flush) = self.no_auto_flush {
             // Canonical representation stores positive sync.auto_* keys.
-            insert_key_value(&mut layer, "sync.auto_flush", (!no_auto_flush).to_string());
+            insert_key_value(&mut layer, "sync.auto_flush", &(!no_auto_flush).to_string());
         }
         if let Some(no_auto_import) = self.no_auto_import {
             insert_key_value(
                 &mut layer,
                 "sync.auto_import",
-                (!no_auto_import).to_string(),
+                &(!no_auto_import).to_string(),
             );
         }
         if let Some(lock_timeout) = self.lock_timeout {
-            insert_key_value(&mut layer, "lock-timeout", lock_timeout.to_string());
+            insert_key_value(&mut layer, "lock-timeout", &lock_timeout.to_string());
         }
 
         layer
@@ -1103,42 +1104,126 @@ pub fn is_startup_key(key: &str) -> bool {
     )
 }
 
-fn canonicalize_key_value(key: &str, value: String) -> (String, String) {
-    match normalize_key(key).as_str() {
+fn canonicalize_key_value(key: &str, value: &str) -> (String, String) {
+    let (canonical_key, transform) = canonicalize_config_key(key);
+    let canonical_value = apply_value_transform(value, transform);
+    (canonical_key, canonical_value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigValueTransform {
+    Identity,
+    InvertBool,
+}
+
+const ISSUE_PREFIX_KEY_ALIASES: &[&str] = &["issue-prefix", "id.prefix", "id-prefix", "prefix"];
+const DEFAULT_PRIORITY_KEY_ALIASES: &[&str] =
+    &["default-priority", "defaults.priority", "defaults-priority"];
+const DEFAULT_TYPE_KEY_ALIASES: &[&str] = &["default-type", "defaults.type", "defaults-type"];
+const DISPLAY_COLOR_KEY_ALIASES: &[&str] = &["display-color", "output.color", "output-color"];
+const SYNC_AUTO_FLUSH_KEY_ALIASES: &[&str] = &[
+    "sync.auto-flush",
+    "sync.auto.flush",
+    "sync-auto-flush",
+    "sync.auto_flush",
+    "no-auto-flush",
+    "no_auto_flush",
+    "no.auto.flush",
+];
+const SYNC_AUTO_IMPORT_KEY_ALIASES: &[&str] = &[
+    "sync.auto-import",
+    "sync.auto.import",
+    "sync-auto-import",
+    "sync.auto_import",
+    "no-auto-import",
+    "no_auto_import",
+    "no.auto.import",
+];
+
+fn config_key_spec(
+    normalized_key: &str,
+) -> Option<(&'static str, ConfigValueTransform, &'static [&'static str])> {
+    match normalized_key {
         // Consolidate user-facing aliases onto runtime canonical keys.
-        "id.prefix" | "id-prefix" | "prefix" | "issue-prefix" => {
-            ("issue_prefix".to_string(), value)
-        }
-        "defaults.priority" | "defaults-priority" | "default-priority" => {
-            ("default_priority".to_string(), value)
-        }
-        "defaults.type" | "defaults-type" | "default-type" => ("default_type".to_string(), value),
-        "output.color" | "output-color" | "display-color" => ("display.color".to_string(), value),
+        "issue-prefix" | "id.prefix" | "id-prefix" | "prefix" => Some((
+            "issue_prefix",
+            ConfigValueTransform::Identity,
+            ISSUE_PREFIX_KEY_ALIASES,
+        )),
+        "default-priority" | "defaults.priority" | "defaults-priority" => Some((
+            "default_priority",
+            ConfigValueTransform::Identity,
+            DEFAULT_PRIORITY_KEY_ALIASES,
+        )),
+        "default-type" | "defaults.type" | "defaults-type" => Some((
+            "default_type",
+            ConfigValueTransform::Identity,
+            DEFAULT_TYPE_KEY_ALIASES,
+        )),
+        "display-color" | "output.color" | "output-color" => Some((
+            "display.color",
+            ConfigValueTransform::Identity,
+            DISPLAY_COLOR_KEY_ALIASES,
+        )),
         // Consolidate legacy no-auto-* keys onto sync.auto_* with inverted semantics.
-        "no-auto-flush" | "no.auto.flush" => {
-            ("sync.auto_flush".to_string(), invert_bool_string(value))
-        }
-        "no-auto-import" | "no.auto.import" => {
-            ("sync.auto_import".to_string(), invert_bool_string(value))
-        }
-        // Canonicalize equivalent sync key spellings.
-        "sync.auto-flush" | "sync.auto.flush" | "sync-auto-flush" => {
-            ("sync.auto_flush".to_string(), value)
-        }
-        "sync.auto-import" | "sync.auto.import" | "sync-auto-import" => {
-            ("sync.auto_import".to_string(), value)
-        }
-        _ => (key.to_string(), value),
+        "no-auto-flush" | "no.auto.flush" | "sync.auto-flush" | "sync.auto.flush"
+        | "sync-auto-flush" => Some((
+            "sync.auto_flush",
+            if matches!(normalized_key, "no-auto-flush" | "no.auto.flush") {
+                ConfigValueTransform::InvertBool
+            } else {
+                ConfigValueTransform::Identity
+            },
+            SYNC_AUTO_FLUSH_KEY_ALIASES,
+        )),
+        "no-auto-import" | "no.auto.import" | "sync.auto-import" | "sync.auto.import"
+        | "sync-auto-import" => Some((
+            "sync.auto_import",
+            if matches!(normalized_key, "no-auto-import" | "no.auto.import") {
+                ConfigValueTransform::InvertBool
+            } else {
+                ConfigValueTransform::Identity
+            },
+            SYNC_AUTO_IMPORT_KEY_ALIASES,
+        )),
+        _ => None,
     }
 }
 
-fn invert_bool_string(value: String) -> String {
-    parse_bool(&value)
-        .map(|bool_value| (!bool_value).to_string())
-        .unwrap_or(value)
+#[must_use]
+pub(crate) fn canonicalize_config_key(key: &str) -> (String, ConfigValueTransform) {
+    let normalized = normalize_key(key);
+    if let Some((canonical_key, transform, _aliases)) = config_key_spec(&normalized) {
+        (canonical_key.to_string(), transform)
+    } else {
+        (key.to_string(), ConfigValueTransform::Identity)
+    }
 }
 
-fn insert_key_value(layer: &mut ConfigLayer, key: &str, value: String) {
+#[must_use]
+pub(crate) fn config_key_aliases(key: &str) -> Vec<String> {
+    let normalized = normalize_key(key);
+    if let Some((canonical_key, _transform, aliases)) = config_key_spec(&normalized) {
+        let mut keys = vec![canonical_key.to_string()];
+        keys.extend(aliases.iter().map(|alias| (*alias).to_string()));
+        keys.sort();
+        keys.dedup();
+        keys
+    } else {
+        vec![key.to_string()]
+    }
+}
+
+#[must_use]
+pub(crate) fn apply_value_transform(value: &str, transform: ConfigValueTransform) -> String {
+    match transform {
+        ConfigValueTransform::Identity => value.to_string(),
+        ConfigValueTransform::InvertBool => parse_bool(value)
+            .map_or_else(|| value.to_string(), |bool_value| (!bool_value).to_string()),
+    }
+}
+
+fn insert_key_value(layer: &mut ConfigLayer, key: &str, value: &str) {
     let (canonical_key, canonical_value) = canonicalize_key_value(key, value);
 
     if is_startup_key(&canonical_key) {
@@ -1227,7 +1312,7 @@ fn layer_from_yaml_value(value: &serde_yml::Value) -> ConfigLayer {
     flatten_yaml(value, "", &mut flat);
 
     for (key, value) in flat {
-        insert_key_value(&mut layer, &key, value);
+        insert_key_value(&mut layer, &key, &value);
     }
 
     layer
@@ -1825,8 +1910,8 @@ labels:
     fn insert_key_value_canonicalizes_legacy_no_auto_keys() {
         let mut layer = ConfigLayer::default();
 
-        insert_key_value(&mut layer, "no-auto-flush", "true".to_string());
-        insert_key_value(&mut layer, "no-auto-import", "false".to_string());
+        insert_key_value(&mut layer, "no-auto-flush", "true");
+        insert_key_value(&mut layer, "no-auto-import", "false");
 
         assert_eq!(
             layer.startup.get("sync.auto_flush"),
@@ -1844,8 +1929,8 @@ labels:
     fn insert_key_value_canonicalizes_sync_alias_spellings() {
         let mut layer = ConfigLayer::default();
 
-        insert_key_value(&mut layer, "sync.auto-flush", "false".to_string());
-        insert_key_value(&mut layer, "sync.auto.import", "true".to_string());
+        insert_key_value(&mut layer, "sync.auto-flush", "false");
+        insert_key_value(&mut layer, "sync.auto.import", "true");
 
         assert_eq!(
             layer.startup.get("sync.auto_flush"),
@@ -1861,10 +1946,10 @@ labels:
     fn insert_key_value_canonicalizes_runtime_aliases() {
         let mut layer = ConfigLayer::default();
 
-        insert_key_value(&mut layer, "id.prefix", "proj".to_string());
-        insert_key_value(&mut layer, "defaults.priority", "1".to_string());
-        insert_key_value(&mut layer, "defaults.type", "feature".to_string());
-        insert_key_value(&mut layer, "output.color", "false".to_string());
+        insert_key_value(&mut layer, "id.prefix", "proj");
+        insert_key_value(&mut layer, "defaults.priority", "1");
+        insert_key_value(&mut layer, "defaults.type", "feature");
+        insert_key_value(&mut layer, "output.color", "false");
 
         assert_eq!(layer.runtime.get("issue_prefix"), Some(&"proj".to_string()));
         assert_eq!(

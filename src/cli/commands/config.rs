@@ -177,122 +177,8 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
     merged
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueTransform {
-    Identity,
-    InvertBool,
-}
-
 fn normalize_config_key(key: &str) -> String {
     key.trim().to_lowercase().replace('_', "-")
-}
-
-fn canonical_config_key(key: &str) -> (String, ValueTransform) {
-    match normalize_config_key(key).as_str() {
-        "issue-prefix" | "id.prefix" | "id-prefix" | "prefix" => {
-            ("issue_prefix".to_string(), ValueTransform::Identity)
-        }
-        "default-priority" | "defaults.priority" | "defaults-priority" => {
-            ("default_priority".to_string(), ValueTransform::Identity)
-        }
-        "default-type" | "defaults.type" | "defaults-type" => {
-            ("default_type".to_string(), ValueTransform::Identity)
-        }
-        "display-color" | "output.color" | "output-color" => {
-            ("display.color".to_string(), ValueTransform::Identity)
-        }
-        "no-auto-flush" | "no.auto.flush" => {
-            ("sync.auto_flush".to_string(), ValueTransform::InvertBool)
-        }
-        "no-auto-import" | "no.auto.import" => {
-            ("sync.auto_import".to_string(), ValueTransform::InvertBool)
-        }
-        "sync.auto-flush" | "sync.auto.flush" | "sync-auto-flush" => {
-            ("sync.auto_flush".to_string(), ValueTransform::Identity)
-        }
-        "sync.auto-import" | "sync.auto.import" | "sync-auto-import" => {
-            ("sync.auto_import".to_string(), ValueTransform::Identity)
-        }
-        _ => (key.to_string(), ValueTransform::Identity),
-    }
-}
-
-fn parse_bool_like(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" => Some(true),
-        "0" | "false" | "no" | "n" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn apply_transform_to_value(value: &str, transform: ValueTransform) -> String {
-    match transform {
-        ValueTransform::Identity => value.to_string(),
-        ValueTransform::InvertBool => parse_bool_like(value)
-            .map_or_else(|| value.to_string(), |bool_value| (!bool_value).to_string()),
-    }
-}
-
-fn delete_key_candidates(raw_key: &str) -> Vec<String> {
-    let (canonical_key, _) = canonical_config_key(raw_key);
-    let mut keys = vec![canonical_key.clone()];
-
-    match canonical_key.as_str() {
-        "sync.auto_flush" => {
-            keys.extend([
-                "sync.auto-flush".to_string(),
-                "sync.auto.flush".to_string(),
-                "sync-auto-flush".to_string(),
-                "no-auto-flush".to_string(),
-                "no_auto_flush".to_string(),
-                "no.auto.flush".to_string(),
-            ]);
-        }
-        "sync.auto_import" => {
-            keys.extend([
-                "sync.auto-import".to_string(),
-                "sync.auto.import".to_string(),
-                "sync-auto-import".to_string(),
-                "no-auto-import".to_string(),
-                "no_auto_import".to_string(),
-                "no.auto.import".to_string(),
-            ]);
-        }
-        "issue_prefix" => {
-            keys.extend([
-                "issue-prefix".to_string(),
-                "id.prefix".to_string(),
-                "id-prefix".to_string(),
-                "prefix".to_string(),
-            ]);
-        }
-        "default_priority" => {
-            keys.extend([
-                "default-priority".to_string(),
-                "defaults.priority".to_string(),
-                "defaults-priority".to_string(),
-            ]);
-        }
-        "default_type" => {
-            keys.extend([
-                "default-type".to_string(),
-                "defaults.type".to_string(),
-                "defaults-type".to_string(),
-            ]);
-        }
-        "display.color" => {
-            keys.extend([
-                "display-color".to_string(),
-                "output.color".to_string(),
-                "output-color".to_string(),
-            ]);
-        }
-        _ => {}
-    }
-
-    keys.sort();
-    keys.dedup();
-    keys
 }
 
 fn map_contains_key(map: &HashMap<String, String>, key: &str) -> bool {
@@ -493,9 +379,9 @@ fn get_config_value(
     let layers = build_layers(beads_dir, overrides)?;
     let layer = merge_layers(&layers);
 
-    let (lookup_key, transform) = canonical_config_key(key);
+    let (lookup_key, transform) = config::canonicalize_config_key(key);
     let value = get_layer_value(&layer, &lookup_key)
-        .map(|resolved_value| apply_transform_to_value(&resolved_value, transform));
+        .map(|resolved_value| config::apply_value_transform(&resolved_value, transform));
 
     if ctx.is_json() {
         let output = json!({
@@ -550,8 +436,8 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
         }
     };
 
-    let (key, transform) = canonical_config_key(raw_key);
-    let value = apply_transform_to_value(raw_value, transform);
+    let (key, transform) = config::canonicalize_config_key(raw_key);
+    let value = config::apply_value_transform(raw_value, transform);
 
     // Determine target config file
     let (config_path, is_project) = if let Ok(beads_dir) = discover_beads_dir(None) {
@@ -716,8 +602,8 @@ fn delete_config_value(
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let (canonical_key, _) = canonical_config_key(key);
-    let delete_keys = delete_key_candidates(key);
+    let (canonical_key, _) = config::canonicalize_config_key(key);
+    let delete_keys = config::config_key_aliases(key);
 
     // 1. Delete from DB
     let beads_dir = discover_beads_dir(None).ok();
@@ -1140,75 +1026,96 @@ mod tests {
     #[test]
     fn test_canonical_config_key_aliases() {
         assert_eq!(
-            canonical_config_key("id.prefix"),
-            ("issue_prefix".to_string(), ValueTransform::Identity)
+            config::canonicalize_config_key("id.prefix"),
+            (
+                "issue_prefix".to_string(),
+                config::ConfigValueTransform::Identity
+            )
         );
         assert_eq!(
-            canonical_config_key("defaults.priority"),
-            ("default_priority".to_string(), ValueTransform::Identity)
+            config::canonicalize_config_key("defaults.priority"),
+            (
+                "default_priority".to_string(),
+                config::ConfigValueTransform::Identity
+            )
         );
         assert_eq!(
-            canonical_config_key("defaults.type"),
-            ("default_type".to_string(), ValueTransform::Identity)
+            config::canonicalize_config_key("defaults.type"),
+            (
+                "default_type".to_string(),
+                config::ConfigValueTransform::Identity
+            )
         );
         assert_eq!(
-            canonical_config_key("output.color"),
-            ("display.color".to_string(), ValueTransform::Identity)
+            config::canonicalize_config_key("output.color"),
+            (
+                "display.color".to_string(),
+                config::ConfigValueTransform::Identity
+            )
         );
         assert_eq!(
-            canonical_config_key("no-auto-flush"),
-            ("sync.auto_flush".to_string(), ValueTransform::InvertBool)
+            config::canonicalize_config_key("no-auto-flush"),
+            (
+                "sync.auto_flush".to_string(),
+                config::ConfigValueTransform::InvertBool
+            )
         );
         assert_eq!(
-            canonical_config_key("sync.auto.flush"),
-            ("sync.auto_flush".to_string(), ValueTransform::Identity)
+            config::canonicalize_config_key("sync.auto.flush"),
+            (
+                "sync.auto_flush".to_string(),
+                config::ConfigValueTransform::Identity
+            )
         );
         assert_eq!(
-            canonical_config_key("no_auto_import"),
-            ("sync.auto_import".to_string(), ValueTransform::InvertBool)
+            config::canonicalize_config_key("no_auto_import"),
+            (
+                "sync.auto_import".to_string(),
+                config::ConfigValueTransform::InvertBool
+            )
         );
     }
 
     #[test]
     fn test_apply_transform_to_value_inverts_bools() {
         assert_eq!(
-            apply_transform_to_value("true", ValueTransform::InvertBool),
+            config::apply_value_transform("true", config::ConfigValueTransform::InvertBool),
             "false"
         );
         assert_eq!(
-            apply_transform_to_value("false", ValueTransform::InvertBool),
+            config::apply_value_transform("false", config::ConfigValueTransform::InvertBool),
             "true"
         );
         assert_eq!(
-            apply_transform_to_value("hello", ValueTransform::InvertBool),
+            config::apply_value_transform("hello", config::ConfigValueTransform::InvertBool),
             "hello"
         );
         assert_eq!(
-            apply_transform_to_value("1", ValueTransform::InvertBool),
+            config::apply_value_transform("1", config::ConfigValueTransform::InvertBool),
             "false"
         );
         assert_eq!(
-            apply_transform_to_value("0", ValueTransform::InvertBool),
+            config::apply_value_transform("0", config::ConfigValueTransform::InvertBool),
             "true"
         );
         assert_eq!(
-            apply_transform_to_value("y", ValueTransform::InvertBool),
+            config::apply_value_transform("y", config::ConfigValueTransform::InvertBool),
             "false"
         );
         assert_eq!(
-            apply_transform_to_value("n", ValueTransform::InvertBool),
+            config::apply_value_transform("n", config::ConfigValueTransform::InvertBool),
             "true"
         );
     }
 
     #[test]
     fn test_delete_key_candidates_include_aliases() {
-        let keys = delete_key_candidates("id.prefix");
+        let keys = config::config_key_aliases("id.prefix");
         assert!(keys.contains(&"issue_prefix".to_string()));
         assert!(keys.contains(&"id.prefix".to_string()));
         assert!(keys.contains(&"prefix".to_string()));
 
-        let keys = delete_key_candidates("no-auto-flush");
+        let keys = config::config_key_aliases("no-auto-flush");
         assert!(keys.contains(&"sync.auto_flush".to_string()));
         assert!(keys.contains(&"no-auto-flush".to_string()));
     }
@@ -1225,7 +1132,7 @@ id:
         .expect("parse yaml");
 
         let mut deleted_any = false;
-        for delete_key in delete_key_candidates("id.prefix") {
+        for delete_key in config::config_key_aliases("id.prefix") {
             deleted_any |= delete_from_yaml(&mut config, &delete_key);
         }
 
