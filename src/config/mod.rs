@@ -433,9 +433,11 @@ pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
 #[must_use]
 pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
     // Direct key: no-auto-import / no_auto_import / no.auto.import
-    if let Some(v) =
-        get_startup_value(layer, &["no-auto-import", "no_auto_import", "no.auto.import"])
-            .and_then(|value| parse_bool(value))
+    if let Some(v) = get_startup_value(
+        layer,
+        &["no-auto-import", "no_auto_import", "no.auto.import"],
+    )
+    .and_then(|value| parse_bool(value))
     {
         return Some(v);
     }
