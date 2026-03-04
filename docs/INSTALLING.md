@@ -284,7 +284,7 @@ Create `~/.config/beads/config.yaml` for global defaults:
 
 ```yaml
 # Default issue prefix
-prefix: bd
+issue_prefix: bd
 
 # Default priority for new issues (0-4)
 default_priority: 2
@@ -293,7 +293,8 @@ default_priority: 2
 default_type: task
 
 # Auto-flush after mutations
-auto_flush: true
+sync:
+  auto_flush: true
 ```
 
 ### Project Configuration
@@ -302,7 +303,7 @@ Create `.beads/config.yaml` for project-specific settings:
 
 ```yaml
 # Project-specific prefix
-prefix: myproj
+issue_prefix: myproj
 
 # Override defaults
 default_priority: 1

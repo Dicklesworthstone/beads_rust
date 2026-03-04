@@ -471,6 +471,52 @@ fn e2e_no_auto_flush_flag() {
     );
 }
 
+#[test]
+fn e2e_no_auto_flush_from_project_config() {
+    let _log = common::test_log("e2e_no_auto_flush_from_project_config");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Disable auto-flush via project config (new nested form).
+    let config_path = workspace.root.join(".beads").join("config.yaml");
+    fs::write(
+        &config_path,
+        "sync:
+  auto_flush: false
+",
+    )
+    .expect("write config");
+
+    // Create without --no-auto-flush flag; config should suppress auto-flush.
+    let create = run_br(
+        &workspace,
+        ["create", "No auto-flush from config"],
+        "create_with_config",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    // Issue should not be present in JSONL until explicit flush.
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    if jsonl_path.exists() {
+        let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+        assert!(
+            !contents.contains("No auto-flush from config"),
+            "issue should not be in JSONL before explicit flush when sync.auto_flush=false"
+        );
+    }
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    let contents = fs::read_to_string(&jsonl_path).expect("read jsonl");
+    assert!(
+        contents.contains("No auto-flush from config"),
+        "issue should be in JSONL after explicit flush"
+    );
+}
+
 // ============================================================================
 // --lock-timeout flag tests
 // ============================================================================

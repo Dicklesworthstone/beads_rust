@@ -668,34 +668,32 @@ br sync --flush-only -v
 Configuration management.
 
 ```bash
-br config [OPTIONS]
+br config <SUBCOMMAND>
 ```
 
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `-l, --list` | List all config options with descriptions |
-| `-g, --get <KEY>` | Get a specific config value |
-| `-s, --set <KEY=VALUE>` | Set a config value |
-| `-d, --delete <KEY>` | Delete a config value |
-| `-e, --edit` | Open config in `$EDITOR` |
-| `-p, --path` | Show config file paths |
-| `--project` | Show only project config |
-| `--user` | Show only user config |
+**Subcommands:**
+| Subcommand | Description |
+|------------|-------------|
+| `list [--project] [--user]` | List merged/project/user config values |
+| `get <KEY>` | Get a specific config value |
+| `set <KEY=VALUE>` | Set a config value |
+| `delete <KEY>` | Delete a config value (alias: `unset`) |
+| `edit` | Open config in `$EDITOR` |
+| `path` | Show config file paths |
 
 **Examples:**
 ```bash
 # List all config
-br config --list
+br config list
 
 # Get specific value
-br config --get id.prefix
+br config get issue_prefix
 
 # Set value
-br config --set id.prefix=myproj
+br config set issue_prefix=myproj
 
 # Edit in editor
-br config --edit
+br config edit
 ```
 
 ---
@@ -872,7 +870,7 @@ source ~/.bashrc
 | `BEADS_DIR` | Override `.beads` directory location |
 | `BEADS_JSONL` | Override JSONL file path (requires `--allow-external-jsonl`) |
 | `BD_ACTOR` | Default actor name for audit trail |
-| `EDITOR` | Editor for `br config --edit` |
+| `EDITOR` | Editor for `br config edit` |
 | `NO_COLOR` | Disable colored output (any value) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 

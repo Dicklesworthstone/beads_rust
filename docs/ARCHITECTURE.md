@@ -375,7 +375,8 @@ pub struct ConfigLayer {
 ```
 
 **Startup-only keys** (cannot be stored in DB):
-- `no-db`, `no-daemon`, `no-auto-flush`
+- `no-db`, `no-daemon`, `sync.auto_flush`, `sync.auto_import`
+- legacy aliases `no-auto-flush` / `no-auto-import` are normalized
 - `db`, `actor`, `identity`
 - `git.*`, `routing.*`, `sync.*`
 
@@ -507,8 +508,8 @@ fn main() {
         handle_error(&e, cli.json);
     }
 
-    // Auto-flush if enabled
-    if is_mutating && !cli.no_auto_flush {
+    // Auto-flush if enabled by effective startup flags (CLI/config/env)
+    if is_mutating && !effective_startup_flags.no_auto_flush && !effective_startup_flags.no_db {
         run_auto_flush(&overrides);
     }
 }

@@ -414,6 +414,37 @@ pub fn no_db_from_layer(layer: &ConfigLayer) -> Option<bool> {
     get_startup_value(layer, &["no-db", "no_db", "no.db"]).and_then(|value| parse_bool(value))
 }
 
+#[must_use]
+pub fn no_auto_flush_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    get_startup_value(
+        layer,
+        &["sync.auto_flush", "sync.auto-flush", "sync.auto.flush"],
+    )
+    .and_then(|value| parse_bool(value).map(|auto_flush| !auto_flush))
+    .or_else(|| {
+        // Backward compatibility for legacy keys in existing config files.
+        get_startup_value(layer, &["no-auto-flush", "no_auto_flush", "no.auto.flush"])
+            .and_then(|value| parse_bool(value))
+    })
+}
+
+#[must_use]
+pub fn no_auto_import_from_layer(layer: &ConfigLayer) -> Option<bool> {
+    get_startup_value(
+        layer,
+        &["sync.auto_import", "sync.auto-import", "sync.auto.import"],
+    )
+    .and_then(|value| parse_bool(value).map(|auto_import| !auto_import))
+    .or_else(|| {
+        // Backward compatibility for legacy keys in existing config files.
+        get_startup_value(
+            layer,
+            &["no-auto-import", "no_auto_import", "no.auto.import"],
+        )
+        .and_then(|value| parse_bool(value))
+    })
+}
+
 fn resolve_no_db_prefix(beads_dir: &Path, jsonl_path: &Path) -> Result<String> {
     let project_layer = load_project_config(beads_dir)?;
     if let Some(prefix) = get_value(&project_layer, &["issue_prefix", "issue-prefix", "prefix"]) {
@@ -696,10 +727,15 @@ impl CliOverrides {
             insert_key_value(&mut layer, "no-daemon", no_daemon.to_string());
         }
         if let Some(no_auto_flush) = self.no_auto_flush {
-            insert_key_value(&mut layer, "no-auto-flush", no_auto_flush.to_string());
+            // Canonical representation stores positive sync.auto_* keys.
+            insert_key_value(&mut layer, "sync.auto_flush", (!no_auto_flush).to_string());
         }
         if let Some(no_auto_import) = self.no_auto_import {
-            insert_key_value(&mut layer, "no-auto-import", no_auto_import.to_string());
+            insert_key_value(
+                &mut layer,
+                "sync.auto_import",
+                (!no_auto_import).to_string(),
+            );
         }
         if let Some(lock_timeout) = self.lock_timeout {
             insert_key_value(&mut layer, "lock-timeout", lock_timeout.to_string());
@@ -813,10 +849,19 @@ pub fn load_config(
 /// Build ID generation config from a merged config layer.
 #[must_use]
 pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
-    let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
-        .cloned()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| "bd".to_string());
+    let prefix = get_value(
+        layer,
+        &[
+            "issue_prefix",
+            "issue-prefix",
+            "prefix",
+            "id.prefix",
+            "id-prefix",
+        ],
+    )
+    .cloned()
+    .filter(|p| !p.trim().is_empty())
+    .unwrap_or_else(|| "bd".to_string());
 
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
@@ -837,8 +882,16 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
 ///
 /// Returns an error if the configured value is not a valid priority (0-4).
 pub fn default_priority_from_layer(layer: &ConfigLayer) -> Result<Priority> {
-    get_value(layer, &["default_priority", "default-priority"])
-        .map_or_else(|| Ok(Priority::MEDIUM), |value| Priority::from_str(value))
+    get_value(
+        layer,
+        &[
+            "default_priority",
+            "default-priority",
+            "defaults.priority",
+            "defaults-priority",
+        ],
+    )
+    .map_or_else(|| Ok(Priority::MEDIUM), |value| Priority::from_str(value))
 }
 
 /// Resolve default issue type for new issues from config.
@@ -847,8 +900,16 @@ pub fn default_priority_from_layer(layer: &ConfigLayer) -> Result<Priority> {
 ///
 /// Returns an error only if parsing fails (custom types are allowed).
 pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
-    get_value(layer, &["default_type", "default-type"])
-        .map_or_else(|| Ok(IssueType::Task), |value| IssueType::from_str(value))
+    get_value(
+        layer,
+        &[
+            "default_type",
+            "default-type",
+            "defaults.type",
+            "defaults-type",
+        ],
+    )
+    .map_or_else(|| Ok(IssueType::Task), |value| IssueType::from_str(value))
 }
 
 /// Resolve display color preference from a merged config layer.
@@ -856,8 +917,17 @@ pub fn default_issue_type_from_layer(layer: &ConfigLayer) -> Result<IssueType> {
 /// Accepts keys: `display.color`, `display-color`, `display_color`.
 #[must_use]
 pub fn display_color_from_layer(layer: &ConfigLayer) -> Option<bool> {
-    get_value(layer, &["display.color", "display-color", "display_color"])
-        .and_then(|value| parse_bool(value))
+    get_value(
+        layer,
+        &[
+            "display.color",
+            "display-color",
+            "display_color",
+            "output.color",
+            "output-color",
+        ],
+    )
+    .and_then(|value| parse_bool(value))
 }
 
 /// Determine whether human-readable output should use ANSI color.
@@ -1033,11 +1103,48 @@ pub fn is_startup_key(key: &str) -> bool {
     )
 }
 
+fn canonicalize_key_value(key: &str, value: String) -> (String, String) {
+    match normalize_key(key).as_str() {
+        // Consolidate user-facing aliases onto runtime canonical keys.
+        "id.prefix" | "id-prefix" | "prefix" | "issue-prefix" => {
+            ("issue_prefix".to_string(), value)
+        }
+        "defaults.priority" | "defaults-priority" | "default-priority" => {
+            ("default_priority".to_string(), value)
+        }
+        "defaults.type" | "defaults-type" | "default-type" => ("default_type".to_string(), value),
+        "output.color" | "output-color" | "display-color" => ("display.color".to_string(), value),
+        // Consolidate legacy no-auto-* keys onto sync.auto_* with inverted semantics.
+        "no-auto-flush" | "no.auto.flush" => {
+            ("sync.auto_flush".to_string(), invert_bool_string(value))
+        }
+        "no-auto-import" | "no.auto.import" => {
+            ("sync.auto_import".to_string(), invert_bool_string(value))
+        }
+        // Canonicalize equivalent sync key spellings.
+        "sync.auto-flush" | "sync.auto.flush" | "sync-auto-flush" => {
+            ("sync.auto_flush".to_string(), value)
+        }
+        "sync.auto-import" | "sync.auto.import" | "sync-auto-import" => {
+            ("sync.auto_import".to_string(), value)
+        }
+        _ => (key.to_string(), value),
+    }
+}
+
+fn invert_bool_string(value: String) -> String {
+    parse_bool(&value)
+        .map(|bool_value| (!bool_value).to_string())
+        .unwrap_or(value)
+}
+
 fn insert_key_value(layer: &mut ConfigLayer, key: &str, value: String) {
-    if is_startup_key(key) {
-        layer.startup.insert(key.to_string(), value);
+    let (canonical_key, canonical_value) = canonicalize_key_value(key, value);
+
+    if is_startup_key(&canonical_key) {
+        layer.startup.insert(canonical_key, canonical_value);
     } else {
-        layer.runtime.insert(key.to_string(), value);
+        layer.runtime.insert(canonical_key, canonical_value);
     }
 }
 
@@ -1278,11 +1385,33 @@ labels:
     }
 
     #[test]
+    fn id_config_reads_id_prefix_alias() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("id.prefix".to_string(), "alias".to_string());
+
+        let config = id_config_from_layer(&layer);
+        assert_eq!(config.prefix, "alias");
+    }
+
+    #[test]
     fn default_priority_from_layer_uses_config_value() {
         let mut layer = ConfigLayer::default();
         layer
             .runtime
             .insert("default_priority".to_string(), "1".to_string());
+
+        let priority = default_priority_from_layer(&layer).expect("default priority");
+        assert_eq!(priority, Priority::HIGH);
+    }
+
+    #[test]
+    fn default_priority_from_layer_reads_defaults_priority_alias() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("defaults.priority".to_string(), "1".to_string());
 
         let priority = default_priority_from_layer(&layer).expect("default priority");
         assert_eq!(priority, Priority::HIGH);
@@ -1307,6 +1436,27 @@ labels:
 
         let issue_type = default_issue_type_from_layer(&layer).expect("default type");
         assert_eq!(issue_type, IssueType::Feature);
+    }
+
+    #[test]
+    fn default_issue_type_from_layer_reads_defaults_type_alias() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("defaults.type".to_string(), "feature".to_string());
+
+        let issue_type = default_issue_type_from_layer(&layer).expect("default type");
+        assert_eq!(issue_type, IssueType::Feature);
+    }
+
+    #[test]
+    fn display_color_from_layer_reads_output_color_alias() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("output.color".to_string(), "false".to_string());
+
+        assert_eq!(display_color_from_layer(&layer), Some(false));
     }
 
     #[test]
@@ -1628,6 +1778,114 @@ labels:
     }
 
     #[test]
+    fn no_auto_flush_from_layer_reads_legacy_key() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("no-auto-flush".to_string(), "true".to_string());
+
+        assert_eq!(no_auto_flush_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn no_auto_flush_from_layer_reads_sync_auto_flush_alias() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("sync.auto_flush".to_string(), "false".to_string());
+
+        assert_eq!(no_auto_flush_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn no_auto_import_from_layer_reads_sync_auto_import_alias() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("sync.auto_import".to_string(), "false".to_string());
+
+        assert_eq!(no_auto_import_from_layer(&layer), Some(true));
+    }
+
+    #[test]
+    fn no_auto_flush_sync_alias_wins_over_legacy_key() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("sync.auto_flush".to_string(), "true".to_string());
+        layer
+            .startup
+            .insert("no-auto-flush".to_string(), "true".to_string());
+
+        // Canonical sync.auto_flush=true should mean no_auto_flush=false.
+        assert_eq!(no_auto_flush_from_layer(&layer), Some(false));
+    }
+
+    #[test]
+    fn insert_key_value_canonicalizes_legacy_no_auto_keys() {
+        let mut layer = ConfigLayer::default();
+
+        insert_key_value(&mut layer, "no-auto-flush", "true".to_string());
+        insert_key_value(&mut layer, "no-auto-import", "false".to_string());
+
+        assert_eq!(
+            layer.startup.get("sync.auto_flush"),
+            Some(&"false".to_string())
+        );
+        assert_eq!(
+            layer.startup.get("sync.auto_import"),
+            Some(&"true".to_string())
+        );
+        assert!(!layer.startup.contains_key("no-auto-flush"));
+        assert!(!layer.startup.contains_key("no-auto-import"));
+    }
+
+    #[test]
+    fn insert_key_value_canonicalizes_sync_alias_spellings() {
+        let mut layer = ConfigLayer::default();
+
+        insert_key_value(&mut layer, "sync.auto-flush", "false".to_string());
+        insert_key_value(&mut layer, "sync.auto.import", "true".to_string());
+
+        assert_eq!(
+            layer.startup.get("sync.auto_flush"),
+            Some(&"false".to_string())
+        );
+        assert_eq!(
+            layer.startup.get("sync.auto_import"),
+            Some(&"true".to_string())
+        );
+    }
+
+    #[test]
+    fn insert_key_value_canonicalizes_runtime_aliases() {
+        let mut layer = ConfigLayer::default();
+
+        insert_key_value(&mut layer, "id.prefix", "proj".to_string());
+        insert_key_value(&mut layer, "defaults.priority", "1".to_string());
+        insert_key_value(&mut layer, "defaults.type", "feature".to_string());
+        insert_key_value(&mut layer, "output.color", "false".to_string());
+
+        assert_eq!(layer.runtime.get("issue_prefix"), Some(&"proj".to_string()));
+        assert_eq!(
+            layer.runtime.get("default_priority"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            layer.runtime.get("default_type"),
+            Some(&"feature".to_string())
+        );
+        assert_eq!(
+            layer.runtime.get("display.color"),
+            Some(&"false".to_string())
+        );
+        assert!(!layer.runtime.contains_key("id.prefix"));
+        assert!(!layer.runtime.contains_key("defaults.priority"));
+        assert!(!layer.runtime.contains_key("defaults.type"));
+        assert!(!layer.runtime.contains_key("output.color"));
+    }
+
+    #[test]
     fn is_startup_key_identifies_startup_keys() {
         assert!(is_startup_key("no-db"));
         assert!(is_startup_key("no-daemon"));
@@ -1769,8 +2027,10 @@ labels:
         assert_eq!(layer.startup.get("json").unwrap(), "true");
         assert_eq!(layer.startup.get("no-db").unwrap(), "true");
         assert_eq!(layer.startup.get("no-daemon").unwrap(), "true");
-        assert_eq!(layer.startup.get("no-auto-flush").unwrap(), "true");
-        assert_eq!(layer.startup.get("no-auto-import").unwrap(), "true");
+        assert_eq!(layer.startup.get("sync.auto_flush").unwrap(), "false");
+        assert_eq!(layer.startup.get("sync.auto_import").unwrap(), "false");
+        assert!(!layer.startup.contains_key("no-auto-flush"));
+        assert!(!layer.startup.contains_key("no-auto-import"));
         assert_eq!(layer.startup.get("lock-timeout").unwrap(), "5000");
     }
 

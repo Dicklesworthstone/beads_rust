@@ -19,7 +19,7 @@ use crate::error::Result;
 use crate::output::OutputContext;
 use rich_rust::prelude::*;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -177,9 +177,146 @@ fn merge_layers(layers: &[LayerWithSource]) -> ConfigLayer {
     merged
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueTransform {
+    Identity,
+    InvertBool,
+}
+
+fn normalize_config_key(key: &str) -> String {
+    key.trim().to_lowercase().replace('_', "-")
+}
+
+fn canonical_config_key(key: &str) -> (String, ValueTransform) {
+    match normalize_config_key(key).as_str() {
+        "issue-prefix" | "id.prefix" | "id-prefix" | "prefix" => {
+            ("issue_prefix".to_string(), ValueTransform::Identity)
+        }
+        "default-priority" | "defaults.priority" | "defaults-priority" => {
+            ("default_priority".to_string(), ValueTransform::Identity)
+        }
+        "default-type" | "defaults.type" | "defaults-type" => {
+            ("default_type".to_string(), ValueTransform::Identity)
+        }
+        "display-color" | "output.color" | "output-color" => {
+            ("display.color".to_string(), ValueTransform::Identity)
+        }
+        "no-auto-flush" | "no.auto.flush" => {
+            ("sync.auto_flush".to_string(), ValueTransform::InvertBool)
+        }
+        "no-auto-import" | "no.auto.import" => {
+            ("sync.auto_import".to_string(), ValueTransform::InvertBool)
+        }
+        "sync.auto-flush" | "sync.auto.flush" | "sync-auto-flush" => {
+            ("sync.auto_flush".to_string(), ValueTransform::Identity)
+        }
+        "sync.auto-import" | "sync.auto.import" | "sync-auto-import" => {
+            ("sync.auto_import".to_string(), ValueTransform::Identity)
+        }
+        _ => (key.to_string(), ValueTransform::Identity),
+    }
+}
+
+fn parse_bool_like(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn apply_transform_to_value(value: &str, transform: ValueTransform) -> String {
+    match transform {
+        ValueTransform::Identity => value.to_string(),
+        ValueTransform::InvertBool => parse_bool_like(value)
+            .map_or_else(|| value.to_string(), |bool_value| (!bool_value).to_string()),
+    }
+}
+
+fn delete_key_candidates(raw_key: &str) -> Vec<String> {
+    let (canonical_key, _) = canonical_config_key(raw_key);
+    let mut keys = vec![canonical_key.clone()];
+
+    match canonical_key.as_str() {
+        "sync.auto_flush" => {
+            keys.extend([
+                "sync.auto-flush".to_string(),
+                "sync.auto.flush".to_string(),
+                "sync-auto-flush".to_string(),
+                "no-auto-flush".to_string(),
+                "no_auto_flush".to_string(),
+                "no.auto.flush".to_string(),
+            ]);
+        }
+        "sync.auto_import" => {
+            keys.extend([
+                "sync.auto-import".to_string(),
+                "sync.auto.import".to_string(),
+                "sync-auto-import".to_string(),
+                "no-auto-import".to_string(),
+                "no_auto_import".to_string(),
+                "no.auto.import".to_string(),
+            ]);
+        }
+        "issue_prefix" => {
+            keys.extend([
+                "issue-prefix".to_string(),
+                "id.prefix".to_string(),
+                "id-prefix".to_string(),
+                "prefix".to_string(),
+            ]);
+        }
+        "default_priority" => {
+            keys.extend([
+                "default-priority".to_string(),
+                "defaults.priority".to_string(),
+                "defaults-priority".to_string(),
+            ]);
+        }
+        "default_type" => {
+            keys.extend([
+                "default-type".to_string(),
+                "defaults.type".to_string(),
+                "defaults-type".to_string(),
+            ]);
+        }
+        "display.color" => {
+            keys.extend([
+                "display-color".to_string(),
+                "output.color".to_string(),
+                "output-color".to_string(),
+            ]);
+        }
+        _ => {}
+    }
+
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn map_contains_key(map: &HashMap<String, String>, key: &str) -> bool {
+    let target = normalize_config_key(key);
+    map.keys()
+        .any(|candidate| normalize_config_key(candidate) == target)
+}
+
+fn map_get_value(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    let target = normalize_config_key(key);
+    map.iter().find_map(|(candidate, value)| {
+        (normalize_config_key(candidate) == target).then(|| value.clone())
+    })
+}
+
+fn get_layer_value(layer: &ConfigLayer, key: &str) -> Option<String> {
+    map_get_value(&layer.runtime, key).or_else(|| map_get_value(&layer.startup, key))
+}
+
 fn resolve_source(key: &str, layers: &[LayerWithSource]) -> ConfigSource {
     for layer in layers.iter().rev() {
-        if layer.layer.runtime.contains_key(key) || layer.layer.startup.contains_key(key) {
+        if map_contains_key(&layer.layer.runtime, key)
+            || map_contains_key(&layer.layer.startup, key)
+        {
             return layer.source;
         }
     }
@@ -356,17 +493,16 @@ fn get_config_value(
     let layers = build_layers(beads_dir, overrides)?;
     let layer = merge_layers(&layers);
 
-    // Look for the key in both runtime and startup
-    let value = layer
-        .runtime
-        .get(key)
-        .or_else(|| layer.startup.get(key))
-        .cloned();
+    let (lookup_key, transform) = canonical_config_key(key);
+    let value = get_layer_value(&layer, &lookup_key)
+        .map(|resolved_value| apply_transform_to_value(&resolved_value, transform));
 
     if ctx.is_json() {
         let output = json!({
             "key": key,
             "value": value,
+            "requested_key": key,
+            "resolved_key": lookup_key,
         });
         ctx.json_pretty(&output);
     } else if let Some(v) = value {
@@ -374,7 +510,7 @@ fn get_config_value(
             return Ok(());
         }
         if ctx.is_rich() {
-            let source = resolve_source(key, &layers);
+            let source = resolve_source(&lookup_key, &layers);
             trace!(key, source = ?source, "Config source resolved");
             render_config_table(
                 "Config Value",
@@ -398,7 +534,7 @@ fn get_config_value(
 
 /// Set a config value in project config (if available) or user config.
 fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> Result<()> {
-    let (key, value) = match args.len() {
+    let (raw_key, raw_value) = match args.len() {
         1 => args[0]
             .split_once('=')
             .ok_or_else(|| crate::error::BeadsError::Validation {
@@ -413,6 +549,9 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
             });
         }
     };
+
+    let (key, transform) = canonical_config_key(raw_key);
+    let value = apply_transform_to_value(raw_value, transform);
 
     // Determine target config file
     let (config_path, is_project) = if let Ok(beads_dir) = discover_beads_dir(None) {
@@ -446,11 +585,7 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
     // Set the value
     let parts: Vec<&str> = key.split('.').collect();
     let old_value = get_yaml_value(&config, &parts);
-    set_yaml_value(
-        &mut config,
-        &parts,
-        serde_yml::Value::String(value.to_string()),
-    );
+    set_yaml_value(&mut config, &parts, serde_yml::Value::String(value.clone()));
 
     // Write back
     let yaml_str = serde_yml::to_string(&config)?;
@@ -459,7 +594,7 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
     info!(
         key,
         old_value = old_value.as_deref(),
-        new_value = value,
+        new_value = %value,
         "Config updated"
     );
 
@@ -480,11 +615,11 @@ fn set_config_value(args: &[String], _json_mode: bool, ctx: &OutputContext) -> R
         content.append("\n");
 
         content.append_styled("Key: ", theme.dimmed.clone());
-        content.append_styled(key, theme.issue_title.clone());
+        content.append_styled(&key, theme.issue_title.clone());
         content.append("\n");
 
         content.append_styled("Value: ", theme.dimmed.clone());
-        content.append(&format_config_value(value));
+        content.append(&format_config_value(&value));
         content.append("\n");
 
         if let Some(old) = old_value {
@@ -574,12 +709,16 @@ fn yaml_value_to_string(value: &serde_yml::Value) -> Option<String> {
 }
 
 /// Delete a config value from the database, project config, and user config.
+#[allow(clippy::too_many_lines)]
 fn delete_config_value(
     key: &str,
     _json_mode: bool,
     overrides: &CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let (canonical_key, _) = canonical_config_key(key);
+    let delete_keys = delete_key_candidates(key);
+
     // 1. Delete from DB
     let beads_dir = discover_beads_dir(None).ok();
     let mut db_deleted = false;
@@ -588,11 +727,11 @@ fn delete_config_value(
         // Only try to open DB if we have a beads dir
         if let Ok(mut storage_ctx) = config::open_storage_with_cli(dir, overrides) {
             // We ignore is_startup_key check here to allow deleting from YAML even if not in DB
-            match storage_ctx.storage.delete_config(key) {
+            match storage_ctx.storage.delete_config(&canonical_key) {
                 Ok(deleted) => db_deleted = deleted,
                 Err(e) => {
-                    tracing::warn!(key, error = %e, "Failed to delete config key from DB");
-                    eprintln!("Warning: failed to delete '{key}' from DB: {e}");
+                    tracing::warn!(key = %canonical_key, error = %e, "Failed to delete config key from DB");
+                    eprintln!("Warning: failed to delete '{canonical_key}' from DB: {e}");
                 }
             }
         }
@@ -607,7 +746,12 @@ fn delete_config_value(
             let mut config: serde_yml::Value = serde_yml::from_str(&contents)
                 .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
 
-            if delete_from_yaml(&mut config, key) {
+            let mut deleted_any = false;
+            for delete_key in &delete_keys {
+                deleted_any |= delete_from_yaml(&mut config, delete_key);
+            }
+
+            if deleted_any {
                 let yaml_str = serde_yml::to_string(&config)?;
                 fs::write(&config_path, yaml_str)?;
                 project_deleted = true;
@@ -624,7 +768,12 @@ fn delete_config_value(
         let mut config: serde_yml::Value = serde_yml::from_str(&contents)
             .unwrap_or(serde_yml::Value::Mapping(serde_yml::Mapping::default()));
 
-        if delete_from_yaml(&mut config, key) {
+        let mut deleted_any = false;
+        for delete_key in &delete_keys {
+            deleted_any |= delete_from_yaml(&mut config, delete_key);
+        }
+
+        if deleted_any {
             let yaml_str = serde_yml::to_string(&config)?;
             fs::write(&config_path, yaml_str)?;
             user_deleted = true;
@@ -633,7 +782,8 @@ fn delete_config_value(
 
     if ctx.is_json() {
         let output = json!({
-            "key": key,
+            "key": canonical_key,
+            "requested_key": key,
             "deleted_from_db": db_deleted,
             "deleted_from_project": project_deleted,
             "deleted_from_user": user_deleted,
@@ -658,7 +808,7 @@ fn delete_config_value(
             content.append_styled("Configuration deleted\n", theme.emphasis.clone());
             content.append("\n");
             content.append_styled("Key: ", theme.dimmed.clone());
-            content.append_styled(key, theme.issue_title.clone());
+            content.append_styled(&canonical_key, theme.issue_title.clone());
             content.append("\n");
             content.append_styled("Sources: ", theme.dimmed.clone());
             content.append(&sources.join(", "));
@@ -670,18 +820,21 @@ fn delete_config_value(
                 .border_style(theme.panel_border.clone());
             ctx.render(&panel);
         } else {
-            println!("Deleted config key: {key} (from {})", sources.join(", "));
+            println!(
+                "Deleted config key: {canonical_key} (from {})",
+                sources.join(", ")
+            );
         }
     } else if ctx.is_rich() {
         let theme = ctx.theme();
-        let message = format!("Config key not found: {key}");
+        let message = format!("Config key not found: {canonical_key}");
         let panel = Panel::from_text(&message)
             .title(Text::styled("Config Delete", theme.panel_title.clone()))
             .box_style(theme.box_style)
             .border_style(theme.panel_border.clone());
         ctx.render(&panel);
     } else {
-        println!("Config key not found: {key}");
+        println!("Config key not found: {canonical_key}");
     }
 
     Ok(())
@@ -982,6 +1135,95 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0], "display");
         assert_eq!(parts[1], "color");
+    }
+
+    #[test]
+    fn test_canonical_config_key_aliases() {
+        assert_eq!(
+            canonical_config_key("id.prefix"),
+            ("issue_prefix".to_string(), ValueTransform::Identity)
+        );
+        assert_eq!(
+            canonical_config_key("defaults.priority"),
+            ("default_priority".to_string(), ValueTransform::Identity)
+        );
+        assert_eq!(
+            canonical_config_key("defaults.type"),
+            ("default_type".to_string(), ValueTransform::Identity)
+        );
+        assert_eq!(
+            canonical_config_key("output.color"),
+            ("display.color".to_string(), ValueTransform::Identity)
+        );
+        assert_eq!(
+            canonical_config_key("no-auto-flush"),
+            ("sync.auto_flush".to_string(), ValueTransform::InvertBool)
+        );
+        assert_eq!(
+            canonical_config_key("sync.auto.flush"),
+            ("sync.auto_flush".to_string(), ValueTransform::Identity)
+        );
+        assert_eq!(
+            canonical_config_key("no_auto_import"),
+            ("sync.auto_import".to_string(), ValueTransform::InvertBool)
+        );
+    }
+
+    #[test]
+    fn test_apply_transform_to_value_inverts_bools() {
+        assert_eq!(
+            apply_transform_to_value("true", ValueTransform::InvertBool),
+            "false"
+        );
+        assert_eq!(
+            apply_transform_to_value("false", ValueTransform::InvertBool),
+            "true"
+        );
+        assert_eq!(
+            apply_transform_to_value("hello", ValueTransform::InvertBool),
+            "hello"
+        );
+        assert_eq!(
+            apply_transform_to_value("1", ValueTransform::InvertBool),
+            "false"
+        );
+        assert_eq!(
+            apply_transform_to_value("0", ValueTransform::InvertBool),
+            "true"
+        );
+    }
+
+    #[test]
+    fn test_delete_key_candidates_include_aliases() {
+        let keys = delete_key_candidates("id.prefix");
+        assert!(keys.contains(&"issue_prefix".to_string()));
+        assert!(keys.contains(&"id.prefix".to_string()));
+        assert!(keys.contains(&"prefix".to_string()));
+
+        let keys = delete_key_candidates("no-auto-flush");
+        assert!(keys.contains(&"sync.auto_flush".to_string()));
+        assert!(keys.contains(&"no-auto-flush".to_string()));
+    }
+
+    #[test]
+    fn test_delete_alias_variants_removes_all_matching_keys() {
+        let mut config: serde_yml::Value = serde_yml::from_str(
+            r"
+issue_prefix: canonical
+id:
+  prefix: legacy
+",
+        )
+        .expect("parse yaml");
+
+        let mut deleted_any = false;
+        for delete_key in delete_key_candidates("id.prefix") {
+            deleted_any |= delete_from_yaml(&mut config, &delete_key);
+        }
+
+        assert!(deleted_any);
+        assert_eq!(get_yaml_value(&config, &["issue_prefix"]), None);
+        assert_eq!(get_yaml_value(&config, &["id", "prefix"]), None);
     }
 
     #[test]

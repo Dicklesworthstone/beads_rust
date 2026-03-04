@@ -36,7 +36,7 @@ br stats
 br sync --status
 
 # Show configuration
-br config --list
+br config list
 
 # Show version
 br version
@@ -64,7 +64,7 @@ br init --prefix myproj
 **Verification:**
 ```bash
 ls -la .beads/
-# Should show: beads.db, issues.jsonl, beads.yaml
+# Should show: beads.db, issues.jsonl, metadata.json
 ```
 
 ---
@@ -93,7 +93,7 @@ br list
 **Solution:**
 ```bash
 # Check current location
-br config --path
+br config path
 
 # Move to correct directory
 cd /correct/path
@@ -408,13 +408,13 @@ br sync --import-only --error-policy best-effort
 **Solutions:**
 ```bash
 # Check configured prefix
-br config --get id.prefix
+br config get issue_prefix
 
 # Import with force (if intentional)
 br sync --import-only --force
 
 # Or update config to match
-br config --set id.prefix=bd
+br config set issue_prefix=bd
 ```
 
 ---
@@ -610,13 +610,13 @@ br sync --import-only
 **Solutions:**
 ```bash
 # Check syntax
-cat .beads/beads.yaml | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)"
+cat .beads/config.yaml | python3 -c "import yaml,sys; yaml.safe_load(sys.stdin)"
 
 # Find config paths
-br config --path
+br config path
 
 # Reset to defaults
-rm .beads/beads.yaml
+rm .beads/config.yaml
 br init
 ```
 
@@ -629,10 +629,10 @@ br init
 **Diagnosis:**
 ```bash
 # Show effective config with sources
-br config --list -v
+br -v config list
 
 # Check specific value
-br config --get <key>
+br config get <key>
 
 # Override via CLI
 br --db /path/to/db list
@@ -641,7 +641,7 @@ br --db /path/to/db list
 **Config precedence (highest to lowest):**
 1. CLI flags
 2. Environment variables
-3. Project config (`.beads/beads.yaml`)
+3. Project config (`.beads/config.yaml`)
 4. User config (`~/.config/beads/config.yaml`)
 5. Global config (`/etc/beads/config.yaml`)
 6. Embedded defaults
@@ -950,7 +950,7 @@ If you're still stuck:
    ```bash
    br doctor
    br version
-   br config --list
+   br config list
    ```
 
 3. **Enable debug logging:**

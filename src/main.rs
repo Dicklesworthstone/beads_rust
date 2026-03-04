@@ -26,13 +26,18 @@ fn main() {
     }
 
     let overrides = build_cli_overrides(&cli);
+    let effective_startup_flags = resolve_effective_startup_flags(&cli, &overrides);
 
     // Track if this command potentially mutates data (for auto-flush)
     let is_mutating = is_mutating_command(&cli.command);
 
     if should_auto_import(&cli.command)
-        && !cli.no_db
-        && let Err(e) = run_auto_import(&overrides, cli.allow_stale, cli.no_auto_import)
+        && !effective_startup_flags.no_db
+        && let Err(e) = run_auto_import(
+            &overrides,
+            cli.allow_stale,
+            effective_startup_flags.no_auto_import,
+        )
     {
         handle_error(&e, json_error_mode);
     }
@@ -131,8 +136,8 @@ fn main() {
         handle_error(&e, json_error_mode);
     }
 
-    // Auto-flush after successful mutating commands (unless --no-auto-flush)
-    if is_mutating && !cli.no_auto_flush && !cli.no_db {
+    // Auto-flush after successful mutating commands (unless disabled via CLI/config)
+    if is_mutating && !effective_startup_flags.no_auto_flush && !effective_startup_flags.no_db {
         run_auto_flush(&overrides);
     }
 }
@@ -229,6 +234,46 @@ const fn command_requests_robot_json(cmd: &Commands) -> bool {
 
 const fn should_render_errors_as_json(cli: &Cli) -> bool {
     cli.json || command_requests_robot_json(&cli.command)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectiveStartupFlags {
+    no_db: bool,
+    no_auto_flush: bool,
+    no_auto_import: bool,
+}
+
+fn resolve_effective_startup_flags(
+    cli: &Cli,
+    overrides: &config::CliOverrides,
+) -> EffectiveStartupFlags {
+    let mut flags = EffectiveStartupFlags {
+        no_db: cli.no_db,
+        no_auto_flush: cli.no_auto_flush,
+        no_auto_import: cli.no_auto_import,
+    };
+
+    let Ok(beads_dir) = config::discover_beads_dir(Some(Path::new("."))) else {
+        return flags;
+    };
+
+    let Ok(startup_layer) = config::load_startup_config(&beads_dir) else {
+        return flags;
+    };
+
+    let merged_layer = config::ConfigLayer::merge_layers(&[startup_layer, overrides.as_layer()]);
+
+    if let Some(no_db) = config::no_db_from_layer(&merged_layer) {
+        flags.no_db = no_db;
+    }
+    if let Some(no_auto_flush) = config::no_auto_flush_from_layer(&merged_layer) {
+        flags.no_auto_flush = no_auto_flush;
+    }
+    if let Some(no_auto_import) = config::no_auto_import_from_layer(&merged_layer) {
+        flags.no_auto_import = no_auto_import;
+    }
+
+    flags
 }
 
 /// Run auto-import before read-only commands when JSONL is newer.
@@ -369,13 +414,14 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
         db: cli.db.clone(),
         actor: cli.actor.clone(),
         identity: None,
-        json: Some(cli.json),
+        // Only set bool overrides when CLI flags are explicitly passed.
+        json: cli.json.then_some(true),
         display_color: if cli.no_color { Some(false) } else { None },
-        quiet: Some(cli.quiet),
-        no_db: Some(cli.no_db),
-        no_daemon: Some(cli.no_daemon),
-        no_auto_flush: Some(cli.no_auto_flush),
-        no_auto_import: Some(cli.no_auto_import),
+        quiet: cli.quiet.then_some(true),
+        no_db: cli.no_db.then_some(true),
+        no_daemon: cli.no_daemon.then_some(true),
+        no_auto_flush: cli.no_auto_flush.then_some(true),
+        no_auto_import: cli.no_auto_import.then_some(true),
         lock_timeout: cli.lock_timeout,
     }
 }
@@ -445,6 +491,19 @@ mod tests {
         assert_eq!(overrides.display_color, Some(false));
         assert_eq!(overrides.no_auto_flush, Some(true));
         assert_eq!(overrides.lock_timeout, Some(2500));
+    }
+
+    #[test]
+    fn build_overrides_omits_false_bools() {
+        let cli = Cli::parse_from(["br", "list"]);
+        let overrides = build_cli_overrides(&cli);
+
+        assert_eq!(overrides.json, None);
+        assert_eq!(overrides.quiet, None);
+        assert_eq!(overrides.no_db, None);
+        assert_eq!(overrides.no_daemon, None);
+        assert_eq!(overrides.no_auto_flush, None);
+        assert_eq!(overrides.no_auto_import, None);
     }
 
     #[test]
