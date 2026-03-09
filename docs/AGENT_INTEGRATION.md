@@ -101,11 +101,13 @@ If you omit `--format` / `--json`, br can default the output format via env vars
 
 - `BR_OUTPUT_FORMAT` (highest precedence)
 - `TOON_DEFAULT_FORMAT` (fallback)
+- `RUST_LOG=error` (recommended for routine agent runs so stderr stays clean unless you're debugging internals)
 
 Example:
 
 ```bash
 export TOON_DEFAULT_FORMAT=toon
+export RUST_LOG=error
 br list --limit 5          # defaults to TOON
 br list --json --limit 5   # JSON always wins
 ```
@@ -381,6 +383,7 @@ br close bd-123 --quiet --json
 ```bash
 # Set actor for audit trail
 export BD_ACTOR="claude-agent"
+export RUST_LOG=error
 
 # Workflow
 br ready --json --limit 10
@@ -395,6 +398,7 @@ br sync --flush-only
 ```bash
 # Initialize in project
 br init --prefix cursor
+export RUST_LOG=error
 
 # Use with Cursor's tool system
 br ready --json

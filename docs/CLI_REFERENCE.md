@@ -876,6 +876,14 @@ source ~/.bashrc
 | `NO_COLOR` | Disable colored output (any value) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
 
+Recommended routine default:
+
+```bash
+export RUST_LOG=error
+```
+
+This keeps successful commands readable by suppressing low-level dependency logs. Override it with `debug`/`trace` when troubleshooting.
+
 ---
 
 ## JSON Output Schemas

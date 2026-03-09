@@ -169,6 +169,13 @@ br ready --json  # Structured output for agents
 br show bd-abc123 --json
 ```
 
+For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
+
+```bash
+RUST_LOG=error br ready --json
+RUST_LOG=error br sync --flush-only
+```
+
 ### 5. Rich Terminal Output
 
 Interactive terminals get enhanced visual output:
@@ -475,6 +482,14 @@ br config edit
 | `BEADS_DB` | Override database path |
 | `BEADS_JSONL` | Override JSONL path (requires `--allow-external-jsonl`) |
 | `RUST_LOG` | Logging level (debug, info, warn, error) |
+
+Recommended default for normal CLI use:
+
+```bash
+export RUST_LOG=error
+```
+
+This keeps successful commands readable by suppressing low-level dependency logging. Remove or override it when debugging `br` internals.
 
 ---
 
