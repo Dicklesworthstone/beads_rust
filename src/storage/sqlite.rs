@@ -344,44 +344,67 @@ impl SqliteStorage {
     }
 
     // Helper for cycle detection (refactored from would_create_cycle)
+    //
+    // Uses iterative BFS instead of a recursive CTE to avoid materializing the
+    // full transitive closure. On large graphs (1000+ edges) the CTE caused 99%
+    // CPU hangs and held the SQLite WAL lock, blocking all other br processes.
     fn check_cycle(
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
         blocking_only: bool,
     ) -> Result<bool> {
-        // Construct filter clause
+        use std::collections::HashSet;
+
+        // We want to know: if we add edge (issue_id -> depends_on_id),
+        // does depends_on_id already transitively reach issue_id?
+        // i.e., is there a path from depends_on_id -> ... -> issue_id
+        // via the existing dependency graph?
+        //
+        // BFS forward from depends_on_id through existing edges,
+        // stopping as soon as we find issue_id (early termination).
+
         let type_filter = if blocking_only {
             "AND type IN ('blocks', 'parent-child', 'conditional-blocks')"
         } else {
-            "" // No filter, follow all edges
+            ""
         };
 
         let query = format!(
-            r"
-            WITH RECURSIVE transitive_deps(id) AS (
-                -- Base case: direct dependencies of starting point
-                SELECT depends_on_id FROM dependencies 
-                WHERE issue_id = ?1 {type_filter}
-                UNION
-                -- Recursive step: follow dependencies forward
-                SELECT d.depends_on_id
-                FROM dependencies d
-                JOIN transitive_deps td ON d.issue_id = td.id
-                WHERE 1=1 {type_filter}
-            )
-            SELECT 1 FROM transitive_deps WHERE id = ?2 LIMIT 1;
-            "
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 {type_filter}"
         );
 
-        let exists: bool = conn
-            .query_row(&query, rusqlite::params![depends_on_id, issue_id], |_| {
-                Ok(true)
-            })
-            .optional()?
-            .unwrap_or(false);
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
+        visited.insert(depends_on_id.to_string());
 
-        Ok(exists)
+        // Depth limit: no legitimate dependency chain should exceed this.
+        // Prevents runaway traversal on corrupted or pathological graphs.
+        const MAX_DEPTH: usize = 500;
+        let mut depth = 0;
+
+        while !frontier.is_empty() && depth < MAX_DEPTH {
+            let mut next_frontier: Vec<String> = Vec::new();
+            for node in &frontier {
+                let mut stmt = conn.prepare_cached(&query)?;
+                let neighbors = stmt.query_map(rusqlite::params![node], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                for neighbor in neighbors {
+                    let neighbor = neighbor?;
+                    if neighbor == issue_id {
+                        return Ok(true); // Cycle found -- early termination
+                    }
+                    if visited.insert(neighbor.clone()) {
+                        next_frontier.push(neighbor);
+                    }
+                }
+            }
+            frontier = next_frontier;
+            depth += 1;
+        }
+
+        Ok(false)
     }
 
     /// Update an issue's fields.
