@@ -41,8 +41,8 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
-clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
+clap = { version = "4.6.0", features = ["derive", "env", "unstable-ext"] }
+clap_complete = { version = "4.6.0", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
@@ -80,7 +80,7 @@ thiserror = "2.0.18"
 
 # Logging
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # Terminal
 indicatif = "0.18.4"
@@ -99,7 +99,7 @@ dunce = "1.0.5"
 once_cell = "1.21"
 regex = "1.12"
 shell-words = "1.1.1"
-tempfile = "3.25"
+tempfile = "3.27"
 unicode-width = "0.2.2"
 
 # Versioning
@@ -115,7 +115,7 @@ self_update = { version = "0.42", features = ["rustls", "archive-tar", "compress
 vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-assert_cmd = "2.1"
+assert_cmd = "2.2"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 walkdir = "2.5"
