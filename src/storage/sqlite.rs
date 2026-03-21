@@ -2889,7 +2889,7 @@ impl SqliteStorage {
         let mut count = 0;
         for (issue_id, blockers_json) in entries {
             conn.execute_with_params(
-                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(blockers_json.as_str()),
