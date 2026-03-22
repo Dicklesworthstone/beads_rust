@@ -698,12 +698,11 @@ impl SqliteStorage {
                 .collect();
             self.conn.execute_with_params(&sql, &params)?;
 
-            // `fsqlite` can report a false primary-key conflict when many
-            // existing rows are reinserted via one VALUES list, so keep each
-            // insert isolated after the chunk delete.
+            // Plain INSERT after chunk DELETE — fsqlite does not reliably
+            // enforce UNIQUE/PRIMARY KEY for OR REPLACE.
             for (issue_id, content_hash) in chunk {
                 self.conn.execute_with_params(
-                    "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
                     &[
                         SqliteValue::from(issue_id.as_str()),
                         SqliteValue::from(content_hash.as_str()),
@@ -841,14 +840,27 @@ impl SqliteStorage {
                 let dirty_vec: Vec<_> = ctx.dirty_ids.iter().collect();
 
                 for chunk in dirty_vec.chunks(DIRTY_ISSUE_CHUNK_SIZE) {
-                    // Use INSERT OR REPLACE (REPLACE) for a single-step atomic update.
-                    // This is more efficient than DELETE + INSERT and correctly handles
-                    // existing dirty flags by updating their marked_at time.
+                    // DELETE + INSERT to simulate UPSERT (fsqlite does not
+                    // reliably enforce UNIQUE/PRIMARY KEY for OR REPLACE).
                     for insert_chunk in chunk.chunks(450) {
+                        // Delete existing rows first
+                        let del_placeholders: Vec<&str> =
+                            insert_chunk.iter().map(|_| "?").collect();
+                        let delete_sql = format!(
+                            "DELETE FROM dirty_issues WHERE issue_id IN ({})",
+                            del_placeholders.join(", ")
+                        );
+                        let delete_params: Vec<SqliteValue> = insert_chunk
+                            .iter()
+                            .map(|id| SqliteValue::from(id.as_str()))
+                            .collect();
+                        storage.conn.execute_with_params(&delete_sql, &delete_params)?;
+
+                        // Insert fresh rows
                         let placeholders: Vec<&str> =
                             insert_chunk.iter().map(|_| "(?, ?)").collect();
                         let insert_sql = format!(
-                            "INSERT OR REPLACE INTO dirty_issues (issue_id, marked_at) VALUES {}",
+                            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES {}",
                             placeholders.join(", ")
                         );
                         let mut insert_params = Vec::with_capacity(insert_chunk.len() * 2);
@@ -2813,7 +2825,7 @@ impl SqliteStorage {
         let mut count = 0;
         for (parent_id, last_child) in max_children {
             conn.execute_with_params(
-                "INSERT OR REPLACE INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
                 &[
                     SqliteValue::from(parent_id.as_str()),
                     SqliteValue::from(i64::from(last_child)),
@@ -3013,7 +3025,13 @@ impl SqliteStorage {
         let mut count = 0;
         for (issue_id, blockers_json) in entries {
             conn.execute_with_params(
-                "INSERT OR REPLACE INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                // DELETE + INSERT to simulate UPSERT (fsqlite does not
+                // reliably enforce UNIQUE/PRIMARY KEY for OR REPLACE).
+                "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id.as_str())],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(blockers_json.as_str()),
@@ -4958,7 +4976,7 @@ impl SqliteStorage {
                 &[SqliteValue::from(parent_id)],
             )?;
             conn.execute_with_params(
-                "INSERT OR REPLACE INTO child_counters (parent_id, last_child) VALUES (?, ?)",
+                "INSERT INTO child_counters (parent_id, last_child) VALUES (?, ?)",
                 &[
                     SqliteValue::from(parent_id),
                     SqliteValue::from(i64::from(child_number)),
@@ -5476,7 +5494,7 @@ impl SqliteStorage {
                 &[SqliteValue::from(issue_id)],
             )?;
             storage.conn.execute_with_params(
-                "INSERT OR REPLACE INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(content_hash),
@@ -6804,7 +6822,7 @@ impl SqliteStorage {
 
     /// Upsert an issue (create or update) for import operations.
     ///
-    /// Uses INSERT OR REPLACE to atomically handle both cases.
+    /// Uses DELETE + INSERT to atomically handle both cases.
     /// This does NOT trigger dirty tracking or events.
     ///
     /// # Errors
@@ -8581,7 +8599,14 @@ mod tests {
         );
         storage.create_issue(&issue2, "tester").unwrap();
 
-        // Manually insert some cache data
+        // Manually insert some cache data (DELETE + INSERT for fsqlite safety)
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+                &[SqliteValue::from("bd-c1")],
+            )
+            .unwrap();
         storage
             .conn
             .execute_with_params(
