@@ -18,7 +18,7 @@ use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, auto_flush, compute_jsonl_hash,
     export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
 };
-use crate::util::id::{IdConfig, split_prefix_remainder};
+use crate::util::id::{IdConfig, abbreviate_prefix, split_prefix_remainder};
 use chrono::Utc;
 use fsqlite_error::FrankenError;
 use serde::{Deserialize, Serialize};
@@ -1379,7 +1379,7 @@ fn resolve_bootstrap_issue_prefix(
         .map(str::trim)
         .filter(|name| !name.is_empty())
     {
-        return Ok(name.to_string());
+        return Ok(abbreviate_prefix(name));
     }
 
     Ok("br".to_string())
@@ -3932,6 +3932,37 @@ routing:
         let prefix = resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path)
             .expect("prefix");
         assert_eq!(prefix, "cfg");
+    }
+
+    #[test]
+    fn resolve_bootstrap_issue_prefix_abbreviates_long_dir_name() {
+        let temp = TempDir::new().expect("tempdir");
+        // Simulate a repo with a long hyphenated name
+        let repo_dir = temp.path().join("acme-widgets");
+        let beads_dir = repo_dir.join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&jsonl_path, "").expect("write empty jsonl");
+
+        let bootstrap_layer = ConfigLayer::default();
+        let prefix = resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path)
+            .expect("prefix");
+        assert_eq!(prefix, "aw");
+    }
+
+    #[test]
+    fn resolve_bootstrap_issue_prefix_keeps_short_dir_name() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo_dir = temp.path().join("myrepo");
+        let beads_dir = repo_dir.join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&jsonl_path, "").expect("write empty jsonl");
+
+        let bootstrap_layer = ConfigLayer::default();
+        let prefix = resolve_bootstrap_issue_prefix(&bootstrap_layer, &beads_dir, &jsonl_path)
+            .expect("prefix");
+        assert_eq!(prefix, "myrepo");
     }
 
     #[test]

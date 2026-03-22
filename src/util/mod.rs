@@ -16,9 +16,9 @@ pub mod time;
 
 pub use hash::{ContentHashable, content_hash, content_hash_from_parts};
 pub use id::{
-    IdConfig, IdGenerator, IdResolver, MatchType, ParsedId, ResolvedId, ResolverConfig, child_id,
-    find_matching_ids, generate_id, id_depth, is_child_id, is_valid_id_format, normalize_id,
-    parse_id, resolve_id, validate_prefix,
+    IdConfig, IdGenerator, IdResolver, MatchType, ParsedId, ResolvedId, ResolverConfig,
+    abbreviate_prefix, child_id, find_matching_ids, generate_id, id_depth, is_child_id,
+    is_valid_id_format, normalize_id, parse_id, resolve_id, validate_prefix,
 };
 
 use std::env;

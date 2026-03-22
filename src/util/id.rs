@@ -10,6 +10,31 @@ pub const MAX_ID_PREFIX_LEN: usize = 64;
 pub const MAX_ID_HASH_LEN: usize = 40;
 pub const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
 
+/// Maximum length for an auto-derived prefix before abbreviation kicks in.
+pub const AUTO_PREFIX_MAX_LEN: usize = 6;
+
+/// Abbreviate a long prefix by taking the first letter of each hyphen-separated
+/// word (e.g. `acme-widgets` -> `aw`, `my-cool-project` -> `mcp`).
+/// If the result is only 1 character, use the first 3 characters of the original instead.
+/// Prefixes at or below `AUTO_PREFIX_MAX_LEN` are returned unchanged.
+#[must_use]
+pub fn abbreviate_prefix(name: &str) -> String {
+    if name.len() <= AUTO_PREFIX_MAX_LEN {
+        return name.to_string();
+    }
+    let initials: String = name
+        .split('-')
+        .filter(|w| !w.is_empty())
+        .filter_map(|w| w.chars().next())
+        .collect();
+    if initials.len() <= 1 {
+        // Single word longer than AUTO_PREFIX_MAX_LEN: take first 3 chars
+        name.chars().take(3).collect()
+    } else {
+        initials
+    }
+}
+
 /// Default ID generation configuration.
 #[derive(Debug, Clone)]
 pub struct IdConfig {
@@ -1249,5 +1274,34 @@ mod tests {
             parse_id(&good_id).is_ok(),
             "Fixed fallback format should parse correctly"
         );
+    }
+
+    // ========================================================================
+    // Prefix Abbreviation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_abbreviate_prefix_short_unchanged() {
+        assert_eq!(abbreviate_prefix("br"), "br");
+        assert_eq!(abbreviate_prefix("abcdef"), "abcdef"); // exactly 6
+    }
+
+    #[test]
+    fn test_abbreviate_prefix_multi_word() {
+        assert_eq!(abbreviate_prefix("acme-widgets"), "aw");
+        assert_eq!(abbreviate_prefix("my-cool-project"), "mcp");
+        assert_eq!(abbreviate_prefix("a-b-c-d-e-f-g"), "abcdefg");
+    }
+
+    #[test]
+    fn test_abbreviate_prefix_single_long_word() {
+        assert_eq!(abbreviate_prefix("superlongname"), "sup");
+    }
+
+    #[test]
+    fn test_abbreviate_prefix_empty_segments_ignored() {
+        // Leading/trailing/double hyphens produce empty segments
+        assert_eq!(abbreviate_prefix("acme--widgets"), "aw");
+        assert_eq!(abbreviate_prefix("-acme-widgets"), "aw");
     }
 }
