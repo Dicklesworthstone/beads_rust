@@ -109,7 +109,7 @@ semver = "1.0.27"
 fastmcp-rust = { version = "0.2.1", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
-self_update = { version = "0.42", features = ["rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
+self_update = { version = "0.44", features = ["rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
 
 [build-dependencies]
 vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
