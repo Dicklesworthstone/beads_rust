@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Verify tag matches Cargo.toml version
         run: |
@@ -77,7 +77,7 @@ jobs:
             echo "Reason: $RELIABILITY_OVERRIDE_REASON"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
 
       - name: Install Rust toolchain
@@ -134,7 +134,7 @@ jobs:
 
       - name: Upload reliability artifacts
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates) }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: release-reliability-gate-artifacts
           path: target/test-artifacts/
@@ -193,7 +193,7 @@ jobs:
             linker: x86_64-w64-mingw32-gcc
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0  # Full history for vergen
 
@@ -337,7 +337,7 @@ jobs:
           rm -f /tmp/minisign.key
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: br-${{ matrix.name }}
           path: |
@@ -353,12 +353,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -532,7 +532,7 @@ jobs:
           syft dir:. -o spdx-json > artifacts/sbom.spdx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b  # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v2
         with:
           name: br ${{ github.ref_name }}
           body_path: RELEASE_NOTES.md
@@ -550,7 +550,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate SLSA provenance attestations
-        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018  # v2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v2
         with:
           subject-path: |
             artifacts/br-${{ github.ref_name }}-*.tar.gz
@@ -563,7 +563,7 @@ jobs:
     timeout-minutes: 15
     if: "!contains(github.ref_name, '-')"  # Skip pre-releases
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
