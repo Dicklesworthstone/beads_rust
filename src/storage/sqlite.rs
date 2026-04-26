@@ -7565,7 +7565,8 @@ impl SqliteStorage {
     ///
     /// Updates existing rows in place, falling back to INSERT for new rows.
     /// Avoid `DELETE` + `INSERT` here: child tables reference `issues.id`, so
-    /// deleting first can orphan import-time events, labels, deps, and comments.
+    /// deleting first can cascade-drop import-time events, labels, deps, and
+    /// comments that should remain attached to the issue.
     /// This does NOT trigger dirty tracking or events.
     ///
     /// # Errors
@@ -7647,7 +7648,16 @@ impl SqliteStorage {
             ]
         };
 
-        if Self::get_issue_from_conn(&self.conn, &issue.id)?.is_some() {
+        let issue_exists = match self.conn.query_row_with_params(
+            "SELECT 1 FROM issues WHERE id = ? LIMIT 1",
+            &[SqliteValue::from(issue.id.as_str())],
+        ) {
+            Ok(_) => true,
+            Err(FrankenError::QueryReturnedNoRows) => false,
+            Err(error) => return Err(error.into()),
+        };
+
+        if issue_exists {
             let mut params = import_field_values();
             params.push(SqliteValue::from(issue.id.as_str()));
             let rows = self.conn.execute_with_params(
@@ -10902,8 +10912,46 @@ mod tests {
             !storage
                 .has_missing_issue_reference("events", "issue_id")
                 .unwrap(),
-            "import update must not orphan event rows"
+            "import update must not leave dangling event rows"
         );
+    }
+
+    #[test]
+    fn test_upsert_issue_for_import_overwrites_malformed_existing_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let stamp = Utc.with_ymd_and_hms(2026, 4, 25, 12, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-import-heals-existing",
+            "Original import title",
+            Status::Open,
+            2,
+            None,
+            stamp,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "UPDATE issues SET status = ? WHERE id = ?",
+                &[
+                    SqliteValue::from("not-a-valid-status"),
+                    SqliteValue::from(issue.id.as_str()),
+                ],
+            )
+            .unwrap();
+
+        let mut imported = issue.clone();
+        imported.title = "Healed import title".to_string();
+        imported.updated_at = stamp + chrono::Duration::minutes(1);
+
+        storage
+            .upsert_issue_for_import(&imported)
+            .expect("import upsert should not parse the malformed row before overwriting it");
+
+        let updated = storage.get_issue(&issue.id).unwrap().unwrap();
+        assert_eq!(updated.title, "Healed import title");
+        assert_eq!(updated.status, Status::Open);
     }
 
     #[test]
