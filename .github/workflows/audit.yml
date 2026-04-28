@@ -34,7 +34,7 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@5f57d6cb7cd20b14a8a27f522884c4bc8a187458  # v2
+        uses: taiki-e/install-action@481c34c1cf3a84c68b5e46f4eccfc82af798415a  # v2
         with:
           tool: cargo-audit
 
