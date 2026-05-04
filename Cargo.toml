@@ -38,7 +38,7 @@ path = "src/main.rs"
 [dependencies]
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
-clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
+clap_complete = { version = "4.6.3", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
