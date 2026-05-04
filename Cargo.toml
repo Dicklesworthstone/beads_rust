@@ -112,7 +112,7 @@ self_update = { version = "0.44", features = ["reqwest", "rustls", "archive-tar"
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
 [target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [build-dependencies]
 vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
