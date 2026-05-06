@@ -111,6 +111,122 @@ fn e2e_label_add_multiple_to_same_issue() {
     );
 }
 
+/// Regression: multi-label issue hydration must stay one logical issue.
+#[test]
+fn e2e_multilabel_issue_show_create_and_close_do_not_duplicate_rows() {
+    let _log = common::test_log("e2e_multilabel_issue_show_create_and_close_do_not_duplicate_rows");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let cases: [(&str, &[&str]); 4] = [
+        ("zero labels", &[]),
+        ("one label", &["alpha"]),
+        ("two labels", &["alpha", "beta"]),
+        (
+            "five labels",
+            &["alpha", "beta", "gamma", "delta", "epsilon"],
+        ),
+    ];
+    let mut five_label_id = String::new();
+
+    for (index, (title, expected_labels)) in cases.iter().enumerate() {
+        let mut create_args = vec![
+            "create".to_string(),
+            format!("Multi-label regression issue: {title}"),
+            "--type".to_string(),
+            "bug".to_string(),
+            "--priority".to_string(),
+            "1".to_string(),
+            "--json".to_string(),
+        ];
+        if !expected_labels.is_empty() {
+            create_args.push("--labels".to_string());
+            create_args.push(expected_labels.join(","));
+        }
+
+        let create = run_br(
+            &workspace,
+            create_args,
+            &format!("create_multilabel_regression_{index}"),
+        );
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        let create_payload = extract_json_payload(&create.stdout);
+        let created: Value = serde_json::from_str(&create_payload).expect("create json");
+        let id = created["id"].as_str().expect("created id").to_string();
+
+        let show = run_br(
+            &workspace,
+            ["show", id.as_str(), "--json"],
+            &format!("show_multilabel_{index}"),
+        );
+        assert!(show.status.success(), "show failed: {}", show.stderr);
+        let show_payload = extract_json_payload(&show.stdout);
+        let shown: Vec<Value> = serde_json::from_str(&show_payload).expect("show json");
+        assert_eq!(
+            shown.len(),
+            1,
+            "show must return one issue, not one per label"
+        );
+        let labels: Vec<String> = if shown[0]["labels"].is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value(shown[0]["labels"].clone()).unwrap()
+        };
+        let mut expected: Vec<String> = expected_labels
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(labels, expected);
+
+        if expected_labels.len() == 5 {
+            five_label_id = id;
+        }
+    }
+    assert!(!five_label_id.is_empty(), "missing five-label issue id");
+
+    let second_create = run_br(
+        &workspace,
+        ["create", "Issue after multi-label row", "--json"],
+        "create_after_multilabel",
+    );
+    assert!(
+        second_create.status.success(),
+        "create after multi-label issue failed: {}",
+        second_create.stderr
+    );
+
+    let close = run_br(
+        &workspace,
+        [
+            "close",
+            five_label_id.as_str(),
+            "--reason",
+            "done",
+            "--json",
+        ],
+        "close_multilabel",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let show_closed = run_br(
+        &workspace,
+        ["show", five_label_id.as_str(), "--json"],
+        "show_closed_multilabel",
+    );
+    assert!(
+        show_closed.status.success(),
+        "show after close failed: {}",
+        show_closed.stderr
+    );
+    let closed_payload = extract_json_payload(&show_closed.stdout);
+    let closed: Vec<Value> = serde_json::from_str(&closed_payload).expect("closed show json");
+    assert_eq!(closed.len(), 1, "closed show must return one issue");
+    assert_eq!(closed[0]["status"], "closed");
+}
+
 /// Test 3: Remove label, verify removed
 #[test]
 fn e2e_label_remove_verify() {
