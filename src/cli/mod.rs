@@ -143,6 +143,7 @@ const DEP_TYPE_CANDIDATES: &[(&str, &str)] = &[
 
 const SORT_KEY_CANDIDATES: &[(&str, &str)] = &[
     ("priority", "Priority"),
+    ("effective", "Effective priority"),
     ("created_at", "Created at"),
     ("updated_at", "Updated at"),
     ("title", "Title"),
@@ -1506,9 +1507,13 @@ pub struct ListArgs {
     #[arg(long)]
     pub offset: Option<usize>,
 
-    /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
+    /// Sort field (`priority`, `effective`, `created_at`, `updated_at`, `title`)
     #[arg(long, add = ArgValueCompleter::new(sort_key_completer))]
     pub sort: Option<String>,
+
+    /// Show view-time effective priority inherited from downstream dependents
+    #[arg(long)]
+    pub effective_priority: bool,
 
     /// Reverse sort order
     #[arg(long, short = 'r')]

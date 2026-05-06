@@ -293,12 +293,54 @@ fn visible_len(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// View-time priority inherited from downstream dependents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectivePriority {
+    pub priority: Priority,
+    pub promoted_from: Option<Priority>,
+    pub promoted_by: Vec<String>,
+}
+
+impl EffectivePriority {
+    #[must_use]
+    pub fn new(priority: Priority) -> Self {
+        Self {
+            priority,
+            promoted_from: None,
+            promoted_by: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_promoted(&self) -> bool {
+        self.promoted_from.is_some() && !self.promoted_by.is_empty()
+    }
+}
+
 /// Format a single-line issue summary with options.
 ///
 /// Format: `{icon} {id} [● {priority}] [{type}] - {title}`
 /// (matches bd text output format)
 #[must_use]
 pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> String {
+    format_issue_line_inner(issue, options, None)
+}
+
+/// Format a single-line issue summary with an opt-in effective-priority marker.
+#[must_use]
+pub fn format_issue_line_with_effective(
+    issue: &Issue,
+    options: TextFormatOptions,
+    effective: Option<&EffectivePriority>,
+) -> String {
+    format_issue_line_inner(issue, options, effective)
+}
+
+fn format_issue_line_inner(
+    issue: &Issue,
+    options: TextFormatOptions,
+    effective: Option<&EffectivePriority>,
+) -> String {
     let status_icon_plain = format_status_icon(&issue.status);
     // Account for the bullet in priority badge: [● P2]
     let priority_badge_plain = format!("[● {}]", format_priority(&issue.priority));
@@ -326,12 +368,26 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
 
     let status_icon = format_status_icon_colored(&issue.status, options.use_color);
     let priority_badge = format_priority_badge(&issue.priority, options.use_color);
+    let effective_marker = effective.map_or_else(String::new, format_effective_priority_marker);
     let type_badge = format_type_badge_colored(&issue.issue_type, options.use_color);
 
     format!(
-        "{status_icon} {issue_id} {priority_badge} {type_badge} - {title}",
+        "{status_icon} {issue_id} {priority_badge}{effective_marker} {type_badge} - {title}",
         issue_id = issue_id.as_ref()
     )
+}
+
+fn format_effective_priority_marker(effective: &EffectivePriority) -> String {
+    let promoted_from = effective.promoted_from.unwrap_or(effective.priority);
+    if effective.is_promoted() {
+        format!(
+            " => P{} via blocks {}",
+            effective.priority.0,
+            effective.promoted_by.join(", ")
+        )
+    } else {
+        format!(" => P{}", promoted_from.0)
+    }
 }
 
 /// Format a single-line issue summary.

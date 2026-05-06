@@ -46,11 +46,12 @@ pub use output::{
     StatsSummary, TreeNode,
 };
 pub use text::{
-    TextFormatOptions, format_issue_line, format_issue_line_with, format_issue_long_with,
-    format_issue_pretty_with, format_priority, format_priority_badge, format_priority_label,
-    format_status_icon, format_status_icon_colored, format_status_label, format_type_badge,
-    format_type_badge_colored, format_type_label, sanitize_terminal_inline, sanitize_terminal_text,
-    terminal_width, truncate_title,
+    EffectivePriority, TextFormatOptions, format_issue_line, format_issue_line_with,
+    format_issue_line_with_effective, format_issue_long_with, format_issue_pretty_with,
+    format_priority, format_priority_badge, format_priority_label, format_status_icon,
+    format_status_icon_colored, format_status_label, format_type_badge, format_type_badge_colored,
+    format_type_label, sanitize_terminal_inline, sanitize_terminal_text, terminal_width,
+    truncate_title,
 };
 
 // Rich output support

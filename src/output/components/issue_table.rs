@@ -1,6 +1,6 @@
 use crate::format::{
-    format_status_label, format_type_label, sanitize_terminal_inline, sanitize_terminal_text,
-    truncate_title,
+    EffectivePriority, format_status_label, format_type_label, sanitize_terminal_inline,
+    sanitize_terminal_text, truncate_title,
 };
 use crate::model::Issue;
 use crate::output::Theme;
@@ -17,6 +17,7 @@ pub struct IssueTable<'a> {
     title: Option<String>,
     highlight_query: Option<String>,
     context_snippets: Option<HashMap<String, String>>,
+    effective_priorities: HashMap<String, EffectivePriority>,
     width: Option<usize>,
     wrap: bool,
 }
@@ -26,6 +27,7 @@ pub struct IssueTable<'a> {
 pub struct IssueTableColumns {
     pub id: bool,
     pub priority: bool,
+    pub effective_priority: bool,
     pub status: bool,
     pub issue_type: bool,
     pub title: bool,
@@ -88,6 +90,7 @@ impl<'a> IssueTable<'a> {
             title: None,
             highlight_query: None,
             context_snippets: None,
+            effective_priorities: HashMap::new(),
             width: None,
             wrap: false,
         }
@@ -135,6 +138,12 @@ impl<'a> IssueTable<'a> {
     }
 
     #[must_use]
+    pub fn effective_priorities(mut self, priorities: HashMap<String, EffectivePriority>) -> Self {
+        self.effective_priorities = priorities;
+        self
+    }
+
+    #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn build(&self) -> Table {
         let highlight_regex = self
@@ -160,6 +169,13 @@ impl<'a> IssueTable<'a> {
         }
         if self.columns.priority {
             table = table.with_column(Column::new("P").justify(JustifyMethod::Center).width(3));
+        }
+        if self.columns.effective_priority {
+            table = table.with_column(
+                Column::new("Eff")
+                    .justify(JustifyMethod::Center)
+                    .min_width(3),
+            );
         }
         if self.columns.status {
             table = table.with_column(Column::new("Status").min_width(8));
@@ -204,6 +220,29 @@ impl<'a> IssueTable<'a> {
                 cells.push(
                     Cell::new(Text::new(format!("P{}", issue.priority.0)))
                         .style(self.theme.priority_style(issue.priority)),
+                );
+            }
+            if self.columns.effective_priority {
+                let effective = self.effective_priorities.get(&issue.id);
+                let label = effective.map_or_else(
+                    || format!("P{}", issue.priority.0),
+                    |priority| {
+                        if priority.is_promoted() {
+                            format!(
+                                "P{}↑ {}",
+                                priority.priority.0,
+                                priority.promoted_by.join(",")
+                            )
+                        } else {
+                            format!("P{}", priority.priority.0)
+                        }
+                    },
+                );
+                let effective_priority =
+                    effective.map_or(issue.priority, |priority| priority.priority);
+                cells.push(
+                    Cell::new(Text::new(sanitize_terminal_inline(&label).into_owned()))
+                        .style(self.theme.priority_style(effective_priority)),
                 );
             }
             if self.columns.status {

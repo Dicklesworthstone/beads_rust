@@ -11,8 +11,9 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
 use crate::format::{
-    IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with, format_issue_long_with,
-    format_issue_pretty_with, terminal_width,
+    EffectivePriority, IssueWithCounts, ListPage, TextFormatOptions, format_issue_line_with,
+    format_issue_line_with_effective, format_issue_long_with, format_issue_pretty_with,
+    terminal_width,
 };
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, JsonArrayPageMeta, OutputContext, OutputMode};
@@ -69,7 +70,8 @@ fn execute_inner(
 
     // Build filter from args
     let mut filters = build_filters(args)?;
-    let client_filters = needs_client_filters(args);
+    let effective_sort = args.sort.as_deref() == Some("effective");
+    let client_filters = needs_client_filters(args) || effective_sort;
 
     // Determine output format early so we know whether to run a count query.
     let output_format = resolve_output_format_with_outer_mode(
@@ -150,6 +152,21 @@ fn execute_inner(
     };
     if client_filters {
         issues = apply_client_filters(issues, args)?;
+    }
+
+    let effective_priorities = if args.effective_priority || effective_sort {
+        Some(compute_effective_priorities(
+            &issues,
+            &storage.get_blocks_dep_edges()?,
+        ))
+    } else {
+        None
+    };
+
+    if effective_sort {
+        if let Some(ref priorities) = effective_priorities {
+            sort_by_effective_priority(&mut issues, priorities, args.reverse);
+        }
     }
 
     // For JSON output, determine the total matching count.
@@ -278,6 +295,7 @@ fn execute_inner(
                     IssueTableColumns {
                         id: true,
                         priority: true,
+                        effective_priority: args.effective_priority,
                         status: true,
                         issue_type: true,
                         title: true,
@@ -290,6 +308,7 @@ fn execute_inner(
                     IssueTableColumns {
                         id: true,
                         priority: true,
+                        effective_priority: args.effective_priority,
                         status: true,
                         issue_type: true,
                         title: true,
@@ -298,6 +317,7 @@ fn execute_inner(
                 };
                 let mut table = IssueTable::new(&issues, ctx.theme())
                     .columns(columns)
+                    .effective_priorities(effective_priorities.clone().unwrap_or_default())
                     .title(format!("Issues ({})", issues.len()))
                     .wrap(args.wrap);
                 if args.wrap {
@@ -310,7 +330,17 @@ fn execute_inner(
             } else {
                 // Note: bd outputs nothing when no issues found, matching that for conformance
                 for issue in &issues {
-                    let line = format_issue_line_with(issue, format_options);
+                    let line = if args.effective_priority {
+                        format_issue_line_with_effective(
+                            issue,
+                            format_options,
+                            effective_priorities
+                                .as_ref()
+                                .and_then(|priorities| priorities.get(&issue.id)),
+                        )
+                    } else {
+                        format_issue_line_with(issue, format_options)
+                    };
                     println!("{line}");
                 }
             }
@@ -498,7 +528,11 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         title_contains: args.title_contains.clone(),
         limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
         offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
-        sort: args.sort.clone(),
+        sort: if args.sort.as_deref() == Some("effective") {
+            None
+        } else {
+            args.sort.clone()
+        },
         reverse: args.reverse,
         labels: if args.label.is_empty() {
             None
@@ -531,6 +565,141 @@ fn needs_client_filters(args: &ListArgs) -> bool {
         || args.notes_contains.is_some()
         || args.deferred
         || args.overdue
+}
+
+fn compute_effective_priorities(
+    issues: &[crate::model::Issue],
+    edges: &[(String, String)],
+) -> HashMap<String, EffectivePriority> {
+    let issue_by_id: HashMap<&str, &crate::model::Issue> = issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect();
+    let visible_ids: HashSet<&str> = issue_by_id.keys().copied().collect();
+    let active_ids: HashSet<&str> = issues
+        .iter()
+        .filter(|issue| !issue.status.is_terminal())
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let mut dependents_by_blocker: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for (issue_id, depends_on_id) in edges {
+        let dependent_id = issue_id.as_str();
+        let blocker_id = depends_on_id.as_str();
+        if issue_id.starts_with("external:") || depends_on_id.starts_with("external:") {
+            continue;
+        }
+        if active_ids.contains(dependent_id) && visible_ids.contains(blocker_id) {
+            dependents_by_blocker
+                .entry(blocker_id)
+                .or_default()
+                .push(dependent_id);
+        }
+    }
+
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    for issue in issues {
+        let _ = effective_priority_for(
+            issue.id.as_str(),
+            &issue_by_id,
+            &dependents_by_blocker,
+            &mut memo,
+            &mut visiting,
+        );
+    }
+    memo
+}
+
+fn effective_priority_for(
+    id: &str,
+    issue_by_id: &HashMap<&str, &crate::model::Issue>,
+    dependents_by_blocker: &HashMap<&str, Vec<&str>>,
+    memo: &mut HashMap<String, EffectivePriority>,
+    visiting: &mut HashSet<String>,
+) -> EffectivePriority {
+    if let Some(cached) = memo.get(id) {
+        return cached.clone();
+    }
+
+    let Some(issue) = issue_by_id.get(id).copied() else {
+        return EffectivePriority::new(Priority::MEDIUM);
+    };
+    if issue.status.is_terminal() {
+        let effective = EffectivePriority::new(issue.priority);
+        memo.insert(id.to_string(), effective.clone());
+        return effective;
+    }
+
+    if !visiting.insert(id.to_string()) {
+        return EffectivePriority::new(issue.priority);
+    }
+
+    let mut effective = issue.priority;
+    let mut promoted_by = Vec::new();
+    if let Some(dependents) = dependents_by_blocker.get(id) {
+        for dependent_id in dependents {
+            if *dependent_id == id {
+                continue;
+            }
+            let dependent_effective = effective_priority_for(
+                dependent_id,
+                issue_by_id,
+                dependents_by_blocker,
+                memo,
+                visiting,
+            );
+            if dependent_effective.priority.0 < effective.0 {
+                effective = dependent_effective.priority;
+                promoted_by.clear();
+                promoted_by.push((*dependent_id).to_string());
+            } else if dependent_effective.priority.0 == effective.0
+                && effective.0 < issue.priority.0
+            {
+                promoted_by.push((*dependent_id).to_string());
+            }
+        }
+    }
+
+    visiting.remove(id);
+    promoted_by.sort();
+    promoted_by.dedup();
+    let effective_priority = if effective.0 < issue.priority.0 {
+        EffectivePriority {
+            priority: effective,
+            promoted_from: Some(issue.priority),
+            promoted_by,
+        }
+    } else {
+        EffectivePriority::new(issue.priority)
+    };
+    memo.insert(id.to_string(), effective_priority.clone());
+    effective_priority
+}
+
+fn sort_by_effective_priority(
+    issues: &mut [crate::model::Issue],
+    effective_priorities: &HashMap<String, EffectivePriority>,
+    reverse: bool,
+) {
+    issues.sort_by(|a, b| {
+        let a_priority = effective_priorities
+            .get(&a.id)
+            .map_or(a.priority.0, |priority| priority.priority.0);
+        let b_priority = effective_priorities
+            .get(&b.id)
+            .map_or(b.priority.0, |priority| priority.priority.0);
+        let ordering = if reverse {
+            b_priority
+                .cmp(&a_priority)
+                .then_with(|| a.created_at.cmp(&b.created_at))
+        } else {
+            a_priority
+                .cmp(&b_priority)
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        };
+        ordering.then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn should_use_full_relation_scan(
@@ -690,7 +859,8 @@ fn validate_sort_key(sort: Option<&str>) -> Result<()> {
     };
 
     match sort_key {
-        "priority" | "created_at" | "updated_at" | "title" | "created" | "updated" => Ok(()),
+        "priority" | "effective" | "created_at" | "updated_at" | "title" | "created"
+        | "updated" => Ok(()),
         _ => Err(BeadsError::Validation {
             field: "sort".to_string(),
             reason: format!("invalid sort field '{sort_key}'"),
