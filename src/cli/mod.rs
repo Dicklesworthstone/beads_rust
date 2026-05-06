@@ -2256,6 +2256,13 @@ pub struct SyncArgs {
     #[arg(long = "merge-from-jsonl", value_name = "PATH", requires = "merge")]
     pub merge_from_jsonl: Option<PathBuf>,
 
+    /// Only add issues from --merge-from-jsonl that are missing locally.
+    ///
+    /// This prevents stale worker JSONL snapshots from deleting or overwriting
+    /// canonical workspace issues while repairing worker-to-central divergence.
+    #[arg(long = "merge-import-only", requires = "merge_from_jsonl")]
+    pub merge_import_only: bool,
+
     /// Show sync status (read-only)
     ///
     /// Displays hash comparison and freshness info without modifications.

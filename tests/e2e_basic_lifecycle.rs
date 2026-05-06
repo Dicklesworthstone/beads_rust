@@ -878,6 +878,17 @@ fn e2e_sync_merge_from_jsonl_imports_worker_file_into_no_db_workspace() {
     let worker_jsonl = format!("{local_jsonl_before}{worker_issue_line}\n");
     fs::write(&worker_jsonl_path, &worker_jsonl).expect("write worker jsonl");
 
+    let local_only = run_br(
+        &workspace,
+        ["create", "Local-only issue after worker snapshot"],
+        "create_no_db_local_only_after_worker_snapshot",
+    );
+    assert!(
+        local_only.status.success(),
+        "local-only create failed: {}",
+        local_only.stderr
+    );
+
     let worker_jsonl_arg = worker_jsonl_path.to_string_lossy().to_string();
     let rejected = run_br(
         &workspace,
@@ -886,6 +897,7 @@ fn e2e_sync_merge_from_jsonl_imports_worker_file_into_no_db_workspace() {
             "--merge".to_string(),
             "--merge-from-jsonl".to_string(),
             worker_jsonl_arg.clone(),
+            "--merge-import-only".to_string(),
             "--json".to_string(),
         ],
         "merge_from_external_without_opt_in",
@@ -908,6 +920,7 @@ fn e2e_sync_merge_from_jsonl_imports_worker_file_into_no_db_workspace() {
             "--merge".to_string(),
             "--merge-from-jsonl".to_string(),
             worker_jsonl_arg,
+            "--merge-import-only".to_string(),
             "--allow-external-jsonl".to_string(),
             "--json".to_string(),
         ],
@@ -917,6 +930,8 @@ fn e2e_sync_merge_from_jsonl_imports_worker_file_into_no_db_workspace() {
     let merge_payload = extract_json_payload(&merge.stdout);
     let merge_json: Value = serde_json::from_str(&merge_payload).expect("merge json");
     assert_eq!(merge_json["status"], "success");
+    assert_eq!(merge_json["mode"], "merge-import-only");
+    assert_eq!(merge_json["imported_issues"], 1);
     assert_eq!(
         fs::canonicalize(PathBuf::from(
             merge_json["target_jsonl"].as_str().expect("target_jsonl")
@@ -939,6 +954,13 @@ fn e2e_sync_merge_from_jsonl_imports_worker_file_into_no_db_workspace() {
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .any(|issue| issue["id"].as_str() == Some(worker_id.as_str())),
         "worker issue should be merged into the local JSONL"
+    );
+    assert!(
+        local_jsonl_after
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|issue| issue["title"].as_str() == Some("Local-only issue after worker snapshot")),
+        "add-only worker import must not delete local-only issues"
     );
     assert_eq!(
         fs::read_to_string(&worker_jsonl_path).expect("read worker jsonl"),

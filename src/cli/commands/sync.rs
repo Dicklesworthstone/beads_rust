@@ -2487,6 +2487,86 @@ fn execute_merge(
         "Loaded external state (JSONL)"
     );
 
+    if args.merge_import_only {
+        let mut imported = Vec::new();
+        let mut skipped_tombstones = 0usize;
+        let source_issue_count = right.len();
+        let local_ids: HashSet<String> = left.keys().cloned().collect();
+
+        for (id, issue) in right {
+            if local_ids.contains(&id) {
+                continue;
+            }
+            if issue.status == crate::model::Status::Tombstone {
+                skipped_tombstones += 1;
+                continue;
+            }
+            imported.push(issue);
+        }
+
+        let skipped_existing = source_issue_count
+            .saturating_sub(imported.len())
+            .saturating_sub(skipped_tombstones);
+
+        info!(
+            imported = imported.len(),
+            skipped_existing, skipped_tombstones, "Add-only merge import calculated"
+        );
+
+        for issue in &imported {
+            storage.upsert_issue_for_import(issue)?;
+            storage.sync_labels_for_import(&issue.id, &issue.labels)?;
+            storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
+            storage.sync_comments_for_import(&issue.id, &issue.comments)?;
+        }
+
+        storage.rebuild_blocked_cache(true)?;
+        storage.rebuild_child_counters_in_tx()?;
+
+        let export_config = ExportConfig {
+            force: true,
+            is_default_path: true,
+            error_policy: ExportErrorPolicy::Strict,
+            retention_days,
+            beads_dir: Some(path_policy.beads_dir.clone()),
+            allow_external_jsonl: path_policy.allow_external_jsonl,
+            show_progress,
+            history: HistoryConfig::default(),
+            max_parallel_workers: args.export_parallelism.unwrap_or(0),
+        };
+
+        let (export_result, _) =
+            export_to_jsonl_with_policy(storage, target_jsonl_path, &export_config)?;
+        finalize_export(
+            storage,
+            &export_result,
+            Some(&export_result.issue_hashes),
+            target_jsonl_path,
+        )?;
+        save_base_snapshot_from_jsonl(target_jsonl_path, beads_dir)?;
+
+        if use_json {
+            let output = serde_json::json!({
+                "status": "success",
+                "mode": "merge-import-only",
+                "imported_issues": imported.len(),
+                "skipped_existing": skipped_existing,
+                "skipped_tombstones": skipped_tombstones,
+                "merge_input": merge_input_path,
+                "target_jsonl": target_jsonl_path,
+            });
+            ctx.json_pretty(&output);
+        } else {
+            ctx.success(&format!(
+                "Imported {} missing issue(s) from {}",
+                imported.len(),
+                merge_input_path.display()
+            ));
+        }
+
+        return Ok(());
+    }
+
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
     let strategy = merge_conflict_resolution(args);
