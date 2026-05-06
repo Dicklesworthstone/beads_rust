@@ -141,6 +141,7 @@ impl SavedFilters {
             format: None,
             stats: false,
             fields: None,
+            effective_priority: false,
         }
     }
 
@@ -210,6 +211,7 @@ impl SavedFilters {
             format: cli.format,
             stats: cli.stats,
             fields: cli.fields.clone(),
+            effective_priority: cli.effective_priority,
         }
     }
 }

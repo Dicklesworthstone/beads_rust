@@ -68,6 +68,7 @@ impl IssueTableColumns {
         Self {
             id: true,
             priority: true,
+            effective_priority: false,
             status: true,
             issue_type: true,
             title: true,
