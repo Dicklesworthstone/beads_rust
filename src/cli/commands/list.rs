@@ -1189,4 +1189,210 @@ mod tests {
             BeadsError::InvalidPriority { ref priority } if priority == "7"
         ));
     }
+
+    fn issue(id: &str, priority: Priority) -> Issue {
+        Issue {
+            id: id.to_string(),
+            priority,
+            status: Status::Open,
+            ..Default::default()
+        }
+    }
+
+    fn closed_issue(id: &str, priority: Priority) -> Issue {
+        Issue {
+            id: id.to_string(),
+            priority,
+            status: Status::Closed,
+            ..Default::default()
+        }
+    }
+
+    fn edge(dependent: &str, blocker: &str) -> (String, String) {
+        (dependent.to_string(), blocker.to_string())
+    }
+
+    #[test]
+    fn test_effective_priority_simple_chain_promotes_low_to_high() {
+        // P3 leaf blocks a P1 task → leaf is effectively P1
+        let issues = vec![
+            issue("a", Priority::HIGH),
+            issue("b", Priority::LOW),
+        ];
+        let edges = vec![edge("a", "b")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["b"].priority, Priority::HIGH);
+        assert!(result["b"].is_promoted());
+        assert_eq!(result["b"].promoted_from, Some(Priority::LOW));
+        assert_eq!(result["b"].promoted_by, vec!["a"]);
+        // High-priority task: not promoted (already at target)
+        assert_eq!(result["a"].priority, Priority::HIGH);
+        assert!(!result["a"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_takes_min_across_branching() {
+        // P3 blocks both a P0 and a P2 → P3 effective P0 (most urgent)
+        let issues = vec![
+            issue("crit", Priority::CRITICAL),
+            issue("med", Priority::MEDIUM),
+            issue("leaf", Priority::LOW),
+        ];
+        let edges = vec![edge("crit", "leaf"), edge("med", "leaf")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["leaf"].priority, Priority::CRITICAL);
+        assert!(result["leaf"].is_promoted());
+        assert_eq!(result["leaf"].promoted_by, vec!["crit"]);
+    }
+
+    #[test]
+    fn test_effective_priority_propagates_through_chain() {
+        // a (P0) <- b (P3) <- c (P2): c blocks b, b blocks a
+        // c is effectively P0 via the b → a chain.
+        let issues = vec![
+            issue("a", Priority::CRITICAL),
+            issue("b", Priority::LOW),
+            issue("c", Priority::MEDIUM),
+        ];
+        let edges = vec![edge("a", "b"), edge("b", "c")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["b"].priority, Priority::CRITICAL);
+        assert_eq!(result["c"].priority, Priority::CRITICAL);
+        assert!(result["c"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_no_promotion_when_self_already_more_urgent() {
+        // P0 blocks a P3 → P0 stays P0 (not demoted)
+        let issues = vec![
+            issue("crit", Priority::CRITICAL),
+            issue("low", Priority::LOW),
+        ];
+        let edges = vec![edge("low", "crit")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["crit"].priority, Priority::CRITICAL);
+        assert!(!result["crit"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_closed_dependent_does_not_promote() {
+        // A closed P0 should NOT promote a P3 blocker — closed work blocks nothing.
+        let issues = vec![
+            closed_issue("done", Priority::CRITICAL),
+            issue("leaf", Priority::LOW),
+        ];
+        let edges = vec![edge("done", "leaf")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["leaf"].priority, Priority::LOW);
+        assert!(!result["leaf"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_external_deps_are_skipped() {
+        // external:* edges must not promote — v1 doesn't resolve external workspaces.
+        let issues = vec![issue("local", Priority::LOW)];
+        let edges = vec![
+            edge("external:foo-1", "local"),
+            edge("local", "external:bar-7"),
+        ];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["local"].priority, Priority::LOW);
+        assert!(!result["local"].is_promoted());
+    }
+
+    #[test]
+    fn test_effective_priority_handles_cycle_without_panicking() {
+        // a depends on b, b depends on a — pathological but possible if check_cycle
+        // is bypassed elsewhere. Walk must terminate without infinite recursion.
+        let issues = vec![
+            issue("a", Priority::HIGH),
+            issue("b", Priority::LOW),
+        ];
+        let edges = vec![edge("a", "b"), edge("b", "a")];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        // Both terminate; b promotes via a's HIGH priority.
+        assert_eq!(result["b"].priority, Priority::HIGH);
+        assert_eq!(result["a"].priority, Priority::HIGH);
+    }
+
+    #[test]
+    fn test_effective_priority_unrelated_issues_keep_static_priority() {
+        // Issues with no edges between them — each keeps its static priority.
+        let issues = vec![
+            issue("a", Priority::HIGH),
+            issue("b", Priority::LOW),
+            issue("c", Priority::MEDIUM),
+        ];
+        let edges = vec![];
+
+        let result = compute_effective_priorities(&issues, &edges);
+
+        assert_eq!(result["a"].priority, Priority::HIGH);
+        assert_eq!(result["b"].priority, Priority::LOW);
+        assert_eq!(result["c"].priority, Priority::MEDIUM);
+        for entry in result.values() {
+            assert!(!entry.is_promoted());
+        }
+    }
+
+    #[test]
+    fn test_sort_by_effective_priority_orders_promoted_first() {
+        let mut issues = vec![
+            issue("low_leaf", Priority::LOW),
+            issue("high_root", Priority::HIGH),
+            issue("plain_med", Priority::MEDIUM),
+        ];
+        let mut effective_priorities = HashMap::new();
+        // low_leaf is promoted to HIGH because it blocks high_root
+        effective_priorities.insert(
+            "low_leaf".to_string(),
+            EffectivePriority {
+                priority: Priority::HIGH,
+                promoted_from: Some(Priority::LOW),
+                promoted_by: vec!["high_root".to_string()],
+            },
+        );
+        effective_priorities.insert(
+            "high_root".to_string(),
+            EffectivePriority::new(Priority::HIGH),
+        );
+        effective_priorities.insert(
+            "plain_med".to_string(),
+            EffectivePriority::new(Priority::MEDIUM),
+        );
+
+        sort_by_effective_priority(&mut issues, &effective_priorities, false);
+
+        // Both HIGH-effective issues come before MEDIUM, and the LOW-statically-but-
+        // promoted-to-HIGH issue is intermixed with the HIGH static issue — order
+        // within a tier is created_at then id (deterministic).
+        let ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids[2], "plain_med", "MEDIUM should sort last");
+        assert!(
+            (ids[0] == "low_leaf" && ids[1] == "high_root")
+                || (ids[0] == "high_root" && ids[1] == "low_leaf"),
+            "promoted LOW should be tied with static HIGH at the top, got {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_sort_key_accepts_effective() {
+        assert!(validate_sort_key(Some("effective")).is_ok());
+        assert!(validate_sort_key(Some("priority")).is_ok());
+        assert!(validate_sort_key(Some("nonsense")).is_err());
+    }
 }
