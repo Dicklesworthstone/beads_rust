@@ -104,6 +104,25 @@ fn create_issue_all_fields_populated() {
 }
 
 #[test]
+fn upsert_issue_for_import_accepts_sparse_jsonl_default_fields() {
+    let storage = test_db();
+    let mut issue = fixtures::issue("sparse-jsonl-import");
+    issue.description = None;
+    issue.design = None;
+    issue.acceptance_criteria = None;
+    issue.notes = None;
+
+    storage.upsert_issue_for_import(&issue).unwrap();
+
+    let retrieved = storage.get_issue(&issue.id).unwrap().expect("issue exists");
+    assert_eq!(retrieved.id, issue.id);
+    assert_eq!(retrieved.description, None);
+    assert_eq!(retrieved.design, None);
+    assert_eq!(retrieved.acceptance_criteria, None);
+    assert_eq!(retrieved.notes, None);
+}
+
+#[test]
 fn create_issue_records_created_event() {
     let mut storage = test_db();
     let issue = fixtures::issue("event-create");

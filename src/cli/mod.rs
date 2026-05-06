@@ -2249,6 +2249,13 @@ pub struct SyncArgs {
     #[arg(long)]
     pub merge: bool,
 
+    /// Read merge input from another JSONL file while writing this workspace's JSONL.
+    ///
+    /// This is useful for importing explicit worker-worktree bead exports without
+    /// treating that worker file as the sync target.
+    #[arg(long = "merge-from-jsonl", value_name = "PATH", requires = "merge")]
+    pub merge_from_jsonl: Option<PathBuf>,
+
     /// Show sync status (read-only)
     ///
     /// Displays hash comparison and freshness info without modifications.

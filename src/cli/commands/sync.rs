@@ -643,6 +643,20 @@ fn validate_sync_paths(
     })
 }
 
+fn resolve_merge_input_path(args: &SyncArgs, path_policy: &SyncPathPolicy) -> Result<PathBuf> {
+    match args.merge_from_jsonl.as_ref() {
+        Some(path) => {
+            let source_policy = validate_sync_paths(
+                &path_policy.beads_dir,
+                path,
+                path_policy.allow_external_jsonl,
+            )?;
+            Ok(source_policy.jsonl_path)
+        }
+        None => Ok(path_policy.jsonl_path.clone()),
+    }
+}
+
 fn validate_operator_requested_sync_path(beads_dir: &Path, jsonl_path: &Path) -> Result<()> {
     let git_check = validate_no_git_path(jsonl_path);
     if !git_check.is_allowed() {
@@ -2422,7 +2436,8 @@ fn execute_merge(
 ) -> Result<()> {
     info!("Starting 3-way merge");
     let beads_dir = &path_policy.beads_dir;
-    let jsonl_path = &path_policy.jsonl_path;
+    let target_jsonl_path = &path_policy.jsonl_path;
+    let merge_input_path = resolve_merge_input_path(args, path_policy)?;
 
     // 1. Load Base State (ancestor)
     let base = load_base_snapshot(beads_dir)?;
@@ -2454,19 +2469,23 @@ fn execute_merge(
 
     // 3. Load Right State (external JSONL)
     let mut right = HashMap::new();
-    if jsonl_path.exists() {
+    if merge_input_path.exists() {
         // `read_issues_from_jsonl` parses JSON line-by-line, which yields a
         // generic "Invalid JSON at line 1" error when the JSONL still
         // contains unresolved merge-conflict markers from a botched
         // `git merge` / `git pull`. A three-way merge on top of that state
         // would be nonsense, so scan for markers first and surface the
         // helpful error before we try to parse.
-        crate::sync::ensure_no_conflict_markers(jsonl_path)?;
-        for issue in read_issues_from_jsonl(jsonl_path)? {
+        crate::sync::ensure_no_conflict_markers(&merge_input_path)?;
+        for issue in read_issues_from_jsonl(&merge_input_path)? {
             right.insert(issue.id.clone(), issue);
         }
     }
-    debug!(right_count = right.len(), "Loaded external state (JSONL)");
+    debug!(
+        right_count = right.len(),
+        merge_input = %merge_input_path.display(),
+        "Loaded external state (JSONL)"
+    );
 
     // 4. Perform Merge
     let context = MergeContext::new(base, left, right);
@@ -2554,7 +2573,11 @@ fn execute_merge(
     storage.rebuild_child_counters_in_tx()?;
 
     // Force Export to update JSONL (ensure sync)
-    info!(path = %jsonl_path.display(), "Writing merged issues.jsonl");
+    info!(
+        path = %target_jsonl_path.display(),
+        merge_input = %merge_input_path.display(),
+        "Writing merged issues.jsonl"
+    );
     let export_config = ExportConfig {
         force: true, // Force export to ensure JSONL matches DB
         is_default_path: true,
@@ -2567,14 +2590,15 @@ fn execute_merge(
         max_parallel_workers: args.export_parallelism.unwrap_or(0),
     };
 
-    let (export_result, _) = export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
+    let (export_result, _) =
+        export_to_jsonl_with_policy(storage, target_jsonl_path, &export_config)?;
     finalize_export(
         storage,
         &export_result,
         Some(&export_result.issue_hashes),
-        jsonl_path,
+        target_jsonl_path,
     )?;
-    save_base_snapshot_from_jsonl(jsonl_path, beads_dir)?;
+    save_base_snapshot_from_jsonl(target_jsonl_path, beads_dir)?;
 
     // Output success message
     if use_json {
@@ -2584,6 +2608,8 @@ fn execute_merge(
             "deleted_issues": report.deleted.len(),
             "conflicts": report.conflicts.len(),
             "resolution": resolution,
+            "merge_input": merge_input_path,
+            "target_jsonl": target_jsonl_path,
             "notes": report.notes,
         });
         ctx.json_pretty(&output);

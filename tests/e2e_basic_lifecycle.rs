@@ -842,6 +842,122 @@ fn e2e_sync_merge_resolution_flags_choose_db_or_jsonl() {
 }
 
 #[test]
+fn e2e_sync_merge_from_jsonl_imports_worker_file_into_no_db_workspace() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_no_db_merge_from");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    fs::write(beads_dir.join("config.yaml"), "no-db: true\n").expect("write no-db config");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Canonical issue before worker merge"],
+        "create_no_db_canonical_issue",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let local_jsonl_before = fs::read_to_string(&jsonl_path).expect("read local jsonl");
+    let first_line = local_jsonl_before
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("local jsonl issue");
+    let mut worker_issue: Value = serde_json::from_str(first_line).expect("parse issue");
+    let original_id = worker_issue["id"].as_str().expect("issue id");
+    let worker_id = format!("{original_id}w");
+    worker_issue["id"] = Value::String(worker_id.clone());
+    worker_issue["title"] = Value::String("Worker-created bead".to_string());
+    worker_issue["content_hash"] = Value::Null;
+    worker_issue["created_at"] = Value::String(Utc::now().to_rfc3339());
+    worker_issue["updated_at"] = Value::String(Utc::now().to_rfc3339());
+
+    let worker_jsonl_path = workspace.root.join("worker-issues.jsonl");
+    let worker_issue_line = serde_json::to_string(&worker_issue).expect("serialize worker issue");
+    let worker_jsonl = format!("{local_jsonl_before}{worker_issue_line}\n");
+    fs::write(&worker_jsonl_path, &worker_jsonl).expect("write worker jsonl");
+
+    let worker_jsonl_arg = worker_jsonl_path.to_string_lossy().to_string();
+    let rejected = run_br(
+        &workspace,
+        vec![
+            "sync".to_string(),
+            "--merge".to_string(),
+            "--merge-from-jsonl".to_string(),
+            worker_jsonl_arg.clone(),
+            "--json".to_string(),
+        ],
+        "merge_from_external_without_opt_in",
+    );
+    assert!(
+        !rejected.status.success(),
+        "external merge source should require explicit opt-in"
+    );
+    assert!(
+        rejected.stderr.contains("outside .beads") || rejected.stdout.contains("outside .beads"),
+        "rejection should mention external path: stdout={} stderr={}",
+        rejected.stdout,
+        rejected.stderr
+    );
+
+    let merge = run_br(
+        &workspace,
+        vec![
+            "sync".to_string(),
+            "--merge".to_string(),
+            "--merge-from-jsonl".to_string(),
+            worker_jsonl_arg,
+            "--allow-external-jsonl".to_string(),
+            "--json".to_string(),
+        ],
+        "merge_from_worker_jsonl",
+    );
+    assert!(merge.status.success(), "merge failed: {}", merge.stderr);
+    let merge_payload = extract_json_payload(&merge.stdout);
+    let merge_json: Value = serde_json::from_str(&merge_payload).expect("merge json");
+    assert_eq!(merge_json["status"], "success");
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(
+            merge_json["target_jsonl"].as_str().expect("target_jsonl")
+        ))
+        .expect("canonical target jsonl"),
+        fs::canonicalize(&jsonl_path).expect("canonical expected target")
+    );
+    assert_eq!(
+        fs::canonicalize(PathBuf::from(
+            merge_json["merge_input"].as_str().expect("merge_input")
+        ))
+        .expect("canonical merge input"),
+        fs::canonicalize(&worker_jsonl_path).expect("canonical expected input")
+    );
+
+    let local_jsonl_after = fs::read_to_string(&jsonl_path).expect("read merged local jsonl");
+    assert!(
+        local_jsonl_after
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|issue| issue["id"].as_str() == Some(worker_id.as_str())),
+        "worker issue should be merged into the local JSONL"
+    );
+    assert_eq!(
+        fs::read_to_string(&worker_jsonl_path).expect("read worker jsonl"),
+        worker_jsonl,
+        "merge source must not be overwritten"
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", worker_id.as_str(), "--json"],
+        "show_worker_issue_after_merge",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let show_payload = extract_json_payload(&show.stdout);
+    let shown: Vec<Value> = serde_json::from_str(&show_payload).expect("show json");
+    assert_eq!(shown[0]["title"], "Worker-created bead");
+}
+
+#[test]
 fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
     let workspace = BrWorkspace::new();
 
