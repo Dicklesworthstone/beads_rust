@@ -925,9 +925,10 @@ pub enum ShellType {
 /// Arguments for the `watch` command.
 #[derive(Args, Debug, Default)]
 pub struct WatchArgs {
-    /// Issue ID prefix to watch (required). Emits events for beads whose ID starts with this prefix.
-    #[arg(long, required = true)]
-    pub prefix: String,
+    /// Issue ID prefix to watch. Defaults to the resolved issue prefix
+    /// (BD_ISSUE_PREFIX env, project config, or "bd").
+    #[arg(long)]
+    pub prefix: Option<String>,
 
     /// Comma-separated statuses to watch (e.g., "open,in_progress"). When set, only emits
     /// events for beads currently or previously matching these statuses; defaults to all.

@@ -46,10 +46,6 @@ struct EventJson<'a> {
 ///
 /// Returns an error if the initial snapshot cannot be taken or arguments are invalid.
 pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    let prefix = args.prefix.trim();
-    if prefix.is_empty() {
-        return Err(BeadsError::validation("prefix", "cannot be empty"));
-    }
     if args.interval < 1 {
         return Err(BeadsError::validation("interval", "must be >= 1 second"));
     }
@@ -58,8 +54,9 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let status_filter = parse_status_filter(&args.status)?;
     let interval = Duration::from_secs(args.interval);
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let prefix = resolve_prefix(args, &beads_dir, cli)?;
 
-    let mut snapshot = snapshot_state(&beads_dir, cli, prefix)?;
+    let mut snapshot = snapshot_state(&beads_dir, cli, &prefix)?;
 
     let mut tick: u64 = 0;
     loop {
@@ -71,7 +68,7 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         thread::sleep(interval);
         tick += 1;
 
-        let current = match snapshot_state(&beads_dir, cli, prefix) {
+        let current = match snapshot_state(&beads_dir, cli, &prefix) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("watch: snapshot failed: {e}");
@@ -83,6 +80,26 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         snapshot = current;
     }
     Ok(())
+}
+
+fn resolve_prefix(
+    args: &WatchArgs,
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+) -> Result<String> {
+    if let Some(p) = args.prefix.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Ok(p.to_string());
+    }
+    let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let layer = config::load_config(beads_dir, Some(&storage), cli)?;
+    let prefix = config::id_config_from_layer(&layer).prefix;
+    if prefix.trim().is_empty() {
+        return Err(BeadsError::validation(
+            "prefix",
+            "could not resolve a prefix from --prefix, BD_ISSUE_PREFIX, or config",
+        ));
+    }
+    Ok(prefix)
 }
 
 fn parse_status_filter(raw: &[String]) -> Result<Option<HashSet<Status>>> {
