@@ -65,10 +65,11 @@ rustc-ice-*.txt
 sweep_*.png
 test_screenshot.png
 
-# Nix build outputs (keep flake.lock - it should be committed)
+# Nix / devenv runtime state
 result
 result-*
 .direnv/
+.devenv/
 
 # Private keys and certificates
 *.pem
