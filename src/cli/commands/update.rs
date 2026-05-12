@@ -44,7 +44,14 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let mut config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+
+    if let Some(prefix) = args.prefix.as_ref().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        config_layer
+            .runtime
+            .insert("issue_prefix".to_string(), prefix.to_string());
+    }
+
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;

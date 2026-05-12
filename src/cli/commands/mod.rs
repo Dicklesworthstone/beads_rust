@@ -33,6 +33,7 @@ pub mod stats;
 pub mod sync;
 pub mod update;
 pub mod version;
+pub mod watch;
 pub mod r#where;
 
 #[cfg(feature = "self_update")]

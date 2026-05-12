@@ -18,6 +18,10 @@ pub struct CreateConfig {
     pub default_priority: Priority,
     pub default_issue_type: IssueType,
     pub actor: String,
+    /// Source prefix to tag onto the issue when the creator is deliberately
+    /// reaching across into a different prefix (e.g., app1 creating a bead
+    /// in app2's space via `--prefix=app2`). `None` for same-prefix creates.
+    pub sender: Option<String>,
 }
 
 /// Execute the create command.
@@ -48,13 +52,32 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     // We open storage even for dry-run to check ID collisions.
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let mut layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+
+    let home_prefix = config::id_config_from_layer(&layer).prefix;
+    let cli_prefix = args
+        .prefix
+        .as_ref()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    if let Some(prefix) = &cli_prefix {
+        layer
+            .runtime
+            .insert("issue_prefix".to_string(), prefix.clone());
+    }
+
+    let sender = cli_prefix
+        .as_ref()
+        .filter(|p| *p != &home_prefix)
+        .map(|_| home_prefix.clone());
 
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
         default_priority: config::default_priority_from_layer(&layer)?,
         default_issue_type: config::default_issue_type_from_layer(&layer)?,
         actor: config::resolve_actor(&layer),
+        sender,
     };
 
     let issue = create_issue_impl(&mut storage_ctx.storage, args, &config)?;
@@ -242,7 +265,7 @@ pub fn create_issue_impl(
         compacted_at: None,
         compacted_at_commit: None,
         original_size: None,
-        sender: None,
+        sender: config.sender.clone(),
         pinned: false,
         is_template: false,
         labels: vec![],
@@ -401,7 +424,25 @@ fn execute_import(
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let mut layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+
+    let home_prefix = config::id_config_from_layer(&layer).prefix;
+    let cli_prefix = args
+        .prefix
+        .as_ref()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    if let Some(prefix) = &cli_prefix {
+        layer
+            .runtime
+            .insert("issue_prefix".to_string(), prefix.clone());
+    }
+
+    let sender_override = cli_prefix
+        .as_ref()
+        .filter(|p| *p != &home_prefix)
+        .map(|_| home_prefix.clone());
 
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
@@ -508,7 +549,7 @@ fn execute_import(
             compacted_at: None,
             compacted_at_commit: None,
             original_size: None,
-            sender: None,
+            sender: sender_override.clone(),
             pinned: false,
             is_template: false,
             labels: vec![],
@@ -640,6 +681,7 @@ mod tests {
             defer: None,
             external_ref: None,
             status: None,
+            prefix: None,
             ephemeral: false,
             dry_run: false,
             silent: false,
@@ -658,6 +700,7 @@ mod tests {
             default_priority: Priority::MEDIUM,
             default_issue_type: IssueType::Task,
             actor: "test_user".to_string(),
+            sender: None,
         }
     }
 
@@ -863,6 +906,29 @@ mod tests {
         }
 
         info!("test_create_child_with_nonexistent_parent_fails: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_sets_sender_when_config_provided() {
+        init_test_logging();
+        let mut storage = setup_memory_storage();
+        let mut config = default_config();
+        config.sender = Some("app1".to_string());
+
+        let issue =
+            create_issue_impl(&mut storage, &default_args(), &config).expect("create failed");
+        assert_eq!(issue.sender.as_deref(), Some("app1"));
+    }
+
+    #[test]
+    fn test_create_issue_no_sender_when_none() {
+        init_test_logging();
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+
+        let issue =
+            create_issue_impl(&mut storage, &default_args(), &config).expect("create failed");
+        assert!(issue.sender.is_none());
     }
 
     #[test]

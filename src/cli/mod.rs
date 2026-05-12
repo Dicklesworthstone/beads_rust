@@ -745,6 +745,9 @@ pub enum Commands {
     /// Delete an issue (creates tombstone)
     Delete(DeleteArgs),
 
+    /// Watch a prefix for create/close/defer/status-change events
+    Watch(WatchArgs),
+
     /// List ready issues (unblocked, not in-progress, not deferred)
     Ready(ReadyArgs),
 
@@ -919,6 +922,31 @@ pub enum ShellType {
     Elvish,
 }
 
+/// Arguments for the `watch` command.
+#[derive(Args, Debug, Default)]
+pub struct WatchArgs {
+    /// Issue ID prefix to watch (required). Emits events for beads whose ID starts with this prefix.
+    #[arg(long, required = true)]
+    pub prefix: String,
+
+    /// Comma-separated statuses to watch (e.g., "open,in_progress"). When set, only emits
+    /// events for beads currently or previously matching these statuses; defaults to all.
+    #[arg(long, value_delimiter = ',', add = ArgValueCompleter::new(status_completer))]
+    pub status: Vec<String>,
+
+    /// Poll interval in seconds (default 2, min 1)
+    #[arg(long, default_value_t = 2)]
+    pub interval: u64,
+
+    /// Run for at most N polling ticks then exit (omitted = run until SIGINT)
+    #[arg(long)]
+    pub max_ticks: Option<u64>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+}
+
 #[derive(Args, Debug, Default)]
 pub struct CreateArgs {
     /// Issue title
@@ -983,6 +1011,10 @@ pub struct CreateArgs {
     /// Initial status (open, deferred, in_progress, closed)
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Option<String>,
+
+    /// Issue ID prefix for the new bead (overrides BD_ISSUE_PREFIX env var)
+    #[arg(long)]
+    pub prefix: Option<String>,
 
     /// Preview without creating
     #[arg(long)]
@@ -1105,6 +1137,10 @@ pub struct UpdateArgs {
     /// Set `closed_by_session` when closing
     #[arg(long)]
     pub session: Option<String>,
+
+    /// Issue ID prefix for partial-ID resolution (overrides BD_ISSUE_PREFIX env var)
+    #[arg(long)]
+    pub prefix: Option<String>,
 }
 
 #[derive(Args, Debug)]
