@@ -434,6 +434,47 @@ fn issue_with_batched_relation_metadata(
     }
 }
 
+/// Expand `--priority`/`-p` raw values into a flat list of Priority values.
+///
+/// Each raw value may be a single priority (`0`, `P0`), a comma-separated
+/// list (`0,1,2`), an inclusive range (`0-2`, `P0-P3`), or a mix
+/// (`0,P2-P3`). Repeated `-p` flags are concatenated. Duplicates are removed
+/// while preserving first-occurrence order. Empty entries (e.g. trailing
+/// commas) are silently skipped. Each non-range piece must parse as a valid
+/// Priority via `FromStr`; otherwise the helper returns the same
+/// `InvalidPriority` error the single-value path used to return.
+fn expand_priority_specs(raw: &[String]) -> Result<Vec<Priority>> {
+    let mut out: Vec<Priority> = Vec::new();
+    let push_unique = |p: Priority, out: &mut Vec<Priority>| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    for value in raw {
+        for piece in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((lo_str, hi_str)) = piece.split_once('-')
+                && !lo_str.is_empty()
+                && !hi_str.is_empty()
+            {
+                let lo: Priority = lo_str.trim().parse()?;
+                let hi: Priority = hi_str.trim().parse()?;
+                let (a, b) = if lo.0 <= hi.0 {
+                    (lo.0, hi.0)
+                } else {
+                    (hi.0, lo.0)
+                };
+                for n in a..=b {
+                    push_unique(Priority(n), &mut out);
+                }
+            } else {
+                let p: Priority = piece.parse()?;
+                push_unique(p, &mut out);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Convert CLI args to storage filter.
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     // Parse status strings to Status enums
@@ -460,16 +501,19 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         )
     };
 
-    // Parse priority values (invalid values should error, not be silently dropped)
+    // Parse priority values. Each raw value may be a single priority, a
+    // comma-separated list (`0,1`), an inclusive range (`0-2`), or a mix.
+    // See `expand_priority_specs` above. Invalid values surface as errors
+    // rather than being silently dropped.
     let priorities = if args.priority.is_empty() {
         None
     } else {
-        Some(
-            args.priority
-                .iter()
-                .map(|p| p.parse())
-                .collect::<Result<Vec<Priority>>>()?,
-        )
+        let expanded = expand_priority_specs(&args.priority)?;
+        if expanded.is_empty() {
+            None
+        } else {
+            Some(expanded)
+        }
     };
 
     let include_closed = args.all
@@ -765,6 +809,98 @@ mod tests {
         let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
         assert_eq!(values, vec![0, 2]);
         info!("test_build_filters_parses_priorities: assertions passed");
+    }
+
+    #[test]
+    fn test_expand_priority_specs_comma_list() {
+        let out = expand_priority_specs(&["0,1,2".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_inclusive_range() {
+        let out = expand_priority_specs(&["0-2".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_range_with_p_prefix() {
+        let out = expand_priority_specs(&["P1-P3".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_reversed_range_normalizes() {
+        let out = expand_priority_specs(&["3-1".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_mixed_repeated_and_csv() {
+        let out =
+            expand_priority_specs(&["0,P2".to_string(), "3".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_dedup_preserves_first_occurrence() {
+        let out =
+            expand_priority_specs(&["0,1".to_string(), "1,2,0".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_skips_empty_pieces() {
+        // Trailing commas and stray whitespace must not produce a value.
+        let out = expand_priority_specs(&[" 0, ,1, ".to_string()]).expect("expand");
+        let values: Vec<i32> = out.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_expand_priority_specs_invalid_in_list_errors() {
+        // 9 is out of range; the whole call must error rather than silently
+        // returning the valid prefix.
+        let err = expand_priority_specs(&["0,9".to_string()]).expect_err("should error");
+        assert!(
+            err.to_string().contains("Priority"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_filters_accepts_comma_list_priority() {
+        // Regression: `br list --priority 0,1` used to error with
+        // "Priority must be 0-4, got: 0,1". Now it expands to [P0, P1].
+        let args = cli::ListArgs {
+            priority: vec!["0,1".to_string()],
+            ..Default::default()
+        };
+        let filters = build_filters(&args).expect("build filters");
+        let priorities = filters.priorities.expect("priorities");
+        let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_build_filters_accepts_range_priority() {
+        // Regression: `br list -p 0-1` is documented in the repo CLAUDE.md
+        // as working; this makes the doc claim true.
+        let args = cli::ListArgs {
+            priority: vec!["0-1".to_string()],
+            ..Default::default()
+        };
+        let filters = build_filters(&args).expect("build filters");
+        let priorities = filters.priorities.expect("priorities");
+        let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
+        assert_eq!(values, vec![0, 1]);
     }
 
     #[test]
