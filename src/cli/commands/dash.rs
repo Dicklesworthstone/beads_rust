@@ -279,7 +279,10 @@ fn render_text<W: Write>(out: &mut W, groups: &[OwnedGroup], width: u16) -> Resu
     }
 
     // Pre-compute max ID width so columns align inside each cluster.
-    for group in groups {
+    for (i, group) in groups.iter().enumerate() {
+        if i > 0 {
+            writeln!(out)?;
+        }
         writeln!(out, "=== {} {} ===", group.prefix, header_counts(group))?;
         if group.beads.is_empty() {
             writeln!(out, "  (no beads in this group)")?;
