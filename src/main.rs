@@ -36,11 +36,7 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Init {
-            prefix,
-            force,
-            backend: _,
-        } => commands::init::execute(prefix, force, None, &output_ctx),
+        Commands::Init(args) => commands::init::execute(args.prefix, args.force, None, &output_ctx),
         Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
         Commands::Delete(args) => {
@@ -129,6 +125,7 @@ fn main() {
             };
             commands::agents::execute(&agents_args, &output_ctx)
         }
+        Commands::Admin { command } => dispatch_admin(command, &overrides, &output_ctx, cli.json),
     };
 
     // Handle command result
@@ -139,6 +136,59 @@ fn main() {
     // Auto-flush after successful mutating commands (unless --no-auto-flush)
     if is_mutating && !cli.no_auto_flush && !cli.no_db {
         run_auto_flush(&overrides);
+    }
+}
+
+/// Route a `bd admin <op>` invocation through the same handlers as the
+/// top-level (hidden) equivalent.
+fn dispatch_admin(
+    command: beads_rust::cli::AdminCommands,
+    overrides: &config::CliOverrides,
+    output_ctx: &OutputContext,
+    json: bool,
+) -> Result<()> {
+    use beads_rust::cli::AdminCommands as A;
+    match command {
+        A::Init(args) => commands::init::execute(args.prefix, args.force, None, output_ctx),
+        A::Dash(args) => commands::dash::execute(&args, overrides, output_ctx),
+        A::Graph(args) => commands::graph::execute(&args, overrides, output_ctx),
+        A::Stats(args) | A::Status(args) => {
+            commands::stats::execute(&args, json || args.robot, overrides, output_ctx)
+        }
+        A::Delete(args) => commands::delete::execute(&args, json, overrides, output_ctx),
+        A::Epic { command } => commands::epic::execute(&command, json, overrides, output_ctx),
+        A::Count(args) => commands::count::execute(&args, json, overrides, output_ctx),
+        A::Stale(args) => commands::stale::execute(&args, overrides, output_ctx),
+        A::Lint(args) => commands::lint::execute(&args, json, overrides, output_ctx),
+        A::Config { command } => commands::config::execute(&command, json, overrides, output_ctx),
+        A::Sync(args) => commands::sync::execute(&args, json, overrides, output_ctx),
+        A::Doctor => commands::doctor::execute(overrides, output_ctx),
+        A::Info(args) => commands::info::execute(&args, overrides, output_ctx),
+        A::Schema(args) => commands::schema::execute(&args, overrides, output_ctx),
+        A::Where => commands::r#where::execute(overrides, output_ctx),
+        #[cfg(feature = "self_update")]
+        A::Upgrade(args) => commands::upgrade::execute(&args, output_ctx),
+        A::Completions(args) => commands::completions::execute(&args, output_ctx),
+        A::Audit { command } => commands::audit::execute(&command, json, overrides, output_ctx),
+        A::History(args) => commands::history::execute(args, overrides, output_ctx),
+        A::Orphans(args) => {
+            commands::orphans::execute(&args, json || args.robot, overrides, output_ctx)
+        }
+        A::Changelog(args) => {
+            commands::changelog::execute(&args, json || args.robot, overrides, output_ctx)
+        }
+        A::Query { command } => commands::query::execute(&command, overrides, output_ctx),
+        A::Agents(args) => {
+            let agents_args = commands::agents::AgentsArgs {
+                add: args.add,
+                remove: args.remove,
+                update: args.update,
+                check: args.check,
+                dry_run: args.dry_run,
+                force: args.force,
+            };
+            commands::agents::execute(&agents_args, output_ctx)
+        }
     }
 }
 
@@ -158,6 +208,19 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Undefer(_)
         | Commands::Msg(_) => true,
         Commands::Epic { command } => matches!(
+            command,
+            beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
+        ),
+        Commands::Admin { command } => is_mutating_admin(command),
+        _ => false,
+    }
+}
+
+const fn is_mutating_admin(cmd: &beads_rust::cli::AdminCommands) -> bool {
+    use beads_rust::cli::AdminCommands as A;
+    match cmd {
+        A::Delete(_) => true,
+        A::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
@@ -199,7 +262,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Query { .. } => true,
 
         // Explicitly excluded: init, sync, diagnostic, and config commands
-        Commands::Init { .. }
+        Commands::Init(_)
         | Commands::Sync(_)
         | Commands::Doctor
         | Commands::Info(_)
@@ -217,8 +280,31 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dash(_)
         | Commands::Agents(_) => false,
 
+        Commands::Admin { command } => should_auto_import_admin(command),
+
         #[cfg(feature = "self_update")]
         Commands::Upgrade(_) => false,
+    }
+}
+
+const fn should_auto_import_admin(cmd: &beads_rust::cli::AdminCommands) -> bool {
+    use beads_rust::cli::AdminCommands as A;
+    match cmd {
+        // Operations that benefit from fresh data.
+        A::Dash(_)
+        | A::Graph(_)
+        | A::Stats(_)
+        | A::Status(_)
+        | A::Delete(_)
+        | A::Epic { .. }
+        | A::Count(_)
+        | A::Stale(_)
+        | A::Lint(_)
+        | A::Orphans(_)
+        | A::Changelog(_)
+        | A::Query { .. } => true,
+        // Diagnostic / setup / sync-adjacent: skip.
+        _ => false,
     }
 }
 

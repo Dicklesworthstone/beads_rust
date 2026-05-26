@@ -706,47 +706,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Initialize a beads workspace
-    Init {
-        /// Issue ID prefix (e.g., "bd")
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// Overwrite existing DB
-        #[arg(long)]
-        force: bool,
-
-        /// Backend type (ignored, always sqlite)
-        #[arg(long)]
-        backend: Option<String>,
-    },
-
-    /// Create a new issue
-    Create(CreateArgs),
-
-    /// Quick capture (create issue, print ID only)
-    Q(QuickArgs),
-
-    /// List issues
-    List(ListArgs),
-
-    /// Show issue details
-    Show(ShowArgs),
-
-    /// Update an issue
-    Update(UpdateArgs),
-
-    /// Close an issue
-    Close(CloseArgs),
-
-    /// Reopen an issue
-    Reopen(ReopenArgs),
-
-    /// Delete an issue (creates tombstone)
-    Delete(DeleteArgs),
-
-    /// Grouped situational-awareness view of what's going on across beads
-    Dash(DashArgs),
+    // ─── Notifications & comms ───
+    /// Watch a prefix for bead events (and inbox messages by default)
+    Watch(WatchArgs),
 
     /// Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
     Msg(MsgArgs),
@@ -757,9 +719,7 @@ pub enum Commands {
     /// List sent messages
     Outbox(OutboxArgs),
 
-    /// Watch a prefix for create/close/defer/status-change events
-    Watch(WatchArgs),
-
+    // ─── Find work ───
     /// List ready issues (unblocked, not in-progress, not deferred)
     Ready(ReadyArgs),
 
@@ -769,17 +729,70 @@ pub enum Commands {
     /// Search issues
     Search(SearchArgs),
 
+    /// List issues
+    List(ListArgs),
+
+    /// Show issue details
+    Show(ShowArgs),
+
+    // ─── CRUD ───
+    /// Create a new issue
+    Create(CreateArgs),
+
+    /// Quick capture (create issue, print ID only)
+    Q(QuickArgs),
+
+    /// Update an issue
+    Update(UpdateArgs),
+
+    /// Close an issue
+    Close(CloseArgs),
+
+    /// Reopen an issue
+    Reopen(ReopenArgs),
+
+    /// Defer issues (schedule for later)
+    Defer(DeferArgs),
+
+    /// Undefer issues (make ready again)
+    Undefer(UndeferArgs),
+
+    // ─── Relationships ───
     /// Manage dependencies
     Dep {
         #[command(subcommand)]
         command: DepCommands,
     },
 
+    /// Manage comments
+    #[command(alias = "comment")]
+    Comments(CommentsArgs),
+
     /// Manage labels
     Label {
         #[command(subcommand)]
         command: LabelCommands,
     },
+
+    // ─── Admin grouping ───
+    /// Power-user / diagnostic commands (init, dash, graph, stats, sync, ...)
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
+
+    // ─── Hidden top-level aliases for back-compat ───
+    /// Initialize a beads workspace
+    #[command(hide = true)]
+    Init(InitArgs),
+
+    /// Delete an issue (creates tombstone)
+    #[command(hide = true)]
+    Delete(DeleteArgs),
+
+    /// Grouped situational-awareness view of what's going on across beads
+    #[command(hide = true)]
+    Dash(DashArgs),
 
     /// Epic management commands
     #[command(hide = true)]
@@ -788,14 +801,12 @@ pub enum Commands {
         command: EpicCommands,
     },
 
-    /// Manage comments
-    #[command(alias = "comment")]
-    Comments(CommentsArgs),
-
     /// Show project statistics
+    #[command(hide = true)]
     Stats(StatsArgs),
 
     /// Alias for stats
+    #[command(hide = true)]
     Status(StatsArgs),
 
     /// Count issues with optional grouping
@@ -809,12 +820,6 @@ pub enum Commands {
     /// Check issues for missing template sections
     #[command(hide = true)]
     Lint(LintArgs),
-
-    /// Defer issues (schedule for later)
-    Defer(DeferArgs),
-
-    /// Undefer issues (make ready again)
-    Undefer(UndeferArgs),
 
     /// Configuration management
     #[command(hide = true)]
@@ -922,6 +927,101 @@ EXAMPLES:
     Agents(AgentsArgs),
 }
 
+/// Operations grouped under `bd admin`.
+///
+/// Each variant mirrors a top-level hidden command and routes to the same
+/// handler. Exists to make rarely-used / diagnostic / setup operations
+/// discoverable via `bd admin --help` without polluting the agent-facing
+/// `bd --help` surface.
+#[derive(Subcommand, Debug)]
+pub enum AdminCommands {
+    /// Initialize a beads workspace
+    Init(InitArgs),
+
+    /// Grouped situational-awareness view of what's going on across beads
+    Dash(DashArgs),
+
+    /// Visualize dependency graph
+    Graph(GraphArgs),
+
+    /// Show project statistics
+    Stats(StatsArgs),
+
+    /// Alias for stats
+    Status(StatsArgs),
+
+    /// Delete an issue (creates tombstone)
+    Delete(DeleteArgs),
+
+    /// Epic management commands
+    Epic {
+        #[command(subcommand)]
+        command: EpicCommands,
+    },
+
+    /// Count issues with optional grouping
+    Count(CountArgs),
+
+    /// List stale issues
+    Stale(StaleArgs),
+
+    /// Check issues for missing template sections
+    Lint(LintArgs),
+
+    /// Configuration management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+
+    /// Sync database with JSONL file (export or import)
+    Sync(SyncArgs),
+
+    /// Run read-only diagnostics
+    Doctor,
+
+    /// Show diagnostic metadata about the workspace
+    Info(InfoArgs),
+
+    /// Emit JSON Schemas for br output types
+    Schema(SchemaArgs),
+
+    /// Show the active .beads directory
+    Where,
+
+    /// Upgrade br to the latest version
+    #[cfg(feature = "self_update")]
+    Upgrade(UpgradeArgs),
+
+    /// Generate shell completions
+    #[command(alias = "completion")]
+    Completions(CompletionsArgs),
+
+    /// Record and label agent interactions (append-only JSONL)
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
+    },
+
+    /// Manage local history backups
+    History(HistoryArgs),
+
+    /// List orphan issues (referenced in commits but open)
+    Orphans(OrphansArgs),
+
+    /// Generate changelog from closed issues
+    Changelog(ChangelogArgs),
+
+    /// Manage saved queries
+    Query {
+        #[command(subcommand)]
+        command: QueryCommands,
+    },
+
+    /// Manage AGENTS.md workflow instructions
+    Agents(AgentsArgs),
+}
+
 /// Arguments for the completions command.
 #[derive(Args, Debug, Clone)]
 pub struct CompletionsArgs {
@@ -949,6 +1049,22 @@ pub enum ShellType {
     PowerShell,
     /// Elvish
     Elvish,
+}
+
+/// Arguments for the `init` command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct InitArgs {
+    /// Issue ID prefix (e.g., "bd")
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Overwrite existing DB
+    #[arg(long)]
+    pub force: bool,
+
+    /// Backend type (ignored, always sqlite)
+    #[arg(long)]
+    pub backend: Option<String>,
 }
 
 /// Arguments for the `dash` command (grouped situational-awareness view).
