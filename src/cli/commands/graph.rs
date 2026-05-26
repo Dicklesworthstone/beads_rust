@@ -11,10 +11,10 @@ use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids, split_prefix_remainder};
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tracing::debug;
 
 /// JSON output for a single node in the graph.
@@ -25,6 +25,8 @@ struct GraphNode {
     status: String,
     priority: i32,
     depth: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sender: Option<String>,
 }
 
 /// JSON output for the graph command (single issue mode).
@@ -67,7 +69,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let all_ids = storage_ctx.storage.get_all_ids()?;
 
     if args.all {
-        graph_all(&storage_ctx.storage, args.compact, ctx)
+        graph_all(&storage_ctx.storage, args, ctx)
     } else {
         let issue_id = args.issue.as_ref().ok_or_else(|| {
             BeadsError::validation("issue", "Issue ID required unless --all is specified")
@@ -120,6 +122,7 @@ fn graph_single(
             status: issue.status.as_str().to_string(),
             priority: issue.priority.0,
             depth,
+            sender: issue.sender.clone(),
         });
 
         // Get dependents (issues that depend on current_id)
@@ -199,7 +202,7 @@ fn graph_single(
 
 /// Show graph for all `open`/`in_progress`/`blocked`/`deferred` issues.
 #[allow(clippy::too_many_lines)]
-fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Result<()> {
+fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> Result<()> {
     // Get all open/in_progress/blocked issues
     let filters = ListFilters {
         statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked, Status::Deferred]),
@@ -313,6 +316,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
                     status: issue.status.as_str().to_string(),
                     priority: issue.priority.0,
                     depth,
+                    sender: issue.sender.clone(),
                 });
             }
         }
@@ -357,43 +361,188 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
 
     // Text output
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_all_graph_rich(&components, total_nodes, ctx);
+        render_all_graph_rich_with_args(&components, total_nodes, args, ctx);
+    } else if args.no_cluster {
+        render_all_flat(&components, total_nodes, args);
     } else {
-        println!(
-            "Dependency graph: {} issues in {} component(s)",
-            total_nodes,
-            components.len()
-        );
-        println!();
-
-        for (i, component) in components.iter().enumerate() {
-            if compact {
-                // Compact: one line per component
-                let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-                println!("Component {}: {}", i + 1, ids.join(", "));
-            } else {
-                // Detailed view
-                println!(
-                    "Component {} ({} issues, roots: {}):",
-                    i + 1,
-                    component.nodes.len(),
-                    component.roots.join(", ")
-                );
-
-                for node in &component.nodes {
-                    let indent = "  ".repeat(node.depth + 1);
-                    let root_marker = if node.depth == 0 { " (root)" } else { "" };
-                    println!(
-                        "{}{}: {} [P{}] [{}]{}",
-                        indent, node.id, node.title, node.priority, node.status, root_marker
-                    );
-                }
-                println!();
-            }
-        }
+        render_all_clustered(&components, total_nodes, args);
     }
 
     Ok(())
+}
+
+/// Determine the "dominant prefix" of a component: most common prefix among its
+/// nodes. Ties broken alphabetically. Mixed-prefix components return ("<mixed>",
+/// vec of distinct prefixes).
+fn component_prefix(component: &ConnectedComponent) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for node in &component.nodes {
+        let prefix = split_prefix_remainder(&node.id)
+            .map(|(p, _)| p.to_string())
+            .unwrap_or_else(|| "(no-prefix)".to_string());
+        *counts.entry(prefix).or_insert(0) += 1;
+    }
+    if counts.len() > 1 {
+        return "<cross-prefix>".to_string();
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(p, _)| p)
+        .unwrap_or_else(|| "(no-prefix)".to_string())
+}
+
+fn terminal_cols() -> usize {
+    match crossterm::terminal::size() {
+        Ok((cols, _)) if cols > 0 => cols as usize,
+        _ => 100,
+    }
+}
+
+/// Compute usable title width given the row prefix (indent + id + badges).
+fn title_budget(args: &GraphArgs, used: usize) -> usize {
+    let cols = terminal_cols();
+    let cap = args.max_title.unwrap_or_else(|| cols.saturating_sub(used).max(40));
+    cap
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    // Try to break on a word boundary.
+    let limit = max_chars.saturating_sub(1);
+    let prefix: String = s.chars().take(limit).collect();
+    let trimmed = match prefix.rfind(char::is_whitespace) {
+        Some(idx) if idx >= max_chars / 2 => prefix[..idx].trim_end().to_string(),
+        _ => prefix.trim_end().to_string(),
+    };
+    format!("{trimmed}…")
+}
+
+/// Cluster components by dominant prefix and render with section headers.
+fn render_all_clustered(components: &[ConnectedComponent], total_nodes: usize, args: &GraphArgs) {
+    if components.is_empty() {
+        println!("(no beads)");
+        return;
+    }
+
+    println!(
+        "Dependency graph: {} issues in {} component(s)",
+        total_nodes,
+        components.len()
+    );
+
+    // Group component indices by dominant prefix. Components are pre-sorted by size desc.
+    let mut groups: BTreeMap<String, Vec<&ConnectedComponent>> = BTreeMap::new();
+    for component in components {
+        groups
+            .entry(component_prefix(component))
+            .or_default()
+            .push(component);
+    }
+
+    // Cross-prefix goes last; the rest alphabetical.
+    let mut prefixes: Vec<String> = groups.keys().filter(|p| *p != "<cross-prefix>").cloned().collect();
+    prefixes.sort();
+    if groups.contains_key("<cross-prefix>") {
+        prefixes.push("<cross-prefix>".to_string());
+    }
+
+    for prefix in &prefixes {
+        let comps = groups.get(prefix).expect("present");
+        let total_in_prefix: usize = comps.iter().map(|c| c.nodes.len()).sum();
+        let component_word = if comps.len() == 1 { "component" } else { "components" };
+        println!(
+            "=== {prefix} ({n} {issue_word}, {c} {comp_word}) ===",
+            n = total_in_prefix,
+            issue_word = if total_in_prefix == 1 { "issue" } else { "issues" },
+            c = comps.len(),
+            comp_word = component_word,
+        );
+
+        for component in comps {
+            render_component_text(component, args, true);
+        }
+    }
+}
+
+/// Flat (non-clustered) view — preserves backwards compatibility via --no-cluster.
+fn render_all_flat(components: &[ConnectedComponent], total_nodes: usize, args: &GraphArgs) {
+    println!(
+        "Dependency graph: {} issues in {} component(s)",
+        total_nodes,
+        components.len()
+    );
+    println!();
+    for (i, component) in components.iter().enumerate() {
+        if args.compact {
+            let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
+            println!("Component {}: {}", i + 1, ids.join(", "));
+        } else {
+            println!(
+                "Component {} ({} issues, roots: {}):",
+                i + 1,
+                component.nodes.len(),
+                component.roots.join(", ")
+            );
+            render_component_body(component, args, "  ");
+            println!();
+        }
+    }
+}
+
+fn render_component_text(component: &ConnectedComponent, args: &GraphArgs, indent: bool) {
+    if args.compact {
+        let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
+        let prefix = if indent { "  " } else { "" };
+        println!("{prefix}{}", ids.join(" → "));
+        return;
+    }
+
+    if indent && component.nodes.len() > 1 {
+        println!(
+            "  ── component ({n} {issue_word}, roots: {roots})",
+            n = component.nodes.len(),
+            issue_word = if component.nodes.len() == 1 { "issue" } else { "issues" },
+            roots = component.roots.join(", ")
+        );
+    }
+    let base_indent = if indent { "    " } else { "  " };
+    render_component_body(component, args, base_indent);
+}
+
+fn render_component_body(component: &ConnectedComponent, args: &GraphArgs, base_indent: &str) {
+    for node in &component.nodes {
+        let depth_indent = "  ".repeat(node.depth);
+        let priority_badge = format!("[P{}]", node.priority);
+        let status_badge = format!("[{}]", node.status);
+        let root_marker = if node.depth == 0 { " (root)" } else { "" };
+        let row_prefix = format!(
+            "{base_indent}{depth_indent}{id}  {pri}  {stat}{root} ",
+            id = node.id,
+            pri = priority_badge,
+            stat = status_badge,
+            root = root_marker,
+        );
+        let used = row_prefix.chars().count();
+        let sender_suffix = if !args.no_sender {
+            node.sender
+                .as_ref()
+                .map(|s| format!(" (from: {s})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let sender_w = sender_suffix.chars().count();
+        let title_cap = title_budget(args, used + sender_w);
+        let title = truncate_with_ellipsis(&node.title, title_cap);
+        println!("{row_prefix}{title}{sender_suffix}");
+    }
 }
 
 // Calculate depths for nodes using longest path from roots.
@@ -587,10 +736,110 @@ fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputCont
     console.print_renderable(&panel);
 }
 
-/// Render all graph (connected components) with rich formatting.
+fn render_all_graph_rich_with_args(
+    components: &[ConnectedComponent],
+    total_nodes: usize,
+    args: &GraphArgs,
+    ctx: &OutputContext,
+) {
+    if args.no_cluster {
+        render_all_graph_rich(components, total_nodes, args, ctx);
+        return;
+    }
+
+    let console = Console::default();
+    let theme = ctx.theme();
+    let width = ctx.width();
+
+    let mut content = Text::new("");
+
+    content.append_styled(
+        &format!(
+            "{total_nodes} issue{ip} across {comp_n} component{cp}\n",
+            ip = if total_nodes == 1 { "" } else { "s" },
+            comp_n = components.len(),
+            cp = if components.len() == 1 { "" } else { "s" },
+        ),
+        theme.section.clone(),
+    );
+
+    let mut groups: BTreeMap<String, Vec<&ConnectedComponent>> = BTreeMap::new();
+    for component in components {
+        groups
+            .entry(component_prefix(component))
+            .or_default()
+            .push(component);
+    }
+    let mut prefixes: Vec<String> = groups
+        .keys()
+        .filter(|p| *p != "<cross-prefix>")
+        .cloned()
+        .collect();
+    prefixes.sort();
+    if groups.contains_key("<cross-prefix>") {
+        prefixes.push("<cross-prefix>".to_string());
+    }
+
+    let title_cap = args.max_title.unwrap_or(60);
+
+    for prefix in &prefixes {
+        let comps = groups.get(prefix).expect("present");
+        let total_in_prefix: usize = comps.iter().map(|c| c.nodes.len()).sum();
+        content.append("\n");
+        content.append_styled(
+            &format!(
+                "{prefix} ({n} issue{ip}, {c} component{cp})\n",
+                n = total_in_prefix,
+                ip = if total_in_prefix == 1 { "" } else { "s" },
+                c = comps.len(),
+                cp = if comps.len() == 1 { "" } else { "s" },
+            ),
+            theme.emphasis.clone(),
+        );
+
+        for component in comps {
+            for node in &component.nodes {
+                let indent = "  ".repeat(node.depth + 1);
+                content.append(&indent);
+                content.append_styled(&node.id, theme.issue_id.clone());
+                content.append(" ");
+                let mut title = node.title.clone();
+                if !args.no_sender {
+                    if let Some(sender) = &node.sender {
+                        title.push_str(&format!(" (from: {sender})"));
+                    }
+                }
+                content.append(&truncate_with_ellipsis(&title, title_cap));
+                content.append(" ");
+                content.append_styled(
+                    &format!("[P{}]", node.priority),
+                    priority_style(node.priority, theme),
+                );
+                content.append(" ");
+                content.append_styled(
+                    &format!("[{}]", node.status),
+                    status_style(&node.status, theme),
+                );
+                if node.depth == 0 {
+                    content.append_styled(" (root)", theme.dimmed.clone());
+                }
+                content.append("\n");
+            }
+        }
+    }
+
+    let panel = Panel::from_rich_text(&content, width)
+        .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
+        .box_style(theme.box_style);
+
+    console.print_renderable(&panel);
+}
+
+/// Legacy flat rich rendering (used when --no-cluster). Title width now honors `--max-title`.
 fn render_all_graph_rich(
     components: &[ConnectedComponent],
     total_nodes: usize,
+    args: &GraphArgs,
     ctx: &OutputContext,
 ) {
     let console = Console::default();
@@ -628,6 +877,7 @@ fn render_all_graph_rich(
         );
 
         // Render nodes in component
+        let title_cap = args.max_title.unwrap_or(60);
         for node in &component.nodes {
             let indent = "  ".repeat(node.depth + 1);
             content.append(&indent);
@@ -636,12 +886,14 @@ fn render_all_graph_rich(
             content.append_styled(&node.id, theme.issue_id.clone());
             content.append(" ");
 
-            // Title (truncate if too long)
-            let title = if node.title.len() > 40 {
-                format!("{}...", &node.title[..37])
-            } else {
-                node.title.clone()
-            };
+            // Title (with optional sender annotation, ellipsized to fit).
+            let mut title = node.title.clone();
+            if !args.no_sender {
+                if let Some(sender) = &node.sender {
+                    title.push_str(&format!(" (from: {sender})"));
+                }
+            }
+            let title = truncate_with_ellipsis(&title, title_cap);
             content.append(&title);
             content.append(" ");
 
@@ -723,6 +975,7 @@ mod tests {
             status: "open".to_string(),
             priority: 2,
             depth: 0,
+            sender: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -742,6 +995,7 @@ mod tests {
                     status: "open".to_string(),
                     priority: 2,
                     depth: 0,
+            sender: None,
                 },
                 GraphNode {
                     id: "bd-002".to_string(),
@@ -749,6 +1003,7 @@ mod tests {
                     status: "blocked".to_string(),
                     priority: 1,
                     depth: 1,
+            sender: None,
                 },
             ],
             edges: vec![("bd-002".to_string(), "bd-001".to_string())],
@@ -768,6 +1023,7 @@ mod tests {
                 status: "open".to_string(),
                 priority: 2,
                 depth: 0,
+            sender: None,
             }],
             edges: vec![],
             roots: vec!["bd-001".to_string()],
@@ -792,6 +1048,7 @@ mod tests {
                         status: "open".to_string(),
                         priority: 1,
                         depth: 0,
+            sender: None,
                     },
                     GraphNode {
                         id: "bd-002".to_string(),
@@ -799,6 +1056,7 @@ mod tests {
                         status: "blocked".to_string(),
                         priority: 2,
                         depth: 1,
+            sender: None,
                     },
                 ],
                 edges: vec![("bd-002".to_string(), "bd-001".to_string())],
@@ -836,6 +1094,7 @@ mod tests {
             status: "in_progress".to_string(),
             priority: 0,
             depth: 5,
+            sender: None,
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -875,6 +1134,7 @@ mod tests {
                     status: "open".to_string(),
                     priority: 1,
                     depth: 0,
+            sender: None,
                 },
                 GraphNode {
                     id: "bd-002".to_string(),
@@ -882,6 +1142,7 @@ mod tests {
                     status: "open".to_string(),
                     priority: 2,
                     depth: 0,
+            sender: None,
                 },
                 GraphNode {
                     id: "bd-003".to_string(),
@@ -889,6 +1150,7 @@ mod tests {
                     status: "blocked".to_string(),
                     priority: 3,
                     depth: 1,
+            sender: None,
                 },
             ],
             edges: vec![
@@ -936,6 +1198,7 @@ mod tests {
                     status: "open".to_string(),
                     priority: 0,
                     depth: 0,
+            sender: None,
                 },
                 GraphNode {
                     id: "bd-a".to_string(),
@@ -943,6 +1206,7 @@ mod tests {
                     status: "blocked".to_string(),
                     priority: 1,
                     depth: 1,
+            sender: None,
                 },
                 GraphNode {
                     id: "bd-b".to_string(),
@@ -950,6 +1214,7 @@ mod tests {
                     status: "blocked".to_string(),
                     priority: 1,
                     depth: 1,
+            sender: None,
                 },
                 GraphNode {
                     id: "bd-c".to_string(),
@@ -957,6 +1222,7 @@ mod tests {
                     status: "blocked".to_string(),
                     priority: 2,
                     depth: 2,
+            sender: None,
                 },
             ],
             edges: vec![
@@ -984,6 +1250,7 @@ mod tests {
             status: "open".to_string(),
             priority: 0,
             depth: 0,
+            sender: None,
         };
         let json = serde_json::to_string(&p0_node).unwrap();
         assert!(json.contains("\"priority\":0"));
@@ -995,6 +1262,7 @@ mod tests {
             status: "open".to_string(),
             priority: 4,
             depth: 0,
+            sender: None,
         };
         let json = serde_json::to_string(&p4_node).unwrap();
         assert!(json.contains("\"priority\":4"));
@@ -1011,6 +1279,7 @@ mod tests {
                         status: "open".to_string(),
                         priority: 1,
                         depth: 0,
+            sender: None,
                     }],
                     edges: vec![],
                     roots: vec!["comp1-a".to_string()],
@@ -1023,6 +1292,7 @@ mod tests {
                             status: "open".to_string(),
                             priority: 2,
                             depth: 0,
+            sender: None,
                         },
                         GraphNode {
                             id: "comp2-b".to_string(),
@@ -1030,6 +1300,7 @@ mod tests {
                             status: "blocked".to_string(),
                             priority: 2,
                             depth: 1,
+            sender: None,
                         },
                     ],
                     edges: vec![("comp2-b".to_string(), "comp2-a".to_string())],
@@ -1066,6 +1337,7 @@ mod tests {
                 status: status.to_string(),
                 priority: 2,
                 depth: 0,
+            sender: None,
             };
 
             let json = serde_json::to_string(&node).unwrap();
@@ -1130,7 +1402,11 @@ mod tests {
 
         // This should not hang even with root feeding into cycle
         // If it hangs, the test runner will timeout
-        let result = graph_all(&storage, false, &ctx);
+        let args = GraphArgs {
+            all: true,
+            ..Default::default()
+        };
+        let result = graph_all(&storage, &args, &ctx);
         assert!(result.is_ok());
     }
 }

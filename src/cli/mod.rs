@@ -2524,6 +2524,18 @@ pub struct GraphArgs {
     /// One line per issue (compact output)
     #[arg(long)]
     pub compact: bool,
+
+    /// Maximum title length in plain output (default: derived from terminal width).
+    #[arg(long)]
+    pub max_title: Option<usize>,
+
+    /// Skip prefix grouping. Restores the flat connected-component listing.
+    #[arg(long)]
+    pub no_cluster: bool,
+
+    /// Hide the `(from: <prefix>)` sender annotation per bead.
+    #[arg(long)]
+    pub no_sender: bool,
 }
 
 /// Arguments for the agents command.
