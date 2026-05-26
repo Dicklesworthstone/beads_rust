@@ -1018,10 +1018,13 @@ pub struct WatchArgs {
     #[arg(long)]
     pub max_ticks: Option<u64>,
 
-    /// Watch the inbox instead of the bead set: streams incoming messages
-    /// for the resolved prefix rather than bead state changes.
-    #[arg(long)]
+    /// Watch only the inbox (messages), skipping bead state changes.
+    #[arg(long, conflicts_with = "no_inbox")]
     pub inbox: bool,
+
+    /// Skip watching the inbox; only emit bead state changes.
+    #[arg(long, conflicts_with = "inbox")]
+    pub no_inbox: bool,
 
     /// Debounce window: wait this many seconds of no new events for a given
     /// sender before flushing that sender's accumulated batch. 0 disables

@@ -119,61 +119,117 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let prefix = resolve_prefix(args, &beads_dir, cli)?;
 
-    if args.inbox {
-        return watch_inbox(args, cli, &beads_dir, &prefix, interval, format);
-    }
+    let watch_beads = !args.inbox;
+    let watch_inbox = !args.no_inbox;
 
-    let actor = resolved_actor(&beads_dir, cli)?;
+    let actor = if watch_beads {
+        Some(resolved_actor(&beads_dir, cli)?)
+    } else {
+        None
+    };
     let status_filter = parse_status_filter(&args.status)?;
     let debounce = Duration::from_secs(args.debounce);
     let debounce_max = Duration::from_secs(args.debounce_max);
     let streaming = debounce.is_zero();
 
-    let mut snapshot = snapshot_state(&beads_dir, cli, &prefix)?;
+    let mut bead_snapshot = if watch_beads {
+        snapshot_state(&beads_dir, cli, &prefix)?
+    } else {
+        HashMap::new()
+    };
     let mut batches: HashMap<Option<String>, SenderBatch> = HashMap::new();
+    let mut seen_msgs: HashSet<String> = if watch_inbox {
+        inbox_messages(&beads_dir, cli, &prefix)?
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     let mut tick: u64 = 0;
     loop {
         if let Some(max) = args.max_ticks {
             if tick >= max {
-                flush_batches(&mut batches, &prefix, format, Utc::now(), true, debounce, debounce_max)?;
+                if watch_beads {
+                    flush_batches(
+                        &mut batches,
+                        &prefix,
+                        format,
+                        Utc::now(),
+                        true,
+                        debounce,
+                        debounce_max,
+                    )?;
+                }
                 break;
             }
         }
         thread::sleep(interval);
         tick += 1;
 
-        let current = match snapshot_state(&beads_dir, cli, &prefix) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("watch: snapshot failed: {e}");
-                continue;
-            }
-        };
-
         let now = Utc::now();
-        if streaming {
-            stream_diff(
-                &snapshot,
-                &current,
-                status_filter.as_ref(),
-                &actor,
-                args.include_self,
-                format,
-            )?;
-        } else {
-            ingest_diff(
-                &snapshot,
-                &current,
-                status_filter.as_ref(),
-                &actor,
-                args.include_self,
-                now,
-                &mut batches,
-            );
-            flush_batches(&mut batches, &prefix, format, now, false, debounce, debounce_max)?;
+
+        if watch_beads {
+            let current = match snapshot_state(&beads_dir, cli, &prefix) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("watch: bead snapshot failed: {e}");
+                    HashMap::new()
+                }
+            };
+            if !current.is_empty() || !bead_snapshot.is_empty() {
+                let actor_str = actor.as_deref().unwrap_or("");
+                if streaming {
+                    stream_diff(
+                        &bead_snapshot,
+                        &current,
+                        status_filter.as_ref(),
+                        actor_str,
+                        args.include_self,
+                        format,
+                    )?;
+                } else {
+                    ingest_diff(
+                        &bead_snapshot,
+                        &current,
+                        status_filter.as_ref(),
+                        actor_str,
+                        args.include_self,
+                        now,
+                        &mut batches,
+                    );
+                    flush_batches(
+                        &mut batches,
+                        &prefix,
+                        format,
+                        now,
+                        false,
+                        debounce,
+                        debounce_max,
+                    )?;
+                }
+                bead_snapshot = current;
+            }
         }
-        snapshot = current;
+
+        if watch_inbox {
+            match inbox_messages(&beads_dir, cli, &prefix) {
+                Ok(messages) => {
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    for msg in &messages {
+                        if seen_msgs.insert(msg.id.clone()) {
+                            emit_message_event(&mut out, msg, format)?;
+                        }
+                    }
+                    out.flush().ok();
+                }
+                Err(e) => {
+                    eprintln!("watch: inbox snapshot failed: {e}");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -352,48 +408,6 @@ fn flush_batches(
     Ok(())
 }
 
-/// Watch the inbox for new incoming messages addressed to the resolved prefix.
-fn watch_inbox(
-    args: &WatchArgs,
-    cli: &config::CliOverrides,
-    beads_dir: &Path,
-    prefix: &str,
-    interval: Duration,
-    format: OutputFormat,
-) -> Result<()> {
-    let initial = inbox_messages(beads_dir, cli, prefix)?;
-    let mut seen: HashSet<String> = initial.into_iter().map(|m| m.id).collect();
-
-    let mut tick: u64 = 0;
-    loop {
-        if let Some(max) = args.max_ticks {
-            if tick >= max {
-                break;
-            }
-        }
-        thread::sleep(interval);
-        tick += 1;
-
-        let messages = match inbox_messages(beads_dir, cli, prefix) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("watch: inbox snapshot failed: {e}");
-                continue;
-            }
-        };
-
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        for msg in &messages {
-            if seen.insert(msg.id.clone()) {
-                emit_message_event(&mut out, msg, format)?;
-            }
-        }
-        out.flush().ok();
-    }
-    Ok(())
-}
-
 fn inbox_messages(
     beads_dir: &Path,
     cli: &config::CliOverrides,
@@ -461,24 +475,33 @@ fn emit_message_event<W: Write>(
     Ok(())
 }
 
-fn resolve_prefix(
-    args: &WatchArgs,
-    beads_dir: &Path,
-    cli: &config::CliOverrides,
-) -> Result<String> {
-    if let Some(p) = args.prefix.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+/// Strict prefix resolution for `bd watch`.
+///
+/// Unlike the rest of the CLI, watch refuses to fall back to project / user
+/// config or the default "bd". Reasoning: when an agent boots and starts a
+/// watch, the harness is *supposed* to set BD_ISSUE_PREFIX. Silently watching
+/// the wrong prefix would mean missing notifications addressed to the agent.
+fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrides) -> Result<String> {
+    if let Some(p) = args
+        .prefix
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         return Ok(p.to_string());
     }
-    let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
-    let layer = config::load_config(beads_dir, Some(&storage), cli)?;
-    let prefix = config::id_config_from_layer(&layer).prefix;
-    if prefix.trim().is_empty() {
-        return Err(BeadsError::validation(
-            "prefix",
-            "could not resolve a prefix from --prefix, BD_ISSUE_PREFIX, or config",
-        ));
+    if let Ok(env_prefix) = std::env::var("BD_ISSUE_PREFIX") {
+        let trimmed = env_prefix.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
     }
-    Ok(prefix)
+    Err(BeadsError::validation(
+        "prefix",
+        "BD_ISSUE_PREFIX is not set and --prefix was not supplied. \
+         Set BD_ISSUE_PREFIX in the agent environment so watch knows \
+         which inbox to monitor.",
+    ))
 }
 
 fn resolved_actor(beads_dir: &Path, cli: &config::CliOverrides) -> Result<String> {
