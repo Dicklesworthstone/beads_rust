@@ -391,20 +391,6 @@ fn static_candidates_delimited(
         .collect()
 }
 
-fn dynamic_candidates_delimited(
-    current: &OsStr,
-    delimiter: char,
-    values: &[String],
-) -> Vec<CompletionCandidate> {
-    let Some(current) = current.to_str() else {
-        return Vec::new();
-    };
-    let (prefix, needle) = split_delimited_prefix(current, delimiter);
-    dynamic_candidates(needle, values)
-        .into_iter()
-        .map(|candidate| candidate.add_prefix(prefix.clone()))
-        .collect()
-}
 
 fn issue_id_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     issue_id_completer_with_filter(current, IssueCompletionFilter::Any)
@@ -536,10 +522,6 @@ fn label_completer(current: &OsStr) -> Vec<CompletionCandidate> {
         return Vec::new();
     };
     dynamic_candidates(prefix, &completion_index().labels)
-}
-
-fn label_completer_delimited(current: &OsStr) -> Vec<CompletionCandidate> {
-    dynamic_candidates_delimited(current, ',', &completion_index().labels)
 }
 
 fn assignee_completer(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -762,16 +744,6 @@ pub enum Commands {
     Dep {
         #[command(subcommand)]
         command: DepCommands,
-    },
-
-    /// Manage comments
-    #[command(alias = "comment")]
-    Comments(CommentsArgs),
-
-    /// Manage labels
-    Label {
-        #[command(subcommand)]
-        command: LabelCommands,
     },
 
     // ─── Admin grouping ───
@@ -1220,8 +1192,8 @@ pub struct CreateArgs {
     #[arg(long, add = ArgValueCompleter::new(owner_completer))]
     pub owner: Option<String>,
 
-    /// Labels (comma-separated)
-    #[arg(long, short = 'l', value_delimiter = ',', add = ArgValueCompleter::new(label_completer_delimited))]
+    /// Labels (no longer exposed via CLI; field kept for back-compat).
+    #[arg(skip)]
     pub labels: Vec<String>,
 
     /// Parent issue ID (creates parent-child dep)
@@ -1286,8 +1258,8 @@ pub struct QuickArgs {
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Option<String>,
 
-    /// Labels to apply (repeatable, comma-separated allowed)
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
+    /// Labels (no longer exposed via CLI; field kept for back-compat).
+    #[arg(skip)]
     pub labels: Vec<String>,
 }
 
@@ -1358,16 +1330,16 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub estimate: Option<i32>,
 
-    /// Add label(s)
-    #[arg(long, add = ArgValueCompleter::new(label_completer))]
+    /// Add labels (no longer exposed via CLI; field kept for back-compat).
+    #[arg(skip)]
     pub add_label: Vec<String>,
 
-    /// Remove label(s)
-    #[arg(long, add = ArgValueCompleter::new(label_completer))]
+    /// Remove labels (no longer exposed via CLI; field kept for back-compat).
+    #[arg(skip)]
     pub remove_label: Vec<String>,
 
-    /// Set label(s) (replaces all) - repeatable like bd
-    #[arg(long, add = ArgValueCompleter::new(label_completer_delimited))]
+    /// Set labels (no longer exposed via CLI; field kept for back-compat).
+    #[arg(skip)]
     pub set_labels: Vec<String>,
 
     /// Reparent to new parent (empty string removes parent)
@@ -1839,113 +1811,6 @@ pub struct DepCyclesArgs {
     /// Only check blocking dependency types
     #[arg(long)]
     pub blocking_only: bool,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum LabelCommands {
-    /// Add label(s) to issue(s)
-    Add(LabelAddArgs),
-    /// Remove label(s) from issue(s)
-    Remove(LabelRemoveArgs),
-    /// List labels for an issue or all unique labels
-    List(LabelListArgs),
-    /// List all unique labels with counts
-    #[command(name = "list-all")]
-    ListAll,
-    /// Rename a label across all issues
-    Rename(LabelRenameArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct LabelAddArgs {
-    /// Issue ID(s) to add label to
-    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub issues: Vec<String>,
-
-    /// Label to add
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
-    pub label: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct LabelRemoveArgs {
-    /// Issue ID(s) to remove label from
-    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub issues: Vec<String>,
-
-    /// Label to remove
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
-    pub label: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct LabelListArgs {
-    /// Issue ID (optional - if omitted, lists all unique labels)
-    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub issue: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct LabelRenameArgs {
-    /// Current label name
-    #[arg(add = ArgValueCompleter::new(label_completer))]
-    pub old_name: String,
-
-    /// New label name
-    pub new_name: String,
-}
-
-#[derive(Args, Debug)]
-pub struct CommentsArgs {
-    #[command(subcommand)]
-    pub command: Option<CommentCommands>,
-
-    /// Issue ID (for listing comments)
-    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub id: Option<String>,
-
-    /// Truncate long lines instead of wrapping to terminal width
-    #[arg(long)]
-    pub no_wrap: bool,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum CommentCommands {
-    Add(CommentAddArgs),
-    List(CommentListArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct CommentAddArgs {
-    /// Issue ID
-    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub id: String,
-
-    /// Comment text
-    pub text: Vec<String>,
-
-    /// Read comment text from file
-    #[arg(short = 'f', long = "file")]
-    pub file: Option<PathBuf>,
-
-    /// Override author (defaults to actor/env/git)
-    #[arg(long)]
-    pub author: Option<String>,
-
-    /// Comment text (alternative flag)
-    #[arg(long = "message")]
-    pub message: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct CommentListArgs {
-    /// Issue ID
-    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
-    pub id: String,
-
-    /// Truncate long lines instead of wrapping to terminal width
-    #[arg(long)]
-    pub no_wrap: bool,
 }
 
 #[derive(Subcommand, Debug)]

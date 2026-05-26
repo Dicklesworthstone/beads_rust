@@ -222,7 +222,7 @@ Output mode is auto-detected:
 | Works offline | **Yes** | No |
 | Lives in repo | **Yes** | Separate |
 | Dependencies | **Yes** | Workarounds |
-| Custom fields | Via labels | Limited |
+| Custom fields | external_ref / sender | Limited |
 | Machine API | `--json` flag | REST API |
 | Cost | Free | Free (limits) |
 
@@ -306,32 +306,26 @@ br create "Fix login timeout bug" \
 # Created: bd-a1b2c3
 ```
 
-### 3. Add Labels
-
-```bash
-br label add bd-a1b2c3 backend auth
-```
-
-### 4. Check Ready Work
+### 3. Check Ready Work
 
 ```bash
 br ready
 # Shows issues that are open, not blocked, not deferred
 ```
 
-### 5. Claim and Work
+### 4. Claim and Work
 
 ```bash
 br update bd-a1b2c3 --status in_progress --assignee "$(git config user.email)"
 ```
 
-### 6. Close When Done
+### 5. Close When Done
 
 ```bash
 br close bd-a1b2c3 --reason "Increased timeout to 60s, added retry logic"
 ```
 
-### 7. Sync to Git
+### 6. Sync to Git
 
 ```bash
 br sync --flush-only        # Export DB to JSONL
@@ -376,22 +370,6 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | `dep list` | List dependencies | `br dep list bd-abc123` |
 | `dep tree` | Dependency tree | `br dep tree bd-abc123` |
 | `dep cycles` | Find cycles | `br dep cycles` |
-
-### Labels
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `label add` | Add labels | `br label add bd-abc123 backend urgent` |
-| `label remove` | Remove label | `br label remove bd-abc123 urgent` |
-| `label list` | List issue labels | `br label list bd-abc123` |
-| `label list-all` | All labels in project | `br label list-all` |
-
-### Comments
-
-| Command | Description | Example |
-|---------|-------------|---------|
-| `comments add` | Add comment | `br comments add bd-abc123 "Found root cause"` |
-| `comments list` | List comments | `br comments list bd-abc123` |
 
 ### Sync & System
 

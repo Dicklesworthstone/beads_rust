@@ -43,9 +43,6 @@ fn main() {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
         }
         Commands::List(args) => commands::list::execute(&args, cli.json, &overrides, &output_ctx),
-        Commands::Comments(args) => {
-            commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
-        }
         Commands::Search(args) => {
             commands::search::execute(&args, cli.json, &overrides, &output_ctx)
         }
@@ -62,9 +59,6 @@ fn main() {
         }
         Commands::Epic { command } => {
             commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
-        }
-        Commands::Label { command } => {
-            commands::label::execute(&command, cli.json, &overrides, &output_ctx)
         }
         Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
@@ -202,8 +196,6 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Reopen(_)
         | Commands::Q(_)
         | Commands::Dep { .. }
-        | Commands::Label { .. }
-        | Commands::Comments(_)
         | Commands::Defer(_)
         | Commands::Undefer(_)
         | Commands::Msg(_) => true,
@@ -255,9 +247,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Q(_)
         | Commands::Defer(_)
         | Commands::Undefer(_)
-        | Commands::Comments(_)
         | Commands::Dep { .. }
-        | Commands::Label { .. }
         | Commands::Epic { .. }
         | Commands::Query { .. } => true,
 
