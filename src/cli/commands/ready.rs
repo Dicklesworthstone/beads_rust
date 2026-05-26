@@ -9,10 +9,29 @@ use crate::format::{ReadyIssue, format_priority_badge, terminal_width, truncate_
 use crate::model::{IssueType, Priority};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ReadyFilters, ReadySortPolicy};
+use crate::util::id::split_prefix_remainder;
 use std::io::IsTerminal;
 use std::str::FromStr;
 use tracing::{debug, info, trace};
 use unicode_width::UnicodeWidthStr;
+
+/// Resolve the prefix-scope for `bd ready`:
+///   1. --all-prefixes → no scoping
+///   2. --prefix=X     → scope to X
+///   3. BD_ISSUE_PREFIX env set → scope to it (this is the agent default)
+///   4. otherwise no scoping
+fn resolve_ready_prefix(args: &ReadyArgs) -> Option<String> {
+    if args.all_prefixes {
+        return None;
+    }
+    if let Some(p) = args.prefix.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return Some(p.to_string());
+    }
+    std::env::var("BD_ISSUE_PREFIX")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// Execute the ready command.
 ///
@@ -75,7 +94,16 @@ pub fn execute(
         ready_issues.retain(|issue| !external_blockers.contains_key(&issue.id));
     }
 
-    // Apply limit after external filtering
+    // Scope to the agent's own prefix by default (BD_ISSUE_PREFIX).
+    if let Some(target) = resolve_ready_prefix(args) {
+        ready_issues.retain(|issue| {
+            split_prefix_remainder(&issue.id)
+                .map(|(p, _)| p == target.as_str())
+                .unwrap_or(false)
+        });
+    }
+
+    // Apply limit after external + prefix filtering
     if args.limit > 0 && ready_issues.len() > args.limit {
         ready_issues.truncate(args.limit);
     }

@@ -2024,6 +2024,15 @@ pub struct ReadyArgs {
     #[arg(long, default_value_t = 20)]
     pub limit: usize,
 
+    /// Limit to a specific issue ID prefix. Defaults to `BD_ISSUE_PREFIX`
+    /// when set, so an agent sees only its own ready work.
+    #[arg(long, conflicts_with = "all_prefixes")]
+    pub prefix: Option<String>,
+
+    /// Show ready work across every prefix, ignoring `BD_ISSUE_PREFIX`.
+    #[arg(long, conflicts_with = "prefix")]
+    pub all_prefixes: bool,
+
     /// Filter by assignee (no value = current actor)
     #[arg(long, add = ArgValueCompleter::new(assignee_completer))]
     pub assignee: Option<String>,
