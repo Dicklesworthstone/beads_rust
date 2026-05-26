@@ -136,6 +136,71 @@ impl SqliteStorage {
         crate::storage::events::get_all_events(&self.conn, limit)
     }
 
+    /// Insert a new message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB insert fails.
+    pub fn insert_message(&mut self, msg: &crate::model::Message) -> Result<()> {
+        crate::storage::messages::insert_message(&self.conn, msg)
+    }
+
+    /// Fetch a message by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn get_message(&self, id: &str) -> Result<Option<crate::model::Message>> {
+        crate::storage::messages::get_message(&self.conn, id)
+    }
+
+    /// Check whether a message ID is already in use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn message_id_exists(&self, id: &str) -> Result<bool> {
+        crate::storage::messages::message_id_exists(&self.conn, id)
+    }
+
+    /// List messages matching a filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn list_messages(
+        &self,
+        filter: &crate::storage::messages::MessageFilter,
+    ) -> Result<Vec<crate::model::Message>> {
+        crate::storage::messages::list_messages(&self.conn, filter)
+    }
+
+    /// Mark a message as read; returns whether it transitioned from unread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB update fails.
+    pub fn mark_message_read(
+        &mut self,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        crate::storage::messages::mark_message_read(&self.conn, id, now)
+    }
+
+    /// Sweep read messages older than the TTL. Returns rows deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB delete fails.
+    pub fn sweep_read_messages(
+        &mut self,
+        ttl_days: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<usize> {
+        crate::storage::messages::sweep_read_messages(&self.conn, ttl_days, now)
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// # Errors

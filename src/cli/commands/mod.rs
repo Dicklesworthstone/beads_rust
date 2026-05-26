@@ -20,6 +20,7 @@ pub mod init;
 pub mod label;
 pub mod lint;
 pub mod list;
+pub mod messaging;
 pub mod orphans;
 pub mod q;
 pub mod query;

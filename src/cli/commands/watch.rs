@@ -51,11 +51,15 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     }
 
     let format = resolve_output_format_basic(args.format, ctx.is_json(), false);
-    let status_filter = parse_status_filter(&args.status)?;
     let interval = Duration::from_secs(args.interval);
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let prefix = resolve_prefix(args, &beads_dir, cli)?;
 
+    if args.inbox {
+        return watch_inbox(args, cli, &beads_dir, &prefix, interval, format);
+    }
+
+    let status_filter = parse_status_filter(&args.status)?;
     let mut snapshot = snapshot_state(&beads_dir, cli, &prefix)?;
 
     let mut tick: u64 = 0;
@@ -78,6 +82,130 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
 
         emit_diff(&snapshot, &current, status_filter.as_ref(), format)?;
         snapshot = current;
+    }
+    Ok(())
+}
+
+/// Watch the inbox for new incoming messages addressed to the resolved prefix.
+fn watch_inbox(
+    args: &WatchArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+    prefix: &str,
+    interval: Duration,
+    format: OutputFormat,
+) -> Result<()> {
+    use crate::storage::messages::MessageFilter;
+
+    let initial = inbox_snapshot(beads_dir, cli, prefix)?;
+    let mut seen: HashSet<String> = initial.into_iter().collect();
+
+    let mut tick: u64 = 0;
+    loop {
+        if let Some(max) = args.max_ticks {
+            if tick >= max {
+                break;
+            }
+        }
+        thread::sleep(interval);
+        tick += 1;
+
+        let messages = match inbox_messages(beads_dir, cli, prefix) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("watch: inbox snapshot failed: {e}");
+                continue;
+            }
+        };
+
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        for msg in &messages {
+            if seen.insert(msg.id.clone()) {
+                emit_message_event(&mut out, msg, format)?;
+            }
+        }
+        out.flush().ok();
+
+        let _ = MessageFilter::default(); // touch import for unused-warning safety
+    }
+    Ok(())
+}
+
+fn inbox_snapshot(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    prefix: &str,
+) -> Result<Vec<String>> {
+    Ok(inbox_messages(beads_dir, cli, prefix)?
+        .into_iter()
+        .map(|m| m.id)
+        .collect())
+}
+
+fn inbox_messages(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    prefix: &str,
+) -> Result<Vec<crate::model::Message>> {
+    use crate::storage::messages::MessageFilter;
+    let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let filter = MessageFilter {
+        to_prefix: Some(prefix.to_string()),
+        ..Default::default()
+    };
+    storage.list_messages(&filter)
+}
+
+fn emit_message_event<W: Write>(
+    out: &mut W,
+    msg: &crate::model::Message,
+    format: OutputFormat,
+) -> Result<()> {
+    let event = if msg.in_reply_to.is_some() {
+        "message_replied"
+    } else {
+        "message_received"
+    };
+
+    match format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            let line = serde_json::to_string(&serde_json::json!({
+                "ts": Utc::now().to_rfc3339(),
+                "event": event,
+                "id": msg.id,
+                "from": msg.from_prefix,
+                "to": msg.to_prefix,
+                "sent_at": msg.sent_at.to_rfc3339(),
+                "in_reply_to": msg.in_reply_to,
+                "body_preview": msg.body.chars().take(200).collect::<String>(),
+                "truncated": msg.body.len() > 200,
+            }))?;
+            writeln!(out, "{line}")?;
+        }
+        _ => {
+            let preview: String = msg.body.chars().take(200).collect();
+            let truncated = msg.body.len() > 200;
+            let reply_part = msg
+                .in_reply_to
+                .as_ref()
+                .map(|r| format!(" ↪{r}"))
+                .unwrap_or_default();
+            writeln!(
+                out,
+                "[{ts}] {id} from {from}{reply_part} {event}: {preview}",
+                ts = Utc::now().to_rfc3339(),
+                id = msg.id,
+                from = msg.from_prefix,
+            )?;
+            if truncated {
+                writeln!(
+                    out,
+                    "  ... [truncated; run `bd inbox {id}` for the rest]",
+                    id = msg.id
+                )?;
+            }
+        }
     }
     Ok(())
 }

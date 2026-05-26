@@ -73,6 +73,11 @@ fn main() {
         Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Msg(args) => commands::messaging::execute_msg(&args, &overrides, &output_ctx),
+        Commands::Inbox(args) => commands::messaging::execute_inbox(&args, &overrides, &output_ctx),
+        Commands::Outbox(args) => {
+            commands::messaging::execute_outbox(&args, &overrides, &output_ctx)
+        }
         Commands::Watch(args) => commands::watch::execute(&args, &overrides, &output_ctx),
         Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Blocked(args) => {
@@ -149,7 +154,8 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Label { .. }
         | Commands::Comments(_)
         | Commands::Defer(_)
-        | Commands::Undefer(_) => true,
+        | Commands::Undefer(_)
+        | Commands::Msg(_) => true,
         Commands::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
@@ -204,6 +210,9 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Config { .. }
         | Commands::History(_)
         | Commands::Watch(_)
+        | Commands::Msg(_)
+        | Commands::Inbox(_)
+        | Commands::Outbox(_)
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "self_update")]

@@ -745,6 +745,15 @@ pub enum Commands {
     /// Delete an issue (creates tombstone)
     Delete(DeleteArgs),
 
+    /// Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
+    Msg(MsgArgs),
+
+    /// List received messages (or show a specific message in full)
+    Inbox(InboxArgs),
+
+    /// List sent messages
+    Outbox(OutboxArgs),
+
     /// Watch a prefix for create/close/defer/status-change events
     Watch(WatchArgs),
 
@@ -939,6 +948,55 @@ pub enum ShellType {
     Elvish,
 }
 
+/// Arguments for the `msg` command (send a message).
+#[derive(Args, Debug, Default)]
+pub struct MsgArgs {
+    /// Recipient prefix (e.g., "arc1").
+    pub to: String,
+
+    /// Message body. If omitted, read from stdin.
+    pub body: Vec<String>,
+
+    /// Reply to an existing message; chains via in_reply_to.
+    #[arg(long)]
+    pub reply: Option<String>,
+}
+
+/// Arguments for the `inbox` command (list/show received messages).
+#[derive(Args, Debug, Default)]
+pub struct InboxArgs {
+    /// Show a specific message in full (marks it read).
+    pub id: Option<String>,
+
+    /// Include already-read messages.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Filter to messages from a specific sender prefix.
+    #[arg(long)]
+    pub from: Option<String>,
+
+    /// Don't mark listed unread messages as read.
+    #[arg(long)]
+    pub peek: bool,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+}
+
+/// Arguments for the `outbox` command (list sent messages).
+#[derive(Args, Debug, Default)]
+pub struct OutboxArgs {
+    /// Filter to messages sent to a specific recipient prefix.
+    #[arg(long)]
+    pub to: Option<String>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+}
+
 /// Arguments for the `watch` command.
 #[derive(Args, Debug, Default)]
 pub struct WatchArgs {
@@ -959,6 +1017,11 @@ pub struct WatchArgs {
     /// Run for at most N polling ticks then exit (omitted = run until SIGINT)
     #[arg(long)]
     pub max_ticks: Option<u64>,
+
+    /// Watch the inbox instead of the bead set: streams incoming messages
+    /// for the resolved prefix rather than bead state changes.
+    #[arg(long)]
+    pub inbox: bool,
 
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]

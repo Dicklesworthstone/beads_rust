@@ -635,6 +635,22 @@ pub struct Comment {
     pub created_at: DateTime<Utc>,
 }
 
+/// An ephemeral inter-agent message. Distinct from `Issue`: messages
+/// are conversational, auto-expire after read, and never carry work-item
+/// semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+pub struct Message {
+    pub id: String,
+    pub from_prefix: String,
+    pub to_prefix: String,
+    pub body: String,
+    pub sent_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+}
+
 /// An event in the issue's history (audit log).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Event {

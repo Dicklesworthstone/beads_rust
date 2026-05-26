@@ -191,6 +191,28 @@ pub const SCHEMA_SQL: &str = r"
         last_child INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
     );
+
+    -- Ephemeral inter-agent messages (NOT issues).
+    -- These are conversational, not work items; auto-expire after a TTL on read.
+    CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        from_prefix TEXT NOT NULL,
+        to_prefix TEXT NOT NULL,
+        body TEXT NOT NULL,
+        sent_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        read_at DATETIME,
+        in_reply_to TEXT,
+        FOREIGN KEY (in_reply_to) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_to_unread
+        ON messages(to_prefix) WHERE read_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_messages_to_sent_at
+        ON messages(to_prefix, sent_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_from_sent_at
+        ON messages(from_prefix, sent_at);
+    CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to
+        ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL;
 ";
 
 /// Apply the schema to the database.
