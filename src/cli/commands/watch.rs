@@ -1,8 +1,8 @@
-//! Watch a prefix for create / status-change events.
+//! Watch a prefix for bead state changes and / or incoming messages.
 //!
-//! Polls the database on an interval and emits one event per state change
-//! for beads whose ID has the given prefix. The initial snapshot is silent;
-//! only subsequent changes produce output.
+//! Polls the database on an interval. Bead events are debounced and grouped
+//! by the bead's `sender` field so a stager dripping a batch of beads
+//! produces one rollup per sender. The initial snapshot is silent.
 
 use crate::cli::{OutputFormat, WatchArgs, resolve_output_format_basic};
 use crate::config;
@@ -11,7 +11,7 @@ use crate::model::Status;
 use crate::output::OutputContext;
 use crate::storage::ListFilters;
 use crate::util::id::split_prefix_remainder;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -20,11 +20,47 @@ use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct BeadState {
     status: Status,
     title: String,
     sender: Option<String>,
+    created_by: Option<String>,
+}
+
+#[derive(Clone)]
+enum BatchChange {
+    Created(BeadState),
+    StatusChanged { from: Status, current: BeadState },
+    Deleted(BeadState),
+}
+
+#[derive(Clone)]
+struct SenderBatch {
+    sender: Option<String>,
+    changes: HashMap<String, BatchChange>,
+    batch_start: DateTime<Utc>,
+    last_event: DateTime<Utc>,
+}
+
+impl SenderBatch {
+    fn new(sender: Option<String>, now: DateTime<Utc>) -> Self {
+        Self {
+            sender,
+            changes: HashMap::new(),
+            batch_start: now,
+            last_event: now,
+        }
+    }
+
+    fn should_flush(&self, now: DateTime<Utc>, debounce: Duration, debounce_max: Duration) -> bool {
+        if self.changes.is_empty() {
+            return false;
+        }
+        let since_last = (now - self.last_event).to_std().unwrap_or(Duration::ZERO);
+        let since_start = (now - self.batch_start).to_std().unwrap_or(Duration::ZERO);
+        since_last >= debounce || since_start >= debounce_max
+    }
 }
 
 #[derive(Serialize)]
@@ -40,6 +76,28 @@ struct EventJson<'a> {
     from: Option<&'a str>,
 }
 
+#[derive(Serialize)]
+struct BatchJson<'a> {
+    event: &'static str,
+    ts: String,
+    prefix: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from: Option<&'a str>,
+    count: usize,
+    window_secs: i64,
+    beads: Vec<BatchBeadJson<'a>>,
+}
+
+#[derive(Serialize)]
+struct BatchBeadJson<'a> {
+    id: &'a str,
+    change: &'static str,
+    status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_status: Option<&'a str>,
+    title: &'a str,
+}
+
 /// Execute the watch command.
 ///
 /// # Errors
@@ -48,6 +106,12 @@ struct EventJson<'a> {
 pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     if args.interval < 1 {
         return Err(BeadsError::validation("interval", "must be >= 1 second"));
+    }
+    if args.debounce_max < args.debounce {
+        return Err(BeadsError::validation(
+            "debounce_max",
+            "must be >= --debounce",
+        ));
     }
 
     let format = resolve_output_format_basic(args.format, ctx.is_json(), false);
@@ -59,13 +123,20 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         return watch_inbox(args, cli, &beads_dir, &prefix, interval, format);
     }
 
+    let actor = resolved_actor(&beads_dir, cli)?;
     let status_filter = parse_status_filter(&args.status)?;
+    let debounce = Duration::from_secs(args.debounce);
+    let debounce_max = Duration::from_secs(args.debounce_max);
+    let streaming = debounce.is_zero();
+
     let mut snapshot = snapshot_state(&beads_dir, cli, &prefix)?;
+    let mut batches: HashMap<Option<String>, SenderBatch> = HashMap::new();
 
     let mut tick: u64 = 0;
     loop {
         if let Some(max) = args.max_ticks {
             if tick >= max {
+                flush_batches(&mut batches, &prefix, format, Utc::now(), true, debounce, debounce_max)?;
                 break;
             }
         }
@@ -80,9 +151,204 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
             }
         };
 
-        emit_diff(&snapshot, &current, status_filter.as_ref(), format)?;
+        let now = Utc::now();
+        if streaming {
+            stream_diff(
+                &snapshot,
+                &current,
+                status_filter.as_ref(),
+                &actor,
+                args.include_self,
+                format,
+            )?;
+        } else {
+            ingest_diff(
+                &snapshot,
+                &current,
+                status_filter.as_ref(),
+                &actor,
+                args.include_self,
+                now,
+                &mut batches,
+            );
+            flush_batches(&mut batches, &prefix, format, now, false, debounce, debounce_max)?;
+        }
         snapshot = current;
     }
+    Ok(())
+}
+
+/// Streaming mode: emit one event per diff immediately.
+fn stream_diff(
+    prev: &HashMap<String, BeadState>,
+    curr: &HashMap<String, BeadState>,
+    status_filter: Option<&HashSet<Status>>,
+    actor: &str,
+    include_self: bool,
+    format: OutputFormat,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    for (id, state) in curr {
+        if !include_self && is_self(state, actor) {
+            continue;
+        }
+        match prev.get(id) {
+            None => {
+                if status_filter.is_none_or(|f| f.contains(&state.status)) {
+                    emit_single_event(&mut out, "created", id, state, None, format)?;
+                }
+            }
+            Some(prev_state) if prev_state.status != state.status => {
+                let prev_matches = status_filter.is_none_or(|f| f.contains(&prev_state.status));
+                let curr_matches = status_filter.is_none_or(|f| f.contains(&state.status));
+                if prev_matches || curr_matches {
+                    let kind = status_event_kind(&state.status);
+                    emit_single_event(&mut out, kind, id, state, Some(&prev_state.status), format)?;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (id, state) in prev {
+        if !include_self && is_self(state, actor) {
+            continue;
+        }
+        if !curr.contains_key(id) && status_filter.is_none_or(|f| f.contains(&state.status)) {
+            emit_single_event(&mut out, "deleted", id, state, Some(&state.status), format)?;
+        }
+    }
+
+    out.flush().ok();
+    Ok(())
+}
+
+/// Debounced mode: accrue per-sender net diffs into batches for later flushing.
+fn ingest_diff(
+    prev: &HashMap<String, BeadState>,
+    curr: &HashMap<String, BeadState>,
+    status_filter: Option<&HashSet<Status>>,
+    actor: &str,
+    include_self: bool,
+    now: DateTime<Utc>,
+    batches: &mut HashMap<Option<String>, SenderBatch>,
+) {
+    for (id, state) in curr {
+        if !include_self && is_self(state, actor) {
+            continue;
+        }
+        match prev.get(id) {
+            None => {
+                if status_filter.is_none_or(|f| f.contains(&state.status)) {
+                    record_change(
+                        batches,
+                        state.sender.clone(),
+                        id,
+                        BatchChange::Created(state.clone()),
+                        now,
+                    );
+                }
+            }
+            Some(prev_state) if prev_state.status != state.status => {
+                let prev_matches = status_filter.is_none_or(|f| f.contains(&prev_state.status));
+                let curr_matches = status_filter.is_none_or(|f| f.contains(&state.status));
+                if prev_matches || curr_matches {
+                    record_change(
+                        batches,
+                        state.sender.clone(),
+                        id,
+                        BatchChange::StatusChanged {
+                            from: prev_state.status.clone(),
+                            current: state.clone(),
+                        },
+                        now,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (id, state) in prev {
+        if !include_self && is_self(state, actor) {
+            continue;
+        }
+        if !curr.contains_key(id) && status_filter.is_none_or(|f| f.contains(&state.status)) {
+            record_change(
+                batches,
+                state.sender.clone(),
+                id,
+                BatchChange::Deleted(state.clone()),
+                now,
+            );
+        }
+    }
+}
+
+/// Collapse a new change for `id` into the existing batch, applying net-delta
+/// semantics so create-then-delete (etc.) disappears.
+fn record_change(
+    batches: &mut HashMap<Option<String>, SenderBatch>,
+    sender: Option<String>,
+    id: &str,
+    change: BatchChange,
+    now: DateTime<Utc>,
+) {
+    let batch = batches
+        .entry(sender.clone())
+        .or_insert_with(|| SenderBatch::new(sender, now));
+
+    let collapsed = match (batch.changes.remove(id), change) {
+        (Some(BatchChange::Created(_)), BatchChange::Deleted(_)) => None,
+        (Some(BatchChange::Created(_)), BatchChange::StatusChanged { current, .. }) => {
+            Some(BatchChange::Created(current))
+        }
+        (Some(BatchChange::StatusChanged { from, .. }), BatchChange::StatusChanged { current, .. }) => {
+            if from == current.status {
+                None
+            } else {
+                Some(BatchChange::StatusChanged { from, current })
+            }
+        }
+        (Some(BatchChange::StatusChanged { current, .. }), BatchChange::Deleted(_)) => {
+            Some(BatchChange::Deleted(current))
+        }
+        (Some(BatchChange::Deleted(_)), BatchChange::Created(state)) => {
+            Some(BatchChange::Created(state))
+        }
+        (None, change) => Some(change),
+        (_, change) => Some(change),
+    };
+
+    if let Some(c) = collapsed {
+        batch.changes.insert(id.to_string(), c);
+    }
+    batch.last_event = now;
+}
+
+fn flush_batches(
+    batches: &mut HashMap<Option<String>, SenderBatch>,
+    prefix: &str,
+    format: OutputFormat,
+    now: DateTime<Utc>,
+    force: bool,
+    debounce: Duration,
+    debounce_max: Duration,
+) -> Result<()> {
+    let ready: Vec<Option<String>> = batches
+        .iter()
+        .filter(|(_, b)| !b.changes.is_empty() && (force || b.should_flush(now, debounce, debounce_max)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in ready {
+        if let Some(batch) = batches.remove(&key) {
+            emit_batch(prefix, &batch, now, format)?;
+        }
+    }
+    // Drop empty batches that may have been collapsed to zero.
+    batches.retain(|_, b| !b.changes.is_empty());
     Ok(())
 }
 
@@ -95,10 +361,8 @@ fn watch_inbox(
     interval: Duration,
     format: OutputFormat,
 ) -> Result<()> {
-    use crate::storage::messages::MessageFilter;
-
-    let initial = inbox_snapshot(beads_dir, cli, prefix)?;
-    let mut seen: HashSet<String> = initial.into_iter().collect();
+    let initial = inbox_messages(beads_dir, cli, prefix)?;
+    let mut seen: HashSet<String> = initial.into_iter().map(|m| m.id).collect();
 
     let mut tick: u64 = 0;
     loop {
@@ -126,21 +390,8 @@ fn watch_inbox(
             }
         }
         out.flush().ok();
-
-        let _ = MessageFilter::default(); // touch import for unused-warning safety
     }
     Ok(())
-}
-
-fn inbox_snapshot(
-    beads_dir: &Path,
-    cli: &config::CliOverrides,
-    prefix: &str,
-) -> Result<Vec<String>> {
-    Ok(inbox_messages(beads_dir, cli, prefix)?
-        .into_iter()
-        .map(|m| m.id)
-        .collect())
 }
 
 fn inbox_messages(
@@ -230,6 +481,12 @@ fn resolve_prefix(
     Ok(prefix)
 }
 
+fn resolved_actor(beads_dir: &Path, cli: &config::CliOverrides) -> Result<String> {
+    let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+    let layer = config::load_config(beads_dir, Some(&storage), cli)?;
+    Ok(config::resolve_actor(&layer))
+}
+
 fn parse_status_filter(raw: &[String]) -> Result<Option<HashSet<Status>>> {
     if raw.is_empty() {
         return Ok(None);
@@ -271,6 +528,7 @@ fn snapshot_state(
                 status: issue.status,
                 title: issue.title,
                 sender: issue.sender,
+                created_by: issue.created_by,
             },
         );
     }
@@ -281,44 +539,8 @@ fn id_has_prefix(id: &str, prefix: &str) -> bool {
     split_prefix_remainder(id).is_some_and(|(p, _)| p == prefix)
 }
 
-fn emit_diff(
-    prev: &HashMap<String, BeadState>,
-    curr: &HashMap<String, BeadState>,
-    status_filter: Option<&HashSet<Status>>,
-    format: OutputFormat,
-) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-
-    for (id, state) in curr {
-        match prev.get(id) {
-            None => {
-                if status_filter.is_none_or(|f| f.contains(&state.status)) {
-                    emit_event(&mut out, "created", id, state, None, format)?;
-                }
-            }
-            Some(prev_state) if prev_state.status != state.status => {
-                let prev_matches = status_filter.is_none_or(|f| f.contains(&prev_state.status));
-                let curr_matches = status_filter.is_none_or(|f| f.contains(&state.status));
-                if prev_matches || curr_matches {
-                    let kind = status_event_kind(&state.status);
-                    emit_event(&mut out, kind, id, state, Some(&prev_state.status), format)?;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for (id, state) in prev {
-        if !curr.contains_key(id)
-            && status_filter.is_none_or(|f| f.contains(&state.status))
-        {
-            emit_event(&mut out, "deleted", id, state, Some(&state.status), format)?;
-        }
-    }
-
-    out.flush().ok();
-    Ok(())
+fn is_self(state: &BeadState, actor: &str) -> bool {
+    state.sender.is_none() && state.created_by.as_deref().is_some_and(|c| c == actor)
 }
 
 fn status_event_kind(status: &Status) -> &'static str {
@@ -334,7 +556,7 @@ fn status_event_kind(status: &Status) -> &'static str {
     }
 }
 
-fn emit_event<W: Write>(
+fn emit_single_event<W: Write>(
     out: &mut W,
     event: &str,
     id: &str,
@@ -349,7 +571,7 @@ fn emit_event<W: Write>(
     match format {
         OutputFormat::Json | OutputFormat::Toon => {
             let ev = EventJson {
-                ts: ts.clone(),
+                ts,
                 id,
                 event,
                 status: status_str,
@@ -357,8 +579,7 @@ fn emit_event<W: Write>(
                 title: &state.title,
                 from: state.sender.as_deref(),
             };
-            let line = serde_json::to_string(&ev)?;
-            writeln!(out, "{line}")?;
+            writeln!(out, "{}", serde_json::to_string(&ev)?)?;
         }
         _ => {
             let from_part = state
@@ -380,15 +601,113 @@ fn emit_event<W: Write>(
     Ok(())
 }
 
+fn emit_batch(
+    prefix: &str,
+    batch: &SenderBatch,
+    now: DateTime<Utc>,
+    format: OutputFormat,
+) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let window_secs = (now - batch.batch_start).num_seconds().max(0);
+    let mut entries: Vec<(&String, &BatchChange)> = batch.changes.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    let from_label = batch.sender.as_deref();
+    match format {
+        OutputFormat::Json | OutputFormat::Toon => {
+            let beads: Vec<BatchBeadJson> = entries
+                .iter()
+                .map(|(id, change)| match change {
+                    BatchChange::Created(s) => BatchBeadJson {
+                        id: id.as_str(),
+                        change: "created",
+                        status: s.status.as_str(),
+                        from_status: None,
+                        title: &s.title,
+                    },
+                    BatchChange::StatusChanged { from, current } => BatchBeadJson {
+                        id: id.as_str(),
+                        change: "status_changed",
+                        status: current.status.as_str(),
+                        from_status: Some(from.as_str()),
+                        title: &current.title,
+                    },
+                    BatchChange::Deleted(s) => BatchBeadJson {
+                        id: id.as_str(),
+                        change: "deleted",
+                        status: s.status.as_str(),
+                        from_status: None,
+                        title: &s.title,
+                    },
+                })
+                .collect();
+            let obj = BatchJson {
+                event: "batch",
+                ts: now.to_rfc3339(),
+                prefix,
+                from: from_label,
+                count: beads.len(),
+                window_secs,
+                beads,
+            };
+            writeln!(out, "{}", serde_json::to_string(&obj)?)?;
+        }
+        _ => {
+            let from_part = from_label
+                .map(|s| format!(" from {s}"))
+                .unwrap_or_else(|| " from self".to_string());
+            let ts = now.to_rfc3339();
+            writeln!(
+                out,
+                "[{ts}] prefix={prefix} — {n} beads{from_part} (debounced {window_secs}s):",
+                n = entries.len()
+            )?;
+            for (id, change) in entries {
+                match change {
+                    BatchChange::Created(s) => writeln!(
+                        out,
+                        "  + {id} created ({status}): {title}",
+                        status = s.status.as_str(),
+                        title = s.title
+                    )?,
+                    BatchChange::StatusChanged { from, current } => writeln!(
+                        out,
+                        "  ~ {id} {from} → {to}: {title}",
+                        from = from.as_str(),
+                        to = current.status.as_str(),
+                        title = current.title
+                    )?,
+                    BatchChange::Deleted(s) => writeln!(
+                        out,
+                        "  - {id} deleted (was: {prev}): {title}",
+                        prev = s.status.as_str(),
+                        title = s.title
+                    )?,
+                }
+            }
+        }
+    }
+    out.flush().ok();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn state(status: Status, title: &str, sender: Option<&str>) -> BeadState {
+    fn bead(
+        status: Status,
+        title: &str,
+        sender: Option<&str>,
+        created_by: Option<&str>,
+    ) -> BeadState {
         BeadState {
             status,
             title: title.to_string(),
             sender: sender.map(String::from),
+            created_by: created_by.map(String::from),
         }
     }
 
@@ -401,65 +720,173 @@ mod tests {
     }
 
     #[test]
-    fn diff_emits_created_for_new_bead() {
-        let prev: HashMap<String, BeadState> = HashMap::new();
-        let mut curr: HashMap<String, BeadState> = HashMap::new();
-        curr.insert("bd-a".to_string(), state(Status::Open, "x", None));
-        let mut buf = Vec::new();
-        for (id, st) in &curr {
-            if prev.get(id).is_none() {
-                emit_event(&mut buf, "created", id, st, None, OutputFormat::Json).unwrap();
-            }
-        }
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\"event\":\"created\""));
-        assert!(s.contains("\"id\":\"bd-a\""));
+    fn is_self_requires_no_sender_and_matching_creator() {
+        let me = bead(Status::Open, "x", None, Some("toad"));
+        let theirs = bead(Status::Open, "x", Some("app2"), Some("toad"));
+        let other = bead(Status::Open, "x", None, Some("other"));
+        assert!(is_self(&me, "toad"));
+        assert!(!is_self(&theirs, "toad"));
+        assert!(!is_self(&other, "toad"));
     }
 
     #[test]
-    fn diff_emits_closed_on_status_change() {
-        let mut prev = HashMap::new();
-        prev.insert("bd-a".to_string(), state(Status::Open, "x", None));
+    fn batch_groups_changes_by_sender() {
+        let now = Utc::now();
+        let mut batches = HashMap::new();
+        let prev = HashMap::new();
         let mut curr = HashMap::new();
-        curr.insert("bd-a".to_string(), state(Status::Closed, "x", None));
-        let mut buf = Vec::new();
-        for (id, st) in &curr {
-            if let Some(prev_st) = prev.get(id) {
-                if prev_st.status != st.status {
-                    emit_event(
-                        &mut buf,
-                        status_event_kind(&st.status),
-                        id,
-                        st,
-                        Some(&prev_st.status),
-                        OutputFormat::Json,
-                    )
-                    .unwrap();
-                }
-            }
-        }
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("\"event\":\"closed\""));
-        assert!(s.contains("\"from_status\":\"open\""));
+
+        curr.insert(
+            "p-1".to_string(),
+            bead(Status::Open, "a", Some("app2"), Some("alice")),
+        );
+        curr.insert(
+            "p-2".to_string(),
+            bead(Status::Open, "b", Some("app3"), Some("bob")),
+        );
+        curr.insert(
+            "p-3".to_string(),
+            bead(Status::Open, "c", Some("app2"), Some("alice")),
+        );
+
+        ingest_diff(&prev, &curr, None, "me", true, now, &mut batches);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches.get(&Some("app2".to_string())).unwrap().changes.len(),
+            2
+        );
+        assert_eq!(
+            batches.get(&Some("app3".to_string())).unwrap().changes.len(),
+            1
+        );
     }
 
     #[test]
-    fn text_format_includes_sender_when_present() {
-        let mut buf = Vec::new();
-        emit_event(
-            &mut buf,
-            "created",
-            "app2-abc",
-            &state(Status::Open, "fix typo", Some("app1")),
-            None,
-            OutputFormat::Text,
-        )
-        .unwrap();
-        let s = String::from_utf8(buf).unwrap();
-        assert!(s.contains("app2-abc"));
-        assert!(s.contains("from app1"));
-        assert!(s.contains("created"));
-        assert!(s.contains("fix typo"));
+    fn self_filter_drops_own_creates_keeps_foreign() {
+        let now = Utc::now();
+        let mut batches = HashMap::new();
+        let prev = HashMap::new();
+        let mut curr = HashMap::new();
+        curr.insert(
+            "p-1".to_string(),
+            bead(Status::Open, "mine", None, Some("toad")),
+        );
+        curr.insert(
+            "p-2".to_string(),
+            bead(Status::Open, "theirs", Some("app2"), Some("toad")),
+        );
+
+        ingest_diff(&prev, &curr, None, "toad", false, now, &mut batches);
+
+        assert_eq!(batches.len(), 1);
+        assert!(batches.contains_key(&Some("app2".to_string())));
+    }
+
+    #[test]
+    fn collapse_create_then_delete_drops_event() {
+        let now = Utc::now();
+        let mut batches = HashMap::new();
+        let state = bead(Status::Open, "t", Some("app2"), Some("alice"));
+
+        record_change(
+            &mut batches,
+            Some("app2".into()),
+            "p-1",
+            BatchChange::Created(state.clone()),
+            now,
+        );
+        assert_eq!(
+            batches.get(&Some("app2".to_string())).unwrap().changes.len(),
+            1
+        );
+
+        record_change(
+            &mut batches,
+            Some("app2".into()),
+            "p-1",
+            BatchChange::Deleted(state),
+            now,
+        );
+        assert!(
+            batches
+                .get(&Some("app2".to_string()))
+                .map(|b| b.changes.is_empty())
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn collapse_status_roundtrip_drops_event() {
+        let now = Utc::now();
+        let mut batches = HashMap::new();
+        let open_state = bead(Status::Open, "t", Some("app2"), Some("alice"));
+        let deferred_state = bead(Status::Deferred, "t", Some("app2"), Some("alice"));
+
+        record_change(
+            &mut batches,
+            Some("app2".into()),
+            "p-1",
+            BatchChange::StatusChanged {
+                from: Status::Open,
+                current: deferred_state,
+            },
+            now,
+        );
+        record_change(
+            &mut batches,
+            Some("app2".into()),
+            "p-1",
+            BatchChange::StatusChanged {
+                from: Status::Deferred,
+                current: open_state,
+            },
+            now,
+        );
+
+        assert!(
+            batches
+                .get(&Some("app2".to_string()))
+                .map(|b| b.changes.is_empty())
+                .unwrap_or(true)
+        );
+    }
+
+    #[test]
+    fn should_flush_on_quiet_window() {
+        let start = Utc::now();
+        let mut b = SenderBatch::new(Some("app2".into()), start);
+        b.changes.insert(
+            "p-1".to_string(),
+            BatchChange::Created(bead(Status::Open, "x", Some("app2"), Some("alice"))),
+        );
+        assert!(!b.should_flush(start, Duration::from_secs(120), Duration::from_secs(600)));
+        let later = start + chrono::Duration::seconds(121);
+        assert!(b.should_flush(later, Duration::from_secs(120), Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn should_flush_on_max_age_ceiling() {
+        let start = Utc::now();
+        let mut b = SenderBatch::new(Some("app2".into()), start);
+        b.changes.insert(
+            "p-1".to_string(),
+            BatchChange::Created(bead(Status::Open, "x", Some("app2"), Some("alice"))),
+        );
+        let still_dripping = start + chrono::Duration::seconds(550);
+        b.last_event = still_dripping;
+        assert!(!b.should_flush(
+            still_dripping + chrono::Duration::seconds(30),
+            Duration::from_secs(120),
+            Duration::from_secs(600)
+        ));
+        let past_ceiling = start + chrono::Duration::seconds(610);
+        b.last_event = past_ceiling;
+        assert!(b.should_flush(
+            past_ceiling,
+            Duration::from_secs(120),
+            Duration::from_secs(600)
+        ));
     }
 
     #[test]
@@ -479,6 +906,5 @@ mod tests {
             .unwrap();
         assert!(set.contains(&Status::Open));
         assert!(set.contains(&Status::Deferred));
-        assert!(!set.contains(&Status::Closed));
     }
 }

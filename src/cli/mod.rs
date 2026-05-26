@@ -1023,6 +1023,22 @@ pub struct WatchArgs {
     #[arg(long)]
     pub inbox: bool,
 
+    /// Debounce window: wait this many seconds of no new events for a given
+    /// sender before flushing that sender's accumulated batch. 0 disables
+    /// batching (events stream immediately).
+    #[arg(long, default_value_t = 120)]
+    pub debounce: u64,
+
+    /// Maximum batch age before a forced flush, even if a sender keeps
+    /// dripping events within the debounce window. Prevents starvation.
+    #[arg(long, default_value_t = 600)]
+    pub debounce_max: u64,
+
+    /// Surface bead events you originated (created_by matches your actor,
+    /// no foreign sender). Off by default — self-events are filtered.
+    #[arg(long)]
+    pub include_self: bool,
+
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
