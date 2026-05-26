@@ -287,43 +287,42 @@ fn render_text<W: Write>(out: &mut W, groups: &[OwnedGroup], width: u16) -> Resu
         }
 
         let id_w = group.beads.iter().map(|b| b.id.len()).max().unwrap_or(8);
-        let pri_w = 3; // "P0".."P4" max width with the P prefix
-        let assignee_w = group
-            .beads
-            .iter()
-            .filter_map(|b| b.assignee.as_deref())
-            .map(str::len)
-            .max()
-            .unwrap_or(0);
-
-        // glyph(1) + space(1) + id + 2sp + pri + 2sp + title + 2sp + assignee
-        // (assignee/parent/sender suffixes inline after title).
-        let fixed = 1 + 1 + id_w + 2 + pri_w + 2 + 2 + assignee_w + 1;
-        let title_w = (width as usize).saturating_sub(fixed).max(20);
+        let pri_w = 3; // "P0".."P4"
 
         for bead in &group.beads {
             let glyph = bead.kind.glyph();
             let pri = format!("P{}", bead.priority.0);
-            let mut title = bead.title.clone();
-            // Append inline annotations to the title before width-fit.
-            if let Some(parent) = &bead.parent {
-                title.push_str(&format!(" ← {parent}"));
-            }
-            if let Some(sender) = &bead.sender {
-                title.push_str(&format!(" (from: {sender})"));
-            }
-            let title_fit = truncate_with_ellipsis(&title, title_w);
-            let assignee = bead.assignee.as_deref().unwrap_or("");
-            writeln!(
-                out,
-                "  {glyph} {id:<id_w$}  {pri:>pri_w$}  {title:<title_w$}  {assignee}",
+            let row_prefix = format!(
+                "  {glyph} {id:<id_w$}  {pri:>pri_w$}  ",
                 id = bead.id,
-                id_w = id_w,
                 pri = pri,
+                id_w = id_w,
                 pri_w = pri_w,
-                title = title_fit,
-                title_w = title_w,
-            )?;
+            );
+
+            // Suffixes that should never get truncated off the end.
+            let assignee_suffix = bead
+                .assignee
+                .as_deref()
+                .map(|a| format!(" [{a}]"))
+                .unwrap_or_default();
+            let parent_suffix = bead
+                .parent
+                .as_deref()
+                .map(|p| format!(" ← {p}"))
+                .unwrap_or_default();
+            let sender_suffix = bead
+                .sender
+                .as_deref()
+                .map(|s| format!(" (from: {s})"))
+                .unwrap_or_default();
+            let trailing = format!("{parent_suffix}{sender_suffix}{assignee_suffix}");
+
+            let used = row_prefix.chars().count() + trailing.chars().count();
+            let title_cap = (width as usize).saturating_sub(used).max(20);
+            let title = truncate_with_ellipsis(&bead.title, title_cap);
+
+            writeln!(out, "{row_prefix}{title}{trailing}")?;
         }
     }
     Ok(())
