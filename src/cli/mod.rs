@@ -660,7 +660,7 @@ pub struct Cli {
     pub db: Option<PathBuf>,
 
     /// Actor name for audit trail
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub actor: Option<String>,
 
     /// Output as JSON
@@ -668,27 +668,27 @@ pub struct Cli {
     pub json: bool,
 
     /// Force direct mode (no daemon) - effectively no-op in br v1
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub no_daemon: bool,
 
     /// Skip auto JSONL export
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub no_auto_flush: bool,
 
     /// Skip auto import check
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub no_auto_import: bool,
 
     /// Allow stale DB (bypass freshness check warning)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub allow_stale: bool,
 
     /// `SQLite` busy timeout in ms
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub lock_timeout: Option<u64>,
 
     /// JSONL-only mode (no DB connection)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub no_db: bool,
 
     /// Increase logging verbosity (-v, -vv)
@@ -770,6 +770,7 @@ pub enum Commands {
     },
 
     /// Epic management commands
+    #[command(hide = true)]
     Epic {
         #[command(subcommand)]
         command: EpicCommands,
@@ -786,12 +787,15 @@ pub enum Commands {
     Status(StatsArgs),
 
     /// Count issues with optional grouping
+    #[command(hide = true)]
     Count(CountArgs),
 
     /// List stale issues
+    #[command(hide = true)]
     Stale(StaleArgs),
 
     /// Check issues for missing template sections
+    #[command(hide = true)]
     Lint(LintArgs),
 
     /// Defer issues (schedule for later)
@@ -801,6 +805,7 @@ pub enum Commands {
     Undefer(UndeferArgs),
 
     /// Configuration management
+    #[command(hide = true)]
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
@@ -811,7 +816,7 @@ pub enum Commands {
     /// IMPORTANT: br sync NEVER executes git commands or auto-commits.
     /// All file operations are confined to .beads/ by default.
     /// Use -v for detailed safety logging, -vv for debug output.
-    #[command(long_about = "Sync database with JSONL file (export or import).
+    #[command(hide = true, long_about = "Sync database with JSONL file (export or import).
 
 SAFETY GUARANTEES:
   • br sync NEVER executes git commands or auto-commits
@@ -845,15 +850,19 @@ EXAMPLES:
     Sync(SyncArgs),
 
     /// Run read-only diagnostics
+    #[command(hide = true)]
     Doctor,
 
     /// Show diagnostic metadata about the workspace
+    #[command(hide = true)]
     Info(InfoArgs),
 
     /// Emit JSON Schemas for br output types (for agent/tooling integration)
+    #[command(hide = true)]
     Schema(SchemaArgs),
 
     /// Show the active .beads directory
+    #[command(hide = true)]
     Where,
 
     /// Show version information
@@ -861,35 +870,43 @@ EXAMPLES:
 
     /// Upgrade br to the latest version
     #[cfg(feature = "self_update")]
+    #[command(hide = true)]
     Upgrade(UpgradeArgs),
 
     /// Generate shell completions
-    #[command(alias = "completion")]
+    #[command(hide = true, alias = "completion")]
     Completions(CompletionsArgs),
 
     /// Record and label agent interactions (append-only JSONL)
+    #[command(hide = true)]
     Audit {
         #[command(subcommand)]
         command: AuditCommands,
     },
 
     /// Manage local history backups
+    #[command(hide = true)]
     History(HistoryArgs),
     /// List orphan issues (referenced in commits but open)
+    #[command(hide = true)]
     Orphans(OrphansArgs),
     /// Generate changelog from closed issues
+    #[command(hide = true)]
     Changelog(ChangelogArgs),
 
     /// Manage saved queries
+    #[command(hide = true)]
     Query {
         #[command(subcommand)]
         command: QueryCommands,
     },
 
     /// Visualize dependency graph
+    #[command(hide = true)]
     Graph(GraphArgs),
 
     /// Manage AGENTS.md workflow instructions
+    #[command(hide = true)]
     Agents(AgentsArgs),
 }
 
