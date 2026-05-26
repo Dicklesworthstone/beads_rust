@@ -745,6 +745,9 @@ pub enum Commands {
     /// Delete an issue (creates tombstone)
     Delete(DeleteArgs),
 
+    /// Grouped situational-awareness view of what's going on across beads
+    Dash(DashArgs),
+
     /// Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
     Msg(MsgArgs),
 
@@ -946,6 +949,31 @@ pub enum ShellType {
     PowerShell,
     /// Elvish
     Elvish,
+}
+
+/// Arguments for the `dash` command (grouped situational-awareness view).
+#[derive(Args, Debug, Default)]
+pub struct DashArgs {
+    /// Limit to a single prefix.
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Include deferred beads (hidden by default).
+    #[arg(long)]
+    pub show_deferred: bool,
+
+    /// Include closed beads (hidden by default).
+    #[arg(long)]
+    pub show_closed: bool,
+
+    /// Redraw every N seconds (top-style live view). Auto-disabled when
+    /// stdout is not a TTY — pipes get one frame and exit.
+    #[arg(long)]
+    pub refresh: Option<u64>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
 }
 
 /// Arguments for the `msg` command (send a message).

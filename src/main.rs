@@ -73,6 +73,7 @@ fn main() {
         Commands::Count(args) => commands::count::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Stale(args) => commands::stale::execute(&args, &overrides, &output_ctx),
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
+        Commands::Dash(args) => commands::dash::execute(&args, &overrides, &output_ctx),
         Commands::Msg(args) => commands::messaging::execute_msg(&args, &overrides, &output_ctx),
         Commands::Inbox(args) => commands::messaging::execute_inbox(&args, &overrides, &output_ctx),
         Commands::Outbox(args) => {
@@ -213,6 +214,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Msg(_)
         | Commands::Inbox(_)
         | Commands::Outbox(_)
+        | Commands::Dash(_)
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "self_update")]
