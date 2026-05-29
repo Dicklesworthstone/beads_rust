@@ -754,6 +754,14 @@ pub enum Commands {
     },
 
     // ─── Hidden top-level aliases for back-compat ───
+    /// Mark the current prefix as actively working (undocumented; used by lifecycle hooks)
+    #[command(hide = true)]
+    Working,
+
+    /// Mark the current prefix as idle (undocumented; used by lifecycle hooks)
+    #[command(hide = true)]
+    Idle,
+
     /// Initialize a beads workspace
     #[command(hide = true)]
     Init(InitArgs),
@@ -1063,6 +1071,11 @@ pub struct DashArgs {
     /// means unbounded within the window.
     #[arg(long, default_value_t = 5)]
     pub closed_limit: usize,
+
+    /// Treat agent presence older than this as offline (e.g. `30m`, `1h`).
+    /// Set to `0` to hide presence badges entirely. Default `30m`.
+    #[arg(long, default_value = "30m")]
+    pub presence_ttl: String,
 
     /// Redraw every N seconds (top-style live view). Auto-disabled when
     /// stdout is not a TTY — pipes get one frame and exit.

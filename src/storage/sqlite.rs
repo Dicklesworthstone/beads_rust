@@ -201,6 +201,29 @@ impl SqliteStorage {
         crate::storage::messages::sweep_read_messages(&self.conn, ttl_days, now)
     }
 
+    /// Upsert presence for `prefix` to `state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB write fails.
+    pub fn set_presence(
+        &mut self,
+        prefix: &str,
+        state: crate::storage::presence::PresenceState,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        crate::storage::presence::set_presence(&self.conn, prefix, state, now)
+    }
+
+    /// Fetch all agent presence rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn all_presence(&self) -> Result<Vec<crate::storage::presence::PresenceRow>> {
+        crate::storage::presence::all_presence(&self.conn)
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// # Errors

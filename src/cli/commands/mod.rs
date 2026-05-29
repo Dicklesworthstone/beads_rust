@@ -21,6 +21,7 @@ pub mod lint;
 pub mod list;
 pub mod messaging;
 pub mod orphans;
+pub mod presence;
 pub mod q;
 pub mod query;
 pub mod ready;

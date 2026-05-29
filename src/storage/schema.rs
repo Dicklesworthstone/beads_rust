@@ -213,6 +213,14 @@ pub const SCHEMA_SQL: &str = r"
         ON messages(from_prefix, sent_at);
     CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to
         ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL;
+
+    -- Per-prefix agent presence (working/idle), populated by the undocumented
+    -- `bd working` / `bd idle` commands wired into Claude Code lifecycle hooks.
+    CREATE TABLE IF NOT EXISTS agent_presence (
+        prefix TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK(state IN ('working', 'idle')),
+        last_changed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 ";
 
 /// Apply the schema to the database.

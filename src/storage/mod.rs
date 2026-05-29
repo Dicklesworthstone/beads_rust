@@ -14,6 +14,7 @@
 
 pub mod events;
 pub mod messages;
+pub mod presence;
 pub mod schema;
 pub mod sqlite;
 

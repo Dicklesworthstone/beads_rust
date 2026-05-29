@@ -37,6 +37,8 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init(args) => commands::init::execute(args.prefix, args.force, None, &output_ctx),
+        Commands::Working => commands::presence::execute_working(&overrides, &output_ctx),
+        Commands::Idle => commands::presence::execute_idle(&overrides, &output_ctx),
         Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
         Commands::Delete(args) => {
@@ -268,6 +270,8 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Inbox(_)
         | Commands::Outbox(_)
         | Commands::Dash(_)
+        | Commands::Working
+        | Commands::Idle
         | Commands::Agents(_) => false,
 
         Commands::Admin { command } => should_auto_import_admin(command),

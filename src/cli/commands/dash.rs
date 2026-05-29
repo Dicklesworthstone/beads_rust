@@ -8,6 +8,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::model::{Issue, Priority, Status};
 use crate::output::OutputContext;
+use crate::storage::presence::{PresenceRow, PresenceState};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::split_prefix_remainder;
 use chrono::{DateTime, Utc};
@@ -65,9 +66,17 @@ struct DashGroup<'a> {
     deferred: usize,
     closed: usize,
     closed_recently: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence: Option<PresenceJson<'a>>,
     beads: Vec<DashBead<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     recently_closed: Vec<RecentClosure<'a>>,
+}
+
+#[derive(Serialize)]
+struct PresenceJson<'a> {
+    state: &'a str,
+    age_secs: i64,
 }
 
 #[derive(Serialize)]
@@ -138,6 +147,7 @@ fn render_once(
 
     // Parse the recent-closures window. Empty / "0" disables.
     let window = parse_closed_within(&args.closed_within)?;
+    let presence_ttl = parse_closed_within(&args.presence_ttl)?;
 
     // We need closed beads in the fetch when either:
     //  - the user asked for them via --show-closed (current behavior), or
@@ -153,8 +163,28 @@ fn render_once(
     let blocked_ids = storage.get_blocked_ids()?;
     let parents = fetch_parent_map(&storage)?;
 
+    // Pull presence as a per-prefix lookup. Empty when ttl is None.
+    let presence: HashMap<String, PresenceRow> = if presence_ttl.is_some() {
+        storage
+            .all_presence()?
+            .into_iter()
+            .map(|p| (p.prefix.clone(), p))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+
     let now = Utc::now();
-    let groups = build_groups(&issues, &blocked_ids, &parents, args, now, window);
+    let groups = build_groups(
+        &issues,
+        &blocked_ids,
+        &parents,
+        args,
+        now,
+        window,
+        &presence,
+        presence_ttl,
+    );
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -251,6 +281,7 @@ fn fetch_parent_map(storage: &SqliteStorage) -> Result<HashMap<String, String>> 
     Ok(map)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_groups<'a>(
     issues: &'a [Issue],
     blocked_ids: &HashSet<String>,
@@ -258,6 +289,8 @@ fn build_groups<'a>(
     args: &DashArgs,
     now: DateTime<Utc>,
     window: Option<chrono::Duration>,
+    presence: &HashMap<String, PresenceRow>,
+    presence_ttl: Option<chrono::Duration>,
 ) -> Vec<OwnedGroup> {
     let mut by_prefix: BTreeMap<String, Vec<&Issue>> = BTreeMap::new();
     for issue in issues {
@@ -348,8 +381,26 @@ fn build_groups<'a>(
             })
             .collect();
 
+        let presence_view = presence.get(&prefix).map(|p| {
+            let age = (now - p.last_changed).num_seconds().max(0);
+            let label = match (p.state, presence_ttl) {
+                (_, None) => None, // shouldn't reach here since presence map is empty
+                (PresenceState::Working, Some(ttl)) if age <= ttl.num_seconds() => Some(
+                    PresenceView { state: PresenceKind::Working, age_secs: age },
+                ),
+                (PresenceState::Idle, Some(ttl)) if age <= ttl.num_seconds() => Some(
+                    PresenceView { state: PresenceKind::Idle, age_secs: age },
+                ),
+                _ => Some(PresenceView {
+                    state: PresenceKind::Offline,
+                    age_secs: age,
+                }),
+            };
+            label
+        }).flatten();
+
         // Skip prefixes that have nothing to show at all.
-        if rows.is_empty() && recent.is_empty() {
+        if rows.is_empty() && recent.is_empty() && presence_view.is_none() {
             continue;
         }
 
@@ -361,11 +412,92 @@ fn build_groups<'a>(
             deferred,
             closed,
             closed_recently: recent.len(),
+            presence: presence_view,
             beads: rows,
             recently_closed: recent,
         });
     }
+
+    // Also surface prefixes that have ONLY presence (no beads or closures
+    // in the current window). Iterate presence map for prefixes we haven't
+    // emitted yet.
+    if presence_ttl.is_some() {
+        let emitted: HashSet<String> = groups.iter().map(|g| g.prefix.clone()).collect();
+        for (prefix, row) in presence {
+            if emitted.contains(prefix) {
+                continue;
+            }
+            if let Some(filter) = &args.prefix {
+                if filter != prefix {
+                    continue;
+                }
+            }
+            let age = (now - row.last_changed).num_seconds().max(0);
+            let view = match (row.state, presence_ttl) {
+                (PresenceState::Working, Some(ttl)) if age <= ttl.num_seconds() => PresenceView {
+                    state: PresenceKind::Working,
+                    age_secs: age,
+                },
+                (PresenceState::Idle, Some(ttl)) if age <= ttl.num_seconds() => PresenceView {
+                    state: PresenceKind::Idle,
+                    age_secs: age,
+                },
+                _ => PresenceView {
+                    state: PresenceKind::Offline,
+                    age_secs: age,
+                },
+            };
+            // Skip offline-only prefixes — too noisy if they're stale forever.
+            if matches!(view.state, PresenceKind::Offline) {
+                continue;
+            }
+            groups.push(OwnedGroup {
+                prefix: prefix.clone(),
+                in_progress: 0,
+                ready: 0,
+                blocked: 0,
+                deferred: 0,
+                closed: 0,
+                closed_recently: 0,
+                presence: Some(view),
+                beads: vec![],
+                recently_closed: vec![],
+            });
+        }
+        groups.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    }
+
     groups
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceKind {
+    Working,
+    Idle,
+    Offline,
+}
+
+impl PresenceKind {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Working => "▶",
+            Self::Idle => "⏸",
+            Self::Offline => "○",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Working => "working",
+            Self::Idle => "idle",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PresenceView {
+    state: PresenceKind,
+    age_secs: i64,
 }
 
 struct OwnedBead {
@@ -386,6 +518,7 @@ struct OwnedGroup {
     deferred: usize,
     closed: usize,
     closed_recently: usize,
+    presence: Option<PresenceView>,
     beads: Vec<OwnedBead>,
     recently_closed: Vec<OwnedClosure>,
 }
@@ -431,7 +564,18 @@ fn render_text<W: Write>(
         if i > 0 {
             writeln!(out)?;
         }
-        writeln!(out, "=== {} {} ===", group.prefix, header_counts(group))?;
+        let presence_badge = group
+            .presence
+            .as_ref()
+            .map(|p| format!(" [{} {} {}]", p.state.glyph(), p.state.label(), format_age(p.age_secs)))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "=== {}{} {} ===",
+            group.prefix,
+            presence_badge,
+            header_counts(group)
+        )?;
 
         // Compute ID column width considering both live and recently-closed rows.
         let id_w = group
@@ -541,7 +685,7 @@ fn header_counts(g: &OwnedGroup) -> String {
         parts.push(format!("{} closed recently", g.closed_recently));
     }
     if parts.is_empty() {
-        "(empty)".to_string()
+        String::new()
     } else {
         format!("({})", parts.join(", "))
     }
@@ -571,6 +715,10 @@ fn render_json<W: Write>(out: &mut W, groups: &[OwnedGroup], now: DateTime<Utc>)
             deferred: g.deferred,
             closed: g.closed,
             closed_recently: g.closed_recently,
+            presence: g.presence.as_ref().map(|p| PresenceJson {
+                state: p.state.label(),
+                age_secs: p.age_secs,
+            }),
             beads: g
                 .beads
                 .iter()
@@ -698,7 +846,7 @@ mod tests {
         ];
         let blocked: HashSet<String> = ["arc1-a".to_string()].into_iter().collect();
         let parents = HashMap::new();
-        let groups = build_groups(&issues, &blocked, &parents, &default_args(), Utc::now(), None);
+        let groups = build_groups(&issues, &blocked, &parents, &default_args(), Utc::now(), None, &HashMap::new(), None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].beads[0].id, "arc1-b");
         assert_eq!(groups[0].beads[0].kind, StatusKind::InProgress);
@@ -717,7 +865,7 @@ mod tests {
         ];
         let blocked = HashSet::new();
         let parents = HashMap::new();
-        let groups = build_groups(&issues, &blocked, &parents, &default_args(), Utc::now(), None);
+        let groups = build_groups(&issues, &blocked, &parents, &default_args(), Utc::now(), None, &HashMap::new(), None);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].prefix, "arc1");
         assert_eq!(groups[0].beads.len(), 2);
@@ -735,6 +883,7 @@ mod tests {
             deferred: 0,
             closed: 0,
             closed_recently: 0,
+            presence: None,
             beads: vec![],
             recently_closed: vec![],
         };
@@ -748,6 +897,7 @@ mod tests {
             deferred: 0,
             closed: 0,
             closed_recently: 0,
+            presence: None,
             beads: vec![],
             recently_closed: vec![],
         };
@@ -761,10 +911,128 @@ mod tests {
             deferred: 0,
             closed: 0,
             closed_recently: 2,
+            presence: None,
             beads: vec![],
             recently_closed: vec![],
         };
         assert_eq!(header_counts(&g3), "(1 ready, 2 closed recently)");
+    }
+
+    #[test]
+    fn presence_within_ttl_renders_working_or_idle() {
+        let now = Utc::now();
+        let issues = vec![issue("arc1-a", Status::Open, 1, "live")];
+        let blocked = HashSet::new();
+        let parents = HashMap::new();
+        let mut presence = HashMap::new();
+        presence.insert(
+            "arc1".to_string(),
+            PresenceRow {
+                prefix: "arc1".into(),
+                state: PresenceState::Working,
+                last_changed: now - chrono::Duration::seconds(30),
+            },
+        );
+        let groups = build_groups(
+            &issues,
+            &blocked,
+            &parents,
+            &default_args(),
+            now,
+            None,
+            &presence,
+            Some(chrono::Duration::minutes(30)),
+        );
+        assert_eq!(groups.len(), 1);
+        let p = groups[0].presence.as_ref().unwrap();
+        assert_eq!(p.state, PresenceKind::Working);
+    }
+
+    #[test]
+    fn presence_past_ttl_becomes_offline() {
+        let now = Utc::now();
+        let issues = vec![issue("arc1-a", Status::Open, 1, "live")];
+        let blocked = HashSet::new();
+        let parents = HashMap::new();
+        let mut presence = HashMap::new();
+        presence.insert(
+            "arc1".to_string(),
+            PresenceRow {
+                prefix: "arc1".into(),
+                state: PresenceState::Working,
+                last_changed: now - chrono::Duration::hours(2),
+            },
+        );
+        let groups = build_groups(
+            &issues,
+            &blocked,
+            &parents,
+            &default_args(),
+            now,
+            None,
+            &presence,
+            Some(chrono::Duration::minutes(30)),
+        );
+        let p = groups[0].presence.as_ref().unwrap();
+        assert_eq!(p.state, PresenceKind::Offline);
+    }
+
+    #[test]
+    fn presence_only_prefix_surfaces_when_live() {
+        let now = Utc::now();
+        let issues: Vec<Issue> = vec![];
+        let blocked = HashSet::new();
+        let parents = HashMap::new();
+        let mut presence = HashMap::new();
+        presence.insert(
+            "ghost".to_string(),
+            PresenceRow {
+                prefix: "ghost".into(),
+                state: PresenceState::Idle,
+                last_changed: now - chrono::Duration::seconds(10),
+            },
+        );
+        let groups = build_groups(
+            &issues,
+            &blocked,
+            &parents,
+            &default_args(),
+            now,
+            None,
+            &presence,
+            Some(chrono::Duration::minutes(30)),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].prefix, "ghost");
+        assert!(groups[0].beads.is_empty());
+    }
+
+    #[test]
+    fn presence_only_offline_is_omitted() {
+        let now = Utc::now();
+        let issues: Vec<Issue> = vec![];
+        let blocked = HashSet::new();
+        let parents = HashMap::new();
+        let mut presence = HashMap::new();
+        presence.insert(
+            "stale".to_string(),
+            PresenceRow {
+                prefix: "stale".into(),
+                state: PresenceState::Idle,
+                last_changed: now - chrono::Duration::hours(5),
+            },
+        );
+        let groups = build_groups(
+            &issues,
+            &blocked,
+            &parents,
+            &default_args(),
+            now,
+            None,
+            &presence,
+            Some(chrono::Duration::minutes(30)),
+        );
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -784,7 +1052,7 @@ mod tests {
         let parents = HashMap::new();
         let mut args = default_args();
         args.prefix = Some("arc2".into());
-        let groups = build_groups(&issues, &blocked, &parents, &args, Utc::now(), None);
+        let groups = build_groups(&issues, &blocked, &parents, &args, Utc::now(), None, &HashMap::new(), None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].prefix, "arc2");
     }
@@ -861,6 +1129,8 @@ mod tests {
             &args,
             now,
             Some(chrono::Duration::hours(24)),
+            &HashMap::new(),
+            None,
         );
         assert_eq!(groups.len(), 1);
         let g = &groups[0];
@@ -888,6 +1158,8 @@ mod tests {
             &default_args(),
             now,
             Some(chrono::Duration::hours(24)),
+            &HashMap::new(),
+            None,
         );
         assert_eq!(groups.len(), 1);
         assert!(groups[0].beads.is_empty());
@@ -909,6 +1181,8 @@ mod tests {
             &default_args(),
             now,
             Some(chrono::Duration::hours(24)),
+            &HashMap::new(),
+            None,
         );
         assert!(groups.is_empty());
     }
