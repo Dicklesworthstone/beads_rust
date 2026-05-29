@@ -419,7 +419,7 @@ fn render_text<W: Write>(
     out: &mut W,
     groups: &[OwnedGroup],
     width: u16,
-    closed_within_label: &str,
+    _closed_within_label: &str,
     _now: DateTime<Utc>,
 ) -> Result<()> {
     if groups.is_empty() {
@@ -480,7 +480,9 @@ fn render_text<W: Write>(
         }
 
         if !group.recently_closed.is_empty() {
-            writeln!(out, "recently closed (last {closed_within_label}):")?;
+            if !group.beads.is_empty() {
+                writeln!(out)?;
+            }
             // Align the age column for compact reading.
             let age_w = group
                 .recently_closed
