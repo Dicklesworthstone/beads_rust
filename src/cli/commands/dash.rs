@@ -37,7 +37,7 @@ impl StatusKind {
             Self::InProgress => "▶",
             Self::Ready => "○",
             Self::Blocked => "⚠",
-            Self::Deferred => "⏸",
+            Self::Deferred => "❄",
             Self::Closed => "✓",
         }
     }
@@ -480,7 +480,7 @@ enum PresenceKind {
 impl PresenceKind {
     fn glyph(self) -> &'static str {
         match self {
-            Self::Working => "▶",
+            Self::Working => "⚡",
             Self::Idle => "⏸",
             Self::Offline => "○",
         }
