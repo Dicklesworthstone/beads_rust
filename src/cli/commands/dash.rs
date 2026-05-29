@@ -231,6 +231,31 @@ fn parse_closed_within(raw: &str) -> Result<Option<chrono::Duration>> {
     Ok(Some(dur))
 }
 
+/// Render a relative age without an "ago" suffix — for the in-bracket
+/// presence badge where the surrounding context implies "now."
+fn format_age_compact(secs: i64) -> String {
+    if secs < 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let m = secs / 60;
+    if m < 60 {
+        return format!("{m}m");
+    }
+    let h = m / 60;
+    if h < 24 {
+        return format!("{h}h");
+    }
+    let d = h / 24;
+    if d < 7 {
+        return format!("{d}d");
+    }
+    let w = d / 7;
+    format!("{w}w")
+}
+
 /// Render a relative age as a terse string.
 fn format_age(secs: i64) -> String {
     if secs < 0 {
@@ -564,18 +589,21 @@ fn render_text<W: Write>(
         if i > 0 {
             writeln!(out)?;
         }
-        let presence_badge = group
-            .presence
-            .as_ref()
-            .map(|p| format!(" [{} {} {}]", p.state.glyph(), p.state.label(), format_age(p.age_secs)))
-            .unwrap_or_default();
-        writeln!(
-            out,
-            "=== {}{} {} ===",
-            group.prefix,
-            presence_badge,
-            header_counts(group)
-        )?;
+        let header_label = match &group.presence {
+            Some(p) => format!(
+                "[{} {} {}]",
+                p.state.glyph(),
+                group.prefix,
+                format_age_compact(p.age_secs)
+            ),
+            None => format!("[{}]", group.prefix),
+        };
+        let counts = header_counts(group);
+        if counts.is_empty() {
+            writeln!(out, "{header_label}")?;
+        } else {
+            writeln!(out, "{header_label} {counts}")?;
+        }
 
         // Compute ID column width considering both live and recently-closed rows.
         let id_w = group
