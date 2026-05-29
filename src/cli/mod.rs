@@ -1067,9 +1067,9 @@ pub struct DashArgs {
     #[arg(long, default_value = "24h")]
     pub closed_within: String,
 
-    /// Maximum recently-closed beads shown per prefix. Default 5; `0`
+    /// Maximum recently-closed beads shown per prefix. Default 3; `0`
     /// means unbounded within the window.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 3)]
     pub closed_limit: usize,
 
     /// Treat agent presence older than this as offline (e.g. `30m`, `1h`).
