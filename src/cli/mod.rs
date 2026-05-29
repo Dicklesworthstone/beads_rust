@@ -1054,6 +1054,16 @@ pub struct DashArgs {
     #[arg(long)]
     pub show_closed: bool,
 
+    /// Show recently-closed footer per prefix within this window
+    /// (e.g. `2h`, `24h`, `3d`, `1w`). Default `24h`; `0` disables.
+    #[arg(long, default_value = "24h")]
+    pub closed_within: String,
+
+    /// Maximum recently-closed beads shown per prefix. Default 5; `0`
+    /// means unbounded within the window.
+    #[arg(long, default_value_t = 5)]
+    pub closed_limit: usize,
+
     /// Redraw every N seconds (top-style live view). Auto-disabled when
     /// stdout is not a TTY — pipes get one frame and exit.
     #[arg(long)]
