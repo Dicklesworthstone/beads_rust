@@ -529,7 +529,7 @@ fn finalize_sync_result(
 ) -> Result<()> {
     match command_result {
         Ok(()) => {
-            open_result.discard_pending_recovery_backup();
+            open_result.discard_pending_recovery_backup()?;
             Ok(())
         }
         Err(command_err) => {

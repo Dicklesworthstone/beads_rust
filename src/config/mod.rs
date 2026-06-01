@@ -1166,8 +1166,55 @@ pub(crate) fn repair_database_from_jsonl_with_import_config(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
     show_progress: bool,
-    mut import_config: ImportConfig,
+    import_config: ImportConfig,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
+    let (storage, import_result, backup_set) = repair_database_from_jsonl_with_backup(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        lock_timeout,
+        bootstrap_layer,
+        show_progress,
+        import_config,
+    )?;
+    let verified_backups = backup_set.verified_files.clone();
+    Ok((storage, import_result, verified_backups))
+}
+
+fn repair_database_from_jsonl_retaining_backup(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    show_progress: bool,
+    allow_external_jsonl: bool,
+) -> Result<(SqliteStorage, ImportResult, RecoveryBackupSet)> {
+    let mut import_config =
+        import_config_for_resolved_jsonl(beads_dir, db_path, jsonl_path, allow_external_jsonl);
+    import_config.show_progress = show_progress;
+    import_config.skip_prefix_validation = true;
+
+    repair_database_from_jsonl_with_backup(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        lock_timeout,
+        bootstrap_layer,
+        show_progress,
+        import_config,
+    )
+}
+
+fn repair_database_from_jsonl_with_backup(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    show_progress: bool,
+    mut import_config: ImportConfig,
+) -> Result<(SqliteStorage, ImportResult, RecoveryBackupSet)> {
     import_config.beads_dir = Some(beads_dir.to_path_buf());
     import_config.allow_external_jsonl |=
         implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path);
@@ -1203,7 +1250,7 @@ pub(crate) fn repair_database_from_jsonl_with_import_config(
         verified_backups = ?verified_backups,
         "SQLite rebuild from JSONL succeeded"
     );
-    Ok((storage, import_result, verified_backups))
+    Ok((storage, import_result, backup_set))
 }
 
 fn should_surface_recovery_error(recovery_err: &BeadsError) -> bool {
@@ -2172,6 +2219,44 @@ fn restore_database_family_after_failed_rebuild(backup_set: &RecoveryBackupSet) 
     Ok(())
 }
 
+fn discard_successful_recovery_backup(backup_set: &RecoveryBackupSet) -> Result<()> {
+    for (_, backup) in &backup_set.files {
+        match fs::remove_file(backup) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Successful database rebuild completed, but recovery backup '{}' could not be removed",
+                        backup.display()
+                    ),
+                    source: Box::new(err),
+                });
+            }
+        }
+    }
+
+    match fs::remove_dir(&backup_set.recovery_dir) {
+        Ok(()) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) => {}
+        Err(err) => {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Successful database rebuild completed, but empty recovery directory '{}' could not be removed",
+                    backup_set.recovery_dir.display()
+                ),
+                source: Box::new(err),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) fn recovery_dir_for_db_path(db_path: &Path, beads_dir: &Path) -> PathBuf {
     db_path
         .parent()
@@ -2419,7 +2504,7 @@ impl OpenStorageResult {
         // BusySnapshot conflicts.
         self.storage = SqliteStorage::open_memory()?;
 
-        let (storage, _, _) = repair_database_from_jsonl(
+        let (storage, _, backup_set) = repair_database_from_jsonl_retaining_backup(
             &self.paths.beads_dir,
             &self.paths.db_path,
             &self.paths.jsonl_path,
@@ -2431,7 +2516,7 @@ impl OpenStorageResult {
         self.storage = storage;
         self.loaded_jsonl_hash = None;
         self.auto_rebuilt = true;
-        self.pending_recovery_backup = None;
+        self.pending_recovery_backup = Some(backup_set);
         Ok(())
     }
 
@@ -2442,8 +2527,11 @@ impl OpenStorageResult {
             .map(|backup| backup.recovery_dir.as_path())
     }
 
-    pub(crate) fn discard_pending_recovery_backup(&mut self) {
-        self.pending_recovery_backup = None;
+    pub(crate) fn discard_pending_recovery_backup(&mut self) -> Result<()> {
+        if let Some(backup_set) = self.pending_recovery_backup.take() {
+            discard_successful_recovery_backup(&backup_set)?;
+        }
+        Ok(())
     }
 
     /// Restore the original database family after a deferred recovery prepared
