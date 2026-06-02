@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           # Check out the requested tag on workflow_dispatch so the Cargo.toml
           # we verify matches the artifacts that will actually be built.
@@ -87,7 +87,7 @@ jobs:
             echo "Reason: $RELIABILITY_OVERRIDE_REASON"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
@@ -213,7 +213,7 @@ jobs:
             linker: x86_64-w64-mingw32-gcc
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           # On workflow_dispatch, build from the requested tag so the binary's
           # embedded version matches what we publish.
@@ -404,7 +404,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           # On workflow_dispatch, the default ref is the branch (e.g. "main"),
           # but the release needs to be cut from the requested tag so the SBOM,
@@ -639,7 +639,7 @@ jobs:
     timeout-minutes: 15
     if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}  # Skip pre-releases
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           # cargo publish must build from the tagged source, not the branch HEAD.
           ref: ${{ github.event.inputs.tag || github.ref }}
