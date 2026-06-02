@@ -42,7 +42,7 @@ clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.3"
+fsqlite = "0.1.5"
 fsqlite-types = "0.1.3"
 fsqlite-error = "0.1.3"
 fsqlite-core = "0.1.3"
