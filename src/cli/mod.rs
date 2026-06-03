@@ -695,6 +695,9 @@ pub enum Commands {
     /// Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
     Msg(MsgArgs),
 
+    /// Ask the human operator a question (free-form, --yn, or --choices)
+    Ask(AskArgs),
+
     /// List received messages (or show a specific message in full)
     Inbox(InboxArgs),
 
@@ -1000,6 +1003,43 @@ pub enum AdminCommands {
 
     /// Manage AGENTS.md workflow instructions
     Agents(AgentsArgs),
+
+    /// Triage questions agents have sent to the operator
+    Operator {
+        #[command(subcommand)]
+        command: OperatorCommands,
+    },
+}
+
+/// Subcommands of `bd admin operator` for handling agent asks.
+#[derive(Subcommand, Debug)]
+pub enum OperatorCommands {
+    /// Interactive REPL: page through pending asks, answer or skip
+    Attend,
+
+    /// One-shot list of pending asks (scripting escape hatch)
+    List(OperatorListArgs),
+
+    /// One-shot reply to a specific ask (scripting escape hatch)
+    Reply(OperatorReplyArgs),
+}
+
+/// Args for `bd admin operator list`.
+#[derive(Args, Debug, Default)]
+pub struct OperatorListArgs {
+    /// Include already-handled asks.
+    #[arg(long)]
+    pub all: bool,
+}
+
+/// Args for `bd admin operator reply <id> [body]`.
+#[derive(Args, Debug, Default)]
+pub struct OperatorReplyArgs {
+    /// Ask message ID to reply to.
+    pub id: String,
+
+    /// Reply body. If omitted, read from stdin.
+    pub body: Vec<String>,
 }
 
 /// Arguments for the completions command.
@@ -1099,6 +1139,23 @@ pub struct MsgArgs {
     /// Reply to an existing message; chains via in_reply_to.
     #[arg(long)]
     pub reply: Option<String>,
+}
+
+/// Arguments for the `ask` command (send a question to the operator).
+#[derive(Args, Debug, Default)]
+pub struct AskArgs {
+    /// Question body. If omitted, read from stdin.
+    pub body: Vec<String>,
+
+    /// Shorthand for `--choices y,n` — operator gets y/n hotkeys.
+    #[arg(long, conflicts_with = "choices")]
+    pub yn: bool,
+
+    /// Comma-separated choice tokens (e.g. `safe,bold,abort`). Each
+    /// token's first letter becomes a hotkey in the operator REPL, so
+    /// tokens must have unique first letters.
+    #[arg(long)]
+    pub choices: Option<String>,
 }
 
 /// Arguments for the `inbox` command (list/show received messages).

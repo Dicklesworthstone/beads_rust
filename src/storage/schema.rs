@@ -194,6 +194,10 @@ pub const SCHEMA_SQL: &str = r"
 
     -- Ephemeral inter-agent messages (NOT issues).
     -- These are conversational, not work items; auto-expire after a TTL on read.
+    -- `choices` distinguishes operator-asks from regular messages:
+    --   NULL        → regular message (free-form reply expected, if any)
+    --   ''          → free-form ask to operator (rendered [r]eply in attend)
+    --   'y,n'/...   → constrained ask; operator REPL maps each token to a hotkey
     CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY,
         from_prefix TEXT NOT NULL,
@@ -202,6 +206,7 @@ pub const SCHEMA_SQL: &str = r"
         sent_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         read_at DATETIME,
         in_reply_to TEXT,
+        choices TEXT,
         FOREIGN KEY (in_reply_to) REFERENCES messages(id) ON DELETE SET NULL
     );
 
@@ -335,6 +340,8 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
     ("created_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
 ];
 
+const MESSAGE_COLUMNS: &[(&str, &str)] = &[("choices", "TEXT")];
+
 fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
     if !table_exists(conn, table) {
         return Ok(());
@@ -372,6 +379,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
     ensure_columns(conn, "dependencies", DEPENDENCY_COLUMNS)?;
     ensure_columns(conn, "comments", COMMENT_COLUMNS)?;
     ensure_columns(conn, "events", EVENT_COLUMNS)?;
+    ensure_columns(conn, "messages", MESSAGE_COLUMNS)?;
 
     // Always drop idx_issues_ready so SCHEMA_SQL recreates it with the
     // current definition (including is_template filter). DROP INDEX is O(1)

@@ -50,6 +50,7 @@ pub fn execute(
     let mut prefix_set = None;
     if let Some(p) = prefix {
         let normalized = p.to_ascii_lowercase();
+        crate::config::assert_writable_prefix(&normalized)?;
         storage.set_config("issue_prefix", &normalized)?;
         prefix_set = Some(normalized);
     }

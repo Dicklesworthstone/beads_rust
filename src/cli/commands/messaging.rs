@@ -42,6 +42,15 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         return Err(BeadsError::validation("to", "recipient prefix is required"));
     }
 
+    if to.eq_ignore_ascii_case(config::OPERATOR_PREFIX) {
+        return Err(BeadsError::validation(
+            "to",
+            "messages to 'operator' must use `bd ask` so the attend REPL \
+             can render them — try `bd ask <body>`, `bd ask --yn`, or \
+             `bd ask --choices a,b,c`",
+        ));
+    }
+
     let body = resolve_body(&args.body)?;
     if body.trim().is_empty() {
         return Err(BeadsError::validation("body", "message body is empty"));
@@ -71,6 +80,7 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         sent_at: now,
         read_at: None,
         in_reply_to: args.reply.clone(),
+        choices: None,
     };
 
     storage_ctx.storage.insert_message(&msg)?;
@@ -129,6 +139,9 @@ pub fn execute_inbox(
         from_prefix: args.from.clone(),
         only_unread: !args.all,
         limit: None,
+        // Asks are handled by `bd admin operator attend`; keep them out
+        // of regular inbox listings so they don't get auto-marked-read.
+        only_asks: Some(false),
     };
     let messages = storage_ctx.storage.list_messages(&filter)?;
 
@@ -174,8 +187,7 @@ pub fn execute_outbox(
     let filter = MessageFilter {
         from_prefix: Some(me),
         to_prefix: args.to.clone(),
-        only_unread: false,
-        limit: None,
+        ..Default::default()
     };
 
     let messages = storage_ctx.storage.list_messages(&filter)?;
@@ -304,6 +316,7 @@ mod tests {
             sent_at: Utc::now(),
             read_at: None,
             in_reply_to: None,
+            choices: None,
         };
         let mut buf = Vec::new();
         let (display, truncated) = if m.body.len() > PREVIEW_CHARS {

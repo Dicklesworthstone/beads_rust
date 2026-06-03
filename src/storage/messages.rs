@@ -28,6 +28,10 @@ pub struct MessageFilter {
     pub from_prefix: Option<String>,
     pub only_unread: bool,
     pub limit: Option<usize>,
+    /// `None` → no filter on `choices`; `Some(true)` → only asks
+    /// (choices IS NOT NULL); `Some(false)` → only regular messages
+    /// (choices IS NULL).
+    pub only_asks: Option<bool>,
 }
 
 /// Generate a short, opaque message ID. Collisions are checked by the caller.
@@ -49,8 +53,8 @@ pub fn generate_message_id(from: &str, to: &str, body: &str, sent_at: DateTime<U
 /// Returns an error if the DB insert fails.
 pub fn insert_message(conn: &Connection, msg: &Message) -> Result<()> {
     conn.execute(
-        "INSERT INTO messages (id, from_prefix, to_prefix, body, sent_at, read_at, in_reply_to)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO messages (id, from_prefix, to_prefix, body, sent_at, read_at, in_reply_to, choices)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             msg.id,
             msg.from_prefix,
@@ -59,6 +63,7 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> Result<()> {
             msg.sent_at.to_rfc3339(),
             msg.read_at.map(|t| t.to_rfc3339()),
             msg.in_reply_to,
+            msg.choices,
         ],
     )?;
     Ok(())
@@ -83,7 +88,7 @@ pub fn message_id_exists(conn: &Connection, id: &str) -> Result<bool> {
 /// Returns an error if the DB query fails.
 pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>> {
     conn.prepare_cached(
-        "SELECT id, from_prefix, to_prefix, body, sent_at, read_at, in_reply_to
+        "SELECT id, from_prefix, to_prefix, body, sent_at, read_at, in_reply_to, choices
          FROM messages WHERE id = ?1",
     )?
     .query_row([id], row_to_message)
@@ -98,7 +103,7 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>> {
 /// Returns an error if the DB query fails.
 pub fn list_messages(conn: &Connection, filter: &MessageFilter) -> Result<Vec<Message>> {
     let mut sql = String::from(
-        "SELECT id, from_prefix, to_prefix, body, sent_at, read_at, in_reply_to
+        "SELECT id, from_prefix, to_prefix, body, sent_at, read_at, in_reply_to, choices
          FROM messages WHERE 1=1",
     );
     let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -113,6 +118,11 @@ pub fn list_messages(conn: &Connection, filter: &MessageFilter) -> Result<Vec<Me
     }
     if filter.only_unread {
         sql.push_str(" AND read_at IS NULL");
+    }
+    match filter.only_asks {
+        Some(true) => sql.push_str(" AND choices IS NOT NULL"),
+        Some(false) => sql.push_str(" AND choices IS NULL"),
+        None => {}
     }
     sql.push_str(" ORDER BY sent_at DESC");
     if let Some(limit) = filter.limit {
@@ -166,6 +176,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
         sent_at: parse_db_timestamp(&sent_at_str),
         read_at: read_at_str.map(|s| parse_db_timestamp(&s)),
         in_reply_to: row.get("in_reply_to")?,
+        choices: row.get("choices")?,
     })
 }
 
@@ -189,6 +200,7 @@ mod tests {
             sent_at: Utc::now(),
             read_at: None,
             in_reply_to: reply.map(String::from),
+            choices: None,
         }
     }
 

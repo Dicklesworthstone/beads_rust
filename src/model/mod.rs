@@ -638,6 +638,11 @@ pub struct Comment {
 /// An ephemeral inter-agent message. Distinct from `Issue`: messages
 /// are conversational, auto-expire after read, and never carry work-item
 /// semantics.
+///
+/// `choices` distinguishes operator-asks from regular messages: `None`
+/// means a normal message; `Some("")` means a free-form ask to operator;
+/// `Some("y,n")` (or other CSV) means a constrained ask. The operator
+/// REPL renders hotkeys based on this field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
 pub struct Message {
     pub id: String,
@@ -649,6 +654,8 @@ pub struct Message {
     pub read_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices: Option<String>,
 }
 
 /// An event in the issue's history (audit log).

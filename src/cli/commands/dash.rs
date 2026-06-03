@@ -94,7 +94,13 @@ struct RecentClosure<'a> {
 #[derive(Serialize)]
 struct DashOutput<'a> {
     ts: String,
+    #[serde(skip_serializing_if = "is_zero")]
+    pending_asks: usize,
     groups: Vec<DashGroup<'a>>,
+}
+
+const fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Execute the dash command.
@@ -186,14 +192,38 @@ fn render_once(
         presence_ttl,
     );
 
+    let pending_asks = count_pending_asks(&storage)?;
+
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     match format {
-        OutputFormat::Json | OutputFormat::Toon => render_json(&mut out, &groups, now)?,
-        _ => render_text(&mut out, &groups, terminal_width(), &args.closed_within, now)?,
+        OutputFormat::Json | OutputFormat::Toon => {
+            render_json(&mut out, &groups, now, pending_asks)?;
+        }
+        _ => render_text(
+            &mut out,
+            &groups,
+            terminal_width(),
+            &args.closed_within,
+            now,
+            pending_asks,
+        )?,
     }
     out.flush().ok();
     Ok(())
+}
+
+/// Count unread asks addressed to the operator. Cheap query — single
+/// indexed scan on `messages`.
+fn count_pending_asks(storage: &SqliteStorage) -> Result<usize> {
+    use crate::storage::messages::MessageFilter;
+    let filter = MessageFilter {
+        to_prefix: Some(crate::config::OPERATOR_PREFIX.to_string()),
+        only_unread: true,
+        only_asks: Some(true),
+        ..Default::default()
+    };
+    Ok(storage.list_messages(&filter)?.len())
 }
 
 /// Parse a `--closed-within` duration string. `""`, `"0"`, `"0s"` etc. yield None.
@@ -579,7 +609,16 @@ fn render_text<W: Write>(
     width: u16,
     _closed_within_label: &str,
     _now: DateTime<Utc>,
+    pending_asks: usize,
 ) -> Result<()> {
+    if pending_asks > 0 {
+        let noun = if pending_asks == 1 { "ask" } else { "asks" };
+        writeln!(
+            out,
+            "operator: {pending_asks} {noun} pending — run `bd admin operator attend`"
+        )?;
+        writeln!(out)?;
+    }
     if groups.is_empty() {
         writeln!(out, "(no beads)")?;
         return Ok(());
@@ -732,7 +771,12 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn render_json<W: Write>(out: &mut W, groups: &[OwnedGroup], now: DateTime<Utc>) -> Result<()> {
+fn render_json<W: Write>(
+    out: &mut W,
+    groups: &[OwnedGroup],
+    now: DateTime<Utc>,
+    pending_asks: usize,
+) -> Result<()> {
     let view: Vec<DashGroup> = groups
         .iter()
         .map(|g| DashGroup {
@@ -776,6 +820,7 @@ fn render_json<W: Write>(out: &mut W, groups: &[OwnedGroup], now: DateTime<Utc>)
         .collect();
     let payload = DashOutput {
         ts: now.to_rfc3339(),
+        pending_asks,
         groups: view,
     };
     writeln!(out, "{}", serde_json::to_string(&payload)?)?;
@@ -1088,7 +1133,7 @@ mod tests {
     #[test]
     fn empty_workspace_renders_no_beads() {
         let mut buf = Vec::new();
-        render_text(&mut buf, &[], 80, "24h", Utc::now()).unwrap();
+        render_text(&mut buf, &[], 80, "24h", Utc::now(), 0).unwrap();
         let s = String::from_utf8(buf).unwrap();
         assert_eq!(s.trim(), "(no beads)");
     }

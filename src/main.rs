@@ -67,6 +67,7 @@ fn main() {
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Dash(args) => commands::dash::execute(&args, &overrides, &output_ctx),
         Commands::Msg(args) => commands::messaging::execute_msg(&args, &overrides, &output_ctx),
+        Commands::Ask(args) => commands::ask::execute(&args, &overrides, &output_ctx),
         Commands::Inbox(args) => commands::messaging::execute_inbox(&args, &overrides, &output_ctx),
         Commands::Outbox(args) => {
             commands::messaging::execute_outbox(&args, &overrides, &output_ctx)
@@ -185,6 +186,20 @@ fn dispatch_admin(
             };
             commands::agents::execute(&agents_args, output_ctx)
         }
+        A::Operator { command } => dispatch_operator(command, overrides, output_ctx),
+    }
+}
+
+fn dispatch_operator(
+    command: beads_rust::cli::OperatorCommands,
+    overrides: &config::CliOverrides,
+    output_ctx: &OutputContext,
+) -> Result<()> {
+    use beads_rust::cli::OperatorCommands as O;
+    match command {
+        O::Attend => commands::operator::execute_attend(overrides, output_ctx),
+        O::List(args) => commands::operator::execute_list(&args, overrides, output_ctx),
+        O::Reply(args) => commands::operator::execute_reply(&args, overrides, output_ctx),
     }
 }
 
@@ -200,7 +215,8 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Defer(_)
         | Commands::Undefer(_)
-        | Commands::Msg(_) => true,
+        | Commands::Msg(_)
+        | Commands::Ask(_) => true,
         Commands::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
@@ -212,12 +228,14 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
 
 const fn is_mutating_admin(cmd: &beads_rust::cli::AdminCommands) -> bool {
     use beads_rust::cli::AdminCommands as A;
+    use beads_rust::cli::OperatorCommands as O;
     match cmd {
         A::Delete(_) => true,
         A::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
+        A::Operator { command } => matches!(command, O::Attend | O::Reply(_)),
         _ => false,
     }
 }
@@ -267,6 +285,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::History(_)
         | Commands::Watch(_)
         | Commands::Msg(_)
+        | Commands::Ask(_)
         | Commands::Inbox(_)
         | Commands::Outbox(_)
         | Commands::Dash(_)

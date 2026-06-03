@@ -27,6 +27,32 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::warn;
 
+/// Reserved prefix that addresses the human operator. Agents must not
+/// adopt this as their own issue prefix; it is the recipient of
+/// `bd ask` and is triaged via `bd admin operator attend`.
+pub const OPERATOR_PREFIX: &str = "operator";
+
+/// Reject the reserved operator prefix at write paths (init, create).
+/// Read paths (e.g. attend) intentionally do *not* call this — they
+/// need to query the operator namespace directly.
+///
+/// # Errors
+///
+/// Returns a validation error when `prefix` equals [`OPERATOR_PREFIX`]
+/// (case-insensitive).
+pub fn assert_writable_prefix(prefix: &str) -> Result<()> {
+    if prefix.trim().eq_ignore_ascii_case(OPERATOR_PREFIX) {
+        return Err(BeadsError::validation(
+            "prefix",
+            format!(
+                "'{OPERATOR_PREFIX}' is a reserved prefix for the human operator; \
+                 agents cannot adopt it. Pick a different prefix."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Default database filename used when metadata is missing.
 const DEFAULT_DB_FILENAME: &str = "beads.db";
 /// Default JSONL filename used when metadata is missing.

@@ -80,6 +80,11 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         sender,
     };
 
+    // Reject the reserved `operator` prefix at the write boundary — both
+    // when an agent explicitly passes --prefix operator and when the
+    // environment has BD_ISSUE_PREFIX=operator.
+    config::assert_writable_prefix(&config.id_config.prefix)?;
+
     let issue = create_issue_impl(&mut storage_ctx.storage, args, &config)?;
 
     // Output
@@ -445,6 +450,7 @@ fn execute_import(
         .map(|_| home_prefix.clone());
 
     let id_config = config::id_config_from_layer(&layer);
+    config::assert_writable_prefix(&id_config.prefix)?;
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
