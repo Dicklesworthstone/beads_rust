@@ -13,6 +13,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [Parsing JSON Output](#parsing-json-output)
 - [Error Handling](#error-handling)
 - [MCP Server](#mcp-server)
+- [Agent Contract Drift Verifier](#agent-contract-drift-verifier)
 - [Robot Mode Flags](#robot-mode-flags)
 - [Degraded Coordination Without Agent Mail](#degraded-coordination-without-agent-mail)
 - [Swarm-Scale Tuning](#swarm-scale-tuning)
@@ -656,6 +657,48 @@ Use MCP when an agent is already MCP-native, needs to discover available actions
 without memorizing CLI flags, or should receive structured recovery data such as
 `suggested_tool_calls`. Use shell commands with `--json` for short scripts,
 bulk pipelines, and workflows that need standard Unix composition with `jq`.
+
+---
+
+## Agent Contract Drift Verifier
+
+Run this verifier before changing any surface that agents parse, discover, or
+quote in prompts:
+
+- `br schema ...` targets or schema command output;
+- JSON or TOON output for `list`, `show`, `ready`, `coordination status`, and
+  related read commands;
+- MCP resources, tools, prompts, or serve-mode descriptions;
+- `robot-docs`, `doctor capabilities`, `agent_baseline/`, or docs examples that
+  agents copy into prompts.
+
+The verifier is intentionally a command block, not a background service. It must
+not require live Agent Mail, network access, git mutation, daemon state, or a
+running MCP client. Run it through RCH when working as an agent; the commands are
+plain Cargo/test/doc checks so an operator can run the same block locally.
+
+```bash
+set -euo pipefail
+export RUST_LOG=error
+
+cargo test --test e2e_schema -- --nocapture
+cargo test --test conformance_schema -- --nocapture
+cargo test --test conformance_text_output -- --nocapture
+cargo test --test conformance_workflows -- --nocapture
+cargo test doctor_subsystems::surface --lib
+
+# Only needed when editing MCP resources, tools, prompts, or serve-mode docs.
+cargo test --features mcp mcp:: --lib
+
+git diff --check
+br sync --flush-only
+```
+
+If a change only touches prose outside agent-facing examples, run at least
+`git diff --check` and explain why the full verifier was not relevant in the PR
+body. If the full verifier fails, do not update snapshots or accept new command
+shapes until the failure is classified as either a real regression or an
+intentional contract change with matching docs.
 
 ---
 
