@@ -143,11 +143,12 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     // checks this table to flag typos that would otherwise drop messages
     // into an unwatched queue. Crashed watchers self-evict via TTL.
     let pid = i64::try_from(std::process::id()).unwrap_or(0);
-    {
+    let startup_reload_gen = {
         let (mut storage, _paths) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
         storage.register_watcher(&prefix, pid, Utc::now())?;
-    }
+        crate::cli::commands::reload::read_generation(&storage)?
+    };
     let _watcher_guard = WatcherGuard {
         beads_dir: beads_dir.clone(),
         prefix: prefix.clone(),
@@ -206,13 +207,43 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
 
         let now = Utc::now();
 
-        // Heartbeat. Best-effort — a single failed write shouldn't kill
-        // the watch loop. `bd msg` uses this to detect typos like
-        // `bd msg infra` vs `infra1`.
+        // Heartbeat + reload check. Best-effort — a single failed write
+        // shouldn't kill the watch loop. `bd msg` uses the heartbeat to
+        // detect typos like `bd msg infra` vs `infra1`. The reload-gen
+        // check lets `bd admin reload` ask running watchers to exit
+        // cleanly so a freshly-installed bd binary can take over.
         if let Ok((mut storage, _paths)) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)
         {
             let _ = storage.heartbeat_watcher(&prefix, pid, now);
+            if let Ok(current_gen) =
+                crate::cli::commands::reload::read_generation(&storage)
+                && current_gen > startup_reload_gen
+            {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let _ = writeln!(
+                    out,
+                    "[{}] BD_RELOAD: bd reload requested at {}; exiting so a \
+                     new bd watch can pick up the latest binary.",
+                    now.to_rfc3339(),
+                    chrono::DateTime::<Utc>::from_timestamp(current_gen, 0)
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| current_gen.to_string())
+                );
+                if watch_beads {
+                    flush_batches(
+                        &mut batches,
+                        &prefix,
+                        format,
+                        now,
+                        true,
+                        debounce,
+                        debounce_max,
+                    )?;
+                }
+                break;
+            }
         }
 
         if watch_beads {

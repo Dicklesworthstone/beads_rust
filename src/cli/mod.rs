@@ -1005,6 +1005,11 @@ pub enum AdminCommands {
         #[command(subcommand)]
         command: OperatorCommands,
     },
+
+    /// Ask running `bd watch` processes to exit cleanly (e.g. to pick
+    /// up a freshly-installed bd binary). Each watcher exits on its
+    /// next tick with a BD_RELOAD notification.
+    Reload,
 }
 
 /// Subcommands of `bd admin operator` for handling agent asks.

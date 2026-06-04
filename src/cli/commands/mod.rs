@@ -26,6 +26,7 @@ pub mod presence;
 pub mod q;
 pub mod query;
 pub mod ready;
+pub mod reload;
 pub mod reopen;
 pub mod schema;
 pub mod search;
