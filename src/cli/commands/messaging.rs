@@ -71,6 +71,34 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
     }
 
     let now = Utc::now();
+
+    // Reject messages to prefixes with no active `bd watch` heartbeat
+    // (the silent-drop footgun: `bd msg infra` when the watcher is
+    // `infra1`). Skip the check when --force is set, when replying
+    // to a real message (the asker presumably knows what they're
+    // doing), or when messaging your own prefix (testing).
+    if !args.force && args.reply.is_none() && to != from {
+        let ttl = crate::storage::watchers::WATCHER_TTL_SECONDS;
+        let _ = storage_ctx.storage.sweep_stale_watchers(now, ttl);
+        if !storage_ctx.storage.is_prefix_watched(to, now, ttl)? {
+            let active = storage_ctx.storage.active_watcher_prefixes(now, ttl)?;
+            let suggestion = if active.is_empty() {
+                "no agents are currently watching. Start one with `bd watch` \
+                 in the recipient's environment, or use --force to send anyway."
+                    .to_string()
+            } else {
+                format!(
+                    "active watcher prefixes: {}. Use --force to send anyway.",
+                    active.join(", ")
+                )
+            };
+            return Err(BeadsError::validation(
+                "to",
+                format!("no active `bd watch` for '{to}' — {suggestion}"),
+            ));
+        }
+    }
+
     let id = pick_message_id(&storage_ctx.storage, &from, to, &body, now)?;
     let msg = Message {
         id: id.clone(),

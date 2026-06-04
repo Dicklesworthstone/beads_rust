@@ -17,5 +17,6 @@ pub mod messages;
 pub mod presence;
 pub mod schema;
 pub mod sqlite;
+pub mod watchers;
 
 pub use sqlite::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};

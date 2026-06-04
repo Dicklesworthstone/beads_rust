@@ -226,6 +226,19 @@ pub const SCHEMA_SQL: &str = r"
         state TEXT NOT NULL CHECK(state IN ('working', 'idle')),
         last_changed DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Active `bd watch` heartbeats. Used by `bd msg` to detect typos like
+    -- 'infra' vs 'infra1' that would otherwise silently drop messages.
+    -- A row exists for each running `bd watch` process; `last_seen` is
+    -- updated each poll tick. Crashed watchers self-evict via TTL.
+    CREATE TABLE IF NOT EXISTS watchers (
+        prefix TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (prefix, pid)
+    );
+    CREATE INDEX IF NOT EXISTS idx_watchers_last_seen ON watchers(last_seen);
 ";
 
 /// Apply the schema to the database.

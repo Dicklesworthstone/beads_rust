@@ -15,10 +15,30 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
+
+/// Drop guard that unregisters this `bd watch` from the `watchers`
+/// table on clean shutdown. Best-effort — failures are silenced (the
+/// row will age out via TTL if we can't reach the DB anymore).
+struct WatcherGuard {
+    beads_dir: PathBuf,
+    prefix: String,
+    pid: i64,
+    cli: config::CliOverrides,
+}
+
+impl Drop for WatcherGuard {
+    fn drop(&mut self) {
+        if let Ok((mut storage, _paths)) =
+            config::open_storage(&self.beads_dir, self.cli.db.as_ref(), self.cli.lock_timeout)
+        {
+            let _ = storage.unregister_watcher(&self.prefix, self.pid);
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct BeadState {
@@ -119,6 +139,22 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let prefix = resolve_prefix(args, &beads_dir, cli)?;
 
+    // Register this watcher and arrange to unregister on Drop. `bd msg`
+    // checks this table to flag typos that would otherwise drop messages
+    // into an unwatched queue. Crashed watchers self-evict via TTL.
+    let pid = i64::try_from(std::process::id()).unwrap_or(0);
+    {
+        let (mut storage, _paths) =
+            config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+        storage.register_watcher(&prefix, pid, Utc::now())?;
+    }
+    let _watcher_guard = WatcherGuard {
+        beads_dir: beads_dir.clone(),
+        prefix: prefix.clone(),
+        pid,
+        cli: cli.clone(),
+    };
+
     let watch_beads = !args.inbox;
     let watch_inbox = !args.no_inbox;
 
@@ -169,6 +205,15 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         tick += 1;
 
         let now = Utc::now();
+
+        // Heartbeat. Best-effort — a single failed write shouldn't kill
+        // the watch loop. `bd msg` uses this to detect typos like
+        // `bd msg infra` vs `infra1`.
+        if let Ok((mut storage, _paths)) =
+            config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)
+        {
+            let _ = storage.heartbeat_watcher(&prefix, pid, now);
+        }
 
         if watch_beads {
             let current = match snapshot_state(&beads_dir, cli, &prefix) {

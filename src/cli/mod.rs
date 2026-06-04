@@ -1139,6 +1139,12 @@ pub struct MsgArgs {
     /// Reply to an existing message; chains via in_reply_to.
     #[arg(long)]
     pub reply: Option<String>,
+
+    /// Send even if no `bd watch` heartbeat exists for the recipient.
+    /// Useful when you know the recipient will start watching shortly,
+    /// or for write-and-forget testing.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for the `ask` command (send a question to the operator).

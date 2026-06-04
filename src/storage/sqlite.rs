@@ -224,6 +224,83 @@ impl SqliteStorage {
         crate::storage::presence::all_presence(&self.conn)
     }
 
+    /// Register an active `bd watch` heartbeat.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB write fails.
+    pub fn register_watcher(
+        &mut self,
+        prefix: &str,
+        pid: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        crate::storage::watchers::register(&self.conn, prefix, pid, now)
+    }
+
+    /// Update `last_seen` for a running watcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB write fails.
+    pub fn heartbeat_watcher(
+        &mut self,
+        prefix: &str,
+        pid: i64,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        crate::storage::watchers::heartbeat(&self.conn, prefix, pid, now)
+    }
+
+    /// Remove a watcher row (clean shutdown).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB write fails.
+    pub fn unregister_watcher(&mut self, prefix: &str, pid: i64) -> Result<()> {
+        crate::storage::watchers::unregister(&self.conn, prefix, pid)
+    }
+
+    /// Whether `prefix` has any live watcher within `ttl_seconds`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn is_prefix_watched(
+        &self,
+        prefix: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: i64,
+    ) -> Result<bool> {
+        crate::storage::watchers::is_active(&self.conn, prefix, now, ttl_seconds)
+    }
+
+    /// Distinct prefixes with at least one live watcher.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn active_watcher_prefixes(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: i64,
+    ) -> Result<Vec<String>> {
+        crate::storage::watchers::active_prefixes(&self.conn, now, ttl_seconds)
+    }
+
+    /// GC stale watcher rows. Called opportunistically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB delete fails.
+    pub fn sweep_stale_watchers(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: i64,
+    ) -> Result<usize> {
+        crate::storage::watchers::sweep_stale(&self.conn, now, ttl_seconds)
+    }
+
     /// Execute a mutation with the 4-step transaction protocol.
     ///
     /// # Errors
