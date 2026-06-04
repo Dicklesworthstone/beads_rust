@@ -695,6 +695,9 @@ pub enum Commands {
     /// Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
     Msg(MsgArgs),
 
+    /// List agents currently watching for messages (active `bd watch` heartbeats)
+    Who(WhoArgs),
+
     /// Ask the human operator a question (free-form, --yn, or --choices)
     Ask(AskArgs),
 
@@ -904,10 +907,6 @@ EXAMPLES:
     /// Visualize dependency graph
     #[command(hide = true)]
     Graph(GraphArgs),
-
-    /// Manage AGENTS.md workflow instructions
-    #[command(hide = true)]
-    Agents(AgentsArgs),
 }
 
 /// Operations grouped under `bd admin`.
@@ -1000,9 +999,6 @@ pub enum AdminCommands {
         #[command(subcommand)]
         command: QueryCommands,
     },
-
-    /// Manage AGENTS.md workflow instructions
-    Agents(AgentsArgs),
 
     /// Triage questions agents have sent to the operator
     Operator {
@@ -1145,6 +1141,22 @@ pub struct MsgArgs {
     /// or for write-and-forget testing.
     #[arg(long)]
     pub force: bool,
+}
+
+/// Arguments for the `who` command (list active watchers).
+#[derive(Args, Debug, Default)]
+pub struct WhoArgs {
+    /// Show extra columns (PID, started-at, last-seen-timestamp).
+    #[arg(long, short = 'l')]
+    pub long_format: bool,
+
+    /// Override the staleness threshold in seconds. Default 60.
+    #[arg(long)]
+    pub ttl: Option<i64>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
 }
 
 /// Arguments for the `ask` command (send a question to the operator).
@@ -2614,31 +2626,3 @@ pub struct GraphArgs {
     pub no_sender: bool,
 }
 
-/// Arguments for the agents command.
-#[derive(Args, Debug, Clone, Default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct AgentsArgs {
-    /// Add beads workflow instructions to AGENTS.md
-    #[arg(long)]
-    pub add: bool,
-
-    /// Remove beads workflow instructions from AGENTS.md
-    #[arg(long)]
-    pub remove: bool,
-
-    /// Update beads workflow instructions to latest version
-    #[arg(long)]
-    pub update: bool,
-
-    /// Check status only (default behavior)
-    #[arg(long)]
-    pub check: bool,
-
-    /// Preview changes without modifying files
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Skip confirmation prompts
-    #[arg(long, short = 'f')]
-    pub force: bool,
-}

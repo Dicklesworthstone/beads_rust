@@ -67,6 +67,7 @@ fn main() {
         Commands::Lint(args) => commands::lint::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Dash(args) => commands::dash::execute(&args, &overrides, &output_ctx),
         Commands::Msg(args) => commands::messaging::execute_msg(&args, &overrides, &output_ctx),
+        Commands::Who(args) => commands::who::execute(&args, &overrides, &output_ctx),
         Commands::Ask(args) => commands::ask::execute(&args, &overrides, &output_ctx),
         Commands::Inbox(args) => commands::messaging::execute_inbox(&args, &overrides, &output_ctx),
         Commands::Outbox(args) => {
@@ -111,17 +112,6 @@ fn main() {
         }
         Commands::Query { command } => commands::query::execute(&command, &overrides, &output_ctx),
         Commands::Graph(args) => commands::graph::execute(&args, &overrides, &output_ctx),
-        Commands::Agents(args) => {
-            let agents_args = commands::agents::AgentsArgs {
-                add: args.add,
-                remove: args.remove,
-                update: args.update,
-                check: args.check,
-                dry_run: args.dry_run,
-                force: args.force,
-            };
-            commands::agents::execute(&agents_args, &output_ctx)
-        }
         Commands::Admin { command } => dispatch_admin(command, &overrides, &output_ctx, cli.json),
     };
 
@@ -175,17 +165,6 @@ fn dispatch_admin(
             commands::changelog::execute(&args, json || args.robot, overrides, output_ctx)
         }
         A::Query { command } => commands::query::execute(&command, overrides, output_ctx),
-        A::Agents(args) => {
-            let agents_args = commands::agents::AgentsArgs {
-                add: args.add,
-                remove: args.remove,
-                update: args.update,
-                check: args.check,
-                dry_run: args.dry_run,
-                force: args.force,
-            };
-            commands::agents::execute(&agents_args, output_ctx)
-        }
         A::Operator { command } => dispatch_operator(command, overrides, output_ctx),
     }
 }
@@ -285,13 +264,13 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::History(_)
         | Commands::Watch(_)
         | Commands::Msg(_)
+        | Commands::Who(_)
         | Commands::Ask(_)
         | Commands::Inbox(_)
         | Commands::Outbox(_)
         | Commands::Dash(_)
         | Commands::Working
-        | Commands::Idle
-        | Commands::Agents(_) => false,
+        | Commands::Idle => false,
 
         Commands::Admin { command } => should_auto_import_admin(command),
 

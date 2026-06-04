@@ -288,6 +288,15 @@ impl SqliteStorage {
         crate::storage::watchers::active_prefixes(&self.conn, now, ttl_seconds)
     }
 
+    /// List all watcher rows (regardless of staleness). For `bd who`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn list_all_watchers(&self) -> Result<Vec<crate::storage::watchers::WatcherRow>> {
+        crate::storage::watchers::list_all(&self.conn)
+    }
+
     /// GC stale watcher rows. Called opportunistically.
     ///
     /// # Errors

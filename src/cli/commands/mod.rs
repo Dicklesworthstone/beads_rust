@@ -1,4 +1,3 @@
-pub mod agents;
 pub mod ask;
 pub mod audit;
 pub mod blocked;
@@ -38,6 +37,7 @@ pub mod update;
 pub mod version;
 pub mod watch;
 pub mod r#where;
+pub mod who;
 
 #[cfg(feature = "self_update")]
 pub mod upgrade;
