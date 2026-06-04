@@ -82,19 +82,20 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         let _ = storage_ctx.storage.sweep_stale_watchers(now, ttl);
         if !storage_ctx.storage.is_prefix_watched(to, now, ttl)? {
             let active = storage_ctx.storage.active_watcher_prefixes(now, ttl)?;
-            let suggestion = if active.is_empty() {
-                "no agents are currently watching. Start one with `bd watch` \
-                 in the recipient's environment, or use --force to send anyway."
+            let hint = if active.is_empty() {
+                "no agents are currently watching. If this isn't a typo, \
+                 flag it to the operator with `bd ask`."
                     .to_string()
             } else {
                 format!(
-                    "active watcher prefixes: {}. Use --force to send anyway.",
+                    "active watchers: {}. If this isn't a typo, flag it to \
+                     the operator with `bd ask`.",
                     active.join(", ")
                 )
             };
             return Err(BeadsError::validation(
                 "to",
-                format!("no active `bd watch` for '{to}' — {suggestion}"),
+                format!("no active `bd watch` for '{to}' — {hint}"),
             ));
         }
     }
