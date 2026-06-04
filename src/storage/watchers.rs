@@ -8,7 +8,7 @@
 //! call [`unregister`] from a Drop guard.
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Result;
 
@@ -112,6 +112,59 @@ pub fn active_prefixes(
         .query_map([cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Whether any *other* watcher row for the same prefix has a strictly
+/// later `started_at` than `my_started_at`. Used by `bd watch` to
+/// implement newest-wins-per-prefix: when an older watcher sees a
+/// newer one, it exits to avoid duplicate notifications.
+///
+/// # Errors
+///
+/// Returns an error if the DB query fails.
+pub fn is_superseded(
+    conn: &Connection,
+    prefix: &str,
+    my_pid: i64,
+    my_started_at: DateTime<Utc>,
+) -> Result<bool> {
+    let exists: bool = conn
+        .prepare_cached(
+            "SELECT 1 FROM watchers
+             WHERE prefix = ?1
+               AND pid <> ?2
+               AND started_at > ?3
+             LIMIT 1",
+        )?
+        .exists(params![prefix, my_pid, my_started_at.to_rfc3339()])?;
+    Ok(exists)
+}
+
+/// Find the newest other watcher for `prefix`. Returns None if this
+/// is the only / newest watcher. Used to render BD_SUPERSEDED
+/// messages with concrete (pid, started_at) of the winner.
+///
+/// # Errors
+///
+/// Returns an error if the DB query fails.
+pub fn newest_other_watcher(
+    conn: &Connection,
+    prefix: &str,
+    my_pid: i64,
+    my_started_at: DateTime<Utc>,
+) -> Result<Option<WatcherRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT prefix, pid, started_at, last_seen FROM watchers
+         WHERE prefix = ?1 AND pid <> ?2 AND started_at > ?3
+         ORDER BY started_at DESC LIMIT 1",
+    )?;
+    let row = stmt
+        .query_row(
+            params![prefix, my_pid, my_started_at.to_rfc3339()],
+            row_to_watcher,
+        )
+        .optional()?;
+    Ok(row)
 }
 
 /// All watcher rows (regardless of staleness). For diagnostics.

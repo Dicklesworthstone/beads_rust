@@ -143,10 +143,11 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     // checks this table to flag typos that would otherwise drop messages
     // into an unwatched queue. Crashed watchers self-evict via TTL.
     let pid = i64::try_from(std::process::id()).unwrap_or(0);
+    let my_started_at = Utc::now();
     let startup_reload_gen = {
         let (mut storage, _paths) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
-        storage.register_watcher(&prefix, pid, Utc::now())?;
+        storage.register_watcher(&prefix, pid, my_started_at)?;
         crate::cli::commands::reload::read_generation(&storage)?
     };
     let _watcher_guard = WatcherGuard {
@@ -207,15 +208,20 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
 
         let now = Utc::now();
 
-        // Heartbeat + reload check. Best-effort — a single failed write
-        // shouldn't kill the watch loop. `bd msg` uses the heartbeat to
-        // detect typos like `bd msg infra` vs `infra1`. The reload-gen
-        // check lets `bd admin reload` ask running watchers to exit
-        // cleanly so a freshly-installed bd binary can take over.
+        // Heartbeat + reload check + supersede check. Best-effort — a
+        // single failed write shouldn't kill the watch loop. `bd msg`
+        // uses the heartbeat to detect typos like `bd msg infra` vs
+        // `infra1`. The reload-gen check lets `bd admin reload` ask
+        // running watchers to exit cleanly so a freshly-installed bd
+        // binary can take over. The supersede check is newest-wins
+        // per prefix: if another bd watch started after this one for
+        // the same prefix, exit so the agent stops getting duplicate
+        // notifications.
         if let Ok((mut storage, _paths)) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)
         {
             let _ = storage.heartbeat_watcher(&prefix, pid, now);
+
             if let Ok(current_gen) =
                 crate::cli::commands::reload::read_generation(&storage)
                 && current_gen > startup_reload_gen
@@ -230,6 +236,34 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
                     chrono::DateTime::<Utc>::from_timestamp(current_gen, 0)
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_else(|| current_gen.to_string())
+                );
+                if watch_beads {
+                    flush_batches(
+                        &mut batches,
+                        &prefix,
+                        format,
+                        now,
+                        true,
+                        debounce,
+                        debounce_max,
+                    )?;
+                }
+                break;
+            }
+
+            if let Ok(Some(winner)) =
+                storage.newest_other_watcher(&prefix, pid, my_started_at)
+            {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let _ = writeln!(
+                    out,
+                    "[{}] BD_SUPERSEDED: another bd watch started for prefix \
+                     '{}' at {} (pid {}); exiting to avoid duplicate notifications.",
+                    now.to_rfc3339(),
+                    prefix,
+                    winner.started_at.to_rfc3339(),
+                    winner.pid,
                 );
                 if watch_beads {
                     flush_batches(

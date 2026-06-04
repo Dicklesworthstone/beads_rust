@@ -297,6 +297,34 @@ impl SqliteStorage {
         crate::storage::watchers::list_all(&self.conn)
     }
 
+    /// Whether another watcher for `prefix` has started after this one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn is_watcher_superseded(
+        &self,
+        prefix: &str,
+        my_pid: i64,
+        my_started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool> {
+        crate::storage::watchers::is_superseded(&self.conn, prefix, my_pid, my_started_at)
+    }
+
+    /// Fetch the newest other watcher for the same prefix, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the DB query fails.
+    pub fn newest_other_watcher(
+        &self,
+        prefix: &str,
+        my_pid: i64,
+        my_started_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<crate::storage::watchers::WatcherRow>> {
+        crate::storage::watchers::newest_other_watcher(&self.conn, prefix, my_pid, my_started_at)
+    }
+
     /// GC stale watcher rows. Called opportunistically.
     ///
     /// # Errors
