@@ -24,7 +24,6 @@
     "comment_count": 50462,
     "simulated_agent_count": 10000,
     "claim_count": 20013,
-    "load_strategy": "direct_sqlite_seed",
     "generation_ms": 482049,
     "jsonl_size_bytes": 68547006,
     "expected_jsonl_size_bytes": 68547006,
@@ -33,8 +32,8 @@
     "health": {
       "jsonl_valid": true,
       "jsonl_issue_count": 100000,
-      "sync_import_ok": false,
-      "doctor_ok": false,
+      "sync_import_ok": true,
+      "doctor_ok": true,
       "sync_status_clean": false
     }
   },

@@ -22,7 +22,7 @@ use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -4652,6 +4652,23 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
+        // Resolve `--parent` membership in Rust so the candidate query filters
+        // on a plain `id IN (...)` list rather than an `IN (subquery)` /
+        // recursive CTE (see `ReadyFilters::parent_member_ids`). Skip the work
+        // when membership has already been resolved by the caller.
+        let resolved_filters;
+        let filters = if filters.parent.is_some() && filters.parent_member_ids.is_none() {
+            let mut owned = filters.clone();
+            owned.parent_member_ids = Some(self.resolve_ready_parent_member_ids(
+                owned.parent.as_deref().unwrap_or_default(),
+                owned.recursive,
+            )?);
+            resolved_filters = owned;
+            &resolved_filters
+        } else {
+            filters
+        };
+
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
         if readiness.blocked_cache_stale {
@@ -4681,6 +4698,49 @@ impl SqliteStorage {
                 )
             }
         }
+    }
+
+    /// Resolve the set of issue IDs matched by a `--parent` filter on `ready`.
+    ///
+    /// Returns the direct children of `parent_id`, or — when `recursive` — all
+    /// transitive parent-child descendants. Traversal is an iterative BFS with a
+    /// visited-set, so it terminates in bounded time even if the parent-child
+    /// graph contains a cycle (the embedded SQLite backend mishandles recursive
+    /// CTEs referenced from a correlated `EXISTS`, which previously surfaced as a
+    /// hang/error — #308).
+    fn resolve_ready_parent_member_ids(
+        &self,
+        parent_id: &str,
+        recursive: bool,
+    ) -> Result<Vec<String>> {
+        let children_by_parent = Self::load_local_parent_child_edges_impl(&self.conn)?;
+
+        let mut members: Vec<String> = Vec::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(parent_id.to_string());
+
+        if recursive {
+            let mut queue: VecDeque<String> = VecDeque::new();
+            queue.push_back(parent_id.to_string());
+            while let Some(current) = queue.pop_front() {
+                if let Some(children) = children_by_parent.get(&current) {
+                    for child in children {
+                        if visited.insert(child.clone()) {
+                            members.push(child.clone());
+                            queue.push_back(child.clone());
+                        }
+                    }
+                }
+            }
+        } else if let Some(children) = children_by_parent.get(parent_id) {
+            for child in children {
+                if visited.insert(child.clone()) {
+                    members.push(child.clone());
+                }
+            }
+        }
+
+        Ok(members)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4779,31 +4839,25 @@ impl SqliteStorage {
             sql.push_str(" AND (assignee IS NULL OR assignee = '')");
         }
 
-        // Filter by parent (--parent flag)
-        let mut cte_prefix = String::new();
-        if let Some(ref parent_id) = filters.parent {
-            if filters.recursive {
-                cte_prefix = String::from(
-                    "WITH RECURSIVE _descendants(did) AS (\
-                        SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child' \
-                        UNION \
-                        SELECT d.issue_id FROM dependencies d \
-                        JOIN _descendants ON d.depends_on_id = _descendants.did \
-                        WHERE d.type = 'parent-child'\
-                    ) ",
-                );
-                // The CTE is prepended to the SQL, so its ? appears first.
-                // Insert the parent_id param at position 0 to match.
-                params.insert(0, SqliteValue::from(parent_id.as_str()));
-                sql.push_str(" AND id IN (SELECT did FROM _descendants)");
-            } else {
-                sql.push_str(
-                    " AND id IN (
-                        SELECT issue_id FROM dependencies
-                        WHERE depends_on_id = ? AND type = 'parent-child'
-                    )",
-                );
-                params.push(SqliteValue::from(parent_id.as_str()));
+        // Filter by parent (--parent flag).
+        //
+        // Membership is resolved in Rust (see `resolve_ready_parent_member_ids`)
+        // and passed as `parent_member_ids`, so we filter with a plain
+        // `id IN (...)` list rather than an `IN (subquery)` / recursive CTE. This
+        // avoids embedded-SQLite planner bugs around `IN (subquery)` under
+        // multi-table joins (#307) and recursive CTEs referenced from a
+        // correlated `EXISTS` (#308).
+        let cte_prefix = String::new();
+        if filters.parent.is_some() {
+            match filters.parent_member_ids.as_deref() {
+                Some([]) | None => {
+                    // Parent has no matching descendants (or membership was not
+                    // resolved): force an empty result without scanning.
+                    sql.push_str(" AND 1=0");
+                }
+                Some(member_ids) => {
+                    append_issue_id_membership_filter(&mut sql, &mut params, member_ids);
+                }
             }
         }
 
@@ -10048,6 +10102,21 @@ pub struct ReadyFilters {
     pub parent: Option<String>,
     /// Include all descendants (grandchildren, etc.) not just direct children.
     pub recursive: bool,
+    /// Pre-resolved parent membership IDs.
+    ///
+    /// When `parent` is set, the query layer resolves the matching issue IDs in
+    /// Rust (direct children, or all transitive descendants when `recursive`)
+    /// and stores them here before building the SQL. The candidate query then
+    /// filters with a plain `id IN (...)` list instead of a correlated
+    /// subquery / recursive CTE. This sidesteps engine limitations in the
+    /// embedded SQLite backend with `IN (subquery)` under multi-table joins
+    /// (#307) and recursive CTEs referenced from a correlated `EXISTS` (#308),
+    /// and guarantees bounded traversal via a visited-set BFS even when the
+    /// parent-child graph contains cycles.
+    ///
+    /// `Some(empty)` means "parent is set but has no matching descendants" → the
+    /// candidate query must return no rows. `None` means no parent filter.
+    pub parent_member_ids: Option<Vec<String>>,
 }
 
 /// Minimal metadata needed for fast collision detection during sync.

@@ -137,6 +137,7 @@ fn execute_inner(
         limit: None,
         parent: resolved_parent,
         recursive: args.recursive,
+        parent_member_ids: None,
     };
 
     let sort_policy = match args.sort {

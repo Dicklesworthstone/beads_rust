@@ -34,7 +34,6 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | PC-2 | HIGH | If `BEADS_JSONL` env var is set, it MUST be validated and logged before use | Unit test: verify validation function is called; log assertion |
 | PC-3 | HIGH | All paths are canonicalized before I/O operations | Unit test: verify symlink resolution doesn't escape .beads/ |
 | PC-4 | MEDIUM | Temp files are created in the same directory as target file | Unit test: verify temp path parent matches target parent |
-| PC-RECOVERY | MEDIUM | Sync invocations may *transitively* cause storage recovery flows in `src/config/mod.rs::backup_database_family_for_recovery` to write under `.beads/.br_recovery/` with filenames `<original-name>.<stamp>.<suffix>` where `<suffix>` ∈ {`bak`, `rebuild-failed`, `truncated-wal`}. Recovery flow has its own path validation (separate from sync's `validate_sync_path`); the two are deliberately decoupled because recovery is a storage concern, not a sync concern. Tests that take a workspace-wide snapshot during sync MUST recognize these as legitimate side-effect writes. | Unit + e2e tests in `tests/e2e_sync_git_safety.rs::is_allowed_sync_file` recognize the three suffixes; arbitrary other contents in `.beads/.br_recovery/` are still rejected. |
 
 ### 2.2 Atomic Write Invariants
 
