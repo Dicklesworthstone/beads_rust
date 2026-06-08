@@ -47,6 +47,8 @@ fn run_setup_br(root: &Path, args: &[&str]) -> String {
     cmd.args(args);
     clear_inherited_br_env(&mut cmd);
     cmd.env("HOME", root);
+    cmd.env("USER", "ubuntu");
+    cmd.env("LOGNAME", "ubuntu");
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "error");
     cmd.env("RUST_BACKTRACE", "1");

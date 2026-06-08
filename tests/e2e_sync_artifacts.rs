@@ -999,6 +999,10 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     const ISSUE_COUNT: usize = 220;
 
     let _log = common::test_log("e2e_sync_import_force_preserves_integrity_and_close_works");
+    if !require_sqlite3_cli("e2e_sync_import_force_preserves_integrity_and_close_works") {
+        return;
+    }
+
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "sync_import_force_preserves_integrity");
 
@@ -1166,6 +1170,10 @@ fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {
     const LOOP_COUNT: usize = 25;
 
     let _log = common::test_log("e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths");
+    if !require_sqlite3_cli("e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths") {
+        return;
+    }
+
     let workspace = BrWorkspace::new();
     let mut artifacts = TestArtifacts::new(&workspace, "rebuilt_alt_db_fresh_lookup");
 
@@ -1539,9 +1547,8 @@ fn e2e_rebuilt_alt_db_preserves_fresh_lookup_and_mutation_paths() {
 
 /// Invoke the C `sqlite3` CLI to run `PRAGMA integrity_check` against the
 /// given database.  Returns stdout verbatim (expected to be "ok\n" for a
-/// clean DB).  If the binary is missing the test falls back to the string
-/// "sqlite3-missing" so the assertion fails with a clear message rather
-/// than panicking in the test harness.
+/// clean DB).  Callers should use `require_sqlite3_cli` before exercising
+/// this external-tool coverage path.
 fn run_sqlite3_pragma_integrity_check(db_path: &Path) -> String {
     match std::process::Command::new("sqlite3")
         .arg(db_path)
@@ -1565,4 +1572,21 @@ fn run_sqlite3_pragma_integrity_check(db_path: &Path) -> String {
         }
         Err(err) => format!("sqlite3-missing: {err}"),
     }
+}
+
+fn require_sqlite3_cli(test_name: &str) -> bool {
+    let available = std::process::Command::new("sqlite3")
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+
+    if !available {
+        eprintln!(
+            "[skip] {test_name}: missing sqlite3 CLI; install sqlite3 to run upstream integrity_check coverage"
+        );
+    }
+
+    available
 }

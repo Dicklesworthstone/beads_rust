@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -241,6 +241,10 @@ jobs:
 
 #[test]
 fn audit_report_marks_up_to_date_actions() -> Result<(), String> {
+    if !require_python3("audit_report_marks_up_to_date_actions") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -257,6 +261,10 @@ fn audit_report_marks_up_to_date_actions() -> Result<(), String> {
 
 #[test]
 fn audit_report_marks_update_available_actions() -> Result<(), String> {
+    if !require_python3("audit_report_marks_update_available_actions") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -277,6 +285,10 @@ fn audit_report_marks_update_available_actions() -> Result<(), String> {
 
 #[test]
 fn audit_report_records_upstream_unreachable_without_failing() -> Result<(), String> {
+    if !require_python3("audit_report_records_upstream_unreachable_without_failing") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -297,6 +309,10 @@ fn audit_report_records_upstream_unreachable_without_failing() -> Result<(), Str
 
 #[test]
 fn audit_report_records_missing_tag_without_failing() -> Result<(), String> {
+    if !require_python3("audit_report_records_missing_tag_without_failing") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -317,6 +333,10 @@ fn audit_report_records_missing_tag_without_failing() -> Result<(), String> {
 
 #[test]
 fn audit_report_rejects_disallowed_downgrades() -> Result<(), String> {
+    if !require_python3("audit_report_rejects_disallowed_downgrades") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -332,6 +352,10 @@ fn audit_report_rejects_disallowed_downgrades() -> Result<(), String> {
 
 #[test]
 fn audit_text_report_is_concise_human_output() -> Result<(), String> {
+    if !require_python3("audit_text_report_is_concise_human_output") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -352,6 +376,10 @@ fn audit_text_report_is_concise_human_output() -> Result<(), String> {
 
 #[test]
 fn audit_text_report_suppresses_current_rows_by_default() -> Result<(), String> {
+    if !require_python3("audit_text_report_suppresses_current_rows_by_default") {
+        return Ok(());
+    }
+
     let fixture = PinFixture::new()?;
     fixture.write_inventory(&[inventory_line_with_tag(
         ".github/workflows/example.yml",
@@ -684,6 +712,24 @@ fn is_workflow_file(path: &Path) -> bool {
 
 fn is_sha40_hex(value: &str) -> bool {
     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+fn require_python3(test_name: &str) -> bool {
+    let available = Command::new("python3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+
+    if !available {
+        eprintln!(
+            "[skip] {test_name}: missing python3 CLI; install python3 to run action-pin audit script coverage"
+        );
+    }
+
+    available
 }
 
 #[cfg(test)]

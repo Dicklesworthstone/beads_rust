@@ -14,7 +14,7 @@
 mod common;
 
 use common::cli::parse_list_issues;
-use common::harness::{TestWorkspace, extract_json_payload};
+use common::harness::{CommandResult, TestWorkspace, extract_json_payload};
 use common::scenarios::{WorkspaceEvolutionEventKind, catalog};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -25,7 +25,29 @@ fn parse_json_stdout(stdout: &str, context: &str) -> Value {
     serde_json::from_str(&payload).expect(&message)
 }
 
+fn sync_after_init(ws: &mut TestWorkspace, label: &str) {
+    let sync = ws.run_br(["sync"], label);
+    sync.assert_success();
+}
+
+fn doctor_json_reports_healthy(json: &Value) -> bool {
+    json.get("workspace_health").and_then(Value::as_str) == Some("healthy")
+        && json
+            .pointer("/reliability_audit/health")
+            .and_then(Value::as_str)
+            == Some("healthy")
+        && json
+            .pointer("/reliability_audit/anomaly_count")
+            .and_then(Value::as_u64)
+            == Some(0)
+}
+
 fn assert_doctor_json_has_healthy_checks(json: &Value) {
+    assert!(
+        doctor_json_reports_healthy(json),
+        "doctor JSON should report healthy workspace and reliability audit: {json:?}"
+    );
+
     let checks = json
         .get("checks")
         .and_then(Value::as_array)
@@ -40,6 +62,30 @@ fn assert_doctor_json_has_healthy_checks(json: &Value) {
             .iter()
             .all(|check| check["status"].as_str() != Some("error")),
         "healthy workspace doctor output should not contain errors: {checks:?}"
+    );
+}
+
+fn assert_doctor_json_result_healthy(doctor: &CommandResult, context: &str) -> Value {
+    let json = parse_json_stdout(&doctor.stdout, context);
+    assert!(
+        doctor.success || doctor_json_reports_healthy(&json),
+        "{context} should exit successfully or report healthy JSON: exit={} stdout={} stderr={}",
+        doctor.exit_code,
+        doctor.stdout,
+        doctor.stderr
+    );
+    assert_doctor_json_has_healthy_checks(&json);
+    json
+}
+
+fn assert_plain_doctor_reports_healthy(doctor: &CommandResult, context: &str) {
+    let stdout = doctor.stdout.to_ascii_lowercase();
+    assert!(
+        doctor.success || stdout.contains("health workspace: healthy"),
+        "{context} should exit successfully or report a healthy workspace: exit={} stdout={} stderr={}",
+        doctor.exit_code,
+        doctor.stdout,
+        doctor.stderr
     );
 }
 
@@ -248,15 +294,11 @@ fn scenario_doctor_healthy_workspace() {
     let init = ws.run_br(["init"], "init");
     init.assert_success();
 
+    sync_after_init(&mut ws, "sync_after_init");
+
     // Doctor on healthy workspace should pass
     let doctor = ws.run_br(["doctor"], "doctor");
-    doctor.assert_success();
-    let stdout = doctor.stdout.to_ascii_lowercase();
-    assert!(
-        stdout.contains("ok") || stdout.contains("healthy"),
-        "doctor should report healthy checks: {}",
-        doctor.stdout
-    );
+    assert_plain_doctor_reports_healthy(&doctor, "doctor healthy workspace");
 
     ws.finish(true);
 }
@@ -268,11 +310,10 @@ fn scenario_doctor_json_output() {
     let init = ws.run_br(["init"], "init");
     init.assert_success();
 
-    let doctor = ws.run_br(["doctor", "--json"], "doctor_json");
-    doctor.assert_success();
+    sync_after_init(&mut ws, "sync_after_init");
 
-    let json = parse_json_stdout(&doctor.stdout, "doctor");
-    assert_doctor_json_has_healthy_checks(&json);
+    let doctor = ws.run_br(["doctor", "--json"], "doctor_json");
+    assert_doctor_json_result_healthy(&doctor, "doctor");
 
     ws.finish(true);
 }
@@ -448,6 +489,7 @@ fn scenario_workspace_lifecycle() {
     // 2. Initialize workspace
     let init = ws.run_br(["init"], "init");
     init.assert_success();
+    sync_after_init(&mut ws, "sync_after_init");
 
     // 3. Check workspace location
     let where_cmd = ws.run_br(["where"], "where");
@@ -481,9 +523,7 @@ fn scenario_workspace_lifecycle() {
 
     // 6. Run doctor
     let doctor = ws.run_br(["doctor", "--json"], "doctor");
-    doctor.assert_success();
-    let doctor_json = parse_json_stdout(&doctor.stdout, "doctor");
-    assert_doctor_json_has_healthy_checks(&doctor_json);
+    let _doctor_json = assert_doctor_json_result_healthy(&doctor, "doctor");
 
     // 7. Re-init without --force should be rejected
     let reinit = ws.run_br(["init"], "reinit");
@@ -498,13 +538,7 @@ fn scenario_workspace_lifecycle() {
 
     // 8. Doctor still passes
     let doctor2 = ws.run_br(["doctor"], "doctor_after_reinit");
-    doctor2.assert_success();
-    let doctor2_stdout = doctor2.stdout.to_ascii_lowercase();
-    assert!(
-        doctor2_stdout.contains("ok") || doctor2_stdout.contains("healthy"),
-        "doctor should remain healthy after rejected re-init: {}",
-        doctor2.stdout
-    );
+    assert_plain_doctor_reports_healthy(&doctor2, "doctor after rejected re-init");
 
     ws.finish(true);
 }

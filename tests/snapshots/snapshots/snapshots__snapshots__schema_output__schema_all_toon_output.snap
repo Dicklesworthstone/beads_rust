@@ -174,7 +174,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -981,7 +981,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -1177,7 +1177,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -1231,6 +1231,15 @@ schemas:
           created_at:
             type: string
             format: date-time
+          agent_name:
+            description: "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution."
+            type[2]: string,"null"
+          harness:
+            description: "Tier 1 attribution: self-reported harness identifier (capture-only)."
+            type[2]: string,"null"
+          model:
+            description: "Tier 1 attribution: self-reported model identifier (capture-only)."
+            type[2]: string,"null"
         required[5]: id,issue_id,event_type,actor,created_at
       EventType.type: string
   IssueWithCounts:
@@ -1402,7 +1411,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.

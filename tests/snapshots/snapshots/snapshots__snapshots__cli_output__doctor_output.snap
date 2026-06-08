@@ -6,18 +6,36 @@ br doctor
 HEALTH workspace: degraded
 OK jsonl.merge_artifacts
 OK base_jsonl
+OK doctor.runs_dir
+OK doctor.runs_creatable
+OK permissions.recovery_dir
+OK permissions.write_lock
+OK permissions.root_gitignore
+OK permissions.config_yaml_secrets
+OK br_path_dupes
+WARN gitignore.beads_inner_present: /TMP/.beads/.gitignore exists but is missing expected pattern(s): .write.lock
+OK tmp_files_orphan
+OK br_history.size
 OK routes_jsonl: No routes.jsonl present (ID-REDACTED routing is optional)
 WARN rust_log: RUST_LOG=beads_rust=debug would dump verbose tracing to stderr and break agents parsing --json. Run `export RUST_LOG=error` as documented in README.md.
 OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
-OK binary_version: Running br 0.2.10; no beads_rust Cargo.toml reachable from .beads/ — not flagging
+OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable from .beads/ — not flagging
 OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale
 OK routes.targets: No local or town routes.jsonl present (route targets are optional)
 OK startup_cache.health
+OK permissions.jsonl_world_writable
+OK jsonl_crlf
+OK jsonl_bom
+OK jsonl_eof_newline
+OK jsonl_size
+OK jsonl.duplicate_ids
 OK sync_jsonl_path: JSONL path is within sync allowlist
 OK sync_conflict_markers: No merge conflict markers found
 OK jsonl.parse: Parsed 0 records
+OK db_bloat
+OK wal_size
 OK db.recovery_artifacts
 OK db.recovery_artifacts.aged
 WARN db.sidecars: WAL sidecar exists without a matching SHM sidecar at /TMP/.beads/beads.ID-REDACTED (expected for frankensqlite)
@@ -29,6 +47,9 @@ OK sqlite.integrity_check
 WARN db.export_hash_cache: ID-REDACTED JSONL content hash in `metadata` differs from computed hash. Cache is stale; doctor --repair will recompute.
 OK base_jsonl.missing_post_flush
 OK dirty_bitmap
+OK comments.orphans
+OK labels.orphans
+OK dependencies.orphans
 OK audit.suspect_close_reasons
 OK counts.db_vs_jsonl: Both have 0 records
 OK sync.metadata: External changes pending import

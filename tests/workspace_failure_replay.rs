@@ -88,7 +88,11 @@ fn surface_label(name: &str, surface: &str) -> String {
     format!("{name}_{slug}")
 }
 
-fn run_surface(fixture: &FixtureWorkspace, surface: &str) -> BrRun {
+fn run_surface(
+    fixture: &FixtureWorkspace,
+    surface: &str,
+    outcome: WorkspaceFailureCommandOutcome,
+) -> BrRun {
     let label = surface_label(&fixture.metadata.name, surface);
     match surface {
         "startup/open" => run_br(&fixture.workspace, ["list", "--json"], &label),
@@ -98,6 +102,16 @@ fn run_surface(fixture: &FixtureWorkspace, surface: &str) -> BrRun {
             &label,
         ),
         "doctor" => run_br(&fixture.workspace, ["doctor", "--json"], &label),
+        "doctor --repair"
+            if outcome == WorkspaceFailureCommandOutcome::RepairApplied
+                && fixture_has_failed_rebuild_evidence(fixture) =>
+        {
+            run_br(
+                &fixture.workspace,
+                ["doctor", "--repair", "--allow-repeated-repair", "--json"],
+                &label,
+            )
+        }
         "doctor --repair" => run_br(&fixture.workspace, ["doctor", "--repair", "--json"], &label),
         "sync --status" => run_br(&fixture.workspace, ["sync", "--status", "--json"], &label),
         "sync --import-only" => run_br(
@@ -117,6 +131,20 @@ fn run_surface(fixture: &FixtureWorkspace, surface: &str) -> BrRun {
         "info" => run_br(&fixture.workspace, ["info", "--json"], &label),
         other => unreachable!("unsupported replay surface '{other}'"),
     }
+}
+
+fn fixture_has_failed_rebuild_evidence(fixture: &FixtureWorkspace) -> bool {
+    let recovery_dir = fixture.beads_dir.join(".br_recovery");
+    let Ok(entries) = fs::read_dir(recovery_dir) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .contains(".rebuild-failed")
+    })
 }
 
 fn assert_sqlite_header(db_path: &Path, context: &str) {
@@ -419,7 +447,7 @@ fn assert_surface_outcome(
     surface: &str,
     outcome: WorkspaceFailureCommandOutcome,
 ) {
-    let run = run_surface(fixture, surface);
+    let run = run_surface(fixture, surface, outcome);
     let context = format!("{} {surface}", fixture.metadata.name);
 
     match outcome {
@@ -776,12 +804,12 @@ fn workspace_failure_replay_doctor_reliability_audit_matches_fixture_posture() {
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
 
     for fixture in fixtures {
-        if fixture.metadata.outcome_for("doctor").is_none() {
+        let Some(doctor_outcome) = fixture.metadata.outcome_for("doctor") else {
             continue;
-        }
+        };
 
         let workspace = fixture_workspace(&fixture.metadata.name);
-        let doctor = run_surface(&workspace, "doctor");
+        let doctor = run_surface(&workspace, "doctor", doctor_outcome);
         let context = format!("{} doctor", fixture.metadata.name);
         let json = parse_stdout_json(&doctor, &context);
         assert_doctor_reliability_audit(&workspace, &context, &json);

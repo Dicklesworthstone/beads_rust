@@ -19,13 +19,19 @@ use std::process::Command;
 /// Run the bash-driven real-world fixture suite end-to-end. Asserts exit 0.
 #[test]
 fn doctor_fixture_suite_passes() {
-    // Skip when `jq` or `bash` are unavailable (e.g. cross-compiled CI host).
-    if which("bash").is_none() {
-        eprintln!("[skip] bash not on PATH");
-        return;
-    }
-    if which("jq").is_none() {
-        eprintln!("[skip] jq not on PATH; install jq to run the doctor fixture suite");
+    // Skip when fixture-driver dependencies are unavailable (e.g.
+    // cross-compiled CI hosts or minimal agent workspaces).
+    let required_tools = ["bash", "jq", "python3", "sqlite3", "xxd"];
+    let missing: Vec<_> = required_tools
+        .iter()
+        .copied()
+        .filter(|tool| which(tool).is_none())
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "[skip] missing doctor fixture suite tool(s): {}; install them to run fixtures",
+            missing.join(", ")
+        );
         return;
     }
 

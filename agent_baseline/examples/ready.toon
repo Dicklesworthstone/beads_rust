@@ -1,26 +1,29 @@
 [3]:
-  - created_at: "2026-05-14T07:19:19.650542856Z"
-    created_by: ubuntu
-    id: bd-e73
+  - created_at: "2026-06-07T15:41:42.797901791Z"
+    created_by: node
+    id: bd-ti5
     issue_type: bug
+    labels[0]:
     priority: 0
     status: open
     title: Two
-    updated_at: "2026-05-14T07:19:19.650542856Z"
-  - created_at: "2026-05-14T07:19:19.685078309Z"
-    created_by: ubuntu
-    id: bd-8r8
+    updated_at: "2026-06-07T15:41:42.797901791Z"
+  - created_at: "2026-06-07T15:41:42.855929514Z"
+    created_by: node
+    id: bd-92m
     issue_type: feature
+    labels[0]:
     priority: 1
     status: open
     title: Three
-    updated_at: "2026-05-14T07:19:19.685078309Z"
-  - created_at: "2026-05-14T07:19:19.619034261Z"
-    created_by: ubuntu
+    updated_at: "2026-06-07T15:41:42.855929514Z"
+  - created_at: "2026-06-07T15:41:42.753765482Z"
+    created_by: node
     description: Short desc
-    id: bd-bnr
+    id: bd-e99
     issue_type: task
+    labels[0]:
     priority: 2
     status: open
     title: One
-    updated_at: "2026-05-14T07:19:19.619034261Z"
+    updated_at: "2026-06-07T15:41:42.753765482Z"

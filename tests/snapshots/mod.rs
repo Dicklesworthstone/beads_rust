@@ -64,7 +64,13 @@ static BUILD_PROFILE_RE: LazyLock<Regex> =
 static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
 static VERSION_NUM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
+    LazyLock::new(|| Regex::new(r"\b(version|br) \d+\.\d+\.\d+\b").expect("version number regex"));
+static SQLITE3_INTEGRITY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^WARN sqlite3\.integrity_check: sqlite3 not available; skipping orthogonal integrity validation$",
+    )
+    .expect("sqlite3 integrity availability regex")
+});
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 /// `tracing` source-location annotation that appears in dev builds after the
@@ -488,9 +494,20 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
     // 13. Mask version numbers
     if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
         normalized = VERSION_NUM_RE
-            .replace_all(&normalized, "version X.Y.Z")
+            .replace_all(&normalized, |captures: &regex::Captures<'_>| {
+                format!("{} X.Y.Z", &captures[1])
+            })
             .to_string();
         log.push("version_numbers".to_string());
+    }
+
+    // 13b. sqlite3 is optional; normalize the doctor line across machines with
+    // and without the CLI installed while preserving the check's position.
+    if SQLITE3_INTEGRITY_RE.is_match(&normalized) {
+        normalized = SQLITE3_INTEGRITY_RE
+            .replace_all(&normalized, "OK sqlite3.integrity_check")
+            .to_string();
+        log.push("sqlite3_availability".to_string());
     }
 
     // 14. Strip trailing whitespace (per line)

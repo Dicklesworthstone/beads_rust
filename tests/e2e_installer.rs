@@ -58,6 +58,10 @@ fn run_installer(temp_dir: &TempDir, args: &[&str], env_vars: HashMap<&str, &str
     cmd.env("HOME", temp_dir.path());
     cmd.env("DEST", &dest_dir);
     cmd.env("NO_GUM", "1"); // Disable fancy output for test parsing
+    cmd.env(
+        "BR_INSTALL_LOCK_FILE",
+        temp_dir.path().join("br-install.lock"),
+    );
     cmd.current_dir(temp_dir.path());
 
     // Clear potentially interfering variables
@@ -92,9 +96,34 @@ fn run_installer_function(temp_dir: &TempDir, _function_name: &str, function_cal
         .env("HOME", temp_dir.path())
         .env("NO_GUM", "1")
         .env("QUIET", "1")
+        .env(
+            "BR_INSTALL_LOCK_FILE",
+            temp_dir.path().join("br-install.lock"),
+        )
         .current_dir(temp_dir.path())
         .output()
         .expect("Failed to run installer function")
+}
+
+const BAD_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn fake_release_artifact_url(temp_dir: &TempDir) -> String {
+    let archive = temp_dir.path().join("br-0.0.0-linux_amd64.tar.gz");
+    fs::write(&archive, b"not a release archive").expect("write fake archive");
+    format!("file://{}", archive.display())
+}
+
+fn checksum_mismatch_args<'a>(artifact_url: &'a str) -> [&'a str; 8] {
+    [
+        "--version",
+        "v0.0.0",
+        "--artifact-url",
+        artifact_url,
+        "--checksum",
+        BAD_SHA256,
+        "--quiet",
+        "--skip-skills",
+    ]
 }
 
 fn install_script_contents() -> String {
@@ -420,27 +449,10 @@ fn e2e_installer_checksum_mismatch_fails() {
     }
 
     let temp = TempDir::new().expect("temp dir");
-    let archive = temp.path().join("br-0.0.0-linux_amd64.tar.gz");
-    fs::write(&archive, b"not a release archive").expect("write fake archive");
+    let artifact_url = fake_release_artifact_url(&temp);
+    let args = checksum_mismatch_args(&artifact_url);
 
-    // Provide a bad checksum - installer should fail
-    let bad_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
-    let artifact_url = format!("file://{}", archive.display());
-
-    let output = run_installer(
-        &temp,
-        &[
-            "--version",
-            "v0.0.0",
-            "--artifact-url",
-            &artifact_url,
-            "--checksum",
-            bad_checksum,
-            "--quiet",
-            "--skip-skills",
-        ],
-        HashMap::new(),
-    );
+    let output = run_installer(&temp, &args, HashMap::new());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -489,19 +501,26 @@ fn e2e_installer_idempotent_runs_twice() {
         fs::set_permissions(&fake_binary, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
+    let artifact_url = fake_release_artifact_url(&temp);
+    let args = checksum_mismatch_args(&artifact_url);
+
     // First run
-    let output1 = run_installer(&temp, &["--quiet"], HashMap::new());
+    let output1 = run_installer(&temp, &args, HashMap::new());
     let stderr1 = String::from_utf8_lossy(&output1.stderr);
 
     // Second run - should not error out
-    let output2 = run_installer(&temp, &["--quiet"], HashMap::new());
+    let output2 = run_installer(&temp, &args, HashMap::new());
     let stderr2 = String::from_utf8_lossy(&output2.stderr);
 
-    // Both runs should complete without critical errors
-    // (Note: they may fail to download if no network, but shouldn't crash)
+    // Both runs should fail closed on the bounded local artifact, not on lock
+    // contention or a panic.
     assert!(
-        !stderr1.contains("panic") && !stderr2.contains("panic"),
-        "Installer should not panic on repeated runs: stderr1={stderr1}, stderr2={stderr2}"
+        !output1.status.success() && !output2.status.success(),
+        "installer should reject the fake artifact both times: stderr1={stderr1}, stderr2={stderr2}"
+    );
+    assert!(
+        stderr1.contains("Checksum mismatch") && stderr2.contains("Checksum mismatch"),
+        "repeated runs should reach checksum validation: stderr1={stderr1}, stderr2={stderr2}"
     );
 }
 
@@ -518,11 +537,18 @@ fn e2e_installer_creates_dest_directory() {
     let mut env = HashMap::new();
     env.insert("DEST", nested_dest.to_str().unwrap());
 
-    let _output = run_installer(&temp, &["--quiet"], env);
+    let artifact_url = fake_release_artifact_url(&temp);
+    let args = checksum_mismatch_args(&artifact_url);
+    let output = run_installer(&temp, &args, env);
 
-    // Installer should create the directory (even if download fails)
-    // The mkdir -p happens early in the script
-    // Note: Directory might not be created if script exits early due to lock
+    assert!(
+        !output.status.success(),
+        "fake artifact should fail verification, not install successfully"
+    );
+    assert!(
+        nested_dest.exists(),
+        "installer should create DEST before artifact verification fails"
+    );
 }
 
 // ============================================================================
@@ -538,8 +564,10 @@ fn e2e_installer_lock_prevents_concurrent() {
 
     let temp = TempDir::new().expect("temp dir");
 
-    // Create a stale lock directory
-    let lock_dir = PathBuf::from("/tmp/br-install.lock.d");
+    // Create a stale lock directory scoped to this installer instance.
+    let lock_file = temp.path().join("br-install.lock");
+    let lock_file = lock_file.to_str().expect("lock path");
+    let lock_dir = PathBuf::from(format!("{lock_file}.d"));
 
     // Clean up any existing lock first
     let _ = fs::remove_dir_all(&lock_dir);
@@ -626,10 +654,18 @@ fn e2e_installer_respects_br_install_dir() {
     let mut env = HashMap::new();
     env.insert("BR_INSTALL_DIR", custom_dir.to_str().unwrap());
 
-    let _output = run_installer(&temp, &["--quiet"], env);
+    let artifact_url = fake_release_artifact_url(&temp);
+    let args = checksum_mismatch_args(&artifact_url);
+    let output = run_installer(&temp, &args, env);
 
-    // The directory should be created (mkdir -p in script)
-    // Even if download fails, the setup should prepare the directory
+    assert!(
+        !output.status.success(),
+        "fake artifact should fail verification, not install successfully"
+    );
+    assert!(
+        custom_dir.exists(),
+        "installer should honor BR_INSTALL_DIR before artifact verification fails"
+    );
 }
 
 #[test]

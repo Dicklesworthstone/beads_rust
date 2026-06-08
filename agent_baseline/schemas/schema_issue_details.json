@@ -164,6 +164,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -351,7 +358,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -491,6 +498,27 @@
             "created_at": {
               "type": "string",
               "format": "date-time"
+            },
+            "agent_name": {
+              "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

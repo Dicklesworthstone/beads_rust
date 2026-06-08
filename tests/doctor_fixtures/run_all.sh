@@ -48,6 +48,23 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 2
 fi
 
+# Running the full suite requires helper CLIs used by multiple fixture
+# corrupt/assert scripts. When ONLY is set, let the selected fixture run so
+# minimal one-off replays that do not need every helper still work.
+if [ -z "${ONLY:-}" ]; then
+    missing_tools=()
+    for tool in python3 sqlite3 xxd; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing_tools+=("$tool")
+        fi
+    done
+    if [ "${#missing_tools[@]}" -gt 0 ]; then
+        echo "run_all.sh: missing fixture tool(s): ${missing_tools[*]}" >&2
+        echo "run_all.sh: install them or rerun with ONLY=<fixture> for a targeted replay" >&2
+        exit 2
+    fi
+fi
+
 declare -a fixtures=()
 while IFS= read -r dir; do
     fixtures+=("$dir")

@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::sync::LazyLock;
 
 // Representative fixture for exact robot-output goldens.
@@ -127,6 +127,21 @@ where
     }
 }
 
+fn require_bv(test_name: &str) -> bool {
+    let available = std::process::Command::new("bv")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+
+    if !available {
+        eprintln!("[skip] {test_name}: missing bv CLI; install bv to run robot bv goldens");
+    }
+
+    available
+}
+
 fn assert_valid_json(raw: &str, context: &str) {
     let error = serde_json::from_str::<Value>(raw)
         .err()
@@ -241,6 +256,10 @@ fn robot_golden_ready_output() {
 
 #[test]
 fn robot_golden_bv_next_output() {
+    if !require_bv("robot_golden_bv_next_output") {
+        return;
+    }
+
     let workspace = init_robot_golden_workspace();
 
     let output = run_bv(&workspace, ["--robot-next"]);
@@ -257,6 +276,10 @@ fn robot_golden_bv_next_output() {
 
 #[test]
 fn robot_golden_bv_triage_output() {
+    if !require_bv("robot_golden_bv_triage_output") {
+        return;
+    }
+
     let workspace = init_robot_golden_workspace();
 
     let output = run_bv(&workspace, ["--robot-triage"]);
@@ -273,6 +296,10 @@ fn robot_golden_bv_triage_output() {
 
 #[test]
 fn robot_golden_bv_plan_output() {
+    if !require_bv("robot_golden_bv_plan_output") {
+        return;
+    }
+
     let workspace = init_robot_golden_workspace();
 
     let output = run_bv(&workspace, ["--robot-plan"]);

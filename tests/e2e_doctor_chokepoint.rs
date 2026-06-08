@@ -82,28 +82,39 @@ fn corrupt_root_gitignore(cwd: &Path) {
     fs::write(cwd.join(".gitignore"), body).expect("write corrupt .gitignore");
 }
 
-/// SHA-256 every regular file under `root` excluding `.doctor/` (the
-/// run-artifact area is supposed to grow under `--repair`). Returns a
-/// stable map of relative-path -> hex digest.
+/// SHA-256 every regular file under `root` excluding `.doctor/` and volatile
+/// SQLite runtime artifacts. The run-artifact area is supposed to grow under
+/// `--repair`, and WAL/SHM/journal sidecars may change when read-only doctor
+/// and undo commands open the database. Returns a stable map of relative-path
+/// -> hex digest.
 fn hash_workspace(root: &Path) -> BTreeMap<PathBuf, String> {
     let mut out = BTreeMap::new();
     walk_workspace_hashes(root, root, &mut out);
     out
 }
 
+fn is_volatile_runtime_artifact(rel: &Path) -> bool {
+    matches!(
+        rel.to_str(),
+        Some(".beads/.write.lock")
+            | Some(".beads/beads.db-wal")
+            | Some(".beads/beads.db-shm")
+            | Some(".beads/beads.db-journal")
+    )
+}
+
 fn walk_workspace_hashes(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, String>) {
     for entry in fs::read_dir(dir).expect("read_dir") {
         let entry = entry.expect("dir entry");
         let path = entry.path();
-        // Skip the doctor artifact tree and the SQLite write lock — the
-        // lock is a runtime artifact whose existence depends on whether
-        // anything has opened the DB and is not part of the workspace
-        // state we want to round-trip.
+        // Skip runtime artifacts whose existence or bytes depend on whether
+        // anything has opened the DB and are not part of the chokepoint
+        // workspace state we want to round-trip.
         let rel = path.strip_prefix(root).unwrap();
         if rel.starts_with(".doctor") {
             continue;
         }
-        if rel == Path::new(".beads/.write.lock") {
+        if is_volatile_runtime_artifact(rel) {
             continue;
         }
         let ft = entry.file_type().expect("file_type");

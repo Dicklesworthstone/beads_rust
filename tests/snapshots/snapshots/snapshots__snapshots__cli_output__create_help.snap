@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/cli_output.rs
+assertion_line: 42
 expression: normalize_output(&output.stdout)
 ---
 Create a new issue
@@ -29,6 +30,9 @@ Options:
       --ID-REDACTED                      Preview without creating
       --silent                       Output only issue ID
   -f, --file <FILE>                  Create issues from a markdown file (bulk import)
+      --ID-REDACTED <NAME>            Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only [env: BR_AGENT_NAME=]
+      --harness <HARNESS>            Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only [env: BR_HARNESS=]
+      --model <MODEL>                Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only [env: BR_MODEL=]
       --db <DB>                      Database path (ID-REDACTED .beads/*.db if not set)
       --actor <ACTOR>                Actor name for audit trail
       --json                         Output as JSON

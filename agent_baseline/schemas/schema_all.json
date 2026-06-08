@@ -164,6 +164,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -346,7 +353,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -1765,6 +1772,28 @@
         }
       }
     },
+    "CountGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CountGroup",
+      "description": "Row emitted inside `br count --by <field> --json` under `groups[]`.\n\nKeep this in sync with `cli::commands::count::CountGroup`.",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "Group label, for example a status, priority, type, assignee, or label.",
+          "type": "string"
+        },
+        "count": {
+          "description": "Number of matching issues in this group.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "group",
+        "count"
+      ]
+    },
     "ErrorEnvelope": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ErrorEnvelope",
@@ -1974,6 +2003,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -2143,7 +2179,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -2382,6 +2418,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -2569,7 +2612,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -2709,6 +2752,27 @@
             "created_at": {
               "type": "string",
               "format": "date-time"
+            },
+            "agent_name": {
+              "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -2881,6 +2945,13 @@
         },
         "source_repo_path": {
           "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
           "type": [
             "string",
             "null"
@@ -3067,7 +3138,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -3191,6 +3262,13 @@
         "issue_type": {
           "$ref": "#/$defs/IssueType"
         },
+        "labels": {
+          "description": "Labels attached to the issue.\n\nAlways emitted (as `[]` when empty) so downstream consumers can filter\n`br ready --json` output on labels the same way they filter\n`br list --json` (#309).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "notes": {
           "type": [
             "string",
@@ -3221,6 +3299,7 @@
         "created_at",
         "id",
         "issue_type",
+        "labels",
         "priority",
         "status",
         "title",
@@ -3654,7 +3733,15 @@
       "shape": "object",
       "jq_filter": ".count",
       "error_envelope_on_stderr": false,
-      "notes": "Scalar count under `.count`."
+      "notes": "Ungrouped `br count --json`; scalar count under `.count`. Grouped variants use the `count --by` entry."
+    },
+    "count --by": {
+      "shape": "object",
+      "jq_filter": ".groups[]",
+      "items_at": ".groups",
+      "item_schema": "CountGroup",
+      "error_envelope_on_stderr": false,
+      "notes": "For `br count --by <status|priority|type|assignee|label> --json`. The wrapper object also includes `total`."
     },
     "dep list": {
       "shape": "array",

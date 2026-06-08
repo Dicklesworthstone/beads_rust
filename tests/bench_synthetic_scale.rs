@@ -414,12 +414,7 @@ impl SyntheticDataset {
             &root,
             "br sync --import-only",
         )?;
-        let doctor_ok = run_br_status(
-            br_path,
-            ["doctor", "--json", "--no-auto-import", "--no-auto-flush"],
-            &root,
-            "br doctor",
-        )?;
+        let doctor_ok = run_br_doctor_health(br_path, &root)?;
         let sync_status_clean = sync_status_is_clean(br_path, &root)?;
         let jsonl_health = validate_generated_jsonl(&beads_dir.join("issues.jsonl"))?;
 
@@ -1051,6 +1046,49 @@ fn run_br_status<const N: usize>(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     )))
+}
+
+fn run_br_doctor_health(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {
+    let output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+        .args(["doctor", "--json", "--no-auto-import", "--no-auto-flush"])
+        .current_dir(workspace)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    if matches!(exit_code, 0 | 1) && doctor_json_reports_healthy(&output.stdout) {
+        return Ok(true);
+    }
+
+    if output.status.success() {
+        return Ok(false);
+    }
+
+    Err(std::io::Error::other(format!(
+        "br doctor failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )))
+}
+
+fn doctor_json_reports_healthy(stdout: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(stdout) else {
+        return false;
+    };
+    value
+        .get("workspace_health")
+        .and_then(Value::as_str)
+        .is_some_and(|health| health == "healthy")
+        && value
+            .pointer("/reliability_audit/health")
+            .and_then(Value::as_str)
+            .is_some_and(|health| health == "healthy")
+        && value
+            .pointer("/reliability_audit/anomaly_count")
+            .and_then(Value::as_u64)
+            .is_some_and(|anomaly_count| anomaly_count == 0)
 }
 
 fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<bool> {

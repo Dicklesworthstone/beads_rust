@@ -279,10 +279,10 @@ fn e2e_basic_lifecycle() {
     );
 
     let close_args = vec![
-        "update".to_string(),
+        "close".to_string(),
         id,
-        "--status".to_string(),
-        "closed".to_string(),
+        "--reason".to_string(),
+        "e2e lifecycle completion".to_string(),
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -1727,9 +1727,10 @@ fn e2e_doctor_json() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_json");
-    assert!(doctor.status.success(), "doctor failed: {}", doctor.stderr);
     let payload = extract_json_payload(&doctor.stdout);
     let doctor_json: Value = serde_json::from_str(&payload).expect("doctor json");
+    // The post-#292 doctor contract can exit 1 for WARN-only findings; this
+    // smoke test only proves JSON output shape.
     assert!(doctor_json["checks"].is_array(), "doctor checks missing");
 }
 

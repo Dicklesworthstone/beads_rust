@@ -123,7 +123,7 @@ CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 INSECURE_SKIP_CHECKSUM=0
-LOCK_FILE="/tmp/br-install.lock"
+LOCK_FILE="${BR_INSTALL_LOCK_FILE:-/tmp/br-install.lock}"
 NO_GUM=0
 SKIP_SKILLS=0
 # Per-skill opt-ins. Default is to NOT install the bd-to-br-migration skill

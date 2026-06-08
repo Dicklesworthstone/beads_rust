@@ -1,2 +1,2 @@
 [1]{id,title,status,priority,issue_type,created_at,created_by,updated_at,source_repo,source_repo_path,compaction_level,original_size}:
-  bd-e73,Two,open,0,bug,"2026-05-14T07:19:19.650542856Z",ubuntu,"2026-05-14T07:19:19.650542856Z",.tmpxvT4Sf,/tmp/.tmpxvT4Sf,0,0
+  bd-ti5,Two,open,0,bug,"2026-06-07T15:41:42.797901791Z",node,"2026-06-07T15:41:42.797901791Z",.tmpaAZTHe,/tmp/.tmpaAZTHe,0,0
