@@ -25,8 +25,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use std::collections::HashSet;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+/// Config-table key that persists the user's collapsed-prefix set
+/// across `bd dash --tui` invocations.
+const COLLAPSED_KEY: &str = "dash_tui_collapsed";
 
 /// Max wait between event-loop wake-ups. Short enough for snappy key
 /// response; the actual refetch cadence is `RefreshSchedule`.
@@ -38,28 +42,26 @@ const EVENT_POLL_MS: u64 = 100;
 const DEFAULT_REFRESH_SECS: u64 = 2;
 
 /// One row of the flattened, currently-visible list. Rebuilt every
-/// frame from the snapshot + expansion state. The `prefix` slots on
-/// Bead/Closure are used by .3's collapse navigation (h jumps cursor
-/// to that prefix's header).
-#[allow(dead_code)]
+/// frame from the snapshot + collapse state. We carry `bead_id` on
+/// child rows so the cursor can re-anchor on the exact same bead
+/// across refreshes (not just the parent header).
 enum VisibleRow {
-    /// A prefix header. Always present for each group; collapse state
-    /// determines whether child rows follow.
-    Header { prefix: String },
-    /// One live bead under a prefix.
+    Header {
+        prefix: String,
+    },
     Bead {
         prefix: String,
+        bead_id: String,
         line: Line<'static>,
     },
-    /// A recently-closed bead under a prefix.
     Closure {
         prefix: String,
+        bead_id: String,
         line: Line<'static>,
     },
 }
 
 impl VisibleRow {
-    #[allow(dead_code)]
     fn prefix(&self) -> &str {
         match self {
             Self::Header { prefix } | Self::Bead { prefix, .. } | Self::Closure { prefix, .. } => {
@@ -69,21 +71,52 @@ impl VisibleRow {
     }
 }
 
+/// Stable identity of the currently-selected row, used to re-anchor
+/// the cursor across snapshot refreshes. We track the row *kind*, not
+/// just the prefix, so a cursor parked on a specific bead stays there
+/// even when neighboring rows shift.
+#[derive(Clone)]
+enum CursorKey {
+    Header(String),
+    Bead { prefix: String, bead_id: String },
+    Closure { prefix: String, bead_id: String },
+}
+
+impl CursorKey {
+    fn prefix(&self) -> &str {
+        match self {
+            Self::Header(p) | Self::Bead { prefix: p, .. } | Self::Closure { prefix: p, .. } => p,
+        }
+    }
+}
+
 struct App {
     groups: Vec<OwnedGroup>,
     pending_asks: usize,
-    /// Prefixes whose children are currently shown. Default = every
-    /// prefix in `groups` (start fully expanded).
-    expanded: HashSet<String>,
+    /// Prefixes the user has explicitly collapsed. Empty = everything
+    /// expanded (the default). Tracking *collapses* rather than
+    /// expansions means refreshes don't accidentally re-expand a
+    /// prefix the user just folded.
+    collapsed: HashSet<String>,
     rows: Vec<VisibleRow>,
     state: ListState,
     show_help: bool,
+    /// Held for self-persistence — the App writes its collapsed-set
+    /// back to the config table on every fold change so it survives
+    /// across `bd dash --tui` invocations.
+    beads_dir: PathBuf,
+    cli: config::CliOverrides,
 }
 
 impl App {
-    fn new(groups: Vec<OwnedGroup>, pending_asks: usize) -> Self {
-        let expanded: HashSet<String> = groups.iter().map(|g| g.prefix.clone()).collect();
-        let rows = build_rows(&groups, &expanded);
+    fn new(
+        groups: Vec<OwnedGroup>,
+        pending_asks: usize,
+        beads_dir: PathBuf,
+        cli: config::CliOverrides,
+    ) -> Self {
+        let collapsed = load_collapsed(&beads_dir, &cli).unwrap_or_default();
+        let rows = build_rows(&groups, &collapsed);
         let mut state = ListState::default();
         if !rows.is_empty() {
             state.select(Some(0));
@@ -91,11 +124,49 @@ impl App {
         Self {
             groups,
             pending_asks,
-            expanded,
+            collapsed,
             rows,
             state,
             show_help: false,
+            beads_dir,
+            cli,
         }
+    }
+
+    /// Best-effort write of `collapsed` back to the config table.
+    /// A failed write shouldn't disrupt the TUI; the state simply
+    /// doesn't persist for this session.
+    fn save_collapsed(&self) {
+        if let Ok((mut storage, _paths)) =
+            config::open_storage(&self.beads_dir, self.cli.db.as_ref(), self.cli.lock_timeout)
+        {
+            let mut list: Vec<&str> = self.collapsed.iter().map(String::as_str).collect();
+            list.sort_unstable();
+            if let Ok(json) = serde_json::to_string(&list) {
+                let _ = storage.set_config(COLLAPSED_KEY, &json);
+            }
+        }
+    }
+
+    fn is_expanded(&self, prefix: &str) -> bool {
+        !self.collapsed.contains(prefix)
+    }
+
+    /// Capture a stable key for the current selection so it can be
+    /// re-located after a `build_rows` rebuild.
+    fn cursor_key(&self) -> Option<CursorKey> {
+        let row = self.state.selected().and_then(|i| self.rows.get(i))?;
+        Some(match row {
+            VisibleRow::Header { prefix } => CursorKey::Header(prefix.clone()),
+            VisibleRow::Bead { prefix, bead_id, .. } => CursorKey::Bead {
+                prefix: prefix.clone(),
+                bead_id: bead_id.clone(),
+            },
+            VisibleRow::Closure { prefix, bead_id, .. } => CursorKey::Closure {
+                prefix: prefix.clone(),
+                bead_id: bead_id.clone(),
+            },
+        })
     }
 
     fn select_first(&mut self) {
@@ -142,61 +213,77 @@ impl App {
         )
     }
 
+    /// True if the prefix at the cursor has any beads or closures.
+    /// Folding empty groups is a visual no-op, so skip the work.
+    fn cursor_has_children(&self) -> bool {
+        let Some(prefix) = self.current_prefix() else {
+            return false;
+        };
+        self.groups
+            .iter()
+            .find(|g| g.prefix == prefix)
+            .is_some_and(group_has_children)
+    }
+
     /// `h` / Left semantics:
     /// - on a child row → jump cursor to that prefix's header (don't collapse)
-    /// - on an expanded header → collapse it (cursor stays)
-    /// - on a collapsed header → no-op
+    /// - on an expanded header with children → collapse it (cursor stays)
+    /// - on a collapsed or empty header → no-op
     fn collapse_or_jump(&mut self) {
         let Some(prefix) = self.current_prefix().map(str::to_string) else {
             return;
         };
-        if self.on_header() {
-            self.expanded.remove(&prefix);
-            self.rebuild_rows_preserving(&prefix);
-        } else {
+        if !self.on_header() {
             self.jump_to_header(&prefix);
+            return;
         }
+        if !self.cursor_has_children() {
+            return;
+        }
+        self.collapsed.insert(prefix.clone());
+        self.rebuild_rows_preserving(CursorKey::Header(prefix));
+        self.save_collapsed();
     }
 
-    /// `l` / Right semantics: expand current prefix's header.
+    /// `l` / Right semantics: expand current prefix's header (no-op
+    /// for empty groups).
     fn expand(&mut self) {
         let Some(prefix) = self.current_prefix().map(str::to_string) else {
             return;
         };
-        if self.expanded.insert(prefix.clone()) {
-            self.rebuild_rows_preserving(&prefix);
+        if !self.cursor_has_children() {
+            return;
+        }
+        if self.collapsed.remove(&prefix) {
+            self.rebuild_rows_preserving(CursorKey::Header(prefix));
+            self.save_collapsed();
         }
     }
 
-    /// Space toggles the prefix the cursor is currently within.
+    /// Space toggles the prefix the cursor is currently within
+    /// (no-op for empty groups).
     fn toggle(&mut self) {
         let Some(prefix) = self.current_prefix().map(str::to_string) else {
             return;
         };
-        if self.expanded.contains(&prefix) {
-            self.expanded.remove(&prefix);
-        } else {
-            self.expanded.insert(prefix.clone());
-        }
-        self.rebuild_rows_preserving(&prefix);
-    }
-
-    /// Replace `rows` from current state. After collapses the previous
-    /// selected index may point past the end (or to a now-gone child);
-    /// move the cursor to `preserve_prefix`'s header so the user keeps
-    /// their bearings.
-    fn rebuild_rows_preserving(&mut self, preserve_prefix: &str) {
-        self.rows = build_rows(&self.groups, &self.expanded);
-        if self.rows.is_empty() {
-            self.state.select(None);
+        if !self.cursor_has_children() {
             return;
         }
-        let target = self
-            .rows
-            .iter()
-            .position(|r| matches!(r, VisibleRow::Header { prefix } if prefix == preserve_prefix))
-            .unwrap_or(0);
-        self.state.select(Some(target.min(self.rows.len() - 1)));
+        if self.collapsed.contains(&prefix) {
+            self.collapsed.remove(&prefix);
+        } else {
+            self.collapsed.insert(prefix.clone());
+        }
+        self.rebuild_rows_preserving(CursorKey::Header(prefix));
+        self.save_collapsed();
+    }
+
+    /// Replace `rows` from current state. The caller supplies the
+    /// `CursorKey` they want re-anchored — usually the header of the
+    /// prefix whose fold-state just changed.
+    fn rebuild_rows_preserving(&mut self, target: CursorKey) {
+        self.rows = build_rows(&self.groups, &self.collapsed);
+        self.select_by_key(Some(target));
     }
 
     fn jump_to_header(&mut self, prefix: &str) {
@@ -209,72 +296,111 @@ impl App {
         }
     }
 
-    /// Replace `groups` + `pending_asks` from a fresh snapshot,
-    /// preserving cursor position by remembering which prefix the
-    /// selection lived under and re-selecting that prefix's header
-    /// if it still exists.
+    /// Replace `groups` + `pending_asks` from a fresh snapshot.
+    /// Preserves both fold-state (via `self.collapsed`, untouched
+    /// except for prefixes that disappeared) and cursor row (via
+    /// CursorKey lookup).
     fn apply_snapshot(&mut self, groups: Vec<OwnedGroup>, pending_asks: usize) {
-        let cursor_prefix = self.current_prefix().map(str::to_string);
+        let key = self.cursor_key();
 
-        // Drop expanded entries for prefixes that no longer exist.
+        // Drop collapsed entries for prefixes that no longer exist —
+        // but never *add* prefixes here. New prefixes are implicitly
+        // expanded because absence from `collapsed` means "shown".
         let live: HashSet<String> = groups.iter().map(|g| g.prefix.clone()).collect();
-        self.expanded.retain(|p| live.contains(p));
-        // New prefixes default to expanded so users see them.
-        for p in &live {
-            self.expanded.insert(p.clone());
-        }
+        self.collapsed.retain(|p| live.contains(p));
 
         self.groups = groups;
         self.pending_asks = pending_asks;
-        self.rows = build_rows(&self.groups, &self.expanded);
+        self.rows = build_rows(&self.groups, &self.collapsed);
+        self.select_by_key(key);
+    }
 
+    /// Re-select the row matching `key`. Falls back to: same prefix's
+    /// header if the specific bead/closure is gone; row 0 if nothing
+    /// matches at all.
+    fn select_by_key(&mut self, key: Option<CursorKey>) {
         if self.rows.is_empty() {
             self.state.select(None);
             return;
         }
-        let target = cursor_prefix
-            .as_deref()
-            .and_then(|p| {
-                self.rows.iter().position(
-                    |r| matches!(r, VisibleRow::Header { prefix } if prefix == p),
-                )
+        let target = key
+            .as_ref()
+            .and_then(|k| self.find_row(k))
+            .or_else(|| {
+                key.as_ref().and_then(|k| {
+                    let p = k.prefix();
+                    self.rows.iter().position(
+                        |r| matches!(r, VisibleRow::Header { prefix } if prefix == p),
+                    )
+                })
             })
             .unwrap_or(0);
         self.state.select(Some(target.min(self.rows.len() - 1)));
     }
+
+    /// Locate a row matching this CursorKey in the freshly-built rows.
+    fn find_row(&self, key: &CursorKey) -> Option<usize> {
+        self.rows.iter().position(|r| match (key, r) {
+            (CursorKey::Header(p), VisibleRow::Header { prefix }) => prefix == p,
+            (
+                CursorKey::Bead { prefix, bead_id },
+                VisibleRow::Bead { prefix: rp, bead_id: rb, .. },
+            ) => rp == prefix && rb == bead_id,
+            (
+                CursorKey::Closure { prefix, bead_id },
+                VisibleRow::Closure { prefix: rp, bead_id: rb, .. },
+            ) => rp == prefix && rb == bead_id,
+            _ => false,
+        })
+    }
 }
 
 /// Build the flattened visible-row vec from a snapshot. Children of
-/// a prefix are only emitted when that prefix is in `expanded`.
-fn build_rows(groups: &[OwnedGroup], expanded: &HashSet<String>) -> Vec<VisibleRow> {
+/// a prefix are only emitted when that prefix is NOT in `collapsed`.
+fn build_rows(groups: &[OwnedGroup], collapsed: &HashSet<String>) -> Vec<VisibleRow> {
     let mut rows: Vec<VisibleRow> = Vec::new();
     for g in groups {
         rows.push(VisibleRow::Header {
             prefix: g.prefix.clone(),
         });
-        if !expanded.contains(&g.prefix) {
+        if collapsed.contains(&g.prefix) {
             continue;
         }
         for b in &g.beads {
-            let line = bead_line(b);
             rows.push(VisibleRow::Bead {
                 prefix: g.prefix.clone(),
-                line,
+                bead_id: b.id.clone(),
+                line: bead_line(b),
             });
         }
         for c in &g.recently_closed {
-            let line = closure_line(c);
             rows.push(VisibleRow::Closure {
                 prefix: g.prefix.clone(),
-                line,
+                bead_id: c.id.clone(),
+                line: closure_line(c),
             });
         }
     }
     rows
 }
 
+/// Whether this group has any visible children at all. Empty groups
+/// shouldn't display a fold chevron — there's nothing to toggle.
+fn group_has_children(g: &OwnedGroup) -> bool {
+    !g.beads.is_empty() || !g.recently_closed.is_empty()
+}
+
 fn header_line(group: &OwnedGroup, expanded: bool) -> Line<'static> {
-    let chevron = if expanded { "▾ " } else { "▸ " };
+    // Empty groups get a two-space pad instead of a chevron — there's
+    // nothing to expand or collapse, and the missing arrow makes that
+    // obvious at a glance.
+    let chevron = if !group_has_children(group) {
+        "  "
+    } else if expanded {
+        "▾ "
+    } else {
+        "▸ "
+    };
     let bold = Style::default().add_modifier(Modifier::BOLD);
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -317,7 +443,12 @@ fn presence_style(p: &PresenceView) -> Style {
 fn status_glyph_style(kind: StatusKind) -> Style {
     match kind {
         StatusKind::InProgress => Style::default().fg(Color::Green),
-        StatusKind::Ready => Style::default().fg(Color::Blue),
+        // Ready stays uncolored — the agent-presence "offline" glyph
+        // also uses ○ (dim), and tinting ready's circle blue made
+        // the two look distinct in a way that didn't match meaning.
+        // A plain ○ for "available work" reads cleanly against the
+        // dim ○ for "no presence record."
+        StatusKind::Ready => Style::default(),
         StatusKind::Blocked => Style::default().fg(Color::Red),
         StatusKind::Deferred | StatusKind::Closed => Style::default().add_modifier(Modifier::DIM),
     }
@@ -416,7 +547,7 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let initial = snapshot(args, cli, &beads_dir, Utc::now())?;
-    let mut app = App::new(initial.0, initial.1);
+    let mut app = App::new(initial.0, initial.1, beads_dir.clone(), cli.clone());
 
     let refresh_every =
         Duration::from_secs(args.refresh.unwrap_or(DEFAULT_REFRESH_SECS).max(1));
@@ -521,7 +652,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .map(|row| match row {
             VisibleRow::Header { prefix } => {
                 let group = app.groups.iter().find(|g| g.prefix == *prefix);
-                let expanded = app.expanded.contains(prefix);
+                let expanded = app.is_expanded(prefix);
                 let line = group
                     .map(|g| header_line(g, expanded))
                     .unwrap_or_else(|| Line::from(prefix.clone()));
@@ -579,6 +710,18 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title("help");
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(para, rect);
+}
+
+/// Pull the persisted collapsed-prefix set out of the config table.
+/// Treats every failure mode (missing row, bad JSON, DB lock) as
+/// "no persisted state" and returns an empty set so the TUI just
+/// starts fully-expanded.
+fn load_collapsed(beads_dir: &Path, cli: &config::CliOverrides) -> Option<HashSet<String>> {
+    let (storage, _paths) =
+        config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
+    let raw = storage.get_config(COLLAPSED_KEY).ok().flatten()?;
+    let list: Vec<String> = serde_json::from_str(&raw).ok()?;
+    Some(list.into_iter().collect())
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
