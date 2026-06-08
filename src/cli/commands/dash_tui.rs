@@ -630,7 +630,8 @@ fn header_line(group: &OwnedGroup, expanded: bool) -> Line<'static> {
 
 fn presence_style(p: &PresenceView) -> Style {
     match p.state {
-        crate::cli::commands::dash::PresenceKind::Working => Style::default().fg(Color::Green),
+        // Yellow for the lightning bolt — it's lightning, not growth.
+        crate::cli::commands::dash::PresenceKind::Working => Style::default().fg(Color::Yellow),
         crate::cli::commands::dash::PresenceKind::Idle => Style::default().add_modifier(Modifier::DIM),
         crate::cli::commands::dash::PresenceKind::Offline => Style::default().add_modifier(Modifier::DIM),
     }
@@ -677,11 +678,6 @@ fn header_counts(g: &OwnedGroup) -> String {
 fn bead_line(b: &crate::cli::commands::dash::OwnedBead) -> Line<'static> {
     let glyph = StatusKind::glyph(b.kind);
     let pri = format!("P{}", b.priority.0);
-    let assignee = b
-        .assignee
-        .as_deref()
-        .map(|a| format!(" [{a}]"))
-        .unwrap_or_default();
     let parent = b
         .parent
         .as_deref()
@@ -692,16 +688,32 @@ fn bead_line(b: &crate::cli::commands::dash::OwnedBead) -> Line<'static> {
         .as_deref()
         .map(|s| format!(" (from: {s})"))
         .unwrap_or_default();
-    let tail = format!(
-        " {id}  {pri}  {title}{parent}{sender}{assignee}",
-        id = b.id,
-        title = b.title,
-    );
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(glyph.to_string(), status_glyph_style(b.kind)),
-        Span::raw(tail),
-    ])
+    let assignee = b
+        .assignee
+        .as_deref()
+        .map(|a| format!(" [{a}]"))
+        .unwrap_or_default();
+
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(glyph.to_string(), status_glyph_style(b.kind)));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(b.id.clone(), Style::default().fg(Color::Cyan)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(pri, Style::default().fg(Color::Yellow)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::raw(b.title.clone()));
+    if !parent.is_empty() {
+        spans.push(Span::styled(parent, dim));
+    }
+    if !sender.is_empty() {
+        spans.push(Span::styled(sender, dim));
+    }
+    if !assignee.is_empty() {
+        spans.push(Span::styled(assignee, dim));
+    }
+    Line::from(spans)
 }
 
 fn closure_line(c: &crate::cli::commands::dash::OwnedClosure) -> Line<'static> {

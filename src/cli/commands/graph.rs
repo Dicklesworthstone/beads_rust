@@ -626,12 +626,12 @@ fn render_component_body_lines(
         let status_badge = format!("[{}]", node.status);
         let root_marker = if node.depth == 0 { " (root)" } else { "" };
 
-        // Plain prefix (indent + id + double space) — uncolored.
-        let prefix_text = format!(
-            "{base_indent}{depth_indent}{id}  ",
-            id = node.id,
-        );
-        let used_for_title_budget = prefix_text.chars().count()
+        // Indent stays plain; the id gets cyan styling on its own span
+        // so it pops against the rest of the row.
+        let indent_text = format!("{base_indent}{depth_indent}");
+        let used_for_title_budget = indent_text.chars().count()
+            + node.id.chars().count()
+            + 2 // double space between id and priority
             + priority_badge.chars().count()
             + 2 // double space between pri and stat
             + status_badge.chars().count()
@@ -651,7 +651,9 @@ fn render_component_body_lines(
         let title = truncate_with_ellipsis(&node.title, title_cap);
 
         let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::raw(prefix_text));
+        spans.push(Span::raw(indent_text));
+        spans.push(Span::styled(node.id.clone(), id_style()));
+        spans.push(Span::raw("  "));
         spans.push(Span::styled(priority_badge, priority_style_for(node.priority)));
         spans.push(Span::raw("  "));
         spans.push(Span::styled(status_badge, status_style_for(&node.status)));
@@ -675,6 +677,10 @@ fn render_component_body_lines(
     out
 }
 
+fn id_style() -> RStyle {
+    RStyle::default().fg(RColor::Cyan)
+}
+
 fn status_style_for(status: &str) -> RStyle {
     match status {
         "in_progress" => RStyle::default().fg(RColor::Green),
@@ -684,11 +690,11 @@ fn status_style_for(status: &str) -> RStyle {
     }
 }
 
-fn priority_style_for(p: i32) -> RStyle {
-    match p {
-        0 | 1 => RStyle::default().fg(RColor::Yellow),
-        _ => RStyle::default(),
-    }
+fn priority_style_for(_p: i32) -> RStyle {
+    // All priority badges yellow; the [Pn] number inside the bracket
+    // already communicates urgency, so a uniform tint reads cleaner
+    // than a graded scale.
+    RStyle::default().fg(RColor::Yellow)
 }
 
 /// Flatten styled Lines into plain text (one line per `Line`,
