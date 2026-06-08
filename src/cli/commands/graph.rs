@@ -12,6 +12,10 @@ use crate::model::{DependencyType, Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids, split_prefix_remainder};
+// Aliased to avoid colliding with `rich_rust::Style` imported via
+// rich_rust::prelude. The TUI Lines code uses RStyle/RModifier/RColor.
+use ratatui::style::{Color as RColor, Modifier as RModifier, Style as RStyle};
+use ratatui::text::{Line, Span};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -60,33 +64,49 @@ struct AllGraphOutput {
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
 /// Render the same `--all` text view that `bd graph --all` prints,
-/// but into a String. Used by the TUI's Graph view-mode so it doesn't
-/// have to redirect stdout.
+/// but into a String (plain text, no color). Kept as a convenience
+/// for any caller that wants the unstyled form.
 ///
 /// # Errors
 ///
 /// Returns an error if storage open or graph computation fails.
+#[allow(dead_code)]
 pub(crate) fn render_all_string(
     cli: &config::CliOverrides,
     args: &GraphArgs,
 ) -> Result<String> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    render_all_components(&storage_ctx.storage, args)
-}
-
-/// Build the component list and dispatch to the right text renderer.
-/// Extracted from `graph_all` so the TUI path can reuse the same
-/// data-fetch + formatting without going through `ctx`.
-fn render_all_components(storage: &SqliteStorage, args: &GraphArgs) -> Result<String> {
-    let components = compute_components(storage)?;
+    let components = compute_components(&storage_ctx.storage)?;
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
-    let text = if args.no_cluster {
+    Ok(if args.no_cluster {
         render_all_flat_str(&components, total_nodes, args)
     } else {
         render_all_clustered_str(&components, total_nodes, args)
-    };
-    Ok(text)
+    })
+}
+
+/// Same as `render_all_string` but returns styled ratatui Lines for
+/// the TUI graph view. Background: graph.rs is the source of truth
+/// for layout + color; the TUI renders these Lines directly, the
+/// stdout path strips style off via `lines_to_plain`.
+///
+/// # Errors
+///
+/// Returns an error if storage open or graph computation fails.
+pub(crate) fn render_all_lines(
+    cli: &config::CliOverrides,
+    args: &GraphArgs,
+) -> Result<Vec<Line<'static>>> {
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let components = compute_components(&storage_ctx.storage)?;
+    let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
+    Ok(if args.no_cluster {
+        render_all_flat_lines(&components, total_nodes, args)
+    } else {
+        render_all_clustered_lines(&components, total_nodes, args)
+    })
 }
 
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
@@ -451,20 +471,32 @@ fn render_all_clustered_str(
     total_nodes: usize,
     args: &GraphArgs,
 ) -> String {
-    use std::fmt::Write;
+    lines_to_plain(&render_all_clustered_lines(components, total_nodes, args))
+}
 
-    let mut out = String::new();
+/// Same content as `render_all_clustered_str` but yielding ratatui
+/// `Line`s with sensible color/style. The stdout path strips spans
+/// back to plain text via `lines_to_plain`; the TUI consumes Lines
+/// directly so the graph view shows color.
+fn render_all_clustered_lines(
+    components: &[ConnectedComponent],
+    total_nodes: usize,
+    args: &GraphArgs,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
     if components.is_empty() {
-        let _ = writeln!(out, "(no beads)");
+        out.push(Line::from("(no beads)"));
         return out;
     }
 
-    let _ = writeln!(
-        out,
-        "Dependency graph: {} issues in {} component(s)",
-        total_nodes,
-        components.len()
-    );
+    out.push(Line::from(Span::styled(
+        format!(
+            "Dependency graph: {} issues in {} component(s)",
+            total_nodes,
+            components.len()
+        ),
+        RStyle::default().add_modifier(RModifier::BOLD),
+    )));
 
     let mut groups: BTreeMap<String, Vec<&ConnectedComponent>> = BTreeMap::new();
     for component in components {
@@ -488,17 +520,20 @@ fn render_all_clustered_str(
         let comps = groups.get(prefix).expect("present");
         let total_in_prefix: usize = comps.iter().map(|c| c.nodes.len()).sum();
         let component_word = if comps.len() == 1 { "component" } else { "components" };
-        let _ = writeln!(
-            out,
+        let header_text = format!(
             "=== {prefix} ({n} {issue_word}, {c} {comp_word}) ===",
             n = total_in_prefix,
             issue_word = if total_in_prefix == 1 { "issue" } else { "issues" },
             c = comps.len(),
             comp_word = component_word,
         );
+        out.push(Line::from(Span::styled(
+            header_text,
+            RStyle::default().add_modifier(RModifier::BOLD),
+        )));
 
         for component in comps {
-            out.push_str(&render_component_text_str(component, args, true));
+            out.extend(render_component_text_lines(component, args, true));
         }
     }
     out
@@ -514,81 +549,95 @@ fn render_all_flat_str(
     total_nodes: usize,
     args: &GraphArgs,
 ) -> String {
-    use std::fmt::Write;
+    lines_to_plain(&render_all_flat_lines(components, total_nodes, args))
+}
 
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "Dependency graph: {} issues in {} component(s)",
-        total_nodes,
-        components.len()
-    );
-    let _ = writeln!(out);
+fn render_all_flat_lines(
+    components: &[ConnectedComponent],
+    total_nodes: usize,
+    args: &GraphArgs,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::from(Span::styled(
+        format!(
+            "Dependency graph: {} issues in {} component(s)",
+            total_nodes,
+            components.len()
+        ),
+        RStyle::default().add_modifier(RModifier::BOLD),
+    )));
+    out.push(Line::raw(""));
     for (i, component) in components.iter().enumerate() {
         if args.compact {
             let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-            let _ = writeln!(out, "Component {}: {}", i + 1, ids.join(", "));
+            out.push(Line::from(format!("Component {}: {}", i + 1, ids.join(", "))));
         } else {
-            let _ = writeln!(
-                out,
+            out.push(Line::from(format!(
                 "Component {} ({} issues, roots: {}):",
                 i + 1,
                 component.nodes.len(),
                 component.roots.join(", ")
-            );
-            out.push_str(&render_component_body_str(component, args, "  "));
-            let _ = writeln!(out);
+            )));
+            out.extend(render_component_body_lines(component, args, "  "));
+            out.push(Line::raw(""));
         }
     }
     out
 }
 
-fn render_component_text_str(component: &ConnectedComponent, args: &GraphArgs, indent: bool) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::new();
+fn render_component_text_lines(
+    component: &ConnectedComponent,
+    args: &GraphArgs,
+    indent: bool,
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
     if args.compact {
         let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
         let prefix = if indent { "  " } else { "" };
-        let _ = writeln!(out, "{prefix}{}", ids.join(" → "));
+        out.push(Line::from(format!("{prefix}{}", ids.join(" → "))));
         return out;
     }
 
     if indent && component.nodes.len() > 1 {
-        let _ = writeln!(
-            out,
-            "  ── component ({n} {issue_word}, roots: {roots})",
-            n = component.nodes.len(),
-            issue_word = if component.nodes.len() == 1 { "issue" } else { "issues" },
-            roots = component.roots.join(", ")
-        );
+        out.push(Line::from(Span::styled(
+            format!(
+                "  ── component ({n} {issue_word}, roots: {roots})",
+                n = component.nodes.len(),
+                issue_word = if component.nodes.len() == 1 { "issue" } else { "issues" },
+                roots = component.roots.join(", ")
+            ),
+            RStyle::default().add_modifier(RModifier::DIM),
+        )));
     }
     let base_indent = if indent { "    " } else { "  " };
-    out.push_str(&render_component_body_str(component, args, base_indent));
+    out.extend(render_component_body_lines(component, args, base_indent));
     out
 }
 
-fn render_component_body_str(
+fn render_component_body_lines(
     component: &ConnectedComponent,
     args: &GraphArgs,
     base_indent: &str,
-) -> String {
-    use std::fmt::Write;
-
-    let mut out = String::new();
+) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
     for node in &component.nodes {
         let depth_indent = "  ".repeat(node.depth);
         let priority_badge = format!("[P{}]", node.priority);
         let status_badge = format!("[{}]", node.status);
         let root_marker = if node.depth == 0 { " (root)" } else { "" };
-        let row_prefix = format!(
-            "{base_indent}{depth_indent}{id}  {pri}  {stat}{root} ",
+
+        // Plain prefix (indent + id + double space) — uncolored.
+        let prefix_text = format!(
+            "{base_indent}{depth_indent}{id}  ",
             id = node.id,
-            pri = priority_badge,
-            stat = status_badge,
-            root = root_marker,
         );
-        let used = row_prefix.chars().count();
+        let used_for_title_budget = prefix_text.chars().count()
+            + priority_badge.chars().count()
+            + 2 // double space between pri and stat
+            + status_badge.chars().count()
+            + root_marker.chars().count()
+            + 1; // trailing space before title
+
         let sender_suffix = if !args.no_sender {
             node.sender
                 .as_ref()
@@ -598,9 +647,60 @@ fn render_component_body_str(
             String::new()
         };
         let sender_w = sender_suffix.chars().count();
-        let title_cap = title_budget(args, used + sender_w);
+        let title_cap = title_budget(args, used_for_title_budget + sender_w);
         let title = truncate_with_ellipsis(&node.title, title_cap);
-        let _ = writeln!(out, "{row_prefix}{title}{sender_suffix}");
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(prefix_text));
+        spans.push(Span::styled(priority_badge, priority_style_for(node.priority)));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(status_badge, status_style_for(&node.status)));
+        if !root_marker.is_empty() {
+            spans.push(Span::styled(
+                root_marker.to_string(),
+                RStyle::default().add_modifier(RModifier::DIM),
+            ));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::raw(title));
+        if !sender_suffix.is_empty() {
+            spans.push(Span::styled(
+                sender_suffix,
+                RStyle::default().add_modifier(RModifier::DIM),
+            ));
+        }
+
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn status_style_for(status: &str) -> RStyle {
+    match status {
+        "in_progress" => RStyle::default().fg(RColor::Green),
+        "blocked" => RStyle::default().fg(RColor::Red),
+        "deferred" | "closed" => RStyle::default().add_modifier(RModifier::DIM),
+        _ => RStyle::default(),
+    }
+}
+
+fn priority_style_for(p: i32) -> RStyle {
+    match p {
+        0 | 1 => RStyle::default().fg(RColor::Yellow),
+        _ => RStyle::default(),
+    }
+}
+
+/// Flatten styled Lines into plain text (one line per `Line`,
+/// `\n`-joined). Used by the stdout path so `bd graph --all` output
+/// is unchanged from before the Lines refactor.
+fn lines_to_plain(lines: &[Line<'static>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        for span in &line.spans {
+            out.push_str(span.content.as_ref());
+        }
+        out.push('\n');
     }
     out
 }

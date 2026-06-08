@@ -204,9 +204,9 @@ struct App {
     /// Active view. Each mode keeps its own scroll/cursor state.
     view: ViewMode,
     /// Cached graph rendering. Refreshed on the same cadence as the
-    /// dashboard snapshot. Stored as a Vec<String> so we can use a
-    /// simple scroll offset (line index) for Paragraph rendering.
-    graph_lines: Vec<String>,
+    /// dashboard snapshot. Stored as styled ratatui Lines so the
+    /// graph view shows color (status, priority, headers).
+    graph_lines: Vec<Line<'static>>,
     graph_scroll: u16,
     /// Held for self-persistence — the App writes its collapsed-set,
     /// sort mode, and view mode back to the config table on every
@@ -314,8 +314,8 @@ impl App {
             all: true,
             ..Default::default()
         };
-        if let Ok(text) = crate::cli::commands::graph::render_all_string(&self.cli, &args) {
-            self.graph_lines = text.lines().map(str::to_string).collect();
+        if let Ok(lines) = crate::cli::commands::graph::render_all_lines(&self.cli, &args) {
+            self.graph_lines = lines;
             // Clamp scroll if the new content is shorter.
             let max = self.graph_lines.len().saturating_sub(1) as u16;
             if self.graph_scroll > max {
@@ -935,10 +935,7 @@ fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Style::default().add_modifier(Modifier::DIM),
         ))]
     } else {
-        app.graph_lines
-            .iter()
-            .map(|l| Line::from(l.clone()))
-            .collect()
+        app.graph_lines.clone()
     };
 
     let title = format!("graph — {} lines", app.graph_lines.len());
