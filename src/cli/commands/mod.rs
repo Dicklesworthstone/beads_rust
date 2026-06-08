@@ -8,6 +8,7 @@ pub mod config;
 pub mod count;
 pub mod create;
 pub mod dash;
+pub mod dash_tui;
 pub mod defer;
 pub mod delete;
 pub mod dep;

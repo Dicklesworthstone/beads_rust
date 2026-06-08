@@ -23,7 +23,7 @@ const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum StatusKind {
+pub(crate) enum StatusKind {
     InProgress,
     Ready,
     Blocked,
@@ -32,7 +32,7 @@ enum StatusKind {
 }
 
 impl StatusKind {
-    fn glyph(self) -> &'static str {
+    pub(crate) fn glyph(self) -> &'static str {
         match self {
             Self::InProgress => "▶",
             Self::Ready => "○",
@@ -109,6 +109,10 @@ const fn is_zero(n: &usize) -> bool {
 ///
 /// Returns an error if storage open or queries fail.
 pub fn execute(args: &DashArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    if args.tui {
+        return crate::cli::commands::dash_tui::execute(args, cli, ctx);
+    }
+
     let format = resolve_output_format_basic(args.format, ctx.is_json(), false);
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
 
@@ -143,21 +147,22 @@ fn refresh_loop(
     }
 }
 
-fn render_once(
+/// Snapshot the dashboard state in one shot. Shared by the print-and-
+/// exit path (`render_once`) and the `--tui` ratatui path.
+///
+/// # Errors
+///
+/// Returns an error if storage open or any query fails.
+pub(crate) fn snapshot(
     args: &DashArgs,
     cli: &config::CliOverrides,
     beads_dir: &Path,
-    format: OutputFormat,
-) -> Result<()> {
+    now: DateTime<Utc>,
+) -> Result<(Vec<OwnedGroup>, usize)> {
     let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
 
-    // Parse the recent-closures window. Empty / "0" disables.
     let window = parse_closed_within(&args.closed_within)?;
     let presence_ttl = parse_closed_within(&args.presence_ttl)?;
-
-    // We need closed beads in the fetch when either:
-    //  - the user asked for them via --show-closed (current behavior), or
-    //  - the recently-closed footer is enabled (window > 0).
     let want_closed = args.show_closed || window.is_some();
 
     let filters = ListFilters {
@@ -169,7 +174,6 @@ fn render_once(
     let blocked_ids = storage.get_blocked_ids()?;
     let parents = fetch_parent_map(&storage)?;
 
-    // Pull presence as a per-prefix lookup. Empty when ttl is None.
     let presence: HashMap<String, PresenceRow> = if presence_ttl.is_some() {
         storage
             .all_presence()?
@@ -180,7 +184,6 @@ fn render_once(
         HashMap::new()
     };
 
-    let now = Utc::now();
     let groups = build_groups(
         &issues,
         &blocked_ids,
@@ -193,6 +196,18 @@ fn render_once(
     );
 
     let pending_asks = count_pending_asks(&storage)?;
+
+    Ok((groups, pending_asks))
+}
+
+fn render_once(
+    args: &DashArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+    format: OutputFormat,
+) -> Result<()> {
+    let now = Utc::now();
+    let (groups, pending_asks) = snapshot(args, cli, beads_dir, now)?;
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -263,7 +278,7 @@ fn parse_closed_within(raw: &str) -> Result<Option<chrono::Duration>> {
 
 /// Render a relative age without an "ago" suffix — for the in-bracket
 /// presence badge where the surrounding context implies "now."
-fn format_age_compact(secs: i64) -> String {
+pub(crate) fn format_age_compact(secs: i64) -> String {
     if secs < 0 {
         return "now".to_string();
     }
@@ -526,21 +541,21 @@ fn build_groups<'a>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PresenceKind {
+pub(crate) enum PresenceKind {
     Working,
     Idle,
     Offline,
 }
 
 impl PresenceKind {
-    fn glyph(self) -> &'static str {
+    pub(crate) fn glyph(self) -> &'static str {
         match self {
             Self::Working => "⚡",
             Self::Idle => "⏸",
             Self::Offline => "○",
         }
     }
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Working => "working",
             Self::Idle => "idle",
@@ -550,41 +565,41 @@ impl PresenceKind {
 }
 
 #[derive(Debug, Clone)]
-struct PresenceView {
-    state: PresenceKind,
-    age_secs: i64,
+pub(crate) struct PresenceView {
+    pub(crate) state: PresenceKind,
+    pub(crate) age_secs: i64,
 }
 
-struct OwnedBead {
-    id: String,
-    kind: StatusKind,
-    priority: Priority,
-    title: String,
-    assignee: Option<String>,
-    parent: Option<String>,
-    sender: Option<String>,
+pub(crate) struct OwnedBead {
+    pub(crate) id: String,
+    pub(crate) kind: StatusKind,
+    pub(crate) priority: Priority,
+    pub(crate) title: String,
+    pub(crate) assignee: Option<String>,
+    pub(crate) parent: Option<String>,
+    pub(crate) sender: Option<String>,
 }
 
-struct OwnedGroup {
-    prefix: String,
-    in_progress: usize,
-    ready: usize,
-    blocked: usize,
-    deferred: usize,
-    closed: usize,
-    closed_recently: usize,
-    presence: Option<PresenceView>,
-    beads: Vec<OwnedBead>,
-    recently_closed: Vec<OwnedClosure>,
+pub(crate) struct OwnedGroup {
+    pub(crate) prefix: String,
+    pub(crate) in_progress: usize,
+    pub(crate) ready: usize,
+    pub(crate) blocked: usize,
+    pub(crate) deferred: usize,
+    pub(crate) closed: usize,
+    pub(crate) closed_recently: usize,
+    pub(crate) presence: Option<PresenceView>,
+    pub(crate) beads: Vec<OwnedBead>,
+    pub(crate) recently_closed: Vec<OwnedClosure>,
 }
 
-struct OwnedClosure {
-    id: String,
-    title: String,
-    closed_at: DateTime<Utc>,
-    age_secs: i64,
-    assignee: Option<String>,
-    sender: Option<String>,
+pub(crate) struct OwnedClosure {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) closed_at: DateTime<Utc>,
+    pub(crate) age_secs: i64,
+    pub(crate) assignee: Option<String>,
+    pub(crate) sender: Option<String>,
 }
 
 fn kind_of(issue: &Issue, blocked_ids: &HashSet<String>) -> StatusKind {

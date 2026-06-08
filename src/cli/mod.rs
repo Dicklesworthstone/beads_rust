@@ -1123,6 +1123,12 @@ pub struct DashArgs {
     #[arg(long)]
     pub refresh: Option<u64>,
 
+    /// Render via the interactive ratatui TUI instead of the
+    /// print-and-exit dash. Hidden while the TUI is under development;
+    /// will become the default for tty stdout once stable.
+    #[arg(long, hide = true)]
+    pub tui: bool,
+
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
