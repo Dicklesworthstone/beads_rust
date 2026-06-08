@@ -32,6 +32,65 @@ use std::time::{Duration, Instant};
 /// across `bd dash --tui` invocations.
 const COLLAPSED_KEY: &str = "dash_tui_collapsed";
 
+/// Config-table key for the persisted sort mode.
+const SORT_KEY: &str = "dash_tui_sort";
+
+/// How the prefix list is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    /// Alphabetical by prefix (the default).
+    Name,
+    /// Working agents first, then idle, then offline / no presence;
+    /// alpha within each tier so the ordering is stable.
+    Activity,
+}
+
+impl SortMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Activity => "activity",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Activity,
+            Self::Activity => Self::Name,
+        }
+    }
+
+    fn from_label(s: &str) -> Self {
+        match s {
+            "activity" => Self::Activity,
+            _ => Self::Name,
+        }
+    }
+}
+
+/// Numeric tier for activity sort: lower = more active. Used as the
+/// primary key when SortMode::Activity is active.
+fn activity_tier(g: &OwnedGroup) -> u8 {
+    match g.presence.as_ref().map(|p| p.state) {
+        Some(crate::cli::commands::dash::PresenceKind::Working) => 0,
+        Some(crate::cli::commands::dash::PresenceKind::Idle) => 1,
+        _ => 2,
+    }
+}
+
+/// Sort `groups` in place per the active mode. Always stable on the
+/// prefix as a secondary key.
+fn sort_groups(groups: &mut [OwnedGroup], mode: SortMode) {
+    match mode {
+        SortMode::Name => groups.sort_by(|a, b| a.prefix.cmp(&b.prefix)),
+        SortMode::Activity => groups.sort_by(|a, b| {
+            activity_tier(a)
+                .cmp(&activity_tier(b))
+                .then_with(|| a.prefix.cmp(&b.prefix))
+        }),
+    }
+}
+
 /// Max wait between event-loop wake-ups. Short enough for snappy key
 /// response; the actual refetch cadence is `RefreshSchedule`.
 const EVENT_POLL_MS: u64 = 100;
@@ -98,24 +157,27 @@ struct App {
     /// expansions means refreshes don't accidentally re-expand a
     /// prefix the user just folded.
     collapsed: HashSet<String>,
+    sort: SortMode,
     rows: Vec<VisibleRow>,
     state: ListState,
     show_help: bool,
     /// Held for self-persistence — the App writes its collapsed-set
-    /// back to the config table on every fold change so it survives
-    /// across `bd dash --tui` invocations.
+    /// and sort mode back to the config table on every user change so
+    /// they survive across `bd dash --tui` invocations.
     beads_dir: PathBuf,
     cli: config::CliOverrides,
 }
 
 impl App {
     fn new(
-        groups: Vec<OwnedGroup>,
+        mut groups: Vec<OwnedGroup>,
         pending_asks: usize,
         beads_dir: PathBuf,
         cli: config::CliOverrides,
     ) -> Self {
         let collapsed = load_collapsed(&beads_dir, &cli).unwrap_or_default();
+        let sort = load_sort(&beads_dir, &cli).unwrap_or(SortMode::Name);
+        sort_groups(&mut groups, sort);
         let rows = build_rows(&groups, &collapsed);
         let mut state = ListState::default();
         if !rows.is_empty() {
@@ -125,6 +187,7 @@ impl App {
             groups,
             pending_asks,
             collapsed,
+            sort,
             rows,
             state,
             show_help: false,
@@ -146,6 +209,27 @@ impl App {
                 let _ = storage.set_config(COLLAPSED_KEY, &json);
             }
         }
+    }
+
+    /// Same best-effort write for the sort mode.
+    fn save_sort(&self) {
+        if let Ok((mut storage, _paths)) =
+            config::open_storage(&self.beads_dir, self.cli.db.as_ref(), self.cli.lock_timeout)
+        {
+            let _ = storage.set_config(SORT_KEY, self.sort.label());
+        }
+    }
+
+    /// Cycle to the next sort mode and persist the choice.
+    /// Cursor stays on the same row (we re-anchor by CursorKey, which
+    /// is identity-based, not position-based).
+    fn cycle_sort(&mut self) {
+        let key = self.cursor_key();
+        self.sort = self.sort.next();
+        sort_groups(&mut self.groups, self.sort);
+        self.rows = build_rows(&self.groups, &self.collapsed);
+        self.select_by_key(key);
+        self.save_sort();
     }
 
     fn is_expanded(&self, prefix: &str) -> bool {
@@ -297,10 +381,10 @@ impl App {
     }
 
     /// Replace `groups` + `pending_asks` from a fresh snapshot.
-    /// Preserves both fold-state (via `self.collapsed`, untouched
-    /// except for prefixes that disappeared) and cursor row (via
-    /// CursorKey lookup).
-    fn apply_snapshot(&mut self, groups: Vec<OwnedGroup>, pending_asks: usize) {
+    /// Preserves fold-state (via `self.collapsed`, untouched except
+    /// for prefixes that disappeared), sort mode, and cursor row
+    /// (via CursorKey lookup).
+    fn apply_snapshot(&mut self, mut groups: Vec<OwnedGroup>, pending_asks: usize) {
         let key = self.cursor_key();
 
         // Drop collapsed entries for prefixes that no longer exist —
@@ -309,6 +393,7 @@ impl App {
         let live: HashSet<String> = groups.iter().map(|g| g.prefix.clone()).collect();
         self.collapsed.retain(|p| live.contains(p));
 
+        sort_groups(&mut groups, self.sort);
         self.groups = groups;
         self.pending_asks = pending_asks;
         self.rows = build_rows(&self.groups, &self.collapsed);
@@ -589,6 +674,7 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
                             KeyCode::Char(' ') => app.toggle(),
                             KeyCode::Char('g') | KeyCode::Home => app.select_first(),
                             KeyCode::Char('G') | KeyCode::End => app.select_last(),
+                            KeyCode::Char('s') => app.cycle_sort(),
                             KeyCode::Char('?') => app.show_help = true,
                             KeyCode::Char('r') => {
                                 // Force refresh immediately; reset the next-refresh deadline.
@@ -664,15 +750,17 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         })
         .collect();
 
+    let title = format!("dashboard — sort: {}", app.sort.label());
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("dashboard"))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, chunks[1], &mut app.state);
 
     // Footer help.
-    let footer =
-        Paragraph::new("j/k nav  h/l fold  space toggle  g/G first/last  r refresh  ? help  q quit")
-            .style(Style::default().add_modifier(Modifier::DIM));
+    let footer = Paragraph::new(
+        "j/k nav  h/l fold  space toggle  g/G first/last  s sort  r refresh  ? help  q quit",
+    )
+    .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(footer, chunks[2]);
 
     if app.show_help {
@@ -694,6 +782,7 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("space        toggle current prefix"),
         Line::raw("g / Home     first row"),
         Line::raw("G / End      last row"),
+        Line::raw("s            cycle sort: name → activity → name"),
         Line::raw("r            refresh now"),
         Line::raw("?            toggle this help"),
         Line::raw("q / Esc      quit"),
@@ -722,6 +811,15 @@ fn load_collapsed(beads_dir: &Path, cli: &config::CliOverrides) -> Option<HashSe
     let raw = storage.get_config(COLLAPSED_KEY).ok().flatten()?;
     let list: Vec<String> = serde_json::from_str(&raw).ok()?;
     Some(list.into_iter().collect())
+}
+
+/// Pull the persisted sort mode out of the config table; default
+/// (SortMode::Name) is returned via the caller's unwrap_or.
+fn load_sort(beads_dir: &Path, cli: &config::CliOverrides) -> Option<SortMode> {
+    let (storage, _paths) =
+        config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
+    let raw = storage.get_config(SORT_KEY).ok().flatten()?;
+    Some(SortMode::from_label(&raw))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
