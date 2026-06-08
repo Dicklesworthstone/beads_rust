@@ -59,6 +59,36 @@ struct AllGraphOutput {
 /// # Errors
 ///
 /// Returns an error if database operations fail or if inputs are invalid.
+/// Render the same `--all` text view that `bd graph --all` prints,
+/// but into a String. Used by the TUI's Graph view-mode so it doesn't
+/// have to redirect stdout.
+///
+/// # Errors
+///
+/// Returns an error if storage open or graph computation fails.
+pub(crate) fn render_all_string(
+    cli: &config::CliOverrides,
+    args: &GraphArgs,
+) -> Result<String> {
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    render_all_components(&storage_ctx.storage, args)
+}
+
+/// Build the component list and dispatch to the right text renderer.
+/// Extracted from `graph_all` so the TUI path can reuse the same
+/// data-fetch + formatting without going through `ctx`.
+fn render_all_components(storage: &SqliteStorage, args: &GraphArgs) -> Result<String> {
+    let components = compute_components(storage)?;
+    let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
+    let text = if args.no_cluster {
+        render_all_flat_str(&components, total_nodes, args)
+    } else {
+        render_all_clustered_str(&components, total_nodes, args)
+    };
+    Ok(text)
+}
+
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -202,8 +232,10 @@ fn graph_single(
 
 /// Show graph for all `open`/`in_progress`/`blocked`/`deferred` issues.
 #[allow(clippy::too_many_lines)]
-fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> Result<()> {
-    // Get all open/in_progress/blocked issues
+/// Compute the connected-component view of the open/in-progress/
+/// blocked/deferred issue graph. Shared by the stdout path and the
+/// TUI graph view. Empty result is valid (no issues found).
+fn compute_components(storage: &SqliteStorage) -> Result<Vec<ConnectedComponent>> {
     let filters = ListFilters {
         statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked, Status::Deferred]),
         include_closed: false,
@@ -212,61 +244,35 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
     };
 
     let issues = storage.list_issues(&filters)?;
-    debug!(count = issues.len(), "Found issues for graph");
-
     if issues.is_empty() {
-        if ctx.is_json() {
-            let output = AllGraphOutput {
-                components: vec![],
-                total_nodes: 0,
-                total_components: 0,
-            };
-            ctx.json_pretty(&output);
-        } else if matches!(ctx.mode(), OutputMode::Rich) {
-            render_no_issues_rich(ctx);
-        } else {
-            println!("No open/in_progress/blocked/deferred issues found");
-        }
-        return Ok(());
+        return Ok(Vec::new());
     }
 
-    // Build issue lookup and adjacency lists
     let issue_set: HashSet<String> = issues.iter().map(|i| i.id.clone()).collect();
     let issue_map: HashMap<String, &crate::model::Issue> =
         issues.iter().map(|i| (i.id.clone(), i)).collect();
 
-    // Build adjacency list (both directions for connected components)
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut blocking_edges: Vec<(String, String)> = Vec::new();
-
-    // Optimize: fetch all dependencies once
     let all_dependencies = storage.get_all_dependency_records()?;
 
     for issue in &issues {
         adj.entry(issue.id.clone()).or_default();
-
-        // Get dependencies from bulk map
         if let Some(deps) = all_dependencies.get(&issue.id) {
             for dep in deps {
                 if !dep.dep_type.affects_ready_work() {
                     continue;
                 }
                 let dep_id = &dep.depends_on_id;
-                // Only include edges within our issue set
                 if issue_set.contains(dep_id) {
-                    adj.entry(issue.id.clone())
-                        .or_default()
-                        .push(dep_id.clone());
-                    adj.entry(dep_id.clone())
-                        .or_default()
-                        .push(issue.id.clone());
+                    adj.entry(issue.id.clone()).or_default().push(dep_id.clone());
+                    adj.entry(dep_id.clone()).or_default().push(issue.id.clone());
                     blocking_edges.push((issue.id.clone(), dep_id.clone()));
                 }
             }
         }
     }
 
-    // Find connected components using BFS
     let mut visited: HashSet<String> = HashSet::new();
     let mut components: Vec<ConnectedComponent> = Vec::new();
 
@@ -275,16 +281,13 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
             continue;
         }
 
-        // BFS to find all nodes in this component
         let mut component_nodes: Vec<String> = Vec::new();
         let mut queue: VecDeque<String> = VecDeque::new();
-
         queue.push_back(issue.id.clone());
         visited.insert(issue.id.clone());
 
         while let Some(current) = queue.pop_front() {
             component_nodes.push(current.clone());
-
             if let Some(neighbors) = adj.get(&current) {
                 for neighbor in neighbors {
                     if !visited.contains(neighbor) {
@@ -295,15 +298,11 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
             }
         }
 
-        // Calculate depths using longest path from roots
-        // Roots are issues with no unsatisfied dependencies within the component
         let component_set: HashSet<&String> = component_nodes.iter().collect();
         let mut depths = calculate_depths(&all_dependencies, &component_nodes, &component_set);
 
-        // Build component output
         let mut nodes: Vec<GraphNode> = Vec::new();
         let mut roots: Vec<String> = Vec::new();
-
         for node_id in &component_nodes {
             if let Some(issue) = issue_map.get(node_id) {
                 let depth = depths.remove(node_id).unwrap_or(0);
@@ -321,7 +320,6 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
             }
         }
 
-        // Sort by depth, priority, id
         nodes.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
@@ -330,7 +328,6 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
         });
         roots.sort();
 
-        // Filter edges to this component
         let component_edges: Vec<(String, String)> = blocking_edges
             .iter()
             .filter(|(from, to)| component_set.contains(from) && component_set.contains(to))
@@ -344,8 +341,29 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
         });
     }
 
-    // Sort components by size (largest first)
     components.sort_by_key(|b| std::cmp::Reverse(b.nodes.len()));
+    Ok(components)
+}
+
+fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> Result<()> {
+    let components = compute_components(storage)?;
+    debug!(count = components.len(), "Computed components for graph");
+
+    if components.is_empty() {
+        if ctx.is_json() {
+            let output = AllGraphOutput {
+                components: vec![],
+                total_nodes: 0,
+                total_components: 0,
+            };
+            ctx.json_pretty(&output);
+        } else if matches!(ctx.mode(), OutputMode::Rich) {
+            render_no_issues_rich(ctx);
+        } else {
+            println!("No open/in_progress/blocked/deferred issues found");
+        }
+        return Ok(());
+    }
 
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
 
@@ -359,7 +377,6 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
         return Ok(());
     }
 
-    // Text output
     if matches!(ctx.mode(), OutputMode::Rich) {
         render_all_graph_rich_with_args(&components, total_nodes, args, ctx);
     } else if args.no_cluster {
@@ -426,18 +443,29 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
 
 /// Cluster components by dominant prefix and render with section headers.
 fn render_all_clustered(components: &[ConnectedComponent], total_nodes: usize, args: &GraphArgs) {
+    print!("{}", render_all_clustered_str(components, total_nodes, args));
+}
+
+fn render_all_clustered_str(
+    components: &[ConnectedComponent],
+    total_nodes: usize,
+    args: &GraphArgs,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
     if components.is_empty() {
-        println!("(no beads)");
-        return;
+        let _ = writeln!(out, "(no beads)");
+        return out;
     }
 
-    println!(
+    let _ = writeln!(
+        out,
         "Dependency graph: {} issues in {} component(s)",
         total_nodes,
         components.len()
     );
 
-    // Group component indices by dominant prefix. Components are pre-sorted by size desc.
     let mut groups: BTreeMap<String, Vec<&ConnectedComponent>> = BTreeMap::new();
     for component in components {
         groups
@@ -446,8 +474,11 @@ fn render_all_clustered(components: &[ConnectedComponent], total_nodes: usize, a
             .push(component);
     }
 
-    // Cross-prefix goes last; the rest alphabetical.
-    let mut prefixes: Vec<String> = groups.keys().filter(|p| *p != "<cross-prefix>").cloned().collect();
+    let mut prefixes: Vec<String> = groups
+        .keys()
+        .filter(|p| *p != "<cross-prefix>")
+        .cloned()
+        .collect();
     prefixes.sort();
     if groups.contains_key("<cross-prefix>") {
         prefixes.push("<cross-prefix>".to_string());
@@ -457,7 +488,8 @@ fn render_all_clustered(components: &[ConnectedComponent], total_nodes: usize, a
         let comps = groups.get(prefix).expect("present");
         let total_in_prefix: usize = comps.iter().map(|c| c.nodes.len()).sum();
         let component_word = if comps.len() == 1 { "component" } else { "components" };
-        println!(
+        let _ = writeln!(
+            out,
             "=== {prefix} ({n} {issue_word}, {c} {comp_word}) ===",
             n = total_in_prefix,
             issue_word = if total_in_prefix == 1 { "issue" } else { "issues" },
@@ -466,46 +498,65 @@ fn render_all_clustered(components: &[ConnectedComponent], total_nodes: usize, a
         );
 
         for component in comps {
-            render_component_text(component, args, true);
+            out.push_str(&render_component_text_str(component, args, true));
         }
     }
+    out
 }
 
 /// Flat (non-clustered) view — preserves backwards compatibility via --no-cluster.
 fn render_all_flat(components: &[ConnectedComponent], total_nodes: usize, args: &GraphArgs) {
-    println!(
+    print!("{}", render_all_flat_str(components, total_nodes, args));
+}
+
+fn render_all_flat_str(
+    components: &[ConnectedComponent],
+    total_nodes: usize,
+    args: &GraphArgs,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "Dependency graph: {} issues in {} component(s)",
         total_nodes,
         components.len()
     );
-    println!();
+    let _ = writeln!(out);
     for (i, component) in components.iter().enumerate() {
         if args.compact {
             let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-            println!("Component {}: {}", i + 1, ids.join(", "));
+            let _ = writeln!(out, "Component {}: {}", i + 1, ids.join(", "));
         } else {
-            println!(
+            let _ = writeln!(
+                out,
                 "Component {} ({} issues, roots: {}):",
                 i + 1,
                 component.nodes.len(),
                 component.roots.join(", ")
             );
-            render_component_body(component, args, "  ");
-            println!();
+            out.push_str(&render_component_body_str(component, args, "  "));
+            let _ = writeln!(out);
         }
     }
+    out
 }
 
-fn render_component_text(component: &ConnectedComponent, args: &GraphArgs, indent: bool) {
+fn render_component_text_str(component: &ConnectedComponent, args: &GraphArgs, indent: bool) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
     if args.compact {
         let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
         let prefix = if indent { "  " } else { "" };
-        println!("{prefix}{}", ids.join(" → "));
-        return;
+        let _ = writeln!(out, "{prefix}{}", ids.join(" → "));
+        return out;
     }
 
     if indent && component.nodes.len() > 1 {
-        println!(
+        let _ = writeln!(
+            out,
             "  ── component ({n} {issue_word}, roots: {roots})",
             n = component.nodes.len(),
             issue_word = if component.nodes.len() == 1 { "issue" } else { "issues" },
@@ -513,10 +564,18 @@ fn render_component_text(component: &ConnectedComponent, args: &GraphArgs, inden
         );
     }
     let base_indent = if indent { "    " } else { "  " };
-    render_component_body(component, args, base_indent);
+    out.push_str(&render_component_body_str(component, args, base_indent));
+    out
 }
 
-fn render_component_body(component: &ConnectedComponent, args: &GraphArgs, base_indent: &str) {
+fn render_component_body_str(
+    component: &ConnectedComponent,
+    args: &GraphArgs,
+    base_indent: &str,
+) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
     for node in &component.nodes {
         let depth_indent = "  ".repeat(node.depth);
         let priority_badge = format!("[P{}]", node.priority);
@@ -541,8 +600,9 @@ fn render_component_body(component: &ConnectedComponent, args: &GraphArgs, base_
         let sender_w = sender_suffix.chars().count();
         let title_cap = title_budget(args, used + sender_w);
         let title = truncate_with_ellipsis(&node.title, title_cap);
-        println!("{row_prefix}{title}{sender_suffix}");
+        let _ = writeln!(out, "{row_prefix}{title}{sender_suffix}");
     }
+    out
 }
 
 // Calculate depths for nodes using longest path from roots.

@@ -35,6 +35,46 @@ const COLLAPSED_KEY: &str = "dash_tui_collapsed";
 /// Config-table key for the persisted sort mode.
 const SORT_KEY: &str = "dash_tui_sort";
 
+/// Config-table key for the persisted view mode.
+const VIEW_KEY: &str = "dash_tui_view";
+
+/// Which pane is on screen. Tab cycles forward; Shift-Tab cycles
+/// backward; 1/2 jump directly. Each mode owns its own scroll state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Dashboard,
+    Graph,
+}
+
+impl ViewMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dashboard => "dashboard",
+            Self::Graph => "graph",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Dashboard => Self::Graph,
+            Self::Graph => Self::Dashboard,
+        }
+    }
+
+    const fn prev(self) -> Self {
+        // Two modes — same as next, but kept distinct so Shift-Tab
+        // does the right thing once we add a third mode.
+        self.next()
+    }
+
+    fn from_label(s: &str) -> Self {
+        match s {
+            "graph" => Self::Graph,
+            _ => Self::Dashboard,
+        }
+    }
+}
+
 /// How the prefix list is ordered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SortMode {
@@ -161,9 +201,16 @@ struct App {
     rows: Vec<VisibleRow>,
     state: ListState,
     show_help: bool,
-    /// Held for self-persistence — the App writes its collapsed-set
-    /// and sort mode back to the config table on every user change so
-    /// they survive across `bd dash --tui` invocations.
+    /// Active view. Each mode keeps its own scroll/cursor state.
+    view: ViewMode,
+    /// Cached graph rendering. Refreshed on the same cadence as the
+    /// dashboard snapshot. Stored as a Vec<String> so we can use a
+    /// simple scroll offset (line index) for Paragraph rendering.
+    graph_lines: Vec<String>,
+    graph_scroll: u16,
+    /// Held for self-persistence — the App writes its collapsed-set,
+    /// sort mode, and view mode back to the config table on every
+    /// user change so they survive across `bd dash --tui` invocations.
     beads_dir: PathBuf,
     cli: config::CliOverrides,
 }
@@ -177,6 +224,7 @@ impl App {
     ) -> Self {
         let collapsed = load_collapsed(&beads_dir, &cli).unwrap_or_default();
         let sort = load_sort(&beads_dir, &cli).unwrap_or(SortMode::Name);
+        let view = load_view(&beads_dir, &cli).unwrap_or(ViewMode::Dashboard);
         sort_groups(&mut groups, sort);
         let rows = build_rows(&groups, &collapsed);
         let mut state = ListState::default();
@@ -191,6 +239,9 @@ impl App {
             rows,
             state,
             show_help: false,
+            view,
+            graph_lines: Vec::new(),
+            graph_scroll: 0,
             beads_dir,
             cli,
         }
@@ -230,6 +281,66 @@ impl App {
         self.rows = build_rows(&self.groups, &self.collapsed);
         self.select_by_key(key);
         self.save_sort();
+    }
+
+    fn save_view(&self) {
+        if let Ok((mut storage, _paths)) =
+            config::open_storage(&self.beads_dir, self.cli.db.as_ref(), self.cli.lock_timeout)
+        {
+            let _ = storage.set_config(VIEW_KEY, self.view.label());
+        }
+    }
+
+    fn set_view(&mut self, v: ViewMode) {
+        if self.view == v {
+            return;
+        }
+        self.view = v;
+        self.save_view();
+    }
+
+    fn cycle_view_forward(&mut self) {
+        self.set_view(self.view.next());
+    }
+
+    fn cycle_view_back(&mut self) {
+        self.set_view(self.view.prev());
+    }
+
+    /// Re-fetch the graph rendering. Best-effort — keeps the previous
+    /// text on failure rather than blanking the view.
+    fn refresh_graph(&mut self) {
+        let args = crate::cli::GraphArgs {
+            all: true,
+            ..Default::default()
+        };
+        if let Ok(text) = crate::cli::commands::graph::render_all_string(&self.cli, &args) {
+            self.graph_lines = text.lines().map(str::to_string).collect();
+            // Clamp scroll if the new content is shorter.
+            let max = self.graph_lines.len().saturating_sub(1) as u16;
+            if self.graph_scroll > max {
+                self.graph_scroll = max;
+            }
+        }
+    }
+
+    fn graph_scroll_down(&mut self) {
+        let max = (self.graph_lines.len().saturating_sub(1)) as u16;
+        if self.graph_scroll < max {
+            self.graph_scroll += 1;
+        }
+    }
+
+    fn graph_scroll_up(&mut self) {
+        self.graph_scroll = self.graph_scroll.saturating_sub(1);
+    }
+
+    fn graph_scroll_first(&mut self) {
+        self.graph_scroll = 0;
+    }
+
+    fn graph_scroll_last(&mut self) {
+        self.graph_scroll = self.graph_lines.len().saturating_sub(1) as u16;
     }
 
     fn is_expanded(&self, prefix: &str) -> bool {
@@ -633,6 +744,9 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let initial = snapshot(args, cli, &beads_dir, Utc::now())?;
     let mut app = App::new(initial.0, initial.1, beads_dir.clone(), cli.clone());
+    // Prime the graph view so switching to it doesn't show empty
+    // contents until the first refresh tick.
+    app.refresh_graph();
 
     let refresh_every =
         Duration::from_secs(args.refresh.unwrap_or(DEFAULT_REFRESH_SECS).max(1));
@@ -662,26 +776,42 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
                             app.show_help = false;
                         }
                     } else {
+                        // Keys common to all views.
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 return Ok(());
                             }
-                            KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-                            KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-                            KeyCode::Char('h') | KeyCode::Left => app.collapse_or_jump(),
-                            KeyCode::Char('l') | KeyCode::Right => app.expand(),
-                            KeyCode::Char(' ') => app.toggle(),
-                            KeyCode::Char('g') | KeyCode::Home => app.select_first(),
-                            KeyCode::Char('G') | KeyCode::End => app.select_last(),
-                            KeyCode::Char('s') => app.cycle_sort(),
                             KeyCode::Char('?') => app.show_help = true,
+                            KeyCode::Tab => app.cycle_view_forward(),
+                            KeyCode::BackTab => app.cycle_view_back(),
+                            KeyCode::Char('1') => app.set_view(ViewMode::Dashboard),
+                            KeyCode::Char('2') => app.set_view(ViewMode::Graph),
                             KeyCode::Char('r') => {
-                                // Force refresh immediately; reset the next-refresh deadline.
                                 refresh(&mut app, args, cli, &beads_dir);
                                 next_refresh = Instant::now() + refresh_every;
                             }
-                            _ => {}
+                            // View-specific bindings.
+                            _ => match app.view {
+                                ViewMode::Dashboard => match key.code {
+                                    KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                                    KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                                    KeyCode::Char('h') | KeyCode::Left => app.collapse_or_jump(),
+                                    KeyCode::Char('l') | KeyCode::Right => app.expand(),
+                                    KeyCode::Char(' ') => app.toggle(),
+                                    KeyCode::Char('g') | KeyCode::Home => app.select_first(),
+                                    KeyCode::Char('G') | KeyCode::End => app.select_last(),
+                                    KeyCode::Char('s') => app.cycle_sort(),
+                                    _ => {}
+                                },
+                                ViewMode::Graph => match key.code {
+                                    KeyCode::Char('j') | KeyCode::Down => app.graph_scroll_down(),
+                                    KeyCode::Char('k') | KeyCode::Up => app.graph_scroll_up(),
+                                    KeyCode::Char('g') | KeyCode::Home => app.graph_scroll_first(),
+                                    KeyCode::Char('G') | KeyCode::End => app.graph_scroll_last(),
+                                    _ => {}
+                                },
+                            },
                         }
                     }
                 }
@@ -699,11 +829,13 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
 
 /// Best-effort snapshot refresh — a single failed query shouldn't
 /// kill the TUI loop. If the refresh fails, the previous snapshot
-/// continues to render.
+/// continues to render. Refreshes both the dashboard snapshot and
+/// the graph rendering on every tick so view switches feel snappy.
 fn refresh(app: &mut App, args: &DashArgs, cli: &config::CliOverrides, beads_dir: &Path) {
     if let Ok((groups, pending)) = snapshot(args, cli, beads_dir, Utc::now()) {
         app.apply_snapshot(groups, pending);
     }
+    app.refresh_graph();
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -716,7 +848,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(frame.area());
 
-    // Top status line.
+    // Top status line — shared across views.
     let status: Paragraph<'_> = if app.pending_asks > 0 {
         let noun = if app.pending_asks == 1 { "ask" } else { "asks" };
         Paragraph::new(format!(
@@ -725,13 +857,52 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ))
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
     } else {
-        Paragraph::new("")
+        Paragraph::new(view_tab_strip(app.view))
+            .style(Style::default().add_modifier(Modifier::DIM))
     };
     frame.render_widget(status, chunks[0]);
 
-    // Scrollable list. We build ListItems on the fly, looking up
-    // headers by prefix from the snapshot rather than caching them
-    // alongside VisibleRow — keeps build_rows cheap.
+    match app.view {
+        ViewMode::Dashboard => draw_dashboard(frame, chunks[1], app),
+        ViewMode::Graph => draw_graph(frame, chunks[1], app),
+    }
+
+    // Footer help.
+    let footer = Paragraph::new(footer_help(app.view))
+        .style(Style::default().add_modifier(Modifier::DIM));
+    frame.render_widget(footer, chunks[2]);
+
+    if app.show_help {
+        draw_help_overlay(frame, frame.area());
+    }
+}
+
+fn view_tab_strip(active: ViewMode) -> String {
+    // Tiny tab-strip so the user always sees which view is active.
+    let mut s = String::new();
+    for v in [ViewMode::Dashboard, ViewMode::Graph] {
+        if !s.is_empty() {
+            s.push_str("  ");
+        }
+        if v == active {
+            s.push_str(&format!("[{}]", v.label()));
+        } else {
+            s.push_str(&format!(" {} ", v.label()));
+        }
+    }
+    s
+}
+
+fn footer_help(view: ViewMode) -> &'static str {
+    match view {
+        ViewMode::Dashboard => {
+            "j/k nav  h/l fold  space toggle  g/G first/last  s sort  Tab view  r refresh  ? help  q quit"
+        }
+        ViewMode::Graph => "j/k scroll  g/G first/last  Tab view  r refresh  ? help  q quit",
+    }
+}
+
+fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let items: Vec<ListItem<'_>> = app
         .rows
         .iter()
@@ -754,18 +925,28 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(list, chunks[1], &mut app.state);
+    frame.render_stateful_widget(list, area, &mut app.state);
+}
 
-    // Footer help.
-    let footer = Paragraph::new(
-        "j/k nav  h/l fold  space toggle  g/G first/last  s sort  r refresh  ? help  q quit",
-    )
-    .style(Style::default().add_modifier(Modifier::DIM));
-    frame.render_widget(footer, chunks[2]);
+fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let lines: Vec<Line<'static>> = if app.graph_lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "(no graph data yet — refreshing)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))]
+    } else {
+        app.graph_lines
+            .iter()
+            .map(|l| Line::from(l.clone()))
+            .collect()
+    };
 
-    if app.show_help {
-        draw_help_overlay(frame, frame.area());
-    }
+    let title = format!("graph — {} lines", app.graph_lines.len());
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false })
+        .scroll((app.graph_scroll, 0));
+    frame.render_widget(para, area);
 }
 
 fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect) {
@@ -780,9 +961,12 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("h / ←        collapse current prefix (or jump to its header)"),
         Line::raw("l / →        expand current prefix"),
         Line::raw("space        toggle current prefix"),
-        Line::raw("g / Home     first row"),
-        Line::raw("G / End      last row"),
-        Line::raw("s            cycle sort: name → activity → name"),
+        Line::raw("g / Home     first row / top"),
+        Line::raw("G / End      last row / bottom"),
+        Line::raw("s            cycle sort: name → activity (dashboard view)"),
+        Line::raw("Tab          next view (dashboard ⇄ graph)"),
+        Line::raw("Shift-Tab    previous view"),
+        Line::raw("1 / 2        jump to dashboard / graph view"),
         Line::raw("r            refresh now"),
         Line::raw("?            toggle this help"),
         Line::raw("q / Esc      quit"),
@@ -820,6 +1004,14 @@ fn load_sort(beads_dir: &Path, cli: &config::CliOverrides) -> Option<SortMode> {
         config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
     let raw = storage.get_config(SORT_KEY).ok().flatten()?;
     Some(SortMode::from_label(&raw))
+}
+
+/// Same pattern for view mode.
+fn load_view(beads_dir: &Path, cli: &config::CliOverrides) -> Option<ViewMode> {
+    let (storage, _paths) =
+        config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
+    let raw = storage.get_config(VIEW_KEY).ok().flatten()?;
+    Some(ViewMode::from_label(&raw))
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
