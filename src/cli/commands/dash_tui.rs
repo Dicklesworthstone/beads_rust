@@ -108,6 +108,16 @@ impl SortMode {
     }
 }
 
+/// Per-bead detail-pane state. Holds the pre-rendered Lines so we
+/// build them once on Enter (and on 'r' inside detail), not every
+/// frame. Scroll offset is line-indexed against `lines`.
+struct DetailState {
+    bead_id: String,
+    title_for_pane: String,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+}
+
 /// Numeric tier for activity sort: lower = more active. Used as the
 /// primary key when SortMode::Activity is active.
 fn activity_tier(g: &OwnedGroup) -> u8 {
@@ -208,6 +218,11 @@ struct App {
     /// graph view shows color (status, priority, headers).
     graph_lines: Vec<Line<'static>>,
     graph_scroll: u16,
+    /// Active detail-view state, if any. `Some(...)` means the user
+    /// pressed Enter on a bead and is currently looking at its
+    /// details; key handling switches to detail bindings until they
+    /// press q / Backspace to return.
+    detail: Option<DetailState>,
     /// Held for self-persistence — the App writes its collapsed-set,
     /// sort mode, and view mode back to the config table on every
     /// user change so they survive across `bd dash --tui` invocations.
@@ -242,6 +257,7 @@ impl App {
             view,
             graph_lines: Vec::new(),
             graph_scroll: 0,
+            detail: None,
             beads_dir,
             cli,
         }
@@ -341,6 +357,69 @@ impl App {
 
     fn graph_scroll_last(&mut self) {
         self.graph_scroll = self.graph_lines.len().saturating_sub(1) as u16;
+    }
+
+    /// Get the bead-id under the cursor, if any.
+    fn cursor_bead_id(&self) -> Option<&str> {
+        match self.state.selected().and_then(|i| self.rows.get(i)) {
+            Some(VisibleRow::Bead { bead_id, .. } | VisibleRow::Closure { bead_id, .. }) => {
+                Some(bead_id.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Open the detail pane for the currently-selected bead. Best-
+    /// effort — if the fetch fails (DB lock, deleted between snapshot
+    /// and now), silently no-op so the UI stays responsive.
+    fn open_detail(&mut self) {
+        let Some(bead_id) = self.cursor_bead_id().map(str::to_string) else {
+            return;
+        };
+        if let Some(state) = load_detail(&self.beads_dir, &self.cli, &bead_id) {
+            self.detail = Some(state);
+        }
+    }
+
+    /// Re-fetch the current detail (used by 'r' inside the pane).
+    fn refresh_detail(&mut self) {
+        let Some(bead_id) = self.detail.as_ref().map(|d| d.bead_id.clone()) else {
+            return;
+        };
+        if let Some(state) = load_detail(&self.beads_dir, &self.cli, &bead_id) {
+            self.detail = Some(state);
+        }
+    }
+
+    fn close_detail(&mut self) {
+        self.detail = None;
+    }
+
+    fn detail_scroll_down(&mut self) {
+        if let Some(d) = self.detail.as_mut() {
+            let max = d.lines.len().saturating_sub(1) as u16;
+            if d.scroll < max {
+                d.scroll += 1;
+            }
+        }
+    }
+
+    fn detail_scroll_up(&mut self) {
+        if let Some(d) = self.detail.as_mut() {
+            d.scroll = d.scroll.saturating_sub(1);
+        }
+    }
+
+    fn detail_scroll_first(&mut self) {
+        if let Some(d) = self.detail.as_mut() {
+            d.scroll = 0;
+        }
+    }
+
+    fn detail_scroll_last(&mut self) {
+        if let Some(d) = self.detail.as_mut() {
+            d.scroll = d.lines.len().saturating_sub(1) as u16;
+        }
     }
 
     fn is_expanded(&self, prefix: &str) -> bool {
@@ -787,6 +866,23 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
                         ) {
                             app.show_help = false;
                         }
+                    } else if app.detail.is_some() {
+                        // Detail pane keys. q / Backspace go back to
+                        // dashboard; Esc and Ctrl-C exit entirely.
+                        match key.code {
+                            KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                return Ok(());
+                            }
+                            KeyCode::Char('q') | KeyCode::Backspace => app.close_detail(),
+                            KeyCode::Char('j') | KeyCode::Down => app.detail_scroll_down(),
+                            KeyCode::Char('k') | KeyCode::Up => app.detail_scroll_up(),
+                            KeyCode::Char('g') | KeyCode::Home => app.detail_scroll_first(),
+                            KeyCode::Char('G') | KeyCode::End => app.detail_scroll_last(),
+                            KeyCode::Char('r') => app.refresh_detail(),
+                            KeyCode::Char('?') => app.show_help = true,
+                            _ => {}
+                        }
                     } else {
                         // Keys common to all views.
                         match key.code {
@@ -814,6 +910,7 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
                                     KeyCode::Char('g') | KeyCode::Home => app.select_first(),
                                     KeyCode::Char('G') | KeyCode::End => app.select_last(),
                                     KeyCode::Char('s') => app.cycle_sort(),
+                                    KeyCode::Enter => app.open_detail(),
                                     _ => {}
                                 },
                                 ViewMode::Graph => match key.code {
@@ -874,13 +971,22 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     };
     frame.render_widget(status, chunks[0]);
 
-    match app.view {
-        ViewMode::Dashboard => draw_dashboard(frame, chunks[1], app),
-        ViewMode::Graph => draw_graph(frame, chunks[1], app),
+    if app.detail.is_some() {
+        draw_detail(frame, chunks[1], app);
+    } else {
+        match app.view {
+            ViewMode::Dashboard => draw_dashboard(frame, chunks[1], app),
+            ViewMode::Graph => draw_graph(frame, chunks[1], app),
+        }
     }
 
     // Footer help.
-    let footer = Paragraph::new(footer_help(app.view))
+    let footer_text = if app.detail.is_some() {
+        "j/k scroll  g/G top/bot  r refresh  q back  Esc exit"
+    } else {
+        footer_help(app.view)
+    };
+    let footer = Paragraph::new(footer_text)
         .style(Style::default().add_modifier(Modifier::DIM));
     frame.render_widget(footer, chunks[2]);
 
@@ -908,7 +1014,7 @@ fn view_tab_strip(active: ViewMode) -> String {
 fn footer_help(view: ViewMode) -> &'static str {
     match view {
         ViewMode::Dashboard => {
-            "j/k nav  h/l fold  space toggle  g/G first/last  s sort  Tab view  r refresh  ? help  q quit"
+            "j/k nav  h/l fold  ↵ detail  s sort  Tab view  r refresh  ? help  q quit"
         }
         ViewMode::Graph => "j/k scroll  g/G first/last  Tab view  r refresh  ? help  q quit",
     }
@@ -938,6 +1044,21 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(list, area, &mut app.state);
+}
+
+fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    let Some(d) = app.detail.as_ref() else {
+        return;
+    };
+    let para = Paragraph::new(d.lines.clone())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(d.title_for_pane.clone()),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((d.scroll, 0));
+    frame.render_widget(para, area);
 }
 
 fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -973,6 +1094,8 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::raw("g / Home     first row / top"),
         Line::raw("G / End      last row / bottom"),
         Line::raw("s            cycle sort: name → activity (dashboard view)"),
+        Line::raw("Enter        open detail pane for the selected bead"),
+        Line::raw("              (q / Backspace closes; Esc exits entirely)"),
         Line::raw("Tab          next view (dashboard ⇄ graph)"),
         Line::raw("Shift-Tab    previous view"),
         Line::raw("1 / 2        jump to dashboard / graph view"),
@@ -992,6 +1115,197 @@ fn draw_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title("help");
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     frame.render_widget(para, rect);
+}
+
+/// Open the issue details for `bead_id` and prerender them into the
+/// styled Lines that the detail pane displays. None on any fetch
+/// failure or unknown id.
+fn load_detail(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    bead_id: &str,
+) -> Option<DetailState> {
+    let (storage, _paths) =
+        config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
+    let details = storage.get_issue_details(bead_id, false, false, 0).ok()??;
+    let title_for_pane = format!("detail: {bead_id}");
+    let lines = render_issue_detail(&details);
+    Some(DetailState {
+        bead_id: bead_id.to_string(),
+        title_for_pane,
+        lines,
+        scroll: 0,
+    })
+}
+
+fn render_issue_detail(
+    details: &crate::format::IssueDetails,
+) -> Vec<Line<'static>> {
+    let issue = &details.issue;
+    let cyan = Style::default().fg(Color::Cyan);
+    let yellow = Style::default().fg(Color::Yellow);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Header row: <id>  ·  <status>  ·  <P?>  ·  <type>
+    let status_text = issue.status.as_str().to_uppercase();
+    let status_style = match issue.status.as_str() {
+        "in_progress" => Style::default().fg(Color::Green),
+        "blocked" => Style::default().fg(Color::Red),
+        "deferred" | "closed" | "tombstone" => dim,
+        _ => Style::default(),
+    };
+    out.push(Line::from(vec![
+        Span::styled(issue.id.clone(), cyan.add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  "),
+        Span::styled(status_text, status_style.add_modifier(Modifier::BOLD)),
+        Span::raw("  ·  "),
+        Span::styled(format!("P{}", issue.priority.0), yellow),
+        Span::raw("  ·  "),
+        Span::raw(issue.issue_type.as_str().to_string()),
+    ]));
+
+    // Title row.
+    out.push(Line::from(Span::styled(issue.title.clone(), bold)));
+    out.push(Line::raw(""));
+
+    // Owner / assignee.
+    if let Some(owner) = issue.owner.as_deref().filter(|s| !s.is_empty()) {
+        out.push(label_value("Owner", owner));
+    }
+    if let Some(assignee) = issue.assignee.as_deref().filter(|s| !s.is_empty()) {
+        out.push(label_value("Assignee", assignee));
+    }
+
+    // Dates.
+    out.push(label_value(
+        "Created",
+        &issue.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+    ));
+    out.push(label_value(
+        "Updated",
+        &issue.updated_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+    ));
+    if let Some(closed) = issue.closed_at.as_ref() {
+        let reason = issue.close_reason.as_deref().unwrap_or("closed");
+        out.push(label_value(
+            "Closed",
+            &format!("{} ({})", closed.format("%Y-%m-%d %H:%M UTC"), reason),
+        ));
+    }
+    if let Some(due) = issue.due_at.as_ref() {
+        out.push(label_value("Due", &due.format("%Y-%m-%d").to_string()));
+    }
+    if let Some(defer) = issue.defer_until.as_ref() {
+        out.push(label_value(
+            "Deferred until",
+            &defer.format("%Y-%m-%d").to_string(),
+        ));
+    }
+
+    // Estimate.
+    if let Some(min) = issue.estimated_minutes
+        && min > 0
+    {
+        let h = min / 60;
+        let r = min % 60;
+        let txt = if h > 0 && r > 0 {
+            format!("{h}h {r}m")
+        } else if h > 0 {
+            format!("{h}h")
+        } else {
+            format!("{r}m")
+        };
+        out.push(label_value("Estimate", &txt));
+    }
+
+    // External ref / source / sender.
+    if let Some(s) = issue.external_ref.as_deref().filter(|s| !s.is_empty()) {
+        out.push(label_value("External ref", s));
+    }
+    if let Some(s) = issue.sender.as_deref().filter(|s| !s.is_empty()) {
+        out.push(label_value("Sender", s));
+    }
+    if let Some(p) = details.parent.as_deref().filter(|s| !s.is_empty()) {
+        out.push(Line::from(vec![
+            Span::styled("Parent: ", dim),
+            Span::styled(p.to_string(), cyan),
+        ]));
+    }
+
+    // Free-form sections.
+    if let Some(text) = issue.description.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled("Description", bold)));
+        push_wrapped(&mut out, text);
+    }
+    if let Some(text) = issue.design.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled("Design", bold)));
+        push_wrapped(&mut out, text);
+    }
+    if let Some(text) = issue
+        .acceptance_criteria
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled("Acceptance Criteria", bold)));
+        push_wrapped(&mut out, text);
+    }
+    if let Some(text) = issue.notes.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled("Notes", bold)));
+        push_wrapped(&mut out, text);
+    }
+
+    // Dependencies / dependents.
+    if !details.dependencies.is_empty() {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled("Dependencies", bold)));
+        for dep in &details.dependencies {
+            out.push(Line::from(vec![
+                Span::raw("  → "),
+                Span::styled(dep.id.clone(), cyan),
+                Span::styled(format!(" ({}) ", dep.dep_type), dim),
+                Span::raw(dep.title.clone()),
+            ]));
+        }
+    }
+    if !details.dependents.is_empty() {
+        out.push(Line::raw(""));
+        out.push(Line::from(Span::styled("Dependents", bold)));
+        for dep in &details.dependents {
+            out.push(Line::from(vec![
+                Span::raw("  ← "),
+                Span::styled(dep.id.clone(), cyan),
+                Span::styled(format!(" ({}) ", dep.dep_type), dim),
+                Span::raw(dep.title.clone()),
+            ]));
+        }
+    }
+
+    out
+}
+
+/// `Label: value` line — label dim, value default.
+fn label_value(label: &str, value: &str) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    Line::from(vec![
+        Span::styled(format!("{label}: "), dim),
+        Span::raw(value.to_string()),
+    ])
+}
+
+/// Append free-form text as plain Lines, preserving the user's
+/// original line breaks. Paragraph::wrap handles any further wrapping
+/// at render time when the terminal is narrower than the content.
+fn push_wrapped(out: &mut Vec<Line<'static>>, text: &str) {
+    for line in text.lines() {
+        out.push(Line::raw(line.to_string()));
+    }
 }
 
 /// Pull the persisted collapsed-prefix set out of the config table.
