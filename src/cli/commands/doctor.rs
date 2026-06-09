@@ -11,10 +11,11 @@ use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
+use crate::model::{DependencyType, Issue, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness,
+    JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness, path as sync_path,
     restore_tombstones_after_rebuild, scan_conflict_markers, scan_jsonl_for_tombstone_filter,
     snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
     validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
@@ -25,9 +26,9 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -81,6 +82,8 @@ enum DoctorInspectionMode {
     Full,
     Quick,
 }
+
+const DIRECT_BLOCKING_EDGE_SAMPLE_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct LocalRepairResult {
@@ -740,6 +743,14 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     (
         "policy.workflow_statuses",
         "fm-agent_coordination-workflow-status-out-of-set",
+    ),
+    (
+        "dep.dead_closed_blocking_edges",
+        "fm-dependencies-dead-closed-blocking-edges",
+    ),
+    (
+        "dep.fully_unblocked_open",
+        "fm-dependencies-fully-unblocked-open",
     ),
     // routes_external
     ("routes_jsonl", "fm-routes_external-routes-jsonl-corrupt"),
@@ -5928,6 +5939,197 @@ fn check_recoverable_anomalies(conn: &Connection, checks: &mut Vec<CheckResult>)
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct DeadClosedBlockingEdgeSample {
+    issue_id: String,
+    blocker_id: String,
+    dependency_type: String,
+    blocker_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FullyUnblockedOpenIssueSample {
+    issue_id: String,
+    terminal_blocker_count: i64,
+}
+
+fn check_direct_dependency_blocker_health_from_jsonl(
+    jsonl_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Result<()> {
+    let issues_by_id = scan_jsonl_last_write_wins_issues(jsonl_path)?;
+    check_dead_closed_blocking_edges(&issues_by_id, jsonl_path, checks);
+    check_fully_unblocked_open_issues(&issues_by_id, jsonl_path, checks);
+    Ok(())
+}
+
+fn scan_jsonl_last_write_wins_issues(jsonl_path: &Path) -> Result<BTreeMap<String, Issue>> {
+    let file = fs::File::open(jsonl_path)?;
+    sync_path::validate_jsonl_fd_metadata(&file, jsonl_path)?;
+    let mut reader = BufReader::new(file);
+    let mut issues_by_id = BTreeMap::new();
+    let mut line = String::new();
+    let mut line_num = 0;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            line_num += 1;
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|err| {
+            BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, err))
+        })?;
+        issues_by_id.insert(issue.id.clone(), issue);
+        line_num += 1;
+    }
+
+    Ok(issues_by_id)
+}
+
+fn check_dead_closed_blocking_edges(
+    issues_by_id: &BTreeMap<String, Issue>,
+    jsonl_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
+    let dead_edges: Vec<DeadClosedBlockingEdgeSample> = issues_by_id
+        .values()
+        .filter(|issue| issue.status == Status::Open)
+        .flat_map(|issue| {
+            issue
+                .dependencies
+                .iter()
+                .filter(|dep| dependency_is_direct_blocker(&dep.dep_type))
+                .filter_map(|dep| {
+                    let blocker = issues_by_id.get(&dep.depends_on_id)?;
+                    blocker
+                        .status
+                        .is_terminal()
+                        .then(|| DeadClosedBlockingEdgeSample {
+                            issue_id: issue.id.clone(),
+                            blocker_id: dep.depends_on_id.clone(),
+                            dependency_type: dep.dep_type.as_str().to_string(),
+                            blocker_status: blocker.status.as_str().to_string(),
+                        })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let count = i64::try_from(dead_edges.len()).unwrap_or(i64::MAX);
+    let samples: Vec<DeadClosedBlockingEdgeSample> = dead_edges
+        .iter()
+        .take(DIRECT_BLOCKING_EDGE_SAMPLE_LIMIT)
+        .cloned()
+        .collect();
+    let sample_count = i64::try_from(samples.len()).unwrap_or(i64::MAX);
+    push_check(
+        checks,
+        "dep.dead_closed_blocking_edges",
+        if count == 0 {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        (count > 0).then(|| {
+            format!(
+                "{count} direct blocking dependency edge(s) point to closed or tombstoned blockers"
+            )
+        }),
+        Some(serde_json::json!({
+            "count": count,
+            "source": "issues_jsonl_last_write_wins",
+            "path": jsonl_path.display().to_string(),
+            "sample_limit": DIRECT_BLOCKING_EDGE_SAMPLE_LIMIT,
+            "truncated": count > sample_count,
+            "samples": samples,
+        })),
+    );
+}
+
+fn check_fully_unblocked_open_issues(
+    issues_by_id: &BTreeMap<String, Issue>,
+    jsonl_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
+    let fully_unblocked: Vec<FullyUnblockedOpenIssueSample> = issues_by_id
+        .values()
+        .filter(|issue| issue.status == Status::Open)
+        .filter_map(|issue| fully_unblocked_open_issue_sample(issue, issues_by_id))
+        .collect();
+
+    let count = i64::try_from(fully_unblocked.len()).unwrap_or(i64::MAX);
+    let samples: Vec<FullyUnblockedOpenIssueSample> = fully_unblocked
+        .iter()
+        .take(DIRECT_BLOCKING_EDGE_SAMPLE_LIMIT)
+        .cloned()
+        .collect();
+
+    let sample_count = i64::try_from(samples.len()).unwrap_or(i64::MAX);
+    push_check(
+        checks,
+        "dep.fully_unblocked_open",
+        if count == 0 {
+            CheckStatus::Ok
+        } else {
+            CheckStatus::Warn
+        },
+        (count > 0).then(|| {
+            format!(
+                "{count} open issue(s) have only terminal direct blockers and should no longer be blocked"
+            )
+        }),
+        Some(serde_json::json!({
+            "count": count,
+            "source": "issues_jsonl_last_write_wins",
+            "path": jsonl_path.display().to_string(),
+            "sample_limit": DIRECT_BLOCKING_EDGE_SAMPLE_LIMIT,
+            "truncated": count > sample_count,
+            "samples": samples,
+        })),
+    );
+}
+
+fn fully_unblocked_open_issue_sample(
+    issue: &Issue,
+    issues_by_id: &BTreeMap<String, Issue>,
+) -> Option<FullyUnblockedOpenIssueSample> {
+    let mut blocking_count: i64 = 0;
+    let mut terminal_blocker_count: i64 = 0;
+
+    for dep in issue
+        .dependencies
+        .iter()
+        .filter(|dep| dependency_is_direct_blocker(&dep.dep_type))
+    {
+        blocking_count += 1;
+        let blocker = issues_by_id.get(&dep.depends_on_id)?;
+        if !blocker.status.is_terminal() {
+            return None;
+        }
+        terminal_blocker_count += 1;
+    }
+
+    (blocking_count > 0).then(|| FullyUnblockedOpenIssueSample {
+        issue_id: issue.id.clone(),
+        terminal_blocker_count,
+    })
+}
+
+fn dependency_is_direct_blocker(dep_type: &DependencyType) -> bool {
+    matches!(
+        dep_type,
+        DependencyType::Blocks | DependencyType::ConditionalBlocks | DependencyType::WaitsFor
+    )
+}
+
 /// (table, column, fix_sql) tuples for every NOT NULL DEFAULT column that
 /// can hold a storage-class NULL on legacy databases. Mirrors the schema
 /// bootstrap's v8 migration in `backfill_storage_null_in_default_columns`
@@ -10046,7 +10248,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_routes_targets_resolve(beads_dir, &mut checks);
     check_startup_cache(beads_dir, db_override, &mut checks);
 
-    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
+    let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, mode, &mut checks);
     // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
     check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
     // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
@@ -10082,6 +10284,7 @@ fn collect_doctor_report_with_mode_and_db_override(
 fn inspect_doctor_jsonl(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
+    mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) -> (Option<PathBuf>, JsonlCountState) {
     let jsonl_path = select_doctor_jsonl_path(beads_dir, paths);
@@ -10103,7 +10306,21 @@ fn inspect_doctor_jsonl(
         check_sync_conflict_markers(path, checks);
 
         match check_jsonl(path, checks) {
-            Ok(count) => count,
+            Ok(count) => {
+                if mode == DoctorInspectionMode::Full
+                    && !matches!(count, JsonlCountState::Invalid)
+                    && let Err(err) =
+                        check_direct_dependency_blocker_health_from_jsonl(path, checks)
+                {
+                    push_inspection_error(
+                        checks,
+                        "dep.blocker_health",
+                        "Failed to inspect JSONL direct dependency blocker health",
+                        &err,
+                    );
+                }
+                count
+            }
             Err(err) => {
                 push_check(
                     checks,
@@ -11411,7 +11628,7 @@ fn emit_flat_robot_triage(report: &DoctorReport) {
 mod tests {
     use super::*;
     use crate::health::{AnomalyClass, WorkspaceHealth};
-    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
     use fsqlite::Connection;
@@ -11477,10 +11694,45 @@ mod tests {
         }
     }
 
+    fn sample_dependency(
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: DependencyType,
+    ) -> Dependency {
+        Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: depends_on_id.to_string(),
+            dep_type,
+            created_at: Utc::now(),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }
+    }
+
+    fn write_jsonl_issues(path: &Path, issues: &[Issue]) -> Result<()> {
+        let mut body = String::new();
+        for issue in issues {
+            body.push_str(&serde_json::to_string(issue)?);
+            body.push('\n');
+        }
+        fs::write(path, body)?;
+        Ok(())
+    }
+
     fn create_sample_issue(storage: &mut SqliteStorage, id: &str, title: &str) {
         storage
             .create_issue(&sample_issue(id, title), "tester")
             .unwrap();
+    }
+
+    fn check_detail_count(check: &CheckResult) -> i64 {
+        check
+            .details
+            .as_ref()
+            .and_then(|details| details.get("count"))
+            .and_then(serde_json::Value::as_i64)
+            .expect("check count detail")
     }
 
     fn insert_dependency_row(conn: &Connection, issue_id: &str, depends_on_id: &str) {
@@ -16138,6 +16390,8 @@ mod tests {
             "sync.metadata",
             "sqlite3.integrity_check",
             "db.write_probe",
+            "dep.dead_closed_blocking_edges",
+            "dep.fully_unblocked_open",
         ] {
             assert!(
                 find_check(&quick.report.checks, skipped).is_none(),
@@ -16703,6 +16957,141 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message == READY_PROJECTION_CONTENT_MISMATCH_FINDING)
         }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_direct_dependency_blocker_health_warns_on_dead_closed_blockers() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let mut closed = sample_issue("bd-closed", "Closed blocker");
+        closed.status = Status::Closed;
+        let active = sample_issue("bd-active", "Active blocker");
+        let mut unblocked = sample_issue("bd-unblocked", "Only terminal blockers");
+        unblocked.dependencies.push(sample_dependency(
+            &unblocked.id,
+            &closed.id,
+            DependencyType::Blocks,
+        ));
+        let mut still_blocked = sample_issue("bd-still-blocked", "Still blocked");
+        still_blocked.dependencies.push(sample_dependency(
+            &still_blocked.id,
+            &closed.id,
+            DependencyType::Blocks,
+        ));
+        still_blocked.dependencies.push(sample_dependency(
+            &still_blocked.id,
+            &active.id,
+            DependencyType::Blocks,
+        ));
+        let mut related = sample_issue("bd-related", "Related edge control");
+        related.dependencies.push(sample_dependency(
+            &related.id,
+            &closed.id,
+            DependencyType::Related,
+        ));
+        write_jsonl_issues(
+            &jsonl_path,
+            &[closed, active, unblocked, still_blocked, related],
+        )?;
+
+        let mut checks = Vec::new();
+        check_direct_dependency_blocker_health_from_jsonl(&jsonl_path, &mut checks)?;
+
+        let dead_edges =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead edges check");
+        assert!(matches!(dead_edges.status, CheckStatus::Warn));
+        assert_eq!(check_detail_count(dead_edges), 2);
+        let samples = dead_edges
+            .details
+            .as_ref()
+            .and_then(|details| details.get("samples"))
+            .and_then(serde_json::Value::as_array)
+            .expect("dead edge samples");
+        assert_eq!(samples.len(), 2);
+
+        let fully_unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("unblocked check");
+        assert!(matches!(fully_unblocked.status, CheckStatus::Warn));
+        assert_eq!(check_detail_count(fully_unblocked), 1);
+        let samples = fully_unblocked
+            .details
+            .as_ref()
+            .and_then(|details| details.get("samples"))
+            .and_then(serde_json::Value::as_array)
+            .expect("unblocked samples");
+        assert_eq!(
+            samples
+                .first()
+                .and_then(|sample| sample.get("issue_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("bd-unblocked")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_direct_dependency_blocker_health_ok_when_no_terminal_blockers() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let blocker = sample_issue("bd-blocker", "Open blocker");
+        let mut target = sample_issue("bd-target", "Target");
+        target.dependencies.push(sample_dependency(
+            &target.id,
+            &blocker.id,
+            DependencyType::Blocks,
+        ));
+        write_jsonl_issues(&jsonl_path, &[blocker, target])?;
+
+        let mut checks = Vec::new();
+        check_direct_dependency_blocker_health_from_jsonl(&jsonl_path, &mut checks)?;
+
+        let dead_edges =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead edges check");
+        assert!(matches!(dead_edges.status, CheckStatus::Ok));
+        assert_eq!(check_detail_count(dead_edges), 0);
+
+        let fully_unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("unblocked check");
+        assert!(matches!(fully_unblocked.status, CheckStatus::Ok));
+        assert_eq!(check_detail_count(fully_unblocked), 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_direct_dependency_blocker_health_uses_jsonl_last_write_wins() -> Result<()> {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let stale_open_blocker = sample_issue("bd-rewritten", "Open blocker");
+        let mut target = sample_issue("bd-target", "Target");
+        target.dependencies.push(sample_dependency(
+            &target.id,
+            &stale_open_blocker.id,
+            DependencyType::Blocks,
+        ));
+        let mut current_closed_blocker = stale_open_blocker.clone();
+        current_closed_blocker.status = Status::Closed;
+
+        write_jsonl_issues(
+            &jsonl_path,
+            &[stale_open_blocker, target, current_closed_blocker],
+        )?;
+
+        let mut checks = Vec::new();
+        check_direct_dependency_blocker_health_from_jsonl(&jsonl_path, &mut checks)?;
+
+        let dead_edges =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead edges check");
+        assert!(matches!(dead_edges.status, CheckStatus::Warn));
+        assert_eq!(check_detail_count(dead_edges), 1);
+
+        let fully_unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("unblocked check");
+        assert!(matches!(fully_unblocked.status, CheckStatus::Warn));
+        assert_eq!(check_detail_count(fully_unblocked), 1);
 
         Ok(())
     }

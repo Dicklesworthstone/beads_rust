@@ -1734,6 +1734,103 @@ fn e2e_doctor_json() {
 }
 
 #[test]
+fn e2e_doctor_json_reports_dead_closed_dependency_blockers() {
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_dead_closed_dep_doctor");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let closed = run_br(
+        &workspace,
+        ["create", "Closed blocker"],
+        "create_closed_blocker",
+    );
+    assert!(closed.status.success(), "create failed: {}", closed.stderr);
+    let closed_id = parse_created_id(&closed.stdout);
+
+    let active = run_br(
+        &workspace,
+        ["create", "Active blocker"],
+        "create_active_blocker",
+    );
+    assert!(active.status.success(), "create failed: {}", active.stderr);
+    let active_id = parse_created_id(&active.stdout);
+
+    let unblocked = run_br(
+        &workspace,
+        ["create", "Only terminal blockers"],
+        "create_unblocked_target",
+    );
+    assert!(
+        unblocked.status.success(),
+        "create failed: {}",
+        unblocked.stderr
+    );
+    let unblocked_id = parse_created_id(&unblocked.stdout);
+
+    let still_blocked = run_br(
+        &workspace,
+        ["create", "Still blocked"],
+        "create_still_blocked_target",
+    );
+    assert!(
+        still_blocked.status.success(),
+        "create failed: {}",
+        still_blocked.stderr
+    );
+    let still_blocked_id = parse_created_id(&still_blocked.stdout);
+
+    for (label, issue_id, blocker_id) in [
+        (
+            "dep_unblocked_closed",
+            unblocked_id.as_str(),
+            closed_id.as_str(),
+        ),
+        (
+            "dep_still_blocked_closed",
+            still_blocked_id.as_str(),
+            closed_id.as_str(),
+        ),
+        (
+            "dep_still_blocked_active",
+            still_blocked_id.as_str(),
+            active_id.as_str(),
+        ),
+    ] {
+        let dep = run_br(&workspace, ["dep", "add", issue_id, blocker_id], label);
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    }
+
+    let close = run_br(&workspace, ["close", &closed_id], "close_blocker");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_dead_closed_deps");
+    assert_eq!(
+        doctor.status.code(),
+        Some(1),
+        "doctor should exit findings-present: stderr={} stdout={}",
+        doctor.stderr,
+        doctor.stdout
+    );
+    let payload = extract_json_payload(&doctor.stdout);
+    let doctor_json: Value = serde_json::from_str(&payload).expect("doctor json");
+    let checks = doctor_json["checks"].as_array().expect("doctor checks");
+    let dead_edges = checks
+        .iter()
+        .find(|check| check["name"] == "dep.dead_closed_blocking_edges")
+        .expect("dead closed dependency check");
+    assert_eq!(dead_edges["status"].as_str(), Some("warn"));
+    assert_eq!(dead_edges["details"]["count"].as_i64(), Some(2));
+
+    let fully_unblocked = checks
+        .iter()
+        .find(|check| check["name"] == "dep.fully_unblocked_open")
+        .expect("fully unblocked check");
+    assert_eq!(fully_unblocked["status"].as_str(), Some("warn"));
+    assert_eq!(fully_unblocked["details"]["count"].as_i64(), Some(1));
+}
+
+#[test]
 fn e2e_sync_status_text() {
     let workspace = BrWorkspace::new();
 
