@@ -11,6 +11,7 @@ use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
+use crate::model::{DependencyType, Issue, Status};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
@@ -25,9 +26,9 @@ use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -317,6 +318,8 @@ fn is_quick_suppressed_doctor_check(name: &str) -> bool {
     matches!(
         name,
         "db.recoverable_anomalies"
+            | "dep.dead_closed_blocking_edges"
+            | "dep.fully_unblocked_open"
             | "counts.db_vs_jsonl"
             | "sync.metadata"
             | "sqlite.cli_integrity"
@@ -662,6 +665,14 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     (
         "dependencies.orphans",
         "fm-caches_indexes-dependencies-orphans",
+    ),
+    (
+        "dep.dead_closed_blocking_edges",
+        "fm-dependency_graph-dead-closed-blocking-edges",
+    ),
+    (
+        "dep.fully_unblocked_open",
+        "fm-dependency_graph-fully-unblocked-open",
     ),
     (
         "permissions.config_yaml_secrets",
@@ -5493,6 +5504,220 @@ fn check_dependencies_orphans(conn: &Connection, checks: &mut Vec<CheckResult>) 
     );
 }
 
+const DEAD_CLOSED_BLOCKING_SAMPLE_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, Serialize)]
+struct DeadClosedBlockingEdge {
+    issue_id: String,
+    depends_on_id: String,
+    dependency_type: String,
+    target_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FullyUnblockedOpenIssue {
+    issue_id: String,
+    blocking_dep_count: usize,
+    closed_blocker_ids: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct DeadClosedBlockingAudit {
+    latest_issue_count: usize,
+    open_with_blocking_deps_count: usize,
+    dead_closed_edges: Vec<DeadClosedBlockingEdge>,
+    fully_unblocked_open: Vec<FullyUnblockedOpenIssue>,
+}
+
+fn latest_issues_from_jsonl(path: &Path) -> Result<BTreeMap<String, Issue>> {
+    let file = fs::File::open(path)?;
+    crate::sync::path::validate_jsonl_fd_metadata(&file, path)?;
+    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut issues = BTreeMap::new();
+
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|err| {
+            BeadsError::Config(format!("Invalid JSON issue at line {}: {err}", idx + 1))
+        })?;
+        issues.insert(issue.id.clone(), issue);
+    }
+
+    Ok(issues)
+}
+
+fn audit_dead_closed_blocking_edges(path: &Path) -> Result<DeadClosedBlockingAudit> {
+    let issues = latest_issues_from_jsonl(path)?;
+    let mut audit = DeadClosedBlockingAudit {
+        latest_issue_count: issues.len(),
+        ..DeadClosedBlockingAudit::default()
+    };
+
+    for issue in issues.values() {
+        if issue.status != Status::Open {
+            continue;
+        }
+
+        let blocking_deps: Vec<_> = issue
+            .dependencies
+            .iter()
+            .filter(|dep| dep.dep_type == DependencyType::Blocks)
+            .collect();
+        if blocking_deps.is_empty() {
+            continue;
+        }
+        audit.open_with_blocking_deps_count += 1;
+
+        let mut all_blockers_closed = true;
+        let mut closed_blocker_ids = Vec::with_capacity(blocking_deps.len());
+        for dep in &blocking_deps {
+            match issues.get(&dep.depends_on_id) {
+                Some(target) if target.status == Status::Closed => {
+                    closed_blocker_ids.push(dep.depends_on_id.clone());
+                    audit.dead_closed_edges.push(DeadClosedBlockingEdge {
+                        issue_id: issue.id.clone(),
+                        depends_on_id: dep.depends_on_id.clone(),
+                        dependency_type: dep.dep_type.as_str().to_string(),
+                        target_status: target.status.as_str().to_string(),
+                    });
+                }
+                _ => all_blockers_closed = false,
+            }
+        }
+
+        if all_blockers_closed {
+            audit.fully_unblocked_open.push(FullyUnblockedOpenIssue {
+                issue_id: issue.id.clone(),
+                blocking_dep_count: blocking_deps.len(),
+                closed_blocker_ids,
+            });
+        }
+    }
+
+    Ok(audit)
+}
+
+fn check_dead_closed_blocking_edges(jsonl_path: Option<&Path>, checks: &mut Vec<CheckResult>) {
+    let Some(path) = jsonl_path else {
+        push_check(
+            checks,
+            "dep.dead_closed_blocking_edges",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        push_check(
+            checks,
+            "dep.fully_unblocked_open",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return;
+    };
+
+    let audit = match audit_dead_closed_blocking_edges(path) {
+        Ok(audit) => audit,
+        Err(err) => {
+            let message = format!("Failed to audit dead closed blocking edges from JSONL: {err}");
+            let details = Some(serde_json::json!({ "path": path.display().to_string() }));
+            push_check(
+                checks,
+                "dep.dead_closed_blocking_edges",
+                CheckStatus::Error,
+                Some(message.clone()),
+                details.clone(),
+            );
+            push_check(
+                checks,
+                "dep.fully_unblocked_open",
+                CheckStatus::Error,
+                Some(message),
+                details,
+            );
+            return;
+        }
+    };
+
+    if audit.dead_closed_edges.is_empty() {
+        push_check(
+            checks,
+            "dep.dead_closed_blocking_edges",
+            CheckStatus::Ok,
+            None,
+            Some(serde_json::json!({
+                "latest_issue_count": audit.latest_issue_count,
+                "open_with_blocking_deps_count": audit.open_with_blocking_deps_count,
+                "dead_closed_edge_count": 0,
+                "source": "issues.jsonl_last_write_wins",
+                "dependency_types": ["blocks"],
+            })),
+        );
+    } else {
+        let mut sample_edges = audit.dead_closed_edges.clone();
+        sample_edges.truncate(DEAD_CLOSED_BLOCKING_SAMPLE_LIMIT);
+        push_check(
+            checks,
+            "dep.dead_closed_blocking_edges",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} open-issue `blocks` edge(s) point at closed issues",
+                audit.dead_closed_edges.len()
+            )),
+            Some(serde_json::json!({
+                "latest_issue_count": audit.latest_issue_count,
+                "open_with_blocking_deps_count": audit.open_with_blocking_deps_count,
+                "dead_closed_edge_count": audit.dead_closed_edges.len(),
+                "sample_edges": sample_edges,
+                "sample_limit": DEAD_CLOSED_BLOCKING_SAMPLE_LIMIT,
+                "source": "issues.jsonl_last_write_wins",
+                "dependency_types": ["blocks"],
+            })),
+        );
+    }
+
+    if audit.fully_unblocked_open.is_empty() {
+        push_check(
+            checks,
+            "dep.fully_unblocked_open",
+            CheckStatus::Ok,
+            None,
+            Some(serde_json::json!({
+                "latest_issue_count": audit.latest_issue_count,
+                "open_with_blocking_deps_count": audit.open_with_blocking_deps_count,
+                "fully_unblocked_open_count": 0,
+                "source": "issues.jsonl_last_write_wins",
+                "dependency_types": ["blocks"],
+            })),
+        );
+    } else {
+        let mut sample_issues = audit.fully_unblocked_open.clone();
+        sample_issues.truncate(DEAD_CLOSED_BLOCKING_SAMPLE_LIMIT);
+        push_check(
+            checks,
+            "dep.fully_unblocked_open",
+            CheckStatus::Warn,
+            Some(format!(
+                "{} open issue(s) have only closed `blocks` dependencies",
+                audit.fully_unblocked_open.len()
+            )),
+            Some(serde_json::json!({
+                "latest_issue_count": audit.latest_issue_count,
+                "open_with_blocking_deps_count": audit.open_with_blocking_deps_count,
+                "fully_unblocked_open_count": audit.fully_unblocked_open.len(),
+                "sample_issues": sample_issues,
+                "sample_limit": DEAD_CLOSED_BLOCKING_SAMPLE_LIMIT,
+                "source": "issues.jsonl_last_write_wins",
+                "dependency_types": ["blocks"],
+            })),
+        );
+    }
+}
+
 /// Pass-5 cycle 36 — fixer for `fm-caches_indexes-dependencies-orphans`.
 ///
 /// Surgically deletes orphan rows from `dependencies` (rows whose
@@ -10059,6 +10284,9 @@ fn collect_doctor_report_with_mode_and_db_override(
         mode,
         &mut checks,
     );
+    if mode == DoctorInspectionMode::Full && matches!(jsonl_count, JsonlCountState::Available(_)) {
+        check_dead_closed_blocking_edges(jsonl_path.as_deref(), &mut checks);
+    }
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
     let reliability_audit = classification.audit_record("doctor.inspect");
@@ -10918,8 +11146,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // Phase 8: drop the slow detectors so pre-commit / CI can
             // gate on a sub-second `br doctor --quick --json`. The
             // dropped detectors are: db.recoverable_anomalies,
-            // counts.db_vs_jsonl, sync.metadata, sqlite3.integrity_check,
-            // db.write_probe. The remaining checks are all O(file
+            // counts.db_vs_jsonl, dep.dead_closed_blocking_edges,
+            // dep.fully_unblocked_open, sync.metadata,
+            // sqlite3.integrity_check, db.write_probe. The remaining checks are all O(file
             // existence) or single PRAGMA so they stay cheap.
             initial
                 .report
@@ -11411,7 +11640,7 @@ fn emit_flat_robot_triage(report: &DoctorReport) {
 mod tests {
     use super::*;
     use crate::health::{AnomalyClass, WorkspaceHealth};
-    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::model::{Dependency, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
     use fsqlite::Connection;
@@ -11493,6 +11722,31 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    fn sample_dependency(
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: DependencyType,
+    ) -> Dependency {
+        Dependency {
+            issue_id: issue_id.to_string(),
+            depends_on_id: depends_on_id.to_string(),
+            dep_type,
+            created_at: Utc::now(),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }
+    }
+
+    fn write_issues_jsonl(path: &Path, issues: &[Issue]) {
+        let body = issues
+            .iter()
+            .map(|issue| serde_json::to_string(issue).expect("serialize issue"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(path, format!("{body}\n")).expect("write issues.jsonl");
     }
 
     fn dependency_row_count(conn: &Connection, issue_id: &str, depends_on_id: &str) -> i64 {
@@ -12723,6 +12977,91 @@ mod tests {
         check_dependencies_orphans(&conn, &mut checks);
         let check = find_check(&checks, "dependencies.orphans").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_dead_closed_blocking_edges_uses_jsonl_last_write_wins() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+
+        let mut closed_blocker_old = sample_issue("bd-closed", "Old open blocker row");
+        closed_blocker_old.status = Status::Open;
+        let mut closed_blocker_latest = sample_issue("bd-closed", "Latest closed blocker row");
+        closed_blocker_latest.status = Status::Closed;
+        let open_blocker = sample_issue("bd-open", "Still open blocker");
+
+        let mut fully = sample_issue("bd-fully", "Fully unblocked");
+        fully.dependencies.push(sample_dependency(
+            "bd-fully",
+            "bd-closed",
+            DependencyType::Blocks,
+        ));
+
+        let mut partial = sample_issue("bd-partial", "Partially blocked");
+        partial.dependencies.push(sample_dependency(
+            "bd-partial",
+            "bd-closed",
+            DependencyType::Blocks,
+        ));
+        partial.dependencies.push(sample_dependency(
+            "bd-partial",
+            "bd-open",
+            DependencyType::Blocks,
+        ));
+
+        let mut related = sample_issue("bd-related", "Related closed issue");
+        related.dependencies.push(sample_dependency(
+            "bd-related",
+            "bd-closed",
+            DependencyType::Related,
+        ));
+
+        write_issues_jsonl(
+            &jsonl_path,
+            &[
+                closed_blocker_old,
+                open_blocker,
+                fully,
+                partial,
+                related,
+                closed_blocker_latest,
+            ],
+        );
+
+        let mut checks = Vec::new();
+        check_dead_closed_blocking_edges(Some(&jsonl_path), &mut checks);
+
+        let dead =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead check present");
+        assert!(matches!(dead.status, CheckStatus::Warn), "{dead:?}");
+        assert_eq!(
+            dead.details
+                .as_ref()
+                .and_then(|d| d.get("dead_closed_edge_count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+
+        let fully = find_check(&checks, "dep.fully_unblocked_open").expect("fully check present");
+        assert!(matches!(fully.status, CheckStatus::Warn), "{fully:?}");
+        assert_eq!(
+            fully
+                .details
+                .as_ref()
+                .and_then(|d| d.get("fully_unblocked_open_count"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        let sample_ids: Vec<_> = fully
+            .details
+            .as_ref()
+            .and_then(|d| d.get("sample_issues"))
+            .and_then(serde_json::Value::as_array)
+            .expect("sample issues")
+            .iter()
+            .filter_map(|row| row.get("issue_id").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(sample_ids, vec!["bd-fully"]);
     }
 
     /// issue #311: write a strict workflow policy and a non-conforming issue;
@@ -16135,6 +16474,8 @@ mod tests {
         for skipped in [
             "db.recoverable_anomalies",
             "counts.db_vs_jsonl",
+            "dep.dead_closed_blocking_edges",
+            "dep.fully_unblocked_open",
             "sync.metadata",
             "sqlite3.integrity_check",
             "db.write_probe",
