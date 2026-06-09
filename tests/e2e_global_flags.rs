@@ -7,7 +7,62 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
+use std::time::UNIX_EPOCH;
+
+#[derive(Debug, PartialEq, Eq)]
+enum BeadsTreeEntry {
+    Dir,
+    File {
+        modified_nanos: u128,
+        bytes: Vec<u8>,
+    },
+}
+
+fn snapshot_beads_tree(root: &Path) -> BTreeMap<String, BeadsTreeEntry> {
+    let beads_dir = root.join(".beads");
+    let mut snapshot = BTreeMap::new();
+
+    for entry in walkdir::WalkDir::new(&beads_dir)
+        .sort_by_file_name()
+        .into_iter()
+    {
+        let entry = entry.expect("walk .beads");
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .expect("path below root")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if entry.file_type().is_dir() {
+            snapshot.insert(rel, BeadsTreeEntry::Dir);
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            let metadata = fs::metadata(path).expect("file metadata");
+            let modified_nanos = metadata
+                .modified()
+                .expect("file modified time")
+                .duration_since(UNIX_EPOCH)
+                .expect("modified after epoch")
+                .as_nanos();
+            let bytes = fs::read(path).expect("read file");
+            snapshot.insert(
+                rel,
+                BeadsTreeEntry::File {
+                    modified_nanos,
+                    bytes,
+                },
+            );
+        }
+    }
+
+    snapshot
+}
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -647,6 +702,54 @@ fn e2e_no_db_hard_delete_flushes_jsonl() {
         !after.contains(&format!("\"id\":\"{issue_id}\"")),
         "hard delete in --no-db mode should remove the issue from JSONL"
     );
+}
+
+#[test]
+fn e2e_no_db_flag_doctor_side_effect_free() {
+    let _log = common::test_log("e2e_no_db_flag_doctor_side_effect_free");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "No-DB doctor test"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
+
+    let before = snapshot_beads_tree(&workspace.root);
+    let doctor = run_br(&workspace, ["--no-db", "doctor", "--json"], "doctor_no_db");
+
+    let payload = extract_json_payload(&doctor.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("valid JSON");
+    let checks = json["checks"].as_array().expect("checks array");
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "db.no_db_mode" && check["status"] == "ok"),
+        "doctor should explicitly report SQLite checks skipped in no-db mode: {json}"
+    );
+
+    for skipped_check in [
+        "db.exists",
+        "db.open",
+        "schema.tables",
+        "schema.columns",
+        "sqlite.integrity_check",
+        "sqlite3.integrity_check",
+        "counts.db_vs_jsonl",
+        "sync.metadata",
+        "db.write_probe",
+    ] {
+        assert!(
+            !checks.iter().any(|check| check["name"] == skipped_check),
+            "doctor --no-db must not run SQLite-backed check {skipped_check}: {json}"
+        );
+    }
+
+    let after = snapshot_beads_tree(&workspace.root);
+    assert_eq!(after, before, "doctor --no-db mutated .beads");
 }
 
 // ============================================================================

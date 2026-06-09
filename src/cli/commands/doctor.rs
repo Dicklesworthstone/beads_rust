@@ -780,6 +780,14 @@ fn has_error(checks: &[CheckResult]) -> bool {
         .any(|check| matches!(check.status, CheckStatus::Error))
 }
 
+fn no_db_mode(beads_dir: &Path, cli: &config::CliOverrides) -> bool {
+    let Ok(startup_layer) = config::load_startup_config(beads_dir) else {
+        return cli.no_db.unwrap_or(false);
+    };
+    let merged_layer = config::ConfigLayer::merge_layers(&[startup_layer, cli.as_layer()]);
+    config::no_db_from_layer(&merged_layer).unwrap_or(false)
+}
+
 fn has_non_ok(checks: &[CheckResult]) -> bool {
     checks
         .iter()
@@ -9984,7 +9992,7 @@ fn collect_doctor_report_with_mode(
     paths: &config::ConfigPaths,
     mode: DoctorInspectionMode,
 ) -> Result<DoctorRun> {
-    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, mode)
+    collect_doctor_report_with_mode_and_db_override(beads_dir, paths, None, false, mode)
 }
 
 fn collect_doctor_report_for_cli(
@@ -9992,10 +10000,12 @@ fn collect_doctor_report_for_cli(
     paths: &config::ConfigPaths,
     cli: &config::CliOverrides,
 ) -> Result<DoctorRun> {
+    let no_db = no_db_mode(beads_dir, cli);
     collect_doctor_report_with_mode_and_db_override(
         beads_dir,
         paths,
         cli.db.as_ref(),
+        no_db,
         DoctorInspectionMode::Full,
     )
 }
@@ -10004,6 +10014,7 @@ fn collect_doctor_report_with_mode_and_db_override(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
     db_override: Option<&PathBuf>,
+    no_db: bool,
     mode: DoctorInspectionMode,
 ) -> Result<DoctorRun> {
     let mut checks = Vec::new();
@@ -10015,9 +10026,11 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 28: writability of `.doctor/` so the next --repair
     // won't crash deep inside the chokepoint.
     check_doctor_runs_creatable(repo_root, &mut checks);
-    // Pass-5 cycle 30: writability of the active DB recovery dir so the
-    // next --repair won't crash mid-backup.
-    check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    if !no_db {
+        // Pass-5 cycle 30: writability of the active DB recovery dir so the
+        // next --repair won't crash mid-backup.
+        check_recovery_dir_writable(&paths.db_path, beads_dir, &mut checks);
+    }
     // Pass-5 cycle 31: writability of `.beads/.write.lock` so we don't
     // mask EACCES failures as cryptic "could not open lock" errors.
     check_write_lock_writable(beads_dir, &mut checks);
@@ -10047,18 +10060,48 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_startup_cache(beads_dir, db_override, &mut checks);
 
     let (jsonl_path, jsonl_count) = inspect_doctor_jsonl(beads_dir, paths, &mut checks);
-    // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
-    check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
-    // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
-    check_wal_oversized(&paths.db_path, &mut checks);
-    inspect_doctor_database(
-        beads_dir,
-        &paths.db_path,
-        jsonl_path.as_deref(),
-        jsonl_count,
-        mode,
-        &mut checks,
-    );
+    if no_db {
+        push_check(
+            &mut checks,
+            "db.no_db_mode",
+            CheckStatus::Ok,
+            Some("--no-db active; skipped SQLite-backed doctor checks".to_string()),
+            Some(serde_json::json!({
+                "db_path": paths.db_path.display().to_string(),
+                "skipped_checks": [
+                    "permissions.recovery_dir",
+                    "db_bloat",
+                    "wal_size",
+                    "db.recovery_artifacts",
+                    "db.recovery_artifacts.aged",
+                    "db.sidecars",
+                    "db.exists",
+                    "db.open",
+                    "schema.tables",
+                    "schema.columns",
+                    "sqlite.integrity_check",
+                    "sqlite3.integrity_check",
+                    "db.recoverable_anomalies",
+                    "counts.db_vs_jsonl",
+                    "sync.metadata",
+                    "db.write_probe"
+                ]
+            })),
+        );
+    } else {
+        // Pass-5 cycle 22: db-to-selected-jsonl size ratio (VACUUM candidate).
+        check_db_bloat_vs_jsonl(&paths.db_path, jsonl_path.as_deref(), &mut checks);
+        // Pass-5 cycle 23: selected DB WAL sidecar oversized (checkpoint candidate).
+        check_wal_oversized(&paths.db_path, &mut checks);
+        inspect_doctor_database(
+            beads_dir,
+            &paths.db_path,
+            jsonl_path.as_deref(),
+            jsonl_count,
+            mode,
+            &mut checks,
+        );
+    }
 
     let classification = classify_doctor_checks(&paths.db_path, &paths.jsonl_path, &checks);
     let reliability_audit = classification.audit_record("doctor.inspect");
@@ -10441,10 +10484,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         DoctorInspectionMode::Full
     };
+    let no_db = no_db_mode(&beads_dir, cli);
     let mut initial = collect_doctor_report_with_mode_and_db_override(
         &beads_dir,
         &paths,
         cli.db.as_ref(),
+        no_db,
         inspection_mode,
     )?;
 
