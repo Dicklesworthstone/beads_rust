@@ -15,7 +15,8 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, parse_list_issues, parse_list_page, run_br};
+use common::cli::{BrWorkspace, parse_json_value, parse_list_issues, parse_list_page, run_br};
+use std::collections::HashSet;
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -849,6 +850,85 @@ fn e2e_list_limit_zero_with_offset_reports_unpaginated_total() {
     assert_eq!(page["limit"].as_u64(), Some(0));
     assert_eq!(page["offset"].as_u64(), Some(2));
     assert_eq!(page["has_more"].as_bool(), Some(false));
+}
+
+#[test]
+fn e2e_list_default_is_unlimited_and_matches_show_truth() {
+    let _log = common::test_log("e2e_list_default_is_unlimited_and_matches_show_truth");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let mut ids = Vec::new();
+    for index in 0..60 {
+        let title = format!("Measurement integrity issue {index:02}");
+        let create = run_br(
+            &workspace,
+            ["create", title.as_str()],
+            &format!("create_{index:02}"),
+        );
+        assert!(
+            create.status.success(),
+            "create {index} failed: {}",
+            create.stderr
+        );
+        ids.push(parse_created_id(&create.stdout));
+    }
+
+    let closed_id = ids.first().expect("created ids").clone();
+    let close = run_br(
+        &workspace,
+        [
+            "close",
+            &closed_id,
+            "--reason",
+            "measurement integrity regression",
+        ],
+        "close_first_issue",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let closed_show = run_br(&workspace, ["show", &closed_id, "--json"], "show_closed");
+    assert!(
+        closed_show.status.success(),
+        "show closed failed: {}",
+        closed_show.stderr
+    );
+    let closed_details = parse_json_value(&closed_show.stdout);
+    assert_eq!(closed_details[0]["status"], "closed");
+
+    let list = run_br(&workspace, ["list", "--json"], "list_default_unlimited");
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+
+    let page = parse_list_page(&list.stdout);
+    let issues = page["issues"].as_array().expect("issues array");
+
+    assert_eq!(issues.len(), ids.len() - 1);
+    assert_eq!(page["total"].as_u64(), Some((ids.len() - 1) as u64));
+    assert_eq!(page["limit"].as_u64(), Some(0));
+    assert_eq!(page["offset"].as_u64(), Some(0));
+    assert_eq!(page["has_more"].as_bool(), Some(false));
+
+    let mut listed_ids = HashSet::new();
+    for issue in issues {
+        let id = issue["id"].as_str().expect("listed issue id").to_string();
+        assert_ne!(
+            id, closed_id,
+            "closed issue must not appear in default list"
+        );
+        assert!(listed_ids.insert(id.clone()), "duplicate list id {id}");
+
+        let show = run_br(
+            &workspace,
+            ["show", id.as_str(), "--json"],
+            &format!("show_{}", id.replace('-', "_")),
+        );
+        assert!(show.status.success(), "show {id} failed: {}", show.stderr);
+        let details = parse_json_value(&show.stdout);
+        assert_eq!(details[0]["id"], id);
+        assert_eq!(details[0]["status"], issue["status"]);
+        assert_eq!(details[0]["status"], "open");
+    }
 }
 
 // =============================================================================

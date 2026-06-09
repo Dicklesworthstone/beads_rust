@@ -305,7 +305,7 @@ br list [OPTIONS]
 **Output Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (0=unlimited, default: 50) |
+| `--limit <N>` | Maximum results (0=unlimited, default: unlimited) |
 | `--sort <FIELD>` | Sort by: priority, created_at, updated_at, title |
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
@@ -497,7 +497,7 @@ br ready [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--limit <N>` | Maximum results (default: 20) |
+| `--limit <N>` | Maximum results (default: unlimited, 0=unlimited) |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Show only unassigned |
 | `-l, --label <LABEL>` | Filter by label (AND logic) |

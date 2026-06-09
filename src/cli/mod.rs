@@ -19,8 +19,9 @@ use crate::model::{IssueType, Status};
 
 pub mod commands;
 
-pub(crate) const DEFAULT_LIST_LIMIT: usize = 50;
+pub(crate) const DEFAULT_LIST_LIMIT: usize = 0;
 pub(crate) const DEFAULT_LIST_OFFSET: usize = 0;
+pub(crate) const DEFAULT_SEARCH_LIMIT: usize = 50;
 
 #[derive(Clone, Copy)]
 enum IssueCompletionFilter {
@@ -1681,7 +1682,7 @@ pub struct ListArgs {
     #[arg(long, short = 'a')]
     pub all: bool,
 
-    /// Maximum number of results (0 = unlimited, default: 50)
+    /// Maximum number of results (0 = unlimited, default: unlimited)
     #[arg(long)]
     pub limit: Option<usize>,
 
@@ -2313,8 +2314,8 @@ pub struct UndeferArgs {
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ReadyArgs {
-    /// Maximum number of issues to return (default: 20, 0 = unlimited)
-    #[arg(long, default_value_t = 20)]
+    /// Maximum number of issues to return (default: unlimited, 0 = unlimited)
+    #[arg(long, default_value_t = 0)]
     pub limit: usize,
 
     /// Filter by assignee (no value = current actor)
