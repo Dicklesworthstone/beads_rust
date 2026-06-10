@@ -796,26 +796,42 @@ fn bead_line(b: &crate::cli::commands::dash::OwnedBead) -> Line<'static> {
 }
 
 fn closure_line(c: &crate::cli::commands::dash::OwnedClosure) -> Line<'static> {
-    let assignee = c
-        .assignee
-        .as_deref()
-        .map(|a| format!(" [{a}]"))
-        .unwrap_or_default();
+    // Mirror bead_line's column layout so the eye can scan a single
+    // column for either "P?" (open) or "age" (closed) without having
+    // to hunt past the title.
     let sender = c
         .sender
         .as_deref()
         .map(|s| format!(" (from: {s})"))
         .unwrap_or_default();
-    let text = format!(
-        "  ✓ {id}  {title}  ({age} ago){sender}{assignee}",
-        id = c.id,
-        title = c.title,
-        age = format_age_compact(c.age_secs),
-    );
-    Line::from(Span::styled(
-        text,
-        Style::default().add_modifier(Modifier::DIM),
-    ))
+    let assignee = c
+        .assignee
+        .as_deref()
+        .map(|a| format!(" [{a}]"))
+        .unwrap_or_default();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("✓".to_string(), dim));
+    spans.push(Span::raw(" "));
+    // Keep the id cyan-ish but dimmed so it still parses as an id
+    // without competing visually with live beads above.
+    spans.push(Span::styled(
+        c.id.clone(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+    ));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(format_age_compact(c.age_secs), dim));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(c.title.clone(), dim));
+    if !sender.is_empty() {
+        spans.push(Span::styled(sender, dim));
+    }
+    if !assignee.is_empty() {
+        spans.push(Span::styled(assignee, dim));
+    }
+    Line::from(spans)
 }
 
 /// Execute `bd dash --tui`.
