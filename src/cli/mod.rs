@@ -1007,9 +1007,23 @@ pub enum AdminCommands {
     },
 
     /// Ask running `bd watch` processes to exit cleanly (e.g. to pick
-    /// up a freshly-installed bd binary). Each watcher exits on its
-    /// next tick with a BD_RELOAD notification.
-    Reload,
+    /// up a freshly-installed bd binary). Each watcher exits with a
+    /// `BD_RELOAD` notification on its next tick, jittered over the
+    /// `--spread` window so all agents don't re-spawn simultaneously
+    /// and hit LLM rate-limits.
+    Reload(ReloadArgs),
+}
+
+/// Args for `bd admin reload`.
+#[derive(Args, Debug, Default)]
+pub struct ReloadArgs {
+    /// Spread the BD_RELOAD exits over this many seconds. Each
+    /// watcher rolls a random 0..N sleep before printing BD_RELOAD,
+    /// preventing the thundering-herd respawn that hits LLM
+    /// rate-limits. Default 30. `--spread 0` exits everyone
+    /// immediately (emergency-kill semantics).
+    #[arg(long, default_value_t = 30)]
+    pub spread: u64,
 }
 
 /// Subcommands of `bd admin operator` for handling agent asks.

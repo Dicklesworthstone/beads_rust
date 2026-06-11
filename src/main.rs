@@ -166,7 +166,7 @@ fn dispatch_admin(
         }
         A::Query { command } => commands::query::execute(&command, overrides, output_ctx),
         A::Operator { command } => dispatch_operator(command, overrides, output_ctx),
-        A::Reload => commands::reload::execute(overrides, output_ctx),
+        A::Reload(args) => commands::reload::execute(&args, overrides, output_ctx),
     }
 }
 
@@ -216,7 +216,7 @@ const fn is_mutating_admin(cmd: &beads_rust::cli::AdminCommands) -> bool {
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
         A::Operator { command } => matches!(command, O::Attend | O::Reply(_)),
-        A::Reload => true,
+        A::Reload(_) => true,
         _ => false,
     }
 }

@@ -242,16 +242,39 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
                 crate::cli::commands::reload::read_generation(&storage)
                 && current_gen > startup_reload_gen
             {
+                // Roll a random sleep in 0..spread seconds before
+                // printing BD_RELOAD. Without this, N agents notice
+                // the reload on the same tick and re-spawn within the
+                // same second, tripping the LLM API rate-limit when
+                // they all re-invoke the /bdwatch skill at once.
+                let spread = crate::cli::commands::reload::read_spread(&storage)
+                    .unwrap_or(crate::cli::commands::reload::DEFAULT_SPREAD_SECS);
+                let jitter_secs = if spread == 0 {
+                    0
+                } else {
+                    use rand::Rng;
+                    rand::rng().random_range(0..=spread)
+                };
+
+                // Drop the storage handle before sleeping so we don't
+                // hold a connection open for the jitter duration.
+                drop(storage);
+                if jitter_secs > 0 {
+                    thread::sleep(Duration::from_secs(jitter_secs));
+                }
+
+                let now = Utc::now();
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
                 let _ = writeln!(
                     out,
-                    "[{}] BD_RELOAD: bd reload requested at {}; exiting so a \
-                     new bd watch can pick up the latest binary.",
+                    "[{}] BD_RELOAD: bd reload requested at {} (jitter {}s); \
+                     exiting so a new bd watch can pick up the latest binary.",
                     now.to_rfc3339(),
                     chrono::DateTime::<Utc>::from_timestamp(current_gen, 0)
                         .map(|t| t.to_rfc3339())
-                        .unwrap_or_else(|| current_gen.to_string())
+                        .unwrap_or_else(|| current_gen.to_string()),
+                    jitter_secs,
                 );
                 if watch_beads {
                     flush_batches(

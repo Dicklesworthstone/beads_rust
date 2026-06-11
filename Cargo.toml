@@ -46,6 +46,10 @@ indicatif = "0.18"
 crossterm = "0.29"
 ratatui = "0.30"
 
+# Randomness — used for the bd-reload jitter so N agents don't all
+# exit + respawn within the same second.
+rand = "0.9.2"
+
 # Rich terminal output (sibling project)
 # Pinned to commit with let_chains fix for Rust 1.88+ compatibility
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust.git", rev = "dd3dcdb", features = ["full"] }
