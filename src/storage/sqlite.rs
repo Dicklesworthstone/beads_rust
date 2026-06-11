@@ -234,8 +234,10 @@ impl SqliteStorage {
         prefix: &str,
         pid: i64,
         now: chrono::DateTime<chrono::Utc>,
+        cwd: &str,
+        git_remote: &str,
     ) -> Result<()> {
-        crate::storage::watchers::register(&self.conn, prefix, pid, now)
+        crate::storage::watchers::register(&self.conn, prefix, pid, now, cwd, git_remote)
     }
 
     /// Update `last_seen` for a running watcher.

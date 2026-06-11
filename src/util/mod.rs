@@ -8,6 +8,7 @@
 //! - Last-touched tracking
 //! - Progress indicators (for long-running operations)
 
+pub mod git;
 mod hash;
 pub mod id;
 pub mod markdown_import;

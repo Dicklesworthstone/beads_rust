@@ -231,14 +231,23 @@ pub const SCHEMA_SQL: &str = r"
     -- 'infra' vs 'infra1' that would otherwise silently drop messages.
     -- A row exists for each running `bd watch` process; `last_seen` is
     -- updated each poll tick. Crashed watchers self-evict via TTL.
+    -- `cwd` and `git_remote` are populated at watcher startup so the
+    -- dashboard can map agent-prefix → git repo for the ghwatch
+    -- integration. `git_remote` is the canonicalized form
+    -- (host/owner/repo) so it joins directly against
+    -- ghwatch.watch_state.repo without an adapter expression.
     CREATE TABLE IF NOT EXISTS watchers (
         prefix TEXT NOT NULL,
         pid INTEGER NOT NULL,
         started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        cwd TEXT NOT NULL DEFAULT '',
+        git_remote TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (prefix, pid)
     );
     CREATE INDEX IF NOT EXISTS idx_watchers_last_seen ON watchers(last_seen);
+    CREATE INDEX IF NOT EXISTS idx_watchers_git_remote
+        ON watchers(git_remote) WHERE git_remote != '';
 ";
 
 /// Apply the schema to the database.
@@ -355,6 +364,11 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
 
 const MESSAGE_COLUMNS: &[(&str, &str)] = &[("choices", "TEXT")];
 
+const WATCHER_COLUMNS: &[(&str, &str)] = &[
+    ("cwd", "TEXT NOT NULL DEFAULT ''"),
+    ("git_remote", "TEXT NOT NULL DEFAULT ''"),
+];
+
 fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
     if !table_exists(conn, table) {
         return Ok(());
@@ -393,6 +407,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
     ensure_columns(conn, "comments", COMMENT_COLUMNS)?;
     ensure_columns(conn, "events", EVENT_COLUMNS)?;
     ensure_columns(conn, "messages", MESSAGE_COLUMNS)?;
+    ensure_columns(conn, "watchers", WATCHER_COLUMNS)?;
 
     // Always drop idx_issues_ready so SCHEMA_SQL recreates it with the
     // current definition (including is_template filter). DROP INDEX is O(1)

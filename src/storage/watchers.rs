@@ -24,22 +24,39 @@ pub struct WatcherRow {
     pub pid: i64,
     pub started_at: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+    /// Working directory the `bd watch` process was launched from.
+    /// Empty when discovery failed (no permission, etc.).
+    pub cwd: String,
+    /// Canonical `git remote get-url origin` of the cwd, normalized
+    /// to `host/owner/repo`. Empty when there's no git checkout,
+    /// no `origin` remote, or `git` isn't on PATH. Used by the
+    /// dashboard to join against `ghwatch.watch_state.repo`.
+    pub git_remote: String,
 }
 
 /// Register a new watcher (prefix, pid). If a row already exists for
 /// this pair (e.g., a watcher restarted with the same PID), reset
-/// `started_at` and `last_seen` to `now`.
+/// `started_at` / `last_seen` / `cwd` / `git_remote` to the new values.
 ///
 /// # Errors
 ///
 /// Returns an error if the DB write fails.
-pub fn register(conn: &Connection, prefix: &str, pid: i64, now: DateTime<Utc>) -> Result<()> {
+pub fn register(
+    conn: &Connection,
+    prefix: &str,
+    pid: i64,
+    now: DateTime<Utc>,
+    cwd: &str,
+    git_remote: &str,
+) -> Result<()> {
     conn.execute(
-        "INSERT INTO watchers (prefix, pid, started_at, last_seen)
-         VALUES (?1, ?2, ?3, ?3)
+        "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?5)
          ON CONFLICT(prefix, pid) DO UPDATE SET started_at = excluded.started_at,
-                                                last_seen = excluded.last_seen",
-        params![prefix, pid, now.to_rfc3339()],
+                                                last_seen = excluded.last_seen,
+                                                cwd = excluded.cwd,
+                                                git_remote = excluded.git_remote",
+        params![prefix, pid, now.to_rfc3339(), cwd, git_remote],
     )?;
     Ok(())
 }
@@ -154,7 +171,7 @@ pub fn newest_other_watcher(
     my_started_at: DateTime<Utc>,
 ) -> Result<Option<WatcherRow>> {
     let mut stmt = conn.prepare(
-        "SELECT prefix, pid, started_at, last_seen FROM watchers
+        "SELECT prefix, pid, started_at, last_seen, cwd, git_remote FROM watchers
          WHERE prefix = ?1 AND pid <> ?2 AND started_at > ?3
          ORDER BY started_at DESC LIMIT 1",
     )?;
@@ -173,7 +190,9 @@ pub fn newest_other_watcher(
 ///
 /// Returns an error if the DB query fails.
 pub fn list_all(conn: &Connection) -> Result<Vec<WatcherRow>> {
-    let mut stmt = conn.prepare("SELECT prefix, pid, started_at, last_seen FROM watchers")?;
+    let mut stmt = conn.prepare(
+        "SELECT prefix, pid, started_at, last_seen, cwd, git_remote FROM watchers",
+    )?;
     let rows = stmt
         .query_map([], row_to_watcher)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -208,6 +227,16 @@ fn row_to_watcher(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherRow> {
         pid: row.get("pid")?,
         started_at: parse_db_timestamp(&started),
         last_seen: parse_db_timestamp(&seen),
+        // cwd / git_remote columns are only present on databases that
+        // went through the ghwatch-integration migration. Treat
+        // failure as empty so we stay backward compatible with older
+        // schemas that other tooling might still write.
+        cwd: row.get::<_, Option<String>>("cwd").ok().flatten().unwrap_or_default(),
+        git_remote: row
+            .get::<_, Option<String>>("git_remote")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
     })
 }
 
@@ -236,7 +265,7 @@ mod tests {
     fn register_heartbeat_unregister_roundtrip() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 42, now).unwrap();
+        register(&conn, "arc1", 42, now, "", "").unwrap();
         assert!(is_active(&conn, "arc1", now, 60).unwrap());
 
         let later = now + chrono::Duration::seconds(10);
@@ -251,7 +280,7 @@ mod tests {
     fn stale_row_not_active() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 1, now - chrono::Duration::seconds(120)).unwrap();
+        register(&conn, "arc1", 1, now - chrono::Duration::seconds(120), "", "").unwrap();
         assert!(!is_active(&conn, "arc1", now, 60).unwrap());
         // But it's still in list_all (we GC via sweep, not on read).
         assert_eq!(list_all(&conn).unwrap().len(), 1);
@@ -261,8 +290,8 @@ mod tests {
     fn multiple_pids_per_prefix_allowed() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 1, now).unwrap();
-        register(&conn, "arc1", 2, now).unwrap();
+        register(&conn, "arc1", 1, now, "", "").unwrap();
+        register(&conn, "arc1", 2, now, "", "").unwrap();
         assert_eq!(list_all(&conn).unwrap().len(), 2);
         assert!(is_active(&conn, "arc1", now, 60).unwrap());
 
@@ -275,8 +304,8 @@ mod tests {
     fn active_prefixes_skips_stale() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "fresh", 1, now).unwrap();
-        register(&conn, "stale", 2, now - chrono::Duration::seconds(300)).unwrap();
+        register(&conn, "fresh", 1, now, "", "").unwrap();
+        register(&conn, "stale", 2, now - chrono::Duration::seconds(300), "", "").unwrap();
         let active = active_prefixes(&conn, now, 60).unwrap();
         assert_eq!(active, vec!["fresh".to_string()]);
     }
@@ -285,8 +314,8 @@ mod tests {
     fn sweep_drops_only_stale() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "fresh", 1, now).unwrap();
-        register(&conn, "stale", 2, now - chrono::Duration::seconds(300)).unwrap();
+        register(&conn, "fresh", 1, now, "", "").unwrap();
+        register(&conn, "stale", 2, now - chrono::Duration::seconds(300), "", "").unwrap();
         let deleted = sweep_stale(&conn, now, 60).unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(list_all(&conn).unwrap().len(), 1);
@@ -296,9 +325,9 @@ mod tests {
     fn re_register_resets_timestamps() {
         let conn = open_mem();
         let t1 = Utc::now() - chrono::Duration::seconds(120);
-        register(&conn, "arc1", 1, t1).unwrap();
+        register(&conn, "arc1", 1, t1, "", "").unwrap();
         let t2 = Utc::now();
-        register(&conn, "arc1", 1, t2).unwrap();
+        register(&conn, "arc1", 1, t2, "", "").unwrap();
         let row = &list_all(&conn).unwrap()[0];
         assert_eq!(row.started_at, t2);
         assert_eq!(row.last_seen, t2);

@@ -1,0 +1,15 @@
+# Canonical-form normalization fixture, shared verbatim with ghwatch.
+# Both sides commit this file at this path and read it from their
+# test suites. Drift on either side fails the test.
+#
+# Format: tab-separated `input\texpected`. Blank lines and lines
+# starting with `#` are ignored.
+git@github.com:Owner/Repo.git	github.com/owner/repo
+https://github.com/Owner/Repo.git	github.com/owner/repo
+https://token@github.com/Owner/Repo	github.com/owner/repo
+ssh://git@github.com/Owner/Repo/	github.com/owner/repo
+http://github.com/owner/repo.git	github.com/owner/repo
+git://github.com/owner/repo	github.com/owner/repo
+github.com/owner/repo	github.com/owner/repo
+git@gitlab.com:group/subgroup/repo.git	gitlab.com/group/subgroup/repo
+https://user:tok@github.com/owner/repo.git	github.com/owner/repo

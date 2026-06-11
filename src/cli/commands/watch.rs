@@ -142,12 +142,28 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     // Register this watcher and arrange to unregister on Drop. `bd msg`
     // checks this table to flag typos that would otherwise drop messages
     // into an unwatched queue. Crashed watchers self-evict via TTL.
+    //
+    // cwd + git_remote are stored too so the dashboard can map
+    // (prefix → repo) for the ghwatch CI integration. Both are
+    // best-effort — agents launched outside a git checkout simply
+    // record empty strings and get no CI badge.
     let pid = i64::try_from(std::process::id()).unwrap_or(0);
     let my_started_at = Utc::now();
+    let watcher_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok())
+        .unwrap_or_default();
+    let watcher_git_remote = discover_git_remote(&watcher_cwd);
     let startup_reload_gen = {
         let (mut storage, _paths) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
-        storage.register_watcher(&prefix, pid, my_started_at)?;
+        storage.register_watcher(
+            &prefix,
+            pid,
+            my_started_at,
+            &watcher_cwd,
+            &watcher_git_remote,
+        )?;
         crate::cli::commands::reload::read_generation(&storage)?
     };
     let _watcher_guard = WatcherGuard {
@@ -591,6 +607,30 @@ fn emit_message_event<W: Write>(
 /// config or the default "bd". Reasoning: when an agent boots and starts a
 /// watch, the harness is *supposed* to set BD_ISSUE_PREFIX. Silently watching
 /// the wrong prefix would mean missing notifications addressed to the agent.
+/// Best-effort discovery of the canonical git remote URL for the
+/// directory `cwd`. Runs `git -C <cwd> remote get-url origin` and
+/// passes the result through the shared `canonicalize_repo_url`
+/// normalization so it joins cleanly against ghwatch's `repo`
+/// column. Returns empty string on any failure (not a git checkout,
+/// no `origin` remote, `git` not on PATH, non-UTF8 output, etc.).
+fn discover_git_remote(cwd: &str) -> String {
+    if cwd.is_empty() {
+        return String::new();
+    }
+    let output = std::process::Command::new("git")
+        .args(["-C", cwd, "remote", "get-url", "origin"])
+        .output();
+    let stdout = match output {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return String::new(),
+    };
+    let raw = match String::from_utf8(stdout) {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    crate::util::git::canonicalize_repo_url(raw.trim())
+}
+
 fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrides) -> Result<String> {
     if let Some(p) = args
         .prefix
