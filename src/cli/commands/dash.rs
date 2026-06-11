@@ -184,7 +184,21 @@ pub(crate) fn snapshot(
         HashMap::new()
     };
 
-    let groups = build_groups(
+    // Per-prefix git remote, populated by `bd watch` at startup.
+    // Used by the TUI dashboard to join against ghwatch's CI state.
+    // Empty for any prefix whose watcher hasn't recorded a remote
+    // (no git checkout, no `origin`, or never started a `bd watch`).
+    let git_remotes: HashMap<String, String> = storage
+        .list_all_watchers()
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|r| !r.git_remote.is_empty())
+                .map(|r| (r.prefix, r.git_remote))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut groups = build_groups(
         &issues,
         &blocked_ids,
         &parents,
@@ -194,6 +208,12 @@ pub(crate) fn snapshot(
         &presence,
         presence_ttl,
     );
+
+    for g in &mut groups {
+        if let Some(remote) = git_remotes.get(&g.prefix) {
+            g.git_remote = Some(remote.clone());
+        }
+    }
 
     let pending_asks = count_pending_asks(&storage)?;
 
@@ -483,6 +503,7 @@ fn build_groups<'a>(
             closed,
             closed_recently: recent.len(),
             presence: presence_view,
+            git_remote: None,
             beads: rows,
             recently_closed: recent,
         });
@@ -530,6 +551,7 @@ fn build_groups<'a>(
                 closed: 0,
                 closed_recently: 0,
                 presence: Some(view),
+                git_remote: None,
                 beads: vec![],
                 recently_closed: vec![],
             });
@@ -589,6 +611,11 @@ pub(crate) struct OwnedGroup {
     pub(crate) closed: usize,
     pub(crate) closed_recently: usize,
     pub(crate) presence: Option<PresenceView>,
+    /// Canonical `host/owner/repo` of the prefix's `bd watch` cwd, or
+    /// None when the agent isn't running a watch in a git checkout.
+    /// Populated by `snapshot()` from the watchers table; used by the
+    /// TUI to join against ghwatch's CI state.
+    pub(crate) git_remote: Option<String>,
     pub(crate) beads: Vec<OwnedBead>,
     pub(crate) recently_closed: Vec<OwnedClosure>,
 }
@@ -972,6 +999,7 @@ mod tests {
             closed: 0,
             closed_recently: 0,
             presence: None,
+            git_remote: None,
             beads: vec![],
             recently_closed: vec![],
         };
@@ -986,6 +1014,7 @@ mod tests {
             closed: 0,
             closed_recently: 0,
             presence: None,
+            git_remote: None,
             beads: vec![],
             recently_closed: vec![],
         };
@@ -1000,6 +1029,7 @@ mod tests {
             closed: 0,
             closed_recently: 2,
             presence: None,
+            git_remote: None,
             beads: vec![],
             recently_closed: vec![],
         };

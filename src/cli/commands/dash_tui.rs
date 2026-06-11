@@ -218,6 +218,10 @@ struct App {
     /// graph view shows color (status, priority, headers).
     graph_lines: Vec<Line<'static>>,
     graph_scroll: u16,
+    /// Latest ghwatch snapshot, refreshed on each dashboard tick.
+    /// Quiet (default) when ghwatch isn't running or its db isn't
+    /// reachable; the dashboard simply skips the CI badge.
+    ghwatch: crate::cli::commands::ghwatch::GhwatchStatus,
     /// Active detail-view state, if any. `Some(...)` means the user
     /// pressed Enter on a bead and is currently looking at its
     /// details; key handling switches to detail bindings until they
@@ -257,6 +261,7 @@ impl App {
             view,
             graph_lines: Vec::new(),
             graph_scroll: 0,
+            ghwatch: crate::cli::commands::ghwatch::GhwatchStatus::default(),
             detail: None,
             beads_dir,
             cli,
@@ -376,7 +381,8 @@ impl App {
         let Some(bead_id) = self.cursor_bead_id().map(str::to_string) else {
             return;
         };
-        if let Some(state) = load_detail(&self.beads_dir, &self.cli, &bead_id) {
+        let ci = self.ci_row_for_bead(&bead_id);
+        if let Some(state) = load_detail(&self.beads_dir, &self.cli, &bead_id, ci) {
             self.detail = Some(state);
         }
     }
@@ -386,9 +392,24 @@ impl App {
         let Some(bead_id) = self.detail.as_ref().map(|d| d.bead_id.clone()) else {
             return;
         };
-        if let Some(state) = load_detail(&self.beads_dir, &self.cli, &bead_id) {
+        let ci = self.ci_row_for_bead(&bead_id);
+        if let Some(state) = load_detail(&self.beads_dir, &self.cli, &bead_id, ci) {
             self.detail = Some(state);
         }
+    }
+
+    /// Find the freshest ghwatch CI row associated with `bead_id`'s
+    /// prefix, using the group's recorded git_remote. None when the
+    /// group is missing, has no git_remote, or ghwatch has nothing
+    /// for that repo.
+    fn ci_row_for_bead(&self, bead_id: &str) -> Option<crate::cli::commands::ghwatch::CiRow> {
+        let prefix = bead_id.split('-').next()?;
+        let group = self.groups.iter().find(|g| g.prefix == prefix)?;
+        let remote = group.git_remote.as_deref()?;
+        let rows = self.ghwatch.ci_rows.get(remote)?;
+        rows.iter()
+            .max_by_key(|r| r.observed_at.or(r.updated_at))
+            .cloned()
     }
 
     fn close_detail(&mut self) {
@@ -665,7 +686,68 @@ fn group_has_children(g: &OwnedGroup) -> bool {
     !g.beads.is_empty() || !g.recently_closed.is_empty()
 }
 
-fn header_line(group: &OwnedGroup, expanded: bool) -> Line<'static> {
+/// Render a compact CI indicator for the agent header. Picks the
+/// liveliest signal so a "running" build wins over yesterday's
+/// "success" if there's both. "Recently green" only fires within
+/// the last 30 minutes — older successes get no badge to avoid
+/// pretending the agent is actively shipping.
+fn ci_badge_spans(row: &crate::cli::commands::ghwatch::CiRow) -> Vec<Span<'static>> {
+    use chrono::Duration as ChDur;
+    let (glyph, label, style) = match row.status.as_str() {
+        "in_progress" | "queued" | "requested" | "waiting" | "pending" => (
+            "⏳",
+            "running",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        "completed" => match row.conclusion.as_deref() {
+            Some("success") => {
+                let recent = row
+                    .updated_at
+                    .or(row.observed_at)
+                    .is_some_and(|t| (Utc::now() - t) < ChDur::minutes(30));
+                if !recent {
+                    return Vec::new();
+                }
+                (
+                    "✓",
+                    "success",
+                    Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+                )
+            }
+            Some("failure" | "timed_out" | "action_required" | "startup_failure") => (
+                "✗",
+                "failure",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Some(other) => return ci_badge_unknown(other),
+            None => return Vec::new(),
+        },
+        // Anything else (unknown state vocabulary) → render as a
+        // muted question mark so an unfamiliar ghwatch never silently
+        // hides interesting state.
+        other => return ci_badge_unknown(other),
+    };
+    vec![
+        Span::raw("  "),
+        Span::styled(format!("[{glyph} "), style),
+        Span::styled(label.to_string(), style),
+        Span::styled("]".to_string(), style),
+    ]
+}
+
+fn ci_badge_unknown(label: &str) -> Vec<Span<'static>> {
+    let style = Style::default().add_modifier(Modifier::DIM);
+    vec![
+        Span::raw("  "),
+        Span::styled(format!("[? {label}]"), style),
+    ]
+}
+
+fn header_line(
+    group: &OwnedGroup,
+    expanded: bool,
+    ci: Option<&crate::cli::commands::ghwatch::CiRow>,
+) -> Line<'static> {
     // Empty groups get a two-space pad instead of a chevron — there's
     // nothing to expand or collapse, and the missing arrow makes that
     // obvious at a glance.
@@ -702,6 +784,12 @@ fn header_line(group: &OwnedGroup, expanded: bool) -> Line<'static> {
     let counts = header_counts(group);
     if !counts.is_empty() {
         spans.push(Span::styled(format!(" {counts}"), bold));
+    }
+
+    if let Some(row) = ci {
+        for span in ci_badge_spans(row) {
+            spans.push(span);
+        }
     }
 
     Line::from(spans)
@@ -851,9 +939,10 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let initial = snapshot(args, cli, &beads_dir, Utc::now())?;
     let mut app = App::new(initial.0, initial.1, beads_dir.clone(), cli.clone());
-    // Prime the graph view so switching to it doesn't show empty
-    // contents until the first refresh tick.
+    // Prime the graph view + ghwatch snapshot so view switches and
+    // first-frame CI badges don't have to wait for the first tick.
     app.refresh_graph();
+    app.ghwatch = crate::cli::commands::ghwatch::read_status();
 
     let refresh_every =
         Duration::from_secs(args.refresh.unwrap_or(DEFAULT_REFRESH_SECS).max(1));
@@ -961,6 +1050,7 @@ fn refresh(app: &mut App, args: &DashArgs, cli: &config::CliOverrides, beads_dir
         app.apply_snapshot(groups, pending);
     }
     app.refresh_graph();
+    app.ghwatch = crate::cli::commands::ghwatch::read_status();
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -973,7 +1063,10 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(frame.area());
 
-    // Top status line — shared across views.
+    // Top status line — shared across views. Priority:
+    //   1. Pending operator asks (most actionable) — yellow.
+    //   2. ghwatch schema mismatch or silent process — dim warning.
+    //   3. View tab-strip — dim, ambient.
     let status: Paragraph<'_> = if app.pending_asks > 0 {
         let noun = if app.pending_asks == 1 { "ask" } else { "asks" };
         Paragraph::new(format!(
@@ -981,6 +1074,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
             app.pending_asks, noun
         ))
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    } else if let Some(msg) = ghwatch_status_line(&app.ghwatch) {
+        Paragraph::new(msg)
+            .style(Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM))
     } else {
         Paragraph::new(view_tab_strip(app.view))
             .style(Style::default().add_modifier(Modifier::DIM))
@@ -1009,6 +1105,23 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.show_help {
         draw_help_overlay(frame, frame.area());
     }
+}
+
+/// Renders any notable ghwatch condition into a short top-line
+/// message. Returns None when the integration is healthy/quiet.
+fn ghwatch_status_line(
+    status: &crate::cli::commands::ghwatch::GhwatchStatus,
+) -> Option<String> {
+    if let Some(msg) = &status.schema_mismatch {
+        return Some(msg.clone());
+    }
+    if let Some(secs) = status.silent_for_secs {
+        return Some(format!(
+            "ghwatch: silent for {} — CI state may be stale",
+            format_age_compact(secs)
+        ));
+    }
+    None
 }
 
 fn view_tab_strip(active: ViewMode) -> String {
@@ -1044,8 +1157,18 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             VisibleRow::Header { prefix } => {
                 let group = app.groups.iter().find(|g| g.prefix == *prefix);
                 let expanded = app.is_expanded(prefix);
+                // Look up the CI badge for this prefix's git_remote.
+                // Picks the freshest (by observed_at) row when ghwatch
+                // surfaces multiple branches for one repo so the
+                // dashboard doesn't bounce between them.
+                let ci = group
+                    .and_then(|g| g.git_remote.as_deref())
+                    .and_then(|remote| app.ghwatch.ci_rows.get(remote))
+                    .and_then(|rows| {
+                        rows.iter().max_by_key(|r| r.observed_at.or(r.updated_at))
+                    });
                 let line = group
-                    .map(|g| header_line(g, expanded))
+                    .map(|g| header_line(g, expanded, ci))
                     .unwrap_or_else(|| Line::from(prefix.clone()));
                 ListItem::new(line)
             }
@@ -1140,18 +1263,104 @@ fn load_detail(
     beads_dir: &Path,
     cli: &config::CliOverrides,
     bead_id: &str,
+    ci: Option<crate::cli::commands::ghwatch::CiRow>,
 ) -> Option<DetailState> {
     let (storage, _paths) =
         config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
     let details = storage.get_issue_details(bead_id, false, false, 0).ok()??;
     let title_for_pane = format!("detail: {bead_id}");
-    let lines = render_issue_detail(&details);
+    let mut lines = render_issue_detail(&details);
+    if let Some(row) = ci {
+        lines.extend(render_ci_section(&row));
+    }
     Some(DetailState {
         bead_id: bead_id.to_string(),
         title_for_pane,
         lines,
         scroll: 0,
     })
+}
+
+/// Render the "Current CI" footer block for the detail pane.
+fn render_ci_section(row: &crate::cli::commands::ghwatch::CiRow) -> Vec<Line<'static>> {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let cyan = Style::default().fg(Color::Cyan);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled("Current CI", bold)));
+
+    // status — colored like the badge for consistency.
+    let status_style = match row.status.as_str() {
+        "in_progress" | "queued" | "requested" | "waiting" | "pending" => {
+            Style::default().fg(Color::Yellow)
+        }
+        "completed" => match row.conclusion.as_deref() {
+            Some("success") => Style::default().fg(Color::Green),
+            Some("failure" | "timed_out" | "action_required" | "startup_failure") => {
+                Style::default().fg(Color::Red)
+            }
+            _ => Style::default(),
+        },
+        _ => Style::default(),
+    };
+
+    let mut status_text = row.status.clone();
+    if let Some(c) = &row.conclusion {
+        status_text.push_str(" · ");
+        status_text.push_str(c);
+    }
+    out.push(Line::from(vec![
+        Span::styled("Status:   ", dim),
+        Span::styled(status_text, status_style),
+    ]));
+
+    if !row.kind.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("Kind:     ", dim),
+            Span::raw(row.kind.clone()),
+        ]));
+    }
+    if let Some(wf) = row.workflow.as_deref().filter(|s| !s.is_empty()) {
+        out.push(Line::from(vec![
+            Span::styled("Workflow: ", dim),
+            Span::raw(wf.to_string()),
+        ]));
+    }
+    if !row.branch.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("Branch:   ", dim),
+            Span::raw(row.branch.clone()),
+        ]));
+    }
+    if let Some(updated) = row.updated_at {
+        out.push(Line::from(vec![
+            Span::styled("Updated:  ", dim),
+            Span::raw(updated.format("%Y-%m-%d %H:%M UTC").to_string()),
+        ]));
+    }
+    if let Some(observed) = row.observed_at {
+        let ago = (Utc::now() - observed).num_seconds().max(0);
+        out.push(Line::from(vec![
+            Span::styled("Observed: ", dim),
+            Span::raw(format!("{} ago", format_age_compact(ago))),
+        ]));
+    }
+    if let Some(url) = row.url.as_deref().filter(|s| !s.is_empty()) {
+        out.push(Line::from(vec![
+            Span::styled("URL:      ", dim),
+            Span::styled(url.to_string(), cyan),
+        ]));
+    }
+    if let Some(src) = row.source_id.as_deref().filter(|s| !s.is_empty()) {
+        out.push(Line::from(vec![
+            Span::styled("Source:   ", dim),
+            Span::raw(src.to_string()),
+        ]));
+    }
+
+    out
 }
 
 fn render_issue_detail(

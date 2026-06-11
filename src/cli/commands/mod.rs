@@ -14,6 +14,7 @@ pub mod delete;
 pub mod dep;
 pub mod doctor;
 pub mod epic;
+pub mod ghwatch;
 pub mod graph;
 pub mod history;
 pub mod info;

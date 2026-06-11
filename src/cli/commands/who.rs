@@ -54,6 +54,8 @@ struct WhoRowJson<'a> {
     started_at: String,
     last_seen: String,
     last_seen_secs_ago: i64,
+    cwd: &'a str,
+    git_remote: &'a str,
 }
 
 fn render_json<W: Write>(out: &mut W, rows: &[WatcherRow], now: DateTime<Utc>) -> Result<()> {
@@ -65,6 +67,8 @@ fn render_json<W: Write>(out: &mut W, rows: &[WatcherRow], now: DateTime<Utc>) -
             started_at: r.started_at.to_rfc3339(),
             last_seen: r.last_seen.to_rfc3339(),
             last_seen_secs_ago: (now - r.last_seen).num_seconds().max(0),
+            cwd: &r.cwd,
+            git_remote: &r.git_remote,
         })
         .collect();
     writeln!(out, "{}", serde_json::to_string(&view)?)?;
@@ -83,16 +87,29 @@ fn render_text<W: Write>(
     }
 
     if verbose {
-        writeln!(out, "PREFIX               PID        STARTED              LAST SEEN")?;
+        writeln!(
+            out,
+            "PREFIX               PID        STARTED              LAST SEEN   GIT REMOTE                              CWD"
+        )?;
         for r in rows {
             let ago = format_age_compact((now - r.last_seen).num_seconds());
+            let remote = if r.git_remote.is_empty() {
+                "-".to_string()
+            } else {
+                r.git_remote.clone()
+            };
+            let cwd = if r.cwd.is_empty() {
+                "-".to_string()
+            } else {
+                tail_path(&r.cwd, 40)
+            };
             writeln!(
                 out,
-                "{prefix:<20} {pid:<10} {started:<20} {ago} ago",
+                "{prefix:<20} {pid:<10} {started:<20} {ago:<10}  {remote:<40} {cwd}",
                 prefix = r.prefix,
                 pid = r.pid,
                 started = r.started_at.format("%Y-%m-%d %H:%M:%S"),
-                ago = ago,
+                ago = format!("{ago} ago"),
             )?;
         }
     } else {
@@ -116,6 +133,38 @@ fn render_text<W: Write>(
         }
     }
     Ok(())
+}
+
+/// Right-truncate a path to at most `max` chars by keeping the
+/// trailing segments and prepending `…/` when truncation occurs.
+/// `/home/toad/bit/beads_rust` with max=15 → `…/bit/beads_rust`.
+fn tail_path(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    // Walk the path right-to-left building up segments until adding
+    // the next one would exceed the budget.
+    let segments: Vec<&str> = path.split('/').collect();
+    let mut acc = String::new();
+    for seg in segments.iter().rev() {
+        let candidate = if acc.is_empty() {
+            seg.to_string()
+        } else {
+            format!("{seg}/{acc}")
+        };
+        // Account for the `…/` prefix the truncation will add.
+        if candidate.chars().count() + 2 > max {
+            break;
+        }
+        acc = candidate;
+    }
+    if acc.is_empty() {
+        // Last resort: keep the rightmost `max-2` chars.
+        let suffix: String = path.chars().rev().take(max.saturating_sub(2)).collect();
+        let suffix: String = suffix.chars().rev().collect();
+        return format!("…{suffix}");
+    }
+    format!("…/{acc}")
 }
 
 fn format_age_compact(secs: i64) -> String {
