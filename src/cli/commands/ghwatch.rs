@@ -53,6 +53,24 @@ pub struct CiRow {
     pub observed_at: Option<DateTime<Utc>>,
 }
 
+/// One row from ghwatch's `transitions` append-only log. bd watch
+/// polls for new rows matching the agent's repo and emits a stream
+/// notification per (success | failure) outcome.
+#[derive(Debug, Clone)]
+pub struct TransitionRow {
+    pub id: i64,
+    pub repo: String,
+    pub branch: String,
+    pub kind: String,
+    pub from_status: Option<String>,
+    pub to_status: String,
+    pub conclusion: Option<String>,
+    pub workflow: Option<String>,
+    pub url: Option<String>,
+    pub source_id: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
+}
+
 /// Aggregate CI state for the dashboard, plus any soft errors the
 /// operator should know about. `ci_rows` is keyed by canonical
 /// `repo`; the dashboard joins against `watchers.git_remote`.
@@ -202,4 +220,85 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Current max id in ghwatch's `transitions` table — used by bd watch
+/// at startup so subsequent polls only fire for new rows. Returns 0
+/// when the db or table is absent (including the still-v1 case).
+#[must_use]
+pub fn current_max_transition_id() -> i64 {
+    let Some(path) = discover_state_db() else {
+        return 0;
+    };
+    let Ok(conn) = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return 0;
+    };
+    // Schema gate — old (v1) dbs don't have a transitions table.
+    let version = meta_int(&conn, "schema_version").unwrap_or(0);
+    if version != SUPPORTED_SCHEMA_VERSION {
+        return 0;
+    }
+    conn.prepare("SELECT COALESCE(MAX(id), 0) FROM transitions")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+        .unwrap_or(0)
+}
+
+/// Read transitions for `repo` (canonical form) whose id is strictly
+/// greater than `since_id`, filtered to actionable outcomes
+/// (`success` / `failure`) and non-superseded rows. Returns an empty
+/// vec on every failure mode — bd watch silently no-ops when the db
+/// isn't reachable.
+#[must_use]
+pub fn read_new_transitions(repo: &str, since_id: i64) -> Vec<TransitionRow> {
+    if repo.is_empty() {
+        return Vec::new();
+    }
+    let Some(path) = discover_state_db() else {
+        return Vec::new();
+    };
+    let Ok(conn) = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Vec::new();
+    };
+    let version = meta_int(&conn, "schema_version").unwrap_or(0);
+    if version != SUPPORTED_SCHEMA_VERSION {
+        return Vec::new();
+    }
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, repo, branch, kind, from_status, to_status, conclusion,
+                workflow, url, source_id, observed_at
+         FROM transitions
+         WHERE repo = ?1
+           AND id > ?2
+           AND COALESCE(superseded, 0) = 0
+           AND to_status IN ('success', 'failure')
+         ORDER BY id ASC",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(rusqlite::params![repo, since_id], |row| {
+        Ok(TransitionRow {
+            id: row.get("id")?,
+            repo: row.get("repo")?,
+            branch: row.get::<_, Option<String>>("branch")?.unwrap_or_default(),
+            kind: row.get::<_, Option<String>>("kind")?.unwrap_or_default(),
+            from_status: row.get::<_, Option<String>>("from_status")?,
+            to_status: row.get::<_, Option<String>>("to_status")?.unwrap_or_default(),
+            conclusion: row.get::<_, Option<String>>("conclusion")?,
+            workflow: row.get::<_, Option<String>>("workflow")?,
+            url: row.get::<_, Option<String>>("url")?,
+            source_id: row.get::<_, Option<String>>("source_id")?,
+            observed_at: row
+                .get::<_, Option<String>>("observed_at")?
+                .and_then(|s| parse_ts(&s)),
+        })
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten().collect()
 }

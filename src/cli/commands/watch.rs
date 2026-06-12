@@ -166,6 +166,16 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         )?;
         crate::cli::commands::reload::read_generation(&storage)?
     };
+    // Anchor against ghwatch's transitions table so we only emit CI
+    // notifications for runs that finish after this watch starts.
+    // Runs in flight when we boot still surface (their COMPLETED
+    // transition lands after, hence id > anchor), but historical
+    // outcomes don't re-fire on every bd watch restart.
+    let mut seen_transition_id = if watcher_git_remote.is_empty() {
+        0
+    } else {
+        crate::cli::commands::ghwatch::current_max_transition_id()
+    };
     let _watcher_guard = WatcherGuard {
         beads_dir: beads_dir.clone(),
         prefix: prefix.clone(),
@@ -316,6 +326,29 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
                     )?;
                 }
                 break;
+            }
+        }
+
+        // CI notifications from ghwatch. Each new completed-and-not-
+        // superseded run on our repo lands as one stream line. The
+        // session-overlap gate (observed_at >= my_started_at) keeps
+        // historical outcomes from re-firing on bd watch restart.
+        if !watcher_git_remote.is_empty() {
+            let transitions = crate::cli::commands::ghwatch::read_new_transitions(
+                &watcher_git_remote,
+                seen_transition_id,
+            );
+            for t in transitions {
+                seen_transition_id = seen_transition_id.max(t.id);
+                let session_overlap = t
+                    .observed_at
+                    .is_some_and(|ts| ts >= my_started_at);
+                if !session_overlap {
+                    continue;
+                }
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                emit_ci_transition_event(&mut out, &t, now);
             }
         }
 
@@ -569,6 +602,46 @@ fn inbox_messages(
         ..Default::default()
     };
     storage.list_messages(&filter)
+}
+
+/// Print a single CI-transition event line. Plain-text format only —
+/// the Monitor that wraps `bd watch` surfaces one notification per
+/// line regardless of format. Best-effort: write failures are
+/// silenced (a missed CI ping shouldn't kill the watch loop).
+fn emit_ci_transition_event<W: Write>(
+    out: &mut W,
+    t: &crate::cli::commands::ghwatch::TransitionRow,
+    now: DateTime<Utc>,
+) {
+    let glyph = match t.to_status.as_str() {
+        "success" => "✓",
+        "failure" => "✗",
+        _ => "•",
+    };
+    let workflow = t.workflow.as_deref().unwrap_or("(workflow)");
+    let url = t
+        .url
+        .as_deref()
+        .map(|u| format!(" {u}"))
+        .unwrap_or_default();
+    let source = t
+        .source_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    let branch = if t.branch.is_empty() {
+        String::new()
+    } else {
+        format!("@{}", t.branch)
+    };
+    let _ = writeln!(
+        out,
+        "[{ts}] CI {glyph} {status} {repo}{branch} — {workflow}{source}{url}",
+        ts = now.to_rfc3339(),
+        status = t.to_status,
+        repo = t.repo,
+    );
 }
 
 fn emit_message_event<W: Write>(
