@@ -149,7 +149,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -160,7 +160,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -273,6 +273,9 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "visibility",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -1253,7 +1256,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1347,7 +1350,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1373,9 +1376,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f2130a9a5627e21a7e4633e74abbcbff92fb18929e9c6317dc411c4e9f84cd5"
+checksum = "cc16031e7043c93f6e842fdbc12e8a964b3a0f3211b32e81db880a249ec8dd49"
 dependencies = [
  "asupersync",
  "dirs",
@@ -1390,9 +1393,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6fbda76a1fec1542ef9dbe132351b471f5ea6dec069aca3cb0bd9d921ed4b229"
+checksum = "d5c4e0b123fe86967f389208120b28c46181bd1d67b307cafcd02b87437c4438"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1409,9 +1412,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55259f2528ccea39ca836d6a8fdff0818b0bec048e8450e73d5f4ae0aa316e63"
+checksum = "4edda6aeb1e22dc7d2fd9efc217707703d901bfc2bfcf74009fa9a118a535ca1"
 dependencies = [
  "asupersync",
  "log",
@@ -1421,9 +1424,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0f0d2a69dc60117a4d8d9fc95b8f9c97cd3dd74544e66c77eff5e0d51fbbc2c"
+checksum = "4dbce04e3586bce3b68f7bf3b83a20d8c0f3eaa415a7d7fdf659049de43506f6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1432,9 +1435,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f61ed11a61d1149edc7cdbfe82978e06933305351b5e82cc875142ee0fd4fc26"
+checksum = "00336699203935ff5790d08d2968a90eecf0e2437c1dd5d67b327f522df7162a"
 dependencies = [
  "base64",
  "fastmcp-core",
@@ -1445,9 +1448,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee14b4918c6844150e9e96d97fb805291c4d2214d737dbc803fdc13f4055a2b"
+checksum = "d59b34628877ed2537237774b8429ea9498c30d421760ac5235176c1e79fba7a"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1462,9 +1465,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e889c13394b7223c31b4b820d6fcec4eac34a38178e77c51dd54db616f37dbd5"
+checksum = "88118d8b23da59e23582d6effc2f595e762ddf50f0fecb971982cca2ba609b9a"
 dependencies = [
  "asupersync",
  "base64",
@@ -1484,9 +1487,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25096b6dc32b63f219d4380f65c1ef21b1336ba592a8204748dbb49d1896a0cf"
+checksum = "9e9bbd0cd007bf11dd69f1553f19ffec962531cb19be36d087f8b79b04234592"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -3329,7 +3332,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3667,7 +3670,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3776,7 +3779,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
@@ -4519,7 +4522,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4578,7 +4581,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5004,7 +5007,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5137,7 +5140,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5710,6 +5713,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d5208a9710a6ca1c2da0d64289a5dcca13deb05afdedf651f4e11bcd9fc53eb"
 
 [[package]]
+name = "visibility"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "vte"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5919,7 +5933,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
