@@ -11,9 +11,38 @@ use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, 
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
+use crate::util::id::split_prefix_remainder;
 use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
+
+/// Resolve the prefix-scope for `bd list`:
+///   1. `--all` or `--all-prefixes` → no scoping
+///   2. `--prefix=X`              → scope to X
+///   3. `BD_ISSUE_PREFIX` env set → scope to it (the agent default,
+///      so an agent's JSON output doesn't include every other prefix's
+///      bead bodies)
+///   4. otherwise no scoping
+fn resolve_list_prefix(args: &ListArgs) -> Option<String> {
+    resolve_list_prefix_with(args, std::env::var("BD_ISSUE_PREFIX").ok().as_deref())
+}
+
+fn resolve_list_prefix_with(args: &ListArgs, env_prefix: Option<&str>) -> Option<String> {
+    if args.all || args.all_prefixes {
+        return None;
+    }
+    if let Some(p) = args
+        .prefix
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(p.to_string());
+    }
+    env_prefix
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// Execute the list command.
 ///
@@ -63,6 +92,18 @@ pub fn execute(
     } else {
         issues
     };
+
+    // Scope to the agent's own prefix by default (BD_ISSUE_PREFIX). An
+    // explicit --prefix overrides; --all / --all-prefixes drop scoping.
+    // This keeps `bd list --format=json` from dumping every other
+    // agent's bead descriptions into a calling agent's context.
+    if let Some(target) = resolve_list_prefix(args) {
+        issues.retain(|issue| {
+            split_prefix_remainder(&issue.id)
+                .map(|(p, _)| p == target.as_str())
+                .unwrap_or(false)
+        });
+    }
 
     if let Some(limit) = limit {
         if limit > 0 && issues.len() > limit {
@@ -424,6 +465,47 @@ mod tests {
         let values: Vec<i32> = priorities.iter().map(|p| p.0).collect();
         assert_eq!(values, vec![0, 2]);
         info!("test_build_filters_parses_priorities: assertions passed");
+    }
+
+    #[test]
+    fn test_resolve_list_prefix_uses_env_by_default() {
+        init_logging();
+        info!("test_resolve_list_prefix_uses_env_by_default: starting");
+        let args = ListArgs::default();
+        assert_eq!(
+            resolve_list_prefix_with(&args, Some("demo1")),
+            Some("demo1".to_string())
+        );
+        assert_eq!(resolve_list_prefix_with(&args, None), None);
+        assert_eq!(resolve_list_prefix_with(&args, Some("  ")), None);
+    }
+
+    #[test]
+    fn test_resolve_list_prefix_explicit_prefix_wins() {
+        init_logging();
+        let args = cli::ListArgs {
+            prefix: Some("other1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_list_prefix_with(&args, Some("demo1")),
+            Some("other1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_list_prefix_all_drops_scope() {
+        init_logging();
+        let args = cli::ListArgs {
+            all: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_list_prefix_with(&args, Some("demo1")), None);
+        let args = cli::ListArgs {
+            all_prefixes: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_list_prefix_with(&args, Some("demo1")), None);
     }
 
     #[test]

@@ -1724,9 +1724,22 @@ pub struct ListArgs {
     #[arg(long)]
     pub notes_contains: Option<String>,
 
-    /// Include closed issues (default excludes closed)
+    /// Include closed issues *and* widen to every prefix (default
+    /// excludes closed and scopes to `BD_ISSUE_PREFIX` when set).
+    /// Implies `--all-prefixes`.
     #[arg(long, short = 'a')]
     pub all: bool,
+
+    /// Limit to a specific issue ID prefix. Defaults to
+    /// `BD_ISSUE_PREFIX` when set, so an agent sees only its own
+    /// beads. Only honored by `bd list`.
+    #[arg(long, conflicts_with = "all_prefixes")]
+    pub prefix: Option<String>,
+
+    /// Show beads across every prefix, ignoring `BD_ISSUE_PREFIX`.
+    /// Only honored by `bd list`.
+    #[arg(long, conflicts_with = "prefix")]
+    pub all_prefixes: bool,
 
     /// Maximum number of results (0 = unlimited, default: 50)
     #[arg(long)]
