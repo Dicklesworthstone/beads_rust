@@ -1532,6 +1532,93 @@ pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
     Ok(analyze_jsonl(path)?.0)
 }
 
+fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Result<()> {
+    let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
+
+    let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
+    let mut observed = HashSet::with_capacity(expected_ids.len());
+    let mut reader = BufReader::new(file);
+    let mut line_buf = String::new();
+    let mut line_num = 0;
+    let mut issue_count = 0;
+
+    loop {
+        line_buf.clear();
+        let bytes = reader.read_line(&mut line_buf)?;
+        if bytes == 0 {
+            break;
+        }
+
+        line_num += 1;
+        let trimmed = line_buf.trim_end_matches(['\n', '\r']);
+        if trimmed.trim().is_empty() {
+            continue;
+        }
+
+        let issue: Issue = serde_json::from_str(trimmed).map_err(|err| {
+            BeadsError::Config(format!(
+                "Export verification failed: invalid exported JSON at line {line_num}: {err}"
+            ))
+        })?;
+
+        if issue.id.trim().is_empty() {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: empty issue id at line {line_num}"
+            )));
+        }
+
+        if !expected.contains(issue.id.as_str()) {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: unexpected issue id '{}' at line {line_num}",
+                issue.id
+            )));
+        }
+
+        if !observed.insert(issue.id.clone()) {
+            return Err(BeadsError::Config(format!(
+                "Export verification failed: duplicate issue id '{}' at line {line_num}",
+                issue.id
+            )));
+        }
+
+        issue_count += 1;
+    }
+
+    if issue_count != expected_ids.len() {
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: expected {} issues, JSONL has {} valid issue lines",
+            expected_ids.len(),
+            issue_count
+        )));
+    }
+
+    if observed.len() != expected.len() {
+        let mut missing = expected_ids
+            .iter()
+            .filter(|id| !observed.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        missing.sort();
+        let preview = missing
+            .iter()
+            .take(10)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if missing.len() > 10 {
+            format!(" ... and {} more", missing.len() - 10)
+        } else {
+            String::new()
+        };
+        return Err(BeadsError::Config(format!(
+            "Export verification failed: JSONL is missing expected issue id(s): {preview}{more}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Get issue IDs from an existing JSONL file.
 ///
 /// # Errors
@@ -2229,14 +2316,7 @@ pub fn export_to_jsonl_with_policy(
     let content_hash = hex_encode(&hasher.finalize());
 
     // Verify staged export integrity before replacing the live JSONL.
-    let actual_count = count_issues_in_jsonl(&temp_path)?;
-    if actual_count != exported_ids.len() {
-        return Err(BeadsError::Config(format!(
-            "Export verification failed: expected {} issues, JSONL has {} lines",
-            exported_ids.len(),
-            actual_count
-        )));
-    }
+    verify_exported_jsonl_integrity(&temp_path, &exported_ids)?;
 
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
@@ -3293,14 +3373,8 @@ fn write_jsonl_lines_atomically(
     } = temp_output;
 
     sync_jsonl_writer(writer)?;
-    let actual_count = count_issues_in_jsonl(&temp_path)?;
-    if actual_count != lines_by_id.len() {
-        return Err(BeadsError::Config(format!(
-            "Export verification failed: expected {} issues, JSONL has {} lines",
-            lines_by_id.len(),
-            actual_count
-        )));
-    }
+    let expected_ids = lines_by_id.keys().cloned().collect::<Vec<_>>();
+    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
 
     rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
 
@@ -6103,6 +6177,91 @@ mod tests {
                     if message.contains("Duplicate issue id 'bd-dup'")
             ),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_exported_jsonl_integrity_rejects_corruption_shapes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("corrupt-export.jsonl");
+
+        let issue1 = make_test_issue("bd-001", "One");
+        let issue2 = make_test_issue("bd-002", "Two");
+        let json1 = serde_json::to_string(&issue1).unwrap();
+        let json2 = serde_json::to_string(&issue2).unwrap();
+
+        let cases = [
+            ("collapsed adjacent records", format!("{json1}{json2}\n")),
+            ("stray issue prefix", "{\"i{\"id\":\"bd-001\"}\n".to_string()),
+            (
+                "missing comments array closure",
+                "{\"id\":\"bd-001\",\"title\":\"Broken\",\"comments\":[{\"id\":1}\n".to_string(),
+            ),
+            (
+                "object nested in numeric field",
+                "{\"id\":\"bd-001\",\"title\":\"Broken\",\"original_size\":{\"id\":\"bd-002\"}}\n"
+                    .to_string(),
+            ),
+        ];
+
+        for (name, content) in cases {
+            fs::write(&path, content).unwrap();
+
+            let err = verify_exported_jsonl_integrity(
+                &path,
+                &["bd-001".to_string(), "bd-002".to_string()],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("invalid exported JSON at line 1"),
+                "{name}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_verify_exported_jsonl_integrity_rejects_missing_expected_issue() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("missing-export.jsonl");
+
+        let issue = make_test_issue("bd-001", "One");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = verify_exported_jsonl_integrity(
+            &path,
+            &["bd-001".to_string(), "bd-002".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("expected 2 issues, JSONL has 1 valid issue lines"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_exported_jsonl_integrity_rejects_unexpected_issue() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("unexpected-export.jsonl");
+
+        let issue = make_test_issue("bd-other", "Other");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let err = verify_exported_jsonl_integrity(&path, &["bd-001".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unexpected issue id 'bd-other' at line 1"),
+            "unexpected error: {err}"
         );
     }
 
