@@ -3094,7 +3094,6 @@ struct ExistingJsonlReplacementScan {
     exported_count: usize,
     changed: bool,
     all_replacements_seen: bool,
-    sorted_by_id: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3106,7 +3105,6 @@ enum ExistingJsonlReplacementWrite {
         content_hash: String,
         exported_count: usize,
     },
-    Fallback,
 }
 
 struct JsonlTempOutput {
@@ -3123,12 +3121,10 @@ fn scan_existing_jsonl_replacements(
     let mut reader = BufReader::new(file);
     let mut seen_ids = HashSet::new();
     let mut seen_replacements = HashSet::with_capacity(replacement_lines.len());
-    let mut previous_id: Option<String> = None;
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut exported_count = 0;
     let mut changed = false;
-    let mut sorted_by_id = true;
 
     loop {
         line_buf.clear();
@@ -3155,14 +3151,6 @@ fn scan_existing_jsonl_replacements(
             )));
         }
 
-        if previous_id
-            .as_ref()
-            .is_some_and(|previous| previous > &partial.id)
-        {
-            sorted_by_id = false;
-        }
-        previous_id = Some(partial.id.clone());
-
         if let Some(replacement) = replacement_lines.get(&partial.id) {
             seen_replacements.insert(partial.id);
             changed |= replacement != trimmed;
@@ -3175,7 +3163,6 @@ fn scan_existing_jsonl_replacements(
         exported_count,
         changed,
         all_replacements_seen: seen_replacements.len() == replacement_lines.len(),
-        sorted_by_id,
     })
 }
 
@@ -3210,21 +3197,6 @@ fn absolute_or_current_dir_join(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
-}
-
-fn persist_jsonl_temp_output(
-    temp_output: JsonlTempOutput,
-    output_path: &Path,
-    config: &ExportConfig,
-) -> Result<()> {
-    let JsonlTempOutput {
-        temp_path,
-        temp_guard,
-        writer,
-    } = temp_output;
-
-    sync_jsonl_writer(writer)?;
-    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)
 }
 
 fn rename_jsonl_temp_output(
@@ -3269,11 +3241,7 @@ fn try_write_existing_jsonl_replacements_atomically(
 ) -> Result<ExistingJsonlReplacementWrite> {
     let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
 
-    if !scan.all_replacements_seen || (scan.changed && !scan.sorted_by_id) {
-        return Ok(ExistingJsonlReplacementWrite::Fallback);
-    }
-
-    if !scan.changed {
+    if !scan.changed && scan.all_replacements_seen {
         return Ok(ExistingJsonlReplacementWrite::Unchanged {
             exported_count: scan.exported_count,
         });
@@ -3298,6 +3266,7 @@ fn write_existing_jsonl_replacements_atomically(
     let mut hasher = Sha256::new();
     let mut seen_ids = HashSet::new();
     let mut replaced_ids = HashSet::with_capacity(replacement_lines.len());
+    let mut expected_ids = Vec::new();
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut exported_count = 0;
@@ -3337,17 +3306,46 @@ fn write_existing_jsonl_replacements_atomically(
         writeln!(temp_output.writer, "{output_line}")?;
         hasher.update(output_line.as_bytes());
         hasher.update(b"\n");
+        expected_ids.push(
+            serde_json::from_str::<PartialId>(output_line)
+                .map_err(|e| {
+                    BeadsError::Config(format!(
+                        "Invalid replacement JSON while preparing incremental auto-flush: {e}"
+                    ))
+                })?
+                .id,
+        );
         exported_count += 1;
     }
 
-    if replaced_ids.len() != replacement_lines.len() {
-        return Err(BeadsError::Config(format!(
-            "JSONL changed while preparing incremental auto-flush for {} replacement(s)",
-            replacement_lines.len()
-        )));
+    let mut appended_ids = replacement_lines
+        .keys()
+        .filter(|id| !replaced_ids.contains(*id))
+        .collect::<Vec<_>>();
+    appended_ids.sort();
+
+    for issue_id in appended_ids {
+        let output_line = replacement_lines.get(issue_id).ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Missing replacement JSON while preparing incremental auto-flush for {issue_id}"
+            ))
+        })?;
+        writeln!(temp_output.writer, "{output_line}")?;
+        hasher.update(output_line.as_bytes());
+        hasher.update(b"\n");
+        expected_ids.push(issue_id.clone());
+        exported_count += 1;
     }
 
-    persist_jsonl_temp_output(temp_output, output_path, config)?;
+    let JsonlTempOutput {
+        temp_path,
+        temp_guard,
+        writer,
+    } = temp_output;
+
+    sync_jsonl_writer(writer)?;
+    verify_exported_jsonl_integrity(&temp_path, &expected_ids)?;
+    rename_jsonl_temp_output(&temp_path, temp_guard, output_path, config)?;
 
     Ok((hex_encode(&hasher.finalize()), exported_count))
 }
@@ -3483,7 +3481,6 @@ fn try_existing_line_auto_flush(
                 content_hash,
             }))
         }
-        ExistingJsonlReplacementWrite::Fallback => Ok(None),
     }
 }
 
