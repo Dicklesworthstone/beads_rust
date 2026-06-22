@@ -2768,9 +2768,7 @@ impl ToolHandler for ManageDependenciesTool {
                 read_only: None,
                 destructive: Some(false),
                 idempotent: None,
-                open_world_hint: Some(
-                    "list action is read-only; add is idempotent; remove is not".into(),
-                ),
+                open_world_hint: Some(false),
             }),
         }
     }
@@ -4433,6 +4431,19 @@ mod tests {
                 "equality": "batch dependency adds verified by final storage state and per-item ok counts",
             })
         );
+    }
+
+    #[test]
+    fn manage_dependencies_annotations_use_closed_world_hint() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tool = ManageDependenciesTool::new(state);
+        let annotations = tool.definition().annotations.expect("annotations");
+
+        assert_eq!(annotations.destructive, Some(false));
+        assert_eq!(annotations.idempotent, None);
+        assert_eq!(annotations.read_only, None);
+        assert_eq!(annotations.open_world_hint, Some(false));
     }
 
     #[test]
