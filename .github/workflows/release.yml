@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # Check out the requested tag on workflow_dispatch so the Cargo.toml
           # we verify matches the artifacts that will actually be built.
@@ -87,14 +87,14 @@ jobs:
             echo "Reason: $RELIABILITY_OVERRIDE_REASON"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
           toolchain: nightly
 
@@ -213,7 +213,7 @@ jobs:
             linker: x86_64-w64-mingw32-gcc
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # On workflow_dispatch, build from the requested tag so the binary's
           # embedded version matches what we publish.
@@ -221,7 +221,7 @@ jobs:
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -404,7 +404,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # On workflow_dispatch, the default ref is the branch (e.g. "main"),
           # but the release needs to be cut from the requested tag so the SBOM,
@@ -607,7 +607,7 @@ jobs:
           syft dir:. -o spdx-json > artifacts/sbom.spdx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v2
         with:
           name: br ${{ steps.asset_version.outputs.release_tag }}
           tag_name: ${{ steps.asset_version.outputs.release_tag }}
@@ -639,13 +639,13 @@ jobs:
     timeout-minutes: 15
     if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') }}  # Skip pre-releases
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # cargo publish must build from the tagged source, not the branch HEAD.
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
           toolchain: nightly
 
