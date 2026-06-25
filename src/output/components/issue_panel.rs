@@ -85,6 +85,16 @@ impl<'a> IssuePanel<'a> {
             content.append("\n");
         }
 
+        // Notes (separate column from description — persisted but
+        // previously invisible in the rich panel).
+        if let Some(ref notes) = self.issue.notes {
+            if !notes.is_empty() {
+                content.append_styled("\nNotes:\n", self.theme.emphasis.clone());
+                content.append_styled(notes, self.theme.issue_description.clone());
+                content.append("\n");
+            }
+        }
+
         // Metadata section
         content.append_styled(
             "\n───────────────────────────────────\n",
@@ -95,6 +105,14 @@ impl<'a> IssuePanel<'a> {
         if let Some(ref assignee) = self.issue.assignee {
             content.append_styled("Assignee: ", self.theme.dimmed.clone());
             content.append_styled(&format!("{}\n", assignee), self.theme.username.clone());
+        }
+
+        // Owner (distinct from assignee — who's accountable, not who's
+        // working it). Only render when explicitly set; no USER env
+        // fallback in the rich view since "unknown" adds noise.
+        if let Some(ref owner) = self.issue.owner {
+            content.append_styled("Owner:    ", self.theme.dimmed.clone());
+            content.append_styled(&format!("{}\n", owner), self.theme.username.clone());
         }
 
         // Labels
@@ -112,6 +130,43 @@ impl<'a> IssuePanel<'a> {
             content.append("\n");
         }
 
+        // External ref (e.g. JIRA-123, GH#42)
+        if let Some(ref ext_ref) = self.issue.external_ref {
+            if !ext_ref.is_empty() {
+                content.append_styled("Ref:      ", self.theme.dimmed.clone());
+                content.append_styled(&format!("{}\n", ext_ref), self.theme.timestamp.clone());
+            }
+        }
+
+        // Due / Deferred / Estimate
+        if let Some(due) = self.issue.due_at {
+            content.append_styled("Due:      ", self.theme.dimmed.clone());
+            content.append_styled(
+                &format!("{}\n", due.format("%Y-%m-%d")),
+                self.theme.timestamp.clone(),
+            );
+        }
+        if let Some(defer) = self.issue.defer_until {
+            content.append_styled("Deferred: ", self.theme.dimmed.clone());
+            content.append_styled(
+                &format!("{}\n", defer.format("%Y-%m-%d")),
+                self.theme.timestamp.clone(),
+            );
+        }
+        if let Some(minutes) = self.issue.estimated_minutes {
+            if minutes > 0 {
+                let hours = minutes / 60;
+                let remaining = minutes % 60;
+                let formatted = match (hours, remaining) {
+                    (0, m) => format!("{m}m"),
+                    (h, 0) => format!("{h}h"),
+                    (h, m) => format!("{h}h {m}m"),
+                };
+                content.append_styled("Estimate: ", self.theme.dimmed.clone());
+                content.append_styled(&format!("{formatted}\n"), self.theme.timestamp.clone());
+            }
+        }
+
         // Timestamps
         content.append_styled("Created:  ", self.theme.dimmed.clone());
         content.append_styled(
@@ -124,6 +179,18 @@ impl<'a> IssuePanel<'a> {
             &format!("{}\n", self.issue.updated_at.format("%Y-%m-%d %H:%M")),
             self.theme.timestamp.clone(),
         );
+
+        // Closed: <date> (<reason>)  — only shown when the bead is
+        // actually closed. close_reason is the why; closed_at is the
+        // when. Most user-visible miss before this patch.
+        if let Some(closed) = self.issue.closed_at {
+            let reason = self.issue.close_reason.as_deref().unwrap_or("closed");
+            content.append_styled("Closed:   ", self.theme.dimmed.clone());
+            content.append_styled(
+                &format!("{} ({reason})\n", closed.format("%Y-%m-%d %H:%M")),
+                self.theme.timestamp.clone(),
+            );
+        }
 
         // Dependencies / Dependents
         if self.show_dependencies {
