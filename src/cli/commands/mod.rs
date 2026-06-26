@@ -1,4 +1,3 @@
-pub mod ask;
 pub mod audit;
 pub mod blocked;
 pub mod changelog;
@@ -22,7 +21,6 @@ pub mod init;
 pub mod lint;
 pub mod list;
 pub mod messaging;
-pub mod operator;
 pub mod orphans;
 pub mod presence;
 pub mod q;

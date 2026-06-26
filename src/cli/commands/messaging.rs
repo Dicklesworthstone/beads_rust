@@ -2,9 +2,17 @@
 //!
 //! Messages are NOT issues. They round-trip locally only, expire after
 //! a TTL once read, and never enter the issue work-list.
+//!
+//! Sender identity comes strictly from `BD_ISSUE_PREFIX`. Project
+//! config / default-`"bd"` fallbacks are deliberately *not* honored
+//! here — a prefix-less environment used to silently send as `"bd"`,
+//! which made operator messages appear to come from a phantom agent.
+//! If the env var is missing, `bd msg` errors out; the operator's
+//! send path is the separate `bd admin msg` command, which forces
+//! `from = operator`.
 
 use crate::cli::{InboxArgs, MsgArgs, OutboxArgs, OutputFormat, resolve_output_format_basic};
-use crate::config;
+use crate::config::{self, OPERATOR_PREFIX};
 use crate::error::{BeadsError, Result};
 use crate::model::Message;
 use crate::output::OutputContext;
@@ -42,14 +50,7 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         return Err(BeadsError::validation("to", "recipient prefix is required"));
     }
 
-    if to.eq_ignore_ascii_case(config::OPERATOR_PREFIX) {
-        return Err(BeadsError::validation(
-            "to",
-            "messages to 'operator' must use `bd ask` so the attend REPL \
-             can render them — try `bd ask <body>`, `bd ask --yn`, or \
-             `bd ask --choices a,b,c`",
-        ));
-    }
+    let from = resolve_msg_sender()?;
 
     let body = resolve_body(&args.body)?;
     if body.trim().is_empty() {
@@ -58,8 +59,6 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let from = config::id_config_from_layer(&layer).prefix;
 
     if let Some(reply) = &args.reply {
         if storage_ctx.storage.get_message(reply)?.is_none() {
@@ -72,47 +71,120 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
 
     let now = Utc::now();
 
-    // Reject messages to prefixes with no active `bd watch` heartbeat
-    // (the silent-drop footgun: `bd msg infra` when the watcher is
-    // `infra1`). Skip the check when --force is set, when replying
-    // to a real message (the asker presumably knows what they're
-    // doing), or when messaging your own prefix (testing).
-    if !args.force && args.reply.is_none() && to != from {
+    send_message(
+        &mut storage_ctx.storage,
+        SendParams {
+            from: &from,
+            to,
+            body,
+            reply: args.reply.as_deref(),
+            force: args.force,
+            require_recipient_online: true,
+        },
+        now,
+        ctx,
+    )
+}
+
+/// Strict sender resolution: `BD_ISSUE_PREFIX` only, no fallback. The
+/// `operator` value is rejected here too — operator's send path is
+/// `bd admin msg`, not bare `bd msg`. Reasoning: prefix-less envs
+/// (the operator's normal shell) used to send as `"bd"`, which made
+/// `from=bd` messages appear in agent inboxes attributed to a phantom
+/// agent. Failing loud forces the right command instead.
+fn resolve_msg_sender() -> Result<String> {
+    resolve_msg_sender_from(std::env::var("BD_ISSUE_PREFIX").ok().as_deref())
+}
+
+fn resolve_msg_sender_from(env_prefix: Option<&str>) -> Result<String> {
+    let trimmed = env_prefix.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation(
+            "from",
+            "BD_ISSUE_PREFIX is not set. `bd msg` needs to know who you \
+             are. If you're the human operator, use `bd admin msg` \
+             instead — it identifies you as 'operator' regardless of \
+             environment. If you're an agent, set BD_ISSUE_PREFIX to \
+             your assigned prefix.",
+        ));
+    }
+    if trimmed.eq_ignore_ascii_case(OPERATOR_PREFIX) {
+        return Err(BeadsError::validation(
+            "from",
+            "BD_ISSUE_PREFIX=operator is reserved for the human operator; \
+             agents cannot adopt it. If you're the operator, use \
+             `bd admin msg` instead of `bd msg`.",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+struct SendParams<'a> {
+    from: &'a str,
+    to: &'a str,
+    body: String,
+    reply: Option<&'a str>,
+    force: bool,
+    /// True for agent `bd msg` (which gates on the recipient having
+    /// an active `bd watch` to surface typos); false for `bd admin msg`
+    /// (the operator is allowed to message anyone).
+    require_recipient_online: bool,
+}
+
+fn send_message(
+    storage: &mut SqliteStorage,
+    p: SendParams<'_>,
+    now: chrono::DateTime<Utc>,
+    ctx: &OutputContext,
+) -> Result<()> {
+    // Typo guard: reject messages to prefixes with no active `bd watch`
+    // heartbeat (`bd msg infra` when the watcher is `infra1`). Skip when
+    // --force is set, when replying to a real message, when messaging
+    // your own prefix (testing), when the recipient is the operator
+    // (always-listed-but-not-a-watcher), or when explicitly disabled by
+    // the admin path.
+    let recipient_is_operator = p.to.eq_ignore_ascii_case(OPERATOR_PREFIX);
+    if p.require_recipient_online
+        && !p.force
+        && p.reply.is_none()
+        && p.to != p.from
+        && !recipient_is_operator
+    {
         let ttl = crate::storage::watchers::WATCHER_TTL_SECONDS;
-        let _ = storage_ctx.storage.sweep_stale_watchers(now, ttl);
-        if !storage_ctx.storage.is_prefix_watched(to, now, ttl)? {
-            let active = storage_ctx.storage.active_watcher_prefixes(now, ttl)?;
+        let _ = storage.sweep_stale_watchers(now, ttl);
+        if !storage.is_prefix_watched(p.to, now, ttl)? {
+            let active = storage.active_watcher_prefixes(now, ttl)?;
             let hint = if active.is_empty() {
                 "no agents are currently watching. If this isn't a typo, \
-                 flag it to the operator with `bd ask`."
+                 flag it to the operator with `bd msg operator`."
                     .to_string()
             } else {
                 format!(
                     "active watchers: {}. If this isn't a typo, flag it to \
-                     the operator with `bd ask`.",
+                     the operator with `bd msg operator`.",
                     active.join(", ")
                 )
             };
             return Err(BeadsError::validation(
                 "to",
-                format!("no active `bd watch` for '{to}' — {hint}"),
+                format!("no active `bd watch` for '{to}' — {hint}", to = p.to),
             ));
         }
     }
 
-    let id = pick_message_id(&storage_ctx.storage, &from, to, &body, now)?;
+    let id = pick_message_id(storage, p.from, p.to, &p.body, now)?;
     let msg = Message {
         id: id.clone(),
-        from_prefix: from,
-        to_prefix: to.to_string(),
-        body,
+        from_prefix: p.from.to_string(),
+        to_prefix: p.to.to_string(),
+        body: p.body,
         sent_at: now,
         read_at: None,
-        in_reply_to: args.reply.clone(),
+        in_reply_to: p.reply.map(str::to_string),
         choices: None,
     };
 
-    storage_ctx.storage.insert_message(&msg)?;
+    storage.insert_message(&msg)?;
 
     if ctx.is_json() {
         ctx.json_pretty(&msg);
@@ -122,7 +194,67 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
     Ok(())
 }
 
-/// List received messages, or show one in full.
+/// `bd admin msg <to> <body>` — operator's send path. Identifies the
+/// sender as `operator` regardless of `BD_ISSUE_PREFIX`. The typo
+/// guard is dropped: the operator may legitimately want to drop a
+/// message for an agent that isn't watching yet (will be picked up
+/// next time they boot `bd watch`).
+///
+/// # Errors
+///
+/// Returns an error if the recipient/body are invalid or DB writes fail.
+pub fn execute_admin_msg(
+    args: &MsgArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let to = args.to.trim();
+    if to.is_empty() {
+        return Err(BeadsError::validation("to", "recipient prefix is required"));
+    }
+    if to.eq_ignore_ascii_case(OPERATOR_PREFIX) {
+        return Err(BeadsError::validation(
+            "to",
+            "you cannot send a message to yourself — 'operator' is the \
+             reserved sender prefix for this command",
+        ));
+    }
+
+    let body = resolve_body(&args.body)?;
+    if body.trim().is_empty() {
+        return Err(BeadsError::validation("body", "message body is empty"));
+    }
+
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+
+    if let Some(reply) = &args.reply {
+        if storage_ctx.storage.get_message(reply)?.is_none() {
+            return Err(BeadsError::validation(
+                "reply",
+                format!("no such message: {reply}"),
+            ));
+        }
+    }
+
+    let now = Utc::now();
+    send_message(
+        &mut storage_ctx.storage,
+        SendParams {
+            from: OPERATOR_PREFIX,
+            to,
+            body,
+            reply: args.reply.as_deref(),
+            force: args.force,
+            require_recipient_online: false,
+        },
+        now,
+        ctx,
+    )
+}
+
+/// List received messages, or show one in full. The viewer's identity
+/// comes from `BD_ISSUE_PREFIX` (strict — see [`resolve_msg_sender`]).
 ///
 /// # Errors
 ///
@@ -132,10 +264,31 @@ pub fn execute_inbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let me = resolve_msg_sender()?;
+    execute_inbox_as(&me, args, cli, ctx)
+}
+
+/// `bd admin inbox` — the operator's inbox view.
+///
+/// # Errors
+///
+/// Returns an error if the DB query fails or the requested message ID is unknown.
+pub fn execute_admin_inbox(
+    args: &InboxArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    execute_inbox_as(OPERATOR_PREFIX, args, cli, ctx)
+}
+
+fn execute_inbox_as(
+    me: &str,
+    args: &InboxArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let me = config::id_config_from_layer(&layer).prefix;
 
     // Sweep stale read messages on every inbox access — cheap, no daemon needed.
     let now = Utc::now();
@@ -164,13 +317,11 @@ pub fn execute_inbox(
     }
 
     let filter = MessageFilter {
-        to_prefix: Some(me),
+        to_prefix: Some(me.to_string()),
         from_prefix: args.from.clone(),
         only_unread: !args.all,
         limit: None,
-        // Asks are handled by `bd admin operator attend`; keep them out
-        // of regular inbox listings so they don't get auto-marked-read.
-        only_asks: Some(false),
+        only_asks: None,
     };
     let messages = storage_ctx.storage.list_messages(&filter)?;
 
@@ -207,14 +358,35 @@ pub fn execute_outbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
+    let me = resolve_msg_sender()?;
+    execute_outbox_as(&me, args, cli, ctx)
+}
+
+/// `bd admin outbox` — list messages sent *as* the operator.
+///
+/// # Errors
+///
+/// Returns an error if the DB query fails.
+pub fn execute_admin_outbox(
+    args: &OutboxArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
+    execute_outbox_as(OPERATOR_PREFIX, args, cli, ctx)
+}
+
+fn execute_outbox_as(
+    me: &str,
+    args: &OutboxArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+) -> Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let me = config::id_config_from_layer(&layer).prefix;
 
     let format = resolve_output_format_basic(args.format, ctx.is_json(), false);
     let filter = MessageFilter {
-        from_prefix: Some(me),
+        from_prefix: Some(me.to_string()),
         to_prefix: args.to.clone(),
         ..Default::default()
     };
@@ -332,6 +504,41 @@ mod tests {
     fn resolve_body_joins_words() {
         let words = vec!["hello".to_string(), "world".to_string()];
         assert_eq!(resolve_body(&words).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn resolve_msg_sender_rejects_missing_env() {
+        let err = resolve_msg_sender_from(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("BD_ISSUE_PREFIX"), "got: {msg}");
+        assert!(msg.contains("bd admin msg"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_msg_sender_rejects_empty_env() {
+        assert!(resolve_msg_sender_from(Some("")).is_err());
+        assert!(resolve_msg_sender_from(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn resolve_msg_sender_rejects_operator() {
+        let err = resolve_msg_sender_from(Some("operator")).unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+        // Case-insensitive.
+        assert!(resolve_msg_sender_from(Some("OPERATOR")).is_err());
+        assert!(resolve_msg_sender_from(Some("Operator")).is_err());
+    }
+
+    #[test]
+    fn resolve_msg_sender_trims_and_returns() {
+        assert_eq!(
+            resolve_msg_sender_from(Some(" arc3 ")).unwrap(),
+            "arc3".to_string()
+        );
+        assert_eq!(
+            resolve_msg_sender_from(Some("beads1")).unwrap(),
+            "beads1".to_string()
+        );
     }
 
     #[test]

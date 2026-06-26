@@ -728,26 +728,43 @@ fn discover_git_remote(cwd: &str) -> String {
 }
 
 fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrides) -> Result<String> {
-    if let Some(p) = args
+    let candidate = if let Some(p) = args
         .prefix
         .as_ref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        return Ok(p.to_string());
-    }
-    if let Ok(env_prefix) = std::env::var("BD_ISSUE_PREFIX") {
+        p.to_string()
+    } else if let Ok(env_prefix) = std::env::var("BD_ISSUE_PREFIX") {
         let trimmed = env_prefix.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        if trimmed.is_empty() {
+            return Err(BeadsError::validation(
+                "prefix",
+                "BD_ISSUE_PREFIX is not set and --prefix was not supplied. \
+                 Set BD_ISSUE_PREFIX in the agent environment so watch knows \
+                 which inbox to monitor.",
+            ));
         }
+        trimmed.to_string()
+    } else {
+        return Err(BeadsError::validation(
+            "prefix",
+            "BD_ISSUE_PREFIX is not set and --prefix was not supplied. \
+             Set BD_ISSUE_PREFIX in the agent environment so watch knows \
+             which inbox to monitor.",
+        ));
+    };
+
+    if candidate.eq_ignore_ascii_case(config::OPERATOR_PREFIX) {
+        return Err(BeadsError::validation(
+            "prefix",
+            "'operator' is reserved for the human operator; agents cannot \
+             watch this prefix. (If you're the human operator, the \
+             operator-side surface is `bd admin inbox` / `bd admin msg`.)",
+        ));
     }
-    Err(BeadsError::validation(
-        "prefix",
-        "BD_ISSUE_PREFIX is not set and --prefix was not supplied. \
-         Set BD_ISSUE_PREFIX in the agent environment so watch knows \
-         which inbox to monitor.",
-    ))
+
+    Ok(candidate)
 }
 
 fn resolved_actor(beads_dir: &Path, cli: &config::CliOverrides) -> Result<String> {

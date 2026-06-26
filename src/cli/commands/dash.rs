@@ -248,14 +248,16 @@ fn render_once(
     Ok(())
 }
 
-/// Count unread asks addressed to the operator. Cheap query — single
-/// indexed scan on `messages`.
+/// Count unread messages addressed to the operator. Cheap query —
+/// single indexed scan on `messages`. Surfaced in the dashboard footer
+/// so the operator notices fresh agent messages without polling the
+/// inbox.
 fn count_pending_asks(storage: &SqliteStorage) -> Result<usize> {
     use crate::storage::messages::MessageFilter;
     let filter = MessageFilter {
         to_prefix: Some(crate::config::OPERATOR_PREFIX.to_string()),
         only_unread: true,
-        only_asks: Some(true),
+        only_asks: None,
         ..Default::default()
     };
     Ok(storage.list_messages(&filter)?.len())
@@ -654,10 +656,10 @@ fn render_text<W: Write>(
     pending_asks: usize,
 ) -> Result<()> {
     if pending_asks > 0 {
-        let noun = if pending_asks == 1 { "ask" } else { "asks" };
+        let noun = if pending_asks == 1 { "message" } else { "messages" };
         writeln!(
             out,
-            "operator: {pending_asks} {noun} pending — run `bd admin operator attend`"
+            "operator: {pending_asks} unread {noun} — run `bd admin inbox`"
         )?;
         writeln!(out)?;
     }

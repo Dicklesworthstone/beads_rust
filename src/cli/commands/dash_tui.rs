@@ -1068,9 +1068,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut App) {
     //   2. ghwatch schema mismatch or silent process — dim warning.
     //   3. View tab-strip — dim, ambient.
     let status: Paragraph<'_> = if app.pending_asks > 0 {
-        let noun = if app.pending_asks == 1 { "ask" } else { "asks" };
+        let noun = if app.pending_asks == 1 { "message" } else { "messages" };
         Paragraph::new(format!(
-            "operator: {} {} pending — run `bd admin operator attend`",
+            "operator: {} unread {} — run `bd admin inbox`",
             app.pending_asks, noun
         ))
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))

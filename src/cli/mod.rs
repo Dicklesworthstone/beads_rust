@@ -698,9 +698,6 @@ pub enum Commands {
     /// List agents currently watching for messages (active `bd watch` heartbeats)
     Who(WhoArgs),
 
-    /// Ask the human operator a question (free-form, --yn, or --choices)
-    Ask(AskArgs),
-
     /// List received messages (or show a specific message in full)
     Inbox(InboxArgs),
 
@@ -1000,11 +997,16 @@ pub enum AdminCommands {
         command: QueryCommands,
     },
 
-    /// Triage questions agents have sent to the operator
-    Operator {
-        #[command(subcommand)]
-        command: OperatorCommands,
-    },
+    /// Send a message *as* the operator. Identifies sender as
+    /// `operator` regardless of `BD_ISSUE_PREFIX`. Used by the human
+    /// operator to talk to agents; agents must keep using `bd msg`.
+    Msg(MsgArgs),
+
+    /// Read the operator's inbox (messages addressed to "operator").
+    Inbox(InboxArgs),
+
+    /// List messages sent *as* the operator.
+    Outbox(OutboxArgs),
 
     /// Ask running `bd watch` processes to exit cleanly (e.g. to pick
     /// up a freshly-installed bd binary). Each watcher exits with a
@@ -1024,37 +1026,6 @@ pub struct ReloadArgs {
     /// immediately (emergency-kill semantics).
     #[arg(long, default_value_t = 30)]
     pub spread: u64,
-}
-
-/// Subcommands of `bd admin operator` for handling agent asks.
-#[derive(Subcommand, Debug)]
-pub enum OperatorCommands {
-    /// Interactive REPL: page through pending asks, answer or skip
-    Attend,
-
-    /// One-shot list of pending asks (scripting escape hatch)
-    List(OperatorListArgs),
-
-    /// One-shot reply to a specific ask (scripting escape hatch)
-    Reply(OperatorReplyArgs),
-}
-
-/// Args for `bd admin operator list`.
-#[derive(Args, Debug, Default)]
-pub struct OperatorListArgs {
-    /// Include already-handled asks.
-    #[arg(long)]
-    pub all: bool,
-}
-
-/// Args for `bd admin operator reply <id> [body]`.
-#[derive(Args, Debug, Default)]
-pub struct OperatorReplyArgs {
-    /// Ask message ID to reply to.
-    pub id: String,
-
-    /// Reply body. If omitted, read from stdin.
-    pub body: Vec<String>,
 }
 
 /// Arguments for the completions command.
@@ -1182,23 +1153,6 @@ pub struct WhoArgs {
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
-}
-
-/// Arguments for the `ask` command (send a question to the operator).
-#[derive(Args, Debug, Default)]
-pub struct AskArgs {
-    /// Question body. If omitted, read from stdin.
-    pub body: Vec<String>,
-
-    /// Shorthand for `--choices y,n` — operator gets y/n hotkeys.
-    #[arg(long, conflicts_with = "choices")]
-    pub yn: bool,
-
-    /// Comma-separated choice tokens (e.g. `safe,bold,abort`). Each
-    /// token's first letter becomes a hotkey in the operator REPL, so
-    /// tokens must have unique first letters.
-    #[arg(long)]
-    pub choices: Option<String>,
 }
 
 /// Arguments for the `inbox` command (list/show received messages).

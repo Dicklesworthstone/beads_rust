@@ -29,7 +29,9 @@ use tracing::warn;
 
 /// Reserved prefix that addresses the human operator. Agents must not
 /// adopt this as their own issue prefix; it is the recipient of
-/// `bd ask` and is triaged via `bd admin operator attend`.
+/// `bd msg operator` and is browsed via `bd admin inbox`. The
+/// operator's own send path is `bd admin msg`, which forces this as
+/// the `from_prefix`.
 pub const OPERATOR_PREFIX: &str = "operator";
 
 /// Reject the reserved operator prefix at write paths (init, create).
