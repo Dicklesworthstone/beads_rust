@@ -1008,6 +1008,10 @@ pub enum AdminCommands {
     /// List messages sent *as* the operator.
     Outbox(OutboxArgs),
 
+    /// Interactive REPL: tail messages addressed to the operator, with
+    /// per-message [r]eply / [s]kip / [q]uit prompts. Single-instance.
+    Watch,
+
     /// Ask running `bd watch` processes to exit cleanly (e.g. to pick
     /// up a freshly-installed bd binary). Each watcher exits with a
     /// `BD_RELOAD` notification on its next tick, jittered over the

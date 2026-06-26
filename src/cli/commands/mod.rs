@@ -1,3 +1,4 @@
+pub mod admin_watch;
 pub mod audit;
 pub mod blocked;
 pub mod changelog;

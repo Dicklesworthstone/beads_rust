@@ -167,6 +167,7 @@ fn dispatch_admin(
         A::Msg(args) => commands::messaging::execute_admin_msg(&args, overrides, output_ctx),
         A::Inbox(args) => commands::messaging::execute_admin_inbox(&args, overrides, output_ctx),
         A::Outbox(args) => commands::messaging::execute_admin_outbox(&args, overrides, output_ctx),
+        A::Watch => commands::admin_watch::execute(overrides, output_ctx),
         A::Reload(args) => commands::reload::execute(&args, overrides, output_ctx),
     }
 }
@@ -201,7 +202,7 @@ const fn is_mutating_admin(cmd: &beads_rust::cli::AdminCommands) -> bool {
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
-        A::Msg(_) | A::Inbox(_) => true,
+        A::Msg(_) | A::Inbox(_) | A::Watch => true,
         A::Reload(_) => true,
         _ => false,
     }
