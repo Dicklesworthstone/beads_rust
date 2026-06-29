@@ -98,7 +98,7 @@ struct SchemaOutput {
 /// not the per-row schema (which lives in `schemas`). Agents can use the
 /// `jq_filter` to extract individual items uniformly across commands without
 /// hard-coding per-command knowledge.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 struct CommandShape {
     /// Top-level JSON shape: "array" | "object" | "scalar".
     shape: &'static str,
@@ -500,6 +500,7 @@ fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
 
     #[test]
     fn schema_generation_is_json_serializable() {
@@ -530,6 +531,41 @@ mod tests {
         let commands = build_commands(SchemaTarget::All);
         assert!(!schemas.is_empty(), "All target must include schemas");
         assert!(!commands.is_empty(), "All target must include commands");
+    }
+
+    #[test]
+    fn all_schema_target_covers_every_named_schema_target() {
+        let all_schemas = build_schemas(SchemaTarget::All);
+
+        for target in SchemaTarget::value_variants().iter().copied() {
+            if matches!(target, SchemaTarget::All | SchemaTarget::Commands) {
+                continue;
+            }
+
+            let target_schemas = build_schemas(target);
+            assert!(
+                !target_schemas.is_empty(),
+                "{target:?} should emit at least one schema"
+            );
+
+            for schema_name in target_schemas.keys() {
+                assert!(
+                    all_schemas.contains_key(schema_name),
+                    "SchemaTarget::{target:?} emits {schema_name:?}, but \
+                     SchemaTarget::All omits it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_and_commands_targets_emit_identical_command_maps() {
+        assert_eq!(
+            build_commands(SchemaTarget::All),
+            build_commands(SchemaTarget::Commands),
+            "SchemaTarget::All and SchemaTarget::Commands must describe the \
+             same command envelopes"
+        );
     }
 
     #[test]

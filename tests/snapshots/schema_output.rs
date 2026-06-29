@@ -80,6 +80,13 @@ fn schema_value<'a>(document: &'a Value, schema_name: &str) -> Option<&'a Value>
         .or_else(|| document.get(format!("schemas.{schema_name}")))
 }
 
+fn command_shape_value<'a>(document: &'a Value, command_name: &str) -> Option<&'a Value> {
+    document
+        .get("commands")
+        .and_then(|commands| commands.get(command_name))
+        .or_else(|| document.get(format!("commands.{command_name}")))
+}
+
 fn schema_names(document: &Value) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
 
@@ -107,6 +114,78 @@ fn expected_schema_names() -> BTreeSet<String> {
         .collect()
 }
 
+fn assert_command_shape_schema_ref(
+    expected_names: &BTreeSet<String>,
+    command_name: &str,
+    shape: &Value,
+    context: &str,
+) {
+    let Some(item_schema) = shape.get("item_schema").and_then(Value::as_str) else {
+        return;
+    };
+
+    assert!(
+        expected_names.contains(item_schema),
+        "{context} command {command_name:?} references missing item_schema {item_schema:?}"
+    );
+}
+
+fn assert_command_item_schemas_resolve(document: &Value, context: &str) {
+    let expected_names = schema_names(document);
+    let mut command_count = 0usize;
+
+    if let Some(commands) = document.get("commands").and_then(Value::as_object) {
+        for (command_name, shape) in commands {
+            command_count += 1;
+            assert_command_shape_schema_ref(&expected_names, command_name, shape, context);
+        }
+    }
+
+    if let Some(object) = document.as_object() {
+        for (key, shape) in object {
+            if let Some(command_name) = key.strip_prefix("commands.")
+                && shape.is_object()
+            {
+                command_count += 1;
+                assert_command_shape_schema_ref(&expected_names, command_name, shape, context);
+            }
+        }
+    }
+
+    assert!(command_count > 0, "{context} should include command shapes");
+}
+
+fn assert_coordination_contract_coverage(document: &Value, context: &str) {
+    for schema_name in ["CoordinationStatusOutput", "CoordinationClaimRow"] {
+        assert!(
+            schema_value(document, schema_name).is_some(),
+            "{context} missing required coordination schema {schema_name}"
+        );
+    }
+
+    let coordination = command_shape_value(document, "coordination status");
+    assert!(
+        coordination.is_some(),
+        "{context} missing coordination status command shape"
+    );
+    let coordination = coordination.expect("coordination status command shape asserted present");
+    assert_eq!(
+        coordination.get("jq_filter").and_then(Value::as_str),
+        Some(".claims[]"),
+        "{context} coordination status jq_filter drifted"
+    );
+    assert_eq!(
+        coordination.get("items_at").and_then(Value::as_str),
+        Some(".claims"),
+        "{context} coordination status items_at drifted"
+    );
+    assert_eq!(
+        coordination.get("item_schema").and_then(Value::as_str),
+        Some("CoordinationClaimRow"),
+        "{context} coordination status item_schema must stay linked to claims rows"
+    );
+}
+
 fn assert_schema_document_shape(document: &Value, context: &str) {
     assert_eq!(document["tool"], "br", "{context} should identify br");
     assert_eq!(
@@ -118,6 +197,8 @@ fn assert_schema_document_shape(document: &Value, context: &str) {
         expected_schema_names(),
         "{context} schema target set changed"
     );
+    assert_command_item_schemas_resolve(document, context);
+    assert_coordination_contract_coverage(document, context);
 }
 
 fn assert_toon_matches_json_schema_metadata(json: &Value, toon: &Value) {
