@@ -42,21 +42,21 @@ clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.7"
-fsqlite-types = "0.1.7"
-fsqlite-error = "0.1.7"
-fsqlite-core = "0.1.7"
-fsqlite-func = "0.1.7"
-fsqlite-vdbe = "0.1.7"
-fsqlite-vfs = "0.1.7"
-fsqlite-pager = "0.1.7"
-fsqlite-parser = "0.1.7"
-fsqlite-planner = "0.1.7"
-fsqlite-wal = "0.1.7"
-fsqlite-btree = "0.1.7"
-fsqlite-ast = "0.1.7"
-fsqlite-mvcc = "0.1.7"
-fsqlite-observability = "0.1.7"
+fsqlite = "0.1.12"
+fsqlite-types = "0.1.12"
+fsqlite-error = "0.1.12"
+fsqlite-core = "0.1.12"
+fsqlite-func = "0.1.12"
+fsqlite-vdbe = "0.1.12"
+fsqlite-vfs = "0.1.12"
+fsqlite-pager = "0.1.12"
+fsqlite-parser = "0.1.12"
+fsqlite-planner = "0.1.12"
+fsqlite-wal = "0.1.12"
+fsqlite-btree = "0.1.12"
+fsqlite-ast = "0.1.12"
+fsqlite-mvcc = "0.1.12"
+fsqlite-observability = "0.1.12"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
