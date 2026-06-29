@@ -50,22 +50,6 @@ fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
     }
 }
 
-fn parse_stderr_json(run: &BrRun, context: &str) -> Value {
-    let payload = extract_json_payload(&run.stderr);
-    match serde_json::from_str(&payload) {
-        Ok(value) => value,
-        Err(err) => {
-            assert!(
-                payload.len() == usize::MAX,
-                "{context} should emit structured JSON on stderr: {err}\nstdout={}\nstderr={}",
-                run.stdout,
-                run.stderr
-            );
-            Value::Null
-        }
-    }
-}
-
 fn doctor_check<'a>(doctor_json: &'a Value, name: &str) -> &'a Value {
     let Some(check) = doctor_json["checks"]
         .as_array()
@@ -164,7 +148,7 @@ fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
         run.stdout,
         run.stderr
     );
-    let error_json = parse_stderr_json(run, context);
+    let error_json = parse_stdout_json(run, context);
     assert_eq!(
         error_json["error"]["code"].as_str(),
         Some("CONFIG_ERROR"),
