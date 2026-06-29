@@ -244,15 +244,13 @@ impl NormalizationRules {
                     });
                 }
             }
-            Value::String(s) => {
+            Value::String(s) if self.normalize_line_endings && s.contains("\r\n") => {
                 // Normalize line endings for all string values
-                if self.normalize_line_endings && s.contains("\r\n") {
-                    let normalized = s.replace("\r\n", "\n");
-                    if self.log_normalization {
-                        log.push(format!("Normalized line endings: {path}"));
-                    }
-                    *s = normalized;
+                let normalized = s.replace("\r\n", "\n");
+                if self.log_normalization {
+                    log.push(format!("Normalized line endings: {path}"));
                 }
+                *s = normalized;
             }
             _ => {}
         }
@@ -2555,8 +2553,7 @@ fn extract_issue_id_from_output(output: &str) -> Option<String> {
 fn append_text_to_issues_jsonl(beads_dir: &Path, text: &str) -> std::io::Result<()> {
     let jsonl_path = beads_dir.join("issues.jsonl");
     let needs_newline = std::fs::read_to_string(&jsonl_path)
-        .ok()
-        .is_some_and(|content| !content.is_empty() && !content.ends_with('\n'));
+        .is_ok_and(|content| !content.is_empty() && !content.ends_with('\n'));
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)

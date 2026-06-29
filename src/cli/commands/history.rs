@@ -1107,7 +1107,7 @@ mod tests {
         let current = temp.path().join("current.jsonl");
         let backup = temp.path().join("backup.jsonl");
         fs::write(&current, [0xff, b'{', b'}']).unwrap();
-        fs::write(&backup, [b'{', b'}']).unwrap();
+        fs::write(&backup, b"{}").unwrap();
 
         let (status, diff_available, sizes) = diff_status_for_json(&current, &backup).unwrap();
 

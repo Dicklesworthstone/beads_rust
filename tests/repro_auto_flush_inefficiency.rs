@@ -279,6 +279,7 @@ fn assert_bounded_jsonl_diff(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import() {
     let _log = common::test_log(
         "e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import",

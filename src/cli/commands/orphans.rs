@@ -467,7 +467,7 @@ fn parse_git_log_for_prefixes<R: BufRead>(
     // although matching bd-123a is technically valid if 123a is the hash.
     // The previous regex forced parens: r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)"
     // Use (?i) for case-insensitive matching (user input in commits varies)
-    let pattern = format!(r"(?i)\b((?:{prefix_pattern})-[a-z0-9]+(?:\.[0-9]+)*)\b",);
+    let pattern = format!(r"(?i)\b((?:{prefix_pattern})-[a-z0-9]+(?:\.[0-9]+)*)\b");
     let re = Regex::new(&pattern)
         .map_err(|e| crate::error::BeadsError::internal(format!("Invalid regex pattern: {e}")))?;
 

@@ -486,7 +486,7 @@ pub fn generate_markdown_report(report: &FullReport) -> String {
     md.push_str("# Test Artifact Report\n\n");
     md.push_str(&format!(
         "**Generated:** {}\n\n",
-        &report.generated_at[..19].replace('T', " ")
+        report.generated_at[..19].replace('T', " ")
     ));
 
     // Summary
@@ -689,7 +689,7 @@ pub fn generate_html_report(report: &FullReport) -> String {
     // Header
     html.push_str(&format!(
         "<h1>Test Artifact Report</h1>\n<p>Generated: {}</p>\n",
-        &report.generated_at[..19].replace('T', " ")
+        report.generated_at[..19].replace('T', " ")
     ));
 
     // Summary cards

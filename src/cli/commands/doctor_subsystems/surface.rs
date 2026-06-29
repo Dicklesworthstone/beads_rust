@@ -907,9 +907,7 @@ fn live_bytes_match(target: &Path, expected: &[u8]) -> bool {
 
 fn live_mode_matches(target: &Path, expected: Option<u32>) -> bool {
     expected.is_none_or(|mode| {
-        fs::metadata(target)
-            .ok()
-            .is_some_and(|metadata| metadata_mode(&metadata) == mode)
+        fs::metadata(target).is_ok_and(|metadata| metadata_mode(&metadata) == mode)
     })
 }
 

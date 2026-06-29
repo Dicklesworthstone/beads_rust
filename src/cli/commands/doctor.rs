@@ -1833,11 +1833,7 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     if !db_kind.is_regular_file() {
         let has_dangling_sidecars = database_sidecar_paths(db_path)
             .into_iter()
-            .any(|(path, _)| {
-                classify_path_kind(&path)
-                    .ok()
-                    .is_some_and(FilesystemPathKind::exists)
-            });
+            .any(|(path, _)| classify_path_kind(&path).is_ok_and(FilesystemPathKind::exists));
         if has_dangling_sidecars {
             inspection.findings.push(format!(
                 "Database sidecars exist even though the primary database at {} is a {}",
@@ -8916,9 +8912,7 @@ fn discover_jsonl(beads_dir: &Path) -> Option<PathBuf> {
 }
 
 fn should_fallback_to_workspace_jsonl(beads_dir: &Path, paths: &config::ConfigPaths) -> bool {
-    let has_env_override = std::env::var("BEADS_JSONL")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty());
+    let has_env_override = std::env::var("BEADS_JSONL").is_ok_and(|value| !value.trim().is_empty());
 
     !has_env_override
         && paths.metadata.jsonl_export == "issues.jsonl"
