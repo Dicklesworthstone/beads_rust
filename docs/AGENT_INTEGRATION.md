@@ -9,6 +9,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 - [Overview](#overview)
 - [Quick Start for Agents](#quick-start-for-agents)
 - [JSON Mode](#json-mode)
+- [Agent Contract Inventory](#agent-contract-inventory)
 - [Workflow Patterns](#workflow-patterns)
 - [Parsing JSON Output](#parsing-json-output)
 - [Error Handling](#error-handling)
@@ -151,6 +152,36 @@ $ br ready --json --limit 2
   }
 ]
 ```
+
+---
+
+## Agent Contract Inventory
+
+This inventory names the machine-readable and workflow surfaces that agents
+parse, discover, or treat as coordination contracts. Future contract tests for
+these surfaces must stay local-first and deterministic: no live Agent Mail
+calls, network access, git mutations, background daemons, or long-running MCP
+clients. Use offline fixtures, in-process helpers, temp workspaces, snapshots,
+and schema/TOON decoding instead.
+
+| Surface | Producer | Agent consumer | Stable contract | Current verifier or evidence | Gap / follow-up bead |
+|---------|----------|----------------|-----------------|------------------------------|----------------------|
+| `br schema all` and `br schema commands` targets | `src/cli/commands/schema.rs` (`build_schemas`, `build_commands`) | Agents discovering output shapes before parsing CLI results | JSON Schema documents plus command envelopes with `jq_filter`, `items_at`, and schema names | `tests/e2e_schema.rs`, `tests/conformance_schema.rs`, `tests/snapshots/schema_output.rs`, `agent_baseline/schemas/schema_all.json`, `agent_baseline/cli_schema.json` | `beads_rust-vqs1` adds emitted-target self-checks; `beads_rust-p1g4` validates command-shape paths against live fixtures |
+| JSON output for `list`, `show`, `ready`, `blocked`, `stale`, `search`, counts, labels, deps, comments, stats, and status | CLI command implementations plus the output/context layers | Shell-based agents, MCP adapters, docs examples, and baseline fixtures | Valid JSON on stdout, stable object/list envelopes, structured errors on failure | `tests/snapshots/json_output.rs`, `tests/snapshots/robot_output.rs`, `tests/e2e_create_output.rs`, `tests/common/json_baseline.rs`, `tests/fixtures/json_baseline/`, `agent_baseline/examples/*.json` | `beads_rust-p1g4` checks command metadata against actual JSON; `beads_rust-8bq8` collects the verifier commands |
+| TOON output for agent-read commands | CLI format handling and `toon_rust` integration | Token-sensitive agents using `--format toon` or `TOON_DEFAULT_FORMAT=toon` | TOON decodes to the documented JSON structure with safe folded-key expansion | `tests/snapshots/toon_output.rs`, `agent_baseline/examples/*.toon`, this guide's decode example | `beads_rust-q5jt` cross-checks JSON/TOON semantic parity, including nested coordination fields |
+| Coordination status evidence (`br.coordination.v1`) | `br coordination status`, coordination model code, and optional offline reservation/agent snapshots | Agents deciding whether an `in_progress` claim is fresh, stale, reclaimable, or blocked by missing Mail evidence | Read-only evidence envelope; no automatic reclaim, no Agent Mail calls, and no git operations | `docs/COORDINATION_EVIDENCE.md`, schema entries for `CoordinationStatusOutput` and `CoordinationClaimRow`, agent workflow examples in this guide | `beads_rust-p1g4` covers command-shape extraction; `beads_rust-q5jt` covers JSON/TOON parity for coordination output |
+| `agent_baseline/` examples and schemas | Curated baseline artifacts generated from representative `br` commands | Agents bootstrapping behavior from examples before running the binary | Checked-in JSON, TOON, schema, and journey artifacts that mirror current CLI contracts | `agent_baseline/README_first_80_lines.md`, `agent_baseline/AGENT_JOURNEY_NOTES.md`, `agent_baseline/examples/`, `agent_baseline/schemas/`, `agent_baseline/robot_mode_examples.jsonl` | `beads_rust-8bq8` defines the one-command verifier; later fixture work should prevent stale baseline artifacts |
+| Snapshot and golden tests for agent output | `tests/snapshots/*`, storage golden snapshots, and focused e2e fixtures | Release reviewers and agents checking whether a contract changed intentionally | Deterministic expected output for representative commands and storage states | `tests/snapshots/cli_output.rs`, `tests/snapshots/json_output.rs`, `tests/snapshots/robot_output.rs`, `tests/snapshots/schema_output.rs`, `tests/snapshots/toon_output.rs`, `tests/storage_golden_snapshot.rs` | `beads_rust-vqs1`, `beads_rust-p1g4`, and `beads_rust-q5jt` make the snapshots harder to update incompletely |
+| MCP resources, tools, and prompts | `src/mcp/resources.rs`, `src/mcp/tools.rs`, `src/mcp/prompts.rs`, and `src/mcp/mod.rs` behind the `mcp` feature | MCP-capable agents using `br serve` instead of shelling out | Stdio-only local server surface with stable resource URIs, tool names, prompt names, and JSON payloads | README and CLI reference MCP sections, this guide's MCP section, in-process MCP code paths | `beads_rust-hu4b` ties MCP metadata and representative payloads to CLI contract fixtures without live clients or network services |
+| README and docs command examples | `README.md`, `docs/CLI_REFERENCE.md`, this guide, `docs/SWARM_SCALE_TUNING.md`, `docs/COORDINATION_EVIDENCE.md` | Human operators and agents copying workflow commands | Examples use robot-safe flags, avoid hidden git automation, and state Mail/network boundaries accurately | Review plus `git diff --check`; relevant e2e/snapshot tests cover many listed commands indirectly | `beads_rust-8bq8` documents when to run the full drift verifier before changing docs or examples |
+| `bv` robot handoff expectations | External `bv` binary plus repo guidance in `AGENTS.md`, this guide, and `docs/SWARM_SCALE_TUNING.md` | Agents selecting work by graph priority before claiming with `br` and Agent Mail | Agents use only `--robot-*` or `--recipe ... --robot-*` flags; bare `bv` is interactive and outside `br`'s control | Documented workflow examples only; `bv` is outside the `br` binary and test harness | Keep this as an offline documentation contract; `br` tests should not shell out to live `bv` |
+
+The child beads intentionally split coverage by failure mode. Use
+`beads_rust-vqs1` when schema target discovery drifts, `beads_rust-p1g4` when
+command metadata and live JSON disagree, `beads_rust-q5jt` when TOON and JSON
+semantics diverge, `beads_rust-hu4b` when MCP metadata or payloads fall behind,
+and `beads_rust-8bq8` when agents need a single RCH-friendly verifier command
+sequence.
 
 ---
 
