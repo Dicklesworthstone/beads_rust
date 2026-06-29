@@ -1038,11 +1038,13 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        if database_header_user_version(path)
-            .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0))
-        {
+        let schema_current = database_header_user_version(path)
+            .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
+        let runtime_compatible = runtime_schema_compatible(&conn);
+
+        if schema_current && runtime_compatible {
             crate::storage::schema::apply_runtime_pragmas(&conn)?;
-        } else if runtime_schema_compatible(&conn) {
+        } else if runtime_compatible {
             apply_runtime_compatible_schema(&conn)?;
         } else {
             apply_schema(&conn)?;
@@ -19264,6 +19266,74 @@ mod tests {
         assert!(
             index_names.contains("idx_issues_external_ref_unique"),
             "reopen should recreate missing canonical indexes, got: {index_names:?}"
+        );
+    }
+
+    #[test]
+    fn test_open_repairs_current_version_nullable_blocked_cache_table() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp
+            .path()
+            .join("current_version_nullable_blocked_cache.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("DROP TABLE blocked_issues_cache")
+                .unwrap();
+            storage
+                .conn
+                .execute(
+                    "CREATE TABLE blocked_issues_cache (
+                        issue_id TEXT PRIMARY KEY,
+                        blocked_by TEXT,
+                        blocked_at DATETIME
+                    )",
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+                     VALUES ('bd-null-cache', NULL, CURRENT_TIMESTAMP)",
+                )
+                .unwrap();
+            storage
+                .conn
+                .execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+                .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let column_rows = reopened
+            .conn
+            .query("PRAGMA table_info(blocked_issues_cache)")
+            .unwrap();
+        let mut blocked_by_not_null = false;
+        for row in &column_rows {
+            if row.get(1).and_then(SqliteValue::as_text) == Some("blocked_by") {
+                blocked_by_not_null = row
+                    .get(3)
+                    .and_then(SqliteValue::as_integer)
+                    .is_some_and(|value| value != 0);
+            }
+        }
+        assert!(
+            blocked_by_not_null,
+            "current-version open should repair nullable blocked_by cache columns"
+        );
+
+        let null_rows = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM blocked_issues_cache WHERE blocked_by IS NULL")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(
+            null_rows, 0,
+            "current-version open should discard malformed derived cache rows"
         );
     }
 

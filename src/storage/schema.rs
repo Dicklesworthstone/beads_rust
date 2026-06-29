@@ -768,6 +768,48 @@ fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) 
             .all(|column| column_exists(conn, table, column))
 }
 
+fn blocked_cache_table_canonical(conn: &Connection) -> bool {
+    if !table_exists(conn, "blocked_issues_cache") {
+        return false;
+    }
+
+    let Ok(rows) = conn.query("PRAGMA table_info(blocked_issues_cache)") else {
+        return false;
+    };
+
+    let mut issue_id_primary_key = false;
+    let mut blocked_by_not_null = false;
+    let mut blocked_at_not_null = false;
+    let mut has_legacy_blocked_by_json = false;
+
+    for row in &rows {
+        let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+            continue;
+        };
+        let not_null = row
+            .get(3)
+            .and_then(SqliteValue::as_integer)
+            .is_some_and(|value| value != 0);
+        let primary_key = row
+            .get(5)
+            .and_then(SqliteValue::as_integer)
+            .is_some_and(|value| value != 0);
+
+        match name {
+            "issue_id" => issue_id_primary_key = primary_key,
+            "blocked_by" => blocked_by_not_null = not_null,
+            "blocked_at" => blocked_at_not_null = not_null,
+            "blocked_by_json" => has_legacy_blocked_by_json = true,
+            _ => {}
+        }
+    }
+
+    issue_id_primary_key
+        && blocked_by_not_null
+        && blocked_at_not_null
+        && !has_legacy_blocked_by_json
+}
+
 fn current_schema_version_declared(conn: &Connection) -> bool {
     conn.query_row("PRAGMA user_version")
         .ok()
@@ -1204,16 +1246,12 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
         rebuild_kv_table_without_unique(conn, "metadata")?;
     }
 
-    // Drop blocked_issues_cache if it exists but lacks required columns.
+    // Drop blocked_issues_cache if it exists but is not canonical. The table is
+    // a derived cache, so rebuilding is preferable to preserving legacy NULLs
+    // or weak constraints that can poison later command reads.
     // The main schema will recreate it with the correct structure.
-    if table_exists(conn, "blocked_issues_cache") {
-        let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
-        let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
-        let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
-
-        if !has_blocked_at || !has_blocked_by || !has_issue_id {
-            conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
-        }
+    if table_exists(conn, "blocked_issues_cache") && !blocked_cache_table_canonical(conn) {
+        conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
     }
 
     // Rebuild the issues table if columns are out of order or missing.
@@ -1255,6 +1293,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     if current_schema_version_declared(conn)
         && core_runtime_tables_exist(conn)
+        && blocked_cache_table_canonical(conn)
         && !kv_table_uses_primary_key(conn, "config")
         && !kv_table_uses_primary_key(conn, "metadata")
     {
@@ -1287,11 +1326,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         "export_hashes",
         &["issue_id", "content_hash", "exported_at"],
     );
-    let blocked_cache_ok = table_has_columns(
-        conn,
-        "blocked_issues_cache",
-        &["issue_id", "blocked_by", "blocked_at"],
-    );
+    let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
 
     let compatible = issues_ok
@@ -1331,13 +1366,10 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
 /// This handles upgrades for tables that may have been created with older schemas.
 #[allow(clippy::too_many_lines)]
 fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
-    // Migration: Ensure blocked_issues_cache has correct schema (blocked_by, blocked_at)
-    // Check for old column name (blocked_by_json) or missing columns
-    let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
-    let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
-    let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
-
-    if !has_blocked_by || !has_blocked_at || !has_issue_id {
+    // Migration: ensure blocked_issues_cache has the canonical derived-cache
+    // schema, including NOT NULL payload columns. Older br/bd paths could
+    // leave a nullable blocked_by column with stale NULL cache rows.
+    if !blocked_cache_table_canonical(conn) {
         // Table needs update - drop and recreate (it's a cache, data is regenerated)
         // Wrap in transaction so concurrent opens don't see a partially migrated state
         conn.execute("BEGIN IMMEDIATE")?;
@@ -2728,6 +2760,78 @@ mod tests {
         assert!(
             !cols.contains(&"blocked_by_json".to_string()),
             "Should not have blocked_by_json"
+        );
+    }
+
+    #[test]
+    fn test_apply_schema_rebuilds_nullable_blocked_cache_table() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp.path().to_string_lossy().into_owned()).unwrap();
+
+        execute_batch(
+            &conn,
+            r"
+            CREATE TABLE blocked_issues_cache (
+                issue_id TEXT PRIMARY KEY,
+                blocked_by TEXT,
+                blocked_at DATETIME
+            );
+            INSERT INTO blocked_issues_cache (issue_id, blocked_by, blocked_at)
+            VALUES ('bd-null-cache', NULL, CURRENT_TIMESTAMP);
+            ",
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+
+        let column_rows = conn
+            .query("PRAGMA table_info(blocked_issues_cache)")
+            .unwrap();
+        let mut issue_id_primary_key = false;
+        let mut blocked_by_not_null = false;
+        let mut blocked_at_not_null = false;
+        for row in &column_rows {
+            let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let not_null = row
+                .get(3)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            let primary_key = row
+                .get(5)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            match name {
+                "issue_id" => issue_id_primary_key = primary_key,
+                "blocked_by" => blocked_by_not_null = not_null,
+                "blocked_at" => blocked_at_not_null = not_null,
+                _ => {}
+            }
+        }
+
+        assert!(
+            issue_id_primary_key,
+            "issue_id should be the cache primary key"
+        );
+        assert!(
+            blocked_by_not_null,
+            "blocked_by must be NOT NULL after schema repair"
+        );
+        assert!(
+            blocked_at_not_null,
+            "blocked_at must be NOT NULL after schema repair"
+        );
+
+        let null_rows = conn
+            .query_row("SELECT COUNT(*) FROM blocked_issues_cache WHERE blocked_by IS NULL")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(-1);
+        assert_eq!(
+            null_rows, 0,
+            "derived blocked cache NULL rows should be discarded during schema repair"
         );
     }
 
