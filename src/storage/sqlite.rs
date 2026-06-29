@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 /// Number of mutations between WAL checkpoint attempts.
@@ -64,6 +65,13 @@ pub(crate) struct ChangelogIssueRow {
 pub struct DependencyCycleReport {
     pub active_cycles: Vec<Vec<String>>,
     pub archived_closed_cycles: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BulkDependencyInsert {
+    pub(crate) issue_id: String,
+    pub(crate) depends_on_id: String,
+    pub(crate) dep_type: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7240,6 +7248,180 @@ impl SqliteStorage {
         })
     }
 
+    /// Add already-resolved import dependencies in one storage mutation.
+    ///
+    /// This is intentionally narrower than the interactive `dep add` path:
+    /// callers must have resolved user-facing references and must not attach
+    /// metadata. The method still validates endpoints, parent-child uniqueness,
+    /// and the complete proposed blocking graph before inserting anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any dependency is invalid, would create a cycle, or
+    /// the database update fails.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn add_dependencies_bulk_for_import(
+        &mut self,
+        dependencies: &[BulkDependencyInsert],
+        actor: &str,
+    ) -> Result<usize> {
+        if dependencies.is_empty() {
+            return Ok(0);
+        }
+
+        self.mutate("add_dependencies_bulk_for_import", actor, |conn, ctx| {
+            let mut unique_dependencies: Vec<(&BulkDependencyInsert, String)> = Vec::new();
+            let mut seen_edges = HashSet::new();
+            let mut proposed_parents: HashMap<&str, &str> = HashMap::new();
+
+            for dep in dependencies {
+                if dep.issue_id == dep.depends_on_id {
+                    return Err(BeadsError::SelfDependency {
+                        id: dep.issue_id.clone(),
+                    });
+                }
+
+                let dep_type = Self::canonical_standard_dependency_type(&dep.dep_type)
+                    .unwrap_or(dep.dep_type.as_str())
+                    .to_string();
+                Self::validate_parent_child_endpoints(
+                    &dep.issue_id,
+                    &dep.depends_on_id,
+                    &dep_type,
+                )?;
+
+                match Self::issue_status_in_tx(conn, &dep.issue_id)? {
+                    Some(Status::Tombstone) => {
+                        return Err(BeadsError::Validation {
+                            field: "issue_id".to_string(),
+                            reason: format!(
+                                "cannot add dependency from tombstone issue: {}",
+                                dep.issue_id
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        return Err(BeadsError::IssueNotFound {
+                            id: dep.issue_id.clone(),
+                        });
+                    }
+                }
+                Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
+
+                if dep_type == "parent-child" {
+                    match proposed_parents.get(dep.issue_id.as_str()) {
+                        Some(existing_parent)
+                            if *existing_parent != dep.depends_on_id.as_str() =>
+                        {
+                            return Err(BeadsError::Validation {
+                                field: "depends_on_id".to_string(),
+                                reason: format!(
+                                    "issue {} has multiple imported parents: {existing_parent} and {}",
+                                    dep.issue_id, dep.depends_on_id
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            proposed_parents
+                                .insert(dep.issue_id.as_str(), dep.depends_on_id.as_str());
+                        }
+                    }
+                    if !Self::validate_new_parent_child_parent_in_tx(
+                        conn,
+                        &dep.issue_id,
+                        &dep.depends_on_id,
+                    )? {
+                        continue;
+                    }
+                }
+
+                if seen_edges.insert((dep.issue_id.as_str(), dep.depends_on_id.as_str())) {
+                    unique_dependencies.push((dep, dep_type));
+                }
+            }
+
+            let mut graph = Self::load_dependency_cycle_graph_from_conn(conn, true)?;
+            for (dep, dep_type) in &unique_dependencies {
+                let Ok(parsed_type) = dep_type.parse::<DependencyType>() else {
+                    continue;
+                };
+                if !parsed_type.is_blocking() {
+                    continue;
+                }
+
+                let (from, to) = if dep_type == "parent-child" {
+                    (dep.depends_on_id.clone(), dep.issue_id.clone())
+                } else {
+                    (dep.issue_id.clone(), dep.depends_on_id.clone())
+                };
+                graph.entry(to.clone()).or_default();
+                graph.entry(from).or_default().push(to);
+            }
+            for neighbors in graph.values_mut() {
+                neighbors.sort();
+                neighbors.dedup();
+            }
+            if let Some(cycle) = Self::cycle_witnesses_from_graph(&graph).into_iter().next() {
+                return Err(BeadsError::DependencyCycle {
+                    path: cycle.join(" -> "),
+                });
+            }
+
+            let now = Utc::now().to_rfc3339();
+            let mut inserted_count = 0;
+            let mut touched_issue_ids = HashSet::new();
+
+            for (dep, dep_type) in unique_dependencies {
+                let inserted = conn.execute_with_params(
+                    "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(dep.issue_id.as_str()),
+                        SqliteValue::from(dep.depends_on_id.as_str()),
+                        SqliteValue::from(dep_type.as_str()),
+                        SqliteValue::from(now.as_str()),
+                        SqliteValue::from(actor),
+                        SqliteValue::from("{}"),
+                    ],
+                )?;
+
+                if inserted == 0 {
+                    continue;
+                }
+
+                inserted_count += 1;
+                touched_issue_ids.insert(dep.issue_id.clone());
+                ctx.record_event(
+                    EventType::DependencyAdded,
+                    &dep.issue_id,
+                    Some(format!(
+                        "Added dependency on {} ({})",
+                        dep.depends_on_id, dep_type
+                    )),
+                );
+                ctx.mark_dirty(&dep.issue_id);
+            }
+
+            for issue_id in &touched_issue_ids {
+                conn.execute_with_params(
+                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from(now.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ],
+                )?;
+            }
+
+            if inserted_count > 0 {
+                ctx.invalidate_cache_deferred();
+            }
+
+            Ok(inserted_count)
+        })
+    }
+
     /// Remove a dependency link.
     ///
     /// # Errors
@@ -7598,6 +7780,199 @@ impl SqliteStorage {
         })
     }
 
+    /// Add one label to many issues in a single storage mutation.
+    ///
+    /// Returns the set of issue IDs that actually gained the label. IDs that
+    /// already had the label remain idempotent no-ops, matching [`Self::add_label`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any target issue is missing, tombstoned, or would
+    /// exceed the per-issue label limit.
+    #[allow(clippy::too_many_lines)]
+    pub fn add_label_to_issues_bulk(
+        &mut self,
+        issue_ids: &[String],
+        label: &str,
+        actor: &str,
+    ) -> Result<HashSet<String>> {
+        validate_storage_label(label)?;
+        if issue_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let unique_issue_ids = dedupe_preserving_order(issue_ids);
+
+        self.mutate("add_label_to_issues_bulk", actor, |conn, ctx| {
+            let mut changed_ids = HashSet::new();
+            let now_str = Utc::now().to_rfc3339();
+
+            // The existing-label probe binds one label plus every issue id, so
+            // reserve one parameter slot for the label value.
+            for chunk in unique_issue_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                let placeholders = vec!["?"; chunk.len()];
+                let params = chunk
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect::<Vec<_>>();
+                let rows = conn.query_with_params(
+                    &format!(
+                        "SELECT id, status FROM issues WHERE id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &params,
+                )?;
+                let mut statuses = HashMap::with_capacity(rows.len());
+                for row in &rows {
+                    let id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(
+                                "issues row missing id during bulk label add".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let status = row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(format!(
+                                "issues row missing status during bulk label add for {id}"
+                            ))
+                        })?;
+                    statuses.insert(id, Status::from_str(status)?);
+                }
+
+                for issue_id in chunk {
+                    match statuses.get(issue_id) {
+                        Some(Status::Tombstone) => {
+                            return Err(BeadsError::Validation {
+                                field: "issue_id".to_string(),
+                                reason: format!(
+                                    "cannot add label to tombstone issue: {issue_id}"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(BeadsError::IssueNotFound {
+                                id: issue_id.clone(),
+                            });
+                        }
+                    }
+                }
+
+                let mut label_params = Vec::with_capacity(chunk.len() + 1);
+                label_params.push(SqliteValue::from(label));
+                label_params.extend(chunk.iter().map(|id| SqliteValue::from(id.as_str())));
+                let existing_rows = conn.query_with_params(
+                    &format!(
+                        "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &label_params,
+                )?;
+                let existing_ids = existing_rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(ToString::to_string)
+                    })
+                    .collect::<HashSet<_>>();
+                let missing_ids = chunk
+                    .iter()
+                    .filter(|issue_id| !existing_ids.contains(issue_id.as_str()))
+                    .collect::<Vec<_>>();
+
+                if missing_ids.is_empty() {
+                    continue;
+                }
+
+                let missing_placeholders = vec!["?"; missing_ids.len()];
+                let missing_params = missing_ids
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect::<Vec<_>>();
+                let count_rows = conn.query_with_params(
+                    &format!(
+                        "SELECT issue_id, COUNT(*) FROM labels WHERE issue_id IN ({}) GROUP BY issue_id",
+                        missing_placeholders.join(",")
+                    ),
+                    &missing_params,
+                )?;
+                let mut label_counts = HashMap::with_capacity(count_rows.len());
+                for row in &count_rows {
+                    let issue_id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(
+                                "labels row missing issue_id during bulk label add".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let count = row
+                        .get(1)
+                        .and_then(SqliteValue::as_integer)
+                        .and_then(|count| usize::try_from(count).ok())
+                        .unwrap_or(0);
+                    label_counts.insert(issue_id, count);
+                }
+
+                for issue_id in &missing_ids {
+                    if label_counts
+                        .get(issue_id.as_str())
+                        .copied()
+                        .unwrap_or(0)
+                        >= ISSUE_LABEL_MAX_COUNT
+                    {
+                        return Err(label_count_error());
+                    }
+                }
+
+                for issue_id in &missing_ids {
+                    conn.execute_with_params(
+                        "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
+                        &[
+                            SqliteValue::from(issue_id.as_str()),
+                            SqliteValue::from(label),
+                        ],
+                    )?;
+
+                    ctx.record_event(
+                        EventType::LabelAdded,
+                        issue_id,
+                        Some(format!("Added label {label}")),
+                    );
+                    ctx.mark_dirty(issue_id);
+                    changed_ids.insert((*issue_id).clone());
+                }
+
+                for update_chunk in missing_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                    let update_placeholders = vec!["?"; update_chunk.len()];
+                    let mut update_params = Vec::with_capacity(update_chunk.len() + 1);
+                    update_params.push(SqliteValue::from(now_str.as_str()));
+                    update_params.extend(
+                        update_chunk
+                            .iter()
+                            .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+                    );
+                    conn.execute_with_params(
+                        &format!(
+                            "UPDATE issues SET updated_at = ? WHERE id IN ({})",
+                            update_placeholders.join(",")
+                        ),
+                        &update_params,
+                    )?;
+                }
+            }
+
+            Ok(changed_ids)
+        })
+    }
+
     /// Remove a label from an issue.
     ///
     /// # Errors
@@ -7645,6 +8020,161 @@ impl SqliteStorage {
             }
 
             Ok(rows > 0)
+        })
+    }
+
+    /// Remove one label from many issues in a single storage mutation.
+    ///
+    /// Returns the set of issue IDs that actually lost the label. IDs that did
+    /// not have the label remain idempotent no-ops, matching [`Self::remove_label`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any target issue is missing or tombstoned.
+    #[allow(clippy::too_many_lines)]
+    pub fn remove_label_from_issues_bulk(
+        &mut self,
+        issue_ids: &[String],
+        label: &str,
+        actor: &str,
+    ) -> Result<HashSet<String>> {
+        validate_storage_label(label)?;
+        if issue_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let unique_issue_ids = dedupe_preserving_order(issue_ids);
+
+        self.mutate("remove_label_from_issues_bulk", actor, |conn, ctx| {
+            let mut changed_ids = HashSet::new();
+            let now_str = Utc::now().to_rfc3339();
+
+            // Label lookups/deletes bind one label plus every issue id, so
+            // reserve one parameter slot for the label value.
+            for chunk in unique_issue_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                let placeholders = vec!["?"; chunk.len()];
+                let params = chunk
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect::<Vec<_>>();
+                let rows = conn.query_with_params(
+                    &format!(
+                        "SELECT id, status FROM issues WHERE id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &params,
+                )?;
+                let mut statuses = HashMap::with_capacity(rows.len());
+                for row in &rows {
+                    let id = row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .ok_or_else(|| {
+                            BeadsError::Config(
+                                "issues row missing id during bulk label remove".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let status = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "issues row missing status during bulk label remove for {id}"
+                        ))
+                    })?;
+                    statuses.insert(id, Status::from_str(status)?);
+                }
+
+                for issue_id in chunk {
+                    match statuses.get(issue_id) {
+                        Some(Status::Tombstone) => {
+                            return Err(BeadsError::Validation {
+                                field: "issue_id".to_string(),
+                                reason: format!(
+                                    "cannot remove label from tombstone issue: {issue_id}"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(BeadsError::IssueNotFound {
+                                id: issue_id.clone(),
+                            });
+                        }
+                    }
+                }
+
+                let mut label_params = Vec::with_capacity(chunk.len() + 1);
+                label_params.push(SqliteValue::from(label));
+                label_params.extend(chunk.iter().map(|id| SqliteValue::from(id.as_str())));
+                let existing_rows = conn.query_with_params(
+                    &format!(
+                        "SELECT issue_id FROM labels WHERE label = ? AND issue_id IN ({})",
+                        placeholders.join(",")
+                    ),
+                    &label_params,
+                )?;
+                let removable_ids = existing_rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.get(0)
+                            .and_then(SqliteValue::as_text)
+                            .map(ToString::to_string)
+                    })
+                    .collect::<HashSet<_>>();
+
+                if removable_ids.is_empty() {
+                    continue;
+                }
+
+                let removable_ids = chunk
+                    .iter()
+                    .filter(|issue_id| removable_ids.contains(issue_id.as_str()))
+                    .collect::<Vec<_>>();
+                let remove_placeholders = vec!["?"; removable_ids.len()];
+                let mut remove_params = Vec::with_capacity(removable_ids.len() + 1);
+                remove_params.push(SqliteValue::from(label));
+                remove_params.extend(
+                    removable_ids
+                        .iter()
+                        .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+                );
+                conn.execute_with_params(
+                    &format!(
+                        "DELETE FROM labels WHERE label = ? AND issue_id IN ({})",
+                        remove_placeholders.join(",")
+                    ),
+                    &remove_params,
+                )?;
+
+                for issue_id in &removable_ids {
+                    ctx.record_event(
+                        EventType::LabelRemoved,
+                        issue_id,
+                        Some(format!("Removed label {label}")),
+                    );
+                    ctx.mark_dirty(issue_id);
+                    changed_ids.insert((*issue_id).clone());
+                }
+
+                for update_chunk in removable_ids.chunks(SQLITE_VAR_LIMIT - 1) {
+                    let update_placeholders = vec!["?"; update_chunk.len()];
+                    let mut update_params = Vec::with_capacity(update_chunk.len() + 1);
+                    update_params.push(SqliteValue::from(now_str.as_str()));
+                    update_params.extend(
+                        update_chunk
+                            .iter()
+                            .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+                    );
+                    conn.execute_with_params(
+                        &format!(
+                            "UPDATE issues SET updated_at = ? WHERE id IN ({})",
+                            update_placeholders.join(",")
+                        ),
+                        &update_params,
+                    )?;
+                }
+            }
+
+            Ok(changed_ids)
         })
     }
 
@@ -11411,6 +11941,13 @@ impl SqliteStorage {
         &self,
         blocking_only: bool,
     ) -> Result<BTreeMap<String, Vec<String>>> {
+        Self::load_dependency_cycle_graph_from_conn(&self.conn, blocking_only)
+    }
+
+    fn load_dependency_cycle_graph_from_conn(
+        conn: &Connection,
+        blocking_only: bool,
+    ) -> Result<BTreeMap<String, Vec<String>>> {
         let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let standard_edge_sql = if blocking_only {
             "SELECT issue_id, depends_on_id FROM dependencies \
@@ -11418,7 +11955,7 @@ impl SqliteStorage {
         } else {
             "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'"
         };
-        let rows1 = self.conn.query(standard_edge_sql)?;
+        let rows1 = conn.query(standard_edge_sql)?;
         for row in &rows1 {
             let from = cycle_endpoint(row.get(0));
             let to = cycle_endpoint(row.get(1));
@@ -11426,7 +11963,7 @@ impl SqliteStorage {
             graph.entry(from).or_default().push(to);
         }
 
-        let rows2 = self.conn.query(
+        let rows2 = conn.query(
             "SELECT depends_on_id, issue_id FROM dependencies WHERE type = 'parent-child'",
         )?;
         for row in &rows2 {
@@ -14237,6 +14774,253 @@ mod tests {
     }
 
     #[test]
+    fn test_add_label_to_issues_bulk_marks_only_changed_ids() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-bulk-b", "bulk-added", "tester")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec![
+            "bd-bulk-a".to_string(),
+            "bd-bulk-b".to_string(),
+            "bd-bulk-c".to_string(),
+            "bd-bulk-a".to_string(),
+        ];
+        let changed = storage
+            .add_label_to_issues_bulk(&ids, "bulk-added", "tester")
+            .unwrap();
+        let expected = ["bd-bulk-a", "bd-bulk-c"]
+            .into_iter()
+            .map(String::from)
+            .collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        for id in ["bd-bulk-a", "bd-bulk-b", "bd-bulk-c"] {
+            assert!(
+                storage
+                    .get_labels(id)
+                    .unwrap()
+                    .contains(&"bulk-added".to_string()),
+                "{id} should have the bulk-added label"
+            );
+        }
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec!["bd-bulk-a".to_string(), "bd-bulk-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_handles_sqlite_var_limit_boundary() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let ids = (0..SQLITE_VAR_LIMIT)
+            .map(|index| format!("bd-bulk-boundary-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage.clear_all_dirty_issues().unwrap();
+
+        let changed = storage
+            .add_label_to_issues_bulk(&ids, "bulk-boundary", "tester")
+            .unwrap();
+        let expected = ids.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(dirty, ids);
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_rejects_cap_without_partial_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-cap-ok", "bd-bulk-cap-full"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        for index in 0..ISSUE_LABEL_MAX_COUNT {
+            let label = format!("label-{index:02}");
+            storage
+                .add_label("bd-bulk-cap-full", &label, "tester")
+                .unwrap();
+        }
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec!["bd-bulk-cap-ok".to_string(), "bd-bulk-cap-full".to_string()];
+        let err = storage
+            .add_label_to_issues_bulk(&ids, "label-extra", "tester")
+            .expect_err("bulk label add must reject a target at the label cap");
+        assert!(err.to_string().contains("exceeds 64 labels"));
+        assert!(
+            !storage
+                .get_labels("bd-bulk-cap-ok")
+                .unwrap()
+                .contains(&"label-extra".to_string()),
+            "bulk validation should avoid partially labeling earlier targets"
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_add_label_to_issues_bulk_rejects_tombstone_without_partial_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-active", "bd-bulk-tomb"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .delete_issue("bd-bulk-tomb", "tester", "delete target", None)
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec!["bd-bulk-active".to_string(), "bd-bulk-tomb".to_string()];
+        let err = storage
+            .add_label_to_issues_bulk(&ids, "bulk-added", "tester")
+            .expect_err("bulk label add must reject tombstones");
+        assert!(
+            err.to_string()
+                .contains("cannot add label to tombstone issue: bd-bulk-tomb")
+        );
+        assert!(storage.get_labels("bd-bulk-active").unwrap().is_empty());
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_label_from_issues_bulk_marks_only_changed_ids() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-bulk-remove-a", "bulk-removed", "tester")
+            .unwrap();
+        storage
+            .add_label("bd-bulk-remove-c", "bulk-removed", "tester")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec![
+            "bd-bulk-remove-a".to_string(),
+            "bd-bulk-remove-b".to_string(),
+            "bd-bulk-remove-c".to_string(),
+            "bd-bulk-remove-a".to_string(),
+        ];
+        let changed = storage
+            .remove_label_from_issues_bulk(&ids, "bulk-removed", "tester")
+            .unwrap();
+        let expected = ["bd-bulk-remove-a", "bd-bulk-remove-c"]
+            .into_iter()
+            .map(String::from)
+            .collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b", "bd-bulk-remove-c"] {
+            assert!(
+                !storage
+                    .get_labels(id)
+                    .unwrap()
+                    .contains(&"bulk-removed".to_string()),
+                "{id} should not have the bulk-removed label"
+            );
+        }
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-c".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_remove_label_from_issues_bulk_handles_sqlite_var_limit_boundary() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let ids = (0..SQLITE_VAR_LIMIT)
+            .map(|index| format!("bd-bulk-remove-boundary-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        let added = storage
+            .add_label_to_issues_bulk(&ids, "bulk-remove-boundary", "tester")
+            .unwrap();
+        assert_eq!(added, ids.iter().cloned().collect::<HashSet<_>>());
+        storage.clear_all_dirty_issues().unwrap();
+
+        let changed = storage
+            .remove_label_from_issues_bulk(&ids, "bulk-remove-boundary", "tester")
+            .unwrap();
+        let expected = ids.iter().cloned().collect::<HashSet<_>>();
+        assert_eq!(changed, expected);
+
+        let mut dirty = storage.get_dirty_issue_ids().unwrap();
+        dirty.sort();
+        assert_eq!(dirty, ids);
+    }
+
+    #[test]
+    fn test_remove_label_from_issues_bulk_rejects_tombstone_without_partial_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+
+        for id in ["bd-bulk-remove-active", "bd-bulk-remove-tomb"] {
+            let issue = make_issue(id, id, Status::Open, 2, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-bulk-remove-active", "bulk-removed", "tester")
+            .unwrap();
+        storage
+            .delete_issue("bd-bulk-remove-tomb", "tester", "delete target", None)
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        let ids = vec![
+            "bd-bulk-remove-active".to_string(),
+            "bd-bulk-remove-tomb".to_string(),
+        ];
+        let err = storage
+            .remove_label_from_issues_bulk(&ids, "bulk-removed", "tester")
+            .expect_err("bulk label remove must reject tombstones");
+        assert!(
+            err.to_string()
+                .contains("cannot remove label from tombstone issue: bd-bulk-remove-tomb")
+        );
+        assert_eq!(
+            storage.get_labels("bd-bulk-remove-active").unwrap(),
+            vec!["bulk-removed".to_string()]
+        );
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_set_labels_deduplicates_input() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
@@ -14729,6 +15513,103 @@ mod tests {
         assert!(removed);
         let deps = storage.get_dependencies("bd-a1").unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_bulk_dependency_import_inserts_acyclic_edges_once() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-bulk-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-bulk-b", "B", Status::Open, 2, None, t1, None);
+        let issue_c = make_issue("bd-bulk-c", "C", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage.create_issue(&issue_c, "tester").unwrap();
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-a".to_string(),
+                        depends_on_id: "bd-bulk-b".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-b".to_string(),
+                        depends_on_id: "bd-bulk-c".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-a".to_string(),
+                        depends_on_id: "bd-bulk-b".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_dependencies("bd-bulk-a").unwrap(),
+            vec!["bd-bulk-b".to_string()]
+        );
+        assert_eq!(
+            storage.get_dependencies("bd-bulk-b").unwrap(),
+            vec!["bd-bulk-c".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_bulk_dependency_import_rejects_cycle_before_partial_insert() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-bulk-cycle-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-bulk-cycle-b", "B", Status::Open, 2, None, t1, None);
+        let issue_c = make_issue("bd-bulk-cycle-c", "C", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage.create_issue(&issue_c, "tester").unwrap();
+        storage
+            .add_dependency("bd-bulk-cycle-a", "bd-bulk-cycle-b", "blocks", "tester")
+            .unwrap();
+
+        let error = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-cycle-b".to_string(),
+                        depends_on_id: "bd-bulk-cycle-c".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-cycle-c".to_string(),
+                        depends_on_id: "bd-bulk-cycle-a".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, BeadsError::DependencyCycle { .. }),
+            "unexpected bulk cycle error: {error:?}"
+        );
+        assert!(
+            storage
+                .get_dependencies("bd-bulk-cycle-b")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .get_dependencies("bd-bulk-cycle-c")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -390,18 +390,6 @@ fn dep_add(
         return Err(BeadsError::SelfDependency { id: issue_id });
     }
 
-    // Cycle check for blocking types only
-    if dep_type.is_blocking()
-        && !depends_on_id.starts_with("external:")
-        && storage_ctx
-            .storage
-            .would_create_cycle(&issue_id, &depends_on_id, true)?
-    {
-        return Err(BeadsError::DependencyCycle {
-            path: format!("{issue_id} -> {depends_on_id}"),
-        });
-    }
-
     let added = retry_mutation_with_jsonl_recovery(
         storage_ctx,
         true,

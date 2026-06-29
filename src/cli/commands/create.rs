@@ -5,7 +5,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::{EventAttribution, SqliteStorage};
+use crate::storage::{BulkDependencyInsert, EventAttribution, SqliteStorage};
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
@@ -1123,6 +1123,7 @@ fn execute_import(
     // Phase 2: Resolve and wire up deferred dependencies.
     // Now that all issues exist in storage, we can resolve intra-file references
     // by title or stand-in ID, as well as references to pre-existing issues.
+    let mut resolved_import_deps = Vec::new();
     if !deferred_parent_deps.is_empty() && !args.dry_run {
         for (issue_id, parent_ref) in &deferred_parent_deps {
             let parent_id =
@@ -1148,13 +1149,11 @@ fn execute_import(
                 );
                 continue;
             }
-            if let Err(err) = storage.add_dependency(issue_id, &parent_id, "parent-child", &actor) {
-                eprintln!(
-                    "warning: failed to add parent {} → {}: {err}",
-                    create_display_text(issue_id),
-                    create_display_text(&parent_id)
-                );
-            }
+            resolved_import_deps.push(BulkDependencyInsert {
+                issue_id: issue_id.clone(),
+                depends_on_id: parent_id,
+                dep_type: "parent-child".to_string(),
+            });
         }
     }
 
@@ -1240,14 +1239,35 @@ fn execute_import(
                     continue;
                 }
 
-                if let Err(err) =
-                    storage.add_dependency(issue_id, &resolved_dep_id, &type_str, &actor)
-                {
-                    eprintln!(
-                        "warning: failed to add dependency {} → {}: {err}",
-                        create_display_text(issue_id),
-                        create_display_text(&resolved_dep_id)
-                    );
+                resolved_import_deps.push(BulkDependencyInsert {
+                    issue_id: issue_id.clone(),
+                    depends_on_id: resolved_dep_id,
+                    dep_type: type_str,
+                });
+            }
+        }
+    }
+
+    if !resolved_import_deps.is_empty() && !args.dry_run {
+        match storage.add_dependencies_bulk_for_import(&resolved_import_deps, &actor) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: bulk dependency import failed ({err}); retrying dependencies one by one"
+                );
+                for dep in &resolved_import_deps {
+                    if let Err(err) = storage.add_dependency(
+                        &dep.issue_id,
+                        &dep.depends_on_id,
+                        &dep.dep_type,
+                        &actor,
+                    ) {
+                        eprintln!(
+                            "warning: failed to add dependency {} → {}: {err}",
+                            create_display_text(&dep.issue_id),
+                            create_display_text(&dep.depends_on_id)
+                        );
+                    }
                 }
             }
         }

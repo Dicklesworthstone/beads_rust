@@ -451,6 +451,10 @@ fn execute_prepared_route(
     mut prepared: PreparedUpdateRoute,
     ctx: &OutputContext,
 ) -> Result<UpdateRouteOutput> {
+    if can_use_bulk_label_only_route(&prepared) {
+        return execute_bulk_label_only_route(prepared, ctx);
+    }
+
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
     let mut render_items = Vec::new();
     let resolved_ids = prepared.resolved_ids.clone();
@@ -627,6 +631,110 @@ fn execute_prepared_route(
             blocked_cache_dirty,
             "update",
         )?;
+    }
+
+    prepared.storage_ctx.flush_no_db_if_dirty()?;
+    if prepared.auto_flush_external
+        && let Err(error) = prepared.storage_ctx.auto_flush_if_enabled()
+    {
+        report_auto_flush_failure(
+            ctx,
+            &prepared.storage_ctx.paths.beads_dir,
+            &prepared.storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+
+    Ok(UpdateRouteOutput {
+        updated_issues,
+        render_items,
+        resolved_ids,
+    })
+}
+
+fn can_use_bulk_label_only_route(prepared: &PreparedUpdateRoute) -> bool {
+    let add_only = !prepared.add_labels.is_empty() && prepared.remove_labels.is_empty();
+    let remove_only = prepared.add_labels.is_empty() && !prepared.remove_labels.is_empty();
+
+    (add_only || remove_only)
+        && prepared.update.is_empty()
+        && !prepared.set_labels
+        && matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged)
+}
+
+fn execute_bulk_label_only_route(
+    mut prepared: PreparedUpdateRoute,
+    ctx: &OutputContext,
+) -> Result<UpdateRouteOutput> {
+    let resolved_ids = prepared.resolved_ids.clone();
+    let actor = prepared.actor.clone();
+    let add_labels = prepared.add_labels.clone();
+    let remove_labels = prepared.remove_labels.clone();
+    let mut route_has_mutated = false;
+
+    for label in add_labels {
+        let add_label_result = retry_mutation_with_jsonl_recovery(
+            &mut prepared.storage_ctx,
+            !route_has_mutated,
+            "bulk update label add",
+            None,
+            |storage| storage.add_label_to_issues_bulk(&resolved_ids, &label, &actor),
+        );
+        let _changed_ids = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            false,
+            "update",
+            add_label_result,
+        )?;
+        route_has_mutated = true;
+    }
+
+    for label in remove_labels {
+        let remove_label_result = retry_mutation_with_jsonl_recovery(
+            &mut prepared.storage_ctx,
+            !route_has_mutated,
+            "bulk update label remove",
+            None,
+            |storage| storage.remove_label_from_issues_bulk(&resolved_ids, &label, &actor),
+        );
+        let _changed_ids = preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            false,
+            "update",
+            remove_label_result,
+        )?;
+        route_has_mutated = true;
+    }
+
+    let issues = prepared
+        .storage_ctx
+        .storage
+        .get_issues_by_ids(&resolved_ids)?;
+    let issues_by_id = issues
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+
+    let use_machine_output = update_uses_machine_output(ctx);
+    let use_human_output = update_uses_human_output(ctx);
+    let mut updated_issues = Vec::new();
+    let mut render_items = Vec::new();
+
+    for id in &resolved_ids {
+        let issue = issues_by_id.get(id);
+        if use_machine_output {
+            if let Some(issue) = issue {
+                updated_issues.push(UpdatedIssueOutput::from(issue));
+            }
+        } else if use_human_output && prepared.has_updates {
+            render_items.push(UpdateRenderItem::Summary {
+                id: id.clone(),
+                title: issue.map_or_else(String::new, |issue| issue.title.clone()),
+                diff: Box::new(UpdateDiff::default()),
+            });
+        } else if use_human_output {
+            render_items.push(UpdateRenderItem::NoUpdates { id: id.clone() });
+        }
     }
 
     prepared.storage_ctx.flush_no_db_if_dirty()?;
@@ -1795,6 +1903,179 @@ mod tests {
             assert!(err.to_string().contains("invalid characters"));
         }
         info!("test_prepare_single_route_rejects_invalid_remove_label: assertions passed");
+    }
+
+    #[test]
+    fn test_execute_prepared_route_bulk_label_add_updates_multiple_ids() {
+        init_test_logging();
+        info!("test_execute_prepared_route_bulk_label_add_updates_multiple_ids: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        for id in ["bd-bulk-a", "bd-bulk-b"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: format!("Bulk target {id}"),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+        }
+        storage_ctx
+            .storage
+            .clear_all_dirty_issues()
+            .expect("clear dirty state");
+
+        let prepared = PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec!["bd-bulk-a".to_string(), "bd-bulk-b".to_string()],
+            update: IssueUpdate::default(),
+            has_updates: true,
+            add_labels: vec!["bulk-route".to_string()],
+            remove_labels: Vec::new(),
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+            auto_flush_external: false,
+            attribution: EventAttribution::default(),
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+        };
+
+        let ctx = OutputContext::from_flags(true, false, true);
+        let output = execute_prepared_route(prepared, &ctx).expect("bulk route update");
+        assert_eq!(output.updated_issues.len(), 2);
+        assert_eq!(
+            output.resolved_ids,
+            vec!["bd-bulk-a".to_string(), "bd-bulk-b".to_string()]
+        );
+
+        let reopened =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
+        assert_eq!(
+            reopened.storage.get_labels("bd-bulk-a").expect("labels a"),
+            vec!["bulk-route".to_string()]
+        );
+        assert_eq!(
+            reopened.storage.get_labels("bd-bulk-b").expect("labels b"),
+            vec!["bulk-route".to_string()]
+        );
+        let mut dirty = reopened.storage.get_dirty_issue_ids().expect("dirty ids");
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec!["bd-bulk-a".to_string(), "bd-bulk-b".to_string()]
+        );
+
+        info!("test_execute_prepared_route_bulk_label_add_updates_multiple_ids: assertions passed");
+    }
+
+    #[test]
+    fn test_execute_prepared_route_bulk_label_remove_updates_multiple_ids() {
+        init_test_logging();
+        info!("test_execute_prepared_route_bulk_label_remove_updates_multiple_ids: starting");
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut storage_ctx =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        for id in ["bd-bulk-remove-a", "bd-bulk-remove-b"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: format!("Bulk remove target {id}"),
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Issue::default()
+            };
+            storage_ctx
+                .storage
+                .create_issue(&issue, "tester")
+                .expect("create issue");
+            storage_ctx
+                .storage
+                .add_label(id, "bulk-route-remove", "tester")
+                .expect("add label");
+        }
+        storage_ctx
+            .storage
+            .clear_all_dirty_issues()
+            .expect("clear dirty state");
+
+        let prepared = PreparedUpdateRoute {
+            storage_ctx,
+            actor: "tester".to_string(),
+            resolved_ids: vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-b".to_string(),
+            ],
+            update: IssueUpdate::default(),
+            has_updates: true,
+            add_labels: Vec::new(),
+            remove_labels: vec!["bulk-route-remove".to_string()],
+            set_labels: false,
+            valid_set_labels: Vec::new(),
+            resolved_parent: ParentUpdatePlan::Unchanged,
+            auto_flush_external: false,
+            attribution: EventAttribution::default(),
+            _routed_write_lock: RoutedWorkspaceWriteLock::local(),
+        };
+
+        let ctx = OutputContext::from_flags(true, false, true);
+        let output = execute_prepared_route(prepared, &ctx).expect("bulk route update");
+        assert_eq!(output.updated_issues.len(), 2);
+        assert_eq!(
+            output.resolved_ids,
+            vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-b".to_string()
+            ]
+        );
+
+        let reopened =
+            config::open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("reopen");
+        assert!(
+            reopened
+                .storage
+                .get_labels("bd-bulk-remove-a")
+                .expect("labels a")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .storage
+                .get_labels("bd-bulk-remove-b")
+                .expect("labels b")
+                .is_empty()
+        );
+        let mut dirty = reopened.storage.get_dirty_issue_ids().expect("dirty ids");
+        dirty.sort();
+        assert_eq!(
+            dirty,
+            vec![
+                "bd-bulk-remove-a".to_string(),
+                "bd-bulk-remove-b".to_string()
+            ]
+        );
+
+        info!(
+            "test_execute_prepared_route_bulk_label_remove_updates_multiple_ids: assertions passed"
+        );
     }
 
     #[test]
