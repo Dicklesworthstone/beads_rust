@@ -3149,6 +3149,10 @@ pub struct GraphArgs {
     /// One line per issue (compact output)
     #[arg(long)]
     pub compact: bool,
+
+    /// Emit Graphviz DOT notation (pipe to `dot -Tsvg`); overrides text/JSON rendering
+    #[arg(long)]
+    pub dot: bool,
 }
 
 /// Arguments for the agents command.

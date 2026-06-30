@@ -844,6 +844,7 @@ br graph [OPTIONS] [ISSUE]
 |--------|-------------|
 | `--all` | Show graph for all open, in-progress, and blocked issues |
 | `--compact` | Print one line per issue |
+| `--dot` | Emit Graphviz DOT notation (e.g. `br graph bd-1 --dot \| dot -Tsvg > graph.svg`) |
 
 ---
 

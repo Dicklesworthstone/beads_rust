@@ -173,14 +173,20 @@ fn execute_graph_with_storage_ctx(
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     if args.all {
-        graph_all(&storage_ctx.storage, args.compact, ctx)
+        graph_all(&storage_ctx.storage, args.compact, args.dot, ctx)
     } else {
         let issue_id = args.issue.as_ref().ok_or_else(|| {
             BeadsError::validation("issue", "Issue ID required unless --all is specified")
         })?;
 
         let resolved_id = resolve_issue_id(&storage_ctx.storage, &resolver, issue_id)?;
-        graph_single(&storage_ctx.storage, &resolved_id, args.compact, ctx)
+        graph_single(
+            &storage_ctx.storage,
+            &resolved_id,
+            args.compact,
+            args.dot,
+            ctx,
+        )
     }
 }
 
@@ -189,6 +195,7 @@ fn graph_single(
     storage: &SqliteStorage,
     root_id: &str,
     compact: bool,
+    dot: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     // Verify the root issue exists
@@ -211,6 +218,15 @@ fn graph_single(
     );
     let mut nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
     sort_single_graph_nodes(&mut nodes, root_id);
+
+    // DOT/Graphviz output takes precedence over text/JSON rendering.
+    if dot {
+        print!(
+            "{}",
+            format_single_graph_dot(&nodes, &traversal.edges, root_id)
+        );
+        return Ok(());
+    }
 
     if ctx.is_json() || ctx.is_toon() {
         let output = SingleGraphOutput {
@@ -257,7 +273,7 @@ fn graph_single(
 
 /// Show graph for all nonterminal issues.
 #[allow(clippy::too_many_lines)]
-fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Result<()> {
+fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputContext) -> Result<()> {
     if ctx.is_quiet() {
         return Ok(());
     }
@@ -274,7 +290,9 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     debug!(count = issues.len(), "Found issues for graph");
 
     if issues.is_empty() {
-        if ctx.is_json() || ctx.is_toon() {
+        if dot {
+            print!("{}", format_all_graph_dot(&[]));
+        } else if ctx.is_json() || ctx.is_toon() {
             let output = AllGraphOutput {
                 components: vec![],
                 total_nodes: 0,
@@ -407,6 +425,12 @@ fn graph_all(storage: &SqliteStorage, compact: bool, ctx: &OutputContext) -> Res
     components.sort_by_key(|b| std::cmp::Reverse(b.nodes.len()));
 
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
+
+    // DOT/Graphviz output takes precedence over text/JSON rendering.
+    if dot {
+        print!("{}", format_all_graph_dot(&components));
+        return Ok(());
+    }
 
     if ctx.is_json() || ctx.is_toon() {
         let output = AllGraphOutput {
@@ -1035,6 +1059,117 @@ fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], ro
             parents
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Graphviz DOT Output Rendering
+// ─────────────────────────────────────────────────────────────
+
+/// Escape a string for use inside a double-quoted Graphviz DOT literal.
+///
+/// First strips terminal control sequences (sharing the same hardening as the
+/// human renderers), then escapes the DOT metacharacters `\` and `"` so the
+/// emitted document stays well-formed regardless of issue id/title contents.
+fn sanitize_dot_string(text: &str) -> String {
+    sanitize_terminal_inline(text)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// Graphviz fill color for a status (named X11 colors understood by `dot`).
+fn dot_status_fillcolor(status: &str) -> &'static str {
+    match status {
+        "open" => "lightblue",
+        "in_progress" => "khaki",
+        "blocked" => "lightcoral",
+        "deferred" => "lightcyan",
+        "closed" => "lightgrey",
+        "tombstone" => "grey",
+        _ => "white",
+    }
+}
+
+/// Append one DOT node statement for `node` at the given indentation.
+///
+/// The root (or a component root) is drawn with a heavier border so it stands
+/// out in the rendered image.
+fn push_dot_node(out: &mut String, indent: &str, node: &GraphNode, is_root: bool) {
+    let label = format!(
+        "{}\\n{} [P{}]",
+        sanitize_dot_string(&node.id),
+        sanitize_dot_string(&node.title),
+        node.priority
+    );
+    let root_attr = if is_root { ", penwidth=2" } else { "" };
+    out.push_str(&format!(
+        "{indent}\"{}\" [label=\"{}\", fillcolor=\"{}\"{}];\n",
+        sanitize_dot_string(&node.id),
+        label,
+        dot_status_fillcolor(&node.status),
+        root_attr
+    ));
+}
+
+/// Append one DOT edge statement for a dependency relationship.
+///
+/// Edges are stored as `(dependent, dependency)`; the arrow points from the
+/// dependent to what it depends on (matching the `br dep --format mermaid`
+/// convention), so `A -> B` reads "A depends on B".
+fn push_dot_edge(out: &mut String, dependent: &str, dependency: &str) {
+    out.push_str(&format!(
+        "    \"{}\" -> \"{}\";\n",
+        sanitize_dot_string(dependent),
+        sanitize_dot_string(dependency)
+    ));
+}
+
+/// Format the single-issue dependents graph as a Graphviz DOT document.
+fn format_single_graph_dot(
+    nodes: &[GraphNode],
+    edges: &[(String, String)],
+    root_id: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("digraph dependencies {\n");
+    out.push_str("    node [shape=box, style=\"rounded,filled\", fontname=\"sans-serif\"];\n");
+    for node in nodes {
+        push_dot_node(&mut out, "    ", node, node.id == root_id);
+    }
+    for (dependent, dependency) in edges {
+        push_dot_edge(&mut out, dependent, dependency);
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Format the all-issues connected-component graph as a Graphviz DOT document.
+///
+/// Each connected component becomes its own `subgraph cluster_N` so the
+/// rendered image visually groups independent dependency islands.
+fn format_all_graph_dot(components: &[ConnectedComponent]) -> String {
+    let mut out = String::new();
+    out.push_str("digraph dependencies {\n");
+    out.push_str("    node [shape=box, style=\"rounded,filled\", fontname=\"sans-serif\"];\n");
+    for (index, component) in components.iter().enumerate() {
+        out.push_str(&format!("    subgraph cluster_{index} {{\n"));
+        out.push_str(&format!("        label=\"Component {}\";\n", index + 1));
+        for node in &component.nodes {
+            push_dot_node(
+                &mut out,
+                "        ",
+                node,
+                component.roots.contains(&node.id),
+            );
+        }
+        out.push_str("    }\n");
+    }
+    for component in components {
+        for (dependent, dependency) in &component.edges {
+            push_dot_edge(&mut out, dependent, dependency);
+        }
+    }
+    out.push_str("}\n");
+    out
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1781,7 +1916,7 @@ mod tests {
 
         // This should not hang even with root feeding into cycle
         // If it hangs, the test runner will timeout
-        let result = graph_all(&storage, false, &ctx);
+        let result = graph_all(&storage, false, false, &ctx);
         assert!(result.is_ok());
     }
 
@@ -2086,6 +2221,141 @@ mod tests {
         assert_eq!(
             ordered_ids,
             vec!["root", "branch-a", "middle", "leaf", "branch-b"]
+        );
+    }
+
+    #[test]
+    fn test_format_single_graph_dot_emits_valid_dot() {
+        let nodes = vec![
+            GraphNode {
+                id: "bd-001".to_string(),
+                title: "Root \"issue\"".to_string(),
+                status: "open".to_string(),
+                priority: 0,
+                depth: 0,
+            },
+            GraphNode {
+                id: "bd-002".to_string(),
+                title: "Dependent".to_string(),
+                status: "blocked".to_string(),
+                priority: 2,
+                depth: 1,
+            },
+        ];
+        let edges = vec![("bd-002".to_string(), "bd-001".to_string())];
+
+        let dot = format_single_graph_dot(&nodes, &edges, "bd-001");
+
+        // Structural well-formedness.
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert!(dot.trim_end().ends_with('}'));
+        assert_eq!(
+            dot.matches('{').count(),
+            dot.matches('}').count(),
+            "DOT braces must be balanced: {dot}"
+        );
+
+        // Both nodes declared and the dependency edge present.
+        assert!(dot.contains("\"bd-001\" [label="));
+        assert!(dot.contains("\"bd-002\" [label="));
+        assert!(dot.contains("\"bd-002\" -> \"bd-001\";"));
+
+        // Root carries the heavier border; status drives fill color.
+        assert!(dot.contains("penwidth=2"));
+        assert!(dot.contains("fillcolor=\"lightblue\""));
+        assert!(dot.contains("fillcolor=\"lightcoral\""));
+
+        // Quotes inside titles are escaped, never emitted raw.
+        assert!(dot.contains("Root \\\"issue\\\""));
+        assert!(!dot.contains("Root \"issue\""));
+    }
+
+    #[test]
+    fn test_format_single_graph_dot_root_only_is_valid() {
+        let nodes = vec![GraphNode {
+            id: "bd-001".to_string(),
+            title: "Lonely root".to_string(),
+            status: "open".to_string(),
+            priority: 1,
+            depth: 0,
+        }];
+
+        let dot = format_single_graph_dot(&nodes, &[], "bd-001");
+
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert_eq!(dot.matches('{').count(), dot.matches('}').count());
+        assert!(dot.contains("\"bd-001\" [label="));
+        assert!(!dot.contains("->"));
+    }
+
+    #[test]
+    fn test_format_all_graph_dot_clusters_components() {
+        let components = vec![
+            ConnectedComponent {
+                nodes: vec![
+                    GraphNode {
+                        id: "bd-001".to_string(),
+                        title: "Root".to_string(),
+                        status: "open".to_string(),
+                        priority: 1,
+                        depth: 0,
+                    },
+                    GraphNode {
+                        id: "bd-002".to_string(),
+                        title: "Child".to_string(),
+                        status: "blocked".to_string(),
+                        priority: 2,
+                        depth: 1,
+                    },
+                ],
+                edges: vec![("bd-002".to_string(), "bd-001".to_string())],
+                roots: vec!["bd-001".to_string()],
+            },
+            ConnectedComponent {
+                nodes: vec![GraphNode {
+                    id: "bd-003".to_string(),
+                    title: "Solo".to_string(),
+                    status: "open".to_string(),
+                    priority: 0,
+                    depth: 0,
+                }],
+                edges: vec![],
+                roots: vec!["bd-003".to_string()],
+            },
+        ];
+
+        let dot = format_all_graph_dot(&components);
+
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert_eq!(
+            dot.matches('{').count(),
+            dot.matches('}').count(),
+            "DOT braces must be balanced: {dot}"
+        );
+        assert!(dot.contains("subgraph cluster_0 {"));
+        assert!(dot.contains("subgraph cluster_1 {"));
+        assert!(dot.contains("label=\"Component 1\";"));
+        assert!(dot.contains("label=\"Component 2\";"));
+        assert!(dot.contains("\"bd-002\" -> \"bd-001\";"));
+        assert!(dot.contains("\"bd-003\" [label="));
+    }
+
+    #[test]
+    fn test_format_all_graph_dot_empty_is_valid() {
+        let dot = format_all_graph_dot(&[]);
+        assert!(dot.starts_with("digraph dependencies {"));
+        assert!(dot.trim_end().ends_with('}'));
+        assert_eq!(dot.matches('{').count(), dot.matches('}').count());
+    }
+
+    #[test]
+    fn test_sanitize_dot_string_escapes_metacharacters_and_controls() {
+        let escaped = sanitize_dot_string("a\"b\\c\x1b[2J");
+        assert!(!escaped.chars().any(char::is_control));
+        assert!(escaped.contains("\\\""), "quote must be escaped: {escaped}");
+        assert!(
+            !escaped.contains("a\"b"),
+            "raw quote must not survive: {escaped}"
         );
     }
 }
