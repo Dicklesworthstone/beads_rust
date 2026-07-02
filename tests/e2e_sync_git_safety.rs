@@ -1698,7 +1698,7 @@ fn integration_sync_does_not_create_or_modify_dotgit_anywhere() {
 }
 
 /// PC-1 + PC-3: when a sync invocation is made from a SUBDIRECTORY of the
-/// project (e.g., `cd src/cli && br sync`), the workspace resolution MUST
+/// project (e.g., `cd src/cli && br sync --flush-only`), the workspace resolution MUST
 /// land on the nearest `.beads/` and not escape via `..` traversal during
 /// canonicalization.
 #[test]
@@ -1723,7 +1723,7 @@ fn integration_sync_in_subdirectory_only_touches_nearest_beads_dir() {
     eprintln!("    files before: {}", snapshot_before.files.len());
 
     // Phase 3: Run sync from a subdirectory
-    eprintln!("  Phase 2: sync from subdir (mimics `cd src/cli && br sync`)");
+    eprintln!("  Phase 2: sync from subdir (mimics `cd src/cli && br sync --flush-only`)");
     let subdir = workspace.root.join("src");
     if !subdir.exists() {
         fs::create_dir_all(&subdir).expect("create src/");

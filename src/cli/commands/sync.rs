@@ -189,6 +189,7 @@ enum SyncOperation {
     Flush,
     Merge,
     Import,
+    Unspecified,
 }
 
 struct SyncDispatchOptions {
@@ -298,7 +299,7 @@ fn resolve_sync_startup_paths(
 /// duplicate external_ref cleanup) are applied in the same invocation instead
 /// of being skipped by open-time recovery.
 fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
-    !args.status && !args.witness && !args.flush_only && !args.merge && args.rename_prefix
+    args.import_only && args.rename_prefix
 }
 
 /// Reject argument combinations that must fail BEFORE opening storage or
@@ -307,7 +308,8 @@ fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
 /// touched the DB family — otherwise the validation message arrives after
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
 fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
-    let mode_count = u8::from(args.flush_only)
+    let mode_count = u8::from(args.status)
+        + u8::from(args.flush_only)
         + u8::from(args.import_only)
         + u8::from(args.merge)
         + u8::from(args.witness);
@@ -315,15 +317,16 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify exactly one of --flush-only, --import-only, --merge, or --witness"
+                "Must specify exactly one of --flush-only, --import-only, --merge, --status, or --witness"
                     .to_string(),
         });
     }
-
-    if args.status && args.witness {
+    if mode_count == 0 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
-            reason: "--status cannot be combined with --witness".to_string(),
+            reason:
+                "Must specify one of --flush-only, --import-only, --merge, --status, or --witness"
+                    .to_string(),
         });
     }
 
@@ -347,12 +350,11 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         });
     }
 
-    // --rebuild only makes sense with import (the default or --import-only)
-    if args.rebuild && (args.flush_only || args.merge) {
+    // --rebuild only makes sense with explicit import mode.
+    if args.rebuild && !args.import_only {
         return Err(BeadsError::Validation {
             field: "rebuild".to_string(),
-            reason: "--rebuild can only be used with import mode (not --flush-only or --merge)"
-                .to_string(),
+            reason: "--rebuild can only be used with --import-only".to_string(),
         });
     }
 
@@ -412,10 +414,8 @@ fn merge_conflict_resolution_label(strategy: ConflictResolution) -> &'static str
 /// `auto_rebuilt == true` and short-circuits.
 ///
 /// Only fire this for the request that will actually go through
-/// `execute_import`: `--rebuild` without `--status`, and not alongside
-/// `--flush-only`/`--merge` (already rejected above). `--status` must
-/// stay read-only even when the caller also passed `--rebuild`, so skip
-/// the rebuild if status was requested. Also require the JSONL to exist —
+/// `execute_import`: `--rebuild --import-only`. All other mode pairings
+/// are rejected before storage opens. Also require the JSONL to exist —
 /// `recover_database_from_jsonl` runs a preflight that fails hard if the
 /// file is missing, whereas `execute_import` already handles a missing
 /// JSONL gracefully, so leave that case to the normal path.
@@ -439,7 +439,7 @@ fn maybe_delegate_rebuild(
 ) -> Result<()> {
     let delegation_would_drop_user_flags = args.rename_prefix;
     let should_delegate = args.rebuild
-        && !args.status
+        && args.import_only
         && !open_result.no_db
         && !open_result.auto_rebuilt
         && open_result.paths.jsonl_path.is_file()
@@ -493,7 +493,7 @@ fn maybe_delegate_rebuild(
 
 /// Dispatch to the appropriate sync-subcommand implementation based on
 /// the flag pattern (`--status` / `--flush-only` / `--merge` /
-/// default-or-`--import-only`). The status branch is read-only; the
+/// `--import-only`). The status branch is read-only; the
 /// other three hold a `&mut` borrow on `open_result.storage` for the
 /// duration of their execution. Any `Err` propagates back to
 /// `finalize_sync_result`, which is the single place that decides how to
@@ -539,8 +539,6 @@ fn dispatch_sync_subcommand(
             cli,
             ctx,
         ),
-        // Default to import-only if no flag is specified (consistent with
-        // existing behavior) or explicitly `--import-only`.
         SyncOperation::Import => execute_import(
             &mut open_result.storage,
             beads_dir,
@@ -553,6 +551,12 @@ fn dispatch_sync_subcommand(
             &options.db_path,
             ctx,
         ),
+        SyncOperation::Unspecified => Err(BeadsError::Validation {
+            field: "mode".to_string(),
+            reason:
+                "Must specify one of --flush-only, --import-only, --merge, --status, or --witness"
+                    .to_string(),
+        }),
     }
 }
 
@@ -582,8 +586,10 @@ fn sync_operation(args: &SyncArgs) -> SyncOperation {
         SyncOperation::Flush
     } else if args.merge {
         SyncOperation::Merge
-    } else {
+    } else if args.import_only {
         SyncOperation::Import
+    } else {
+        SyncOperation::Unspecified
     }
 }
 
@@ -3069,6 +3075,7 @@ mod tests {
     #[test]
     fn fresh_force_import_maintenance_gate_only_applies_to_clean_empty_force_loads() {
         let force_import = SyncArgs {
+            import_only: true,
             force: true,
             ..SyncArgs::default()
         };
@@ -3089,6 +3096,7 @@ mod tests {
         ));
 
         let rebuild = SyncArgs {
+            import_only: true,
             force: true,
             rebuild: true,
             ..SyncArgs::default()
@@ -3098,6 +3106,7 @@ mod tests {
         ));
 
         let rename_prefix = SyncArgs {
+            import_only: true,
             force: true,
             rename_prefix: true,
             ..SyncArgs::default()
@@ -3163,7 +3172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_sync_mode_args_rejects_witness_mode_conflicts() {
+    fn test_validate_sync_mode_args_rejects_mode_conflicts() {
         let status_conflict = SyncArgs {
             status: true,
             witness: true,
@@ -3172,6 +3181,15 @@ mod tests {
         };
         let err = validate_sync_mode_args(&status_conflict)
             .expect_err("status and witness should conflict");
+        assert!(matches!(err, BeadsError::Validation { .. }));
+
+        let status_flush_conflict = SyncArgs {
+            status: true,
+            flush_only: true,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&status_flush_conflict)
+            .expect_err("status and flush-only should conflict");
         assert!(matches!(err, BeadsError::Validation { .. }));
 
         let merge_conflict = SyncArgs {
@@ -3220,6 +3238,37 @@ mod tests {
 
         let err = validate_sync_mode_args(&args).expect_err("zero export parallelism should fail");
         assert!(matches!(err, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn test_validate_sync_mode_args_rebuild_requires_import_only() {
+        let status_rebuild = SyncArgs {
+            status: true,
+            rebuild: true,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&status_rebuild)
+            .expect_err("status rebuild should be rejected");
+        assert!(matches!(&err, BeadsError::Validation { field, .. } if field == "rebuild"));
+        assert!(err.to_string().contains("--import-only"));
+
+        let witness_rebuild = SyncArgs {
+            witness: true,
+            rebuild: true,
+            witness_chunk_lines: 2,
+            ..SyncArgs::default()
+        };
+        let err = validate_sync_mode_args(&witness_rebuild)
+            .expect_err("witness rebuild should be rejected");
+        assert!(matches!(&err, BeadsError::Validation { field, .. } if field == "rebuild"));
+        assert!(err.to_string().contains("--import-only"));
+
+        let import_rebuild = SyncArgs {
+            import_only: true,
+            rebuild: true,
+            ..SyncArgs::default()
+        };
+        validate_sync_mode_args(&import_rebuild).unwrap();
     }
 
     #[test]
@@ -3277,8 +3326,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_operation_selects_default_and_explicit_modes() {
-        assert_eq!(sync_operation(&SyncArgs::default()), SyncOperation::Import);
+    fn test_sync_operation_selects_unspecified_and_explicit_modes() {
+        assert_eq!(
+            sync_operation(&SyncArgs::default()),
+            SyncOperation::Unspecified
+        );
+        let bare_err = validate_sync_mode_args(&SyncArgs::default())
+            .expect_err("bare sync should require an explicit mode");
+        assert!(matches!(bare_err, BeadsError::Validation { .. }));
+        assert!(bare_err.to_string().contains("--flush-only"));
 
         let flush = SyncArgs {
             flush_only: true,
@@ -3300,23 +3356,30 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_operation_status_takes_precedence_over_work_modes() {
+    fn test_sync_operation_status_is_explicit_read_only_mode() {
         let args = SyncArgs {
             status: true,
-            flush_only: true,
             ..SyncArgs::default()
         };
 
+        validate_sync_mode_args(&args).unwrap();
         assert_eq!(sync_operation(&args), SyncOperation::Status);
     }
 
     #[test]
     fn test_should_defer_jsonl_recovery_only_for_rename_prefix_import() {
         let rename_import = SyncArgs {
+            import_only: true,
             rename_prefix: true,
             ..SyncArgs::default()
         };
         assert!(should_defer_jsonl_recovery(&rename_import));
+
+        let bare_rename = SyncArgs {
+            rename_prefix: true,
+            ..SyncArgs::default()
+        };
+        assert!(!should_defer_jsonl_recovery(&bare_rename));
 
         let status = SyncArgs {
             status: true,

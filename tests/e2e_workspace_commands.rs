@@ -522,7 +522,7 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
     // showed the issue as open and the rebuild only imports what's in the
     // JSONL. The fix snapshots tombstones from the anomalous-but-queryable
     // storage before dropping it and restores them after the rebuild, the
-    // same way the explicit `br sync --rebuild` delegation path does.
+    // same way the explicit `br sync --import-only --rebuild` delegation path does.
     let _log = common::test_log("e2e_startup_auto_recovery_preserves_unflushed_tombstones");
     let workspace = BrWorkspace::new();
 

@@ -2337,8 +2337,9 @@ pub struct OpenStorageResult {
     /// True when the SQLite DB file was just rebuilt from JSONL during this
     /// `open_storage_with_cli` call (either because the file didn't exist, or
     /// because a recoverable anomaly was detected after opening). Callers that
-    /// would otherwise re-run a full rebuild (e.g. `br sync --rebuild`) can
-    /// skip the redundant work — the DB is already a fresh import.
+    /// would otherwise re-run a full rebuild (e.g.
+    /// `br sync --import-only --rebuild`) can skip the redundant work — the DB
+    /// is already a fresh import.
     pub auto_rebuilt: bool,
     allow_external_jsonl: bool,
     startup_layers: Vec<ConfigLayer>,
@@ -2398,8 +2399,8 @@ impl OpenStorageResult {
     ///
     /// On success, `auto_rebuilt` is set to `true` so downstream code can
     /// detect that the storage is now a fresh import of the JSONL and skip
-    /// redundant rebuilds (for example, `br sync --rebuild` short-circuits
-    /// when it sees this flag).
+    /// redundant rebuilds (for example, `br sync --import-only --rebuild`
+    /// short-circuits when it sees this flag).
     ///
     /// # Errors
     ///
@@ -2519,8 +2520,8 @@ impl OpenStorageResult {
                     "JSONL changed on disk since this --no-db session started: {}\n\
                      Refusing to flush a stale in-memory snapshot because it could overwrite \
                      concurrent changes.\n\
-                     Hint: rerun the command against the latest JSONL, or use `br sync` to \
-                     reconcile competing edits explicitly.",
+                     Hint: rerun the command against the latest JSONL, or use `br sync --merge` \
+                     to reconcile competing edits explicitly.",
                     self.paths.jsonl_path.display()
                 ),
             });
