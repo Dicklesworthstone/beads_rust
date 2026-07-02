@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
-use fastmcp_rust::{McpError, McpErrorCode};
+use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
 
+use crate::error::StructuredError;
 use crate::model::Issue;
 use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::{BeadsError, config};
@@ -34,6 +35,39 @@ const MCP_READ_SNAPSHOT_CACHE_LIMIT: usize = 64;
 /// Tools use the richer `beads_to_mcp` in `tools.rs` instead.
 pub(super) fn to_mcp(err: impl std::fmt::Display) -> McpError {
     McpError::tool_error(err.to_string())
+}
+
+fn shutdown_mcp_error() -> McpError {
+    let err = BeadsError::ShuttingDown;
+    let structured = StructuredError::from_error(&err);
+    let message = structured.message.clone();
+    let mut data = json!({
+        "error_type": structured.code.as_str(),
+        "recoverable": structured.retryable,
+        "message": message,
+    });
+    if let Some(object) = data.as_object_mut() {
+        if let Some(hint) = &structured.hint {
+            object.insert("hint".to_string(), json!(hint));
+        }
+        if let Some(context) = &structured.context {
+            object.insert("context".to_string(), context.clone());
+        }
+    }
+
+    McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
+}
+
+fn ensure_not_shutting_down_with(is_requested: impl FnOnce() -> bool) -> McpResult<()> {
+    if is_requested() {
+        Err(shutdown_mcp_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn ensure_not_shutting_down() -> McpResult<()> {
+    ensure_not_shutting_down_with(crate::shutdown::is_requested)
 }
 
 pub(super) fn mcp_ready_issues(
@@ -428,34 +462,11 @@ impl BeadsState {
 
     fn flush_dirty_storage(&self, storage: &mut SqliteStorage) -> fastmcp_rust::McpResult<()> {
         let dirty_before_flush = storage.get_dirty_issue_count().map_err(to_mcp)?;
-        // Honor `sync.history_enabled: false` (#293) — load the merged config
-        // layer so MCP-mediated mutations don't create `.br_history/` when the
-        // operator has disabled it. Falls back to the default (enabled) if the
-        // config load itself fails — we'd rather flush with history than refuse
-        // the flush, since refusing leaves the dirty row stuck.
-        let history_config = config::load_config(
-            &self.beads_dir,
-            Some(storage),
-            &config::CliOverrides::default(),
-        )
-        .ok()
-        .map(|layer| {
-            let mut cfg = crate::sync::history::HistoryConfig::default();
-            if let Some(enabled) = config::history_enabled_from_layer(&layer) {
-                cfg.enabled = enabled;
-            }
-            if let Some(secs) = config::history_min_interval_secs_from_env() {
-                cfg.min_interval_secs = secs;
-            }
-            cfg
-        })
-        .unwrap_or_default();
         let flush_result = crate::sync::auto_flush(
             storage,
             &self.beads_dir,
             &self.jsonl_path,
             self.allow_external_jsonl,
-            history_config,
         )
         .map_err(|err| auto_flush_mcp_error(&self.beads_dir, &self.jsonl_path, err))?;
 
@@ -523,6 +534,34 @@ mod tests {
         let mut state = test_state(temp, jsonl_path);
         state.read_snapshot_cache = Some(Mutex::new(McpReadSnapshotCache::default()));
         state
+    }
+
+    #[test]
+    fn shutdown_guard_allows_handlers_when_no_signal_is_pending() {
+        ensure_not_shutting_down_with(|| false).expect("unsignalled MCP handler should proceed");
+    }
+
+    #[test]
+    fn shutdown_guard_returns_structured_mcp_error() {
+        let err = ensure_not_shutting_down_with(|| true).unwrap_err();
+
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(err.message, "Shutdown requested");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SHUTTING_DOWN")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("context"))
+                .and_then(|context| context.get("shutdown_requested"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -800,5 +839,6 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .prompt(prompts::PolishBacklogPrompt::new(state))
         .build();
 
-    server.run_stdio();
+    server.run_transport_returning(StdioTransport::stdio());
+    Ok(())
 }

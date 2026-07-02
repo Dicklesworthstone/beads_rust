@@ -20,7 +20,7 @@ use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
 use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
-use super::{BeadsState, mcp_ready_issues};
+use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues};
 
 // ---------------------------------------------------------------------------
 // Constants — pre-computed sets for O(1) placeholder detection
@@ -291,6 +291,7 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
         // Issue / dependency / operational errors → tool execution error
         ErrorCode::IssueNotFound
         | ErrorCode::AmbiguousId
+        | ErrorCode::ShuttingDown
         | ErrorCode::NothingToDo
         | ErrorCode::CycleDetected
         | ErrorCode::DependencyNotFound
@@ -347,6 +348,14 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
             data["available_options"] = json!(["critical", "high", "medium", "low", "backlog"]);
             data["fix_hint"] =
                 json!("Aliases also accepted: urgent, important, normal, minor, someday");
+        }
+        ErrorCode::ShuttingDown => {
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "recovery".to_string(),
+                    json!("Retry after starting a fresh br serve process"),
+                );
+            }
         }
         _ => {
             data["discovery_hint"] =
@@ -1190,7 +1199,7 @@ impl ToolHandler for ListIssuesTool {
             name: "list_issues".into(),
             description: Some(
                 "List issues matching filters, or run multiple filtered list queries in one batch. Returns JSON issue summaries.\n\n\
-                 Discovery: Use beads://labels resource to see valid label values.\n\
+                 Discovery: Use beads://schema for accepted status/type/priority values and beads://labels for valid label values.\n\
                  When to use: Exploring the backlog, finding issues by status/type/priority/label.\n\
                  NOT for: Getting full details on one issue — use show_issue instead.\n\
                  Do: Start broad (no filters) then narrow down. Use limit to cap output, or pass queries[] for a per-item batch envelope.\n\
@@ -1283,6 +1292,8 @@ impl ToolHandler for ListIssuesTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(queries) = list_issues_batch_items(&args)? {
             let key = format!("tool:list_issues_batch:{}", json!(&queries));
             let result = cached_read_json(&self.0, key, |storage| {
@@ -1516,6 +1527,8 @@ impl ToolHandler for ShowIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(ids) = show_issue_batch_ids(&args)? {
             let key = format!("tool:show_issue_batch:{}", json!(&ids));
             let result = cached_read_json(&self.0, key, |storage| {
@@ -1847,6 +1860,8 @@ impl ToolHandler for CreateIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(items) = create_issue_batch_items(&args)? {
             let result = self
                 .0
@@ -2166,6 +2181,8 @@ impl ToolHandler for UpdateIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(items) = update_issue_batch_items(&args)? {
             let result = self
                 .0
@@ -2402,6 +2419,8 @@ impl ToolHandler for CloseIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         let reason = optional_str_arg(&args, "reason")?;
         if let Some(ids) = close_issue_batch_ids(&args)? {
             let result = self.0.with_mutation(|storage| {
@@ -2519,12 +2538,21 @@ fn manage_dependencies_add_json(
         require_valid_issue(storage, depends_on)?;
     }
 
-    if dep_type.is_blocking()
-        && !depends_on.starts_with("external:")
-        && storage
-            .would_create_cycle(id, depends_on, true)
-            .map_err(beads_to_mcp)?
-    {
+    let would_create_cycle = if dep_type.is_blocking() && !depends_on.starts_with("external:") {
+        if dep_type == DependencyType::ParentChild {
+            storage
+                .would_create_parent_child_cycle(id, depends_on, true)
+                .map_err(beads_to_mcp)?
+        } else {
+            storage
+                .would_create_cycle(id, depends_on, true)
+                .map_err(beads_to_mcp)?
+        }
+    } else {
+        false
+    };
+
+    if would_create_cycle {
         return Err(manage_dependency_cycle_error(id, depends_on));
     }
 
@@ -2776,6 +2804,8 @@ impl ToolHandler for ManageDependenciesTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(items) = manage_dependencies_batch_items(&args)? {
             let result = if manage_dependencies_batch_is_read_only(&items) {
                 let mut storage = open(&self.0)?;
@@ -2938,10 +2968,13 @@ impl ToolHandler for ProjectOverviewTool {
             name: "project_overview".into(),
             description: Some(
                 "Get a high-level project summary: counts by status, top labels, blocked/ready work.\n\n\
+                 Discovery: Pairs with beads://project/info, beads://schema, beads://issues/ready, \
+                 and beads://coordination/status for the documented MCP orientation surface.\n\
                  When to use: Starting a session, getting oriented, understanding project health.\n\
                  NOT for: Detailed filtering — use list_issues with filters instead.\n\
                  Do: Call this first when you connect to understand the project state.\n\
                  Don't: Call repeatedly — the data doesn't change unless you mutate issues.\n\
+                 Boundary: local SQLite/JSONL state only; no git, no network listener, and no live Agent Mail call.\n\
                  Idempotency: Safe to retry; read-only."
                     .into(),
             ),
@@ -2964,6 +2997,8 @@ impl ToolHandler for ProjectOverviewTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         let _ = args;
         let storage = self.0.open_read_storage().map_err(beads_to_mcp)?;
         let result = project_overview_json(&self.0, &storage)?;
@@ -2986,7 +3021,7 @@ mod tests {
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::{IssueUpdate, SqliteStorage};
     use chrono::{TimeZone, Utc};
-    use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, ToolHandler};
+    use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, Tool, ToolHandler};
     use serde_json::{Value, json};
     use std::{cell::Cell, fs, sync::Arc, time::Instant};
     use tempfile::TempDir;
@@ -3039,10 +3074,250 @@ mod tests {
             .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
     }
 
+    fn assert_docs_list_mcp_term(term: &str) {
+        for (document_name, document) in [
+            ("README.md", include_str!("../../README.md")),
+            (
+                "docs/AGENT_INTEGRATION.md",
+                include_str!("../../docs/AGENT_INTEGRATION.md"),
+            ),
+            (
+                "docs/CLI_REFERENCE.md",
+                include_str!("../../docs/CLI_REFERENCE.md"),
+            ),
+        ] {
+            assert!(
+                document.contains(term),
+                "{document_name} must document MCP term {term}"
+            );
+        }
+    }
+
+    fn assert_tool_description_mentions(tool: &Tool, expected_terms: &[&str]) {
+        let description = tool
+            .description
+            .as_deref()
+            .expect("MCP tool descriptions are part of the agent contract");
+        assert!(!description.trim().is_empty());
+        for term in expected_terms {
+            assert!(
+                description.contains(term),
+                "MCP tool {} description must mention {term:?}: {description}",
+                tool.name
+            );
+        }
+    }
+
+    fn assert_tool_description_does_not_claim_live_services(tool: &Tool) {
+        let description = tool.description.as_deref().unwrap_or_default();
+        let lower = description.to_ascii_lowercase();
+        for forbidden in [
+            "http://",
+            "https://",
+            "network port",
+            "network socket",
+            "network service",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "MCP tool {} description implies a live service boundary via {forbidden:?}: {description}",
+                tool.name
+            );
+        }
+        if lower.contains("agent mail") {
+            assert!(
+                lower.contains("no live agent mail")
+                    || lower.contains("does not call")
+                    || lower.contains("without"),
+                "Agent Mail mention must be an explicit non-live boundary for {}: {description}",
+                tool.name
+            );
+        }
+        if lower.contains("network listener") {
+            assert!(
+                lower.contains("without network listener")
+                    || lower.contains("no network listener")
+                    || lower.contains("does not listen"),
+                "network listener mention must be an explicit non-live boundary for {}: {description}",
+                tool.name
+            );
+        }
+    }
+
+    fn assert_tool_input_schema_object(tool: &Tool) {
+        assert_eq!(
+            tool.input_schema["type"].as_str(),
+            Some("object"),
+            "MCP tool {} must expose an object input schema",
+            tool.name
+        );
+        assert!(
+            tool.input_schema.get("properties").is_some(),
+            "MCP tool {} must expose input properties",
+            tool.name
+        );
+        assert!(
+            tool.input_schema.get("additionalProperties").is_some(),
+            "MCP tool {} must make extra-argument behavior explicit",
+            tool.name
+        );
+    }
+
+    fn overview_resource_entries(overview: &Value) -> Vec<&str> {
+        overview["discovery"]["resources"]
+            .as_array()
+            .expect("project_overview discovery.resources")
+            .iter()
+            .map(|value| value.as_str().expect("discovery resource entry"))
+            .collect()
+    }
+
     fn assert_batch_counts(batch: &serde_json::Value, count: u64, ok: u64, errors: u64) {
         assert_eq!(batch["count"].as_u64(), Some(count));
         assert_eq!(batch["ok_count"].as_u64(), Some(ok));
         assert_eq!(batch["error_count"].as_u64(), Some(errors));
+    }
+
+    #[test]
+    fn mcp_contract_tool_metadata_matches_docs_and_discovery_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tools = vec![
+            ListIssuesTool::new(Arc::clone(&state)).definition(),
+            ShowIssueTool::new(Arc::clone(&state)).definition(),
+            CreateIssueTool::new(Arc::clone(&state)).definition(),
+            UpdateIssueTool::new(Arc::clone(&state)).definition(),
+            CloseIssueTool::new(Arc::clone(&state)).definition(),
+            ManageDependenciesTool::new(Arc::clone(&state)).definition(),
+            ProjectOverviewTool::new(state).definition(),
+        ];
+
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_issues",
+                "show_issue",
+                "create_issue",
+                "update_issue",
+                "close_issue",
+                "manage_dependencies",
+                "project_overview",
+            ]
+        );
+
+        for tool in &tools {
+            assert_docs_list_mcp_term(&tool.name);
+            assert_tool_input_schema_object(tool);
+            assert_tool_description_does_not_claim_live_services(tool);
+        }
+
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "list_issues")
+                .expect("list_issues tool"),
+            &["beads://schema", "beads://labels", "project_overview"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "show_issue")
+                .expect("show_issue tool"),
+            &["list_issues", "project_overview"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "create_issue")
+                .expect("create_issue tool"),
+            &["beads://schema", "beads://labels", "list_issues"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "update_issue")
+                .expect("update_issue tool"),
+            &["list_issues", "beads://schema"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "close_issue")
+                .expect("close_issue tool"),
+            &["list_issues", "update_issue"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "manage_dependencies")
+                .expect("manage_dependencies tool"),
+            &["list_issues", "beads://schema", "beads://issues/blocked"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "project_overview")
+                .expect("project_overview tool"),
+            &[
+                "beads://project/info",
+                "beads://schema",
+                "beads://issues/ready",
+                "beads://coordination/status",
+                "local SQLite/JSONL",
+            ],
+        );
+    }
+
+    #[test]
+    fn mcp_contract_project_overview_payload_advertises_documented_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(
+            &state,
+            "br-mcp-contract-overview",
+            "overview contract issue",
+        );
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let overview = project_overview_json(&state, &storage).expect("project overview");
+        let resources = overview_resource_entries(&overview);
+        let overview_tool = ProjectOverviewTool::new(Arc::clone(&state)).definition();
+        let description = overview_tool
+            .description
+            .as_deref()
+            .expect("project_overview description");
+
+        assert_eq!(overview["counts"]["total"].as_u64(), Some(1));
+        assert_eq!(overview["counts"]["ready"].as_u64(), Some(1));
+        assert_eq!(
+            overview["ready_issues"][0]["id"].as_str(),
+            Some("br-mcp-contract-overview")
+        );
+
+        for expected in [
+            "beads://project/info",
+            "beads://schema",
+            "beads://issues/ready",
+            "beads://coordination/status",
+        ] {
+            assert!(
+                resources.iter().any(|entry| entry.starts_with(expected)),
+                "project_overview discovery resources must advertise {expected}: {resources:?}"
+            );
+            assert!(
+                description.contains(expected),
+                "project_overview description must mention payload resource {expected}"
+            );
+            assert_docs_list_mcp_term(expected);
+        }
+
+        assert!(
+            overview["discovery"]["prompts"]
+                .as_array()
+                .is_some_and(|prompts| prompts.iter().any(|prompt| prompt
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("triage"))))
+        );
     }
 
     #[test]

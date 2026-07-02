@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use crate::model::{Issue, IssueType, Status};
 use crate::storage::{ListFilters, SqliteStorage};
 
-use super::{BeadsState, mcp_ready_issues, to_mcp};
+use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues, to_mcp};
 
 // ---------------------------------------------------------------------------
 // Display limits — extracted from magic numbers for maintainability
@@ -244,6 +244,8 @@ impl PromptHandler for TriagePrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
+        ensure_not_shutting_down()?;
+
         let raw_focus = arguments.get("focus").map_or("all", String::as_str);
         let (focus, focus_warning) = validate_prompt_arg(
             raw_focus,
@@ -333,6 +335,8 @@ impl PromptHandler for StatusReportPrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
+        ensure_not_shutting_down()?;
+
         let raw_period = arguments.get("period").map_or("all", String::as_str);
         let (period, period_warning) = validate_prompt_arg(
             raw_period,
@@ -550,6 +554,8 @@ impl PromptHandler for PlanNextWorkPrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
+        ensure_not_shutting_down()?;
+
         let raw_goal = arguments.get("goal").map_or("balanced", String::as_str);
         let (goal, goal_warning) = validate_prompt_arg(
             raw_goal,
@@ -814,6 +820,8 @@ impl PromptHandler for PolishBacklogPrompt {
         _ctx: &McpContext,
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
+        ensure_not_shutting_down()?;
+
         let raw_focus = arguments.get("focus").map_or("all", String::as_str);
         let (focus, focus_warning) = validate_prompt_arg(
             raw_focus,

@@ -168,6 +168,10 @@ pub enum BeadsError {
     },
 
     // === Operational Errors ===
+    /// Operation refused because cooperative shutdown has already been requested.
+    #[error("Shutdown requested")]
+    ShuttingDown,
+
     /// All requested items were skipped (already closed, not found, etc.).
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
@@ -193,6 +197,7 @@ impl BeadsError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Database(e) => e.is_transient(),
+            Self::ShuttingDown => true,
             Self::Io(e) => {
                 matches!(
                     e.kind(),
