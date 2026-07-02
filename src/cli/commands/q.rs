@@ -184,7 +184,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     if let Some(parent_id) = resolved_parent_id.as_ref() {
         // Double-check cycle even though we are a new issue, to catch logic errors
         // and ensure the storage would_create_cycle works correctly for prospective links
-        if storage.would_create_cycle(&issue.id, parent_id, true)? {
+        if storage.would_create_parent_child_cycle(&issue.id, parent_id, true)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("{} -> {}", issue.id, parent_id),
             });

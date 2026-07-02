@@ -1377,7 +1377,7 @@ fn validate_parent_updates(
             });
         }
 
-        if storage.would_create_cycle(issue_id, parent_id, true)? {
+        if storage.would_create_parent_child_cycle(issue_id, parent_id, true)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("Setting parent of {issue_id} to {parent_id} would create a cycle"),
             });

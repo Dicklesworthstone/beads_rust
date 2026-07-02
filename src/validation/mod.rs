@@ -13,7 +13,7 @@
 //! See `SyncSafetyValidator` for runtime guards.
 
 use crate::error::{BeadsError, ValidationError};
-use crate::model::{Comment, Dependency, Issue, Priority, Status};
+use crate::model::{Comment, Dependency, DependencyType, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
 use std::path::Path;
 
@@ -275,6 +275,41 @@ pub trait DependencyStore {
     ///
     /// Returns an error if the storage lookup fails.
     fn would_create_cycle(&self, issue_id: &str, depends_on_id: &str) -> Result<bool, BeadsError>;
+
+    /// Return true if adding a stored `parent-child` row would create a cycle.
+    ///
+    /// Stored parent-child rows are child -> parent, while the blocking graph
+    /// treats them as parent -> child. Stores that model `would_create_cycle`
+    /// as a blocking-graph edge can use this default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage lookup fails.
+    fn would_create_parent_child_cycle(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+    ) -> Result<bool, BeadsError> {
+        self.would_create_cycle(parent_id, child_id)
+    }
+
+    /// Return true if adding the typed dependency would create a cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage lookup fails.
+    fn would_create_dependency_cycle(
+        &self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+    ) -> Result<bool, BeadsError> {
+        if matches!(dep_type, DependencyType::ParentChild) {
+            self.would_create_parent_child_cycle(issue_id, depends_on_id)
+        } else {
+            self.would_create_cycle(issue_id, depends_on_id)
+        }
+    }
 }
 
 /// Validates dependency invariants, optionally consulting storage.
@@ -308,7 +343,11 @@ impl DependencyValidator {
         }
 
         if dep.dep_type.is_blocking()
-            && store.would_create_cycle(&dep.issue_id, &dep.depends_on_id)?
+            && store.would_create_dependency_cycle(
+                &dep.issue_id,
+                &dep.depends_on_id,
+                &dep.dep_type,
+            )?
         {
             errors.push(ValidationError::new(
                 "depends_on_id",
@@ -842,6 +881,61 @@ mod tests {
             depends_on_exists: true,
             dependency_exists: false,
             would_cycle: true,
+        };
+
+        assert!(DependencyValidator::validate(&dep, &store).is_ok());
+    }
+
+    struct DirectionalCycleStore {
+        cycle_from: &'static str,
+        cycle_to: &'static str,
+    }
+
+    impl DependencyStore for DirectionalCycleStore {
+        fn issue_exists(&self, _id: &str) -> Result<bool, BeadsError> {
+            Ok(true)
+        }
+
+        fn dependency_exists(
+            &self,
+            _issue_id: &str,
+            _depends_on_id: &str,
+        ) -> Result<bool, BeadsError> {
+            Ok(false)
+        }
+
+        fn would_create_cycle(
+            &self,
+            issue_id: &str,
+            depends_on_id: &str,
+        ) -> Result<bool, BeadsError> {
+            Ok(issue_id == self.cycle_from && depends_on_id == self.cycle_to)
+        }
+    }
+
+    #[test]
+    fn dependency_validation_reverses_parent_child_cycle_check() {
+        let mut dep = base_dependency();
+        dep.dep_type = DependencyType::ParentChild;
+        let store = DirectionalCycleStore {
+            cycle_from: "dep",
+            cycle_to: "issue",
+        };
+
+        let err = DependencyValidator::validate(&dep, &store).unwrap_err();
+        match err {
+            BeadsError::Validation { field, .. } => assert_eq!(field, "depends_on_id"),
+            _ => unreachable!("expected validation error"),
+        }
+    }
+
+    #[test]
+    fn dependency_validation_parent_child_ignores_standard_direction_cycle() {
+        let mut dep = base_dependency();
+        dep.dep_type = DependencyType::ParentChild;
+        let store = DirectionalCycleStore {
+            cycle_from: "issue",
+            cycle_to: "dep",
         };
 
         assert!(DependencyValidator::validate(&dep, &store).is_ok());

@@ -2352,10 +2352,14 @@ impl SqliteStorage {
                     continue;
                 }
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
-                // Check cycle if blocking
-                if dep.dep_type.is_blocking()
-                    && Self::check_cycle(conn, &issue.id, &dep.depends_on_id, true)?
-                {
+                // Check cycle if blocking.
+                if Self::check_dependency_cycle_for_type(
+                    conn,
+                    &issue.id,
+                    &dep.depends_on_id,
+                    &dep.dep_type,
+                    true,
+                )? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!(
                             "Adding dependency {} -> {} would create a cycle",
@@ -2499,6 +2503,34 @@ impl SqliteStorage {
         }
 
         Ok(false)
+    }
+
+    fn check_parent_child_cycle(
+        conn: &Connection,
+        child_id: &str,
+        parent_id: &str,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        // Stored parent-child rows are child -> parent, but the blocker graph
+        // edge is parent -> child because parents wait for children.
+        Self::check_cycle(conn, parent_id, child_id, blocking_only)
+    }
+
+    fn check_dependency_cycle_for_type(
+        conn: &Connection,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        if !dep_type.is_blocking() {
+            return Ok(false);
+        }
+        if matches!(dep_type, DependencyType::ParentChild) {
+            Self::check_parent_child_cycle(conn, issue_id, depends_on_id, blocking_only)
+        } else {
+            Self::check_cycle(conn, issue_id, depends_on_id, blocking_only)
+        }
     }
 
     /// Update an issue's fields.
@@ -6987,6 +7019,39 @@ impl SqliteStorage {
         }
     }
 
+    fn existing_dependency_targets_for_issue_ids(
+        conn: &Connection,
+        issue_ids: &[&str],
+    ) -> Result<HashMap<String, HashSet<String>>> {
+        let mut targets_by_issue_id: HashMap<String, HashSet<String>> = HashMap::new();
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT issue_id, depends_on_id FROM dependencies WHERE issue_id IN ({})",
+                placeholders.join(",")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(*issue_id))
+                .collect();
+            let rows = conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(depends_on_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                targets_by_issue_id
+                    .entry(issue_id.to_string())
+                    .or_default()
+                    .insert(depends_on_id.to_string());
+            }
+        }
+
+        Ok(targets_by_issue_id)
+    }
+
     /// Find issue IDs that end with the given hash substring.
     ///
     /// # Errors
@@ -7183,20 +7248,6 @@ impl SqliteStorage {
                 return Ok(false);
             }
 
-            // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
-            // prevent TOCTOU races where a concurrent writer could insert an
-            // edge between our check and our INSERT.
-            if let Ok(dt) = dep_type.parse::<DependencyType>()
-                && dt.is_blocking()
-                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
-            {
-                return Err(BeadsError::DependencyCycle {
-                    path: format!(
-                        "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
-                    ),
-                });
-            }
-
             let existing = conn.query_with_params(
                 "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? LIMIT 1",
                 &[
@@ -7206,6 +7257,25 @@ impl SqliteStorage {
             )?;
             if !existing.is_empty() {
                 return Ok(false);
+            }
+
+            // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
+            // prevent TOCTOU races where a concurrent writer could insert an
+            // edge between our check and our INSERT.
+            if let Ok(dt) = dep_type.parse::<DependencyType>()
+                && Self::check_dependency_cycle_for_type(
+                    conn,
+                    issue_id,
+                    depends_on_id,
+                    &dt,
+                    true,
+                )?
+            {
+                return Err(BeadsError::DependencyCycle {
+                    path: format!(
+                        "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
+                    ),
+                });
             }
 
             let inserted = conn.execute_with_params(
@@ -7275,6 +7345,14 @@ impl SqliteStorage {
             let mut unique_dependencies: Vec<(&BulkDependencyInsert, String)> = Vec::new();
             let mut seen_edges = HashSet::new();
             let mut proposed_parents: HashMap<&str, &str> = HashMap::new();
+            let mut source_issue_ids: Vec<&str> = dependencies
+                .iter()
+                .map(|dep| dep.issue_id.as_str())
+                .collect();
+            source_issue_ids.sort_unstable();
+            source_issue_ids.dedup();
+            let existing_targets =
+                Self::existing_dependency_targets_for_issue_ids(conn, &source_issue_ids)?;
 
             for dep in dependencies {
                 if dep.issue_id == dep.depends_on_id {
@@ -7311,6 +7389,13 @@ impl SqliteStorage {
                 }
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
 
+                if existing_targets
+                    .get(dep.issue_id.as_str())
+                    .is_some_and(|targets| targets.contains(dep.depends_on_id.as_str()))
+                {
+                    continue;
+                }
+
                 if dep_type == "parent-child" {
                     match proposed_parents.get(dep.issue_id.as_str()) {
                         Some(existing_parent)
@@ -7339,7 +7424,7 @@ impl SqliteStorage {
                     }
                 }
 
-                if seen_edges.insert((dep.issue_id.as_str(), dep.depends_on_id.as_str())) {
+                if seen_edges.insert((dep.issue_id.clone(), dep.depends_on_id.clone())) {
                     unique_dependencies.push((dep, dep_type));
                 }
             }
@@ -7651,7 +7736,7 @@ impl SqliteStorage {
                 Self::validate_parent_child_endpoints(issue_id, pid, "parent-child")?;
                 Self::ensure_dependency_target_exists_in_tx(conn, pid)?;
 
-                if Self::check_cycle(conn, issue_id, pid, true)? {
+                if Self::check_parent_child_cycle(conn, issue_id, pid, true)? {
                     return Err(BeadsError::DependencyCycle {
                         path: format!("Setting parent of {issue_id} to {pid} would create a cycle"),
                     });
@@ -9191,7 +9276,9 @@ impl SqliteStorage {
 
     /// Fetch reverse-dependency edges for a bounded set of blocking roots.
     ///
-    /// Returns a map from `depends_on_id` → `Vec<IssueWithDependencyMetadata>`.
+    /// Returns a map from blocker-graph root ID to dependents. Standard
+    /// dependency rows use `depends_on_id` as the root; `parent-child` rows are
+    /// reversed because parents are blocked by children.
     /// Unlike [`Self::prefetch_blocking_dependents`], this keeps focused graph
     /// traversals from hydrating the entire workspace dependency graph.
     ///
@@ -9207,28 +9294,55 @@ impl SqliteStorage {
         }
 
         let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
-        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+        let chunk_size = SQLITE_VAR_LIMIT.saturating_div(2).max(1);
+        for chunk in issue_ids.chunks(chunk_size) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT d.depends_on_id, d.issue_id, i.title, i.status, i.priority, d.type
-                 FROM dependencies d
-                 LEFT JOIN issues i ON d.issue_id = i.id
-                 WHERE d.depends_on_id IN ({})
-                   AND d.type IN ('blocks', 'conditional-blocks', 'waits-for', 'parent-child')
-                 ORDER BY COALESCE(i.priority, 2) ASC, i.created_at DESC, d.issue_id ASC",
-                placeholders.join(",")
+                "SELECT root_id, dependent_id, title, status, priority, type
+                 FROM (
+                     SELECT d.depends_on_id AS root_id,
+                            d.issue_id AS dependent_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.issue_id = i.id
+                      WHERE d.depends_on_id IN ({placeholders})
+                        AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                     UNION ALL
+                     SELECT d.issue_id AS root_id,
+                            d.depends_on_id AS dependent_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.depends_on_id = i.id
+                      WHERE d.issue_id IN ({placeholders})
+                        AND d.type = 'parent-child'
+                 )
+                 ORDER BY COALESCE(priority, 2) ASC, created_at DESC, dependent_id ASC",
+                placeholders = placeholders.join(",")
             );
-            let params: Vec<SqliteValue> = chunk
+            let mut params: Vec<SqliteValue> = chunk
                 .iter()
                 .map(|issue_id| SqliteValue::from(issue_id.as_str()))
                 .collect();
+            params.extend(
+                chunk
+                    .iter()
+                    .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+            );
             let rows = self.conn.query_with_params(&sql, &params)?;
 
             for row in &rows {
-                let Some(depends_on_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                let Some(root_id) = row.get(0).and_then(SqliteValue::as_text) else {
                     continue;
                 };
-                let Some(issue_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                let Some(dependent_id) = row.get(1).and_then(SqliteValue::as_text) else {
                     continue;
                 };
                 let dep_type = row
@@ -9242,22 +9356,22 @@ impl SqliteStorage {
 
                 let meta = match (title, status, priority) {
                     (Some(title), Some(status), Some(priority)) => IssueWithDependencyMetadata {
-                        id: issue_id.to_string(),
+                        id: dependent_id.to_string(),
                         title: title.to_string(),
                         status: parse_status(Some(status)),
                         priority: Priority(i32::try_from(priority).unwrap_or(2)),
                         dep_type,
                     },
                     _ => IssueWithDependencyMetadata {
-                        id: issue_id.to_string(),
-                        title: format!("[missing issue: {issue_id}]"),
+                        id: dependent_id.to_string(),
+                        title: format!("[missing issue: {dependent_id}]"),
                         status: Status::Tombstone,
                         priority: Priority::MEDIUM,
                         dep_type,
                     },
                 };
 
-                map.entry(depends_on_id.to_string()).or_default().push(meta);
+                map.entry(root_id.to_string()).or_default().push(meta);
             }
         }
 
@@ -11857,10 +11971,12 @@ impl SqliteStorage {
         Ok(count > 0)
     }
 
-    /// Check if adding a dependency would create a cycle.
+    /// Check if adding a standard dependency edge would create a cycle.
     ///
     /// If `blocking_only` is true, only considers dependency types that affect ready-work
     /// blocking: `blocks`, `conditional-blocks`, `waits-for`, and reversed `parent-child`.
+    /// Use [`Self::would_create_parent_child_cycle`] when validating a stored
+    /// `parent-child` row, because those rows are reversed in the blocker graph.
     ///
     /// # Errors
     ///
@@ -11872,6 +11988,23 @@ impl SqliteStorage {
         blocking_only: bool,
     ) -> Result<bool> {
         Self::check_cycle(&self.conn, issue_id, depends_on_id, blocking_only)
+    }
+
+    /// Check if adding a `parent-child` row would create a cycle.
+    ///
+    /// Stored parent rows are `child -> parent`, while dependency graph cycle
+    /// detection represents them as `parent -> child`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn would_create_parent_child_cycle(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+        blocking_only: bool,
+    ) -> Result<bool> {
+        Self::check_parent_child_cycle(&self.conn, child_id, parent_id, blocking_only)
     }
 
     /// Detect all cycles in the dependency graph.
@@ -12544,9 +12677,10 @@ impl SqliteStorage {
                 &dep.depends_on_id,
                 dep.dep_type.as_str(),
             )?;
-            // Deduplicate by (target, type) to allow multiple relationship types
-            // between the same issues while preventing identical duplicates.
-            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
+            // Deduplicate by target because the dependencies table is keyed by
+            // (issue_id, depends_on_id). Type-distinct duplicates would be
+            // ignored by insertion anyway.
+            if seen_deps.insert(dep.depends_on_id.as_str()) {
                 unique_deps.push(dep);
             }
         }
@@ -12762,6 +12896,14 @@ impl crate::validation::DependencyStore for SqliteStorage {
         depends_on_id: &str,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
         Self::check_cycle(&self.conn, issue_id, depends_on_id, true)
+    }
+
+    fn would_create_parent_child_cycle(
+        &self,
+        child_id: &str,
+        parent_id: &str,
+    ) -> std::result::Result<bool, crate::error::BeadsError> {
+        Self::check_parent_child_cycle(&self.conn, child_id, parent_id, true)
     }
 }
 
@@ -15611,6 +15753,214 @@ mod tests {
                 .get_dependencies("bd-bulk-cycle-c")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_add_dependency_existing_pair_skips_cycle_check() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-existing-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-existing-b", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-existing-a", "bd-existing-b", "related", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-existing-b", "bd-existing-a", "blocks", "tester")
+            .unwrap();
+
+        let added = storage
+            .add_dependency("bd-existing-a", "bd-existing-b", "blocks", "tester")
+            .expect("existing pair should return unchanged instead of false cycle");
+
+        assert!(!added);
+        let dep_types: Vec<String> = storage
+            .get_dependencies_full("bd-existing-a")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types, vec!["related".to_string()]);
+    }
+
+    #[test]
+    fn test_bulk_dependency_import_ignores_existing_pairs_before_cycle_check() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue("bd-bulk-existing-a", "A", Status::Open, 2, None, t1, None);
+        let issue_b = make_issue("bd-bulk-existing-b", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-bulk-existing-a",
+                "bd-bulk-existing-b",
+                "related",
+                "tester",
+            )
+            .unwrap();
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-existing-a".to_string(),
+                        depends_on_id: "bd-bulk-existing-b".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-bulk-existing-b".to_string(),
+                        depends_on_id: "bd-bulk-existing-a".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .expect("ignored duplicate pair should not create a false proposed cycle");
+
+        assert_eq!(inserted, 1);
+        let dep_types_a: Vec<String> = storage
+            .get_dependencies_full("bd-bulk-existing-a")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types_a, vec!["related".to_string()]);
+        assert_eq!(
+            storage.get_dependencies("bd-bulk-existing-b").unwrap(),
+            vec!["bd-bulk-existing-a".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parent_child_cycle_check_allows_existing_parent_to_child_blocker_edge() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let parent = make_issue(
+            "bd-pc-cycle-parent",
+            "Parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let child = make_issue(
+            "bd-pc-cycle-child",
+            "Child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+
+        storage
+            .add_dependency(
+                "bd-pc-cycle-parent",
+                "bd-pc-cycle-child",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .would_create_cycle("bd-pc-cycle-child", "bd-pc-cycle-parent", true)
+                .unwrap(),
+            "standard edge semantics would see the existing parent -> child blocker path"
+        );
+        assert!(
+            !storage
+                .would_create_parent_child_cycle("bd-pc-cycle-child", "bd-pc-cycle-parent", true)
+                .unwrap(),
+            "parent-child semantics must check the prospective parent -> child graph edge"
+        );
+        assert!(
+            storage
+                .add_dependency(
+                    "bd-pc-cycle-child",
+                    "bd-pc-cycle-parent",
+                    "parent-child",
+                    "tester",
+                )
+                .unwrap()
+        );
+        assert!(
+            storage.detect_blocking_cycles().unwrap().is_empty(),
+            "duplicate parent -> child graph edges are acyclic"
+        );
+    }
+
+    #[test]
+    fn test_parent_child_cycle_check_rejects_reversed_hierarchy_cycle() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
+
+        let parent = make_issue(
+            "bd-pc-cycle-existing-parent",
+            "Existing parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let child = make_issue(
+            "bd-pc-cycle-existing-child",
+            "Existing child",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency(
+                "bd-pc-cycle-existing-child",
+                "bd-pc-cycle-existing-parent",
+                "parent-child",
+                "tester",
+            )
+            .unwrap();
+
+        assert!(
+            storage
+                .would_create_parent_child_cycle(
+                    "bd-pc-cycle-existing-parent",
+                    "bd-pc-cycle-existing-child",
+                    true,
+                )
+                .unwrap(),
+            "making the existing parent a child of its child must be rejected"
+        );
+        let error = storage
+            .add_dependency(
+                "bd-pc-cycle-existing-parent",
+                "bd-pc-cycle-existing-child",
+                "parent-child",
+                "tester",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, BeadsError::DependencyCycle { .. }),
+            "unexpected reversed hierarchy error: {error:?}"
+        );
+        assert_eq!(
+            storage
+                .get_parent_id("bd-pc-cycle-existing-parent")
+                .unwrap(),
+            None
         );
     }
 

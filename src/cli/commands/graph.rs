@@ -332,16 +332,23 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
                 if !dependency.dep_type.affects_ready_work() {
                     continue;
                 }
-                let dep_id = &dependency.depends_on_id;
+                let (dependent_id, dependency_id) = if matches!(
+                    dependency.dep_type,
+                    crate::model::DependencyType::ParentChild
+                ) {
+                    (dependency.depends_on_id.as_str(), issue.id.as_str())
+                } else {
+                    (issue.id.as_str(), dependency.depends_on_id.as_str())
+                };
                 // Only include edges within our issue set
-                if issue_set.contains(dep_id) {
-                    adj.entry(issue.id.clone())
+                if issue_set.contains(dependency_id) && issue_set.contains(dependent_id) {
+                    adj.entry(dependent_id.to_string())
                         .or_default()
-                        .push(dep_id.clone());
-                    adj.entry(dep_id.clone())
+                        .push(dependency_id.to_string());
+                    adj.entry(dependency_id.to_string())
                         .or_default()
-                        .push(issue.id.clone());
-                    blocking_edges.push((issue.id.clone(), dep_id.clone()));
+                        .push(dependent_id.to_string());
+                    blocking_edges.push((dependent_id.to_string(), dependency_id.to_string()));
                 }
             }
         }
@@ -378,7 +385,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
 
         // Calculate depths using longest path from roots
         // Roots are issues with no unsatisfied dependencies within the component
-        let component_set: HashSet<&String> = component_nodes.iter().collect();
+        let component_set: HashSet<&str> = component_nodes.iter().map(String::as_str).collect();
         let (mut depths, mut roots) =
             calculate_depths(&all_dependencies, &component_nodes, &component_set);
 
@@ -410,7 +417,9 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
         // Filter edges to this component
         let component_edges: Vec<(String, String)> = blocking_edges
             .iter()
-            .filter(|(from, to)| component_set.contains(from) && component_set.contains(to))
+            .filter(|(from, to)| {
+                component_set.contains(from.as_str()) && component_set.contains(to.as_str())
+            })
             .cloned()
             .collect();
 
@@ -519,7 +528,7 @@ fn graph_all(storage: &SqliteStorage, compact: bool, dot: bool, ctx: &OutputCont
 fn calculate_depths(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
-    component_set: &HashSet<&String>,
+    component_set: &HashSet<&str>,
 ) -> (HashMap<String, usize>, Vec<String>) {
     let dependency_edges = dependency_edges_for_component(all_dependencies, nodes, component_set);
     let dependency_map = build_dependency_map(nodes, &dependency_edges);
@@ -535,7 +544,7 @@ fn calculate_depths(
 fn dependency_edges_for_component(
     all_dependencies: &HashMap<String, Vec<crate::model::Dependency>>,
     nodes: &[String],
-    component_set: &HashSet<&String>,
+    component_set: &HashSet<&str>,
 ) -> Vec<(String, String)> {
     let mut dependency_edges = Vec::new();
 
@@ -546,8 +555,17 @@ fn dependency_edges_for_component(
                     continue;
                 }
 
-                if component_set.contains(&dependency.depends_on_id) {
-                    dependency_edges.push((node_id.clone(), dependency.depends_on_id.clone()));
+                let (dependent_id, dependency_id) = if matches!(
+                    dependency.dep_type,
+                    crate::model::DependencyType::ParentChild
+                ) {
+                    (dependency.depends_on_id.as_str(), node_id.as_str())
+                } else {
+                    (node_id.as_str(), dependency.depends_on_id.as_str())
+                };
+
+                if component_set.contains(dependency_id) && component_set.contains(dependent_id) {
+                    dependency_edges.push((dependent_id.to_string(), dependency_id.to_string()));
                 }
             }
         }
@@ -1849,7 +1867,7 @@ mod tests {
 
         let all_dependencies = storage.get_all_dependency_records().unwrap();
         let nodes = vec!["bd-a".to_string(), "bd-b".to_string()];
-        let component_set: HashSet<&String> = nodes.iter().collect();
+        let component_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
 
         let (depths, roots) = calculate_depths(&all_dependencies, &nodes, &component_set);
         assert!(roots.is_empty());
@@ -2017,6 +2035,76 @@ mod tests {
                 "bd-b".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_graph_parent_child_edges_use_blocker_direction() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = chrono::Utc::now();
+
+        for (id, title) in [("bd-parent", "Parent"), ("bd-child", "Child")] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: title.to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                created_at: t1,
+                updated_at: t1,
+                ..Default::default()
+            };
+            storage.create_issue(&issue, "test").unwrap();
+        }
+
+        storage
+            .add_dependency("bd-child", "bd-parent", "parent-child", "tester")
+            .unwrap();
+
+        let child = storage
+            .get_issue("bd-child")
+            .unwrap()
+            .expect("child issue should exist");
+        let child_traversal = collect_single_graph(&storage, "bd-child", &child)
+            .expect("child graph traversal should work");
+        assert_eq!(
+            child_traversal.traversal_order,
+            vec!["bd-child".to_string(), "bd-parent".to_string()]
+        );
+        assert_eq!(
+            child_traversal.edges,
+            vec![("bd-parent".to_string(), "bd-child".to_string())],
+            "parent-child rows are stored child -> parent but block parent -> child"
+        );
+
+        let parent = storage
+            .get_issue("bd-parent")
+            .unwrap()
+            .expect("parent issue should exist");
+        let parent_traversal = collect_single_graph(&storage, "bd-parent", &parent)
+            .expect("parent graph traversal should work");
+        assert_eq!(
+            parent_traversal.traversal_order,
+            vec!["bd-parent".to_string()]
+        );
+        assert!(
+            parent_traversal.edges.is_empty(),
+            "a child is not a dependent of its parent in the blocker graph"
+        );
+
+        let all_dependencies = storage.get_all_dependency_records().unwrap();
+        let nodes = vec!["bd-parent".to_string(), "bd-child".to_string()];
+        let component_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
+        let dependency_edges =
+            dependency_edges_for_component(&all_dependencies, &nodes, &component_set);
+        assert_eq!(
+            dependency_edges,
+            vec![("bd-parent".to_string(), "bd-child".to_string())]
+        );
+
+        let (depths, roots) = calculate_depths(&all_dependencies, &nodes, &component_set);
+        assert_eq!(roots, vec!["bd-child".to_string()]);
+        assert_eq!(depths.get("bd-child"), Some(&0));
+        assert_eq!(depths.get("bd-parent"), Some(&1));
     }
 
     #[test]
