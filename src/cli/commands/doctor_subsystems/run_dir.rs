@@ -94,6 +94,8 @@ fn make_executable(_path: &Path) -> std::io::Result<()> {
 pub struct RunDir {
     /// Stable run identifier (ISO-8601 + short hash).
     pub run_id: String,
+    /// Workspace root whose files this run may restore.
+    pub repo_root: PathBuf,
     /// `<runs_root>/<run-id>/`.
     pub root: PathBuf,
     /// `<root>/backups/`.
@@ -178,6 +180,7 @@ pub fn create_run_dir(repo_root: &Path) -> Result<RunDir, BeadsError> {
 
     Ok(RunDir {
         run_id,
+        repo_root: repo_root.to_path_buf(),
         root,
         backups,
         actions_file,
@@ -373,6 +376,7 @@ fn fsync_dir(dir: &Path) -> Result<(), BeadsError> {
 ///
 /// Returns [`BeadsError::Io`] for write/permission failures.
 pub fn write_undo_sh(run: &RunDir) -> Result<(), BeadsError> {
+    let repo_root_assignment = undo_repo_root_assignment(run);
     let script = format!(
         r#"#!/usr/bin/env bash
 # br doctor undo — pure-bash fallback for run {run_id}
@@ -387,7 +391,7 @@ set -euo pipefail
 run_dir="$(cd "$(dirname "$0")" && pwd)"
 actions="${{run_dir}}/actions.jsonl"
 backups="${{run_dir}}/backups"
-repo_root="$(cd "${{run_dir}}/../../.." && pwd)"
+{repo_root_assignment}
 
 if [[ ! -s "${{actions}}" ]]; then
   echo "no actions.jsonl entries — nothing to undo" >&2
@@ -411,9 +415,13 @@ tac "${{actions}}" | while read -r line; do
       ;;
     rename)
       # Rename op moved <rel> -> <rename_to>; reverse it.
-      if [[ -n "${{rename_to}}" && -e "${{rename_to}}" ]]; then
+      rename_source="${{rename_to}}"
+      if [[ -n "${{rename_source}}" && "${{rename_source}}" != /* ]]; then
+        rename_source="${{repo_root}}/${{rename_source}}"
+      fi
+      if [[ -n "${{rename_source}}" && -e "${{rename_source}}" ]]; then
         mkdir -p "$(dirname "${{repo_root}}/${{rel}}")"
-        mv "${{rename_to}}" "${{repo_root}}/${{rel}}"
+        mv "${{rename_source}}" "${{repo_root}}/${{rel}}"
       fi
       ;;
     db_exec|db_migrate)
@@ -428,11 +436,32 @@ done
 echo "undo complete for run {run_id}" >&2
 "#,
         run_id = run.run_id,
+        repo_root_assignment = repo_root_assignment,
     );
 
     fs::write(&run.undo_script, script).map_err(BeadsError::Io)?;
     make_executable(&run.undo_script).map_err(BeadsError::Io)?;
     Ok(())
+}
+
+fn undo_repo_root_assignment(run: &RunDir) -> String {
+    let default_runs_root = run.repo_root.join(".doctor").join("runs");
+    if run.root.starts_with(default_runs_root) {
+        return r#"repo_root="$(cd "${run_dir}/../../.." && pwd)""#.to_string();
+    }
+
+    format!("repo_root={}", shell_single_quote_path(&run.repo_root))
+}
+
+fn shell_single_quote_path(path: &Path) -> String {
+    shell_single_quote(path.to_string_lossy().as_ref())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(all(test, unix))]
@@ -533,6 +562,61 @@ mod tests {
         let body = fs::read_to_string(&run.undo_script).unwrap();
         assert!(body.starts_with("#!/usr/bin/env bash"));
         assert!(body.contains(&run.run_id));
+        assert!(
+            body.contains(r#"rename_source="${rename_to}""#),
+            "rename undo must normalize the recorded destination before mv"
+        );
+        assert!(
+            body.contains(r#"rename_source="${repo_root}/${rename_source}""#),
+            "relative rename destinations must be resolved from repo_root"
+        );
+    }
+
+    #[test]
+    fn write_undo_sh_keeps_relative_repo_root_for_default_layout() {
+        let tmp = unique_temp_root("undo-default-root");
+
+        let run = create_run_dir(tmp.path()).expect("create run");
+        write_undo_sh(&run).expect("write undo");
+
+        let body = fs::read_to_string(&run.undo_script).unwrap();
+        assert!(
+            body.contains(r#"repo_root="$(cd "${run_dir}/../../.." && pwd)""#),
+            "default in-repo run dirs should keep the move-tolerant repo_root derivation"
+        );
+    }
+
+    #[test]
+    fn write_undo_sh_embeds_repo_root_for_redirected_run_dir() {
+        let repo = unique_temp_root("undo-repo-root");
+        let redirected = unique_temp_root("undo-redirected");
+        let run_root = redirected.path().join("runs").join("run-one");
+        fs::create_dir_all(&run_root).expect("create redirected run root");
+        let run = RunDir {
+            run_id: "run-one".to_string(),
+            repo_root: repo.path().to_path_buf(),
+            root: run_root.clone(),
+            backups: run_root.join("backups"),
+            actions_file: run_root.join("actions.jsonl"),
+            report_file: run_root.join("report.json"),
+            undo_script: run_root.join("undo.sh"),
+            latest_link: redirected.path().join("latest"),
+        };
+
+        write_undo_sh(&run).expect("write undo");
+
+        let body = fs::read_to_string(&run.undo_script).unwrap();
+        assert!(
+            body.contains(&format!(
+                "repo_root={}",
+                shell_single_quote_path(repo.path())
+            )),
+            "redirected run dirs must restore against the original workspace root"
+        );
+        assert!(
+            !body.contains(r#"repo_root="$(cd "${run_dir}/../../.." && pwd)""#),
+            "redirected run dirs cannot infer repo_root from the artifact path"
+        );
     }
 
     /// Verifies the env-override path without mutating process env

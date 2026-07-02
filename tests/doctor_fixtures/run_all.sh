@@ -19,6 +19,11 @@
 #   REPLAY_IDEMPOTENCE — if "1", run --repair a second time and require
 #                        newly-created replay run actions to be empty
 #   REPLAY_IDEMPOTENCE_SKIP — space-separated fixture names to skip for replay
+#
+# Fixture-local .fixture_env keys:
+#   BR_DOCTOR_FIXTURE_PATH_PREPEND — prepend dirs to PATH for env-sensitive checks
+#   BR_DOCTOR_FIXTURE_REPAIR_ARGS — extra whitespace-separated args for the
+#                                   harness's `br doctor --repair` invocations
 
 set -uo pipefail
 
@@ -139,6 +144,31 @@ run_fixture() {
         return 1
     fi
 
+    # Fixture-local environment overlays. Keep this deliberately narrow:
+    # the runner still invokes the real binary via TOOL_BIN, while a fixture
+    # can prepend synthetic executables to PATH for detectors that inspect the
+    # operator shell environment. Fixtures can also opt into extra repair args
+    # for fixers whose public contract requires an explicit flag, such as
+    # `--unsafe-auto-fix`.
+    local fixture_repair_args=()
+    if [ -f "$tmp/.fixture_env" ]; then
+        local fixture_path_prepend=""
+        local fixture_env_line=""
+        while IFS= read -r fixture_env_line; do
+            case "$fixture_env_line" in
+                BR_DOCTOR_FIXTURE_PATH_PREPEND=*)
+                    fixture_path_prepend="${fixture_env_line#BR_DOCTOR_FIXTURE_PATH_PREPEND=}"
+                    ;;
+                BR_DOCTOR_FIXTURE_REPAIR_ARGS=*)
+                    read -ra fixture_repair_args <<<"${fixture_env_line#BR_DOCTOR_FIXTURE_REPAIR_ARGS=}"
+                    ;;
+            esac
+        done < "$tmp/.fixture_env"
+        if [ -n "$fixture_path_prepend" ]; then
+            doctor_env+=(PATH="$fixture_path_prepend:${PATH:-}")
+        fi
+    fi
+
     # Stage 2: detect-stage assertions.
     if ! ( cd "$tmp" && "${doctor_env[@]}" bash "$assert_sh" "$tmp" detect ) \
             > "$diag/detect.stdout" 2> "$diag/detect.stderr"; then
@@ -152,7 +182,12 @@ run_fixture() {
     local runs_dir="$tmp/.doctor/runs"
     local before_first_repair="$diag/runs_before_first_repair"
     list_run_ids "$runs_dir" > "$before_first_repair"
-    ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor --repair --json ) \
+    local repair_cmd=(doctor --repair)
+    if [ "${#fixture_repair_args[@]}" -gt 0 ]; then
+        repair_cmd+=("${fixture_repair_args[@]}")
+    fi
+    repair_cmd+=(--json)
+    ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" "${repair_cmd[@]}" ) \
         > "$diag/repair.json" 2> "$diag/repair.stderr" || true
     # Snapshot the run-ids created by the FIRST --repair. Under
     # REPLAY_IDEMPOTENCE=1 a second --repair below may add a
@@ -206,7 +241,7 @@ run_fixture() {
             local before_runs="$diag/replay_runs.before"
             local after_runs="$diag/replay_runs.after"
             list_run_ids "$runs_dir" > "$before_runs"
-            ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" doctor --repair --json ) \
+            ( cd "$tmp" && "${doctor_env[@]}" "$TOOL_BIN" "${repair_cmd[@]}" ) \
                 > "$diag/repair_replay.json" 2> "$diag/repair_replay.stderr" || true
             list_run_ids "$runs_dir" > "$after_runs"
             local new_run_ids=()

@@ -456,29 +456,71 @@ fn chokepoint_round_trip_gitignore() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 1b — Repair fails closed if no reversible run-dir can be created
+// ---------------------------------------------------------------------------
+
+#[test]
+fn repair_refuses_when_run_dir_creation_fails() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    br_init(&root);
+    corrupt_root_gitignore(&root);
+
+    let gitignore = root.join(".gitignore");
+    let pre_gitignore = fs::read(&gitignore).expect("read pre-repair gitignore");
+    let bad_runs_root = root.join("doctor-runs-target-is-file");
+    fs::write(&bad_runs_root, b"not a directory").expect("seed invalid runs override");
+
+    let out = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
+        .env("BR_DOCTOR_RUNS_DIR", &bad_runs_root)
+        .output()
+        .expect("br doctor --repair spawned");
+
+    assert!(
+        !out.status.success(),
+        "repair must refuse when the reversible run-dir cannot be created\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("without a reversible repair session"),
+        "missing fail-closed repair-session error\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read(&gitignore).expect("read post-refusal gitignore"),
+        pre_gitignore,
+        "failed run-dir setup must not fall back to legacy .gitignore rewrite"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 2 — Dry-run writes no files
 //
 // IGNORED: WP3 is not yet complete. The current `--repair --dry-run` path
-// still leaks side effects through non-chokepointed code:
+// still creates repair-session scaffolding before it knows the run will
+// remain a pure dry-run:
 //
 //   - `create_run_dir` itself writes `.doctor/runs/<id>/...` and may
 //     append `.doctor/` to the root `.gitignore` *before* any chokepoint
 //     mutation runs. That mutation is unconditional.
-//   - the legacy DB-rebuild path (config.rs `Rebuilding SQLite database
-//     from JSONL`) executes regardless of `--dry-run` because it
-//     predates the chokepoint and routes its own writes directly through
-//     fsqlite.
 //
 // The dry-run contract is part of the WP3+WP4 mutate() chokepoint plan;
-// landing it requires (a) honoring `dry_run` in the legacy
-// `repair_database_from_jsonl` path and (b) deferring the
+// landing it requires deferring repair-session/run-dir creation and the
 // `ensure_doctor_in_gitignore` write until after the dry-run preflight
-// confirms an actual repair is needed. Until both land, this test would
-// fail for reasons unrelated to the chokepoint contract.
+// confirms an actual repair is needed. Until that lands, this test fails
+// before it reaches any database repair path.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "WP3 incomplete: --dry-run leaks writes via legacy DB-rebuild + ensure_doctor_in_gitignore (chokepoint not yet covering both paths)"]
+#[ignore = "WP3 incomplete: --dry-run still creates repair run-dir/gitignore scaffolding before pure dry-run preflight"]
 fn chokepoint_dry_run_writes_no_files() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().to_path_buf();
@@ -1361,13 +1403,13 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 12 (bead `beads_rust-8fud`): the four legacy `repair_*` paths
-// (VACUUM, REINDEX, blocked-cache rebuild, sidecar quarantine) now route
-// through the chokepoint's `record_legacy_op` helper, so any disk
-// mutation under those fixers must produce a `legacy_op` line in
-// `actions.jsonl` with a `fixer_id` that names the legacy fn AND a
-// verbatim backup under `<run-dir>/backups/<rel-path>` whose SHA-256
-// matches the recorded `before_hash`.
+// Test 12 (bead `beads_rust-8fud`): remaining legacy DB repair paths
+// (VACUUM, REINDEX, blocked-cache rebuild) route through the
+// chokepoint's `record_legacy_op` helper, so any disk mutation under
+// those fixers must produce a `legacy_op` line in `actions.jsonl` with
+// a `fixer_id` that names the legacy fn AND a verbatim backup under
+// `<run-dir>/backups/<rel-path>` whose SHA-256 matches the recorded
+// `before_hash`.
 //
 // We exercise the VACUUM path because it is the one most likely to
 // rewrite the DB file in ways that defeat naive byte-equality undo;
@@ -1448,7 +1490,7 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
     let actions = read_actions(&run_dir);
 
     // There must be at least one `legacy_op` action whose `fixer_id`
-    // names one of the four legacy fixers we just wired through.
+    // names one of the remaining legacy DB fixers.
     let legacy_actions: Vec<&Value> = actions
         .iter()
         .filter(|a| a["op"].as_str() == Some("legacy_op"))
@@ -1462,7 +1504,6 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         "repair_via_vacuum",
         "repair_partial_indexes",
         "repair_recoverable_db_state",
-        "repair_database_sidecars",
     ]
     .into_iter()
     .collect();

@@ -1384,9 +1384,9 @@ fn execute_atomic(
 ///    `cmp_strict` (same belt-and-braces tripwire `mutate()` uses).
 /// 4. Run the closure (the legacy fixer's actual work).
 /// 5. Read each target AGAIN and compute `after_hash`.
-/// 6. Append one `actions.jsonl` line per target with `op = "legacy_op"`
-///    and `fixer_id` = the supplied identifier so `br doctor undo` can
-///    replay the verbatim backup via its existing
+/// 6. Append one `actions.jsonl` line per target with `op = "legacy_op"`,
+///    `fixer_id` = the supplied identifier, and any closure error so
+///    `br doctor undo` can replay the verbatim backup via its existing
 ///    `WriteFile`-from-backup recovery (the default branch of
 ///    [`super::surface::restore_one`] handles any non-rename, non-db
 ///    op by restoring the verbatim backup).
@@ -1453,6 +1453,7 @@ where
     //     orphaned under the run-dir.
     let outcome = legacy();
     let legacy_ok = outcome.is_ok();
+    let legacy_error = outcome.as_ref().err().map(ToString::to_string);
     let finished_at_ns = now_ns().saturating_sub(ctx.start_ns);
 
     // (5) + (6): post-state hash + actions.jsonl line per path.
@@ -1479,7 +1480,7 @@ where
             ok: legacy_ok,
             rename_to: None,
             rolled_back: None,
-            error: None,
+            error: legacy_error.clone(),
         };
         let mut line = serde_json::to_string(&record).map_err(BeadsError::Json)?;
         // Tag whether the target file existed pre-mutation so `br
@@ -1655,6 +1656,46 @@ mod tests {
             fs::metadata(&actions_path).unwrap().len(),
             0,
             "dry-run legacy op must not append actions.jsonl"
+        );
+    }
+
+    #[test]
+    fn legacy_op_records_closure_error_in_actions_jsonl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("legacy-error.txt");
+        fs::write(&target, b"original").unwrap();
+
+        let (ctx, actions_path) = make_ctx(tmp.path(), false);
+
+        let err = record_legacy_op(&ctx, "legacy-error", &[&target], || {
+            fs::write(&target, b"partially mutated").map_err(BeadsError::Io)?;
+            Err(BeadsError::Config("legacy fixer failed".to_string()))
+        })
+        .expect_err("legacy closure error should be propagated");
+        assert!(
+            err.to_string().contains("legacy fixer failed"),
+            "unexpected propagated error: {err}"
+        );
+
+        let backup = ctx.run_dir.join("backups/.beads/legacy-error.txt");
+        assert_eq!(
+            fs::read(&backup).unwrap(),
+            b"original",
+            "legacy failure must still retain the pre-mutation backup"
+        );
+
+        let lines = fs::read_to_string(actions_path).unwrap();
+        let action: serde_json::Value = serde_json::from_str(lines.trim()).unwrap();
+        assert_eq!(action["op"], "legacy_op");
+        assert_eq!(action["fixer_id"], "legacy-error");
+        assert_eq!(action["ok"], false);
+        assert!(
+            action["error"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("legacy fixer failed")),
+            "legacy action should preserve closure error text: {action}"
         );
     }
 

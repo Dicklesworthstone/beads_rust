@@ -163,9 +163,9 @@ impl DoctorRepairSession {
     ///
     /// The legacy closure does whatever in-place SQL or rename work the
     /// fixer already implements; this wrapper only adds before/after
-    /// audit + verbatim backup. Callers receive the closure's `T`
-    /// unchanged so existing result-collection patterns
-    /// (`LocalRepairResult` accumulation, tracing emit) stay intact.
+    /// audit + verbatim backup. Use
+    /// [`Self::record_legacy_mutation_result`] when callers need to
+    /// receive the closure's output after the audit wrapper runs.
     fn record_legacy_mutation<F>(
         &mut self,
         fixer_id: &str,
@@ -175,10 +175,27 @@ impl DoctorRepairSession {
     where
         F: FnOnce() -> Result<()>,
     {
+        self.record_legacy_mutation_result(fixer_id, paths, legacy)
+            .map(|_| ())
+    }
+
+    fn record_legacy_mutation_result<T, F>(
+        &mut self,
+        fixer_id: &str,
+        paths: &[&Path],
+        legacy: F,
+    ) -> Result<Option<T>>
+    where
+        F: FnOnce() -> Result<T>,
+    {
         let prior_fixer = std::mem::replace(&mut self.ctx.fixer_id, fixer_id.to_string());
-        let result = chokepoint::record_legacy_op(&self.ctx, fixer_id, paths, legacy);
+        let mut legacy_output = None;
+        let result = chokepoint::record_legacy_op(&self.ctx, fixer_id, paths, || {
+            legacy_output = Some(legacy()?);
+            Ok(())
+        });
         self.ctx.fixer_id = prior_fixer;
-        result
+        result.map(|()| legacy_output)
     }
 }
 
@@ -1308,7 +1325,9 @@ fn repair_via_vacuum(
         }
     };
     if let Some(session) = session {
-        let result = session.record_legacy_mutation("repair_via_vacuum", &[db_path], || {
+        let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
+        let family_refs: Vec<&Path> = family_paths.iter().map(PathBuf::as_path).collect();
+        let result = session.record_legacy_mutation("repair_via_vacuum", &family_refs, || {
             do_vacuum(repair);
             Ok(())
         });
@@ -1433,7 +1452,7 @@ fn report_has_warn_level_page_anomaly(report: &DoctorReport) -> bool {
 }
 
 fn repair_report_verified(report: &DoctorReport) -> bool {
-    report.ok && !report_has_warn_level_page_anomaly(report)
+    report.ok && !has_non_ok(&report.checks)
 }
 
 /// Return true if any integrity check reported partial-index row mismatches
@@ -2165,9 +2184,44 @@ fn repair_database_from_jsonl(
     jsonl_path: &Path,
     cli: &config::CliOverrides,
     show_progress: bool,
+    session: Option<&mut DoctorRepairSession>,
 ) -> Result<DoctorRepairResult> {
     preflight_jsonl_rebuild_authority(jsonl_path)?;
 
+    if let Some(session) = session {
+        let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
+        let path_refs: Vec<&Path> = family_paths.iter().map(PathBuf::as_path).collect();
+        return match session.record_legacy_mutation_result(
+            "doctor.jsonl_rebuild",
+            &path_refs,
+            || {
+                repair_database_from_jsonl_after_preflight(
+                    beads_dir,
+                    db_path,
+                    jsonl_path,
+                    cli,
+                    show_progress,
+                )
+            },
+        )? {
+            Some(result) => Ok(result),
+            None => Err(BeadsError::Config(
+                "doctor --repair --dry-run skipped JSONL rebuild; no database writes were applied"
+                    .to_string(),
+            )),
+        };
+    }
+
+    repair_database_from_jsonl_after_preflight(beads_dir, db_path, jsonl_path, cli, show_progress)
+}
+
+fn repair_database_from_jsonl_after_preflight(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    cli: &config::CliOverrides,
+    show_progress: bool,
+) -> Result<DoctorRepairResult> {
     let bootstrap_layer = config::ConfigLayer::merge_layers(&[
         config::load_startup_config(beads_dir)?,
         cli.as_layer(),
@@ -2181,7 +2235,7 @@ fn repair_database_from_jsonl(
     // per-tombstone failure) and the cost of trying is a few selects.
     // Without this, repair would silently wipe any tombstone the user
     // deleted but had not yet flushed to JSONL (same hazard that
-    // `br sync --rebuild` preserves via snapshot/restore), since the
+    // `br sync --import-only --rebuild` preserves via snapshot/restore), since the
     // rebuild only replays what's in the JSONL.
     let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
 
@@ -2320,10 +2374,9 @@ fn write_jsonl_rebuild_verification_failed_marker(
     db_path: &Path,
     post_repair: &DoctorRun,
     repair_result: &DoctorRepairResult,
-    session: Option<&mut DoctorRepairSession>,
+    session: &mut DoctorRepairSession,
 ) -> Result<PathBuf> {
     let recovery_dir = config::recovery_dir_for_db_path(db_path, beads_dir);
-    fs::create_dir_all(&recovery_dir)?;
     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f");
     let marker_path = recovery_dir.join(format!(
         "{}.{stamp}{JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX}",
@@ -2351,19 +2404,15 @@ fn write_jsonl_rebuild_verification_failed_marker(
         "failed_checks": failed_checks,
     });
     let bytes = serde_json::to_vec_pretty(&payload)?;
-    if let Some(session) = session {
-        session.set_fixer("doctor.jsonl_rebuild_verification_marker");
-        chokepoint::mutate(
-            &session.ctx,
-            &marker_path,
-            Op::WriteFile {
-                content: bytes,
-                mode: None,
-            },
-        )?;
-    } else {
-        fs::write(&marker_path, bytes)?;
-    }
+    session.set_fixer("doctor.jsonl_rebuild_verification_marker");
+    chokepoint::mutate(
+        &session.ctx,
+        &marker_path,
+        Op::WriteFile {
+            content: bytes,
+            mode: None,
+        },
+    )?;
     Ok(marker_path)
 }
 
@@ -2419,7 +2468,7 @@ fn preserved_tombstones_for_doctor_rebuild(
 }
 
 fn repair_recoverable_db_state(
-    beads_dir: &Path,
+    _beads_dir: &Path,
     db_path: &Path,
     report: &DoctorReport,
     mut session: Option<&mut DoctorRepairSession>,
@@ -2430,7 +2479,7 @@ fn repair_recoverable_db_state(
     if report_has_sidecar_anomaly(report)
         && fixer_filter.allows("fm-state_files-wal-shm-sidecar-orphan")
     {
-        repair_database_sidecars(beads_dir, db_path, &mut repair, session.as_deref_mut());
+        repair_database_sidecars(db_path, &mut repair, session.as_deref_mut());
     }
 
     if !db_path.is_file() {
@@ -2472,8 +2521,10 @@ fn repair_recoverable_db_state(
         }
     };
     if let Some(session) = session {
+        let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
+        let family_refs: Vec<&Path> = family_paths.iter().map(PathBuf::as_path).collect();
         let result =
-            session.record_legacy_mutation("repair_recoverable_db_state", &[db_path], || {
+            session.record_legacy_mutation("repair_recoverable_db_state", &family_refs, || {
                 do_rebuild(&mut repair);
                 Ok(())
             });
@@ -2545,7 +2596,9 @@ fn repair_partial_indexes(
         }
     };
     if let Some(session) = session {
-        let result = session.record_legacy_mutation("repair_partial_indexes", &[db_path], || {
+        let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
+        let family_refs: Vec<&Path> = family_paths.iter().map(PathBuf::as_path).collect();
+        let result = session.record_legacy_mutation("repair_partial_indexes", &family_refs, || {
             do_reindex(repair);
             Ok(())
         });
@@ -2561,31 +2614,19 @@ fn repair_partial_indexes(
     }
 }
 
-// WP3 NOTE: the underlying file ops here are already non-destructive —
-// `config::quarantine_database_artifacts` calls
-// `rename_existing_paths_with_backup_verification`, which moves orphaned
-// `.wal`/`.shm`/`.journal` files into `.beads/.recovery/` rather than
-// deleting them. So this path already satisfies the AGENTS.md no-delete
-// invariant.
-//
-// What it doesn't yet do is record the quarantine moves in the per-run
-// `actions.jsonl`. Routing through `chokepoint::mutate()` requires
-// threading a `MutateContext` through the config-crate boundary and
-// refactoring `rename_existing_paths_with_backup_verification` to call
-// the chokepoint per-rename. That's a config-layer surgery beyond the
-// WP3 scope budget; deferred to WP4 alongside the SQL-routed
-// `Op::DbExec`/`Op::DbMigrate` migration. The quarantined paths still
-// surface to the operator via `LocalRepairResult::quarantined_artifacts`
-// and the `recovery_audit` JSON, so this is purely an
-// observability-completeness gap, not a correctness one.
+// Route anomalous SQLite sidecar quarantine through the doctor
+// chokepoint. These are removals from the live `.beads/` surface in
+// operator terms, so AGENTS.md's no-delete invariant means they must be
+// explicit `Op::Rename` moves into the per-run quarantine tree. That gives
+// `doctor undo` a concrete inverse move instead of a legacy audit line
+// that only points at the vanished source path.
 fn repair_database_sidecars(
-    beads_dir: &Path,
     db_path: &Path,
     repair: &mut LocalRepairResult,
     session: Option<&mut DoctorRepairSession>,
 ) {
     match inspect_database_sidecars(db_path) {
-        Ok(_) => quarantine_anomalous_sidecars(beads_dir, db_path, repair, session),
+        Ok(_) => quarantine_anomalous_sidecars(db_path, repair, session),
         Err(err) => tracing::warn!(
             path = %db_path.display(),
             error = %err,
@@ -2595,7 +2636,6 @@ fn repair_database_sidecars(
 }
 
 fn quarantine_anomalous_sidecars(
-    beads_dir: &Path,
     db_path: &Path,
     repair: &mut LocalRepairResult,
     session: Option<&mut DoctorRepairSession>,
@@ -2611,43 +2651,48 @@ fn quarantine_anomalous_sidecars(
                 return;
             }
 
-            let do_quarantine = |repair: &mut LocalRepairResult, paths: BTreeSet<PathBuf>| {
-                match config::quarantine_database_artifacts(
-                    db_path,
-                    beads_dir,
-                    paths,
-                    "doctor-quarantine",
-                ) {
-                    Ok(quarantined) => {
-                        repair.quarantined_artifacts = quarantined
-                            .into_iter()
-                            .map(|path| path.display().to_string())
-                            .collect();
-                    }
-                    Err(err) => tracing::warn!(
-                        path = %db_path.display(),
-                        error = %err,
-                        "Failed to quarantine anomalous database sidecar artifacts"
-                    ),
-                }
+            let Some(session) = session else {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    "Skipping sidecar quarantine: no doctor repair session is available"
+                );
+                return;
             };
 
-            if let Some(session) = session {
-                let path_refs: Vec<&Path> = quarantine_paths.iter().map(PathBuf::as_path).collect();
-                let result =
-                    session.record_legacy_mutation("repair_database_sidecars", &path_refs, || {
-                        do_quarantine(repair, quarantine_paths.clone());
-                        Ok(())
-                    });
-                if let Err(err) = result {
+            session.set_fixer("doctor.database_sidecar_quarantine");
+            let mut quarantined = Vec::new();
+            for source in &quarantine_paths {
+                let Some(name) = source.file_name() else {
                     tracing::warn!(
-                        path = %db_path.display(),
-                        error = %err,
-                        "Failed to record sidecar-quarantine legacy-op audit; mutation still proceeded if possible"
+                        path = %source.display(),
+                        "Skipping sidecar quarantine candidate without a file name"
                     );
+                    continue;
+                };
+                let dest = session
+                    .run
+                    .root
+                    .join("quarantine")
+                    .join(".beads")
+                    .join(name);
+
+                match chokepoint::mutate(&session.ctx, source, Op::Rename { to: dest.clone() }) {
+                    Ok(result) if result.ok => {
+                        quarantined.push(dest.display().to_string());
+                    }
+                    Ok(_) => tracing::warn!(
+                        path = %source.display(),
+                        "Sidecar quarantine no-op"
+                    ),
+                    Err(err) => tracing::warn!(
+                        path = %source.display(),
+                        error = %err,
+                        "Failed to quarantine anomalous database sidecar artifact"
+                    ),
                 }
-            } else {
-                do_quarantine(repair, quarantine_paths);
+            }
+            if !quarantined.is_empty() {
+                repair.quarantined_artifacts = quarantined;
             }
         }
         Err(err) => tracing::warn!(
@@ -3134,6 +3179,28 @@ fn sqlite_wal_sidecar_path(db_path: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
+fn sqlite_journal_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push("-journal");
+    PathBuf::from(sidecar)
+}
+
+fn existing_sqlite_family_paths_for_legacy_op(db_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![db_path.to_path_buf()];
+    for sidecar in [
+        sqlite_wal_sidecar_path(db_path),
+        sqlite_shm_sidecar_path(db_path),
+        sqlite_journal_sidecar_path(db_path),
+    ] {
+        if fs::symlink_metadata(&sidecar)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            paths.push(sidecar);
+        }
+    }
+    paths
+}
+
 fn check_wal_oversized(db_path: &Path, checks: &mut Vec<CheckResult>) {
     let path = sqlite_wal_sidecar_path(db_path);
     let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -3252,18 +3319,19 @@ fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
     }
 
     let wal_path = sqlite_wal_sidecar_path(db_path);
-    if let Ok(meta) = fs::symlink_metadata(&wal_path)
+    truncate_oversized_regular_wal_if_needed(&wal_path)?;
+
+    Ok(())
+}
+
+fn truncate_oversized_regular_wal_if_needed(wal_path: &Path) -> Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(wal_path)
         && meta.is_file()
         && !meta.file_type().is_symlink()
         && meta.len() > WAL_OVERSIZED_BYTES
     {
-        return Err(BeadsError::internal(format!(
-            "doctor: WAL checkpoint reported complete but {} is still {} bytes",
-            wal_path.display(),
-            meta.len()
-        )));
+        OpenOptions::new().write(true).open(wal_path)?.set_len(0)?;
     }
-
     Ok(())
 }
 
@@ -6262,9 +6330,38 @@ fn check_issue_write_probe(conn: &Connection, checks: &mut Vec<CheckResult>) {
     ));
 }
 
+fn sqlite_readonly_immutable_uri(db_path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let absolute_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| db_path.to_path_buf(), |cwd| cwd.join(db_path))
+    };
+    let path = absolute_path.to_string_lossy();
+    let mut uri = String::with_capacity(path.len() + 32);
+    uri.push_str("file:");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b'~' => {
+                uri.push(char::from(byte));
+            }
+            #[cfg(windows)]
+            b'\\' => uri.push('/'),
+            #[cfg(windows)]
+            b':' => uri.push(':'),
+            _ => {
+                let _ = write!(&mut uri, "%{byte:02X}");
+            }
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
+}
+
 fn sqlite_cli_integrity_messages(db_path: &Path) -> Result<Vec<String>> {
     let output = Command::new("sqlite3")
-        .arg(db_path)
+        .arg(sqlite_readonly_immutable_uri(db_path))
         .arg("PRAGMA integrity_check;")
         .output()
         .map_err(|err| BeadsError::Config(format!("failed to run sqlite3: {err}")))?;
@@ -8032,8 +8129,9 @@ fn resolve_metadata_jsonl_target(beads_dir: &Path, jsonl_export: &str) -> PathBu
 ///
 /// When a [`DoctorRepairSession`] is provided, the rewrite is routed through
 /// the WP1 [`chokepoint::mutate`] (verbatim backup + `actions.jsonl` line +
-/// dry-run support). Otherwise (no session, or run-dir creation failed)
-/// we fall back to the legacy in-place atomic rewrite.
+/// dry-run support). In production `--repair` flow the session is required
+/// before this fixer runs; the no-session branch is retained for narrow unit
+/// tests that exercise the legacy writer directly.
 fn fix_root_gitignore_if_warned(
     beads_dir: &Path,
     report: &DoctorReport,
@@ -10773,23 +10871,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
-    // Build the per-run session once, lazily, when --repair is requested.
-    // Every WP3-rewired fixer threads its writes through `session.ctx`.
-    // If the run-dir cannot be created (e.g., the tree is read-only and the
-    // BR_DOCTOR_RUNS_DIR override was not set), we degrade gracefully:
-    // the repair flow falls back to its legacy in-place writes. This
-    // matches the project's no-regression rule for WP1→WP3.
+    // Build the per-run session once when --repair is requested. Every repaired
+    // write must have a run-dir, verbatim backup, and actions.jsonl trail. If
+    // the run-dir cannot be created, fail closed before any fixer can fall back
+    // to legacy in-place writes or accidentally ignore --dry-run.
     let mut session: Option<DoctorRepairSession> = if args.repair {
-        match DoctorRepairSession::new(beads_dir.parent().unwrap_or(&beads_dir), args.dry_run) {
-            Ok(sess) => Some(sess),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "Doctor repair session could not be created; falling back to legacy in-place writes"
-                );
-                None
-            }
-        }
+        let repo_root = beads_dir.parent().unwrap_or(&beads_dir);
+        Some(DoctorRepairSession::new(repo_root, args.dry_run).map_err(|err| {
+            BeadsError::Config(format!(
+                "Cannot run doctor --repair without a reversible repair session: failed to create doctor run directory ({err}). No repair writes were applied. Set {} to a writable directory if the workspace is read-only.",
+                run_dir::ENV_RUNS_DIR
+            ))
+        })?)
     } else {
         None
     };
@@ -11599,6 +11692,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         jsonl_path,
         cli,
         !ctx.is_json(),
+        session.as_mut(),
     ) {
         Ok(result) => result,
         Err(err) => {
@@ -11626,12 +11720,18 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let verification_failure_marker = if post_repair_verified {
         None
     } else {
+        let marker_session = session.as_mut().ok_or_else(|| {
+            BeadsError::Config(
+                "Cannot write JSONL rebuild verification marker without a reversible repair session"
+                    .to_string(),
+            )
+        })?;
         Some(write_jsonl_rebuild_verification_failed_marker(
             &beads_dir,
             &paths.db_path,
             &post_repair,
             &repair_result,
-            session.as_mut(),
+            marker_session,
         )?)
     };
     let verification_failure_reason = verification_failure_marker.as_ref().map(|path| {
@@ -12714,13 +12814,15 @@ mod tests {
             fk_violations_cleaned: 0,
             verified_backups: Vec::new(),
         };
+        let mut session =
+            DoctorRepairSession::new(temp.path(), /* dry_run = */ false).expect("session builds");
 
         let marker = write_jsonl_rebuild_verification_failed_marker(
             &beads_dir,
             &db_path,
             &post_repair,
             &repair,
-            None,
+            &mut session,
         )?;
         assert!(
             marker
@@ -12744,6 +12846,24 @@ mod tests {
         let evidence = prior_jsonl_rebuild_failure_evidence(&beads_dir, &db_path)?
             .expect("marker should become repeated-repair evidence");
         assert_eq!(evidence.path, marker);
+
+        let actions = fs::read_to_string(&session.run.actions_file)?;
+        let action: serde_json::Value = serde_json::from_str(
+            actions
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .expect("actions.jsonl should contain the marker write"),
+        )?;
+        assert_eq!(action["op"], "write_file");
+        assert_eq!(
+            action["fixer_id"],
+            "doctor.jsonl_rebuild_verification_marker"
+        );
+        assert!(
+            action["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(".beads/.br_recovery/beads.db."))
+        );
         Ok(())
     }
 
@@ -15514,6 +15634,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_truncate_oversized_regular_wal_if_needed_shrinks_padded_sidecar() {
+        let temp = TempDir::new().unwrap();
+        let wal_path = temp.path().join("beads.db-wal");
+        fs::File::create(&wal_path)
+            .unwrap()
+            .set_len(WAL_OVERSIZED_BYTES + 1)
+            .unwrap();
+
+        truncate_oversized_regular_wal_if_needed(&wal_path).unwrap();
+
+        assert!(
+            fs::metadata(&wal_path).map_or(0, |meta| meta.len()) <= WAL_OVERSIZED_BYTES,
+            "complete checkpoint fallback must shrink padded WAL sidecars"
+        );
+    }
+
     fn create_valid_oversized_wal(db_path: &Path) -> Connection {
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         conn.execute("PRAGMA journal_mode = WAL").unwrap();
@@ -17772,6 +17909,43 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_readonly_immutable_uri_escapes_uri_control_bytes() {
+        let uri = sqlite_readonly_immutable_uri(Path::new("/tmp/br doctor/a b?c#d%.db"));
+
+        assert_eq!(
+            uri,
+            "file:/tmp/br%20doctor/a%20b%3Fc%23d%25.db?mode=ro&immutable=1"
+        );
+    }
+
+    #[test]
+    fn sqlite_cli_integrity_does_not_create_shm_sidecar() -> Result<()> {
+        if Command::new("sqlite3").arg("-version").output().is_err() {
+            return Ok(());
+        }
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.to_string_lossy()));
+        fs::write(&db_path, b"this is not a SQLite")?;
+        fs::write(&wal_path, b"synthetic wal")?;
+
+        assert!(!shm_path.exists(), "test precondition violated");
+        let result = sqlite_cli_integrity_messages(&db_path);
+        assert!(
+            result.is_err(),
+            "malformed database should still surface an integrity failure"
+        );
+        assert!(
+            !shm_path.exists(),
+            "sqlite3 integrity fallback must not create a live SHM sidecar"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_check_recovery_artifacts_warns_on_preserved_database_family() -> Result<()> {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -17827,11 +18001,14 @@ mod tests {
             }],
         };
 
+        let mut session =
+            DoctorRepairSession::new(temp.path(), /* dry_run = */ false).expect("session builds");
+
         let repair = repair_recoverable_db_state(
             &beads_dir,
             &db_path,
             &report,
-            None,
+            Some(&mut session),
             &FixerFilter::default(),
         );
         assert!(
@@ -17839,17 +18016,40 @@ mod tests {
             "expected local repair to quarantine the orphan SHM sidecar"
         );
 
-        let recovery_dir = config::recovery_dir_for_db_path(&db_path, &beads_dir);
-        let backups: Vec<_> = fs::read_dir(&recovery_dir)?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .collect();
+        let quarantine_path = session
+            .run
+            .root
+            .join("quarantine")
+            .join(".beads")
+            .join("beads.db-shm");
+        assert!(!shm_path.exists(), "orphan SHM source should be moved");
         assert!(
-            backups
+            quarantine_path.is_file(),
+            "orphan SHM should be quarantined at {}",
+            quarantine_path.display()
+        );
+        assert!(
+            repair
+                .quarantined_artifacts
                 .iter()
-                .any(|name| name.starts_with("beads.db-shm.")
-                    && name.ends_with(".doctor-quarantine")),
-            "expected quarantined SHM backup in recovery dir: {backups:?}"
+                .any(|path| path == &quarantine_path.display().to_string()),
+            "repair result should report the chokepoint quarantine path: {:?}",
+            repair.quarantined_artifacts
+        );
+
+        let actions = fs::read_to_string(&session.run.actions_file)?;
+        let action: serde_json::Value = serde_json::from_str(
+            actions
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .expect("actions.jsonl should contain the sidecar rename"),
+        )?;
+        assert_eq!(action["op"], "rename");
+        assert_eq!(action["fixer_id"], "doctor.database_sidecar_quarantine");
+        assert_eq!(action["path"], ".beads/beads.db-shm");
+        assert_eq!(
+            action["rename_to"].as_str(),
+            Some(quarantine_path.to_string_lossy().as_ref())
         );
         Ok(())
     }
@@ -18169,6 +18369,7 @@ mod tests {
             &jsonl_path,
             &config::CliOverrides::default(),
             false,
+            None,
         )
         .unwrap_err();
         let err_msg = err.to_string();
@@ -18223,6 +18424,7 @@ mod tests {
             &jsonl_path,
             &config::CliOverrides::default(),
             false,
+            None,
         )
         .unwrap_err();
         let err_msg = err.to_string();
@@ -18275,6 +18477,7 @@ mod tests {
             &jsonl_path,
             &config::CliOverrides::default(),
             false,
+            None,
         )
         .unwrap_err();
         let err_msg = err.to_string();
@@ -18365,6 +18568,7 @@ mod tests {
             &jsonl_path,
             &config::CliOverrides::default(),
             false,
+            None,
         )
         .unwrap();
 
@@ -18374,6 +18578,274 @@ mod tests {
         assert_eq!(
             reopened.get_config("issue_prefix").unwrap().as_deref(),
             Some("proj")
+        );
+    }
+
+    #[test]
+    fn test_repair_database_from_jsonl_records_legacy_op_when_session_present() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-old", "Old"), "tester")
+                .unwrap();
+        }
+        let pre_rebuild_db = fs::read(&db_path).unwrap();
+
+        let issue = sample_issue("bd-new", "New");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let mut session = DoctorRepairSession::new(temp.path(), false).unwrap();
+        let result = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+            Some(&mut session),
+        )
+        .unwrap();
+
+        assert_eq!(result.imported, 1);
+
+        let backup = session.run.root.join("backups").join(".beads/beads.db");
+        assert_eq!(fs::read(&backup).unwrap(), pre_rebuild_db);
+
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let mut found_jsonl_rebuild_action = false;
+        for line in actions.lines() {
+            let action: serde_json::Value = serde_json::from_str(line).unwrap();
+            if action["op"] == "legacy_op"
+                && action["fixer_id"] == "doctor.jsonl_rebuild"
+                && action["path"] == ".beads/beads.db"
+                && action["ok"] == true
+            {
+                found_jsonl_rebuild_action = true;
+            }
+        }
+        assert!(
+            found_jsonl_rebuild_action,
+            "expected a successful doctor.jsonl_rebuild action; got {actions}"
+        );
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert!(
+            reopened.get_issue("bd-new").unwrap().is_some(),
+            "rebuilt database should contain the JSONL issue"
+        );
+    }
+
+    #[test]
+    fn test_existing_sqlite_family_paths_for_legacy_op_includes_only_existing_sidecars() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let shm_path = sqlite_shm_sidecar_path(&db_path);
+        let journal_path = sqlite_journal_sidecar_path(&db_path);
+
+        fs::write(&db_path, b"db").unwrap();
+        fs::write(&wal_path, b"wal").unwrap();
+        fs::write(&journal_path, b"journal").unwrap();
+
+        let paths = existing_sqlite_family_paths_for_legacy_op(&db_path);
+        assert_eq!(paths, vec![db_path, wal_path, journal_path]);
+        assert!(!paths.contains(&shm_path));
+    }
+
+    #[test]
+    fn test_repair_via_vacuum_records_existing_sqlite_family_paths() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-vac-family", "Vacuum family"), "tester")
+                .unwrap();
+        }
+
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let journal_path = sqlite_journal_sidecar_path(&db_path);
+        fs::write(&wal_path, b"wal-before-vacuum").unwrap();
+        fs::write(&journal_path, b"journal-before-vacuum").unwrap();
+
+        let mut session = DoctorRepairSession::new(temp.path(), false).unwrap();
+        let mut repair = LocalRepairResult::default();
+        repair_via_vacuum(&db_path, &mut repair, Some(&mut session));
+
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let action_paths: BTreeSet<String> = actions
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|action| {
+                action["op"] == "legacy_op" && action["fixer_id"] == "repair_via_vacuum"
+            })
+            .map(|action| action["path"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            action_paths,
+            BTreeSet::from([
+                ".beads/beads.db".to_string(),
+                ".beads/beads.db-wal".to_string(),
+                ".beads/beads.db-journal".to_string(),
+            ]),
+            "VACUUM legacy audit must cover the existing SQLite file family; actions={actions}"
+        );
+        assert_eq!(
+            fs::read(session.run.root.join("backups/.beads/beads.db-wal")).unwrap(),
+            b"wal-before-vacuum"
+        );
+        assert_eq!(
+            fs::read(session.run.root.join("backups/.beads/beads.db-journal")).unwrap(),
+            b"journal-before-vacuum"
+        );
+    }
+
+    #[test]
+    fn test_repair_partial_indexes_records_existing_sqlite_family_paths() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .create_issue(&sample_issue("bd-ri-family", "Index family"), "tester")
+                .unwrap();
+        }
+
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let journal_path = sqlite_journal_sidecar_path(&db_path);
+        fs::write(&wal_path, b"wal-prestate").unwrap();
+        fs::write(&journal_path, b"journal-prestate").unwrap();
+
+        let mut session = DoctorRepairSession::new(temp.path(), false).unwrap();
+        let mut repair = LocalRepairResult::default();
+        repair_partial_indexes(&db_path, &mut repair, Some(&mut session));
+
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let action_paths: BTreeSet<String> = actions
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|action| {
+                action["op"] == "legacy_op" && action["fixer_id"] == "repair_partial_indexes"
+            })
+            .map(|action| action["path"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            action_paths,
+            BTreeSet::from([
+                ".beads/beads.db".to_string(),
+                ".beads/beads.db-wal".to_string(),
+                ".beads/beads.db-journal".to_string(),
+            ]),
+            "REINDEX legacy audit must cover the existing SQLite file family; actions={actions}"
+        );
+        assert_eq!(
+            fs::read(session.run.root.join("backups/.beads/beads.db-wal")).unwrap(),
+            b"wal-prestate"
+        );
+        assert_eq!(
+            fs::read(session.run.root.join("backups/.beads/beads.db-journal")).unwrap(),
+            b"journal-prestate"
+        );
+    }
+
+    #[test]
+    fn test_repair_recoverable_db_state_records_existing_sqlite_family_paths() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let blocker = sample_issue("bd-cache-blocker", "Cache blocker");
+            let target = sample_issue("bd-cache-target", "Cache target");
+            storage.create_issue(&blocker, "tester").unwrap();
+            storage.create_issue(&target, "tester").unwrap();
+            storage
+                .add_dependency(&target.id, &blocker.id, "blocks", "tester")
+                .unwrap();
+            assert!(storage.ensure_blocked_cache_fresh().unwrap());
+            storage
+                .execute_test_sql(
+                    "UPDATE blocked_issues_cache
+                     SET blocked_by = '[\"bd-other:open\"]'
+                     WHERE issue_id = 'bd-cache-target'",
+                )
+                .unwrap();
+        }
+
+        let wal_path = sqlite_wal_sidecar_path(&db_path);
+        let journal_path = sqlite_journal_sidecar_path(&db_path);
+        fs::write(&wal_path, b"wal-before-blocked-cache").unwrap();
+        fs::write(&journal_path, b"journal-before-blocked-cache").unwrap();
+
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.recoverable_anomalies".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(BLOCKED_CACHE_CONTENT_MISMATCH_FINDING.to_string()),
+                details: Some(serde_json::json!({
+                    "findings": [BLOCKED_CACHE_CONTENT_MISMATCH_FINDING],
+                })),
+            }],
+        };
+        let mut session = DoctorRepairSession::new(temp.path(), false).unwrap();
+        let repair = repair_recoverable_db_state(
+            &beads_dir,
+            &db_path,
+            &report,
+            Some(&mut session),
+            &FixerFilter::default(),
+        );
+
+        assert!(repair.blocked_cache_rebuilt);
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        let action_paths: BTreeSet<String> = actions
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|action| {
+                action["op"] == "legacy_op" && action["fixer_id"] == "repair_recoverable_db_state"
+            })
+            .map(|action| action["path"].as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            action_paths,
+            BTreeSet::from([
+                ".beads/beads.db".to_string(),
+                ".beads/beads.db-wal".to_string(),
+                ".beads/beads.db-journal".to_string(),
+            ]),
+            "blocked-cache rebuild legacy audit must cover the existing SQLite file family; actions={actions}"
+        );
+        assert_eq!(
+            fs::read(session.run.root.join("backups/.beads/beads.db-wal")).unwrap(),
+            b"wal-before-blocked-cache"
+        );
+        assert_eq!(
+            fs::read(session.run.root.join("backups/.beads/beads.db-journal")).unwrap(),
+            b"journal-before-blocked-cache"
         );
     }
 
@@ -18566,6 +19038,47 @@ mod tests {
         };
 
         assert!(!warning_repair_verified(&report, true, false));
+    }
+
+    #[test]
+    fn repair_report_verified_rejects_residual_warn_findings() {
+        let dirty_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sync.metadata".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Local changes pending export".to_string()),
+                details: Some(serde_json::json!({
+                    "finding_id": "fm-state_files-dirty-flag-divergence",
+                    "dirty_issues": 1,
+                    "pending_export": true,
+                })),
+            }],
+        };
+
+        assert!(
+            !repair_report_verified(&dirty_report),
+            "repair verification must not claim success while WARN findings remain"
+        );
+
+        let clean_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sync.metadata".to_string(),
+                status: CheckStatus::Ok,
+                message: None,
+                details: Some(serde_json::json!({
+                    "dirty_issues": 0,
+                    "pending_export": false,
+                })),
+            }],
+        };
+
+        assert!(repair_report_verified(&clean_report));
     }
 
     // ========================================================================
@@ -18914,7 +19427,7 @@ mod tests {
         // file, it must instead `Op::Rename` it into the per-run
         // quarantine area. We exercise this via a direct chokepoint
         // call against an orphan `.wal` sidecar — the same kind of file
-        // the legacy sidecar repair targets.
+        // the sidecar repair targets.
         let tmp = TempDir::new().unwrap();
         let beads_dir = tmp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();

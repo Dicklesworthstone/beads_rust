@@ -6,7 +6,7 @@ corrupt workspaces end-to-end:
 ```
 corrupt.sh  →  br doctor --json  →  assert.sh (Stage A: detect)
             →  br doctor --repair --json  →  assert.sh (Stage B: post-repair)
-            →  br doctor undo latest --json (best-effort round-trip)
+            →  br doctor undo <first-repair-run-id> --json (best-effort round-trip)
 ```
 
 Each fixture directory contains:
@@ -20,7 +20,8 @@ Each fixture directory contains:
     - `assert.sh DIR detect` — runs `br doctor --json` and asserts the
       planted failure surfaces in the expected check name + status.
     - `assert.sh DIR post_repair` — invoked after `br doctor --repair`; asserts
-      the failure is gone (or quarantined / repaired per the contract).
+      the failure is gone, quarantined, repaired, or truthfully still present
+      for detect-only findings whose contract forbids an automatic fixer.
 - `README.md` — one-paragraph description: what FM, what severity, expected
   detect status, expected exit codes.
 
@@ -38,8 +39,15 @@ serves as the chokepoint regression test.
 
 `run_all.sh` is the bash driver. It iterates each fixture directory, sets up a
 tempdir, runs the recipe, runs the assertions, runs `--repair` + assertions,
-then runs `undo latest` and verifies it exits cleanly. Exits 0 if every
-fixture passes; non-zero on first failure with a clear diagnostic.
+then undoes the first repair run and verifies it exits cleanly. Exits 0 if
+every fixture passes; non-zero on first failure with a clear diagnostic.
+
+Fixtures that need to exercise a public repair opt-in can write
+`BR_DOCTOR_FIXTURE_REPAIR_ARGS=...` to `<target_dir>/.fixture_env` during
+`corrupt.sh`. The runner appends those whitespace-separated arguments to both
+repair invocations. This is for flags that are part of the doctor contract
+itself, such as `--unsafe-auto-fix`; ordinary fixtures should keep the default
+`br doctor --repair --json` path.
 
 Per AGENTS.md: no `Command::new("git")` from runtime `br` code; the fixture
 recipes themselves may call `git init` for setup (e.g. to materialise a real
@@ -57,11 +65,9 @@ per the chokepoint contract:
 REPLAY_IDEMPOTENCE=1 bash tests/doctor_fixtures/run_all.sh
 ```
 
-The gate is opt-in because a second `--repair` creates a new run-dir which
-becomes "latest", causing Stage 5's `undo latest` to reverse the no-op replay
-instead of the original repair. Fixtures whose `post_undo` stage asserts
-"undo restored the corruption" (e.g., the gitignore fixers) are incompatible
-with the replay flow under the standard harness.
+The harness pins Stage 5 undo to the first repair run-id, so a no-op replay run
+does not shadow the meaningful repair. The gate remains opt-in because some
+fixtures are genuinely non-idempotent or intentionally detect-only.
 
 **Per-fixture opt-out**: drop a `.skip_replay` marker file in the fixture
 directory. The gitignore fixtures ship with one and document why.
@@ -70,7 +76,5 @@ directory. The gitignore fixtures ship with one and document why.
 specific fixtures regardless of the marker file.
 
 The pass-3 design intent is to fold a per-fixture replay assertion INTO
-each fixture's `assert.sh post_repair` stage in a future pass, sidestepping
-the run-dir / undo-latest interaction. Until then the env-gated suite-level
-gate is the documented mechanism.
-
+each fixture's `assert.sh post_repair` stage in a future pass. Until then
+the env-gated suite-level gate is the documented mechanism.
