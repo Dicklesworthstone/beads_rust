@@ -7,19 +7,21 @@ use super::{
     report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
-    DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
-    OutputFormat, resolve_output_format_basic_with_outer_mode,
+    DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepImportArgs, DepListArgs,
+    DepRemoveArgs, DepTreeArgs, OutputFormat, resolve_output_format_basic_with_outer_mode,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode, Theme};
-use crate::storage::SqliteStorage;
+use crate::storage::{BulkDependencyInsert, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Execute the dep command.
@@ -36,6 +38,7 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     match command {
         DepCommands::Add(args) => execute_dep_add(args, json, cli, ctx, &beads_dir),
+        DepCommands::Import(args) => execute_dep_import(args, json, cli, ctx, &beads_dir),
         DepCommands::Remove(args) => execute_dep_remove(args, json, cli, ctx, &beads_dir),
         DepCommands::List(args) => execute_dep_list(args, cli, ctx, &beads_dir),
         DepCommands::Tree(args) => execute_dep_tree(args, json, cli, ctx, &beads_dir),
@@ -72,7 +75,7 @@ pub fn execute_with_storage_ctx(
             dep_cycles(args, &storage_ctx.storage, json, ctx)?;
             Ok(true)
         }
-        DepCommands::Add(_) | DepCommands::Remove(_) => Ok(false),
+        DepCommands::Add(_) | DepCommands::Import(_) | DepCommands::Remove(_) => Ok(false),
     }
 }
 
@@ -124,6 +127,21 @@ fn execute_dep_remove(
         local_beads_dir,
         auto_flush_external,
     )
+}
+
+fn execute_dep_import(
+    args: &DepImportArgs,
+    _json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    let mut storage_ctx = config::open_storage_with_cli(local_beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let dependencies = read_dependency_imports(&args.path)?;
+    dep_import(args, &dependencies, &mut storage_ctx, &actor, ctx)
 }
 
 fn execute_dep_list(
@@ -311,6 +329,157 @@ struct DepActionResult {
     action: String,
 }
 
+/// JSON output for dep import operations.
+#[derive(Serialize)]
+struct DepImportResult {
+    status: String,
+    input_path: String,
+    imported: usize,
+    skipped: usize,
+    total_edges: usize,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepImportLine {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    issue_id: Option<String>,
+    #[serde(default)]
+    depends_on_id: Option<String>,
+    #[serde(default, rename = "type", alias = "dep_type")]
+    dep_type: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<DepImportNestedDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepImportNestedDependency {
+    #[serde(default)]
+    issue_id: Option<String>,
+    depends_on_id: String,
+    #[serde(default, rename = "type", alias = "dep_type")]
+    dep_type: Option<String>,
+}
+
+fn read_dependency_imports(path: &Path) -> Result<Vec<BulkDependencyInsert>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut dependencies = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        dependencies.extend(parse_dependency_import_line(&line, line_number)?);
+    }
+
+    if dependencies.is_empty() {
+        return Err(BeadsError::validation(
+            "path",
+            format!(
+                "dependency import file '{}' did not contain any dependency edges",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+fn parse_dependency_import_line(
+    line: &str,
+    line_number: usize,
+) -> Result<Vec<BulkDependencyInsert>> {
+    let record: DepImportLine = serde_json::from_str(line).map_err(|err| {
+        BeadsError::validation(
+            "jsonl",
+            format!("invalid dependency JSONL at line {line_number}: {err}"),
+        )
+    })?;
+
+    let mut dependencies = Vec::new();
+
+    if let (Some(issue_id), Some(depends_on_id)) = (&record.issue_id, &record.depends_on_id) {
+        dependencies.push(build_bulk_dependency_insert(
+            issue_id,
+            depends_on_id,
+            record.dep_type.as_deref(),
+            line_number,
+        )?);
+    }
+
+    if !record.dependencies.is_empty() {
+        let parent_issue_id = record.id.as_deref().or(record.issue_id.as_deref()).ok_or_else(|| {
+            BeadsError::validation(
+                "issue_id",
+                format!(
+                    "dependency JSONL line {line_number} has a dependencies array but no id or issue_id"
+                ),
+            )
+        })?;
+
+        for dep in &record.dependencies {
+            let issue_id = dep.issue_id.as_deref().unwrap_or(parent_issue_id);
+            dependencies.push(build_bulk_dependency_insert(
+                issue_id,
+                &dep.depends_on_id,
+                dep.dep_type.as_deref(),
+                line_number,
+            )?);
+        }
+    }
+
+    if dependencies.is_empty() {
+        if record.id.is_some() {
+            return Ok(dependencies);
+        }
+
+        return Err(BeadsError::validation(
+            "jsonl",
+            format!(
+                "dependency JSONL line {line_number} must contain either issue_id + depends_on_id or an issue record with dependencies"
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+fn build_bulk_dependency_insert(
+    issue_id: &str,
+    depends_on_id: &str,
+    dep_type: Option<&str>,
+    line_number: usize,
+) -> Result<BulkDependencyInsert> {
+    let issue_id = issue_id.trim();
+    let depends_on_id = depends_on_id.trim();
+    if issue_id.is_empty() || depends_on_id.is_empty() {
+        return Err(BeadsError::validation(
+            "jsonl",
+            format!("dependency JSONL line {line_number} contains an empty issue id"),
+        ));
+    }
+
+    let dep_type = dep_type.unwrap_or("blocks").trim();
+    let dep_type = parse_dependency_type(dep_type)
+        .map_err(|err| BeadsError::WithContext {
+            context: format!("dependency JSONL line {line_number} has an invalid type"),
+            source: Box::new(err),
+        })?
+        .as_str()
+        .to_string();
+
+    Ok(BulkDependencyInsert {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type,
+    })
+}
+
 fn finalize_dep_mutation(
     storage_ctx: &mut config::OpenStorageResult,
     cache_dirty: bool,
@@ -470,6 +639,61 @@ fn dep_add(
         let depends_on_id_display = dep_display_text(&depends_on_id);
         ctx.info(&format!(
             "Dependency already exists: {issue_id_display} → {depends_on_id_display}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn dep_import(
+    args: &DepImportArgs,
+    dependencies: &[BulkDependencyInsert],
+    storage_ctx: &mut config::OpenStorageResult,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let total_edges = dependencies.len();
+    let probe_issue_id = dependencies.first().map(|dep| dep.issue_id.as_str());
+    let imported = retry_mutation_with_jsonl_recovery(
+        storage_ctx,
+        true,
+        "dep import",
+        probe_issue_id,
+        |storage| storage.add_dependencies_bulk_for_import(dependencies, actor),
+    )?;
+
+    finalize_dep_mutation(storage_ctx, imported > 0, "dep import")?;
+    if let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+
+    if ctx.is_json() || ctx.is_toon() {
+        let result = DepImportResult {
+            status: "ok".to_string(),
+            input_path: args.path.display().to_string(),
+            imported,
+            skipped: total_edges.saturating_sub(imported),
+            total_edges,
+            action: "imported".to_string(),
+        };
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    } else {
+        ctx.success(&format!(
+            "Imported {} dependencies from {} ({} skipped)",
+            imported,
+            dep_display_text(&args.path.display().to_string()),
+            total_edges.saturating_sub(imported)
         ));
     }
 
@@ -1837,6 +2061,163 @@ mod tests {
     fn test_normalize_dep_type_filter_rejects_unknown_types() {
         let err = normalize_dep_type_filter("parent_child").unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "type"));
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_accepts_edge_jsonl() {
+        let deps = parse_dependency_import_line(
+            r#"{"issue_id":"bd-a","depends_on_id":"bd-b","type":"parent-child"}"#,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deps,
+            vec![BulkDependencyInsert {
+                issue_id: "bd-a".to_string(),
+                depends_on_id: "bd-b".to_string(),
+                dep_type: "parent-child".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_accepts_issue_jsonl_dependencies() {
+        let deps = parse_dependency_import_line(
+            r#"{"id":"bd-a","dependencies":[{"depends_on_id":"bd-b","type":"blocks"},{"issue_id":"bd-c","depends_on_id":"bd-d","dep_type":"waits-for"}]}"#,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deps,
+            vec![
+                BulkDependencyInsert {
+                    issue_id: "bd-a".to_string(),
+                    depends_on_id: "bd-b".to_string(),
+                    dep_type: "blocks".to_string(),
+                },
+                BulkDependencyInsert {
+                    issue_id: "bd-c".to_string(),
+                    depends_on_id: "bd-d".to_string(),
+                    dep_type: "waits-for".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_skips_issue_record_without_dependencies() {
+        let deps = parse_dependency_import_line(
+            r#"{"id":"bd-no-deps","title":"plain issue record","status":"open"}"#,
+            13,
+        )
+        .unwrap();
+
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_rejects_dependency_array_without_owner() {
+        let error = parse_dependency_import_line(
+            r#"{"dependencies":[{"depends_on_id":"bd-target","type":"blocks"}]}"#,
+            17,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "issue_id"),
+            "unexpected missing-owner error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_rejects_empty_edge_ids() {
+        let error = parse_dependency_import_line(
+            r#"{"issue_id":"  ","depends_on_id":"bd-target","type":"blocks"}"#,
+            19,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "jsonl"),
+            "unexpected empty-id error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_dep_import_bulk_storage_path_inserts_parent_child_batch() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-parent", "bd-child-a", "bd-child-b"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-child-a".to_string(),
+                        depends_on_id: "bd-parent".to_string(),
+                        dep_type: "parent-child".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-child-b".to_string(),
+                        depends_on_id: "bd-parent".to_string(),
+                        dep_type: "parent-child".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_dependencies("bd-child-a").unwrap(),
+            vec!["bd-parent".to_string()]
+        );
+        assert_eq!(
+            storage.get_dependencies("bd-child-b").unwrap(),
+            vec!["bd-parent".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_dep_import_bulk_storage_path_skips_type_distinct_duplicate_pairs() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-source", "bd-target"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-source".to_string(),
+                        depends_on_id: "bd-target".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-source".to_string(),
+                        depends_on_id: "bd-target".to_string(),
+                        dep_type: "related".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 1);
+        let dep_types: Vec<String> = storage
+            .get_dependencies_full("bd-source")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types, vec!["blocks".to_string()]);
     }
 
     #[test]

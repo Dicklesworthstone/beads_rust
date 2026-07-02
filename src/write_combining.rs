@@ -996,6 +996,7 @@ fn classify_reopen(args: &ReopenArgs) -> CommandCompatibility {
 fn classify_dependency(command: &DepCommands) -> CommandCompatibility {
     match command {
         DepCommands::Add(args) => classify_dependency_add(args),
+        DepCommands::Import(_) => CommandCompatibility::DirectOnly(DirectOnlyReason::FileInput),
         DepCommands::Remove(args) => classify_dependency_remove(args),
         DepCommands::List(_) | DepCommands::Tree(_) | DepCommands::Cycles(_) => {
             CommandCompatibility::DirectOnly(DirectOnlyReason::ReadOnly)
@@ -1801,6 +1802,21 @@ mod tests {
         assert_eq!(
             classify_command(&command),
             CommandCompatibility::DirectOnly(DirectOnlyReason::UnsupportedOption)
+        );
+    }
+
+    #[test]
+    fn dependency_import_stays_direct_file_input() {
+        let command = Commands::Dep {
+            command: DepCommands::Import(crate::cli::DepImportArgs {
+                path: "edges.jsonl".into(),
+                robot: false,
+            }),
+        };
+
+        assert_eq!(
+            classify_command(&command),
+            CommandCompatibility::DirectOnly(DirectOnlyReason::FileInput)
         );
     }
 

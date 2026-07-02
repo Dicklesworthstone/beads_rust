@@ -1158,6 +1158,66 @@ fn e2e_dotted_ids_survive_no_db_import_update_dep_and_flush() {
 }
 
 #[test]
+fn dep_import_auto_flushes_imported_edges_to_jsonl() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "dep_import_auto_flush_init");
+    assert_br_success(&init, "init failed");
+
+    let source = run_br(
+        &workspace,
+        ["create", "Bulk import source"],
+        "dep_import_auto_flush_source",
+    );
+    assert_br_success(&source, "source create failed");
+    let source_id = parse_created_id(&source.stdout);
+
+    let target = run_br(
+        &workspace,
+        ["create", "Bulk import target"],
+        "dep_import_auto_flush_target",
+    );
+    assert_br_success(&target, "target create failed");
+    let target_id = parse_created_id(&target.stdout);
+
+    let import_path = workspace.root.join("edges.jsonl");
+    fs::write(
+        &import_path,
+        format!(
+            "{{\"issue_id\":\"{}\",\"depends_on_id\":\"{}\",\"type\":\"blocks\"}}\n",
+            source_id, target_id
+        ),
+    )
+    .expect("write dependency import jsonl");
+
+    let import_arg = import_path.to_string_lossy().to_string();
+    let import = run_br(
+        &workspace,
+        ["dep", "import", import_arg.as_str(), "--robot"],
+        "dep_import_auto_flush_import",
+    );
+    assert_br_success(&import, "dep import failed");
+    let import_result: Value =
+        serde_json::from_str(&extract_json_payload(&import.stdout)).expect("parse import result");
+    assert_eq!(import_result["imported"].as_u64(), Some(1));
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let exported = read_jsonl_values(&jsonl_path);
+    let source_record = exported
+        .iter()
+        .find(|issue| issue["id"].as_str() == Some(source_id.as_str()))
+        .expect("source issue exported after dep import");
+    assert!(
+        source_record["dependencies"]
+            .as_array()
+            .is_some_and(|deps| deps.iter().any(|dep| {
+                dep["depends_on_id"].as_str() == Some(target_id.as_str())
+                    && dep["type"].as_str() == Some("blocks")
+            })),
+        "dep import should auto-flush imported edges into issues.jsonl"
+    );
+}
+
+#[test]
 fn e2e_no_db_mutations_succeed_with_large_export_hash_batches() {
     let _log = common::test_log("e2e_no_db_mutations_succeed_with_large_export_hash_batches");
     let workspace = BrWorkspace::new();

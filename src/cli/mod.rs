@@ -920,7 +920,7 @@ SAFETY GUARANTEES:
   • All writes use atomic temp-file-then-rename pattern
   • Safety guards prevent accidental data loss
 
-MODES (one required unless --status):
+MODES (one required):
   --flush-only    Export database to JSONL (safe by default)
   --import-only   Import JSONL into database (validates first)
   --merge         Three-way merge .beads/beads.base.jsonl + DB + JSONL
@@ -957,7 +957,7 @@ EXAMPLES:
   br sync --merge                Merge DB and JSONL changes
   br sync --merge --force-db     Keep local DB conflicts
   br sync --merge --force-jsonl  Keep JSONL conflicts
-  br sync --rebuild              Import + remove DB entries not in JSONL
+  br sync --import-only --rebuild Import + remove DB entries not in JSONL
   br sync --status               Show current sync status
   br sync --witness --json       Emit JSONL chunk witness")]
     Sync(SyncArgs),
@@ -1558,6 +1558,14 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.robot,
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
+        Commands::Dep { command } => match command {
+            DepCommands::Import(args) => args.robot,
+            DepCommands::Add(_)
+            | DepCommands::Remove(_)
+            | DepCommands::List(_)
+            | DepCommands::Tree(_)
+            | DepCommands::Cycles(_) => false,
+        },
         Commands::Gate { command } => match command {
             GateCommands::Report(args) => args.robot,
             GateCommands::List(args) => args.robot,
@@ -1786,6 +1794,8 @@ pub struct ShowArgs {
 pub enum DepCommands {
     /// Add a dependency: <issue> depends on <depends-on>
     Add(DepAddArgs),
+    /// Bulk import dependency edges from JSONL
+    Import(DepImportArgs),
     /// Remove a dependency
     #[command(visible_alias = "rm")]
     Remove(DepRemoveArgs),
@@ -1898,6 +1908,16 @@ pub struct DepAddArgs {
     /// Optional JSON metadata
     #[arg(long)]
     pub metadata: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct DepImportArgs {
+    /// JSONL file containing edge objects or issue records with dependencies
+    pub path: PathBuf,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2579,8 +2599,6 @@ pub struct SyncArgs {
     /// Export database to JSONL (DB → .beads/issues.jsonl)
     ///
     /// Writes all issues from `SQLite` database to JSONL format.
-    ///
-    /// This is the default if the database is newer than the JSONL file.
     #[arg(long, group = "sync_action")]
     pub flush_only: bool,
 

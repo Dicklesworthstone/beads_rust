@@ -482,6 +482,7 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         ],
         "dep" => &[
             "br dep add br-task br-blocker --type blocks --json",
+            "br dep import edges.jsonl --robot",
             "br dep list br-task --direction both --format json",
             "br dep cycles --blocking-only --json",
         ],
@@ -507,9 +508,8 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
 fn command_safety_notes(name: &str) -> &'static [&'static str] {
     match name {
         "comments" | "comments add" | "comments list" => comments_safety_notes(name),
-        "dep" | "dep add" | "dep remove" | "dep list" | "dep tree" | "dep cycles" => {
-            dep_safety_notes(name)
-        }
+        "dep" | "dep add" | "dep import" | "dep remove" | "dep list" | "dep tree"
+        | "dep cycles" => dep_safety_notes(name),
         "query" | "query save" | "query run" | "query list" | "query delete" => {
             query_safety_notes(name)
         }
@@ -597,6 +597,11 @@ fn dep_safety_notes(name: &str) -> &'static [&'static str] {
             "Default dependency type is `blocks`; use `--type parent-child` only for parent/child hierarchy.",
             "External dependency IDs must start with `external:` and are not locally resolved.",
         ],
+        "dep import" => &[
+            "Bulk-imports dependency edges from JSONL in one validated transaction.",
+            "Accepts either edge records with `issue_id` + `depends_on_id` or normal issue records with `dependencies` arrays.",
+            "Use this for large graphs instead of thousands of `dep add` processes.",
+        ],
         "dep remove" => &[
             "Removes the edge from `<issue>` to `<depends-on>`; it does not delete either issue.",
             "JSON output reports `not_found` when the dependency edge was absent.",
@@ -676,6 +681,15 @@ fn command_contract(name: &str) -> CommandContract {
                 "br dep add br-task br-blocker --type blocks --json",
                 "br dep add br-child br-parent --type parent-child --json",
                 "br dep add br-task external:repo-123 --metadata '{\"repo\":\"other\"}' --json",
+            ],
+        },
+        "dep import" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br dep import edges.jsonl --robot",
+                "br dep import .beads/issues.jsonl --robot",
             ],
         },
         "dep remove" => CommandContract {
