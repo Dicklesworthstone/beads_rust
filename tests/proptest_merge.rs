@@ -81,6 +81,17 @@ fn make_issue(
     }
 }
 
+fn notes_bytes(notes: &[(String, String)]) -> String {
+    let mut bytes = String::new();
+    for (id, note) in notes {
+        bytes.push_str(id);
+        bytes.push('\0');
+        bytes.push_str(note);
+        bytes.push('\n');
+    }
+    bytes
+}
+
 prop_compose! {
     fn arb_issue(id_suffix: &'static str)(
         title in "[A-Za-z0-9][A-Za-z0-9 ]{0,30}",
@@ -412,6 +423,74 @@ proptest! {
         // At most 1 action per ID (or 0 for NoAction/identical).
         prop_assert!(all_actions <= 1, "At most one action per ID, got {}", all_actions);
     }
+}
+
+#[test]
+fn three_way_merge_notes_are_byte_identical_across_context_order() {
+    fn context_from_order(ids: &[&str]) -> MergeContext {
+        let mut base = HashMap::new();
+        let mut left = HashMap::new();
+        let mut right = HashMap::new();
+
+        for id in ids {
+            base.insert(
+                (*id).to_string(),
+                make_issue(
+                    id,
+                    &format!("base {id}"),
+                    Status::Open,
+                    Priority(1),
+                    IssueType::Task,
+                    0,
+                ),
+            );
+            left.insert(
+                (*id).to_string(),
+                make_issue(
+                    id,
+                    &format!("local {id}"),
+                    Status::Open,
+                    Priority(1),
+                    IssueType::Task,
+                    20,
+                ),
+            );
+            right.insert(
+                (*id).to_string(),
+                make_issue(
+                    id,
+                    &format!("external {id}"),
+                    Status::Open,
+                    Priority(1),
+                    IssueType::Task,
+                    10,
+                ),
+            );
+        }
+
+        MergeContext::new(base, left, right)
+    }
+
+    let forward = three_way_merge(
+        &context_from_order(&["bd-c", "bd-a", "bd-e", "bd-b", "bd-d", "bd-f"]),
+        ConflictResolution::PreferNewer,
+        None,
+    );
+    let reverse = three_way_merge(
+        &context_from_order(&["bd-f", "bd-d", "bd-b", "bd-e", "bd-a", "bd-c"]),
+        ConflictResolution::PreferNewer,
+        None,
+    );
+
+    assert_eq!(notes_bytes(&forward.notes), notes_bytes(&reverse.notes));
+    assert_eq!(
+        forward
+            .notes
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["bd-a", "bd-b", "bd-c", "bd-d", "bd-e", "bd-f"],
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 
 use crate::util::hex_encode;
 use indicatif::ProgressBar;
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -2801,14 +2801,14 @@ pub fn auto_import_if_stale(
     // process flushes JSONL while another has pending local writes,
     // causing both `jsonl_newer` and `db_newer` to be true.
     //
-    // Explicit `br sync` still detects this as a hard conflict so the
+    // Explicit `br sync --merge` still detects this as a hard conflict so the
     // user can reconcile manually.
     if staleness.db_newer && !allow_stale {
         tracing::warn!(
             dirty_count = staleness.dirty_count,
             jsonl_mtime = ?staleness.jsonl_mtime,
             "Skipping auto-import: JSONL changed externally while {} local change(s) are pending. \
-             Run `br sync` to reconcile.",
+             Run `br sync --merge` to reconcile.",
             staleness.dirty_count,
         );
         return Ok(AutoImportResult::default());
@@ -3892,20 +3892,16 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Deduplicate dependencies: for each (issue_id, depends_on_id, dep_type) triple,
-    // keep only the most recent entry by created_at. This handles duplicate parent-child
-    // entries from reparenting or migration artifacts (see issue #159).
+    // Deduplicate dependencies by the database key (issue_id, depends_on_id),
+    // keeping only the most recent entry by created_at. This handles duplicate
+    // parent-child entries from reparenting or migration artifacts (see issue #159).
     if issue.dependencies.len() > 1 {
         use std::collections::HashMap;
-        // Build a map keyed by (issue_id, depends_on_id, dep_type), keeping the entry
-        // with the latest created_at for each triple.
-        let mut best: HashMap<(String, String, String), usize> = HashMap::new();
+        // The storage schema has one row per pair, so type-distinct duplicates
+        // cannot be preserved without a schema migration.
+        let mut best: HashMap<(String, String), usize> = HashMap::new();
         for (i, dep) in issue.dependencies.iter().enumerate() {
-            let key = (
-                dep.issue_id.clone(),
-                dep.depends_on_id.clone(),
-                dep.dep_type.as_str().to_string(),
-            );
+            let key = (dep.issue_id.clone(), dep.depends_on_id.clone());
             match best.get(&key) {
                 Some(&prev_idx) if issue.dependencies[prev_idx].created_at >= dep.created_at => {
                     // existing entry is newer or equal, skip
@@ -4173,7 +4169,9 @@ fn load_import_metadata_maps(storage: &SqliteStorage) -> Result<ImportMetadataMa
                 .entry(ext.clone())
                 .or_insert_with(|| issue_id.clone());
         }
-        if let Some(hash) = metadata.content_hash.as_ref() {
+        if metadata.status != crate::model::Status::Tombstone
+            && let Some(hash) = metadata.content_hash.as_ref()
+        {
             // Preserve the first matching issue to mirror the old query_row
             // collision path when multiple issues share the same content hash.
             id_by_hash
@@ -4776,8 +4774,8 @@ impl MergeContext {
 
     /// Get all unique issue IDs across all three states.
     #[must_use]
-    pub fn all_issue_ids(&self) -> std::collections::HashSet<String> {
-        let mut ids = std::collections::HashSet::new();
+    pub fn all_issue_ids(&self) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
         ids.extend(self.base.keys().cloned());
         ids.extend(self.left.keys().cloned());
         ids.extend(self.right.keys().cloned());
@@ -5759,7 +5757,9 @@ mod tests {
                     .entry(ext.clone())
                     .or_insert_with(|| issue_id.clone());
             }
-            if let Some(hash) = meta.content_hash.as_ref() {
+            if meta.status != Status::Tombstone
+                && let Some(hash) = meta.content_hash.as_ref()
+            {
                 id_by_hash
                     .entry(hash.clone())
                     .or_insert_with(|| issue_id.clone());
@@ -7577,6 +7577,45 @@ mod tests {
             assert_eq!(match_type, MatchType::ContentHash);
             assert_eq!(phase, 3);
         }
+    }
+
+    #[test]
+    fn test_detect_collision_ignores_tombstones_for_content_hash_match() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        let mut tombstone = make_issue_at("bd-tomb", "Same Tombstone Content", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(110));
+        tombstone.deleted_by = Some("tester".to_string());
+        tombstone.delete_reason = Some("old delete".to_string());
+        set_content_hash(&mut tombstone);
+        storage.upsert_issue_for_import(&tombstone).unwrap();
+
+        let mut incoming = make_issue_at("bd-new", "Same Tombstone Content", fixed_time(200));
+        incoming.status = Status::Tombstone;
+        incoming.deleted_at = Some(fixed_time(210));
+        incoming.deleted_by = Some("jsonl".to_string());
+        incoming.delete_reason = Some("incoming delete".to_string());
+        let computed_hash = crate::util::content_hash(&incoming);
+        assert_eq!(
+            tombstone.content_hash.as_deref(),
+            Some(computed_hash.as_str()),
+            "delete metadata must not affect content_hash"
+        );
+
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
+
+        assert!(
+            matches!(collision, CollisionResult::NewIssue),
+            "tombstones must not participate in content-hash collision matching: {collision:?}"
+        );
     }
 
     #[test]
