@@ -231,6 +231,18 @@ TOON/JSON schemas, MCP support, conformance checks, and sync safety tools are
 all part of the current scope. The focus is still local-first operation, explicit
 git/VCS handoff, and no background services installed behind your back.
 
+Agent-facing output contracts have a focused verifier:
+
+```bash
+BR_AGENT_CONTRACT_USE_RCH=1 ./scripts/verify-agent-contracts.sh
+```
+
+Run it before changing schema command metadata, CLI JSON/TOON output, MCP
+resources/tools/prompts, README/docs examples, or `agent_baseline/` artifacts.
+With `BR_AGENT_CONTRACT_USE_RCH=1`, the script delegates each Cargo target to
+`rch exec --`. The contract tests do not run git, project network calls, live
+Agent Mail, MCP clients, or fixture update modes.
+
 ---
 
 ## Comparison vs Alternatives
@@ -341,6 +353,15 @@ tools, resources, prompts, and structured recovery hints. MCP clients can read
 evidence shape as `br coordination status --json`; use the CLI snapshot flags
 when Agent Mail reservation or liveness evidence is required.
 
+The MCP tool surface is `list_issues`, `show_issue`, `create_issue`,
+`update_issue`, `close_issue`, `manage_dependencies`, and `project_overview`.
+The resource surface is `beads://project/info`, `beads://issues/{id}`,
+`beads://schema`, `beads://labels`, `beads://issues/ready`,
+`beads://issues/blocked`, `beads://issues/in_progress`,
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`, and
+`beads://events/recent`.
+
 ### Verify Installation
 
 ```bash
@@ -440,6 +461,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `dep add` | Add dependency | `br dep add br-child br-parent` |
+| `dep import` | Bulk import dependency JSONL | `br dep import edges.jsonl --robot` |
 | `dep remove` | Remove dependency | `br dep remove br-child br-parent` |
 | `dep list` | List dependencies | `br dep list br-abc123` |
 | `dep tree` | Dependency tree | `br dep tree br-abc123` |
@@ -644,13 +666,16 @@ Update issue        ──►      br update        ──►    SQLite UPDATE
 
 Query issues        ──►      br list          ──►    SQLite SELECT
 
-Export to git       ──►      br sync          ──►    Write JSONL
-                             --flush-only     ──►    Clear dirty flags
+Export to git       ──►      br sync --flush-only
+                                              ──►    Write JSONL + clear dirty flags
 
 Pull from git       ──►      git pull         ──►    JSONL updated
-                    ──►      br sync          ──►    Merge to SQLite
-                             --import-only
+                    ──►      br sync --import-only
+                                              ──►    Merge to SQLite
 ```
+
+Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
+`--merge`, `--status`, or `--witness` so the data direction is explicit.
 
 ### Safety Model
 
@@ -721,9 +746,9 @@ br sync --import-only --force
 br sync --import-only --rebuild
 ```
 
-`--rebuild` is an import-mode operation. It is not valid with `--flush-only` or
-`--merge`; after import it removes database entries that are absent from JSONL,
-while preserving deletion tombstones used by sync.
+`--rebuild` is an explicit import-mode operation. It is valid only with
+`--import-only`; after import it removes database entries that are absent from
+JSONL, while preserving deletion tombstones used by sync.
 
 ### Sync Issues After Git Merge
 

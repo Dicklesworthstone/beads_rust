@@ -4,250 +4,14 @@
   "schemas": {
     "BlockedIssue": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "BlockedIssue",
-      "description": "Blocked issue for blocked view.",
+      "title": "BlockedIssueOutput",
+      "description": "Minimal issue output for blocked command (bd parity).\n\nContains only the fields that bd's blocked command outputs, plus `blocked_by` info.\nDoes NOT include: `compaction_level`, `original_size`",
       "type": "object",
       "properties": {
-        "id": {
-          "description": "Unique ID (e.g., \"bd-abc123\").",
-          "type": "string"
-        },
-        "title": {
-          "description": "Title (1-500 chars).",
-          "type": "string"
-        },
-        "description": {
-          "description": "Detailed description.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "design": {
-          "description": "Technical design notes.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "acceptance_criteria": {
-          "description": "Acceptance criteria.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "notes": {
-          "description": "Additional notes.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "status": {
-          "description": "Workflow status.",
-          "$ref": "#/$defs/Status",
-          "default": "open"
-        },
-        "priority": {
-          "description": "Priority (0=Critical, 4=Backlog).",
-          "$ref": "#/$defs/Priority",
-          "default": 2
-        },
-        "issue_type": {
-          "description": "Issue type (bug, feature, etc.).",
-          "$ref": "#/$defs/IssueType",
-          "default": "task"
-        },
-        "assignee": {
-          "description": "Assigned user.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "owner": {
-          "description": "Issue owner.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "estimated_minutes": {
-          "description": "Estimated effort in minutes.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32"
-        },
-        "created_at": {
-          "description": "Creation timestamp.",
-          "type": "string",
-          "format": "date-time"
-        },
-        "created_by": {
-          "description": "Creator username.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "updated_at": {
-          "description": "Last update timestamp.",
-          "type": "string",
-          "format": "date-time"
-        },
-        "closed_at": {
-          "description": "Closure timestamp.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "close_reason": {
-          "description": "Reason for closure.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "closed_by_session": {
-          "description": "Session ID that closed this issue.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "due_at": {
-          "description": "Due date.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "defer_until": {
-          "description": "Defer until date.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "external_ref": {
-          "description": "External reference (e.g., JIRA-123).",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source_system": {
-          "description": "Source system for imported issues.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source_repo": {
-          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "source_repo_path": {
-          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "deleted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "deleted_by": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "delete_reason": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "original_type": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "compaction_level": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32",
-          "default": 0
-        },
-        "compacted_at": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "format": "date-time"
-        },
-        "compacted_at_commit": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "original_size": {
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "int32"
-        },
-        "sender": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "ephemeral": {
-          "type": "boolean"
-        },
-        "pinned": {
-          "type": "boolean"
-        },
-        "is_template": {
-          "type": "boolean"
-        },
-        "labels": {
+        "blocked_by": {
           "type": "array",
           "items": {
             "type": "string"
-          }
-        },
-        "dependencies": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Dependency"
-          }
-        },
-        "comments": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/Comment"
           }
         },
         "blocked_by_count": {
@@ -255,48 +19,54 @@
           "format": "uint",
           "minimum": 0
         },
-        "blocked_by": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "created_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "issue_type": {
+          "$ref": "#/$defs/IssueType"
+        },
+        "priority": {
+          "$ref": "#/$defs/Priority"
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
         }
       },
       "required": [
-        "id",
-        "title",
-        "created_at",
-        "updated_at",
+        "blocked_by",
         "blocked_by_count",
-        "blocked_by"
+        "created_at",
+        "id",
+        "issue_type",
+        "priority",
+        "status",
+        "title",
+        "updated_at"
       ],
       "$defs": {
-        "Status": {
-          "description": "Issue lifecycle status.",
-          "anyOf": [
-            {
-              "type": "string",
-              "enum": [
-                "open",
-                "in_progress",
-                "blocked",
-                "deferred",
-                "draft",
-                "closed",
-                "tombstone",
-                "pinned"
-              ]
-            },
-            {
-              "type": "string"
-            }
-          ]
-        },
-        "Priority": {
-          "description": "Issue priority (0=Critical, 4=Backlog).",
-          "type": "integer",
-          "format": "int32"
-        },
         "IssueType": {
           "description": "Issue type category.",
           "anyOf": [
@@ -317,108 +87,30 @@
             }
           ]
         },
-        "Dependency": {
-          "description": "Relationship between two issues.",
-          "type": "object",
-          "properties": {
-            "issue_id": {
-              "description": "The issue that has the dependency (source).",
-              "type": "string"
-            },
-            "depends_on_id": {
-              "description": "The issue being depended on (target).",
-              "type": "string"
-            },
-            "type": {
-              "description": "Type of dependency.",
-              "$ref": "#/$defs/DependencyType"
-            },
-            "created_at": {
-              "description": "Creation timestamp.",
-              "type": "string",
-              "format": "date-time"
-            },
-            "created_by": {
-              "description": "Creator.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "metadata": {
-              "description": "Optional metadata (JSON).",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "thread_id": {
-              "description": "Thread ID for conversation linking.",
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "issue_id",
-            "depends_on_id",
-            "type",
-            "created_at"
-          ]
+        "Priority": {
+          "description": "Issue priority (0=Critical, 4=Backlog).",
+          "type": "integer",
+          "format": "int32"
         },
-        "DependencyType": {
-          "description": "Dependency relationship type.",
+        "Status": {
+          "description": "Issue lifecycle status.",
           "anyOf": [
             {
               "type": "string",
               "enum": [
-                "blocks",
-                "parent-child",
-                "conditional-blocks",
-                "waits-for",
-                "related",
-                "discovered-from",
-                "replies-to",
-                "relates-to",
-                "duplicates",
-                "supersedes",
-                "caused-by"
+                "open",
+                "in_progress",
+                "blocked",
+                "deferred",
+                "draft",
+                "closed",
+                "tombstone",
+                "pinned"
               ]
             },
             {
               "type": "string"
             }
-          ]
-        },
-        "Comment": {
-          "description": "A comment on an issue.",
-          "type": "object",
-          "properties": {
-            "id": {
-              "type": "integer",
-              "format": "int64"
-            },
-            "issue_id": {
-              "type": "string"
-            },
-            "author": {
-              "type": "string"
-            },
-            "text": {
-              "type": "string"
-            },
-            "created_at": {
-              "type": "string",
-              "format": "date-time"
-            }
-          },
-          "required": [
-            "id",
-            "issue_id",
-            "author",
-            "text",
-            "created_at"
           ]
         }
       }
@@ -1765,6 +1457,28 @@
         }
       }
     },
+    "CountGroup": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "CountGroup",
+      "description": "Row emitted inside `br count --by <field> --json` under `groups[]`.\n\nKeep this in sync with `cli::commands::count::CountGroup`.",
+      "type": "object",
+      "properties": {
+        "group": {
+          "description": "Group label, for example a status, priority, type, assignee, or label.",
+          "type": "string"
+        },
+        "count": {
+          "description": "Number of matching issues in this group.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "group",
+        "count"
+      ]
+    },
     "ErrorEnvelope": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "title": "ErrorEnvelope",
@@ -1807,7 +1521,9 @@
           "required": [
             "code",
             "message",
-            "retryable"
+            "hint",
+            "retryable",
+            "context"
           ]
         }
       }
@@ -1974,6 +1690,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -2064,8 +1787,12 @@
       "required": [
         "id",
         "title",
+        "status",
+        "priority",
+        "issue_type",
         "created_at",
-        "updated_at"
+        "updated_at",
+        "compaction_level"
       ],
       "$defs": {
         "Status": {
@@ -2143,7 +1870,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -2382,6 +2109,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -2490,8 +2224,12 @@
       "required": [
         "id",
         "title",
+        "status",
+        "priority",
+        "issue_type",
         "created_at",
-        "updated_at"
+        "updated_at",
+        "compaction_level"
       ],
       "$defs": {
         "Status": {
@@ -2569,7 +2307,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -2709,6 +2447,27 @@
             "created_at": {
               "type": "string",
               "format": "date-time"
+            },
+            "agent_name": {
+              "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -2886,6 +2645,13 @@
             "null"
           ]
         },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "deleted_at": {
           "type": [
             "string",
@@ -2986,8 +2752,12 @@
       "required": [
         "id",
         "title",
+        "status",
+        "priority",
+        "issue_type",
         "created_at",
         "updated_at",
+        "compaction_level",
         "dependency_count",
         "dependent_count"
       ],
@@ -3067,7 +2837,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -3191,6 +2961,13 @@
         "issue_type": {
           "$ref": "#/$defs/IssueType"
         },
+        "labels": {
+          "description": "Labels attached to the issue.\n\nAlways emitted (as `[]` when empty) so downstream consumers can filter\n`br ready --json` output on labels the same way they filter\n`br list --json` (#309).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "notes": {
           "type": [
             "string",
@@ -3221,6 +2998,7 @@
         "created_at",
         "id",
         "issue_type",
+        "labels",
         "priority",
         "status",
         "title",
@@ -3396,8 +3174,7 @@
         }
       },
       "required": [
-        "summary",
-        "breakdowns"
+        "summary"
       ],
       "$defs": {
         "StatsSummary": {
@@ -3615,6 +3392,7 @@
         "id",
         "title",
         "depth",
+        "parent_id",
         "priority",
         "status",
         "truncated"
@@ -3654,7 +3432,15 @@
       "shape": "object",
       "jq_filter": ".count",
       "error_envelope_on_stderr": false,
-      "notes": "Scalar count under `.count`."
+      "notes": "Ungrouped `br count --json`; scalar count under `.count`. Grouped variants use the `count --by` entry."
+    },
+    "count --by": {
+      "shape": "object",
+      "jq_filter": ".groups[]",
+      "items_at": ".groups",
+      "item_schema": "CountGroup",
+      "error_envelope_on_stderr": false,
+      "notes": "For `br count --by <status|priority|type|assignee|label> --json`. The wrapper object also includes `total`."
     },
     "dep list": {
       "shape": "array",

@@ -365,6 +365,12 @@ fn write_toon_issue_source_fields<W: Write>(
         issue.source_system.as_deref(),
     )?;
     write_optional_toon_string_field(writer, line, "source_repo", issue.source_repo.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "source_repo_path",
+        issue.source_repo_path.as_deref(),
+    )?;
     write_optional_toon_datetime_field(writer, line, "deleted_at", issue.deleted_at.as_ref())?;
     write_optional_toon_string_field(writer, line, "deleted_by", issue.deleted_by.as_deref())?;
     write_optional_toon_string_field(
@@ -442,6 +448,11 @@ fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> 
     push_optional_toon_field(&mut fields, issue.external_ref.as_ref(), "external_ref");
     push_optional_toon_field(&mut fields, issue.source_system.as_ref(), "source_system");
     push_optional_toon_field(&mut fields, issue.source_repo.as_ref(), "source_repo");
+    push_optional_toon_field(
+        &mut fields,
+        issue.source_repo_path.as_ref(),
+        "source_repo_path",
+    );
     push_optional_toon_field(&mut fields, issue.deleted_at.as_ref(), "deleted_at");
     push_optional_toon_field(&mut fields, issue.deleted_by.as_ref(), "deleted_by");
     push_optional_toon_field(&mut fields, issue.delete_reason.as_ref(), "delete_reason");
@@ -528,6 +539,9 @@ fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: 
             push_toon_string_value(out, issue.source_system.as_deref().unwrap_or(""));
         }
         "source_repo" => push_toon_string_value(out, issue.source_repo.as_deref().unwrap_or("")),
+        "source_repo_path" => {
+            push_toon_string_value(out, issue.source_repo_path.as_deref().unwrap_or(""));
+        }
         "deleted_at" => push_optional_toon_datetime_value(out, issue.deleted_at.as_ref()),
         "deleted_by" => push_toon_string_value(out, issue.deleted_by.as_deref().unwrap_or("")),
         "delete_reason" => {

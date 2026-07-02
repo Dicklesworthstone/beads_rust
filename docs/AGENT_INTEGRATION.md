@@ -183,6 +183,46 @@ semantics diverge, `beads_rust-hu4b` when MCP metadata or payloads fall behind,
 and `beads_rust-8bq8` when agents need a single RCH-friendly verifier command
 sequence.
 
+### Agent Contract Drift Verifier
+
+Run the full agent-facing contract verifier before changing any surface that
+agents parse or copy:
+
+- `src/cli/commands/schema.rs` command metadata, schema names, `jq_filter`, or
+  `items_at` paths
+- CLI JSON or TOON output for agent-read commands
+- MCP resources, tools, prompts, descriptions, or representative payloads
+- README/docs examples that agents may copy
+- `agent_baseline/` schemas, JSON examples, TOON examples, help text, or journey
+  notes
+
+Agent sessions should run the verifier through RCH:
+
+```bash
+BR_AGENT_CONTRACT_USE_RCH=1 ./scripts/verify-agent-contracts.sh
+```
+
+The script itself only runs deterministic Cargo tests. With
+`BR_AGENT_CONTRACT_USE_RCH=1`, each Cargo target is delegated to `rch exec --`
+so agent sessions use the normal remote-compilation path when workers are
+available. The contract tests do not run git, project network calls, live Agent
+Mail, MCP stdio clients, background services, or fixture update modes. The
+script unsets `INSTA_UPDATE` and `UPDATE_AGENT_BASELINE` so a verification run
+detects drift instead of regenerating snapshots.
+
+The verifier currently covers:
+
+- schema document goldens: `schema_document_golden_json_all` and
+  `schema_document_golden_toon_all`
+- command-shape live fixture extraction:
+  `schema_command_shapes_match_live_json_outputs`
+- JSON/TOON semantic parity:
+  `agent_json_and_toon_outputs_match_semantically`
+- checked-in agent baselines:
+  `agent_baseline_snapshots_match_current_binary`
+- optional MCP metadata and payload contracts:
+  `cargo test --lib --features mcp mcp_contract`
+
 ---
 
 ## Workflow Patterns

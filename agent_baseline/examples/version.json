@@ -1,10 +1,9 @@
 {
-  "version": "0.2.10",
+  "version": "0.2.16",
   "build": "<build>",
-  "rust_version": "<rust_version>",
   "target": "<target>",
   "features": [
-    "self_update",
-    "mcp"
-  ]
+    "self_update"
+  ],
+  "rust_version": "<rust_version>"
 }

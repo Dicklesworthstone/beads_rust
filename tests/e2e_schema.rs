@@ -9,7 +9,11 @@ use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br, r
 use serde_json::Value;
 #[cfg(feature = "self_update")]
 use std::{fs, path::PathBuf};
+#[cfg(feature = "self_update")]
+use toon_rust::options::KeyFoldingMode;
 use toon_rust::try_decode as parse_toon;
+#[cfg(feature = "self_update")]
+use toon_rust::{EncodeOptions, JsonValue};
 
 #[cfg(feature = "self_update")]
 const UPDATE_AGENT_BASELINE_ENV: &str = "UPDATE_AGENT_BASELINE";
@@ -1047,7 +1051,7 @@ fn compare_agent_baseline_error(workspace: &BrWorkspace) {
     );
     compare_json_baseline(
         "errors/show_not_found.json",
-        &missing.stderr,
+        &missing.stdout,
         normalize_noop,
     );
 }
@@ -1111,9 +1115,15 @@ fn compare_json_baseline(relative_path: &str, actual: &str, normalize: fn(&mut V
 #[cfg(feature = "self_update")]
 fn compare_toon_baseline(relative_path: &str, actual: &str) {
     let path = baseline_path(relative_path);
-    let actual = with_trailing_newline(actual.trim_end());
+    let actual = actual.trim_end();
     if should_update_agent_baseline() {
-        fs::write(&path, actual).expect("update agent baseline TOON snapshot");
+        let mut normalized =
+            Value::from(parse_toon(actual, None).expect("valid generated TOON for agent baseline"));
+        normalize_issue_example_snapshot(&mut normalized);
+        let toon_value: JsonValue = normalized.into();
+        let encoded = toon_rust::encode(toon_value, Some(agent_baseline_toon_encode_options()));
+        fs::write(&path, with_trailing_newline(encoded.trim_end()))
+            .expect("update agent baseline TOON snapshot");
         return;
     }
 
@@ -1121,7 +1131,7 @@ fn compare_toon_baseline(relative_path: &str, actual: &str) {
     let mut expected =
         Value::from(parse_toon(&expected_raw, None).expect("valid agent baseline TOON snapshot"));
     let mut actual =
-        Value::from(parse_toon(&actual, None).expect("valid generated TOON for agent baseline"));
+        Value::from(parse_toon(actual, None).expect("valid generated TOON for agent baseline"));
     normalize_issue_example_snapshot(&mut expected);
     normalize_issue_example_snapshot(&mut actual);
 
@@ -1129,6 +1139,18 @@ fn compare_toon_baseline(relative_path: &str, actual: &str) {
         expected, actual,
         "agent_baseline/{relative_path} is stale; rerun with {UPDATE_AGENT_BASELINE_ENV}=1"
     );
+}
+
+#[cfg(feature = "self_update")]
+#[must_use]
+fn agent_baseline_toon_encode_options() -> EncodeOptions {
+    EncodeOptions {
+        indent: Some(2),
+        delimiter: None,
+        key_folding: Some(KeyFoldingMode::Safe),
+        flatten_depth: None,
+        replacer: None,
+    }
 }
 
 #[cfg(feature = "self_update")]

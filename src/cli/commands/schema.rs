@@ -18,14 +18,13 @@ use crate::cli::{
 use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
-    BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
+    BlockedIssueOutput, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
 use crate::{config, output};
 use chrono::{DateTime, Utc};
-use schemars::Schema;
-use schemars::schema_for;
+use schemars::{JsonSchema, Schema, generate::SchemaSettings};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -185,55 +184,61 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
 
     match target {
         SchemaTarget::All => {
-            schemas.insert("Issue", schema_for!(Issue));
-            schemas.insert("IssueWithCounts", schema_for!(IssueWithCounts));
-            schemas.insert("IssueDetails", schema_for!(IssueDetails));
-            schemas.insert("ReadyIssue", schema_for!(ReadyIssue));
-            schemas.insert("StaleIssue", schema_for!(StaleIssue));
-            schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
-            schemas.insert("TreeNode", schema_for!(TreeNode));
-            schemas.insert("CountGroup", schema_for!(CountGroup));
-            schemas.insert("Statistics", schema_for!(Statistics));
+            schemas.insert("Issue", schema_for_output::<Issue>());
+            schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
+            schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
+            schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
+            schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
+            schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+            schemas.insert("TreeNode", schema_for_output::<TreeNode>());
+            schemas.insert("CountGroup", schema_for_output::<CountGroup>());
+            schemas.insert("Statistics", schema_for_output::<Statistics>());
             schemas.insert(
                 "CoordinationStatusOutput",
-                schema_for!(CoordinationStatusOutput),
+                schema_for_output::<CoordinationStatusOutput>(),
             );
-            schemas.insert("CoordinationClaimRow", schema_for!(CoordinationClaimRow));
-            schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
+            schemas.insert(
+                "CoordinationClaimRow",
+                schema_for_output::<CoordinationClaimRow>(),
+            );
+            schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Issue => {
-            schemas.insert("Issue", schema_for!(Issue));
+            schemas.insert("Issue", schema_for_output::<Issue>());
         }
         SchemaTarget::IssueWithCounts => {
-            schemas.insert("IssueWithCounts", schema_for!(IssueWithCounts));
+            schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
         }
         SchemaTarget::IssueDetails => {
-            schemas.insert("IssueDetails", schema_for!(IssueDetails));
+            schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
         }
         SchemaTarget::ReadyIssue => {
-            schemas.insert("ReadyIssue", schema_for!(ReadyIssue));
+            schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
         }
         SchemaTarget::StaleIssue => {
-            schemas.insert("StaleIssue", schema_for!(StaleIssue));
+            schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
         }
         SchemaTarget::BlockedIssue => {
-            schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
+            schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
         }
         SchemaTarget::TreeNode => {
-            schemas.insert("TreeNode", schema_for!(TreeNode));
+            schemas.insert("TreeNode", schema_for_output::<TreeNode>());
         }
         SchemaTarget::Statistics => {
-            schemas.insert("Statistics", schema_for!(Statistics));
+            schemas.insert("Statistics", schema_for_output::<Statistics>());
         }
         SchemaTarget::CoordinationStatus => {
             schemas.insert(
                 "CoordinationStatusOutput",
-                schema_for!(CoordinationStatusOutput),
+                schema_for_output::<CoordinationStatusOutput>(),
             );
-            schemas.insert("CoordinationClaimRow", schema_for!(CoordinationClaimRow));
+            schemas.insert(
+                "CoordinationClaimRow",
+                schema_for_output::<CoordinationClaimRow>(),
+            );
         }
         SchemaTarget::Error => {
-            schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
+            schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Commands => {
             // Only the command-shape map is requested; no per-row schemas.
@@ -241,6 +246,13 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
     }
 
     schemas
+}
+
+fn schema_for_output<T: JsonSchema>() -> Schema {
+    SchemaSettings::default()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<T>()
 }
 
 /// Build the per-command output-envelope map.

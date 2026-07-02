@@ -20,6 +20,7 @@ Commands:
   dep           Manage dependencies
   doctor        Run diagnostics and optionally repair issues
   epic          Epic management commands
+  gate          Workflow gate engine: record and inspect gate results (issue #312)
   graph         Visualize dependency graph
   history       Manage local history backups
   info          Show diagnostic metadata about the workspace
@@ -43,7 +44,6 @@ Commands:
   sync          Sync database with JSONL file (export or import)
   undefer       Undefer issues (make ready again)
   update        Update an issue
-  serve         Start an MCP (Model Context Protocol) server on stdio
   upgrade       Upgrade br to the latest version
   version       Show version information
   where         Show the active .beads directory

@@ -46,7 +46,7 @@ Options:
           Include closed issues (default excludes closed)
 
       --limit <LIMIT>
-          Maximum number of results (0 = unlimited, default: 50)
+          Maximum number of results (0 = unlimited; default: unlimited — the full work surface)
 
       --offset <OFFSET>
           Number of results to skip (for pagination, default: 0)
