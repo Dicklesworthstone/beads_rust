@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 13;
+pub const CURRENT_SCHEMA_VERSION: i32 = 14;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -1489,13 +1489,14 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         }
     }
 
-    // v7: Recompute stored content hashes after aligning Rust's algorithm to
-    // Go bd's canonical hash writer. Marking all rows dirty is intentional:
-    // the per-issue export hashes were computed with the old Rust algorithm,
-    // so the next flush must rewrite JSONL tracking metadata.
+    // v7: Historical content-hash rebuild. For databases older than v7 that
+    // open under current br, compute the current canonical format directly
+    // instead of replaying obsolete intermediate encodings. Marking rows dirty
+    // is intentional: per-issue export hashes were computed with an older
+    // algorithm, so the next flush must rewrite JSONL tracking metadata.
     if user_version < 7 && table_exists(conn, "issues") {
-        tracing::info!("Migrating database to schema version 7 (Go bd content hashes)");
-        rebuild_content_hashes_for_go_parity(conn)?;
+        tracing::info!("Migrating database to schema version 7 (content hashes)");
+        rebuild_content_hashes_for_current_format(conn)?;
     }
 
     // v9: Add close_metadata table for closure-time policy gates (issue #274).
@@ -1635,6 +1636,16 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             "Migrating database to schema version 13 (events attribution columns - beads_rust#312)"
         );
         ensure_columns(conn, "events", EVENT_COLUMNS)?;
+    }
+
+    // v14: Recompute stored issue content hashes after switching from
+    // NUL-separated fields to length-prefixed fields. Existing v7-v13
+    // databases may contain hashes where embedded NUL bytes can blur field
+    // boundaries, so rewrite the issue hash and force JSONL tracking metadata
+    // to refresh on the next flush.
+    if (7..14).contains(&user_version) && table_exists(conn, "issues") {
+        tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
+        rebuild_content_hashes_for_current_format(conn)?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -1794,7 +1805,7 @@ fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_content_hashes_for_go_parity(conn: &Connection) -> Result<usize> {
+fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize> {
     let rows = conn.query(
         "SELECT id, title, description, design, acceptance_criteria, notes, \
                 status, priority, issue_type, assignee, owner, created_by, \
@@ -2119,12 +2130,53 @@ mod tests {
             .unwrap();
         assert_eq!(
             row.get(0).and_then(SqliteValue::as_text),
-            Some("c8e7e2783cc1fbb37322ae61efcf0e5c7d79a2cc6203e878fa6556c41742398d"),
-            "v7 should rewrite stored issue hashes to Go bd canonical values"
+            Some("c42bf13dfd6447e08d119f8b0ad0a503d23ccaa92b211348fb6dfbc55a4e0779"),
+            "v7 should rewrite stored issue hashes to the current canonical format"
         );
 
         let dirty_row = conn
             .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash'")
+            .unwrap();
+        assert_eq!(dirty_row.get(0).and_then(SqliteValue::as_integer), Some(1));
+
+        let export_row = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .unwrap();
+        assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
+    fn test_v14_rebuilds_length_prefixed_content_hashes_and_marks_dirty() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("Failed to apply schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-hash-v14', 'old-go-hash', 'Test', 'open', 2, 'task', '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-hash-v14', 'old-go-hash', '2026-04-03T01:00:00Z')",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM dirty_issues").unwrap();
+        conn.execute("PRAGMA user_version = 13").unwrap();
+
+        run_migrations(&conn, false).expect("v14 migration should succeed");
+
+        let row = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash-v14'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("c42bf13dfd6447e08d119f8b0ad0a503d23ccaa92b211348fb6dfbc55a4e0779"),
+            "v14 should rewrite stored issue hashes to length-prefixed values"
+        );
+
+        let dirty_row = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-hash-v14'")
             .unwrap();
         assert_eq!(dirty_row.get(0).and_then(SqliteValue::as_integer), Some(1));
 

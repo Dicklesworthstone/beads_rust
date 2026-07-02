@@ -395,7 +395,7 @@ fn sha256_hex(input: &str) -> String {
 }
 
 #[test]
-fn conformance_content_hash_matches_go_bd_fixture() {
+fn conformance_content_hash_matches_length_prefixed_br_fixture() {
     use beads_rust::model::{IssueType, Priority, Status};
 
     let hash = beads_rust::util::content_hash_from_parts(
@@ -417,8 +417,8 @@ fn conformance_content_hash_matches_go_bd_fixture() {
     );
 
     assert_eq!(
-        hash, "ad16572b6b2e1a60df3520b2b91d181246707390f487a73caa24082dcd24e00e",
-        "content_hash must match the Go bd ComputeContentHash fixture"
+        hash, "ef08b448c7b8eb9a3c3b2facdd9fa8e0b2b420c99725629c6811f019a0a9ab87",
+        "content_hash must match the length-prefixed br fixture"
     );
 }
 

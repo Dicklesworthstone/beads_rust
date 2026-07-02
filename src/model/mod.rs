@@ -76,7 +76,7 @@ impl<'de> Deserialize<'de> for Status {
         let value = String::deserialize(deserializer)?;
         Ok(match Self::known_value(&value) {
             Some(status) => status,
-            None => Self::Custom(value),
+            None => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -138,7 +138,7 @@ impl FromStr for Status {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_lowercase())))
     }
 }
 
@@ -209,7 +209,7 @@ impl<'de> Deserialize<'de> for IssueType {
         let value = String::deserialize(deserializer)?;
         Ok(match Self::known_value(&value) {
             Some(issue_type) => issue_type,
-            None => Self::Custom(value),
+            None => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -260,7 +260,7 @@ impl FromStr for IssueType {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_lowercase())))
     }
 }
 
@@ -286,7 +286,8 @@ pub enum DependencyType {
 impl<'de> Deserialize<'de> for DependencyType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        Ok(match value.to_lowercase().as_str() {
+        let normalized = value.to_lowercase();
+        Ok(match normalized.as_str() {
             "blocks" => Self::Blocks,
             "parent-child" => Self::ParentChild,
             "conditional-blocks" => Self::ConditionalBlocks,
@@ -298,7 +299,7 @@ impl<'de> Deserialize<'de> for DependencyType {
             "duplicates" => Self::Duplicates,
             "supersedes" => Self::Supersedes,
             "caused-by" => Self::CausedBy,
-            _ => Self::Custom(value),
+            _ => Self::Custom(normalized),
         })
     }
 }
@@ -420,7 +421,8 @@ impl Serialize for EventType {
 impl<'de> Deserialize<'de> for EventType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        let event_type = match value.as_str() {
+        let normalized = value.to_lowercase();
+        let event_type = match normalized.as_str() {
             "created" => Self::Created,
             "updated" => Self::Updated,
             "status_changed" => Self::StatusChanged,
@@ -436,7 +438,7 @@ impl<'de> Deserialize<'de> for EventType {
             "compacted" => Self::Compacted,
             "deleted" => Self::Deleted,
             "restored" => Self::Restored,
-            _ => Self::Custom(value),
+            _ => Self::Custom(normalized),
         };
         Ok(event_type)
     }
@@ -676,7 +678,8 @@ impl Default for Issue {
 impl Issue {
     /// Compute the deterministic content hash for this issue.
     ///
-    /// Uses the Go bd canonical field order for cross-tool deduplication.
+    /// Uses br's canonical field order with length-prefixed field encoding for
+    /// unambiguous deduplication.
     /// Excludes IDs, timestamps, relations, and tombstone metadata.
     ///
     /// Delegates to [`crate::util::hash::content_hash`] for the canonical implementation.
@@ -932,13 +935,19 @@ mod tests {
         assert_eq!(serialized, "\"custom_status\"");
 
         let mixed_case: Status = serde_json::from_str("\"QaReview\"").unwrap();
-        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+        assert_eq!(mixed_case, Status::Custom("qareview".to_string()));
     }
 
     #[test]
-    fn issue_type_custom_deserialize_preserves_spelling() {
+    fn issue_type_custom_deserialize_normalizes_spelling() {
         let issue_type: IssueType = serde_json::from_str("\"Odd_Type\"").unwrap();
-        assert_eq!(issue_type, IssueType::Custom("Odd_Type".to_string()));
+        assert_eq!(issue_type, IssueType::Custom("odd_type".to_string()));
+    }
+
+    #[test]
+    fn dependency_type_custom_deserialize_normalizes_spelling() {
+        let dep_type: DependencyType = serde_json::from_str("\"Odd-Dep\"").unwrap();
+        assert_eq!(dep_type, DependencyType::Custom("odd-dep".to_string()));
     }
 
     #[test]
@@ -1108,7 +1117,7 @@ mod tests {
         assert_eq!(result, Status::Custom("invalid_status".to_string()));
 
         let mixed_case = Status::from_str("QaReview").unwrap();
-        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+        assert_eq!(mixed_case, Status::Custom("qareview".to_string()));
     }
 
     #[test]
@@ -1276,7 +1285,7 @@ mod tests {
         );
 
         let mixed_case = IssueType::from_str("Odd_Type").unwrap();
-        assert_eq!(mixed_case, IssueType::Custom("Odd_Type".to_string()));
+        assert_eq!(mixed_case, IssueType::Custom("odd_type".to_string()));
     }
 
     #[test]
@@ -1367,6 +1376,12 @@ mod tests {
     fn test_dependency_type_from_str_custom() {
         let result = DependencyType::from_str("my-custom-dep").unwrap();
         assert_eq!(result, DependencyType::Custom("my-custom-dep".to_string()));
+
+        let mixed_case = DependencyType::from_str("My-Custom-Dep").unwrap();
+        assert_eq!(
+            mixed_case,
+            DependencyType::Custom("my-custom-dep".to_string())
+        );
     }
 
     #[test]
@@ -1770,6 +1785,18 @@ mod tests {
     fn test_event_type_deserialize_custom() {
         let result: EventType = serde_json::from_str("\"my_custom_event\"").unwrap();
         assert_eq!(result, EventType::Custom("my_custom_event".to_string()));
+
+        let mixed_case: EventType = serde_json::from_str("\"My_Custom_Event\"").unwrap();
+        assert_eq!(mixed_case, EventType::Custom("my_custom_event".to_string()));
+    }
+
+    #[test]
+    fn test_event_type_deserialize_normalizes_case() {
+        let result: EventType = serde_json::from_str("\"CREATED\"").unwrap();
+        assert_eq!(result, EventType::Created);
+
+        let result: EventType = serde_json::from_str("\"Status_Changed\"").unwrap();
+        assert_eq!(result, EventType::StatusChanged);
     }
 
     // ========================================================================

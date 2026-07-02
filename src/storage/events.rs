@@ -490,7 +490,8 @@ pub fn count_events(conn: &Connection, issue_id: &str) -> Result<i64> {
 
 /// Parse event type string to `EventType` enum.
 fn parse_event_type(s: &str) -> EventType {
-    match s {
+    let normalized = s.to_lowercase();
+    match normalized.as_str() {
         "created" => EventType::Created,
         "updated" => EventType::Updated,
         "status_changed" => EventType::StatusChanged,
@@ -550,6 +551,20 @@ mod tests {
             .expect("Failed to insert test issue");
 
         conn
+    }
+
+    #[test]
+    fn test_parse_event_type_normalizes_known_variant_case() {
+        assert_eq!(parse_event_type("CREATED"), EventType::Created);
+        assert_eq!(parse_event_type("Status_Changed"), EventType::StatusChanged);
+    }
+
+    #[test]
+    fn test_parse_event_type_normalizes_custom_case() {
+        assert_eq!(
+            parse_event_type("My_Custom_Event"),
+            EventType::Custom("my_custom_event".to_string())
+        );
     }
 
     #[test]
@@ -727,6 +742,39 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].comment.as_deref(), Some("newest"));
         assert_eq!(events[1].comment.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn test_get_events_normalizes_persisted_event_type_case() {
+        let conn = setup_test_db();
+
+        let rows = [
+            ("CREATED", "known", "2026-04-22T10:00:00Z"),
+            ("My_Custom_Event", "custom", "2026-04-22T11:00:00Z"),
+        ];
+        for (event_type, comment, created_at) in rows {
+            conn.execute_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, comment, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqliteValue::from("test-001"),
+                    SqliteValue::from(event_type),
+                    SqliteValue::from("legacy"),
+                    SqliteValue::from(comment),
+                    SqliteValue::from(created_at),
+                ],
+            )
+            .expect("insert event");
+        }
+
+        let events = get_events(&conn, "test-001", 0).expect("events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            EventType::Custom("my_custom_event".to_string())
+        );
+        assert_eq!(events[1].event_type, EventType::Created);
     }
 
     #[test]

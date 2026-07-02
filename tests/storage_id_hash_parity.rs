@@ -291,13 +291,73 @@ fn content_hash_deterministic_fixture() {
 
     assert_eq!(hash1, hash2, "Content hash must be deterministic");
     assert_eq!(
-        hash1, "b13c137c6f248ddd75a5affe1cafdb6acfc7789b97a461c4644293f597cb4224",
-        "Content hash must match the Go bd ComputeContentHash fixture"
+        hash1, "e7c4a780edbb4ebf7df75cf3a38ca3ccb639e5c567b55066babbcca9f7eb06e2",
+        "Content hash must match the length-prefixed br fixture"
     );
     assert_eq!(hash1.len(), 64, "SHA256 hash should be 64 hex chars");
     assert!(
         hash1.chars().all(|c| c.is_ascii_hexdigit()),
         "Hash must be hex"
+    );
+}
+
+/// Regression for EXP-101: embedded NULs in adjacent fields must not collide.
+#[test]
+fn exp_101_no_collision() {
+    let hash_a = content_hash_from_parts(
+        "x",
+        Some("y\0z"),
+        None,
+        None,
+        None,
+        &Status::Open,
+        &Priority::MEDIUM,
+        &IssueType::Task,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    );
+    let hash_b = content_hash_from_parts(
+        "x\0y",
+        Some("z"),
+        None,
+        None,
+        None,
+        &Status::Open,
+        &Priority::MEDIUM,
+        &IssueType::Task,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        false,
+    );
+
+    assert_eq!(
+        hash_a,
+        "19c2a7bfc1ffe3f111332446640be3b7c11a2ff690dc2958d90723d0de7eb84d"
+    );
+    assert_eq!(
+        hash_b,
+        "99713b7c2d00a4cb0f168b14bd65f8928243bd87d589d0e790ad9d7970846004"
+    );
+    assert_ne!(
+        hash_a, hash_b,
+        "length-prefixed fields must distinguish title/description boundaries"
+    );
+    assert_ne!(
+        hash_a, "76dc81c2dbaddc1cddfa1f8c4674d06e018868f121f8c9385e0693fdf679e624",
+        "old NUL-separated collision hash should not survive"
+    );
+    assert_ne!(
+        hash_b, "76dc81c2dbaddc1cddfa1f8c4674d06e018868f121f8c9385e0693fdf679e624",
+        "old NUL-separated collision hash should not survive"
     );
 }
 

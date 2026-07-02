@@ -1,12 +1,13 @@
 //! Property-based tests for model serde round-trip and content_hash stability.
 //!
-//! Verifies that Status and IssueType deserialize case-insensitively,
-//! round-trip correctly through JSON, and produce stable content hashes
-//! regardless of input casing.
+//! Verifies that model enums deserialize case-insensitively, round-trip
+//! correctly through JSON, and produce stable content hashes regardless of
+//! input casing.
 
 use proptest::prelude::*;
+use serde::de::DeserializeOwned;
 
-use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::model::{DependencyType, EventType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{ExportConfig, ImportConfig, export_to_jsonl, import_from_jsonl};
 use beads_rust::util::{content_hash, content_hash_from_parts};
@@ -61,6 +62,14 @@ fn case_variants(s: &str) -> Vec<String> {
             })
             .collect(),
     ]
+}
+
+fn deserialize_json_string<T>(value: &str) -> T
+where
+    T: DeserializeOwned,
+{
+    let json = serde_json::to_string(value).unwrap();
+    serde_json::from_str(&json).unwrap()
 }
 
 #[derive(Debug)]
@@ -193,6 +202,46 @@ fn jsonl_import_mixed_case_status_issue_type_preserves_hash() {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    #[test]
+    fn status_deserialize_matches_lowercase_for_any_string(value in "\\PC{0,64}") {
+        let lowered = value.to_lowercase();
+        let original: Status = deserialize_json_string(&value);
+        let lowercase: Status = deserialize_json_string(&lowered);
+
+        prop_assert_eq!(original, lowercase);
+    }
+
+    #[test]
+    fn issue_type_deserialize_matches_lowercase_for_any_string(value in "\\PC{0,64}") {
+        let lowered = value.to_lowercase();
+        let original: IssueType = deserialize_json_string(&value);
+        let lowercase: IssueType = deserialize_json_string(&lowered);
+
+        prop_assert_eq!(original, lowercase);
+    }
+
+    #[test]
+    fn dependency_type_deserialize_matches_lowercase_for_any_string(value in "\\PC{0,64}") {
+        let lowered = value.to_lowercase();
+        let original: DependencyType = deserialize_json_string(&value);
+        let lowercase: DependencyType = deserialize_json_string(&lowered);
+
+        prop_assert_eq!(original, lowercase);
+    }
+
+    #[test]
+    fn event_type_deserialize_matches_lowercase_for_any_string(value in "\\PC{0,64}") {
+        let lowered = value.to_lowercase();
+        let original: EventType = deserialize_json_string(&value);
+        let lowercase: EventType = deserialize_json_string(&lowered);
+
+        prop_assert_eq!(original, lowercase);
+    }
+}
+
+proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
@@ -290,26 +339,28 @@ proptest! {
     }
 
     #[test]
-    fn custom_status_preserved_verbatim(name in "[a-z_]{3,15}") {
+    fn custom_status_normalized_to_lowercase(name in "[A-Za-z_]{3,15}") {
         let known = ["open", "in_progress", "inprogress", "blocked", "deferred",
                       "draft", "closed", "tombstone", "pinned"];
-        prop_assume!(!known.contains(&name.as_str()));
+        let normalized = name.to_lowercase();
+        prop_assume!(!known.contains(&normalized.as_str()));
         let json = format!("\"{name}\"");
         let status: Status = serde_json::from_str(&json).unwrap();
         match &status {
-            Status::Custom(v) => prop_assert_eq!(v, &name),
+            Status::Custom(v) => prop_assert_eq!(v, &normalized),
             other => prop_assert!(false, "expected Custom, got {:?}", other),
         }
     }
 
     #[test]
-    fn custom_issue_type_preserved_verbatim(name in "[a-z_]{3,15}") {
+    fn custom_issue_type_normalized_to_lowercase(name in "[A-Za-z_]{3,15}") {
         let known = ["task", "bug", "feature", "epic", "chore", "docs", "question"];
-        prop_assume!(!known.contains(&name.as_str()));
+        let normalized = name.to_lowercase();
+        prop_assume!(!known.contains(&normalized.as_str()));
         let json = format!("\"{name}\"");
         let issue_type: IssueType = serde_json::from_str(&json).unwrap();
         match &issue_type {
-            IssueType::Custom(v) => prop_assert_eq!(v, &name),
+            IssueType::Custom(v) => prop_assert_eq!(v, &normalized),
             other => prop_assert!(false, "expected Custom, got {:?}", other),
         }
     }
@@ -361,5 +412,30 @@ proptest! {
         let serialized = serde_json::to_string(&expected).unwrap();
         let deserialized: DependencyType = serde_json::from_str(&serialized).unwrap();
         prop_assert_eq!(&deserialized, &expected);
+    }
+
+    #[test]
+    fn custom_dep_type_normalized_to_lowercase(name in "[A-Za-z_-]{3,20}") {
+        let known = [
+            "blocks",
+            "parent-child",
+            "conditional-blocks",
+            "waits-for",
+            "related",
+            "discovered-from",
+            "replies-to",
+            "relates-to",
+            "duplicates",
+            "supersedes",
+            "caused-by",
+        ];
+        let normalized = name.to_lowercase();
+        prop_assume!(!known.contains(&normalized.as_str()));
+        let json = format!("\"{name}\"");
+        let dep_type: DependencyType = serde_json::from_str(&json).unwrap();
+        match &dep_type {
+            DependencyType::Custom(v) => prop_assert_eq!(v, &normalized),
+            other => prop_assert!(false, "expected Custom, got {:?}", other),
+        }
     }
 }
