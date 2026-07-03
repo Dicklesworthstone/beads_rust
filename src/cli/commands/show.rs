@@ -1103,7 +1103,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
     let mut output = String::new();
     // `usize::MAX` makes `wrap_body` a no-op, so `--no-wrap` (or any caller that
     // opts out) keeps the exact pre-#370 unwrapped output.
-    let wrap_width = if wrap { compact_wrap_width() } else { usize::MAX };
+    let wrap_width = if wrap {
+        compact_wrap_width()
+    } else {
+        usize::MAX
+    };
     let issue = &details.issue;
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);

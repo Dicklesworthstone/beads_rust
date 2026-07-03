@@ -142,11 +142,19 @@ fn e2e_dep_cycles_active_cycle_exits_nonzero() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     let issue_a = run_br(&workspace, ["create", "Active cycle A"], "create_a");
-    assert!(issue_a.status.success(), "create A failed: {}", issue_a.stderr);
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
     let issue_a_id = parse_created_id(&issue_a.stdout);
 
     let issue_b = run_br(&workspace, ["create", "Active cycle B"], "create_b");
-    assert!(issue_b.status.success(), "create B failed: {}", issue_b.stderr);
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
     let issue_b_id = parse_created_id(&issue_b.stdout);
 
     // `related` edges can close a cycle without br refusing the edge (only
@@ -157,13 +165,21 @@ fn e2e_dep_cycles_active_cycle_exits_nonzero() {
         ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
         "add_a_b_related",
     );
-    assert!(add_a_b.status.success(), "add A->B failed: {}", add_a_b.stderr);
+    assert!(
+        add_a_b.status.success(),
+        "add A->B failed: {}",
+        add_a_b.stderr
+    );
     let add_b_a = run_br(
         &workspace,
         ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
         "add_b_a_related",
     );
-    assert!(add_b_a.status.success(), "add B->A failed: {}", add_b_a.stderr);
+    assert!(
+        add_b_a.status.success(),
+        "add B->A failed: {}",
+        add_b_a.stderr
+    );
 
     // JSON surface: cycle data preserved AND non-zero exit.
     let json = run_br(&workspace, ["dep", "cycles", "--json"], "cycles_json");
@@ -225,7 +241,11 @@ fn e2e_create_bulk_dropped_cycle_edge_exits_nonzero() {
     let list = run_br(&workspace, ["list", "--json"], "list_after_bulk");
     assert!(list.status.success(), "list failed: {}", list.stderr);
     let issues = extract_issues_array(&list.stdout);
-    assert_eq!(issues.len(), 2, "both issues should be created from the bulk file");
+    assert_eq!(
+        issues.len(),
+        2,
+        "both issues should be created from the bulk file"
+    );
 
     info!("e2e_create_bulk_dropped_cycle_edge_exits_nonzero: assertions passed");
 }
