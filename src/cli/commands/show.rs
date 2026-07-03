@@ -208,9 +208,9 @@ fn execute_routed(
         let ctx = OutputContext::from_output_format(output_format, quiet, !*use_color);
         if matches!(ctx.mode(), OutputMode::Rich) {
             let panel = IssuePanel::from_details(details, ctx.theme());
-            panel.print(&ctx, args.wrap);
+            panel.print(&ctx, !args.no_wrap);
         } else {
-            print_issue_details(details, *use_color);
+            print_issue_details(details, *use_color, !args.no_wrap);
         }
     }
 
@@ -311,9 +311,9 @@ fn execute_inner(
                 }
                 if matches!(ctx.mode(), OutputMode::Rich) {
                     let panel = IssuePanel::from_details(details, ctx.theme());
-                    panel.print(&ctx, args.wrap);
+                    panel.print(&ctx, !args.no_wrap);
                 } else {
-                    print_issue_details(details, use_color);
+                    print_issue_details(details, use_color, !args.no_wrap);
                 }
             }
         }
@@ -1038,14 +1038,72 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
-fn print_issue_details(details: &IssueDetails, use_color: bool) {
-    let output = format_issue_details(details, use_color);
+fn print_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) {
+    let output = format_issue_details(details, use_color, wrap);
     print!("{output}");
 }
 
+/// Width used to soft-wrap free-text bodies in the non-Rich (piped / no-TTY)
+/// `br show --format text` output. Honors `$COLUMNS` when set to a sane value,
+/// otherwise falls back to a readable 100 columns (#370). The Rich panel path
+/// uses the live terminal width instead.
+fn compact_wrap_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 20)
+        .unwrap_or(100)
+}
+
+/// Soft-wrap `text` to `width` columns on word boundaries (#370). Existing line
+/// breaks are preserved, a line's leading indentation is carried onto wrapped
+/// continuations, and a single over-long word is never split. Passing
+/// `usize::MAX` is a no-op, so callers can disable wrapping cheaply.
+fn wrap_body(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let width = width.max(1);
+    let mut out = String::new();
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            out.push('\n');
+        }
+        if UnicodeWidthStr::width(line) <= width {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = line.len() - line.trim_start().len();
+        let indent = &line[..indent_len];
+        let avail = width.saturating_sub(UnicodeWidthStr::width(indent)).max(1);
+        out.push_str(indent);
+        let mut cur_w = 0usize;
+        let mut started = false;
+        for word in line[indent_len..].split(' ') {
+            let word_w = UnicodeWidthStr::width(word);
+            if !started {
+                out.push_str(word);
+                cur_w = word_w;
+                started = true;
+            } else if cur_w > 0 && cur_w + 1 + word_w > avail {
+                out.push('\n');
+                out.push_str(indent);
+                out.push_str(word);
+                cur_w = word_w;
+            } else {
+                out.push(' ');
+                out.push_str(word);
+                cur_w += 1 + word_w;
+            }
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)]
-fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
+fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> String {
     let mut output = String::new();
+    // `usize::MAX` makes `wrap_body` a no-op, so `--no-wrap` (or any caller that
+    // opts out) keeps the exact pre-#370 unwrapped output.
+    let wrap_width = if wrap { compact_wrap_width() } else { usize::MAX };
     let issue = &details.issue;
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);
@@ -1135,7 +1193,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
 
     if let Some(desc) = &issue.description {
         output.push('\n');
-        let _ = writeln!(output, "{}", sanitize_terminal_text(desc));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(desc).as_ref(), wrap_width)
+        );
     }
 
     if let Some(design) = &issue.design
@@ -1143,7 +1205,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Design:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(design));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(design).as_ref(), wrap_width)
+        );
     }
 
     if let Some(ac) = &issue.acceptance_criteria
@@ -1151,7 +1217,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Acceptance Criteria:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(ac));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(ac).as_ref(), wrap_width)
+        );
     }
 
     if let Some(notes) = &issue.notes
@@ -1159,7 +1229,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Notes:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(notes));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(notes).as_ref(), wrap_width)
+        );
     }
 
     if !details.dependencies.is_empty() {
@@ -1199,7 +1273,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
                 sanitize_terminal_inline(&comment.author),
-                sanitize_terminal_text(&comment.body)
+                wrap_body(sanitize_terminal_text(&comment.body).as_ref(), wrap_width)
             );
         }
     }
@@ -1462,7 +1536,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
         };
-        let output = format_issue_details(&details, false);
+        let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
         assert!(output.contains("-> bd-002 (blocks) - Dep"));
         assert!(output.contains("Comments:"));
@@ -1498,7 +1572,7 @@ mod tests {
             parent: None,
         };
 
-        let output = format_issue_details(&details, false);
+        let output = format_issue_details(&details, false, false);
 
         assert!(!output.contains('\x1b'));
         assert!(!output.contains('\x07'));

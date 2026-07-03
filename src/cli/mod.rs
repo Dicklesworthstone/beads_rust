@@ -1781,9 +1781,15 @@ pub struct ShowArgs {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
-    /// Wrap long lines instead of truncating in text output
+    /// Soft-wrap long lines to the terminal width in text output. Wrapping is
+    /// now on by default; this flag is kept for backwards compatibility.
     #[arg(long)]
     pub wrap: bool,
+
+    /// Disable soft-wrapping; let long description/comment lines extend past the
+    /// panel width (the pre-#370 behavior).
+    #[arg(long, conflicts_with = "wrap")]
+    pub no_wrap: bool,
 
     /// Show token savings stats when using TOON output
     #[arg(long)]
