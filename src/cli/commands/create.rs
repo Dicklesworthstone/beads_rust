@@ -1124,6 +1124,9 @@ fn execute_import(
     // Now that all issues exist in storage, we can resolve intra-file references
     // by title or stand-in ID, as well as references to pre-existing issues.
     let mut resolved_import_deps = Vec::new();
+    // #368: count declared edges we fail to resolve so the command can exit
+    // non-zero for scripted callers instead of silently reporting success.
+    let mut dropped_import_edges = 0usize;
     if !deferred_parent_deps.is_empty() && !args.dry_run {
         for (issue_id, parent_ref) in &deferred_parent_deps {
             let parent_id =
@@ -1139,6 +1142,7 @@ fn execute_import(
                             create_display_text(parent_ref),
                             create_display_text(issue_id)
                         );
+                        dropped_import_edges += 1;
                         continue;
                     }
                 };
@@ -1216,6 +1220,7 @@ fn execute_import(
                                     create_display_text(&dep_id),
                                     create_display_text(issue_id)
                                 );
+                                dropped_import_edges += 1;
                                 continue;
                             }
                         }
@@ -1284,6 +1289,17 @@ fn execute_import(
                 }
             }
         }
+    }
+
+    // #368: declared dependency edges that couldn't be resolved during Phase 2
+    // (a referenced parent/dependency that doesn't exist) were dropped above
+    // with only an eprintln warning. The issues are still created, but the
+    // persisted graph is missing intended edges — surface that to scripted
+    // callers via a non-zero exit code rather than reporting a false success.
+    if dropped_import_edges > 0 {
+        crate::output::record_pending_exit_code(
+            crate::error::ErrorCode::DependencyNotFound.exit_code(),
+        );
     }
 
     if ctx.is_json() || ctx.is_toon() {
