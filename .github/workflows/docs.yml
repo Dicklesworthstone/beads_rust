@@ -1,0 +1,28 @@
+name: docs
+
+# Docs-as-code: kura.toml + this workflow. The kurajs/pages action renders docs/ into a searchable,
+# agent-native static site and deploys it to GitHub Pages. It auto-detects the deploy path and fixes
+# repo-relative links, so there is nothing else to configure.
+
+on:
+  push:
+    branches: [main, master, docs/kura-site]
+    paths:
+      - "docs/**"
+      - "kura.toml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-pages
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: kurajs/pages@v1

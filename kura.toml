@@ -1,0 +1,72 @@
+# beads_rust docs site — the ONLY config. The kurajs/pages action reads this + renders docs/ into
+# the site (auto-detects the deploy path, fixes repo-relative links, ships client-side search + agent
+# surfaces). beads_rust is Rust, so nothing at the repo root is touched.
+
+markdown  = "commonmark"
+base_path = ""
+[site]
+name        = "beads_rust"
+description = "Fast Rust port of Steve Yegge's beads: a local-first, non-invasive issue tracker storing tasks in SQLite with JSONL export for git collaboration."
+[deploy]
+target    = "github-pages"
+[content]
+sources = []
+[[nav.tabs]]
+title = "Guide"
+groups = ["guide"]
+[[nav.tabs]]
+title = "For agents"
+groups = ["agents"]
+[[nav.tabs]]
+title = "Internals"
+groups = ["architecture", "porting"]
+[[nav.tabs]]
+title = "Development"
+groups = ["dev", "notes"]
+[nav.groups.guide]
+title = "Guide"
+pages = [
+  { slug = "INSTALLING", title = "Installation" }, { slug = "CLI_REFERENCE", title = "CLI reference" },
+  { slug = "AGENT_INTEGRATION", title = "AI agent integration" }, { slug = "VCS_INTEGRATION", title = "VCS integration" },
+  { slug = "SYNC_SAFETY", title = "Sync safety model" }, { slug = "TROUBLESHOOTING", title = "Troubleshooting" },
+]
+[nav.groups.agents]
+title = "For agents"
+pages = [
+  { slug = "agent/QUICKSTART", title = "Quickstart" }, { slug = "agent/EXAMPLES", title = "Examples" },
+  { slug = "agent/AGENTS", title = "AGENTS.md entry point" }, { slug = "agent/SCHEMA", title = "Schemas" },
+  { slug = "agent/ROBOT_MODE", title = "Robot mode (JSON/TOON)" }, { slug = "agent/ERRORS", title = "Errors" },
+  { slug = "agent/AGENT_FRIENDLINESS_REPORT", title = "Agent-friendliness report" },
+  { slug = "agent/AGENT_FRIENDLY_CHANGELOG", title = "Agent-friendly changelog" },
+]
+[nav.groups.architecture]
+title = "Architecture & design"
+pages = [
+  { slug = "ARCHITECTURE", title = "Architecture overview" }, { slug = "ARTIFACT_LOG_SCHEMA", title = "Artifact log schema" },
+  { slug = "WRITE_COMBINING_QUEUE_DESIGN", title = "Write-combining queue" }, { slug = "COORDINATION_EVIDENCE", title = "Coordination evidence" },
+  { slug = "SWARM_SCALE_TUNING", title = "Swarm-scale tuning" }, { slug = "reliability/HEALTH_CONTRACT", title = "Workspace health contract" },
+]
+[nav.groups.porting]
+title = "Porting notes"
+pages = [
+  { slug = "porting/EXISTING_BEADS_STRUCTURE_AND_ARCHITECTURE", title = "Existing beads structure" },
+  { slug = "porting/PLAN_TO_PORT_BEADS_WITH_SQLITE_AND_ISSUES_JSONL_TO_RUST", title = "Port plan" },
+  { slug = "porting/PROPOSED_ARCHITECTURE_FOR_BR_USING_RUST_BEST_PRACTICES", title = "Proposed architecture" },
+]
+[nav.groups.dev]
+title = "Development"
+pages = [
+  { slug = "TESTING_GUIDELINES", title = "Testing guidelines" }, { slug = "TEST_HARNESS", title = "Test harness" },
+  { slug = "SNAPSHOT_TESTING", title = "Snapshot testing" }, { slug = "E2E_COVERAGE_MATRIX", title = "E2E coverage matrix" },
+  { slug = "E2E_SYNC_TESTS", title = "E2E sync tests" }, { slug = "SYNC_MAINTENANCE_CHECKLIST", title = "Sync maintenance checklist" },
+  { slug = "CI_SUPPLY_CHAIN", title = "CI supply chain" }, { slug = "operations/UPGRADE_LOG", title = "Dependency upgrade log" },
+  { slug = "plans/RICH_INTEGRATION_PLAN", title = "Rich integration plan" },
+]
+[nav.groups.notes]
+title = "Audit logs"
+pages = [
+  { slug = "audit_bd_to_br_2026_05_09", title = "Audit: bd to br migration" },
+  { slug = "audit_forced_cycle_close_2026_05_09", title = "Audit: forced-cycle-close" },
+  { slug = "audit_id_pinning_2026_05_09", title = "Audit: ID pinning" },
+  { slug = "snapshot_review_2026_05_09", title = "Snapshot review" },
+]
