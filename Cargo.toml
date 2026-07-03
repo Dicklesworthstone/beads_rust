@@ -38,7 +38,7 @@ path = "src/main.rs"
 [dependencies]
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
-clap_complete = { version = "4.6.5", features = ["unstable-dynamic"] }
+clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
@@ -71,7 +71,7 @@ chrono = { version = "0.4.43", features = ["serde"] }
 sha2 = "0.11.0"
 
 # Error handling
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 thiserror = "2.0.18"
 
 # Logging
@@ -79,7 +79,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 
 # Terminal
-indicatif = "0.18.4"
+indicatif = "0.18.6"
 crossterm = "0.29"
 
 # Rich terminal output (sibling project). Keep syntax highlighting out of the
