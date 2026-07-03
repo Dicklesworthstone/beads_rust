@@ -98,6 +98,13 @@ pub fn execute(
     }
 
     if ids.is_empty() {
+        // `br delete --hard` with no IDs is the tombstone garbage-collector:
+        // purge every tombstone in the current workspace (#367). Plain
+        // `br delete` with no IDs remains a usage error.
+        if args.hard {
+            let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+            return purge_all_tombstones(args, cli, ctx, &beads_dir);
+        }
         return Err(BeadsError::validation("ids", "no issue IDs provided"));
     }
 
@@ -364,6 +371,106 @@ pub fn execute(
         if !result.orphaned_issues.is_empty() {
             println!("Orphaned {} issue(s):", result.orphaned_issues.len());
             for id in &result.orphaned_issues {
+                println!("  - {}", delete_display_text(id));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Purge every tombstone in the workspace (`br delete --hard` with no IDs).
+///
+/// Tombstones are the soft-delete markers a normal `br delete` leaves behind so
+/// a deletion can propagate through JSONL/git. They accumulate over time and
+/// there was previously no way to reclaim them — `br delete --hard` with no IDs
+/// errored on the empty argument list (#367). This hard-removes each tombstone
+/// row (no new tombstone is written) and prunes it from the JSONL export.
+fn purge_all_tombstones(
+    args: &DeleteArgs,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    beads_dir: &Path,
+) -> Result<()> {
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+
+    let tombstone_ids = storage_ctx.storage.list_tombstone_ids()?;
+
+    if args.dry_run {
+        if ctx.is_json() || ctx.is_toon() {
+            let preview = DeletePreviewResult {
+                preview: true,
+                would_delete: tombstone_ids.clone(),
+                cascade_delete: Vec::new(),
+                blocked_dependents: Vec::new(),
+                orphaned_issues: Vec::new(),
+            };
+            if ctx.is_toon() {
+                ctx.toon(&preview);
+            } else {
+                ctx.json_pretty(&preview);
+            }
+        } else if !ctx.is_quiet() {
+            if tombstone_ids.is_empty() {
+                ctx.info("Dry-run: no tombstones to purge.");
+            } else {
+                println!("Dry-run: Would purge {} tombstone(s):", tombstone_ids.len());
+                for id in &tombstone_ids {
+                    println!("  - {}", delete_display_text(id));
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    let mut result = DeleteResult::new();
+    let mut batch_has_mutated = false;
+    for id in &tombstone_ids {
+        result.labels_removed += storage_ctx.storage.get_labels(id)?.len();
+        result.events_removed += storage_ctx.storage.count_issue_events(id)?;
+        retry_mutation_with_jsonl_recovery(
+            &mut storage_ctx,
+            !batch_has_mutated,
+            "delete purge",
+            Some(id.as_str()),
+            |storage| storage.purge_issue(id, &actor),
+        )?;
+        batch_has_mutated = true;
+        result.deleted.push(id.clone());
+    }
+    result.deleted_count = result.deleted.len();
+
+    let deleted_ids: HashSet<String> = result.deleted.iter().cloned().collect();
+    storage_ctx.flush_no_db_then(|ctx| {
+        let last_touched = crate::util::get_last_touched_id(&ctx.paths.beads_dir);
+        if !last_touched.is_empty() && deleted_ids.contains(&last_touched) {
+            crate::util::clear_last_touched(&ctx.paths.beads_dir);
+        }
+        Ok(())
+    })?;
+
+    if ctx.is_json() || ctx.is_toon() {
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
+        return Ok(());
+    }
+
+    if ctx.is_quiet() {
+        return Ok(());
+    }
+
+    if result.deleted_count == 0 {
+        ctx.success("No tombstones to purge.");
+    } else {
+        ctx.success(&format!("Purged {} tombstone(s)", result.deleted_count));
+        if !ctx.is_rich() {
+            for id in &result.deleted {
                 println!("  - {}", delete_display_text(id));
             }
         }

@@ -3119,6 +3119,27 @@ impl SqliteStorage {
         })
     }
 
+    /// List the IDs of all tombstoned (soft-deleted) issues, sorted.
+    ///
+    /// Used by `br delete --hard` (invoked with no explicit IDs) to purge every
+    /// tombstone from the store in one pass (#367).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_tombstone_ids(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query("SELECT id FROM issues WHERE status = 'tombstone' ORDER BY id")?;
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                ids.push(id.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
     /// Get an issue by ID.
     ///
     /// # Errors
