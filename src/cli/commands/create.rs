@@ -1255,6 +1255,7 @@ fn execute_import(
                 eprintln!(
                     "warning: bulk dependency import failed ({err}); retrying dependencies one by one"
                 );
+                let mut dropped_edges = 0usize;
                 for dep in &resolved_import_deps {
                     if let Err(err) = storage.add_dependency(
                         &dep.issue_id,
@@ -1262,12 +1263,24 @@ fn execute_import(
                         &dep.dep_type,
                         &actor,
                     ) {
+                        dropped_edges += 1;
                         eprintln!(
                             "warning: failed to add dependency {} → {}: {err}",
                             create_display_text(&dep.issue_id),
                             create_display_text(&dep.depends_on_id)
                         );
                     }
+                }
+                // #368: The transactional bulk insert detected a cycle (or other
+                // constraint) and the per-edge fallback then silently dropped the
+                // offending edge(s). The issues are still created and the graph is
+                // persisted, but it differs from the declared spec — surface that
+                // to scripted callers via a non-zero exit code once output and
+                // auto-flush have completed, rather than reporting success.
+                if dropped_edges > 0 {
+                    crate::output::record_pending_exit_code(
+                        crate::error::ErrorCode::CycleDetected.exit_code(),
+                    );
                 }
             }
         }

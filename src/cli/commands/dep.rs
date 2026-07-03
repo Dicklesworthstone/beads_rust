@@ -1797,6 +1797,17 @@ fn dep_cycles(
     let active_count = report.active_cycles.len();
     let archived_closed_count = report.archived_closed_cycles.len();
     let total_count = active_count + archived_closed_count;
+
+    // #368: An active dependency cycle is a machine-actionable condition, so a
+    // scripted/robot caller gating on the exit code must be able to see it. We
+    // still emit the full, data-carrying output on every surface below (text,
+    // rich, JSON `count`, TOON) — the exit code is recorded here and applied by
+    // `main` after output completes, so the JSON/TOON stream stays a single
+    // clean object. Archived-closed-only cycles are historical and never flip
+    // the exit code, even under `--include-closed`.
+    if active_count > 0 {
+        crate::output::record_pending_exit_code(crate::error::ErrorCode::CycleDetected.exit_code());
+    }
     let mut cycles = report.active_cycles.clone();
     let mut active_cycles = Vec::new();
     let mut archived_closed_cycles = Vec::new();

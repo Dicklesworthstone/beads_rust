@@ -8842,7 +8842,16 @@ fn conformance_dep_cycles_simple() {
     let br_cycles = workspace.run_br(["dep", "cycles", "--json"], "cycles");
     let bd_cycles = workspace.run_bd(["dep", "cycles", "--json"], "cycles");
 
-    assert!(br_cycles.status.success(), "br dep cycles failed");
+    // #368: `br dep cycles` exits 5 (CycleDetected) when an active cycle is
+    // present so scripted callers can gate on the exit code. This diverges from
+    // bd, which exits 0; the cycle here is a `related` edge that bd's
+    // blocking-only detector ignores, so bd still exits 0. The cycle *data* is
+    // emitted on stdout regardless and is compared below.
+    assert_eq!(
+        br_cycles.status.code(),
+        Some(5),
+        "br dep cycles should exit 5 when an active cycle is present"
+    );
     assert!(bd_cycles.status.success(), "bd dep cycles failed");
 
     let br_json = extract_json_payload(&br_cycles.stdout);
@@ -8927,7 +8936,14 @@ fn conformance_dep_cycles_complex() {
     let br_cycles = workspace.run_br(["dep", "cycles", "--json"], "cycles");
     let bd_cycles = workspace.run_bd(["dep", "cycles", "--json"], "cycles");
 
-    assert!(br_cycles.status.success(), "br dep cycles failed");
+    // #368: active cycle present -> `br dep cycles` exits 5. The `related`
+    // triangular cycle is invisible to bd's blocking-only detector, so bd
+    // exits 0. Cycle data still lands on stdout and is compared below.
+    assert_eq!(
+        br_cycles.status.code(),
+        Some(5),
+        "br dep cycles should exit 5 when an active cycle is present"
+    );
     assert!(bd_cycles.status.success(), "bd dep cycles failed");
 
     let br_json = extract_json_payload(&br_cycles.stdout);

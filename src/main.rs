@@ -684,6 +684,17 @@ fn main() {
     if let Some(err) = beads_rust::output::take_output_serialization_failure() {
         std::process::exit(err.exit_code());
     }
+
+    // A command emitted its normal output and any auto-flush has now completed,
+    // but detected a condition that must surface to scripted callers via a
+    // non-zero exit code (e.g. `dep cycles` with cycles present, or `create -f`
+    // that dropped declared dependency edges) — see #368. Drop storage first so
+    // `SqliteStorage::Drop` checkpoints the WAL before the process exits (#270).
+    if let Some(exit_code) = beads_rust::output::take_pending_exit_code() {
+        drop(storage_result);
+        drop(write_lock);
+        std::process::exit(exit_code);
+    }
 }
 
 struct StartupContext {
