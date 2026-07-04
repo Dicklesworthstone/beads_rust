@@ -396,7 +396,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "assert_cmd",
