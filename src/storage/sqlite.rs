@@ -22545,8 +22545,24 @@ mod tests {
         storage
             .add_dependency("cyc-c", "cyc-b", "parent-child", "tester")
             .unwrap();
+        // The edge that closes the a -> b -> c -> a cycle. `add_dependency` now
+        // correctly REFUSES to create a parent-child cycle, so a genuine cycle
+        // can only enter the store via import/legacy data. Insert the closing
+        // row straight into the table (bypassing the guard) to exercise the
+        // recursive-BFS termination path against real cyclic data.
         storage
-            .add_dependency("cyc-a", "cyc-c", "parent-child", "tester")
+            .conn
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) \
+                 VALUES (?, ?, ?, ?, ?)",
+                &[
+                    SqliteValue::from("cyc-a"),
+                    SqliteValue::from("cyc-c"),
+                    SqliteValue::from("parent-child"),
+                    SqliteValue::from(Utc::now().to_rfc3339()),
+                    SqliteValue::from("tester"),
+                ],
+            )
             .unwrap();
 
         let filters = ReadyFilters {

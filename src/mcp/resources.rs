@@ -1123,7 +1123,9 @@ mod tests {
             db_path,
             beads_dir: beads_dir.clone(),
             jsonl_path: beads_dir.join("issues.jsonl"),
-            write_lock_timeout_ms: Some(25),
+            // Robust under heavy parallel-test load (a concurrent auto-flush can
+            // hold .write.lock for >25ms); no test asserts the timeout path.
+            write_lock_timeout_ms: Some(5_000),
             allow_external_jsonl: false,
             actor: "mcp-resource-test".to_string(),
             issue_prefix: Some("br".to_string()),

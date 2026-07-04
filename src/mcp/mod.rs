@@ -522,7 +522,9 @@ mod tests {
             db_path,
             beads_dir,
             jsonl_path,
-            write_lock_timeout_ms: Some(25),
+            // Robust under heavy parallel-test load (a concurrent auto-flush can
+            // hold .write.lock for >25ms); no test asserts the timeout path.
+            write_lock_timeout_ms: Some(5_000),
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
