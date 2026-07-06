@@ -94,7 +94,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -221,7 +221,7 @@ jobs:
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -645,7 +645,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 

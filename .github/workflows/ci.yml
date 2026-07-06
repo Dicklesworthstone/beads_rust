@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           components: rustfmt, clippy
@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6  # v2.82.6
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3  # v2.82.9
         with:
           tool: cargo-audit
 
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -104,7 +104,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -160,7 +160,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -218,7 +218,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           components: llvm-tools-preview
@@ -227,7 +227,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@9bcaee1dcae34154180f412e2fa69355a7cda9f6  # v2.82.6
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3  # v2.82.9
         with:
           tool: cargo-llvm-cov
 
@@ -276,7 +276,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -321,7 +321,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -455,7 +455,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
