@@ -655,8 +655,24 @@ fn emit_message_event<W: Write>(
         "message_received"
     };
 
+    // The human-readable firehose keeps a short 200-char preview and points
+    // the reader at `bd inbox <id>` for the rest. Structured consumers
+    // (JSON / TOON) are typically other agents that must act on the message
+    // directly, so they get a very generous cap — a full bead-length body
+    // survives intact. Compare by character count (not bytes) so multi-byte
+    // text isn't clipped early.
+    const TEXT_PREVIEW_CHARS: usize = 200;
+    const STRUCTURED_PREVIEW_CHARS: usize = 100_000;
+    let body_chars = msg.body.chars().count();
+
     match format {
         OutputFormat::Json | OutputFormat::Toon => {
+            let truncated = body_chars > STRUCTURED_PREVIEW_CHARS;
+            let body_preview: String = if truncated {
+                msg.body.chars().take(STRUCTURED_PREVIEW_CHARS).collect()
+            } else {
+                msg.body.clone()
+            };
             let line = serde_json::to_string(&serde_json::json!({
                 "ts": Utc::now().to_rfc3339(),
                 "event": event,
@@ -665,14 +681,14 @@ fn emit_message_event<W: Write>(
                 "to": msg.to_prefix,
                 "sent_at": msg.sent_at.to_rfc3339(),
                 "in_reply_to": msg.in_reply_to,
-                "body_preview": msg.body.chars().take(200).collect::<String>(),
-                "truncated": msg.body.len() > 200,
+                "body_preview": body_preview,
+                "truncated": truncated,
             }))?;
             writeln!(out, "{line}")?;
         }
         _ => {
-            let preview: String = msg.body.chars().take(200).collect();
-            let truncated = msg.body.len() > 200;
+            let preview: String = msg.body.chars().take(TEXT_PREVIEW_CHARS).collect();
+            let truncated = body_chars > TEXT_PREVIEW_CHARS;
             let reply_part = msg
                 .in_reply_to
                 .as_ref()

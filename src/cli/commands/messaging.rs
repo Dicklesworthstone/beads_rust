@@ -22,7 +22,16 @@ use chrono::Utc;
 use serde::Serialize;
 use std::io::{Read, Write};
 
+/// Preview length for the human-readable text listing, where a short
+/// snippet keeps `bd inbox` scannable and the reader is told to re-fetch
+/// the full body by id.
 const PREVIEW_CHARS: usize = 200;
+/// Preview length for structured (JSON / TOON) output. These formats are
+/// consumed programmatically — typically by another agent — so a full
+/// bead-length message must survive. We keep a very generous cap only as a
+/// guard against pathologically huge bodies; anything under it is emitted
+/// whole.
+const STRUCTURED_PREVIEW_CHARS: usize = 100_000;
 const MESSAGES_TTL_DAYS: i64 = 7;
 
 #[derive(Serialize)]
@@ -437,13 +446,28 @@ fn resolve_body(words: &[String]) -> Result<String> {
     Ok(buf.trim_end_matches('\n').to_string())
 }
 
+/// Maximum body length (in characters) shown before a message is
+/// truncated, chosen per output format. Structured formats consumed by
+/// other agents get a very generous cap so bead-length bodies survive
+/// intact; the human text listing stays short and scannable.
+fn preview_limit_for(format: OutputFormat) -> usize {
+    match format {
+        OutputFormat::Json | OutputFormat::Toon => STRUCTURED_PREVIEW_CHARS,
+        _ => PREVIEW_CHARS,
+    }
+}
+
 fn emit_message(msg: &Message, truncate: bool, format: OutputFormat) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
 
-    let (display_body, truncated) = if truncate && msg.body.len() > PREVIEW_CHARS {
+    // Structured consumers (JSON / TOON) need the whole message; the short
+    // 200-char preview is only appropriate for the scannable text listing.
+    let preview_limit = preview_limit_for(format);
+
+    let (display_body, truncated) = if truncate && msg.body.chars().count() > preview_limit {
         (
-            msg.body.chars().take(PREVIEW_CHARS).collect::<String>(),
+            msg.body.chars().take(preview_limit).collect::<String>(),
             true,
         )
     } else {
@@ -498,6 +522,34 @@ mod tests {
     #[test]
     fn preview_constant_matches_design() {
         assert_eq!(PREVIEW_CHARS, 200);
+    }
+
+    #[test]
+    fn structured_formats_get_a_generous_preview_limit() {
+        // Human text stays short and scannable.
+        assert_eq!(preview_limit_for(OutputFormat::Text), PREVIEW_CHARS);
+        // Machine formats consumed by other agents keep full bodies.
+        assert_eq!(preview_limit_for(OutputFormat::Json), STRUCTURED_PREVIEW_CHARS);
+        assert_eq!(preview_limit_for(OutputFormat::Toon), STRUCTURED_PREVIEW_CHARS);
+        assert!(STRUCTURED_PREVIEW_CHARS > PREVIEW_CHARS);
+    }
+
+    #[test]
+    fn bead_length_message_survives_in_json_and_toon() {
+        // A realistic bead-length body: well over the text preview but under
+        // the structured cap, so an agent reading its inbox in JSON/TOON must
+        // receive it whole and un-truncated.
+        let body = "x".repeat(4_000);
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            let limit = preview_limit_for(format);
+            let truncated = body.chars().count() > limit;
+            assert!(
+                !truncated,
+                "bead-length body must not truncate in {format:?}"
+            );
+        }
+        // The same body IS truncated in the human text listing.
+        assert!(body.chars().count() > preview_limit_for(OutputFormat::Text));
     }
 
     #[test]
