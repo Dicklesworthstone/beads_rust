@@ -12820,10 +12820,21 @@ impl SqliteStorage {
             Ok(()) => Ok(()),
             Err(BeadsError::Database(error)) if is_import_comment_id_collision(&error) => {
                 match self.import_comment_id_owner(comment.id)? {
-                    Some(owner_issue_id) if owner_issue_id != issue_id => {
+                    // Route through AUTOINCREMENT whenever ANY row owns the
+                    // id — including this issue itself: an earlier comment in
+                    // this same import call may have had its id
+                    // AUTO-reallocated into the range of a later comment's
+                    // JSONL id (auto ids are max(seq, max(id)) + 1, which can
+                    // land ahead of upcoming JSONL-provided ids). The narrow
+                    // owner != issue_id guard turned that self-collision into
+                    // a hard PK failure during rebuild-from-JSONL. True
+                    // same-issue JSONL duplicates never reach here:
+                    // validate_import_comments_for_issue rejects them before
+                    // any insert.
+                    Some(_) => {
                         self.insert_import_comment_without_id(issue_id, comment, &created_at)
                     }
-                    _ => Err(BeadsError::Database(error)),
+                    None => Err(BeadsError::Database(error)),
                 }
             }
             Err(error) => Err(error),
@@ -17295,6 +17306,70 @@ mod tests {
 
         let comments_b = storage.get_comments("bd-c-import-b").unwrap();
         assert_eq!(comments_b, vec![existing_comment]);
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_handles_same_issue_self_collision_after_auto_realloc() {
+        // Regression for beads_rust-q0c: a corrupt JSONL emitted by a bd→br
+        // migration can have the same comment.id on two different issues.
+        // The defensive check at sqlite.rs:8255 routes the *second* claimant
+        // through AUTOINCREMENT, but AUTOINCREMENT may pick an id that is
+        // *also* a JSONL-provided id later in the same issue's comments
+        // array. When that later comment is processed, the check sees the
+        // colliding row owned by the same issue and falls back to the WITH-id
+        // INSERT path — which then violates the comments.id PK because the
+        // row was just AUTO-allocated to that id.
+        //
+        // Repro shape (matches the real failure on issue beads_rust-6ii1):
+        // 1. Pre-existing row owns id=1 (e.g. issue X with comment id=1).
+        // 2. sync_comments_for_import("A", [{id:1}, {id:2}]) is called:
+        //    - first comment (id=1) collides cross-issue → AUTO → allocates id=2
+        //    - second comment (id=2) now collides with A's own freshly-AUTO'd row
+        //      → existing_issue_id == "A" → routes to WITH-id INSERT (id=2, A)
+        //      → PK violation: row (id=2, A) just landed via AUTO.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap();
+
+        let issue_x = make_issue("br-cs-x", "Anchor", Status::Open, 2, None, t1, None);
+        let issue_a = make_issue("br-cs-a", "Importing", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue_x, "tester").unwrap();
+        storage.create_issue(&issue_a, "tester").unwrap();
+
+        // Pre-existing row pinning the AUTOINCREMENT counter to 1.
+        let anchor = storage
+            .add_comment("br-cs-x", "anchor-author", "anchor body")
+            .unwrap();
+        assert_eq!(anchor.id, 1, "test relies on first auto-id == 1");
+
+        // Two comments on A: first claims id=1 (cross-issue collision → AUTO),
+        // second claims id=2 (which AUTO will have just allocated).
+        let comment_one = crate::model::Comment {
+            id: 1,
+            issue_id: "br-cs-a".to_string(),
+            author: "alice".to_string(),
+            body: "first body".to_string(),
+            created_at: t1,
+        };
+        let comment_two = crate::model::Comment {
+            id: 2,
+            issue_id: "br-cs-a".to_string(),
+            author: "alice".to_string(),
+            body: "second body".to_string(),
+            created_at: t1 + chrono::Duration::minutes(1),
+        };
+
+        storage
+            .sync_comments_for_import("br-cs-a", &[comment_one, comment_two])
+            .expect("self-collision after AUTO must not violate PK");
+
+        let comments_a = storage.get_comments("br-cs-a").unwrap();
+        assert_eq!(comments_a.len(), 2);
+        let bodies: Vec<&str> = comments_a.iter().map(|c| c.body.as_str()).collect();
+        assert!(bodies.contains(&"first body"));
+        assert!(bodies.contains(&"second body"));
+
+        let comments_x = storage.get_comments("br-cs-x").unwrap();
+        assert_eq!(comments_x, vec![anchor]);
     }
 
     #[test]
