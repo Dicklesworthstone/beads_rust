@@ -383,6 +383,7 @@ pub(crate) fn resolve_create_description(args: &CreateArgs) -> Result<Option<Str
     Ok(args.description.clone())
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn create_issue_impl(
     storage: &mut SqliteStorage,
     args: &CreateArgs,
