@@ -1343,6 +1343,7 @@ mod tests {
             slug: None,
             priority: None,
             description: None,
+            description_file: None,
             assignee: None,
             owner: None,
             labels: Vec::new(),
