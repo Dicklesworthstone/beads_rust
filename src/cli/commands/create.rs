@@ -389,6 +389,13 @@ pub fn create_issue_impl(
     config: &CreateConfig,
     description: Option<String>,
 ) -> Result<Issue> {
+    // Real callers pass the pre-resolved `--description-file`/`-d` value
+    // (resolved once at the call site so `-` stdin is read exactly once,
+    // before the JSONL-recovery retry closure). When a caller passes `None`,
+    // fall back to the description carried on `args` so arg-based descriptions
+    // still apply. `description_file` conflicts with `-d`, so this never
+    // double-counts.
+    let description = description.or_else(|| args.description.clone());
     // 1. Resolve title
     let title = args
         .title
@@ -1501,6 +1508,7 @@ mod tests {
             slug: None,
             priority: None,
             description: None,
+            description_file: None,
             assignee: None,
             owner: None,
             labels: vec![],
@@ -1579,7 +1587,7 @@ mod tests {
         config.source_repo = canonical_source_repo(&beads_dir);
         let args = default_args();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create");
         assert_eq!(
             issue.source_repo.as_deref(),
             Some("source_repo_probe"),
@@ -1618,7 +1626,7 @@ mod tests {
         let args = default_args();
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         assert_eq!(issue.title, "Test Issue");
         assert_eq!(issue.priority, Priority::MEDIUM);
@@ -1641,7 +1649,7 @@ mod tests {
         args.title = None;
         let config = default_config();
 
-        let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
+        let err = create_issue_impl(&mut storage, &args, &config, None).unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "title"));
         info!("test_create_issue_validation_empty_title: assertions passed");
     }
@@ -1655,7 +1663,7 @@ mod tests {
         parent.title = Some("Parent".to_string());
         let config = default_config();
         let created_parent =
-            create_issue_impl(&mut storage, &parent, &config).expect("create parent");
+            create_issue_impl(&mut storage, &parent, &config, None).expect("create parent");
 
         storage
             .execute_raw("DROP TABLE issues")
@@ -1664,7 +1672,7 @@ mod tests {
         let mut child = default_args();
         child.parent = Some(created_parent.id);
 
-        let err = create_issue_impl(&mut storage, &child, &config).unwrap_err();
+        let err = create_issue_impl(&mut storage, &child, &config, None).unwrap_err();
         assert!(
             matches!(err, BeadsError::Database(_)),
             "expected database error, got: {err:?}"
@@ -1681,7 +1689,7 @@ mod tests {
         args.dry_run = true;
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         // Should return issue but not verify existence in DB
         assert_eq!(issue.title, "Test Issue");
@@ -1701,7 +1709,7 @@ mod tests {
         args.description = Some("Desc".to_string());
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         assert_eq!(issue.priority, Priority::CRITICAL);
         assert_eq!(issue.issue_type, IssueType::Bug);
@@ -1721,14 +1729,14 @@ mod tests {
             title: Some("Target".to_string()),
             ..default_args()
         };
-        let target = create_issue_impl(&mut storage, &target_args, &config).expect("create target");
+        let target = create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
 
         // Create issue with label and dep
         let mut args = default_args();
         args.labels = vec!["backend".to_string()];
         args.deps = vec![target.id.clone()];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         // Verify labels
         let labels = storage.get_labels(&issue.id).expect("get labels");
@@ -1752,12 +1760,12 @@ mod tests {
             title: Some("Step 1: Setup Database".to_string()),
             ..default_args()
         };
-        let target = create_issue_impl(&mut storage, &target_args, &config).expect("create target");
+        let target = create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
 
         let mut args = default_args();
         args.deps = vec!["Step 1: Setup Database".to_string()];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create dependent");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create dependent");
 
         let deps = storage.get_dependencies(&issue.id).expect("get deps");
         assert_eq!(deps, vec![target.id]);
@@ -1773,7 +1781,7 @@ mod tests {
         let mut args = default_args();
         args.deps = vec!["bd-missing".to_string()];
 
-        let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
+        let err = create_issue_impl(&mut storage, &args, &config, None).unwrap_err();
 
         assert!(matches!(err, BeadsError::IssueNotFound { id } if id == "bd-missing"));
         info!("test_create_issue_with_missing_dependency_fails: assertions passed");
@@ -1787,12 +1795,12 @@ mod tests {
         let config = default_config();
 
         // Parent
-        let parent = create_issue_impl(&mut storage, &default_args(), &config).expect("parent");
+        let parent = create_issue_impl(&mut storage, &default_args(), &config, None).expect("parent");
 
         // Child
         let mut args = default_args();
         args.parent = Some(parent.id.clone());
-        let child = create_issue_impl(&mut storage, &args, &config).expect("child");
+        let child = create_issue_impl(&mut storage, &args, &config, None).expect("child");
 
         let deps = storage.get_dependencies(&child.id).expect("get deps");
         assert_eq!(deps.len(), 1);
@@ -1810,13 +1818,13 @@ mod tests {
         // Create parent (epic)
         let mut parent_args = default_args();
         parent_args.title = Some("Epic Parent".to_string());
-        let parent = create_issue_impl(&mut storage, &parent_args, &config).expect("parent");
+        let parent = create_issue_impl(&mut storage, &parent_args, &config, None).expect("parent");
 
         // Create first child - should get parent.1
         let mut child1_args = default_args();
         child1_args.title = Some("First Child".to_string());
         child1_args.parent = Some(parent.id.clone());
-        let child1 = create_issue_impl(&mut storage, &child1_args, &config).expect("child1");
+        let child1 = create_issue_impl(&mut storage, &child1_args, &config, None).expect("child1");
 
         // Verify child ID has the correct format: parent_id.1
         let expected_child1_id = format!("{}.1", parent.id);
@@ -1830,7 +1838,7 @@ mod tests {
         let mut child2_args = default_args();
         child2_args.title = Some("Second Child".to_string());
         child2_args.parent = Some(parent.id.clone());
-        let child2 = create_issue_impl(&mut storage, &child2_args, &config).expect("child2");
+        let child2 = create_issue_impl(&mut storage, &child2_args, &config, None).expect("child2");
 
         let expected_child2_id = format!("{}.2", parent.id);
         assert_eq!(
@@ -1862,7 +1870,7 @@ mod tests {
         let mut args = default_args();
         args.parent = Some("bd-nonexistent".to_string());
 
-        let result = create_issue_impl(&mut storage, &args, &config);
+        let result = create_issue_impl(&mut storage, &args, &config, None);
         assert!(result.is_err(), "Should fail when parent doesn't exist");
 
         if let Err(BeadsError::IssueNotFound { id }) = result {
@@ -1884,7 +1892,7 @@ mod tests {
         args.type_ = Some("custom_type".to_string());
         let config = default_config();
 
-        let result = create_issue_impl(&mut storage, &args, &config);
+        let result = create_issue_impl(&mut storage, &args, &config, None);
         assert!(result.is_ok(), "create should succeed with custom type");
         let issue = result.unwrap();
         assert_eq!(
@@ -2047,7 +2055,7 @@ mod tests {
         let mut args = default_args();
         args.labels = vec!["  trimmed  ".to_string()];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         let labels = storage.get_labels(&issue.id).expect("get labels");
         assert_eq!(labels, vec!["trimmed"]);
@@ -2067,7 +2075,7 @@ mod tests {
             "  backend  ".to_string(),
         ];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         let labels = storage.get_labels(&issue.id).expect("get labels");
         assert_eq!(labels, vec!["backend"]);
