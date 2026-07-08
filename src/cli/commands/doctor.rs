@@ -1455,6 +1455,52 @@ fn repair_report_verified(report: &DoctorReport) -> bool {
     report.ok && !has_non_ok(&report.checks)
 }
 
+/// Findings that are EXPECTED to remain after a *successful* JSONL rebuild and
+/// therefore must not, on their own, fail post-repair verification (issue #375).
+///
+/// A rebuild-from-JSONL structurally cannot avoid producing these signals:
+/// - `db.recovery_artifacts` (WARN): the rebuild deliberately moves the entire
+///   pre-repair database family — the corrupt `beads.db` *and* any stale
+///   `-wal`/`-shm` sidecars — into `.br_recovery/` as a forensic backup before
+///   writing the fresh DB. A fresh, non-aged backup is the success signal, not
+///   a defect; the separate `db.recovery_artifacts.aged` check still fails on
+///   backups past the TTL.
+/// - `db.sidecars` (WARN): frankensqlite keeps the WAL index in process-local
+///   memory, so a freshly rebuilt DB with a WAL but no sibling SHM is its
+///   normal operating state — the check message itself says "expected for
+///   frankensqlite". Note the WARN gate: an ERROR here (e.g. a non-file
+///   dangling sidecar) is deliberately *not* tolerated.
+/// - `rust_log` (WARN): a nag about the *caller's* `RUST_LOG` environment,
+///   unrelated to database health.
+///
+/// Anything ERROR-level (corrupt rebuilt DB, schema/integrity/count failures)
+/// still flips `report.ok` to false and fails verification, so this only
+/// relaxes the "must be pristine" constraint for these known-benign warnings.
+fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
+    matches!(check.status, CheckStatus::Warn)
+        && matches!(
+            check.name.as_str(),
+            "db.recovery_artifacts" | "db.sidecars" | "rust_log"
+        )
+}
+
+/// Post-repair verification for the JSONL-rebuild path.
+///
+/// Unlike [`repair_report_verified`] (which demands a pristine, zero-non-OK
+/// report), this tolerates the handful of benign findings a successful rebuild
+/// always leaves behind — see [`is_benign_post_rebuild_finding`]. Without this,
+/// the rebuild path could never verify: it always creates a recovery backup and
+/// leaves a frankensqlite WAL sidecar, so `repair_report_verified` returned
+/// false even when the rebuilt database was fully healthy, forcing `doctor
+/// --repair` to exit 7 on the `corrupt_db_text` fixture (issue #375).
+fn jsonl_rebuild_repair_verified(report: &DoctorReport) -> bool {
+    report.ok
+        && report
+            .checks
+            .iter()
+            .all(|check| matches!(check.status, CheckStatus::Ok) || is_benign_post_rebuild_finding(check))
+}
+
 /// Return true if any integrity check reported partial-index row mismatches
 /// ("row N missing from index") as a warning.  These can be repaired via `REINDEX`.
 fn is_partial_index_warning_check(check: &CheckResult) -> bool {
@@ -11716,7 +11762,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let post_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-    let post_repair_verified = repair_report_verified(&post_repair.report);
+    let post_repair_verified = jsonl_rebuild_repair_verified(&post_repair.report);
     let verification_failure_marker = if post_repair_verified {
         None
     } else {
@@ -19013,6 +19059,100 @@ mod tests {
             }],
         };
         assert!(warning_repair_verified(&clean_report, false, false));
+    }
+
+    #[test]
+    fn jsonl_rebuild_verification_tolerates_benign_post_rebuild_warnings() {
+        // Issue #375: a successful rebuild-from-JSONL always leaves a fresh
+        // recovery backup, a frankensqlite WAL-without-SHM sidecar, and (under
+        // the caller's env) a RUST_LOG nag. None of these mean the rebuilt DB
+        // is unhealthy, so post-repair verification must still pass.
+        let report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![
+                CheckResult {
+                    name: "rust_log".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some("RUST_LOG=beads_rust=debug is verbose".to_string()),
+                    details: None,
+                },
+                CheckResult {
+                    name: "db.recovery_artifacts".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some("Preserved recovery artifacts remain (2 item(s))".to_string()),
+                    details: None,
+                },
+                CheckResult {
+                    name: "db.sidecars".to_string(),
+                    status: CheckStatus::Warn,
+                    message: Some(
+                        "WAL sidecar exists without a matching SHM sidecar (expected for frankensqlite)"
+                            .to_string(),
+                    ),
+                    details: None,
+                },
+                CheckResult {
+                    name: "sqlite.integrity_check".to_string(),
+                    status: CheckStatus::Ok,
+                    message: None,
+                    details: None,
+                },
+            ],
+        };
+        // Strict verifier (used by the light-repair path) rejects these...
+        assert!(!repair_report_verified(&report));
+        // ...but the rebuild path's verifier tolerates them.
+        assert!(jsonl_rebuild_repair_verified(&report));
+    }
+
+    #[test]
+    fn jsonl_rebuild_verification_still_fails_on_real_defects() {
+        // An ERROR-level finding (e.g. rebuilt DB still not openable) flips
+        // report.ok to false and must fail verification.
+        let error_report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.open".to_string(),
+                status: CheckStatus::Error,
+                message: Some("Failed to open DB snapshot for inspection".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!jsonl_rebuild_repair_verified(&error_report));
+
+        // A non-benign WARN (page anomaly) is NOT tolerated even though
+        // report.ok is true: it signals residual corruption after rebuild.
+        let page_warn_report = DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "sqlite3.integrity_check".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("Page 55: never used".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!jsonl_rebuild_repair_verified(&page_warn_report));
+
+        // A db.sidecars ERROR (dangling non-file sidecar) is not tolerated
+        // even though the check name is on the benign list.
+        let sidecar_error_report = DoctorReport {
+            ok: false,
+            workspace_health: None,
+            reliability_audit: None,
+            checks: vec![CheckResult {
+                name: "db.sidecars".to_string(),
+                status: CheckStatus::Error,
+                message: Some("WAL sidecar is a directory instead of a regular file".to_string()),
+                details: None,
+            }],
+        };
+        assert!(!jsonl_rebuild_repair_verified(&sidecar_error_report));
     }
 
     #[test]
