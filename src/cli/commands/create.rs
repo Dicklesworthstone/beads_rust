@@ -167,9 +167,15 @@ pub fn execute_with_storage(
         source_repo_path: canonical_source_repo_path(&storage_ctx.paths.beads_dir),
     };
 
+    // Resolve the description up front — before the retry closure — so the
+    // verbatim `--description-file` content (or `-` stdin, which can only be
+    // read once) is captured a single time and reused across any
+    // JSONL-recovery retry.
+    let description = resolve_create_description(args)?;
+
     let issue =
         retry_mutation_with_jsonl_recovery(&mut storage_ctx, true, "create", None, |storage| {
-            create_issue_impl(storage, args, &config)
+            create_issue_impl(storage, args, &config, description.clone())
         })?;
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
@@ -333,10 +339,55 @@ fn create_issue_summary_line(id: &str, title: &str) -> String {
 /// - Validation fails
 /// - Storage write fails
 #[allow(clippy::too_many_lines)]
+/// Read a description body verbatim from a file, or from stdin when `path`
+/// is `-`. The full content is returned unchanged from disk (no paragraph
+/// truncation, no trimming), so callers get exactly the bytes on disk as a
+/// UTF-8 string. Shared by `br create --description-file` and
+/// `br update --description-file`.
+pub(crate) fn read_description_file(path: &Path) -> Result<String> {
+    if path.as_os_str() == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer).map_err(|err| {
+            BeadsError::validation(
+                "description_file",
+                format!("failed to read description from stdin: {err}"),
+            )
+        })?;
+        return Ok(buffer);
+    }
+    std::fs::read_to_string(path).map_err(|err| {
+        BeadsError::validation(
+            "description_file",
+            format!(
+                "failed to read description file '{}': {err}",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Resolve the effective description for `br create`, preferring
+/// `--description-file` (read verbatim) over inline `-d/--description`.
+/// The two are mutually exclusive; clap enforces this at parse time, and
+/// this guard re-checks it so programmatic callers cannot smuggle both.
+pub(crate) fn resolve_create_description(args: &CreateArgs) -> Result<Option<String>> {
+    if let Some(path) = &args.description_file {
+        if args.description.is_some() {
+            return Err(BeadsError::validation(
+                "description_file",
+                "cannot be combined with --description",
+            ));
+        }
+        return Ok(Some(read_description_file(path)?));
+    }
+    Ok(args.description.clone())
+}
+
 pub fn create_issue_impl(
     storage: &mut SqliteStorage,
     args: &CreateArgs,
     config: &CreateConfig,
+    description: Option<String>,
 ) -> Result<Issue> {
     // 1. Resolve title
     let title = args
@@ -386,7 +437,7 @@ pub fn create_issue_impl(
 
         let id_input = NewIdInput {
             title,
-            description: args.description.as_deref(),
+            description: description.as_deref(),
             creator: Some(&config.actor),
             now,
             issue_count: count,
@@ -416,7 +467,7 @@ pub fn create_issue_impl(
         let mut issue = Issue {
             id: id.clone(),
             title: title.clone(),
-            description: args.description.clone(),
+            description: description.clone(),
             status: status.clone(),
             priority,
             issue_type: issue_type.clone(),

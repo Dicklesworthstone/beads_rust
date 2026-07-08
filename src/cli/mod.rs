@@ -1045,6 +1045,17 @@ pub struct CreateArgs {
     #[arg(long, short = 'd', visible_alias = "body")]
     pub description: Option<String>,
 
+    /// Read the issue description verbatim from a file (or `-` for stdin).
+    ///
+    /// The entire file content is used as the description, unchanged from
+    /// disk — unlike the bulk `-f/--file` markdown import, which only
+    /// captures the first paragraph after each `## Title` heading. Use this
+    /// for multi-paragraph / markdown descriptions (lists, fenced code)
+    /// that are fragile to pass through shell quoting on `-d/--description`.
+    /// Mutually exclusive with `-d/--description`.
+    #[arg(long, value_name = "PATH", conflicts_with = "description")]
+    pub description_file: Option<std::path::PathBuf>,
+
     /// Assign to person
     #[arg(long, short = 'a', add = ArgValueCompleter::new(assignee_completer))]
     pub assignee: Option<String>,
@@ -1161,6 +1172,14 @@ pub struct UpdateArgs {
     /// Update description
     #[arg(long, short = 'd', visible_alias = "body")]
     pub description: Option<String>,
+
+    /// Set the issue description verbatim from a file (or `-` for stdin),
+    /// replacing the existing value. The entire file content is used
+    /// unchanged from disk. Mutually exclusive with `-d/--description`;
+    /// use this for multi-paragraph / markdown descriptions that are
+    /// fragile to pass through shell quoting.
+    #[arg(long, value_name = "PATH", conflicts_with = "description")]
+    pub description_file: Option<PathBuf>,
 
     /// Update design notes
     #[arg(long)]
