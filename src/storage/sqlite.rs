@@ -1038,7 +1038,8 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        let schema_current = database_header_user_version(path)
+        let schema_current = connection_user_version(&conn)
+            .or_else(|| database_header_user_version(path))
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
         let runtime_compatible = runtime_schema_compatible(&conn);
 
@@ -1060,8 +1061,13 @@ impl SqliteStorage {
 
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
-        if database_header_user_version(path).is_none_or(|version| version < current_schema_version)
-        {
+        // Cheap header pre-filter: only reject when the file is definitively not
+        // a SQLite database (no valid header magic). A low header *version* must
+        // NOT disqualify — an uncheckpointed WAL from another process may hold
+        // the true, current value that the raw header bytes do not yet reflect
+        // (issue #373). A real database always carries the header magic even
+        // when its user_version lives only in the WAL.
+        if database_header_user_version(path).is_none() {
             return Ok(None);
         }
 
@@ -1069,6 +1075,15 @@ impl SqliteStorage {
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
+        // Now that the connection is open, consult the effective schema version
+        // (WAL-aware) and fall back to the header peek. If it is still below the
+        // current version, this database is genuinely stale.
+        if connection_user_version(&conn)
+            .or_else(|| database_header_user_version(path))
+            .is_none_or(|version| version < current_schema_version)
+        {
+            return Ok(None);
+        }
         Ok(Some(Self {
             conn,
             mutation_count: 0,
@@ -10949,6 +10964,22 @@ fn database_header_user_version(path: &Path) -> Option<u32> {
     ]))
 }
 
+/// Read `PRAGMA user_version` through an open connection (issue #373).
+///
+/// Unlike [`database_header_user_version`], which peeks raw file-header bytes,
+/// this observes the *effective* schema version — including a value that lives
+/// only in an uncheckpointed WAL written by another process. Relying on the
+/// header alone can make a current database read as stale (header still at the
+/// old version, WAL holding the new one), causing the schema to be re-applied
+/// over live data. Prefer this and fall back to the header peek only when the
+/// pragma cannot be read.
+fn connection_user_version(conn: &Connection) -> Option<u32> {
+    let row = conn.query_row("PRAGMA user_version").ok()?;
+    row.get(0)
+        .and_then(SqliteValue::as_integer)
+        .and_then(|v| u32::try_from(v).ok())
+}
+
 fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("wal file is corrupt")
@@ -12820,10 +12851,18 @@ impl SqliteStorage {
             Ok(()) => Ok(()),
             Err(BeadsError::Database(error)) if is_import_comment_id_collision(&error) => {
                 match self.import_comment_id_owner(comment.id)? {
-                    Some(owner_issue_id) if owner_issue_id != issue_id => {
+                    // Whenever ANY row already owns this id — a comment on
+                    // another issue OR an earlier comment of *this* issue whose
+                    // id was AUTO-reallocated to the same value during this
+                    // import — reinsert without an explicit id so AUTOINCREMENT
+                    // assigns a fresh one. True same-issue JSONL duplicates are
+                    // rejected earlier by `validate_import_comments_for_issue`,
+                    // so this cannot silently swallow a genuine duplicate
+                    // (issue #374).
+                    Some(_) => {
                         self.insert_import_comment_without_id(issue_id, comment, &created_at)
                     }
-                    _ => Err(BeadsError::Database(error)),
+                    None => Err(BeadsError::Database(error)),
                 }
             }
             Err(error) => Err(error),
@@ -17360,6 +17399,112 @@ mod tests {
         assert_eq!(
             storage.get_comments(&issue.id).unwrap(),
             vec![existing_comment]
+        );
+    }
+
+    #[test]
+    fn test_sync_comments_for_import_handles_auto_realloc_self_collision() {
+        // Issue #374: during a single import, an earlier comment whose JSONL id
+        // collides with a comment on *another* issue is AUTO-reallocated a fresh
+        // id via AUTOINCREMENT. If that freshly assigned id happens to equal a
+        // *later* comment's JSONL id in the SAME import, the later insert hits a
+        // PK collision whose owner is this very issue. The old narrow guard
+        // (`owner != issue_id`) turned that self-collision into a hard failure,
+        // corrupting rebuild-from-JSONL. It must instead reallocate again.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+
+        let issue_a = make_issue(
+            "bd-c-realloc-a",
+            "Import target",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let issue_b = make_issue(
+            "bd-c-realloc-b",
+            "Existing comment owner",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+
+        // Existing comment on issue B occupies id E and makes E the current
+        // AUTOINCREMENT high-water mark, so the next auto id is E + 1.
+        let existing = storage
+            .add_comment("bd-c-realloc-b", "bob", "Existing comment on B")
+            .unwrap();
+        let e = existing.id;
+
+        // First imported comment collides with B's id (E) -> auto-realloc to
+        // E + 1. Second imported comment's JSONL id is E + 1, which now collides
+        // with the just-reallocated first comment -> a same-issue self-collision.
+        let first = crate::model::Comment {
+            id: e,
+            issue_id: "bd-c-realloc-a".to_string(),
+            author: "alice".to_string(),
+            body: "first imported (collides with B)".to_string(),
+            created_at: t1 + chrono::Duration::minutes(1),
+        };
+        let second = crate::model::Comment {
+            id: e + 1,
+            issue_id: "bd-c-realloc-a".to_string(),
+            author: "alice".to_string(),
+            body: "second imported (self-collision)".to_string(),
+            created_at: t1 + chrono::Duration::minutes(2),
+        };
+
+        storage
+            .sync_comments_for_import("bd-c-realloc-a", &[first, second])
+            .expect("auto-realloc self-collision must not fail the import");
+
+        let mut comments_a = storage.get_comments("bd-c-realloc-a").unwrap();
+        comments_a.sort_by_key(|c| c.created_at);
+        assert_eq!(comments_a.len(), 2, "both imported comments must be kept");
+        assert_eq!(comments_a[0].body, "first imported (collides with B)");
+        assert_eq!(comments_a[1].body, "second imported (self-collision)");
+        // Reallocated ids must be distinct and must not clobber B's comment.
+        assert_ne!(comments_a[0].id, comments_a[1].id);
+        assert_ne!(comments_a[0].id, e);
+        assert_ne!(comments_a[1].id, e);
+
+        // Issue B's original comment is untouched.
+        assert_eq!(
+            storage.get_comments("bd-c-realloc-b").unwrap(),
+            vec![existing]
+        );
+    }
+
+    #[test]
+    fn connection_user_version_sees_wal_resident_value_header_misses() {
+        // Issue #373: a user_version written through a connection lives in the
+        // uncheckpointed WAL, so a raw file-header peek reads a stale value
+        // while the connection observes the true one. connection_user_version
+        // must report the WAL-resident value; database_header_user_version must
+        // not — proving the exact scenario the open-path fix guards against.
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("wal_uv.db");
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        conn.execute("PRAGMA journal_mode=WAL").unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("PRAGMA user_version = 4242").unwrap();
+
+        // Through the connection: WAL-aware, sees the new value.
+        assert_eq!(connection_user_version(&conn), Some(4242));
+
+        // Raw header peek of the main db file misses the uncheckpointed value.
+        assert_ne!(
+            database_header_user_version(&db_path),
+            Some(4242),
+            "header peek unexpectedly reflected the WAL-resident user_version; \
+             the WAL-miss scenario cannot be proven"
         );
     }
 
