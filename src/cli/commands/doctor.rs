@@ -1495,10 +1495,9 @@ fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
 /// --repair` to exit 7 on the `corrupt_db_text` fixture (issue #375).
 fn jsonl_rebuild_repair_verified(report: &DoctorReport) -> bool {
     report.ok
-        && report
-            .checks
-            .iter()
-            .all(|check| matches!(check.status, CheckStatus::Ok) || is_benign_post_rebuild_finding(check))
+        && report.checks.iter().all(|check| {
+            matches!(check.status, CheckStatus::Ok) || is_benign_post_rebuild_finding(check)
+        })
 }
 
 /// Return true if any integrity check reported partial-index row mismatches

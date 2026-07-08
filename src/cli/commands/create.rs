@@ -1729,7 +1729,8 @@ mod tests {
             title: Some("Target".to_string()),
             ..default_args()
         };
-        let target = create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
+        let target =
+            create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
 
         // Create issue with label and dep
         let mut args = default_args();
@@ -1760,12 +1761,14 @@ mod tests {
             title: Some("Step 1: Setup Database".to_string()),
             ..default_args()
         };
-        let target = create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
+        let target =
+            create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
 
         let mut args = default_args();
         args.deps = vec!["Step 1: Setup Database".to_string()];
 
-        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create dependent");
+        let issue =
+            create_issue_impl(&mut storage, &args, &config, None).expect("create dependent");
 
         let deps = storage.get_dependencies(&issue.id).expect("get deps");
         assert_eq!(deps, vec![target.id]);
@@ -1795,7 +1798,8 @@ mod tests {
         let config = default_config();
 
         // Parent
-        let parent = create_issue_impl(&mut storage, &default_args(), &config, None).expect("parent");
+        let parent =
+            create_issue_impl(&mut storage, &default_args(), &config, None).expect("parent");
 
         // Child
         let mut args = default_args();
