@@ -202,22 +202,38 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         HashMap::new()
     };
     let mut batches: HashMap<Option<String>, SenderBatch> = HashMap::new();
-    // Seed the dedup set with messages that are already *read* — those
-    // have been consumed via `bd inbox` and shouldn't re-fire. Crucially
-    // we do NOT pre-seed *unread* messages: anything that arrived while
-    // this watch was down (a crash/restart window, or a supersede-and-
-    // respawn cycle) is still unread and must surface on the first poll
-    // tick. Pre-seeding the whole inbox here is what silently swallowed
-    // queued messages across restarts.
-    let mut seen_msgs: HashSet<String> = if watch_inbox {
-        inbox_messages(&beads_dir, cli, &prefix)?
-            .into_iter()
-            .filter(|m| m.read_at.is_some())
-            .map(|m| m.id)
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    // Cross-restart inbox cursor.
+    //
+    // `bd watch` emits each inbox message exactly once, but it never marks
+    // messages *read* — only `bd inbox` does. So read/unread state cannot
+    // decide what has already been surfaced across a restart: using it,
+    // every *unread* message replays on every respawn, flooding the
+    // monitor with the entire backlog (weeks of stale messages). Using it
+    // the other way (pre-seed the whole inbox as seen) silently swallows
+    // messages that arrived while the watch was down.
+    //
+    // Instead we persist a per-prefix high-water mark: the newest message
+    // `sent_at` we have emitted. On restart:
+    //   * messages with `sent_at <= cursor` were surfaced in a prior
+    //     session -> seed them as seen (don't re-fire);
+    //   * messages with `sent_at > cursor` arrived while this watch was
+    //     down (crash/restart or supersede-and-respawn window) -> let
+    //     them surface on the first poll tick.
+    // On the very first run for a prefix (no cursor yet) we seed the
+    // cursor at the newest existing message, so we start "from now"
+    // rather than replaying history.
+    let mut inbox_cursor: DateTime<Utc> = Utc::now();
+    let mut seen_msgs: HashSet<String> = HashSet::new();
+    if watch_inbox {
+        let messages = inbox_messages(&beads_dir, cli, &prefix)?;
+        let persisted = read_inbox_cursor(&beads_dir, cli, &prefix);
+        let (cursor, seen) = seed_startup(&messages, persisted, Utc::now());
+        inbox_cursor = cursor;
+        seen_msgs = seen;
+        // Persist immediately so a later restart resumes from here even if
+        // no new message arrives in the meantime.
+        write_inbox_cursor(&beads_dir, cli, &prefix, inbox_cursor);
+    }
 
     let mut tick: u64 = 0;
     loop {
@@ -419,12 +435,22 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
                 Ok(messages) => {
                     let stdout = std::io::stdout();
                     let mut out = stdout.lock();
+                    let mut advanced = false;
                     for msg in &messages {
                         if seen_msgs.insert(msg.id.clone()) {
                             emit_message_event(&mut out, msg, format)?;
+                            if msg.sent_at > inbox_cursor {
+                                inbox_cursor = msg.sent_at;
+                                advanced = true;
+                            }
                         }
                     }
                     out.flush().ok();
+                    // Advance the persisted high-water mark so the next
+                    // respawn resumes here instead of replaying these.
+                    if advanced {
+                        write_inbox_cursor(&beads_dir, cli, &prefix, inbox_cursor);
+                    }
                 }
                 Err(e) => {
                     eprintln!("watch: inbox snapshot failed: {e}");
@@ -607,6 +633,72 @@ fn flush_batches(
     // Drop empty batches that may have been collapsed to zero.
     batches.retain(|_, b| !b.changes.is_empty());
     Ok(())
+}
+
+/// Config key holding the per-prefix inbox high-water mark (the newest
+/// message `sent_at` this watch has already emitted). Namespaced by
+/// prefix so each watched inbox tracks its own cursor.
+fn inbox_cursor_key(prefix: &str) -> String {
+    format!("watch_inbox_cursor_{prefix}")
+}
+
+/// Decide the startup high-water mark and which message ids to pre-seed
+/// as already-surfaced, given the current inbox and an optional persisted
+/// cursor. Pure, so the restart semantics can be unit-tested without
+/// touching storage.
+///
+/// * With a persisted cursor (a restart): messages at or before it were
+///   surfaced in a prior session and are pre-seeded; anything newer
+///   arrived while the watch was down and is left to fire on first tick.
+/// * Without one (first run for this prefix): the cursor starts at the
+///   newest existing message (or `now` if the inbox is empty), so the
+///   whole existing backlog is pre-seeded and we start "from now" instead
+///   of replaying history.
+fn seed_startup(
+    messages: &[crate::model::Message],
+    persisted: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> (DateTime<Utc>, HashSet<String>) {
+    let newest = messages.iter().map(|m| m.sent_at).max();
+    let cursor = persisted.or(newest).unwrap_or(now);
+    let seen = messages
+        .iter()
+        .filter(|m| m.sent_at <= cursor)
+        .map(|m| m.id.clone())
+        .collect();
+    (cursor, seen)
+}
+
+/// Read the persisted inbox cursor for `prefix`, if any. Any failure
+/// (missing key, unparseable value, DB open error) yields `None`, which
+/// callers treat as "first run" — never a reason to abort the watch.
+fn read_inbox_cursor(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    prefix: &str,
+) -> Option<DateTime<Utc>> {
+    let (storage, _paths) =
+        config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout).ok()?;
+    let raw = storage.get_config(&inbox_cursor_key(prefix)).ok()??;
+    DateTime::parse_from_rfc3339(&raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Persist the inbox cursor for `prefix`. Best-effort: a write failure
+/// just means the next restart may replay a few already-seen messages,
+/// which is far less harmful than aborting the watch loop.
+fn write_inbox_cursor(
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    prefix: &str,
+    value: DateTime<Utc>,
+) {
+    if let Ok((mut storage, _paths)) =
+        config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)
+    {
+        let _ = storage.set_config(&inbox_cursor_key(prefix), &value.to_rfc3339());
+    }
 }
 
 fn inbox_messages(
@@ -1030,6 +1122,72 @@ mod tests {
             sender: sender.map(String::from),
             created_by: created_by.map(String::from),
         }
+    }
+
+    fn msg(id: &str, secs: i64) -> crate::model::Message {
+        crate::model::Message {
+            id: id.to_string(),
+            from_prefix: "other".to_string(),
+            to_prefix: "me".to_string(),
+            body: "b".to_string(),
+            sent_at: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            read_at: None,
+            in_reply_to: None,
+            choices: None,
+        }
+    }
+
+    #[test]
+    fn seed_startup_first_run_seeds_whole_backlog() {
+        // No persisted cursor: every existing message is pre-seeded so the
+        // watch starts "from now" and does not replay the backlog.
+        let now = chrono::DateTime::from_timestamp(1000, 0).unwrap();
+        let inbox = vec![msg("a", 100), msg("b", 200), msg("c", 300)];
+        let (cursor, seen) = seed_startup(&inbox, None, now);
+        assert_eq!(cursor, inbox[2].sent_at, "cursor pins to newest message");
+        assert_eq!(seen.len(), 3, "all existing messages pre-seeded (no flood)");
+    }
+
+    #[test]
+    fn seed_startup_empty_inbox_uses_now() {
+        let now = chrono::DateTime::from_timestamp(1000, 0).unwrap();
+        let (cursor, seen) = seed_startup(&[], None, now);
+        assert_eq!(cursor, now);
+        assert!(seen.is_empty());
+    }
+
+    #[test]
+    fn seed_startup_restart_surfaces_only_newer_than_cursor() {
+        // Restart with a persisted cursor between the old and the new
+        // message: the old one is pre-seeded (already surfaced), the new
+        // one that arrived while down is left to fire.
+        let now = chrono::DateTime::from_timestamp(9999, 0).unwrap();
+        let persisted = chrono::DateTime::from_timestamp(150, 0);
+        let inbox = vec![msg("old", 100), msg("new", 200)];
+        let (cursor, seen) = seed_startup(&inbox, persisted, now);
+        assert_eq!(cursor, persisted.unwrap(), "cursor honors the persisted value");
+        assert!(seen.contains("old"), "already-surfaced message stays seen");
+        assert!(
+            !seen.contains("new"),
+            "message queued during downtime must surface, not be swallowed"
+        );
+    }
+
+    #[test]
+    fn seed_startup_restart_at_boundary_is_inclusive() {
+        // A message exactly at the cursor was already surfaced (<=).
+        let now = chrono::DateTime::from_timestamp(9999, 0).unwrap();
+        let persisted = chrono::DateTime::from_timestamp(200, 0);
+        let inbox = vec![msg("at", 200), msg("after", 201)];
+        let (_cursor, seen) = seed_startup(&inbox, persisted, now);
+        assert!(seen.contains("at"), "boundary message is inclusive");
+        assert!(!seen.contains("after"));
+    }
+
+    #[test]
+    fn inbox_cursor_key_is_prefix_namespaced() {
+        assert_eq!(inbox_cursor_key("agent3"), "watch_inbox_cursor_agent3");
+        assert_ne!(inbox_cursor_key("agent1"), inbox_cursor_key("agent2"));
     }
 
     #[test]
