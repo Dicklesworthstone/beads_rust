@@ -140,9 +140,11 @@ pub fn execute(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
         let _ = storage_ctx
             .storage
             .heartbeat_watcher(OPERATOR_PREFIX, pid, now);
+        let ttl = crate::storage::watchers::WATCHER_TTL_SECONDS;
+        let _ = storage_ctx.storage.sweep_stale_watchers(now, ttl);
         if let Ok(Some(winner)) = storage_ctx
             .storage
-            .newest_other_watcher(OPERATOR_PREFIX, pid, started_at)
+            .newest_other_watcher(OPERATOR_PREFIX, pid, started_at, now, ttl)
         {
             writeln!(
                 out,

@@ -299,7 +299,10 @@ impl SqliteStorage {
         crate::storage::watchers::list_all(&self.conn)
     }
 
-    /// Whether another watcher for `prefix` has started after this one.
+    /// Whether another *live* watcher for `prefix` legitimately
+    /// supersedes this one (fresh heartbeat, newer non-future
+    /// `started_at`, pid tie-break). Stale (dead) or future-dated rows
+    /// never supersede a live watcher.
     ///
     /// # Errors
     ///
@@ -309,11 +312,23 @@ impl SqliteStorage {
         prefix: &str,
         my_pid: i64,
         my_started_at: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: i64,
     ) -> Result<bool> {
-        crate::storage::watchers::is_superseded(&self.conn, prefix, my_pid, my_started_at)
+        crate::storage::watchers::is_superseded(
+            &self.conn,
+            prefix,
+            my_pid,
+            my_started_at,
+            now,
+            ttl_seconds,
+        )
     }
 
-    /// Fetch the newest other watcher for the same prefix, if any.
+    /// Fetch the newest other *live* watcher that supersedes ours for
+    /// the same prefix, if any. Applies the same freshness /
+    /// future-timestamp / pid tie-break gating as
+    /// [`Self::is_watcher_superseded`].
     ///
     /// # Errors
     ///
@@ -323,8 +338,17 @@ impl SqliteStorage {
         prefix: &str,
         my_pid: i64,
         my_started_at: chrono::DateTime<chrono::Utc>,
+        now: chrono::DateTime<chrono::Utc>,
+        ttl_seconds: i64,
     ) -> Result<Option<crate::storage::watchers::WatcherRow>> {
-        crate::storage::watchers::newest_other_watcher(&self.conn, prefix, my_pid, my_started_at)
+        crate::storage::watchers::newest_other_watcher(
+            &self.conn,
+            prefix,
+            my_pid,
+            my_started_at,
+            now,
+            ttl_seconds,
+        )
     }
 
     /// GC stale watcher rows. Called opportunistically.

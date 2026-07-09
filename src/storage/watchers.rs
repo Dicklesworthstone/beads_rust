@@ -131,10 +131,20 @@ pub fn active_prefixes(
     Ok(rows)
 }
 
-/// Whether any *other* watcher row for the same prefix has a strictly
-/// later `started_at` than `my_started_at`. Used by `bd watch` to
-/// implement newest-wins-per-prefix: when an older watcher sees a
-/// newer one, it exits to avoid duplicate notifications.
+/// Whether any *other* live watcher for the same prefix legitimately
+/// supersedes ours.
+///
+/// Used by `bd watch` to implement newest-wins-per-prefix: when an
+/// older watcher sees a newer one, it exits to avoid duplicate
+/// notifications. A candidate supersedes us only when it is BOTH:
+///   * fresh — `last_seen >= now - ttl_seconds`, so a crashed /
+///     `kill -9`'d duplicate that never unregistered can't evict a
+///     live watcher; and
+///   * legitimately newer — `started_at` strictly greater than ours
+///     but NOT dated in the future relative to `now` (a clock-skewed
+///     row that registered a future timestamp must not win forever).
+///
+/// Ties on `started_at` are broken by the caller on `pid`.
 ///
 /// # Errors
 ///
@@ -144,22 +154,23 @@ pub fn is_superseded(
     prefix: &str,
     my_pid: i64,
     my_started_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    ttl_seconds: i64,
 ) -> Result<bool> {
-    let exists: bool = conn
-        .prepare_cached(
-            "SELECT 1 FROM watchers
-             WHERE prefix = ?1
-               AND pid <> ?2
-               AND started_at > ?3
-             LIMIT 1",
-        )?
-        .exists(params![prefix, my_pid, my_started_at.to_rfc3339()])?;
-    Ok(exists)
+    Ok(newest_other_watcher(conn, prefix, my_pid, my_started_at, now, ttl_seconds)?.is_some())
 }
 
-/// Find the newest other watcher for `prefix`. Returns None if this
-/// is the only / newest watcher. Used to render BD_SUPERSEDED
-/// messages with concrete (pid, started_at) of the winner.
+/// Find the newest other *live* watcher that legitimately supersedes
+/// ours for `prefix`.
+///
+/// Returns None if this is the only / newest watcher. Used to render
+/// BD_SUPERSEDED messages with concrete (pid, started_at) of the
+/// winner. Freshness and future-timestamp gating mirror [`is_superseded`]: a
+/// stale row (dead process) or a future-dated row (clock skew) is
+/// never treated as a winner. A candidate whose `started_at` exactly
+/// equals ours only wins if its `pid` is greater, giving a stable,
+/// symmetric tie-break so two watchers that booted in the same tick
+/// don't both decide to exit.
 ///
 /// # Errors
 ///
@@ -169,15 +180,30 @@ pub fn newest_other_watcher(
     prefix: &str,
     my_pid: i64,
     my_started_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    ttl_seconds: i64,
 ) -> Result<Option<WatcherRow>> {
+    let cutoff = now - chrono::Duration::seconds(ttl_seconds);
     let mut stmt = conn.prepare(
         "SELECT prefix, pid, started_at, last_seen, cwd, git_remote FROM watchers
-         WHERE prefix = ?1 AND pid <> ?2 AND started_at > ?3
-         ORDER BY started_at DESC LIMIT 1",
+         WHERE prefix = ?1
+           AND pid <> ?2
+           AND last_seen >= ?3
+           AND started_at <= ?4
+           AND ( started_at > ?5
+                 OR (started_at = ?5 AND pid > ?6) )
+         ORDER BY started_at DESC, pid DESC LIMIT 1",
     )?;
     let row = stmt
         .query_row(
-            params![prefix, my_pid, my_started_at.to_rfc3339()],
+            params![
+                prefix,
+                my_pid,
+                cutoff.to_rfc3339(),
+                now.to_rfc3339(),
+                my_started_at.to_rfc3339(),
+                my_pid,
+            ],
             row_to_watcher,
         )
         .optional()?;
@@ -331,5 +357,105 @@ mod tests {
         let row = &list_all(&conn).unwrap()[0];
         assert_eq!(row.started_at, t2);
         assert_eq!(row.last_seen, t2);
+    }
+
+    #[test]
+    fn live_newer_watcher_supersedes() {
+        // A genuinely newer, fresh watcher should supersede the older one.
+        let conn = open_mem();
+        let now = Utc::now();
+        let mine = now - chrono::Duration::seconds(30);
+        register(&conn, "arc1", 1, mine, "", "").unwrap();
+        // Newer watcher, heartbeat fresh (last_seen = now).
+        register(&conn, "arc1", 2, now, "", "").unwrap();
+        assert!(is_superseded(&conn, "arc1", 1, mine, now, 60).unwrap());
+        let winner = newest_other_watcher(&conn, "arc1", 1, mine, now, 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.pid, 2);
+    }
+
+    #[test]
+    fn stale_dead_watcher_does_not_supersede() {
+        // Regression: a crashed / kill -9'd duplicate leaves a row with a
+        // newer started_at but a stale last_seen. It must NOT evict the
+        // live watcher — that is the "one agent never gets messages" bug.
+        let conn = open_mem();
+        let now = Utc::now();
+        let mine = now - chrono::Duration::seconds(30);
+        register(&conn, "arc1", 1, mine, "", "").unwrap();
+        // Dead duplicate: started_at newer than mine, but last_seen is
+        // 5 minutes stale (well past the 60s TTL).
+        let dead_started = now - chrono::Duration::seconds(10);
+        register(&conn, "arc1", 2, dead_started, "", "").unwrap();
+        heartbeat(&conn, "arc1", 2, now - chrono::Duration::seconds(300)).unwrap();
+        assert!(!is_superseded(&conn, "arc1", 1, mine, now, 60).unwrap());
+        assert!(
+            newest_other_watcher(&conn, "arc1", 1, mine, now, 60)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn future_dated_watcher_does_not_supersede() {
+        // Regression: clock skew can register a watcher with a started_at
+        // in the future, which would out-rank every real watcher forever.
+        // A future-dated row (relative to `now`) must not win even when
+        // its heartbeat is fresh.
+        let conn = open_mem();
+        let now = Utc::now();
+        let mine = now - chrono::Duration::seconds(30);
+        register(&conn, "arc1", 1, mine, "", "").unwrap();
+        // Skewed watcher: started_at 10 minutes in the FUTURE, fresh heartbeat.
+        let future = now + chrono::Duration::seconds(600);
+        register(&conn, "arc1", 2, future, "", "").unwrap();
+        heartbeat(&conn, "arc1", 2, now).unwrap();
+        assert!(!is_superseded(&conn, "arc1", 1, mine, now, 60).unwrap());
+        assert!(
+            newest_other_watcher(&conn, "arc1", 1, mine, now, 60)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn equal_started_at_breaks_tie_on_pid() {
+        // Two watchers that booted in the same instant must not both
+        // decide to exit. The higher pid wins deterministically; the
+        // lower pid sees itself superseded, the higher pid does not.
+        let conn = open_mem();
+        let now = Utc::now();
+        register(&conn, "arc1", 5, now, "", "").unwrap();
+        register(&conn, "arc1", 9, now, "", "").unwrap();
+        // Lower pid (5) is superseded by the higher pid (9).
+        assert!(is_superseded(&conn, "arc1", 5, now, now, 60).unwrap());
+        assert_eq!(
+            newest_other_watcher(&conn, "arc1", 5, now, now, 60)
+                .unwrap()
+                .unwrap()
+                .pid,
+            9
+        );
+        // Higher pid (9) is NOT superseded by the lower pid (5).
+        assert!(!is_superseded(&conn, "arc1", 9, now, now, 60).unwrap());
+        assert!(
+            newest_other_watcher(&conn, "arc1", 9, now, now, 60)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_watcher_is_not_superseded() {
+        let conn = open_mem();
+        let now = Utc::now();
+        register(&conn, "arc1", 1, now, "", "").unwrap();
+        assert!(!is_superseded(&conn, "arc1", 1, now, now, 60).unwrap());
+        assert!(
+            newest_other_watcher(&conn, "arc1", 1, now, now, 60)
+                .unwrap()
+                .is_none()
+        );
     }
 }

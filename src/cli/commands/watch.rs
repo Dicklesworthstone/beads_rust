@@ -202,9 +202,17 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         HashMap::new()
     };
     let mut batches: HashMap<Option<String>, SenderBatch> = HashMap::new();
+    // Seed the dedup set with messages that are already *read* — those
+    // have been consumed via `bd inbox` and shouldn't re-fire. Crucially
+    // we do NOT pre-seed *unread* messages: anything that arrived while
+    // this watch was down (a crash/restart window, or a supersede-and-
+    // respawn cycle) is still unread and must surface on the first poll
+    // tick. Pre-seeding the whole inbox here is what silently swallowed
+    // queued messages across restarts.
     let mut seen_msgs: HashSet<String> = if watch_inbox {
         inbox_messages(&beads_dir, cli, &prefix)?
             .into_iter()
+            .filter(|m| m.read_at.is_some())
             .map(|m| m.id)
             .collect()
     } else {
@@ -247,6 +255,17 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)
         {
             let _ = storage.heartbeat_watcher(&prefix, pid, now);
+
+            // Evict dead watcher rows before consulting the supersede
+            // table. Without this, a crashed / kill -9'd duplicate
+            // watch (which never ran its Drop unregister) — or one
+            // that registered a clock-skewed future started_at —
+            // lingers with a stale heartbeat and out-ranks us forever,
+            // silently knocking this agent's inbox offline. The
+            // supersede query below also freshness-gates, but sweeping
+            // here keeps the table clean for `bd who` / `bd msg` too.
+            let ttl = crate::storage::watchers::WATCHER_TTL_SECONDS;
+            let _ = storage.sweep_stale_watchers(now, ttl);
 
             if let Ok(current_gen) =
                 crate::cli::commands::reload::read_generation(&storage)
@@ -301,7 +320,7 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
             }
 
             if let Ok(Some(winner)) =
-                storage.newest_other_watcher(&prefix, pid, my_started_at)
+                storage.newest_other_watcher(&prefix, pid, my_started_at, now, ttl)
             {
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
