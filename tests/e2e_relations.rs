@@ -1044,6 +1044,7 @@ fn e2e_close_suggest_next_unblocks() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_close_blocked_requires_force() {
     common::init_test_logging();
     info!("e2e_close_blocked_requires_force: starting");
@@ -1089,8 +1090,15 @@ fn e2e_close_blocked_requires_force() {
         "close blocked should fail with nothing-to-do: {}",
         close_skip.stdout
     );
+    // Since #336, an all-skipped `close --json` writes TWO JSON documents to
+    // stdout: the close payload followed by the structured NOTHING_TO_DO
+    // error envelope. Parse just the first document.
     let payload = extract_json_payload(&close_skip.stdout);
-    let close_json: Value = serde_json::from_str(&payload).expect("close json");
+    let close_json: Value = serde_json::Deserializer::from_str(&payload)
+        .into_iter::<Value>()
+        .next()
+        .expect("close payload document")
+        .expect("close json");
     let closed = close_json["closed"].as_array().cloned().unwrap_or_default();
     let skipped = close_json["skipped"]
         .as_array()
@@ -1121,6 +1129,34 @@ fn e2e_close_blocked_requires_force() {
     let payload = extract_json_payload(&show.stdout);
     let issues: Value = serde_json::from_str(&payload).expect("show json");
     assert_eq!(issues[0]["status"].as_str().unwrap(), "open");
+
+    // Issue #380: the terminal error for an all-skipped close must carry the
+    // real skip reason (dependency block + --force remediation) instead of
+    // the misleading "already closed or not found" hint — the issue is open
+    // and findable, it just has an open blocker.
+    let close_human = run_br(
+        &workspace,
+        ["close", &blocked_id],
+        "close_blocked_human_error",
+    );
+    assert!(
+        !close_human.status.success(),
+        "human-mode close of a blocked issue should fail: {}",
+        close_human.stdout
+    );
+    let combined = format!("{}\n{}", close_human.stdout, close_human.stderr);
+    assert!(
+        combined.contains(&blocker_id) && combined.contains("blocked by"),
+        "close error should name the open blocker: {combined}"
+    );
+    assert!(
+        combined.contains("--force"),
+        "close error should point at the --force escape hatch: {combined}"
+    );
+    assert!(
+        !combined.contains("already closed or not found"),
+        "close error must not claim the issue is closed/missing when it is blocked: {combined}"
+    );
 
     let close_force = run_br(
         &workspace,

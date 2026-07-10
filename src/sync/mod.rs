@@ -5149,6 +5149,47 @@ pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Res
     save_base_snapshot(&issues, jsonl_dir)
 }
 
+/// Refresh `beads.base.jsonl` with the exact bytes of a finalized flush
+/// export (issue #378).
+///
+/// After a clean `br sync --flush-only`, the database and the JSONL agree, so
+/// the JSONL that just reached disk IS the new common state future 3-way
+/// merges should diff against. Historically only the merge path wrote the
+/// anchor, which left flush-only workspaces (the common agent workflow)
+/// permanently anchor-less: `br doctor` warned `base_jsonl.missing_post_flush`
+/// forever while `br sync --status` reported "In sync".
+///
+/// This is a byte copy (not a parse + re-serialize) so the anchor matches the
+/// on-disk export exactly. The write goes through the same validated
+/// temp-file + durable-rename machinery as [`save_base_snapshot`], and a
+/// symlinked anchor is refused rather than followed (same attacker shape the
+/// doctor's `base_jsonl` check rejects).
+///
+/// # Errors
+///
+/// Returns an error if the finalized JSONL cannot be read, the anchor path is
+/// unsafe (symlink / escapes the workspace), or the snapshot cannot be
+/// written durably.
+pub fn refresh_base_snapshot_from_flushed_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
+    ensure_no_conflict_markers(jsonl_path)?;
+    let bytes = fs::read(jsonl_path)?;
+    let snapshot_path = jsonl_dir.join("beads.base.jsonl");
+    let (temp_path, temp_file) = create_base_snapshot_temp_file(&snapshot_path, jsonl_dir)?;
+    let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    let mut writer = BufWriter::new(temp_file);
+    writer.write_all(&bytes).map_err(BeadsError::Io)?;
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|e| BeadsError::Io(e.into_error()))?
+        .sync_all()?;
+    require_safe_sync_overwrite_path(&temp_path, jsonl_dir, false, "rename base snapshot")?;
+    require_safe_sync_overwrite_path(&snapshot_path, jsonl_dir, false, "overwrite base snapshot")?;
+    crate::util::durable_rename(&temp_path, &snapshot_path)?;
+    temp_guard.persist();
+    Ok(())
+}
+
 /// Load the base snapshot from a file.
 ///
 /// Returns an empty map if the snapshot does not exist.

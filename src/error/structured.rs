@@ -750,8 +750,26 @@ impl StructuredError {
                 }
                 Some(format!("Use --force to delete '{id}' anyway."))
             }
-            BeadsError::NothingToDo { .. } => {
-                Some("All specified issues were already closed or not found.".to_string())
+            BeadsError::NothingToDo { reason } => {
+                // The reason string carries the per-issue skip explanations
+                // (issue #380). Pick the hint that matches what actually
+                // happened instead of unconditionally claiming "already
+                // closed or not found" — that wording sent operators hunting
+                // for a nonexistent state bug when the skip was really a
+                // dependency block.
+                if reason.contains("blocked by") {
+                    Some(
+                        "Skipped issue(s) have open blocking dependencies. Close the blockers first, or re-run with --force to close anyway."
+                            .to_string(),
+                    )
+                } else if reason.contains("open children") || reason.contains("child issue") {
+                    Some(
+                        "Skipped issue(s) have open children. Close the children first, or re-run with --force to close anyway."
+                            .to_string(),
+                    )
+                } else {
+                    Some("All specified issues were already closed or not found.".to_string())
+                }
             }
             BeadsError::ShuttingDown => {
                 Some("Retry after starting a fresh br process.".to_string())

@@ -326,19 +326,6 @@ fn create_issue_summary_line(id: &str, title: &str) -> String {
     )
 }
 
-/// Core logic for creating an issue.
-///
-/// Handles ID generation, validation, and storage insertion.
-/// Returns the constructed Issue.
-///
-/// # Errors
-///
-/// Returns error if:
-/// - Title is empty
-/// - ID generation fails
-/// - Validation fails
-/// - Storage write fails
-#[allow(clippy::too_many_lines)]
 /// Read a description body verbatim from a file, or from stdin when `path`
 /// is `-`. The full content is returned unchanged from disk (no paragraph
 /// truncation, no trimming), so callers get exactly the bytes on disk as a
@@ -383,6 +370,18 @@ pub(crate) fn resolve_create_description(args: &CreateArgs) -> Result<Option<Str
     Ok(args.description.clone())
 }
 
+/// Core logic for creating an issue.
+///
+/// Handles ID generation, validation, and storage insertion.
+/// Returns the constructed Issue.
+///
+/// # Errors
+///
+/// Returns error if:
+/// - Title is empty
+/// - ID generation fails
+/// - Validation fails
+/// - Storage write fails
 #[allow(clippy::too_many_lines)]
 pub fn create_issue_impl(
     storage: &mut SqliteStorage,

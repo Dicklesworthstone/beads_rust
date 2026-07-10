@@ -570,11 +570,12 @@ fn scenario_long_lived_single_workspace_stress_suite() {
     // handful of benign WARN findings (test runner sets
     // `RUST_LOG=beads_rust=debug` which trips `rust_log`; frankensqlite
     // leaves a WAL sidecar without a matching SHM file which trips
-    // `db.sidecars`; the post-flush merge anchor
-    // `beads.base.jsonl` is not produced by `sync --flush-only` so
-    // `base_jsonl.missing_post_flush` warns; and `br init` writes a
+    // `db.sidecars`; and `br init` writes a
     // minimal `.beads/.gitignore` that omits the `.write.lock`
-    // pattern so `gitignore.beads_inner_present` warns). None of
+    // pattern so `gitignore.beads_inner_present` warns). Since #378,
+    // `sync --flush-only` also refreshes the merge anchor
+    // `beads.base.jsonl` and `base_jsonl.missing_post_flush` no longer
+    // warns for verifiably in-sync workspaces. None of
     // those degrade the workspace's semantic health, so we assert on
     // the JSON payload's `workspace_health`/`reliability_audit.health`
     // rather than the now-broader-than-necessary exit-code contract.

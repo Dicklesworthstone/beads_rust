@@ -275,3 +275,88 @@ fn e2e_sync_status_reports_workspace_health_and_reliability_audit() {
         "expected jsonl_newer anomaly code, got {codes:?}: {pending}"
     );
 }
+
+/// Issue #378: `br sync --flush-only` maintains the merge anchor
+/// (`beads.base.jsonl`) so `br doctor` and `br sync --status` agree.
+///
+/// Historically only the merge path wrote the anchor: flush-only workspaces
+/// (the common agent workflow) accumulated `metadata.last_export_time`
+/// without ever growing an anchor, so `br doctor` warned
+/// `base_jsonl.missing_post_flush` forever while `br sync --status` reported
+/// a fully healthy "In sync". The flush path now (a) refreshes the anchor
+/// from the finalized export and (b) materializes a missing anchor even on a
+/// no-op flush, making `br sync --flush-only` the idempotent recovery
+/// command the doctor warning names.
+#[test]
+fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Anchor issue"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let anchor_path = beads_dir.join("beads.base.jsonl");
+
+    // No-op flush path: create's auto-flush already exported, so this flush
+    // has nothing to export — it must still materialize the missing anchor.
+    let flush_noop = run_br(&workspace, ["sync", "--flush-only"], "flush_noop");
+    assert!(
+        flush_noop.status.success(),
+        "no-op flush failed: {}",
+        flush_noop.stderr
+    );
+    assert!(
+        anchor_path.is_file(),
+        "no-op flush must materialize the missing merge anchor"
+    );
+    assert_eq!(
+        std::fs::read(&anchor_path).expect("read anchor"),
+        std::fs::read(&jsonl_path).expect("read jsonl"),
+        "anchor must match the live JSONL byte-for-byte after a no-op flush"
+    );
+
+    // Real export path: a dirty issue forces an actual export, which must
+    // refresh the anchor to the newly finalized JSONL.
+    let create2 = run_br(&workspace, ["create", "Second issue"], "create2");
+    assert!(
+        create2.status.success(),
+        "create2 failed: {}",
+        create2.stderr
+    );
+    let flush_real = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--force"],
+        "flush_real",
+    );
+    assert!(
+        flush_real.status.success(),
+        "forced flush failed: {}",
+        flush_real.stderr
+    );
+    assert_eq!(
+        std::fs::read(&anchor_path).expect("read anchor"),
+        std::fs::read(&jsonl_path).expect("read jsonl"),
+        "anchor must track the finalized JSONL after a real export"
+    );
+
+    // Doctor must agree with sync --status: no missing-anchor warning.
+    let status = sync_status_json(&workspace, "status_after_flush");
+    assert_eq!(status["dirty_count"], 0, "{status}");
+    let doctor = run_br(&workspace, ["doctor", "--json"], "doctor_after_flush");
+    let doctor_json: Value =
+        serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor json");
+    let anchor_check = doctor_json["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|c| c["name"] == "base_jsonl.missing_post_flush")
+        .expect("base_jsonl.missing_post_flush check present")
+        .clone();
+    assert_eq!(
+        anchor_check["status"], "ok",
+        "doctor must not warn about a missing anchor after a flush: {anchor_check}"
+    );
+}

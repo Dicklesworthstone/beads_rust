@@ -3139,13 +3139,21 @@ fn check_export_hash_cache_divergence(
 /// the latter means the merge anchor was lost. This check reads
 /// `metadata.last_export_time` from the snapshot connection and emits
 /// Warn if that value is set AND `.beads/beads.base.jsonl` doesn't
-/// exist on disk. Closes the third subset of the FM that cycles 4-6
-/// deferred (operator regen still happens via the cycle 6 fixer if
-/// they also have a live JSONL — the missing-post-flush check just
-/// surfaces the discrepancy as a warning the operator can address).
+/// exist on disk.
+///
+/// Issue #378 refinement: a missing anchor is only a real finding when the
+/// workspace has drifted. When the database and the live JSONL are
+/// verifiably in sync (stored `jsonl_content_hash` matches the computed
+/// hash and no issues are marked dirty) — the exact evidence
+/// `br sync --status` uses to print "In sync" — the anchor is fully
+/// derivable from the live JSONL and the next `br sync --flush-only` (or
+/// merge) rewrites it, so this check reports Ok instead of contradicting
+/// sync's healthy verdict. When the workspace is NOT verifiably in sync,
+/// the Warn stays and now names the exact recovery command.
 fn check_base_jsonl_missing_post_flush(
     conn: &Connection,
     beads_dir: &Path,
+    jsonl_path: Option<&Path>,
     checks: &mut Vec<CheckResult>,
 ) {
     let anchor = beads_dir.join("beads.base.jsonl");
@@ -3164,12 +3172,32 @@ fn check_base_jsonl_missing_post_flush(
     let last_export = latest_metadata_value(conn, "last_export_time");
     match last_export {
         Some(stamp) if !stamp.is_empty() => {
+            if workspace_verifiably_in_sync(conn, jsonl_path) {
+                // DB and JSONL agree (`br sync --status` would say
+                // "In sync"), so nothing is lost: the anchor is derivable
+                // from the live JSONL and the next flush/merge recreates it.
+                push_check(
+                    checks,
+                    "base_jsonl.missing_post_flush",
+                    CheckStatus::Ok,
+                    Some(
+                        "Merge anchor absent, but database and JSONL are in sync; the next `br sync --flush-only` recreates it"
+                            .to_string(),
+                    ),
+                    Some(serde_json::json!({
+                        "anchor": anchor.display().to_string(),
+                        "last_export_time": stamp,
+                        "kind": "missing_but_in_sync",
+                    })),
+                );
+                return;
+            }
             push_check(
                 checks,
                 "base_jsonl.missing_post_flush",
                 CheckStatus::Warn,
                 Some(format!(
-                    "Merge anchor {} is missing despite metadata.last_export_time={stamp} — sync flush should have produced one",
+                    "Merge anchor {} is missing despite metadata.last_export_time={stamp}, and the workspace is not verifiably in sync — run `br sync --flush-only` to reconcile and regenerate it",
                     anchor.display()
                 )),
                 Some(serde_json::json!({
@@ -3190,6 +3218,42 @@ fn check_base_jsonl_missing_post_flush(
             );
         }
     }
+}
+
+/// Whether the workspace passes the same in-sync evidence that
+/// `br sync --status` uses for its "In sync" verdict: the live JSONL exists,
+/// its computed content hash matches the cached `metadata.jsonl_content_hash`,
+/// and no issues are marked dirty (pending re-export). Conservative on any
+/// read failure: returns `false` so callers keep warning rather than
+/// suppressing a real finding (issue #378).
+fn workspace_verifiably_in_sync(conn: &Connection, jsonl_path: Option<&Path>) -> bool {
+    let Some(jsonl) = jsonl_path else {
+        return false;
+    };
+    if !jsonl.is_file() {
+        return false;
+    }
+    let Some(stored) = latest_metadata_value(conn, "jsonl_content_hash") else {
+        return false;
+    };
+    let Ok(computed) = crate::sync::compute_jsonl_hash(jsonl) else {
+        return false;
+    };
+    if stored != computed {
+        return false;
+    }
+    let Ok(rows) = conn.query("SELECT COUNT(*) FROM dirty_issues") else {
+        return false;
+    };
+    let dirty_count = rows
+        .first()
+        .and_then(|row| row.values().first().cloned())
+        .and_then(|v| match v {
+            SqliteValue::Integer(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(i64::MAX);
+    dirty_count == 0
 }
 
 /// Pass-5 cycle 20: detector for
@@ -10673,7 +10737,7 @@ fn inspect_existing_doctor_database(
         // parent), not the snapshot dir, because the missing-on-disk
         // condition must reference the live workspace.
         let real_beads_dir = db_path.parent().unwrap_or(db_path);
-        check_base_jsonl_missing_post_flush(&conn, real_beads_dir, checks);
+        check_base_jsonl_missing_post_flush(&conn, real_beads_dir, jsonl_path, checks);
         // Pass-5 cycle 8: detect orphan rows in dirty_issues (FK
         // CASCADE bypassed). Uses the snapshot connection so live DB
         // family is undisturbed.
@@ -13415,7 +13479,7 @@ mod tests {
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let mut checks = Vec::new();
-        check_base_jsonl_missing_post_flush(&conn, &beads_dir, &mut checks);
+        check_base_jsonl_missing_post_flush(&conn, &beads_dir, None, &mut checks);
 
         let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
         assert!(matches!(check.status, CheckStatus::Warn));
@@ -13439,10 +13503,91 @@ mod tests {
 
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
         let mut checks = Vec::new();
-        check_base_jsonl_missing_post_flush(&conn, &beads_dir, &mut checks);
+        check_base_jsonl_missing_post_flush(&conn, &beads_dir, None, &mut checks);
 
         let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+    }
+
+    #[test]
+    fn test_check_base_jsonl_missing_post_flush_ok_when_verifiably_in_sync() {
+        // Issue #378: a flush-only workspace (anchor never produced) whose DB
+        // and JSONL are verifiably in sync must NOT warn — `br sync --status`
+        // reports "In sync" from the same evidence, and a contradictory
+        // doctor warning is exactly the reported inconsistency.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, b"{\"id\":\"bd-1\"}\n").unwrap();
+        let computed_hash = crate::sync::compute_jsonl_hash(&jsonl_path).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_metadata(
+                crate::sync::METADATA_LAST_EXPORT_TIME,
+                "2026-05-01T00:00:00Z",
+            )
+            .unwrap();
+        storage
+            .set_metadata(crate::sync::METADATA_JSONL_CONTENT_HASH, &computed_hash)
+            .unwrap();
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_base_jsonl_missing_post_flush(&conn, &beads_dir, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("missing_but_in_sync")
+        );
+    }
+
+    #[test]
+    fn test_check_base_jsonl_missing_post_flush_warns_when_hash_diverged() {
+        // Issue #378: the warning must survive for the genuinely suspicious
+        // shape — export metadata present but the live JSONL no longer
+        // matches the cached content hash.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, b"{\"id\":\"bd-1\"}\n").unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_metadata(
+                crate::sync::METADATA_LAST_EXPORT_TIME,
+                "2026-05-01T00:00:00Z",
+            )
+            .unwrap();
+        storage
+            .set_metadata(crate::sync::METADATA_JSONL_CONTENT_HASH, "stale-hash")
+            .unwrap();
+        drop(storage);
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let mut checks = Vec::new();
+        check_base_jsonl_missing_post_flush(&conn, &beads_dir, Some(&jsonl_path), &mut checks);
+
+        let check = find_check(&checks, "base_jsonl.missing_post_flush").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("br sync --flush-only")),
+            "warning should name the recovery command: {check:?}"
+        );
     }
 
     #[test]

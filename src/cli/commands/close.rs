@@ -639,6 +639,13 @@ pub fn execute_with_args(
 
     let closed_count = closed_issues.len();
     let skipped_count = skipped_issues.len();
+    // Capture per-issue skip reasons BEFORE the vectors are moved into the
+    // output emitters. When every issue is skipped, the terminal error must
+    // carry the real reasons: a generic "all N skipped" used to imply
+    // "already closed or not found" even when the skip was actually a
+    // dependency block, sending operators down the wrong debugging path
+    // (issue #380).
+    let skip_summary = summarize_skip_reasons(&skipped_issues);
 
     if let Some(last_closed) = closed_issues.last() {
         crate::util::set_last_touched_id(&beads_dir, &last_closed.id);
@@ -666,11 +673,37 @@ pub fn execute_with_args(
 
     if closed_count == 0 && skipped_count > 0 {
         return Err(BeadsError::NothingToDo {
-            reason: format!("all {skipped_count} issue(s) skipped"),
+            reason: format!("all {skipped_count} issue(s) skipped — {skip_summary}"),
         });
     }
 
     Ok(())
+}
+
+/// Render the per-issue skip reasons for the terminal `NothingToDo` error.
+///
+/// Lists up to five `id: reason` pairs (sanitized for
+/// terminal safety) so the error names WHY each issue was skipped instead of
+/// leaving the operator to guess (issue #380). Longer batches get a
+/// `+N more` suffix; JSON/robot callers still receive the full skip list in
+/// the structured payload.
+fn summarize_skip_reasons(skipped: &[SkippedIssue]) -> String {
+    const SKIP_SUMMARY_PREVIEW: usize = 5;
+    let mut parts: Vec<String> = skipped
+        .iter()
+        .take(SKIP_SUMMARY_PREVIEW)
+        .map(|s| {
+            format!(
+                "{}: {}",
+                sanitize_terminal_inline(&s.id),
+                sanitize_terminal_inline(&s.reason)
+            )
+        })
+        .collect();
+    if skipped.len() > SKIP_SUMMARY_PREVIEW {
+        parts.push(format!("+{} more", skipped.len() - SKIP_SUMMARY_PREVIEW));
+    }
+    parts.join("; ")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -912,10 +945,17 @@ fn execute_route(
             blocker_ids.sort();
             blocker_ids.dedup();
             tracing::debug!(blocked_by = ?blocker_ids, "Issue remains blocked in batch close");
+            // Name the open blockers AND the way out. Without the explicit
+            // remediation this skip used to surface as a bare "all N issue(s)
+            // skipped" error whose hint claimed the issue was "already closed
+            // or not found" — flatly wrong for a dependency block (#380).
             let reason = if blocker_ids.is_empty() {
-                "blocked by dependencies".to_string()
+                "blocked by dependencies — close the open blocker(s) first, or use --force to close anyway".to_string()
             } else {
-                format!("blocked by: {}", blocker_ids.join(", "))
+                format!(
+                    "blocked by: {} — close the open blocker(s) first, or use --force to close anyway",
+                    blocker_ids.join(", ")
+                )
             };
             let skipped = SkippedIssue {
                 id: id.clone(),

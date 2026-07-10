@@ -21,10 +21,10 @@ use crate::sync::{
     METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, analyze_jsonl, compute_jsonl_hash,
     compute_staleness, export_temp_path, export_to_jsonl_with_policy, finalize_export,
     get_issue_ids_from_jsonl, id_matches_expected_prefix, import_from_jsonl, load_base_snapshot,
-    read_issues_from_jsonl, require_safe_sync_overwrite_path, require_valid_sync_path,
-    restore_tombstones_after_rebuild, save_base_snapshot_from_jsonl,
-    scan_jsonl_for_tombstone_filter, snapshot_tombstones, three_way_merge,
-    tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
+    read_issues_from_jsonl, refresh_base_snapshot_from_flushed_jsonl,
+    require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
+    save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
+    three_way_merge, tombstones_missing_from_jsonl_tombstones, validate_no_git_path,
     validate_sync_path_with_external,
 };
 use crate::util::id::split_prefix_remainder;
@@ -1430,6 +1430,24 @@ fn execute_flush(
             }
         }
 
+        // Even with nothing to export, materialize a MISSING merge anchor
+        // from the clean JSONL (issue #378). The guards above already proved
+        // the JSONL is conflict-marker-free and not stale relative to the DB,
+        // so it is exactly the state the anchor should capture. This makes
+        // `br sync --flush-only` an idempotent recovery command for the
+        // doctor's `base_jsonl.missing_post_flush` finding. Best-effort: a
+        // failed anchor write must not fail an otherwise successful no-op
+        // flush.
+        if fs::symlink_metadata(path_policy.beads_dir.join("beads.base.jsonl")).is_err()
+            && let Err(error) =
+                refresh_base_snapshot_from_flushed_jsonl(jsonl_path, &path_policy.beads_dir)
+        {
+            warn!(
+                error = %error,
+                "Failed to materialize missing merge anchor during no-op flush"
+            );
+        }
+
         if use_json {
             let result = FlushResult {
                 exported_issues: 0,
@@ -1488,6 +1506,25 @@ fn execute_flush(
         jsonl_path,
     )?;
     info!("Export complete, cleared dirty flags");
+
+    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
+    // is the new common state future 3-way merges should diff against.
+    // Refresh the merge anchor to match (issue #378): historically only the
+    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
+    // permanently anchor-less and tripping the doctor's
+    // `base_jsonl.missing_post_flush` warning while `br sync --status`
+    // reported "In sync". Skip when the export had per-record errors — a
+    // partial export must not become the merge base. Best-effort: a failed
+    // anchor write must not fail an otherwise durable flush.
+    if !report.has_errors()
+        && let Err(error) =
+            refresh_base_snapshot_from_flushed_jsonl(jsonl_path, &path_policy.beads_dir)
+    {
+        warn!(
+            error = %error,
+            "Failed to refresh merge anchor after flush; `br doctor` may report base_jsonl findings"
+        );
+    }
 
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {
