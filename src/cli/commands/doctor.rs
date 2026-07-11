@@ -11109,22 +11109,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         false
     };
 
-    // Pass-5 cycle 6: regenerate the merge anchor from the current
-    // live JSONL when the detector reports it as stale. Combined with
-    // cycle 5's symlink quarantine, this completes Tier B → Tier A for
-    // both detector-emitted subsets of the FM.
-    let base_jsonl_stale_repaired =
-        if args.repair && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale") {
-            let repaired =
-                fix_base_jsonl_stale_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
-            if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-            }
-            repaired
-        } else {
-            false
-        };
-
     // Pass-5 cycle 16: quarantine orphan *.tmp files under .beads/
     // via Op::Rename (same pattern as cycle 1's merge-artifact-stuck).
     let orphan_tmp_repaired =
@@ -11192,6 +11176,25 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
     let _ = jsonl_crlf_repaired;
+
+    // Pass-5 cycle 6: regenerate the derived merge anchor only after
+    // every content-normalizing JSONL fixer has run. If the live JSONL
+    // contains a BOM, CRLF endings, or lacks its final newline, writing
+    // the anchor first captures the malformed bytes; the normalization
+    // then immediately makes that new anchor stale and forces a second
+    // repair pass. Source-before-derived ordering keeps the repair
+    // idempotent and ensures undo records only one anchor mutation.
+    let base_jsonl_stale_repaired =
+        if args.repair && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale") {
+            let repaired =
+                fix_base_jsonl_stale_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
+            if repaired {
+                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+            }
+            repaired
+        } else {
+            false
+        };
 
     // Pass-5 cycle 25: strip world-write bit from issues.jsonl via Op::Chmod.
     let jsonl_world_writable_repaired =
