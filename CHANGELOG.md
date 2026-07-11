@@ -15,6 +15,55 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.19 -- 2026-07-11 (Release)
+
+This release restores downloadable binaries after the tag-only `v0.2.18` cut
+and makes identifier allocation and doctor repair behavior fail closed under
+the edge cases found during release verification.
+
+### Identifier correctness
+
+- MCP issue creation now derives adaptive hash sizing from the real database
+  issue count instead of a constant placeholder
+  ([#381](https://github.com/Dicklesworthstone/beads_rust/issues/381)).
+- Identifier generation propagates lookup failures, checks every candidate,
+  and returns an explicit collision error after bounded exhaustion instead of
+  ever returning an unchecked identifier.
+- Empty or unusable configured prefixes are rejected consistently across CLI,
+  configuration, MCP startup, and the core ID API. Property, saturation,
+  storage-parity, and MCP regressions cover the complete allocation contract.
+
+### Doctor and sync reliability
+
+- Clean JSONL exports now materialize the merge anchor after all content
+  normalizers run, so the anchor is byte-identical to the final exported file
+  ([#378](https://github.com/Dicklesworthstone/beads_rust/issues/378)).
+- A stale-by-mtime but byte-identical merge anchor is now an idempotent doctor
+  no-op: no backup or repair action is recorded when no bytes would change.
+- The binary-version detector stops at the nearest package manifest, avoiding
+  false beads_rust matches for unrelated repositories nested below the source
+  checkout.
+- Release fixtures retain the fail-closed repeated-repair contract, while the
+  registry-clean lockfile keeps `cargo publish --locked` reproducible.
+
+### CLI and distribution
+
+- Blocked close errors identify the actual blockers and make the explicit
+  override discoverable ([#380](https://github.com/Dicklesworthstone/beads_rust/issues/380)).
+- The self-updater is migrated to the current `self_update` API and its
+  replacement helper, with strict Clippy coverage retained.
+- The release also includes the post-`v0.2.16` dependency-import, tombstone,
+  wrapping, schema-repair, and MCP reliability fixes that were present in the
+  tag-only `v0.2.18` source cut.
+
+### Validation
+
+- Full unit and integration suite, all-target compiler check, strict all-target
+  Clippy, rustfmt, targeted doctor regressions, UBS, and the release reliability
+  matrix.
+- Native/cross release artifacts are architecture-checked and smoke-tested
+  before the annotated tag is published.
+
 ## v0.2.11 -- 2026-05-21 (Release)
 
 This version stops the ephemeral "in-memory" storage path from leaking
