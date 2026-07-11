@@ -18,7 +18,7 @@
     },
     {
       "surface": "doctor --repair",
-      "outcome": "repair_applied"
+      "outcome": "fails_repeated_repair"
     },
     {
       "surface": "sync --status",
@@ -32,6 +32,7 @@
   "source_hint": "Inspired by the large repo-root recovery dumps collected during real-world investigation.",
   "notes": [
     "The live beads.db is plain text on purpose; the interesting state is the preserved backup and .br_recovery trail.",
-    "Future replay tests can assert that recovery tooling prefers the preserved backups over the broken live file."
+    "Future replay tests can assert that recovery tooling prefers the preserved backups over the broken live file.",
+    "Post-de5bc9bd fail-closed contract: the .br_recovery/*.rebuild-failed marker means a prior rebuild's verification failed, so `doctor --repair` refuses and demands --allow-repeated-repair instead of silently re-rebuilding over the evidence."
   ]
 }
