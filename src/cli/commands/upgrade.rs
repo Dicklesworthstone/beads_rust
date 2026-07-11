@@ -456,8 +456,8 @@ fn update_with_checksum(updater: &dyn ReleaseUpdate, release: &Release) -> Resul
     {
         self_replace::self_replace(new_exe).map_err(|err| BeadsError::upgrade(err.to_string()))?;
     } else {
-        Move::from_source(new_exe.as_ref())
-            .to_dest(bin_install_path.as_ref())
+        Move::from_source(&new_exe)
+            .to_dest(bin_install_path)
             .map_err(map_update_error)?;
     }
 
