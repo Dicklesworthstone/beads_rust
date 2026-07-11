@@ -76,7 +76,7 @@ fn execute_check(current_version: &str, ctx: &OutputContext) -> Result<()> {
 
     let update_available = version_newer(latest_version, current_version);
 
-    let download_url = release_binary_asset_for(&latest, asset_target_name(), None)
+    let download_url = release_binary_asset_for(latest, asset_target_name(), None)
         .map(|asset| asset.download_url().to_string());
 
     let result = UpdateCheckResult {
@@ -120,7 +120,7 @@ fn execute_dry_run(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     let install_version = target_version.unwrap_or(latest_version);
     let would_update = args.force || version_newer(install_version, current_version);
 
-    let download_url = release_binary_asset_for(&latest, asset_target_name(), None)
+    let download_url = release_binary_asset_for(latest, asset_target_name(), None)
         .map_or_else(|| "N/A".to_string(), |a| a.download_url().to_string());
 
     if ctx.is_json() {
