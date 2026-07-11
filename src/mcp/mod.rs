@@ -771,7 +771,11 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
     let write_lock = crate::sync::blocking_write_lock_with_timeout(&beads_dir, lock_timeout)?;
     let res = config::open_storage_with_startup_config_under_write_lock(startup, overrides, false)?;
 
-    let prefix = res.storage.get_config("issue_prefix")?;
+    let prefix = res
+        .storage
+        .get_config("issue_prefix")?
+        .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
+        .transpose()?;
     let db_path = res.paths.db_path.clone();
     let jsonl_path = res.paths.jsonl_path.clone();
     let allow_external_jsonl =

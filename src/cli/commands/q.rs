@@ -118,8 +118,8 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         let count = storage.count_issues()?;
         let existing_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
         id_gen.generate(&title, None, None, now, count, |candidate| {
-            existing_ids.contains(candidate)
-        })
+            Ok(existing_ids.contains(candidate))
+        })?
     };
 
     let mut valid_labels = Vec::new();

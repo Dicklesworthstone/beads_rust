@@ -4105,7 +4105,7 @@ fn build_prefix_renames(
         return Ok(HashMap::new());
     };
 
-    let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+    let generator = IdGenerator::new(IdConfig::with_prefix(prefix)?);
     let mut occupied_ids = plan.occupied_ids.clone();
     occupied_ids.extend(storage.get_all_ids()?);
 
@@ -4119,8 +4119,8 @@ fn build_prefix_renames(
             seed.created_by.as_deref(),
             seed.created_at,
             plan.record_count,
-            |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
-        );
+            |candidate| Ok(occupied_ids.contains(candidate) || generated_ids.contains(candidate)),
+        )?;
         generated_ids.insert(new_id.clone());
         renames.insert(seed.old_id.clone(), new_id);
     }

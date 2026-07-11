@@ -241,33 +241,20 @@ fn generate_issue_id_with_checked_lookup<F>(
     actor: &str,
     now: chrono::DateTime<chrono::Utc>,
     prefix: &str,
+    issue_count: usize,
     id_exists: F,
 ) -> McpResult<String>
 where
     F: Fn(&str) -> Result<bool, BeadsError>,
 {
-    let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
-    let lookup_error = std::cell::RefCell::new(None);
-    let id = id_gen.generate(
-        title,
-        None,
-        Some(actor),
-        now,
-        0,
-        |candidate| match id_exists(candidate) {
-            Ok(exists) => exists,
-            Err(err) => {
-                *lookup_error.borrow_mut() = Some(err);
-                true
-            }
-        },
+    let id_gen = crate::util::id::IdGenerator::new(
+        crate::util::id::IdConfig::with_prefix(prefix).map_err(beads_to_mcp)?,
     );
-
-    if let Some(err) = lookup_error.into_inner() {
-        return Err(id_lookup_failed("hash ID generation", &err));
+    match id_gen.generate(title, None, Some(actor), now, issue_count, id_exists) {
+        Ok(id) => Ok(id),
+        Err(err @ BeadsError::IdCollision { .. }) => Err(beads_to_mcp(err)),
+        Err(err) => Err(id_lookup_failed("hash ID generation", &err)),
     }
-
-    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1635,9 +1622,15 @@ fn create_issue_json(
         let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
         next_available_child_id(pid, next_num, |candidate| storage.id_exists(candidate))?
     } else {
-        generate_issue_id_with_checked_lookup(&title, &state.actor, now, prefix, |candidate| {
-            storage.id_exists(candidate)
-        })?
+        let issue_count = storage.count_issues().map_err(beads_to_mcp)?;
+        generate_issue_id_with_checked_lookup(
+            &title,
+            &state.actor,
+            now,
+            prefix,
+            issue_count,
+            |candidate| storage.id_exists(candidate),
+        )?
     };
 
     let issue = Issue {
@@ -5310,6 +5303,7 @@ mod tests {
             "mcp-test",
             now,
             "br",
+            0,
             |_| {
                 let call = calls.get();
                 calls.set(call + 1);
@@ -5337,6 +5331,33 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("hash ID generation")
         );
+    }
+
+    #[test]
+    fn hash_id_generation_uses_mcp_database_issue_count() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 11, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let issue_count = 100_000;
+        let expected_length = crate::util::id::IdGenerator::new(
+            crate::util::id::IdConfig::with_prefix("br").expect("valid prefix"),
+        )
+        .optimal_length(issue_count);
+
+        let id = generate_issue_id_with_checked_lookup(
+            "MCP adaptive length",
+            "mcp-test",
+            now,
+            "br",
+            issue_count,
+            |_| Ok(false),
+        )
+        .expect("empty registry produces an ID");
+        let parsed = crate::util::id::parse_id(&id).expect("generated ID parses");
+
+        assert!(expected_length > 3, "test count must widen the hash");
+        assert_eq!(parsed.hash.len(), expected_length);
     }
 
     #[test]

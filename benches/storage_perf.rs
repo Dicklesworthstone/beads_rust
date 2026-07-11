@@ -931,13 +931,16 @@ fn bench_generate_id(c: &mut Criterion) {
     group.bench_function("single", |b| {
         let bench_name = "id/generate/single";
         let bench_start = log_bench_start(bench_name);
-        let generator = IdGenerator::new(IdConfig::with_prefix("bench"));
+        let generator =
+            IdGenerator::new(IdConfig::with_prefix("bench").expect("valid benchmark prefix"));
         let now = Utc::now();
         let mut counter = 0usize;
 
         b.iter(|| {
             let title = format!("Benchmark issue {counter}");
-            let id = generator.generate(black_box(&title), None, None, now, counter, |_| false);
+            let id = generator
+                .generate(black_box(&title), None, None, now, counter, |_| Ok(false))
+                .expect("in-memory collision lookup succeeds");
             counter += 1;
             black_box(id)
         });
@@ -948,16 +951,19 @@ fn bench_generate_id(c: &mut Criterion) {
     group.bench_function("with_collision_check", |b| {
         let bench_name = "id/generate/with_collision_check";
         let bench_start = log_bench_start(bench_name);
-        let generator = IdGenerator::new(IdConfig::with_prefix("bench"));
+        let generator =
+            IdGenerator::new(IdConfig::with_prefix("bench").expect("valid benchmark prefix"));
         let now = Utc::now();
         let mut existing: HashSet<String> = HashSet::new();
         let mut counter = 0usize;
 
         b.iter(|| {
             let title = format!("Benchmark issue {counter}");
-            let id = generator.generate(black_box(&title), None, None, now, counter, |id| {
-                existing.contains(id)
-            });
+            let id = generator
+                .generate(black_box(&title), None, None, now, counter, |id| {
+                    Ok(existing.contains(id))
+                })
+                .expect("in-memory collision lookup succeeds");
             existing.insert(id.clone());
             counter += 1;
             black_box(id)

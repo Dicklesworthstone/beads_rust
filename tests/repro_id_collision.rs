@@ -35,7 +35,16 @@ fn test_id_generator_fallback_collision() {
     // IF the bug exists, it will return `fallback_candidate` WITHOUT checking `exists`.
     // Since `fallback_candidate` is in `existing_ids`, this means it returned a duplicate.
 
-    let generated = generator.generate(title, None, None, now, 0, |id| existing_ids.contains(id));
+    let generated = generator
+        .generate(
+            title,
+            None,
+            None,
+            now,
+            0,
+            |id| Ok(existing_ids.contains(id)),
+        )
+        .expect("a free fallback candidate exists");
 
     // If the generator was safe, it would have found ANOTHER ID (e.g. by trying more nonces or random).
     // If it returns the blocked fallback ID, it failed the safety contract.

@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 pub const MAX_ID_PREFIX_LEN: usize = 64;
 pub const MAX_ID_HASH_LEN: usize = 40;
 pub const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
+const FALLBACK_HASH_LENGTH: usize = 12;
+const MAX_FALLBACK_NONCE: u32 = 2000;
 
 /// Default ID generation configuration.
 #[derive(Debug, Clone)]
@@ -36,12 +38,16 @@ impl Default for IdConfig {
 
 impl IdConfig {
     /// Create a new ID config with the given prefix.
-    #[must_use]
-    pub fn with_prefix(prefix: impl Into<String>) -> Self {
-        Self {
-            prefix: normalize_prefix(&prefix.into()),
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the prefix contains no usable
+    /// characters after normalization.
+    pub fn with_prefix(prefix: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            prefix: normalize_configured_prefix(&prefix.into())?,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -134,14 +140,19 @@ impl IdGenerator {
     /// slug normalizes to an empty string, this falls back to the regular
     /// hash-only ID generator. The hash suffix is always appended to keep
     /// IDs unique even when two issues use the same slug.
+    ///
+    /// # Errors
+    ///
+    /// Returns the collision checker's error, or `IdCollision` if neither the
+    /// slug-shaped nor hash-only bounded search finds a free ID.
     pub fn generate_with_slug<F>(
         &self,
         input: IdGenerationInput<'_>,
         slug: &str,
-        exists: F,
-    ) -> String
+        mut exists: F,
+    ) -> Result<String>
     where
-        F: Fn(&str) -> bool,
+        F: FnMut(&str) -> Result<bool>,
     {
         let normalized = normalize_slug_for_prefix(slug, &self.config.prefix);
         if normalized.is_empty() {
@@ -151,7 +162,7 @@ impl IdGenerator {
                 input.creator,
                 input.created_at,
                 input.issue_count,
-                exists,
+                &mut exists,
             );
         }
 
@@ -169,8 +180,8 @@ impl IdGenerator {
                 );
                 let hash_str = compute_id_hash(&seed, length);
                 let id = format!("{}-{normalized}-{hash_str}", self.config.prefix);
-                if !exists(&id) {
-                    return id;
+                if !exists(&id)? {
+                    return Ok(id);
                 }
             }
             if length < self.config.max_hash_length {
@@ -185,7 +196,7 @@ impl IdGenerator {
                     input.creator,
                     input.created_at,
                     input.issue_count,
-                    exists,
+                    &mut exists,
                 );
             }
         }
@@ -194,6 +205,14 @@ impl IdGenerator {
     /// Generate an ID, checking for collisions with the provided checker.
     ///
     /// The checker function should return `true` if the ID already exists.
+    /// Lookup failures are returned immediately. If every candidate in the
+    /// bounded collision ladder is occupied, this fails closed with
+    /// [`BeadsError::IdCollision`] instead of fabricating an unchecked ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns the collision checker's error, or `IdCollision` if no free ID
+    /// can be found within the bounded search.
     pub fn generate<F>(
         &self,
         title: &str,
@@ -201,10 +220,10 @@ impl IdGenerator {
         creator: Option<&str>,
         created_at: DateTime<Utc>,
         issue_count: usize,
-        exists: F,
-    ) -> String
+        mut exists: F,
+    ) -> Result<String>
     where
-        F: Fn(&str) -> bool,
+        F: FnMut(&str) -> Result<bool>,
     {
         let mut length = self.optimal_length(issue_count);
 
@@ -213,8 +232,8 @@ impl IdGenerator {
             for nonce in 0..10 {
                 let id =
                     self.generate_candidate(title, description, creator, created_at, nonce, length);
-                if !exists(&id) {
-                    return id;
+                if !exists(&id)? {
+                    return Ok(id);
                 }
             }
 
@@ -222,34 +241,28 @@ impl IdGenerator {
             if length < self.config.max_hash_length {
                 length += 1;
             } else {
-                // Fallback: use full hash with extra entropy
-                // Try increasing nonces until we find a free one
-                let mut nonce = 0;
-                loop {
+                // The normal adaptive range is exhausted. Widen to a
+                // 12-character hash and try a bounded nonce range. Every
+                // returned candidate must have passed the caller's lookup.
+                for nonce in 0..MAX_FALLBACK_NONCE {
                     let seed = generate_id_seed(title, description, creator, created_at, nonce);
-                    let hash_str = compute_id_hash(&seed, 12);
+                    let hash_str = compute_id_hash(&seed, FALLBACK_HASH_LENGTH);
                     let id = format!("{}-{hash_str}", self.config.prefix);
 
-                    if !exists(&id) {
-                        return id;
-                    }
-
-                    nonce += 1;
-
-                    // Safety break: if we hit 1000 collisions even with 12-char hashes,
-                    // append the nonce to force uniqueness.
-                    if nonce > 1000 {
-                        let desperate_id = format!("{}-{hash_str}{nonce}", self.config.prefix);
-                        if !exists(&desperate_id) {
-                            return desperate_id;
-                        }
-                    }
-
-                    // Hard stop at 2000 to prevent infinite loop if exists() is broken
-                    if nonce > 2000 {
-                        return format!("{}-{hash_str}{nonce}", self.config.prefix);
+                    if !exists(&id)? {
+                        return Ok(id);
                     }
                 }
+
+                let seed =
+                    generate_id_seed(title, description, creator, created_at, MAX_FALLBACK_NONCE);
+                let hash_str = compute_id_hash(&seed, FALLBACK_HASH_LENGTH);
+                let id = format!("{}-{hash_str}", self.config.prefix);
+                return if exists(&id)? {
+                    Err(BeadsError::IdCollision { id })
+                } else {
+                    Ok(id)
+                };
             }
         }
     }
@@ -374,18 +387,6 @@ pub fn id_depth(id: &str) -> usize {
         || id.matches('.').count(),
         |(_, remainder)| remainder.matches('.').count(),
     )
-}
-
-/// Convenience function to generate an ID with default settings.
-#[must_use]
-pub fn generate_id(
-    title: &str,
-    description: Option<&str>,
-    creator: Option<&str>,
-    created_at: DateTime<Utc>,
-) -> String {
-    let generator = IdGenerator::with_defaults();
-    generator.generate(title, description, creator, created_at, 0, |_| false)
 }
 
 // ============================================================================
@@ -566,13 +567,7 @@ pub fn normalize_id(id: &str) -> String {
     id.to_lowercase()
 }
 
-/// Normalize a configured issue prefix into a valid runtime form.
-///
-/// This trims whitespace, lowercases ASCII letters, removes unsupported
-/// characters, and clamps the prefix to the maximum supported length. If no
-/// usable characters remain, it falls back to `br`.
-#[must_use]
-pub fn normalize_prefix(prefix: &str) -> String {
+fn normalized_prefix_chars(prefix: &str) -> String {
     let normalized: String = prefix
         .trim()
         .chars()
@@ -586,16 +581,45 @@ pub fn normalize_prefix(prefix: &str) -> String {
         .take(MAX_ID_PREFIX_LEN)
         .collect();
 
-    // Strip trailing separator chars to prevent double-hyphens during ID generation
-    let normalized = normalized
+    normalized
         .trim_end_matches(['_', '-', '.', ':', '#'])
-        .to_string();
+        .to_string()
+}
+
+/// Normalize an inferred issue prefix into a valid runtime form.
+///
+/// This trims whitespace, lowercases ASCII letters, removes unsupported
+/// characters, and clamps the prefix to the maximum supported length. Inferred
+/// prefixes that contain no usable characters fall back to `br`; explicitly
+/// configured prefixes should use [`normalize_configured_prefix`] instead.
+#[must_use]
+pub fn normalize_prefix(prefix: &str) -> String {
+    let normalized = normalized_prefix_chars(prefix);
 
     if normalized.is_empty() {
         "br".to_string()
     } else {
         normalized
     }
+}
+
+/// Normalize an explicitly configured issue prefix.
+///
+/// Unlike [`normalize_prefix`], this rejects values that contain no usable
+/// prefix characters so a typo cannot silently mint IDs in the `br` namespace.
+///
+/// # Errors
+///
+/// Returns a configuration error when the configured value is empty after
+/// normalization.
+pub fn normalize_configured_prefix(prefix: &str) -> Result<String> {
+    let normalized = normalized_prefix_chars(prefix);
+    if normalized.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "issue_prefix {prefix:?} contains no usable ASCII letters, digits, or separators"
+        )));
+    }
+    Ok(normalized)
 }
 
 /// Maximum length of a normalized slug (the user-supplied human-readable
@@ -1432,6 +1456,21 @@ mod tests {
     }
 
     #[test]
+    fn test_configured_prefix_rejects_values_without_usable_characters() {
+        for prefix in ["", "   ", "!!!", "日本語", "___", "...", "###"] {
+            let err = normalize_configured_prefix(prefix)
+                .expect_err("configured prefix must not silently fall back");
+            assert!(matches!(err, BeadsError::Config(_)));
+        }
+
+        assert_eq!(
+            normalize_configured_prefix(" Project-Name_2! ").unwrap(),
+            "project-name_2"
+        );
+        assert!(IdConfig::with_prefix("!!!").is_err());
+    }
+
+    #[test]
     fn test_abbreviate_prefix_handles_mixed_case_and_underscores() {
         assert_eq!(abbreviate_prefix("My_Project-Name"), "mpn");
         assert_eq!(abbreviate_prefix("superlongname"), "sup");
@@ -1464,14 +1503,16 @@ mod tests {
         let id_gen = IdGenerator::with_defaults();
         let now = Utc::now();
 
-        let id = id_gen.generate(
-            "Test Issue",
-            Some("Description"),
-            Some("user"),
-            now,
-            0,
-            |_| false,
-        );
+        let id = id_gen
+            .generate(
+                "Test Issue",
+                Some("Description"),
+                Some("user"),
+                now,
+                0,
+                |_| Ok(false),
+            )
+            .expect("collision lookup succeeds");
 
         assert!(id.starts_with("br-"));
         assert!(is_valid_id_format(&id));
@@ -1485,28 +1526,52 @@ mod tests {
         let mut generated = std::collections::HashSet::new();
 
         // Generate first ID
-        let id1 = id_gen.generate("Test", None, None, now, 0, |id| generated.contains(id));
+        let id1 = id_gen
+            .generate("Test", None, None, now, 0, |id| Ok(generated.contains(id)))
+            .expect("collision lookup succeeds");
         generated.insert(id1.clone());
 
         // Generate second ID - should get different one due to collision check
-        let id2 = id_gen.generate("Test", None, None, now, 0, |id| generated.contains(id));
+        let id2 = id_gen
+            .generate("Test", None, None, now, 0, |id| Ok(generated.contains(id)))
+            .expect("collision lookup succeeds");
 
         assert_ne!(id1, id2);
     }
 
     #[test]
-    fn test_desperate_fallback_id_format() {
-        // Simulate the ID produced by the desperate fallback: prefix-hash-nonce
-        let prefix = "bd";
-        let hash = "abc123456789";
-        let nonce = 1001;
+    fn test_id_generator_propagates_collision_lookup_failure() {
+        let id_gen = IdGenerator::with_defaults();
+        let expected = "collision lookup unavailable";
 
-        // Ensure the fixed format is valid
-        let good_id = format!("{prefix}-{hash}{nonce}");
-        assert!(
-            parse_id(&good_id).is_ok(),
-            "Fixed fallback format should parse correctly"
-        );
+        let err = id_gen
+            .generate("Test", None, None, Utc::now(), 0, |_| {
+                Err(BeadsError::Config(expected.to_string()))
+            })
+            .expect_err("lookup failure must stop generation immediately");
+
+        assert!(matches!(err, BeadsError::Config(message) if message == expected));
+    }
+
+    #[test]
+    fn test_id_generator_fails_closed_when_every_candidate_exists() {
+        let id_gen = IdGenerator::new(IdConfig {
+            prefix: "br".to_string(),
+            min_hash_length: 3,
+            max_hash_length: 3,
+            max_collision_prob: 0.25,
+        });
+        let calls = std::cell::Cell::new(0_u32);
+
+        let err = id_gen
+            .generate("Test", None, None, Utc::now(), 0, |_| {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            })
+            .expect_err("a saturated checker must fail closed");
+
+        assert!(matches!(err, BeadsError::IdCollision { .. }));
+        assert_eq!(calls.get(), 10 + MAX_FALLBACK_NONCE + 1);
     }
 
     #[test]
@@ -1545,7 +1610,9 @@ mod tests {
         };
 
         // Slug present → ID embeds the slug between prefix and hash.
-        let id = id_gen.generate_with_slug(input, "survey-my-thing", |_| false);
+        let id = id_gen
+            .generate_with_slug(input, "survey-my-thing", |_| Ok(false))
+            .expect("collision lookup succeeds");
         assert!(
             id.starts_with("br-survey-my-thing-"),
             "expected prefix br-survey-my-thing-, got {id}"
@@ -1555,7 +1622,9 @@ mod tests {
         assert!(!parsed.hash.is_empty(), "hash suffix must be present");
 
         // Empty slug → falls back to hash-only generation.
-        let id = id_gen.generate_with_slug(input, "", |_| false);
+        let id = id_gen
+            .generate_with_slug(input, "", |_| Ok(false))
+            .expect("collision lookup succeeds");
         let parsed = parse_id(&id).expect("hash-only ID should parse");
         assert_eq!(parsed.prefix, "br");
 
@@ -1563,11 +1632,13 @@ mod tests {
         // very first candidate to "exist" and confirm the generator still
         // produces a slug-shaped ID by retrying with a different nonce.
         let calls = std::cell::Cell::new(0u32);
-        let id = id_gen.generate_with_slug(input, "survey-my-thing", |_candidate| {
-            let n = calls.get();
-            calls.set(n + 1);
-            n == 0
-        });
+        let id = id_gen
+            .generate_with_slug(input, "survey-my-thing", |_candidate| {
+                let n = calls.get();
+                calls.set(n + 1);
+                Ok(n == 0)
+            })
+            .expect("collision lookup succeeds");
         assert!(id.starts_with("br-survey-my-thing-"));
     }
 
@@ -1578,17 +1649,19 @@ mod tests {
             prefix: prefix.clone(),
             ..IdConfig::default()
         });
-        let id = id_gen.generate_with_slug(
-            IdGenerationInput {
-                title: "title",
-                description: None,
-                creator: None,
-                created_at: Utc::now(),
-                issue_count: 10,
-            },
-            "abcd-efgh",
-            |_| false,
-        );
+        let id = id_gen
+            .generate_with_slug(
+                IdGenerationInput {
+                    title: "title",
+                    description: None,
+                    creator: None,
+                    created_at: Utc::now(),
+                    issue_count: 10,
+                },
+                "abcd-efgh",
+                |_| Ok(false),
+            )
+            .expect("collision lookup succeeds");
 
         let parsed = parse_id(&id).expect("slug-shaped ID should stay parseable");
         assert_eq!(parsed.prefix, format!("{prefix}-abc"));
@@ -1602,17 +1675,19 @@ mod tests {
             prefix: prefix.clone(),
             ..IdConfig::default()
         });
-        let id = id_gen.generate_with_slug(
-            IdGenerationInput {
-                title: "title",
-                description: None,
-                creator: None,
-                created_at: Utc::now(),
-                issue_count: 10,
-            },
-            "slug",
-            |_| false,
-        );
+        let id = id_gen
+            .generate_with_slug(
+                IdGenerationInput {
+                    title: "title",
+                    description: None,
+                    creator: None,
+                    created_at: Utc::now(),
+                    issue_count: 10,
+                },
+                "slug",
+                |_| Ok(false),
+            )
+            .expect("collision lookup succeeds");
 
         let parsed = parse_id(&id).expect("fallback ID should stay parseable");
         assert_eq!(parsed.prefix, prefix);
@@ -1638,7 +1713,9 @@ mod tests {
         };
 
         // Mixed-case + spaces + punctuation → lowercased, single-hyphenated
-        let id = id_gen.generate_with_slug(input, "Hello World!", |_| false);
+        let id = id_gen
+            .generate_with_slug(input, "Hello World!", |_| Ok(false))
+            .expect("collision lookup succeeds");
         assert!(
             id.starts_with("br-hello-world-"),
             "expected prefix 'br-hello-world-', got {id}"
@@ -1648,14 +1725,18 @@ mod tests {
         assert!(!parsed.hash.is_empty(), "hash suffix must be present");
 
         // Multiple non-alphanumeric runs collapse to a single hyphen
-        let id2 = id_gen.generate_with_slug(input, "a   b/c.d!!e", |_| false);
+        let id2 = id_gen
+            .generate_with_slug(input, "a   b/c.d!!e", |_| Ok(false))
+            .expect("collision lookup succeeds");
         assert!(
             id2.starts_with("br-a-b-c-d-e-"),
             "expected b-c-d-e collapsed; got {id2}"
         );
 
         // Pure-Unicode (non-ASCII) characters strip out
-        let id3 = id_gen.generate_with_slug(input, "café-résumé", |_| false);
+        let id3 = id_gen
+            .generate_with_slug(input, "café-résumé", |_| Ok(false))
+            .expect("collision lookup succeeds");
         // After normalize_slug: "caf-r-sum" (drops é, kept letters around hyphens)
         assert!(id3.starts_with("br-caf-r-sum-"), "got {id3}");
     }
@@ -1675,7 +1756,9 @@ mod tests {
 
         // 60-char input → 48-char normalized cap (not counting prefix/hash)
         let long_slug = "a".repeat(60);
-        let id = id_gen.generate_with_slug(input, &long_slug, |_| false);
+        let id = id_gen
+            .generate_with_slug(input, &long_slug, |_| Ok(false))
+            .expect("collision lookup succeeds");
         let parsed = parse_id(&id).expect("must parse");
         let slug_part = parsed.prefix.strip_prefix("br-").unwrap_or(&parsed.prefix);
         assert!(
@@ -1686,7 +1769,9 @@ mod tests {
 
         // Slug that ends with a hyphen due to truncation must have it stripped
         let trailing_hyphen_slug = format!("{}!!!", "x".repeat(MAX_SLUG_LEN - 2)); // becomes 48 chars then trailing hyphen risk
-        let id2 = id_gen.generate_with_slug(input, &trailing_hyphen_slug, |_| false);
+        let id2 = id_gen
+            .generate_with_slug(input, &trailing_hyphen_slug, |_| Ok(false))
+            .expect("collision lookup succeeds");
         assert!(!id2.starts_with("br--"), "double-hyphen leak in {id2}");
         // Find the slug portion: between "br-" and the last "-<hash>" segment
         let parsed2 = parse_id(&id2).expect("must parse");
@@ -1716,7 +1801,9 @@ mod tests {
             issue_count: 5,
         };
 
-        let id = id_gen.generate_with_slug(input, "feature-x", |_| false);
+        let id = id_gen
+            .generate_with_slug(input, "feature-x", |_| Ok(false))
+            .expect("collision lookup succeeds");
         assert!(
             id.starts_with("myproj-feature-x-"),
             "expected configured prefix preserved; got {id}"
@@ -1749,7 +1836,9 @@ mod tests {
 
         // Various inputs that all normalize to empty
         for empty_yielding in ["!!!", "...", "   ", "$%^&*()", "", "/\\/\\"] {
-            let id = id_gen.generate_with_slug(input, empty_yielding, |_| false);
+            let id = id_gen
+                .generate_with_slug(input, empty_yielding, |_| Ok(false))
+                .expect("collision lookup succeeds");
             let parsed = parse_id(&id).expect("must parse hash-only fallback");
             assert_eq!(
                 parsed.prefix, "br",

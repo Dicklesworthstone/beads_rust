@@ -17,6 +17,7 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::util::id::normalize_configured_prefix;
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -820,6 +821,10 @@ fn set_config_value(
             });
         }
     };
+
+    if canonical_config_key(key) == "issue_prefix" {
+        normalize_configured_prefix(value)?;
+    }
 
     // Determine target config file
     let (config_path, is_project) =

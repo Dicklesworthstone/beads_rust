@@ -617,9 +617,7 @@ fn generate_new_id(
     } else {
         // Standard ID generation for non-child issues
         let id_gen = IdGenerator::new(input.id_config.clone());
-        let id_check_err: std::cell::RefCell<Option<BeadsError>> = std::cell::RefCell::new(None);
-
-        let generated_id = match slug {
+        match slug {
             Some(s) if !s.trim().is_empty() => id_gen.generate_with_slug(
                 IdGenerationInput {
                     title: input.title,
@@ -629,13 +627,7 @@ fn generate_new_id(
                     issue_count: input.issue_count,
                 },
                 s,
-                |id| match storage.id_exists(id) {
-                    Ok(exists) => exists,
-                    Err(e) => {
-                        id_check_err.replace(Some(e));
-                        true
-                    }
-                },
+                |id| storage.id_exists(id),
             ),
             _ => id_gen.generate(
                 input.title,
@@ -643,21 +635,9 @@ fn generate_new_id(
                 input.creator,
                 input.now,
                 input.issue_count,
-                |id| match storage.id_exists(id) {
-                    Ok(exists) => exists,
-                    Err(e) => {
-                        id_check_err.replace(Some(e));
-                        // Treat as "exists" to force retry with a different ID
-                        true
-                    }
-                },
+                |id| storage.id_exists(id),
             ),
-        };
-
-        if let Some(err) = id_check_err.into_inner() {
-            return Err(err);
         }
-        Ok(generated_id)
     }
 }
 

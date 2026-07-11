@@ -151,7 +151,9 @@ fn prefix_configuration_fixture() {
     // `bd-`).  Assert against the actual configured default so the test
     // stays honest if the default ever changes again.
     let default_gen = IdGenerator::with_defaults();
-    let id_default = default_gen.generate("Test", None, None, created_at, 0, |_| false);
+    let id_default = default_gen
+        .generate("Test", None, None, created_at, 0, |_| Ok(false))
+        .expect("collision lookup succeeds");
     let expected = format!("{}-", IdConfig::default().prefix);
     assert!(
         id_default.starts_with(&expected),
@@ -160,9 +162,11 @@ fn prefix_configuration_fixture() {
     assert!(is_valid_id_format(&id_default));
 
     // Custom prefix
-    let custom_config = IdConfig::with_prefix("myproject");
+    let custom_config = IdConfig::with_prefix("myproject").expect("valid prefix");
     let custom_gen = IdGenerator::new(custom_config);
-    let id_custom = custom_gen.generate("Test", None, None, created_at, 0, |_| false);
+    let id_custom = custom_gen
+        .generate("Test", None, None, created_at, 0, |_| Ok(false))
+        .expect("collision lookup succeeds");
     assert!(
         id_custom.starts_with("myproject-"),
         "Custom prefix should be myproject-"
@@ -170,9 +174,11 @@ fn prefix_configuration_fixture() {
     assert!(is_valid_id_format(&id_custom));
 
     // Hyphenated prefix
-    let hyphen_config = IdConfig::with_prefix("my-project");
+    let hyphen_config = IdConfig::with_prefix("my-project").expect("valid prefix");
     let hyphen_gen = IdGenerator::new(hyphen_config);
-    let id_hyphen = hyphen_gen.generate("Test", None, None, created_at, 0, |_| false);
+    let id_hyphen = hyphen_gen
+        .generate("Test", None, None, created_at, 0, |_| Ok(false))
+        .expect("collision lookup succeeds");
     assert!(
         id_hyphen.starts_with("my-project-"),
         "Hyphenated prefix should work"
@@ -187,16 +193,20 @@ fn collision_handling_fixture() {
     let created_at = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap();
 
     let mut generated: Vec<String> = Vec::new();
-    let exists = |id: &str| generated.contains(&id.to_string());
+    let exists = |id: &str| Ok(generated.contains(&id.to_string()));
 
     // Generate first ID
-    let id1 = generator.generate("Test Issue", None, None, created_at, 0, exists);
+    let id1 = generator
+        .generate("Test Issue", None, None, created_at, 0, exists)
+        .expect("collision lookup succeeds");
     generated.push(id1.clone());
 
     // Generate second ID with same inputs - collision checker should force different ID
-    let id2 = generator.generate("Test Issue", None, None, created_at, 0, |id| {
-        generated.contains(&id.to_string())
-    });
+    let id2 = generator
+        .generate("Test Issue", None, None, created_at, 0, |id| {
+            Ok(generated.contains(&id.to_string()))
+        })
+        .expect("collision lookup succeeds");
     generated.push(id2.clone());
 
     // They should be different due to nonce increment
@@ -794,11 +804,15 @@ fn prefix_change_id_generation() {
     let created_at = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap();
 
     // Generate IDs with different prefixes
-    let gen_bd = IdGenerator::new(IdConfig::with_prefix("bd"));
-    let gen_proj = IdGenerator::new(IdConfig::with_prefix("myproject"));
+    let gen_bd = IdGenerator::new(IdConfig::with_prefix("bd").expect("valid prefix"));
+    let gen_proj = IdGenerator::new(IdConfig::with_prefix("myproject").expect("valid prefix"));
 
-    let id_bd = gen_bd.generate("Test", None, None, created_at, 0, |_| false);
-    let id_proj = gen_proj.generate("Test", None, None, created_at, 0, |_| false);
+    let id_bd = gen_bd
+        .generate("Test", None, None, created_at, 0, |_| Ok(false))
+        .expect("collision lookup succeeds");
+    let id_proj = gen_proj
+        .generate("Test", None, None, created_at, 0, |_| Ok(false))
+        .expect("collision lookup succeeds");
 
     // Same content but different prefixes
     assert!(id_bd.starts_with("bd-"));

@@ -22,7 +22,8 @@ use crate::sync::{
     scan_jsonl_for_tombstone_filter, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{
-    IdConfig, abbreviate_prefix, normalize_prefix, parse_id, split_prefix_remainder,
+    IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
+    split_prefix_remainder,
 };
 use chrono::Utc;
 use fsqlite_error::FrankenError;
@@ -2986,10 +2987,7 @@ fn resolve_bootstrap_issue_prefix(
     allow_external_jsonl: bool,
 ) -> Result<String> {
     if let Some(prefix) = get_value(bootstrap_layer, &["issue_prefix", "issue-prefix", "prefix"]) {
-        let trimmed = prefix.trim();
-        if !trimmed.is_empty() {
-            return Ok(normalize_prefix(trimmed));
-        }
+        return normalize_configured_prefix(prefix);
     }
 
     if let Some(prefix) =
@@ -3009,6 +3007,13 @@ fn resolve_bootstrap_issue_prefix(
     }
 
     Ok("br".to_string())
+}
+
+fn validate_configured_issue_prefix(layer: &ConfigLayer) -> Result<()> {
+    if let Some(prefix) = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"]) {
+        normalize_configured_prefix(prefix)?;
+    }
+    Ok(())
 }
 
 fn first_prefix_from_resolved_jsonl(
@@ -3541,7 +3546,9 @@ fn load_config_from_startup_layers(
     layers.extend(startup_layers.iter().cloned());
     layers.push(cli_layer);
 
-    Ok(ConfigLayer::merge_layers(&layers))
+    let merged = ConfigLayer::merge_layers(&layers);
+    validate_configured_issue_prefix(&merged)?;
+    Ok(merged)
 }
 
 /// Internal structure to hold startup config and paths without redundant IO.
@@ -5877,6 +5884,22 @@ routing:
 
         let config = id_config_from_layer(&layer);
         assert_eq!(config.prefix, "project-name");
+    }
+
+    #[test]
+    fn load_config_rejects_explicit_prefix_without_usable_characters() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(beads_dir.join("config.yaml"), "issue_prefix: '!!!'\n").expect("write config");
+
+        let err = load_config(&beads_dir, None, &CliOverrides::default())
+            .expect_err("unsupported-only configured prefix must be rejected");
+
+        assert!(
+            matches!(&err, BeadsError::Config(message) if message.contains("issue_prefix")),
+            "unexpected error: {err}"
+        );
     }
 
     // ==================== JSONL Discovery Tests ====================
