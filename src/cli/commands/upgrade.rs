@@ -541,19 +541,9 @@ fn download_asset_to_writer(
 ) -> Result<()> {
     let mut download = Download::from_url(url);
     download.show_download_progress(show_progress);
-    download.request_header(
-        "ACCEPT".parse().expect("valid HTTP header name"),
-        "application/octet-stream"
-            .parse()
-            .expect("valid HTTP header value"),
-    );
+    download.request_header("ACCEPT", "application/octet-stream");
     if let Some(token) = auth_token {
-        download.request_header(
-            "AUTHORIZATION".parse().expect("valid HTTP header name"),
-            format!("token {token}")
-                .parse()
-                .map_err(|err| BeadsError::upgrade(format!("invalid auth header: {err}")))?,
-        );
+        download.request_header("AUTHORIZATION", format!("token {token}"));
     }
 
     download.download_to(writer).map_err(map_update_error)
