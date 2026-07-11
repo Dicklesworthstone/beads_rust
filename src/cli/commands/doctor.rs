@@ -7941,18 +7941,23 @@ fn check_binary_version_mismatch(beads_dir: &Path, checks: &mut Vec<CheckResult>
     }
 }
 
-/// Walk upward from `start` looking for a `Cargo.toml` whose
-/// `[package].name == "beads_rust"`. Returns the directory containing
-/// that Cargo.toml, or `None` if none is found in the ancestry. Bounded
-/// at 32 levels to avoid pathological symlink loops.
+/// Walk upward from `start` looking for the containing Rust package.
+/// Returns its root only when the nearest package-bearing `Cargo.toml`
+/// declares `[package].name == "beads_rust"`.
+///
+/// A manifest for another package is a repository boundary, even when that
+/// package happens to live somewhere below a beads_rust checkout (for example,
+/// a test fixture rooted under `target/`). Continuing beyond that boundary can
+/// misidentify an unrelated workspace as beads_rust and emit a false version
+/// mismatch warning. Workspace-only manifests have no package identity, so the
+/// search may continue past them. The walk is bounded at 32 levels to avoid
+/// pathological symlink loops.
 fn find_beads_rust_repo_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.parent()?.to_path_buf();
     for _ in 0..32 {
         let candidate = current.join("Cargo.toml");
-        if let Some(name) = read_cargo_toml_package_name(&candidate)
-            && name == "beads_rust"
-        {
-            return Some(current);
+        if let Some(name) = read_cargo_toml_package_name(&candidate) {
+            return (name == "beads_rust").then_some(current);
         }
         let parent = current.parent()?;
         if parent == current {
@@ -8897,6 +8902,15 @@ fn fix_base_jsonl_stale_if_warned(
     // already skips when live is empty, but re-check at fix time
     // (TOCTOU defense).
     if live_bytes.is_empty() {
+        return false;
+    }
+
+    // The detector deliberately uses only mtimes so its common path stays
+    // stat-only. A later write can therefore make issues.jsonl newer even
+    // when its bytes still match the anchor. Do not turn that harmless
+    // timestamp drift into a recorded mutation: repair must be idempotent,
+    // and an identical anchor is already the exact desired state.
+    if fs::read(&anchor).is_ok_and(|anchor_bytes| anchor_bytes == live_bytes) {
         return false;
     }
 
@@ -13423,6 +13437,55 @@ mod tests {
             .filter(|l| l.contains("\"op\":\"write_file\""))
             .count();
         assert_eq!(write_count, 1, "actions.jsonl: {actions}");
+    }
+
+    #[test]
+    fn test_fix_base_jsonl_stale_skips_byte_identical_anchor() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let anchor = beads_dir.join("beads.base.jsonl");
+        let live = beads_dir.join("issues.jsonl");
+        let content = b"{\"id\":\"bd-same\"}\n";
+        fs::write(&anchor, content).unwrap();
+        fs::write(&live, content).unwrap();
+
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let anchor_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&anchor)
+            .unwrap();
+        anchor_file
+            .set_times(std::fs::FileTimes::new().set_modified(two_hours_ago))
+            .unwrap();
+        drop(anchor_file);
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_base_jsonl(&beads_dir, &mut report.checks);
+        let check = find_check(&report.checks, "base_jsonl").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn));
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(!fix_base_jsonl_stale_if_warned(
+            &beads_dir,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+
+        assert_eq!(fs::read(&anchor).unwrap(), content);
+        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
+        assert!(
+            actions.is_empty(),
+            "identical anchor must be a no-op: {actions}"
+        );
     }
 
     #[test]
@@ -20685,9 +20748,22 @@ edition = "2024"
     #[test]
     fn find_beads_rust_repo_root_returns_none_for_other_repo() {
         let tmp = TempDir::new().unwrap();
-        let beads_dir = tmp.path().join(".beads");
+        // Model an unrelated package nested beneath a beads_rust checkout.
+        // This is also what happens when TMPDIR points inside the checkout:
+        // the nearest package manifest must stop the search before the outer
+        // beads_rust manifest can produce a false-positive match.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            r#"[package]
+name = "beads_rust"
+version = "0.99.0"
+"#,
+        )
+        .unwrap();
+        let other_repo = tmp.path().join("other_repo");
+        let beads_dir = other_repo.join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        let cargo = tmp.path().join("Cargo.toml");
+        let cargo = other_repo.join("Cargo.toml");
         // Wrong [package].name.
         fs::write(
             &cargo,
