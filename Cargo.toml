@@ -108,7 +108,8 @@ semver = "1.0.27"
 fastmcp-rust = { version = "0.3.1", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
-self_update = { version = "0.44", features = ["reqwest", "rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
+self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
+self-replace = { version = "1.5.0", optional = true }
 
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
@@ -157,10 +158,11 @@ default = ["self_update"]
 mcp = ["dep:fastmcp-rust"]
 self_update = [
     "dep:self_update",
+    "dep:self-replace",
     "self_update/rustls",
     "self_update/archive-tar",
     "self_update/archive-zip",
-    "self_update/compression-flate2",
+    "self_update/compression-tar-gz",
     "self_update/compression-zip-deflate",
 ]
 
