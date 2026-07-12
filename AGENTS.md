@@ -461,7 +461,7 @@ use MCP tools/resources/prompts instead of shelling out. It is optional and only
 exists in binaries built with the `mcp` feature:
 
 ```bash
-MCP_TARGET="${TMPDIR:-/tmp}/rch_target_beads_rust_${AGENT_NAME:-agent}"
+MCP_TARGET="${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}/rch_target_beads_rust_${AGENT_NAME:-agent}"
 rch exec -- env CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
 RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
 ```
