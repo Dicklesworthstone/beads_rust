@@ -750,10 +750,8 @@ fn chokepoint_robot_triage_envelope_v1() {
         .output()
         .expect("robot-triage spawned");
     let exit = out.status.code().unwrap_or(-1);
-    // A freshly-initialized workspace currently emits one P2 finding
-    // (`db.sidecars` — WAL-without-SHM is "expected for frankensqlite"
-    // per the detector's own message). The triage exit code is 0
-    // because no errors were raised, just warnings.
+    // A freshly initialized workspace should remain triage-operable. A verbose
+    // ambient RUST_LOG may still produce an advisory finding.
     assert!(
         matches!(exit, 0 | 1),
         "unexpected triage exit {exit}; stderr={}",

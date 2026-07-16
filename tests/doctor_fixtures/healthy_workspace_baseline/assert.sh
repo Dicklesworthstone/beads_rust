@@ -8,12 +8,14 @@ cd "$target_dir"
 
 case "$stage" in
   detect)
-    out=$("$tool_bin" doctor --json 2>/dev/null) || true
-    # No `error` checks. (`warn` from db.sidecars is acceptable.)
-    n_err=$(echo "$out" | jq '[.checks[] | select(.status == "error")] | length')
-    if [ "$n_err" -ne 0 ]; then
-      echo "ASSERT FAIL[$stage]: clean workspace has error-level checks" >&2
-      echo "$out" | jq '.checks[] | select(.status == "error")' >&2
+    out=$(RUST_LOG=error "$tool_bin" doctor --json 2>/dev/null) || {
+      echo "ASSERT FAIL[$stage]: doctor rejected a clean workspace" >&2
+      exit 1
+    }
+    n_non_ok=$(echo "$out" | jq '[.checks[] | select(.status != "ok")] | length')
+    if [ "$n_non_ok" -ne 0 ]; then
+      echo "ASSERT FAIL[$stage]: clean workspace has non-OK checks" >&2
+      echo "$out" | jq '.checks[] | select(.status != "ok")' >&2
       exit 1
     fi
     ;;

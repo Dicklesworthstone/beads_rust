@@ -9,12 +9,13 @@ cd "$target_dir"
 case "$stage" in
   detect)
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
-    # db.sidecars must be warn (NOT error) since frankensqlite expects this.
+    # db.sidecars must be healthy since FrankenSQLite intentionally keeps its
+    # WAL index in process-local memory rather than a sibling SHM file.
     echo "$out" | jq -e '
-      .checks[] | select(.name == "db.sidecars") | select(.status == "warn")
+      .checks[] | select(.name == "db.sidecars") | select(.status == "ok")
       | select(.message | test("WAL sidecar"; "i"))
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: db.sidecars not warn for WAL-without-SHM" >&2
+      echo "ASSERT FAIL[$stage]: db.sidecars not healthy for valid WAL-without-SHM" >&2
       echo "$out" | jq '.checks[] | select(.name == "db.sidecars")' >&2
       exit 1
     }

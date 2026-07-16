@@ -13,7 +13,7 @@ OK permissions.write_lock
 OK permissions.root_gitignore
 OK permissions.config_yaml_secrets
 OK br_path_dupes
-WARN gitignore.beads_inner_present: /TMP/.beads/.gitignore exists but is missing expected pattern(s): .write.lock
+OK gitignore.beads_inner_present
 OK tmp_files_orphan
 OK br_history.size
 OK routes_jsonl: No routes.jsonl present (ID-REDACTED routing is optional)
@@ -40,7 +40,7 @@ OK db_bloat
 OK wal_size
 OK db.recovery_artifacts
 OK db.recovery_artifacts.aged
-WARN db.sidecars: WAL sidecar exists without a matching SHM sidecar at /TMP/.beads/beads.ID-REDACTED (expected for frankensqlite)
+OK db.sidecars: WAL sidecar exists without a matching SHM sidecar at /TMP/.beads/beads.ID-REDACTED (expected for frankensqlite)
 OK schema.tables
 OK schema.columns
 OK db.recoverable_anomalies

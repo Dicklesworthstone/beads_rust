@@ -346,8 +346,8 @@ fn is_quick_suppressed_doctor_check(name: &str) -> bool {
 struct SidecarInspection {
     /// Error-level findings that indicate a genuine problem requiring repair.
     findings: Vec<String>,
-    /// Warning-level findings that are informational but do not require repair.
-    warning_findings: Vec<String>,
+    /// Informational findings for valid engine-specific sidecar layouts.
+    informational_findings: Vec<String>,
     quarantine_candidates: Vec<PathBuf>,
 }
 
@@ -1465,11 +1465,6 @@ fn repair_report_verified(report: &DoctorReport) -> bool {
 ///   writing the fresh DB. A fresh, non-aged backup is the success signal, not
 ///   a defect; the separate `db.recovery_artifacts.aged` check still fails on
 ///   backups past the TTL.
-/// - `db.sidecars` (WARN): frankensqlite keeps the WAL index in process-local
-///   memory, so a freshly rebuilt DB with a WAL but no sibling SHM is its
-///   normal operating state — the check message itself says "expected for
-///   frankensqlite". Note the WARN gate: an ERROR here (e.g. a non-file
-///   dangling sidecar) is deliberately *not* tolerated.
 /// - `rust_log` (WARN): a nag about the *caller's* `RUST_LOG` environment,
 ///   unrelated to database health.
 ///
@@ -1478,10 +1473,7 @@ fn repair_report_verified(report: &DoctorReport) -> bool {
 /// relaxes the "must be pristine" constraint for these known-benign warnings.
 fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
     matches!(check.status, CheckStatus::Warn)
-        && matches!(
-            check.name.as_str(),
-            "db.recovery_artifacts" | "db.sidecars" | "rust_log"
-        )
+        && matches!(check.name.as_str(), "db.recovery_artifacts" | "rust_log")
 }
 
 /// Post-repair verification for the JSONL-rebuild path.
@@ -1489,10 +1481,10 @@ fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
 /// Unlike [`repair_report_verified`] (which demands a pristine, zero-non-OK
 /// report), this tolerates the handful of benign findings a successful rebuild
 /// always leaves behind — see [`is_benign_post_rebuild_finding`]. Without this,
-/// the rebuild path could never verify: it always creates a recovery backup and
-/// leaves a frankensqlite WAL sidecar, so `repair_report_verified` returned
-/// false even when the rebuilt database was fully healthy, forcing `doctor
-/// --repair` to exit 7 on the `corrupt_db_text` fixture (issue #375).
+/// the rebuild path could never verify: it always creates a recovery backup, so
+/// `repair_report_verified` returned false even when the rebuilt database was
+/// fully healthy, forcing `doctor --repair` to exit 7 on the `corrupt_db_text`
+/// fixture (issue #375).
 fn jsonl_rebuild_repair_verified(report: &DoctorReport) -> bool {
     report.ok
         && report.checks.iter().all(|check| {
@@ -1876,10 +1868,12 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     if wal_kind.is_regular_file() && !shm_kind.exists() {
         // frankensqlite manages the WAL index in process-local memory rather than in an SHM
         // file, so a WAL without a sibling SHM is the normal operating state — not an error.
-        // We record this as a warning finding so callers can observe it, but we do not
+        // Record the layout as informational so callers can observe it, but do not
+        // degrade an otherwise healthy workspace: doctor treats every warning as a
+        // failed health check. We also do not
         // quarantine the WAL, because the WAL is valid and the database is accessible.
         // The db.write_probe check validates liveness.
-        inspection.warning_findings.push(format!(
+        inspection.informational_findings.push(format!(
             "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
             PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
         ));
@@ -1933,14 +1927,14 @@ fn check_database_sidecars(db_path: &Path, checks: &mut Vec<CheckResult>) -> Res
         return Ok(());
     }
 
-    if !inspection.warning_findings.is_empty() {
+    if !inspection.informational_findings.is_empty() {
         push_check(
             checks,
             "db.sidecars",
-            CheckStatus::Warn,
-            Some(inspection.warning_findings[0].clone()),
+            CheckStatus::Ok,
+            Some(inspection.informational_findings[0].clone()),
             Some(serde_json::json!({
-                "findings": inspection.warning_findings,
+                "findings": inspection.informational_findings,
             })),
         );
         return Ok(());
@@ -18134,9 +18128,9 @@ mod tests {
     }
 
     #[test]
-    fn test_check_database_sidecars_warns_on_wal_without_shm() -> Result<()> {
+    fn test_check_database_sidecars_accepts_wal_without_shm() -> Result<()> {
         // frankensqlite does not create SHM files — WAL without SHM is expected and should
-        // produce a Warn (informational) rather than an Error that triggers repair.
+        // be informational without degrading an otherwise healthy workspace.
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
         fs::write(&db_path, b"sqlite-header-placeholder")?;
@@ -18150,8 +18144,8 @@ mod tests {
 
         let check = find_check(&checks, "db.sidecars").expect("sidecar check");
         assert!(
-            matches!(check.status, CheckStatus::Warn),
-            "expected Warn for WAL-without-SHM, got {:?}",
+            matches!(check.status, CheckStatus::Ok),
+            "expected Ok for FrankenSQLite WAL-without-SHM, got {:?}",
             check.status
         );
         assert!(
@@ -18161,6 +18155,52 @@ mod tests {
             "unexpected sidecar message: {:?}",
             check.message
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_database_sidecars_rejects_invalid_layouts() -> Result<()> {
+        let assert_error = |db_path: &Path, expected: &str| -> Result<()> {
+            let mut checks = Vec::new();
+            check_database_sidecars(db_path, &mut checks)?;
+            let check = find_check(&checks, "db.sidecars").expect("sidecar check");
+            assert_eq!(check.status, CheckStatus::Error, "{check:?}");
+            assert!(
+                check
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains(expected)),
+                "expected `{expected}` in sidecar error: {check:?}"
+            );
+            Ok(())
+        };
+
+        let shm_only = TempDir::new()?;
+        let shm_only_db = shm_only.path().join("beads.db");
+        fs::write(&shm_only_db, b"sqlite-header-placeholder")?;
+        fs::write(
+            PathBuf::from(format!("{}-shm", shm_only_db.to_string_lossy())),
+            b"orphan shm",
+        )?;
+        assert_error(&shm_only_db, "SHM sidecar exists without a matching WAL")?;
+
+        let non_file = TempDir::new()?;
+        let non_file_db = non_file.path().join("beads.db");
+        fs::write(&non_file_db, b"sqlite-header-placeholder")?;
+        fs::create_dir(PathBuf::from(format!(
+            "{}-wal",
+            non_file_db.to_string_lossy()
+        )))?;
+        assert_error(&non_file_db, "directory instead of a regular file")?;
+
+        let dangling = TempDir::new()?;
+        let missing_db = dangling.path().join("beads.db");
+        fs::write(
+            PathBuf::from(format!("{}-wal", missing_db.to_string_lossy())),
+            b"dangling wal",
+        )?;
+        assert_error(&missing_db, "Database sidecars exist even though")?;
+
         Ok(())
     }
 
@@ -18311,8 +18351,8 @@ mod tests {
     }
 
     #[test]
-    fn test_repair_recoverable_db_state_skips_repair_for_wal_without_shm_warn() -> Result<()> {
-        // WAL-without-SHM is now a Warn (not Error) for frankensqlite compatibility.
+    fn test_repair_recoverable_db_state_skips_repair_for_valid_wal_without_shm() -> Result<()> {
+        // WAL-without-SHM is an informational Ok for FrankenSQLite compatibility.
         // repair_recoverable_db_state should NOT attempt any repair for this condition.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -18322,19 +18362,17 @@ mod tests {
         let wal_path = PathBuf::from(format!("{}-wal", db_path.to_string_lossy()));
         fs::write(&wal_path, b"frankensqlite wal without shm")?;
 
+        let mut checks = Vec::new();
+        check_database_sidecars(&db_path, &mut checks)?;
+        assert_eq!(
+            find_check(&checks, "db.sidecars").map(|check| &check.status),
+            Some(&CheckStatus::Ok)
+        );
         let report = DoctorReport {
-            ok: true, // Warn-only report is considered ok
+            ok: true,
             workspace_health: None,
             reliability_audit: None,
-            checks: vec![CheckResult {
-                name: "db.sidecars".to_string(),
-                status: CheckStatus::Warn,
-                message: Some(
-                    "WAL sidecar exists without a matching SHM sidecar (expected for frankensqlite)"
-                        .to_string(),
-                ),
-                details: None,
-            }],
+            checks,
         };
 
         let repair = repair_recoverable_db_state(
@@ -18346,11 +18384,11 @@ mod tests {
         );
         assert!(
             repair.quarantined_artifacts.is_empty(),
-            "WAL should not be quarantined for a Warn-level sidecar check"
+            "valid FrankenSQLite WAL should not be quarantined"
         );
         assert!(
             wal_path.exists(),
-            "WAL file should remain untouched when sidecar check is only a warning"
+            "valid FrankenSQLite WAL should remain untouched"
         );
         Ok(())
     }
@@ -19274,9 +19312,9 @@ mod tests {
     #[test]
     fn jsonl_rebuild_verification_tolerates_benign_post_rebuild_warnings() {
         // Issue #375: a successful rebuild-from-JSONL always leaves a fresh
-        // recovery backup, a frankensqlite WAL-without-SHM sidecar, and (under
-        // the caller's env) a RUST_LOG nag. None of these mean the rebuilt DB
-        // is unhealthy, so post-repair verification must still pass.
+        // recovery backup and can inherit a RUST_LOG nag from the caller's
+        // environment. Neither means the rebuilt DB is unhealthy, so
+        // post-repair verification must still pass.
         let report = DoctorReport {
             ok: true,
             workspace_health: None,
@@ -19292,15 +19330,6 @@ mod tests {
                     name: "db.recovery_artifacts".to_string(),
                     status: CheckStatus::Warn,
                     message: Some("Preserved recovery artifacts remain (2 item(s))".to_string()),
-                    details: None,
-                },
-                CheckResult {
-                    name: "db.sidecars".to_string(),
-                    status: CheckStatus::Warn,
-                    message: Some(
-                        "WAL sidecar exists without a matching SHM sidecar (expected for frankensqlite)"
-                            .to_string(),
-                    ),
                     details: None,
                 },
                 CheckResult {

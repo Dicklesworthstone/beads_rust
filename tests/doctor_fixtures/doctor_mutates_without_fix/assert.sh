@@ -60,7 +60,7 @@ case "$stage" in
         assert_tree_matches_snapshot beads
 
         echo "$out" | jq -e '
-          any(.checks[]; .name == "db.sidecars" and .status == "warn")
+          any(.checks[]; .name == "db.sidecars" and .status == "ok")
           and any(.checks[]; .name == "db.open" and .status == "error")
           and any(.checks[]; .name == "sqlite3.integrity_check" and .status == "error")
         ' >/dev/null || {

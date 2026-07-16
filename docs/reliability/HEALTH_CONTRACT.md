@@ -43,7 +43,7 @@ Executable implementation: `src/health.rs`.
 | Anomaly | Severity | Detection | Recovery |
 |---------|----------|-----------|----------|
 | `WalCorrupt` | Recoverable | WAL header validation | Delete WAL, rebuild |
-| `SidecarMismatch` | Degraded | WAL exists without SHM or vice versa | Delete orphan |
+| `SidecarMismatch` | Degraded | SHM exists without WAL, a sidecar is not a regular file, or sidecars exist without a database | Quarantine the invalid or dangling sidecar |
 | `TruncatedWal` | Recoverable | WAL file < 32 bytes | Delete truncated WAL |
 | `JournalSidecarPresent` | Degraded | File existence check | Delete journal (incomplete txn) |
 | `StaleRecoveryArtifacts` | Degraded | Recovery temp files present | Clean up |

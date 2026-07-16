@@ -296,7 +296,7 @@ const DETECTOR_ROWS: &[DetectorRow] = &[
     ("sync_conflict_markers", "state_files", "error", true),
     ("db.exists", "state_files", "error", true),
     ("db.open", "state_files", "error", true),
-    ("db.sidecars", "state_files", "warn", true),
+    ("db.sidecars", "state_files", "error", true),
     ("db.recovery_artifacts", "state_files", "info", true),
     ("db.recovery_artifacts.aged", "state_files", "warn", true),
     ("db.export_hash_cache", "caches_indexes", "warn", true),

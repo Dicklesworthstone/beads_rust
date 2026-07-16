@@ -1038,6 +1038,7 @@ fn run_br_status<const N: usize>(
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
