@@ -607,7 +607,7 @@ jobs:
           syft dir:. -o spdx-json > artifacts/sbom.spdx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
         with:
           name: br ${{ steps.asset_version.outputs.release_tag }}
           tag_name: ${{ steps.asset_version.outputs.release_tag }}
@@ -626,7 +626,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate SLSA provenance attestations
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-path: |
             artifacts/br-${{ steps.asset_version.outputs.asset_version }}-*.tar.gz
