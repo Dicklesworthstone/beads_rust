@@ -13,7 +13,7 @@ use std::process::Command;
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env, run_br_with_stdin};
 use serde_json::Value;
 use toon_rust::try_decode as decode_toon;
 
@@ -752,6 +752,81 @@ fn e2e_routing_update_external_issue_via_main_workspace() {
 
     let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
     assert_eq!(jsonl_issue["status"].as_str(), Some("in_progress"));
+}
+
+#[test]
+fn e2e_routing_update_description_stdin_is_consumed_once_before_route_fanout() {
+    let _log = common::test_log(
+        "e2e_routing_update_description_stdin_is_consumed_once_before_route_fanout",
+    );
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_description_stdin_main");
+    init_workspace(&external_workspace, "init_description_stdin_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let local_id = create_issue_and_get_id(
+        &main_workspace,
+        "Local description stdin target",
+        "create_local_description_stdin_target",
+    );
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External description stdin target",
+        "create_external_description_stdin_target",
+    );
+    let exact_description =
+        "  shared leading spaces\n\n# Shared markdown\n\nroute one\nroute two\n\n";
+
+    let update = run_br_with_stdin(
+        &main_workspace,
+        [
+            "update",
+            &local_id,
+            &external_id,
+            "--description-file",
+            "-",
+            "--json",
+        ],
+        exact_description,
+        "update_mixed_routes_description_stdin",
+    );
+    assert!(
+        update.status.success(),
+        "mixed-route stdin update failed: stdout={} stderr={}",
+        update.stdout,
+        update.stderr
+    );
+    assert!(
+        !update.stdout.contains("No updates specified"),
+        "description stdin must be treated as an update: {}",
+        update.stdout
+    );
+    let updated: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
+    assert_eq!(updated.len(), 2);
+    assert_eq!(updated[0]["id"].as_str(), Some(local_id.as_str()));
+    assert_eq!(updated[1]["id"].as_str(), Some(external_id.as_str()));
+
+    let local_after = show_issue_json(
+        &main_workspace,
+        &local_id,
+        "show_local_after_description_stdin",
+    );
+    let external_after = show_issue_json(
+        &external_workspace,
+        &external_id,
+        "show_external_after_description_stdin",
+    );
+    assert_eq!(
+        local_after[0]["description"].as_str(),
+        Some(exact_description)
+    );
+    assert_eq!(
+        external_after[0]["description"].as_str(),
+        Some(exact_description)
+    );
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Update command implementation.
 
+use super::create::read_description_file;
 use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
@@ -168,6 +169,12 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // (closed, tombstone) must go through their dedicated commands so the
     // close-policy / delete pipelines are applied (see beads_rust#301).
     reject_terminal_status_transition(args.status.as_deref())?;
+
+    // Resolve description-file input once before route discovery/fan-out.
+    // This is essential for `--description-file -`: stdin is a single stream
+    // and must not be consumed independently by each routed repository.
+    let resolved_args = resolve_update_description(args)?;
+    let args = &resolved_args;
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut target_inputs = args.ids.clone();
@@ -1207,6 +1214,30 @@ fn reject_terminal_status_transition(raw_status: Option<&str>) -> Result<()> {
     }
 }
 
+/// Resolve `br update`'s effective description before preparing any routes.
+///
+/// Clap enforces the inline/file conflict for CLI callers. This guard repeats
+/// the contract for programmatic callers, then reads the file (or stdin)
+/// verbatim exactly once so routed updates and JSONL-recovery retries reuse
+/// the same captured value.
+fn resolve_update_description(args: &UpdateArgs) -> Result<UpdateArgs> {
+    if args.description.is_some() && args.description_file.is_some() {
+        return Err(BeadsError::validation(
+            "description_file",
+            "cannot be combined with --description",
+        ));
+    }
+
+    let Some(path) = args.description_file.as_deref() else {
+        return Ok(args.clone());
+    };
+
+    let mut resolved = args.clone();
+    resolved.description = Some(read_description_file(path)?);
+    resolved.description_file = None;
+    Ok(resolved)
+}
+
 fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result<IssueUpdate> {
     let status = if args.claim {
         Some(Status::InProgress)
@@ -1602,6 +1633,38 @@ mod tests {
         assert_eq!(update.status, Some(Status::InProgress));
         assert_eq!(update.assignee, Some(Some("test_actor".to_string())));
         info!("test_build_update_with_claim: assertions passed");
+    }
+
+    #[test]
+    fn test_resolve_update_description_file_preserves_exact_content() {
+        init_test_logging();
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("description.md");
+        let exact = "  leading whitespace\n\n# Markdown\n\ntrailing newline\n";
+        fs::write(&path, exact).unwrap();
+        let args = UpdateArgs {
+            description_file: Some(path),
+            ..Default::default()
+        };
+
+        let resolved = resolve_update_description(&args).unwrap();
+
+        assert_eq!(resolved.description.as_deref(), Some(exact));
+        assert!(resolved.description_file.is_none());
+    }
+
+    #[test]
+    fn test_resolve_update_description_rejects_programmatic_conflict_before_read() {
+        init_test_logging();
+        let args = UpdateArgs {
+            description: Some("inline".to_string()),
+            description_file: Some(Path::new("/definitely/missing/description.md").to_path_buf()),
+            ..Default::default()
+        };
+
+        let err = resolve_update_description(&args).unwrap_err();
+
+        assert!(err.to_string().contains("cannot be combined"));
     }
 
     #[test]

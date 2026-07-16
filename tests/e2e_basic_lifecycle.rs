@@ -289,6 +289,157 @@ fn e2e_basic_lifecycle() {
 }
 
 #[test]
+fn e2e_update_description_file_preserves_exact_content() {
+    let _log = common::test_log("e2e_update_description_file_preserves_exact_content");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_update_description_file");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Description file target"],
+        "create_update_description_file_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(!issue_id.is_empty(), "missing created id");
+
+    let exact_description = "  leading spaces stay\n\n# Markdown heading\n\n- first\n- second\n\ntrailing newline stays\n";
+    let description_path = workspace.root.join("description.md");
+    fs::write(&description_path, exact_description).expect("write description file");
+
+    let update = run_br(
+        &workspace,
+        vec![
+            "update".to_string(),
+            issue_id.clone(),
+            "--description-file".to_string(),
+            description_path.display().to_string(),
+            "--json".to_string(),
+        ],
+        "update_description_from_file",
+    );
+    assert!(
+        update.status.success(),
+        "description-file update failed: stdout={} stderr={}",
+        update.stdout,
+        update.stderr
+    );
+    assert!(
+        !update.stdout.contains("No updates specified"),
+        "description-file must be treated as an update: {}",
+        update.stdout
+    );
+    let updated = parse_json_array(&update.stdout, "parse description-file update json");
+    assert_eq!(updated.len(), 1);
+    assert_eq!(updated[0]["id"].as_str(), Some(issue_id.as_str()));
+
+    assert_issue_description(&workspace, &issue_id, exact_description);
+
+    let empty_path = workspace.root.join("empty-description.md");
+    fs::write(&empty_path, "").expect("write empty description file");
+    let clear_to_empty = run_br(
+        &workspace,
+        vec![
+            "update".to_string(),
+            issue_id.clone(),
+            "--description-file".to_string(),
+            empty_path.display().to_string(),
+        ],
+        "update_description_from_empty_file",
+    );
+    assert!(
+        clear_to_empty.status.success(),
+        "empty description-file update failed: stdout={} stderr={}",
+        clear_to_empty.stdout,
+        clear_to_empty.stderr
+    );
+    assert!(
+        !clear_to_empty.stdout.contains("No updates specified"),
+        "an empty file is an explicit empty-description update: {}",
+        clear_to_empty.stdout
+    );
+    assert_issue_description(&workspace, &issue_id, "");
+}
+
+#[test]
+fn e2e_update_description_file_conflicts_and_read_failures_do_not_mutate() {
+    let _log =
+        common::test_log("e2e_update_description_file_conflicts_and_read_failures_do_not_mutate");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(
+        &workspace,
+        ["init"],
+        "init_update_description_file_failures",
+    );
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Description file failure target",
+            "--description",
+            "original description",
+        ],
+        "create_update_description_file_failure_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(!issue_id.is_empty(), "missing created id");
+
+    let description_path = workspace.root.join("replacement.md");
+    fs::write(&description_path, "replacement description\n").expect("write replacement file");
+
+    let conflict = run_br(
+        &workspace,
+        vec![
+            "update".to_string(),
+            issue_id.clone(),
+            "--description".to_string(),
+            "inline replacement".to_string(),
+            "--description-file".to_string(),
+            description_path.display().to_string(),
+        ],
+        "update_description_file_conflict",
+    );
+    assert!(
+        !conflict.status.success(),
+        "conflicting description inputs must fail"
+    );
+    assert!(
+        conflict.stderr.contains("cannot be used with"),
+        "expected clap conflict diagnostic: {}",
+        conflict.stderr
+    );
+    assert_issue_description(&workspace, &issue_id, "original description");
+
+    let missing_path = workspace.root.join("missing-description.md");
+    let missing = run_br(
+        &workspace,
+        vec![
+            "update".to_string(),
+            issue_id.clone(),
+            "--description-file".to_string(),
+            missing_path.display().to_string(),
+        ],
+        "update_description_file_missing",
+    );
+    assert!(
+        !missing.status.success(),
+        "an unreadable description file must fail instead of silently no-oping"
+    );
+    assert!(
+        missing.stderr.contains("failed to read description file"),
+        "expected description-file read diagnostic: {}",
+        missing.stderr
+    );
+    assert_issue_description(&workspace, &issue_id, "original description");
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn json_stdout_write_failure_exits_with_io_error() {
     let workspace = BrWorkspace::new();
