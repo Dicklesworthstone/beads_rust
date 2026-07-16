@@ -74,6 +74,25 @@ pub(crate) struct BulkDependencyInsert {
     pub(crate) dep_type: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CapacityTransition<'a> {
+    issue_id: &'a str,
+    from: Option<&'a str>,
+    to: &'a str,
+}
+
+#[derive(Debug)]
+struct CapacityViolationEvidence<'a> {
+    transition: CapacityTransition<'a>,
+    kind: &'a str,
+    name: &'a str,
+    current: u32,
+    prospective: u32,
+    soft_limit: Option<u32>,
+    hard_limit: u32,
+    policy_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedCacheProjectionHealth {
     pub(crate) parity_status: String,
@@ -345,6 +364,12 @@ pub struct SqliteStorage {
     /// committing (e.g. an empty-`updates` no-op). It therefore never leaks into
     /// an unrelated subsequent operation. Capture-only — never used for gating.
     pending_event_attribution: Option<EventAttribution>,
+    /// Repository-level workflow capacity policy loaded by the command/config
+    /// layer.  Direct storage users default to an inactive policy and may opt
+    /// in with [`SqliteStorage::set_workflow_capacity_policy`].  Enforcement
+    /// happens inside the same `BEGIN IMMEDIATE` transaction as the status
+    /// mutation, closing the count-then-transition race from GitHub #384.
+    workflow_capacity_policy: crate::close_policy::CapacityPolicy,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -1056,6 +1081,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
         })
     }
 
@@ -1089,6 +1115,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
         }))
     }
 
@@ -1138,6 +1165,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
+            workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
         })
     }
 
@@ -2048,6 +2076,288 @@ impl SqliteStorage {
         };
     }
 
+    /// Install the already-validated repository workflow-capacity policy used
+    /// by subsequent creates and status changes.
+    pub fn set_workflow_capacity_policy(&mut self, policy: crate::close_policy::CapacityPolicy) {
+        self.workflow_capacity_policy = policy;
+    }
+
+    /// Snapshot the installed policy so a JSONL recovery storage swap can
+    /// preserve admission behavior for the retried mutation.
+    #[must_use]
+    pub(crate) fn workflow_capacity_policy(&self) -> crate::close_policy::CapacityPolicy {
+        self.workflow_capacity_policy.clone()
+    }
+
+    fn count_capacity_statuses_in_tx(
+        conn: &Connection,
+        counts: &mut HashMap<String, u32>,
+        statuses: &[String],
+    ) -> Result<u32> {
+        let mut seen = HashSet::new();
+        let mut total = 0_u32;
+        for status in statuses {
+            let canonical = status.trim().to_lowercase();
+            if canonical.is_empty() || !seen.insert(canonical.clone()) {
+                continue;
+            }
+            let count = if let Some(count) = counts.get(&canonical) {
+                *count
+            } else {
+                let row = conn.query_row_with_params(
+                    "SELECT COUNT(*) FROM issues WHERE status = ?",
+                    &[SqliteValue::from(canonical.as_str())],
+                )?;
+                let raw = row
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or_default();
+                let count = u32::try_from(raw).map_err(|_| {
+                    BeadsError::internal(format!(
+                        "invalid workflow capacity count {raw} for status '{canonical}'"
+                    ))
+                })?;
+                counts.insert(canonical, count);
+                count
+            };
+            total = total
+                .checked_add(count)
+                .ok_or_else(|| BeadsError::internal("workflow capacity count overflowed u32"))?;
+        }
+        Ok(total)
+    }
+
+    fn prospective_capacity_count(
+        current: u32,
+        statuses: &[String],
+        from: Option<&str>,
+        to: &str,
+    ) -> u32 {
+        let contains = |candidate: &str| {
+            statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case(candidate))
+        };
+        let was_counted = from.is_some_and(contains);
+        let will_count = contains(to);
+        match (was_counted, will_count) {
+            (false, true) => current.saturating_add(1),
+            (true, false) => current.saturating_sub(1),
+            _ => current,
+        }
+    }
+
+    fn capacity_group<'a>(
+        policy: &'a crate::close_policy::CapacityPolicy,
+        name: &str,
+    ) -> Option<(&'a str, &'a crate::close_policy::CapacityGroup)> {
+        policy
+            .groups
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(candidate, group)| (candidate.as_str(), group))
+    }
+
+    fn capacity_violation(evidence: CapacityViolationEvidence<'_>) -> BeadsError {
+        let transition = evidence.transition;
+        BeadsError::WorkflowCapacityExceeded {
+            violation: Box::new(crate::close_policy::WorkflowCapacityViolation {
+                issue_id: transition.issue_id.to_string(),
+                from_status: transition.from.map(ToString::to_string),
+                to_status: transition.to.to_string(),
+                capacity_kind: evidence.kind.to_string(),
+                capacity_name: evidence.name.to_string(),
+                scope: "repository".to_string(),
+                counting_mode: "all".to_string(),
+                current: evidence.current,
+                prospective: evidence.prospective,
+                soft_limit: evidence.soft_limit,
+                hard_limit: evidence.hard_limit,
+                policy_path: evidence.policy_path,
+            }),
+        }
+    }
+
+    fn enforce_status_hard_limits(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transition: CapacityTransition<'_>,
+        counts: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        for (status, limit) in &policy.statuses {
+            let Some(hard_limit) = limit.hard else {
+                continue;
+            };
+            let members = [status.clone()];
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
+            let prospective =
+                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
+            if prospective > current && prospective > hard_limit {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition,
+                    kind: "status",
+                    name: status,
+                    current,
+                    prospective,
+                    soft_limit: limit.soft,
+                    hard_limit,
+                    policy_path: format!("workflow.capacity.statuses.{status}"),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_group_hard_limits(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transition: CapacityTransition<'_>,
+        counts: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        for (name, group) in &policy.groups {
+            let Some(hard_limit) = group.hard else {
+                continue;
+            };
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
+            let prospective = Self::prospective_capacity_count(
+                current,
+                &group.statuses,
+                transition.from,
+                transition.to,
+            );
+            if prospective > current && prospective > hard_limit {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition,
+                    kind: "group",
+                    name,
+                    current,
+                    prospective,
+                    soft_limit: group.soft,
+                    hard_limit,
+                    policy_path: format!("workflow.capacity.groups.{name}"),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn admission_transition_matches(
+        rule: &crate::close_policy::CapacityAdmissionRule,
+        transition: CapacityTransition<'_>,
+    ) -> bool {
+        let source_matches = transition.from.is_some_and(|source| {
+            rule.transitions
+                .from
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(source))
+        });
+        source_matches
+            && rule
+                .transitions
+                .to
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(transition.to))
+    }
+
+    fn enforce_admission_statuses(
+        conn: &Connection,
+        rule: &crate::close_policy::CapacityAdmissionRule,
+        transition: CapacityTransition<'_>,
+        counts: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        for (status, threshold) in &rule.require_below.statuses {
+            let members = [status.clone()];
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
+            let prospective =
+                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
+            if prospective >= *threshold && prospective >= current {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition,
+                    kind: "admission_status",
+                    name: status,
+                    current,
+                    prospective,
+                    soft_limit: None,
+                    hard_limit: *threshold,
+                    policy_path: format!(
+                        "workflow.capacity.admission.{}.require_below.statuses.{status}",
+                        rule.name
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_admission_groups(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        rule: &crate::close_policy::CapacityAdmissionRule,
+        transition: CapacityTransition<'_>,
+        counts: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        for (requested_name, threshold) in &rule.require_below.groups {
+            let Some((canonical_name, group)) = Self::capacity_group(policy, requested_name) else {
+                return Err(BeadsError::internal(format!(
+                    "validated workflow capacity group '{requested_name}' disappeared"
+                )));
+            };
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
+            let prospective = Self::prospective_capacity_count(
+                current,
+                &group.statuses,
+                transition.from,
+                transition.to,
+            );
+            if prospective >= *threshold && prospective >= current {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition,
+                    kind: "admission_group",
+                    name: canonical_name,
+                    current,
+                    prospective,
+                    soft_limit: None,
+                    hard_limit: *threshold,
+                    policy_path: format!(
+                        "workflow.capacity.admission.{}.require_below.groups.{canonical_name}",
+                        rule.name
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate every repository-level capacity affected by a status change.
+    ///
+    /// This function must only be called while the caller holds the same
+    /// `BEGIN IMMEDIATE` transaction that will perform the mutation.  Counts
+    /// therefore observe all prior commits and cannot race another writer for
+    /// the last slot.
+    pub(crate) fn enforce_workflow_capacity_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        issue_id: &str,
+        from: Option<&str>,
+        to: &str,
+    ) -> Result<()> {
+        if !policy.is_active() || from.is_some_and(|status| status.eq_ignore_ascii_case(to)) {
+            return Ok(());
+        }
+        let transition = CapacityTransition { issue_id, from, to };
+        let mut counts = HashMap::new();
+        Self::enforce_status_hard_limits(conn, policy, transition, &mut counts)?;
+        Self::enforce_group_hard_limits(conn, policy, transition, &mut counts)?;
+        for rule in &policy.admission {
+            if !Self::admission_transition_matches(rule, transition) {
+                continue;
+            }
+            Self::enforce_admission_statuses(conn, rule, transition, &mut counts)?;
+            Self::enforce_admission_groups(conn, policy, rule, transition, &mut counts)?;
+        }
+        Ok(())
+    }
+
     /// Remove and return any staged Tier 1 attribution without consuming it via
     /// a mutation (issue #312, Layer 3). Used by the JSONL-recovery path to
     /// carry a not-yet-committed staged value across a storage rebuild so the
@@ -2230,6 +2540,7 @@ impl SqliteStorage {
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
         validate_issue_comments_for_create(issue)?;
+        let capacity_policy = self.workflow_capacity_policy.clone();
 
         self.mutate("create_issue", actor, |conn, ctx| {
             // Explicit duplicate check since fsqlite does not enforce
@@ -2264,6 +2575,14 @@ impl SqliteStorage {
                     )));
                 }
             }
+
+            Self::enforce_workflow_capacity_in_tx(
+                conn,
+                &capacity_policy,
+                &issue.id,
+                None,
+                issue.status.as_str(),
+            )?;
 
             let status_str = issue.status.as_str();
             let issue_type_str = issue.issue_type.as_str();
@@ -2568,6 +2887,7 @@ impl SqliteStorage {
                 .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() });
         }
 
+        let capacity_policy = self.workflow_capacity_policy.clone();
         self.mutate("update_issue", actor, |conn, ctx| {
             let mut issue = Self::get_issue_from_conn(conn, id)?.ok_or_else(|| {
                 // Issue #245: if `get_issue` (read path) can find the row but
@@ -2618,6 +2938,16 @@ impl SqliteStorage {
                         ));
                     }
                 }
+            }
+
+            if let Some(status) = &updates.status {
+                Self::enforce_workflow_capacity_in_tx(
+                    conn,
+                    &capacity_policy,
+                    id,
+                    Some(issue.status.as_str()),
+                    status.as_str(),
+                )?;
             }
 
             let mut set_clauses: Vec<String> = vec![];
@@ -13249,6 +13579,272 @@ mod tests {
         }
     }
 
+    fn hard_status_capacity(status: &str, hard: u32) -> crate::close_policy::CapacityPolicy {
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            status.to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(hard),
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn workflow_capacity_create_reaches_hard_limit_then_rolls_back_next_insert() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-cap-create-1",
+                    "first",
+                    Status::InProgress,
+                    1,
+                    None,
+                    now,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let error = storage
+            .create_issue(
+                &make_issue(
+                    "bd-cap-create-2",
+                    "second",
+                    Status::InProgress,
+                    1,
+                    None,
+                    now,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(violation.prospective, 2);
+        assert_eq!(violation.hard_limit, 1);
+        assert!(storage.get_issue("bd-cap-create-2").unwrap().is_none());
+    }
+
+    #[test]
+    fn workflow_capacity_rejected_update_preserves_original_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-cap-active",
+                    "active",
+                    Status::InProgress,
+                    1,
+                    None,
+                    now,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-cap-open", "open", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            title: Some("must roll back".to_string()),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-cap-open", &update, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+        let unchanged = storage.get_issue("bd-cap-open").unwrap().unwrap();
+        assert_eq!(unchanged.status, Status::Open);
+        assert_eq!(unchanged.title, "open");
+    }
+
+    #[test]
+    fn workflow_capacity_allows_transitions_that_drain_an_overfull_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-cap-over-1", "bd-cap-over-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+        let update = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-cap-over-1", &update, "tester")
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-cap-over-1").unwrap().unwrap().status,
+            Status::Closed
+        );
+    }
+
+    #[test]
+    fn workflow_capacity_group_composes_multiple_custom_statuses() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-cap-group-1", Status::InProgress),
+            ("bd-cap-group-2", Status::Custom("in_review".to_string())),
+            ("bd-cap-group-3", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.groups.insert(
+            "active_work".to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: vec!["in_progress".to_string(), "in_review".to_string()],
+                soft: None,
+                hard: Some(2),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+        let update = IssueUpdate {
+            status: Some(Status::Custom("in_review".to_string())),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-cap-group-3", &update, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.capacity_kind, "group");
+        assert_eq!(violation.capacity_name, "active_work");
+        assert_eq!(violation.current, 2);
+        assert_eq!(violation.prospective, 3);
+    }
+
+    #[test]
+    fn workflow_capacity_admission_blocks_fresh_work_but_allows_rework_transition() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-cap-review", Status::Custom("in_review".to_string())),
+            ("bd-cap-fresh", Status::Open),
+            ("bd-cap-rework", Status::Custom("rework".to_string())),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy
+            .admission
+            .push(crate::close_policy::CapacityAdmissionRule {
+                name: "drain_review".to_string(),
+                transitions: crate::close_policy::CapacityTransitionMatcher {
+                    from: vec!["open".to_string()],
+                    to: vec!["in_progress".to_string()],
+                },
+                require_below: crate::close_policy::CapacityRequirements {
+                    statuses: std::iter::once(("in_review".to_string(), 1)).collect(),
+                    groups: BTreeMap::new(),
+                },
+            });
+        storage.set_workflow_capacity_policy(policy);
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-cap-fresh", &update, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.capacity_kind, "admission_status");
+        assert_eq!(violation.capacity_name, "in_review");
+
+        storage
+            .update_issue("bd-cap-rework", &update, "tester")
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-cap-rework").unwrap().unwrap().status,
+            Status::InProgress
+        );
+    }
+
+    #[test]
+    fn workflow_capacity_concurrent_last_slot_has_exactly_one_winner() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("capacity-race.db");
+        let now = Utc::now();
+        {
+            let mut setup = SqliteStorage::open(&db_path).unwrap();
+            for id in ["bd-cap-race-1", "bd-cap-race-2"] {
+                setup
+                    .create_issue(
+                        &make_issue(id, id, Status::Open, 1, None, now, None),
+                        "tester",
+                    )
+                    .unwrap();
+            }
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for id in ["bd-cap-race-1", "bd-cap-race-2"] {
+            let db_path = db_path.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut storage = SqliteStorage::open(&db_path).unwrap();
+                storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+                let update = IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                };
+                barrier.wait();
+                storage.update_issue(id, &update, "tester")
+            }));
+        }
+        let results: Vec<Result<Issue>> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(BeadsError::WorkflowCapacityExceeded { .. })))
+                .count(),
+            1
+        );
+
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        let active = storage
+            .list_issues(&ListFilters::default())
+            .unwrap()
+            .into_iter()
+            .filter(|issue| issue.status == Status::InProgress)
+            .count();
+        assert_eq!(active, 1);
+    }
+
     type ReadyTextFields = (
         String,
         String,
@@ -22791,6 +23387,7 @@ mod tests {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();

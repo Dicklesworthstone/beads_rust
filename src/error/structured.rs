@@ -130,6 +130,8 @@ pub enum ErrorCode {
     // === Policy Errors (exit code 4) ===
     /// Closure-time policy gate fired (issue #274)
     PolicyViolation,
+    /// Atomic workflow capacity/admission guard fired (GitHub #384)
+    WorkflowCapacityExceeded,
 
     // === Internal Errors (exit code 1) ===
     /// Unexpected internal error
@@ -185,6 +187,7 @@ impl ErrorCode {
             Self::NothingToDo => "NOTHING_TO_DO",
             // Policy
             Self::PolicyViolation => "POLICY_VIOLATION",
+            Self::WorkflowCapacityExceeded => "WORKFLOW_CAPACITY_EXCEEDED",
             // Internal
             Self::InternalError => "INTERNAL_ERROR",
         }
@@ -206,6 +209,7 @@ impl ErrorCode {
                 | Self::InvalidPriority
                 | Self::RequiredField
                 | Self::AmbiguousId
+                | Self::WorkflowCapacityExceeded
                 | Self::ShuttingDown
         )
     }
@@ -245,7 +249,8 @@ impl ErrorCode {
             | Self::InvalidType
             | Self::InvalidPriority
             | Self::RequiredField
-            | Self::PolicyViolation => 4,
+            | Self::PolicyViolation
+            | Self::WorkflowCapacityExceeded => 4,
             // Dependency (5)
             Self::CycleDetected
             | Self::DependencyNotFound
@@ -669,6 +674,15 @@ impl StructuredError {
                     "violations": violations,
                 })),
             ),
+            BeadsError::WorkflowCapacityExceeded { violation } => (
+                ErrorCode::WorkflowCapacityExceeded,
+                Some(serde_json::to_value(violation).unwrap_or_else(|_| {
+                    json!({
+                        "issue_id": violation.issue_id,
+                        "capacity_name": violation.capacity_name,
+                    })
+                })),
+            ),
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
             BeadsError::ExternalCommand { command, reason } => (
                 ErrorCode::IoError,
@@ -1086,6 +1100,40 @@ mod tests {
         assert_eq!(json["error"]["code"], "ISSUE_NOT_FOUND");
         assert_eq!(json["error"]["hint"], "Did you mean 'bd-abd'?");
         assert!(!json["error"]["retryable"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn workflow_capacity_error_preserves_machine_readable_evidence() {
+        let err = BeadsError::WorkflowCapacityExceeded {
+            violation: Box::new(crate::close_policy::WorkflowCapacityViolation {
+                issue_id: "bd-next".to_string(),
+                from_status: Some("open".to_string()),
+                to_status: "in_progress".to_string(),
+                capacity_kind: "status".to_string(),
+                capacity_name: "in_progress".to_string(),
+                scope: "repository".to_string(),
+                counting_mode: "all".to_string(),
+                current: 2,
+                prospective: 3,
+                soft_limit: Some(1),
+                hard_limit: 2,
+                policy_path: "workflow.capacity.statuses.in_progress".to_string(),
+            }),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("capacity evidence");
+        assert_eq!(structured.code, ErrorCode::WorkflowCapacityExceeded);
+        assert!(structured.retryable);
+        assert_eq!(structured.code.exit_code(), 4);
+        assert_eq!(context["issue_id"], "bd-next");
+        assert_eq!(context["current"], 2);
+        assert_eq!(context["prospective"], 3);
+        assert_eq!(context["hard_limit"], 2);
+        assert_eq!(
+            context["policy_path"],
+            "workflow.capacity.statuses.in_progress"
+        );
     }
 
     #[test]

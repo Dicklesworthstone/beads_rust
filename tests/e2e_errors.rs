@@ -2019,6 +2019,99 @@ fn e2e_structured_error_not_initialized() {
 }
 
 #[test]
+fn e2e_workflow_capacity_rejection_is_structured_and_atomic() {
+    let _log = common::test_log("e2e_workflow_capacity_rejection_is_structured_and_atomic");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let active = run_br(
+        &workspace,
+        ["create", "Already active"],
+        "capacity_create_active",
+    );
+    assert!(active.status.success(), "create failed: {}", active.stderr);
+    let active_id = parse_created_id(&active.stdout);
+    let activate = run_br(
+        &workspace,
+        ["update", &active_id, "--status", "in_progress"],
+        "capacity_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "initial activation failed: {}",
+        activate.stderr
+    );
+
+    let candidate = run_br(
+        &workspace,
+        ["create", "Candidate"],
+        "capacity_create_candidate",
+    );
+    assert!(
+        candidate.status.success(),
+        "candidate create failed: {}",
+        candidate.stderr
+    );
+    let candidate_id = parse_created_id(&candidate.stdout);
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 1
+",
+    )
+    .expect("write capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        [
+            "update",
+            &candidate_id,
+            "--status",
+            "in_progress",
+            "--title",
+            "must not commit",
+            "--json",
+        ],
+        "capacity_reject",
+    );
+    assert!(!rejected.status.success(), "capacity update must fail");
+    assert_eq!(rejected.status.code(), Some(4));
+    // Global JSON errors use the same clean stdout channel as successful JSON
+    // output (#336); diagnostics remain isolated on stderr.
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    assert!(verify_error_structure(&json));
+    let error = &json["error"];
+    assert_eq!(error["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(error["retryable"], true);
+    assert_eq!(error["context"]["issue_id"], candidate_id);
+    assert_eq!(error["context"]["from_status"], "open");
+    assert_eq!(error["context"]["to_status"], "in_progress");
+    assert_eq!(error["context"]["capacity_kind"], "status");
+    assert_eq!(error["context"]["current"], 1);
+    assert_eq!(error["context"]["prospective"], 2);
+    assert_eq!(error["context"]["hard_limit"], 1);
+
+    let show = run_br(
+        &workspace,
+        ["show", &candidate_id, "--json"],
+        "capacity_show_unchanged",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown: Value =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+    assert_eq!(shown[0]["status"], "open");
+    assert_eq!(shown[0]["title"], "Candidate");
+}
+
+#[test]
 fn e2e_structured_error_issue_not_found() {
     let _log = common::test_log("e2e_structured_error_issue_not_found");
     let workspace = BrWorkspace::new();

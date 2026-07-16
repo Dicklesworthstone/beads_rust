@@ -189,6 +189,13 @@ pub enum BeadsError {
         summary: String,
         violations: Vec<crate::close_policy::PolicyViolation>,
     },
+
+    /// A status transition would exceed an atomically enforced workflow
+    /// capacity or cross-queue admission threshold (GitHub #384).
+    #[error("{violation}")]
+    WorkflowCapacityExceeded {
+        violation: Box<crate::close_policy::WorkflowCapacityViolation>,
+    },
 }
 
 impl BeadsError {
@@ -255,6 +262,7 @@ impl BeadsError {
                 | Self::PrefixMismatch { .. }
                 | Self::AmbiguousId { .. }
                 | Self::PolicyViolation { .. }
+                | Self::WorkflowCapacityExceeded { .. }
         )
     }
 
@@ -292,6 +300,9 @@ impl BeadsError {
             }
             Self::PolicyViolation { .. } => Some(
                 "Fix the violation(s) above, or pass --bypass-policy --bypass-reason \"<text>\" if your project's policy.yaml allows bypass.",
+            ),
+            Self::WorkflowCapacityExceeded { .. } => Some(
+                "Drain the named queue before admitting fresh work; inspect it with `br list --status <status>`.",
             ),
             _ => None,
         }

@@ -2319,13 +2319,15 @@ pub fn open_storage(
         .or_else(|| lock_timeout_from_layer(&merged_layer))
         .or(Some(30000));
 
-    let (storage, _auto_rebuilt, _pending_recovery_backup) = open_sqlite_storage_with_recovery(
+    let (mut storage, _auto_rebuilt, _pending_recovery_backup) = open_sqlite_storage_with_recovery(
         beads_dir,
         &startup.paths,
         resolved_lock_timeout,
         &merged_layer,
         false,
     )?;
+    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
+    storage.set_workflow_capacity_policy(workflow.capacity);
     Ok((storage, startup.paths))
 }
 
@@ -2421,6 +2423,7 @@ impl OpenStorageResult {
         // intact — but recovery swaps in a brand-new `SqliteStorage`, which would
         // otherwise start with an empty pending slot and drop the attribution.
         let preserved_attribution = self.storage.take_pending_event_attribution();
+        let preserved_capacity_policy = self.storage.workflow_capacity_policy();
 
         // Close the old connection before rebuilding at the same path.
         // fsqlite tracks pages by file path, so keeping the old connection
@@ -2438,6 +2441,8 @@ impl OpenStorageResult {
             self.allow_external_jsonl,
         )?;
         self.storage = storage;
+        self.storage
+            .set_workflow_capacity_policy(preserved_capacity_policy);
         if let Some(attribution) = preserved_attribution {
             self.storage.set_pending_event_attribution(attribution);
         }
@@ -2812,6 +2817,9 @@ fn open_storage_with_startup_config_impl(
             )?;
         }
 
+        let workflow = crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow;
+        storage.set_workflow_capacity_policy(workflow.capacity);
+
         Ok(OpenStorageResult {
             storage,
             paths,
@@ -2825,7 +2833,7 @@ fn open_storage_with_startup_config_impl(
             pending_recovery_backup: None,
         })
     } else {
-        let (storage, auto_rebuilt, pending_recovery_backup) = open_sqlite_storage_for_startup(
+        let (mut storage, auto_rebuilt, pending_recovery_backup) = open_sqlite_storage_for_startup(
             &beads_dir,
             &paths,
             resolved_lock_timeout,
@@ -2837,6 +2845,8 @@ fn open_storage_with_startup_config_impl(
                 allow_external_jsonl,
             },
         )?;
+        let workflow = crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow;
+        storage.set_workflow_capacity_policy(workflow.capacity);
         Ok(OpenStorageResult {
             storage,
             paths,

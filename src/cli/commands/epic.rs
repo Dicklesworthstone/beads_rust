@@ -175,35 +175,10 @@ fn execute_close_eligible(
         return Ok(());
     }
 
-    let mut closed_ids = Vec::new();
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     let reason = "All children completed";
-
-    // Use a single transaction for efficiency and atomicity
-    storage.mutate("close_eligible_epics", &actor, |conn, ctx| {
-        for epic_status in &epics {
-            let id = &epic_status.epic.id;
-
-            let rows = conn.execute_with_params(
-                "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
-                &[
-                    SqliteValue::from(now_str.as_str()),
-                    SqliteValue::from(now_str.as_str()),
-                    SqliteValue::from(reason),
-                    SqliteValue::from(id.as_str()),
-                ],
-            )?;
-
-            if rows > 0 {
-                closed_ids.push(id.clone());
-                ctx.record_event(EventType::Closed, id, Some(reason.to_string()));
-                ctx.mark_dirty(id);
-            }
-        }
-        ctx.invalidate_cache();
-        Ok(())
-    })?;
+    let closed_ids = close_eligible_epics_atomically(storage, &epics, &actor, &now_str, reason)?;
 
     storage_ctx.flush_no_db_if_dirty()?;
 
@@ -230,6 +205,51 @@ fn execute_close_eligible(
         }
     }
     Ok(())
+}
+
+fn close_eligible_epics_atomically(
+    storage: &mut SqliteStorage,
+    epics: &[EpicStatus],
+    actor: &str,
+    now: &str,
+    reason: &str,
+) -> Result<Vec<String>> {
+    let capacity_policy = storage.workflow_capacity_policy();
+    let mut closed_ids = Vec::new();
+
+    // The capacity precondition and every close share this transaction. If a
+    // later epic would exceed a limit, earlier updates roll back with it.
+    storage.mutate("close_eligible_epics", actor, |conn, ctx| {
+        for epic_status in epics {
+            let id = &epic_status.epic.id;
+            SqliteStorage::enforce_workflow_capacity_in_tx(
+                conn,
+                &capacity_policy,
+                id,
+                Some(epic_status.epic.status.as_str()),
+                "closed",
+            )?;
+
+            let rows = conn.execute_with_params(
+                "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
+                &[
+                    SqliteValue::from(now),
+                    SqliteValue::from(now),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(id.as_str()),
+                ],
+            )?;
+
+            if rows > 0 {
+                closed_ids.push(id.clone());
+                ctx.record_event(EventType::Closed, id, Some(reason.to_string()));
+                ctx.mark_dirty(id);
+            }
+        }
+        ctx.invalidate_cache();
+        Ok(())
+    })?;
+    Ok(closed_ids)
 }
 
 fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
@@ -655,6 +675,61 @@ mod tests {
         assert_eq!(epic_status.total_children, 0);
         assert_eq!(epic_status.closed_children, 0);
         assert!(!epic_status.eligible_for_close);
+    }
+
+    #[test]
+    fn close_eligible_epics_rolls_back_entire_batch_on_capacity_failure() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for suffix in ["a", "b"] {
+            let epic_id = format!("bd-epic-cap-{suffix}");
+            let child_id = format!("bd-child-cap-{suffix}");
+            storage
+                .create_issue(
+                    &base_issue(&epic_id, "Epic", IssueType::Epic, Status::Open),
+                    "tester",
+                )
+                .unwrap();
+            let mut child = base_issue(&child_id, "Child", IssueType::Task, Status::Closed);
+            child.closed_at = Some(Utc::now());
+            child.close_reason = Some("Done".to_string());
+            storage.create_issue(&child, "tester").unwrap();
+            storage
+                .add_dependency(&child_id, &epic_id, "parent-child", "tester")
+                .unwrap();
+        }
+
+        let epics: Vec<EpicStatus> = load_epic_statuses(&storage)
+            .unwrap()
+            .into_iter()
+            .filter(|epic| epic.eligible_for_close)
+            .collect();
+        assert_eq!(epics.len(), 2);
+
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "closed".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(3),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let error = close_eligible_epics_atomically(
+            &mut storage,
+            &epics,
+            "tester",
+            &Utc::now().to_rfc3339(),
+            "All children completed",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::BeadsError::WorkflowCapacityExceeded { .. }
+        ));
+        for id in ["bd-epic-cap-a", "bd-epic-cap-b"] {
+            assert_eq!(storage.get_issue(id).unwrap().unwrap().status, Status::Open);
+        }
     }
 
     #[test]

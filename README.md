@@ -610,6 +610,42 @@ workflow:
 
 See `docs/CLI_REFERENCE.md` (the `ready` command) for full details.
 
+The same policy file can enforce **atomic repository-level workflow capacity**.
+Hard limits are checked inside the same `BEGIN IMMEDIATE` transaction that
+creates an issue or changes its status, so two concurrent agents cannot both
+claim the final slot:
+
+```yaml
+workflow:
+  statuses: [open, in_progress, in_review, rework, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 3
+    groups:
+      active_work:
+        statuses: [in_progress, in_review, rework]
+        hard: 5
+    admission:
+      - name: drain_review_before_starting
+        transitions:
+          from: [open]
+          to: [in_progress]
+        require_below:
+          statuses:
+            in_review: 2
+```
+
+Individual status and named multi-status group limits allow the configured
+count and reject only transitions that would exceed it. Admission thresholds
+are exclusive (`count < threshold`) and can inspect a different queue before a
+matching transition. Rejected multi-field updates roll back completely;
+transitions that drain an already-overfull queue remain allowed. Capacity is
+disabled when `workflow.capacity` is absent. This first enforcement layer uses
+repository scope and counts all matching issues; hierarchy-aware counts,
+exemptions, additional scopes, soft-limit warnings, and all-or-nothing batch
+preflight are tracked as subsequent phases of GitHub issue #384.
+
 ### Environment Variables
 
 | Variable | Description |

@@ -558,6 +558,53 @@ Semantics:
 - **Scope:** `br ready`, `br ready --json`, `br ready --robot`,
   `br ready --format toon`, and `br scheduler` all use the same ready group.
 
+**Atomic workflow capacity (`.beads/policy.yaml`):**
+
+Repository-level hard limits and transition-scoped admission guards are
+configured under `workflow.capacity`. Every referenced status must be declared
+in `workflow.statuses`; unknown fields, zero thresholds, undeclared references,
+and a soft threshold greater than its hard threshold fail closed while loading
+the policy.
+
+```yaml
+workflow:
+  statuses: [open, in_progress, in_review, rework, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 3
+    groups:
+      active_work:
+        statuses: [in_progress, in_review, rework]
+        hard: 5
+    admission:
+      - name: drain_review_before_starting
+        transitions:
+          from: [open]
+          to: [in_progress]
+        require_below:
+          statuses:
+            in_review: 2
+          groups:
+            active_work: 5
+```
+
+- A hard limit of `N` admits the transition that reaches `N` and rejects a
+  transition that would reach `N + 1`.
+- Named groups count the union of their configured statuses without duplicate
+  members.
+- Admission requirements are exclusive: `in_review: 2` requires the
+  prospective observed count to remain below 2 for matching transitions.
+- Enforcement and mutation share one `BEGIN IMMEDIATE` transaction. Rejections
+  therefore cannot race another writer and roll back every field in the update.
+- Draining an overfull status/group is always allowed. JSONL import remains a
+  state-replication path rather than a new-work admission path.
+- Omitting `workflow.capacity` preserves existing behavior exactly.
+- The initial enforcement layer has fixed `repository` scope and `all`
+  counting. Soft-limit warnings, atomic batch preflight, hierarchy-aware
+  counting, exemptions, and actor/assignee/harness/session/subtree scopes are
+  later phases tracked in GitHub issue #384.
+
 ---
 
 ### scheduler

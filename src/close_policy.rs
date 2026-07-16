@@ -219,6 +219,158 @@ pub struct Workflow {
     /// ```
     #[serde(default)]
     pub status_groups: StatusGroups,
+    /// Atomic status-capacity and cross-queue admission policy (GitHub #384).
+    ///
+    /// Capacity is deliberately independent from `workflow.strict`: projects
+    /// may keep transition enumeration advisory while still enforcing a hard
+    /// repository admission ceiling.  Once any capacity rule is configured,
+    /// however, every referenced status must be declared in
+    /// `workflow.statuses`; [`Workflow::validate_capacity`] rejects ambiguous
+    /// or misspelled names before storage is opened.
+    #[serde(default)]
+    pub capacity: CapacityPolicy,
+}
+
+/// Repository-level workflow capacity policy (GitHub #384, phase 1).
+///
+/// The first phase intentionally implements the race-sensitive core: hard
+/// limits for individual statuses and named groups, plus transition-scoped
+/// admission rules that inspect other queues.  Hierarchy-aware counting,
+/// exemptions, and actor/harness/subtree scopes are represented by later
+/// phases of the tracked epic rather than silently approximated here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityPolicy {
+    /// Per-status soft/hard limits, keyed by a declared workflow status.
+    pub statuses: std::collections::BTreeMap<String, CapacityLimit>,
+    /// Named multi-status capacity pools.
+    pub groups: std::collections::BTreeMap<String, CapacityGroup>,
+    /// Transition-scoped cross-queue admission guards.
+    pub admission: Vec<CapacityAdmissionRule>,
+}
+
+impl CapacityPolicy {
+    /// Whether any capacity behavior is configured.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.statuses.is_empty() || !self.groups.is_empty() || !self.admission.is_empty()
+    }
+}
+
+/// Soft and hard occupancy thresholds for one capacity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityLimit {
+    /// Advisory threshold. Phase 2 exposes successful-transition warnings.
+    pub soft: Option<u32>,
+    /// Enforced threshold. A prospective count equal to this value is allowed;
+    /// a transition that would exceed it is rejected atomically.
+    pub hard: Option<u32>,
+}
+
+/// A named pool spanning multiple workflow statuses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityGroup {
+    /// Declared workflow statuses included in this pool.
+    pub statuses: Vec<String>,
+    /// Advisory threshold.
+    pub soft: Option<u32>,
+    /// Enforced threshold.
+    pub hard: Option<u32>,
+}
+
+impl CapacityGroup {
+    /// View the group's thresholds through the common limit type.
+    #[must_use]
+    pub const fn limit(&self) -> CapacityLimit {
+        CapacityLimit {
+            soft: self.soft,
+            hard: self.hard,
+        }
+    }
+}
+
+/// Source/target matcher for one admission rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityTransitionMatcher {
+    /// Source statuses to which the rule applies.
+    pub from: Vec<String>,
+    /// Target statuses to which the rule applies.
+    pub to: Vec<String>,
+}
+
+/// Queues that must remain below configured thresholds for an admission rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityRequirements {
+    /// Status name -> exclusive upper bound (`count < threshold`).
+    pub statuses: std::collections::BTreeMap<String, u32>,
+    /// Capacity group name -> exclusive upper bound (`count < threshold`).
+    pub groups: std::collections::BTreeMap<String, u32>,
+}
+
+/// A transition-scoped cross-queue admission rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityAdmissionRule {
+    /// Stable operator-facing name used in diagnostics and policy paths.
+    pub name: String,
+    /// Source and target statuses matched by this rule.
+    pub transitions: CapacityTransitionMatcher,
+    /// Every referenced queue must have a prospective count below its bound.
+    pub require_below: CapacityRequirements,
+}
+
+/// Structured evidence for a hard workflow-capacity rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCapacityViolation {
+    pub issue_id: String,
+    pub from_status: Option<String>,
+    pub to_status: String,
+    pub capacity_kind: String,
+    pub capacity_name: String,
+    pub scope: String,
+    pub counting_mode: String,
+    pub current: u32,
+    pub prospective: u32,
+    pub soft_limit: Option<u32>,
+    pub hard_limit: u32,
+    pub policy_path: String,
+}
+
+impl std::fmt::Display for WorkflowCapacityViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let from = self.from_status.as_deref().unwrap_or("<initial>");
+        if self.capacity_kind.starts_with("admission_") {
+            return write!(
+                f,
+                "cannot transition {} from {} to {}: repository admission guard '{}' requires the observed queue to remain below {} (current: {}, prospective: {}; policy: {})",
+                self.issue_id,
+                from,
+                self.to_status,
+                self.capacity_name,
+                self.hard_limit,
+                self.current,
+                self.prospective,
+                self.policy_path,
+            );
+        }
+        write!(
+            f,
+            "cannot transition {} from {} to {}: repository {} capacity '{}' would exceed its hard limit (current: {}, prospective: {}, hard: {}; policy: {})",
+            self.issue_id,
+            from,
+            self.to_status,
+            self.capacity_kind,
+            self.capacity_name,
+            self.current,
+            self.prospective,
+            self.hard_limit,
+            self.policy_path,
+        )
+    }
 }
 
 /// Named status groups under `workflow.status_groups` (issue #354).
@@ -658,6 +810,39 @@ impl Workflow {
         ))
     }
 
+    /// Validate every configured repository-capacity reference and threshold.
+    ///
+    /// Capacity misspellings must fail closed: unlike advisory workflow
+    /// extensions, a silently ignored queue name would make an operator believe
+    /// admission is bounded when it is not.  Validation is case-insensitive in
+    /// the same way as status parsing and transition matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when a referenced status/group is unknown,
+    /// a name/list is empty, thresholds are zero or inverted, or admission rule
+    /// names collide case-insensitively.
+    pub fn validate_capacity(&self) -> Result<()> {
+        if !self.capacity.is_active() {
+            return Ok(());
+        }
+        if self.statuses.is_empty() {
+            return Err(capacity_validation_error(
+                "capacity requires workflow.statuses to declare every status it references",
+            ));
+        }
+
+        let declared_statuses = declared_capacity_statuses(&self.statuses)?;
+        validate_status_capacities(&self.capacity.statuses, &declared_statuses)?;
+        let group_names = validate_capacity_groups(&self.capacity.groups, &declared_statuses)?;
+        validate_capacity_admission_rules(
+            &self.capacity.admission,
+            &declared_statuses,
+            &group_names,
+        )?;
+        Ok(())
+    }
+
     /// True when `status` (case-insensitively) is in the configured set.
     /// Comparison mirrors [`crate::model::Status`] parsing: canonical names
     /// are matched case-insensitively, so a config entry of `In_Progress`
@@ -824,6 +1009,217 @@ impl Workflow {
             }
         }
     }
+}
+
+fn capacity_validation_error(reason: impl Into<String>) -> BeadsError {
+    BeadsError::validation("workflow.capacity", reason)
+}
+
+fn declared_capacity_statuses(statuses: &[String]) -> Result<std::collections::HashSet<String>> {
+    let declared: std::collections::HashSet<String> = statuses
+        .iter()
+        .map(|status| status.trim().to_lowercase())
+        .filter(|status| !status.is_empty())
+        .collect();
+    if declared.len() != statuses.len() {
+        return Err(capacity_validation_error(
+            "workflow.statuses must be non-empty and unique (case-insensitive) when capacity is configured",
+        ));
+    }
+    Ok(declared)
+}
+
+fn validate_status_capacities(
+    capacities: &std::collections::BTreeMap<String, CapacityLimit>,
+    declared_statuses: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for (status, limit) in capacities {
+        validate_capacity_name(status, "status")?;
+        validate_declared_capacity_status(status, declared_statuses)?;
+        if !names.insert(status.trim().to_lowercase()) {
+            return Err(capacity_validation_error(format!(
+                "capacity status '{status}' is duplicated case-insensitively"
+            )));
+        }
+        validate_capacity_limit(limit, &format!("statuses.{status}"), true)?;
+    }
+    Ok(())
+}
+
+fn validate_capacity_groups(
+    groups: &std::collections::BTreeMap<String, CapacityGroup>,
+    declared_statuses: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>> {
+    let mut names = std::collections::HashSet::new();
+    for (name, group) in groups {
+        validate_capacity_name(name, "group")?;
+        if !names.insert(name.trim().to_lowercase()) {
+            return Err(capacity_validation_error(format!(
+                "capacity group name '{name}' is duplicated case-insensitively"
+            )));
+        }
+        if group.statuses.is_empty() {
+            return Err(capacity_validation_error(format!(
+                "capacity group '{name}' must include at least one status"
+            )));
+        }
+        let mut members = std::collections::HashSet::new();
+        for status in &group.statuses {
+            validate_declared_capacity_status(status, declared_statuses)?;
+            if !members.insert(status.trim().to_lowercase()) {
+                return Err(capacity_validation_error(format!(
+                    "capacity group '{name}' repeats status '{status}'"
+                )));
+            }
+        }
+        validate_capacity_limit(&group.limit(), &format!("groups.{name}"), false)?;
+    }
+    Ok(names)
+}
+
+fn validate_capacity_admission_rules(
+    rules: &[CapacityAdmissionRule],
+    declared_statuses: &std::collections::HashSet<String>,
+    group_names: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for rule in rules {
+        validate_capacity_name(&rule.name, "admission rule")?;
+        if !names.insert(rule.name.trim().to_lowercase()) {
+            return Err(capacity_validation_error(format!(
+                "capacity admission rule name '{}' is duplicated case-insensitively",
+                rule.name
+            )));
+        }
+        validate_capacity_admission_rule(rule, declared_statuses, group_names)?;
+    }
+    Ok(())
+}
+
+fn validate_capacity_admission_rule(
+    rule: &CapacityAdmissionRule,
+    declared_statuses: &std::collections::HashSet<String>,
+    group_names: &std::collections::HashSet<String>,
+) -> Result<()> {
+    if rule.transitions.from.is_empty() || rule.transitions.to.is_empty() {
+        return Err(capacity_validation_error(format!(
+            "capacity admission rule '{}' requires non-empty transitions.from and transitions.to lists",
+            rule.name
+        )));
+    }
+    for status in rule
+        .transitions
+        .from
+        .iter()
+        .chain(&rule.transitions.to)
+        .chain(rule.require_below.statuses.keys())
+    {
+        validate_declared_capacity_status(status, declared_statuses)?;
+    }
+    if rule.require_below.statuses.is_empty() && rule.require_below.groups.is_empty() {
+        return Err(capacity_validation_error(format!(
+            "capacity admission rule '{}' must inspect at least one status or group",
+            rule.name
+        )));
+    }
+    validate_capacity_admission_statuses(rule)?;
+    validate_capacity_admission_groups(rule, group_names)
+}
+
+fn validate_capacity_admission_statuses(rule: &CapacityAdmissionRule) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for (status, threshold) in &rule.require_below.statuses {
+        if !names.insert(status.trim().to_lowercase()) {
+            return Err(capacity_validation_error(format!(
+                "capacity admission rule '{}' repeats required status '{status}' case-insensitively",
+                rule.name
+            )));
+        }
+        if *threshold == 0 {
+            return Err(capacity_validation_error(format!(
+                "capacity admission rule '{}' has zero threshold for status '{status}'",
+                rule.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capacity_admission_groups(
+    rule: &CapacityAdmissionRule,
+    group_names: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for (group, threshold) in &rule.require_below.groups {
+        let canonical = group.trim().to_lowercase();
+        if !names.insert(canonical.clone()) {
+            return Err(capacity_validation_error(format!(
+                "capacity admission rule '{}' repeats required group '{group}' case-insensitively",
+                rule.name
+            )));
+        }
+        if !group_names.contains(&canonical) {
+            return Err(capacity_validation_error(format!(
+                "capacity admission rule '{}' references undeclared group '{group}'",
+                rule.name
+            )));
+        }
+        if *threshold == 0 {
+            return Err(capacity_validation_error(format!(
+                "capacity admission rule '{}' has zero threshold for group '{group}'",
+                rule.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capacity_name(name: &str, kind: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(capacity_validation_error(format!(
+            "capacity {kind} name cannot be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_declared_capacity_status(
+    status: &str,
+    declared_statuses: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let canonical = status.trim().to_lowercase();
+    if canonical.is_empty() || !declared_statuses.contains(&canonical) {
+        return Err(capacity_validation_error(format!(
+            "capacity references undeclared workflow status '{status}'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_capacity_limit(
+    limit: &CapacityLimit,
+    path: &str,
+    require_threshold: bool,
+) -> Result<()> {
+    if require_threshold && limit.soft.is_none() && limit.hard.is_none() {
+        return Err(capacity_validation_error(format!(
+            "capacity {path} must configure soft and/or hard"
+        )));
+    }
+    if limit.soft == Some(0) || limit.hard == Some(0) {
+        return Err(capacity_validation_error(format!(
+            "capacity {path} thresholds must be greater than zero"
+        )));
+    }
+    if let (Some(soft), Some(hard)) = (limit.soft, limit.hard)
+        && soft > hard
+    {
+        return Err(capacity_validation_error(format!(
+            "capacity {path} soft limit ({soft}) cannot exceed hard limit ({hard})"
+        )));
+    }
+    Ok(())
 }
 
 /// Typed-references gate (capability #3 of issue #274).
@@ -1483,6 +1879,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     let document: PolicyDocument = serde_yml::from_str(&raw).map_err(|err| {
         BeadsError::Config(format!("failed to parse {}: {}", path.display(), err))
     })?;
+    document.workflow.validate_capacity()?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -1590,6 +1987,11 @@ impl PolicyNode {
                 // typed `GateRule`/`GateSpec` deserialisers).
                 ("gates", Self::Scalar),
                 ("status_groups", Self::StatusGroups),
+                // Capacity owns a strict typed schema with
+                // `deny_unknown_fields`; its nested keys are validated by
+                // serde plus `Workflow::validate_capacity` rather than the
+                // legacy permissive unknown-field walker.
+                ("capacity", Self::Scalar),
             ],
             Self::StatusGroups => &[("ready", Self::Scalar)],
             Self::Scalar => &[],
@@ -2717,6 +3119,121 @@ workflow:
 "#;
         let raw: serde_yml::Value = serde_yml::from_str(yaml).unwrap();
         assert!(detect_unknown_policy_fields(&raw).is_empty());
+    }
+
+    #[test]
+    fn loader_parses_and_validates_repository_capacity_policy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r"
+workflow:
+  statuses: [open, in_progress, in_review, rework, closed]
+  capacity:
+    statuses:
+      in_progress:
+        soft: 2
+        hard: 3
+    groups:
+      active_work:
+        statuses: [in_progress, in_review, rework]
+        hard: 5
+    admission:
+      - name: drain_downstream
+        transitions:
+          from: [open]
+          to: [in_progress]
+        require_below:
+          statuses:
+            in_review: 2
+          groups:
+            active_work: 5
+";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("capacity policy must load");
+        assert!(policy.workflow.capacity.is_active());
+        assert_eq!(
+            policy.workflow.capacity.statuses["in_progress"].hard,
+            Some(3)
+        );
+        assert_eq!(
+            policy.workflow.capacity.groups["active_work"].statuses,
+            vec!["in_progress", "in_review", "rework"]
+        );
+        assert_eq!(
+            policy.workflow.capacity.admission[0].name,
+            "drain_downstream"
+        );
+    }
+
+    #[test]
+    fn capacity_rejects_undeclared_status_and_inverted_thresholds() {
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  statuses:
+    in_review:
+      soft: 4
+      hard: 2
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("undeclared workflow status 'in_review'"),
+            "{error}"
+        );
+
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  statuses:
+    in_progress:
+      soft: 4
+      hard: 2
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(error.to_string().contains("cannot exceed"), "{error}");
+    }
+
+    #[test]
+    fn capacity_rejects_unknown_nested_policy_keys() {
+        let error = serde_yml::from_str::<Workflow>(
+            r"
+statuses: [open, in_progress]
+capacity:
+  statuses:
+    in_progress:
+      herd: 2
+",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn capacity_rejects_case_ambiguous_map_keys() {
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  statuses:
+    in_progress:
+      hard: 1
+    IN_PROGRESS:
+      hard: 2
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(
+            error.to_string().contains("duplicated case-insensitively"),
+            "{error}"
+        );
     }
 
     // =========================================================================
