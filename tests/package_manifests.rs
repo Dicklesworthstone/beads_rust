@@ -267,6 +267,40 @@ fn test_cargo_metadata() {
     );
 }
 
+/// Source-install instructions must use the repository's validated lockfile.
+///
+/// Without `--locked`, `cargo install` resolves a fresh dependency graph that
+/// can require compiler features newer than the deliberately pinned nightly.
+#[test]
+fn test_source_install_documentation_uses_locked_resolution() {
+    for path in [
+        "README.md",
+        "docs/INSTALLING.md",
+        "docs/AGENT_INTEGRATION.md",
+        "docs/CLI_REFERENCE.md",
+        "Cargo.toml",
+        ".github/workflows/release.yml",
+    ] {
+        let content =
+            fs::read_to_string(path).expect("Failed to read source-install documentation");
+        let logical_lines = content.replace("\\\n", " ");
+
+        for (line_index, line) in logical_lines.lines().enumerate() {
+            let is_source_install = line.contains("cargo install --path .")
+                || line.contains(
+                    "cargo install --git https://github.com/Dicklesworthstone/beads_rust.git",
+                );
+            if is_source_install {
+                assert!(
+                    line.contains("--locked"),
+                    "{path}:{} source-install command must include --locked: {line}",
+                    line_index + 1
+                );
+            }
+        }
+    }
+}
+
 /// Test that all package manifests carry a version no newer than Cargo.toml.
 ///
 /// The `update-package-manifests.yml` workflow rewrites every packaging

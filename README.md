@@ -303,14 +303,17 @@ cargo build --release
 ./target/release/br --help
 
 # Or install globally
-cargo install --path .
+cargo install --path . --locked
 ```
 
 ### Cargo Install
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
 ```
+
+`--locked` is required for source installs so Cargo uses the dependency
+versions validated against the repository's pinned nightly toolchain.
 
 > **Note:** `cargo install` places binaries in `~/.cargo/bin/`, while the install script uses `~/.local/bin/`. If you have both in PATH, ensure the desired location has higher priority to avoid running an outdated version. Run `which br` to verify which binary is active.
 
@@ -321,7 +324,7 @@ cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
 cargo build --release --no-default-features
 
 # Or install without it
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --no-default-features
 ```
 
 ### Enable MCP Server Support
@@ -334,7 +337,7 @@ Context Protocol instead of shelling out to CLI commands.
 cargo build --release --features mcp
 
 # Or install globally with MCP support
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --features mcp
 ```
 
 Run it from an initialized beads workspace:

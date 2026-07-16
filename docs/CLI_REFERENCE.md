@@ -1281,7 +1281,7 @@ br serve [OPTIONS]
 
 ```bash
 cargo build --release --features mcp
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --features mcp
 ```
 
 **Options:**

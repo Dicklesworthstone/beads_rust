@@ -171,7 +171,7 @@ self_update = [
 # All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
 # fastmcp-rust 0.3.1+ — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
-# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
+# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`
 # checkouts (issue #250 bug 1).
 #

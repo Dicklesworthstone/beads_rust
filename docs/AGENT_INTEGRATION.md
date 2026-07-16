@@ -651,7 +651,7 @@ RUST_LOG=error ./target/release/br serve --actor codex
 Installed binary:
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --features mcp
 RUST_LOG=error br serve --actor codex
 ```
 
