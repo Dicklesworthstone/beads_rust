@@ -4,7 +4,7 @@ use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, finalize_batched_blocked_cache_refresh,
     preserve_blocked_cache_on_error, report_auto_flush_failure, resolve_issue_id,
-    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issue_with_recovery,
+    resolve_issue_ids, retry_mutation_with_jsonl_recovery, update_issues_atomically_with_recovery,
 };
 use crate::cli::UpdateArgs;
 use crate::config;
@@ -123,6 +123,13 @@ struct UpdateRouteOutput {
     updated_issues: Vec<UpdatedIssueOutput>,
     render_items: Vec<UpdateRenderItem>,
     resolved_ids: Vec<String>,
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateWithCapacityWarnings {
+    updated: Vec<UpdatedIssueOutput>,
+    warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 enum ParentUpdatePlan {
@@ -177,101 +184,151 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
 
-    let (updated_issues, render_items, ordered_resolved_ids) = if routed_batches
-        .iter()
-        .any(|batch| batch.is_external)
-    {
-        let normalized_local_beads_dir =
-            dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
-        let mut prepared_routes = Vec::new();
-        let mut routed_updated_issues = Vec::new();
-        let mut routed_render_items = Vec::new();
-        let mut routed_resolved_ids = Vec::new();
-        for batch in routed_batches {
-            let mut batch_args = args.clone();
-            batch_args.ids.clone_from(&batch.issue_inputs);
+    let (updated_issues, render_items, ordered_resolved_ids, mut capacity_warnings) =
+        if routed_batches.iter().any(|batch| batch.is_external) {
+            let normalized_local_beads_dir =
+                dunce::canonicalize(&beads_dir).unwrap_or_else(|_| beads_dir.clone());
+            let mut prepared_routes = Vec::new();
+            let mut routed_updated_issues = Vec::new();
+            let mut routed_render_items = Vec::new();
+            let mut routed_resolved_ids = Vec::new();
+            let mut routed_capacity_warnings = Vec::new();
+            for batch in routed_batches {
+                let mut batch_args = args.clone();
+                batch_args.ids.clone_from(&batch.issue_inputs);
 
-            let normalized_batch_beads_dir =
-                dunce::canonicalize(&batch.beads_dir).unwrap_or_else(|_| batch.beads_dir.clone());
-            let mut batch_cli = cli.clone();
-            // Routed projects must resolve their own metadata-defined DB path
-            // instead of being forced back to the local override. Preserve the
-            // caller's explicit DB only for the local batch.
-            batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
-                cli.db.clone()
-            } else {
-                None
-            };
-            prepared_routes.push((
-                batch.issue_inputs.clone(),
-                prepare_single_route(&batch_args, &batch_cli, &batch.beads_dir, batch.is_external)?,
-            ));
-        }
-
-        let all_resolved_ids = prepared_routes
-            .iter()
-            .flat_map(|(_, route)| route.resolved_ids.iter().cloned())
-            .collect::<Vec<_>>();
-        validate_multi_issue_external_ref_update(args.external_ref.as_deref(), &all_resolved_ids)?;
-
-        let use_machine_output = update_uses_machine_output(ctx);
-        let use_human_output = update_uses_human_output(ctx);
-
-        for (issue_inputs, prepared_route) in prepared_routes {
-            let route_output = execute_prepared_route(prepared_route, ctx)?;
-
-            if use_machine_output {
-                routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
-            } else if use_human_output {
-                routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+                let normalized_batch_beads_dir = dunce::canonicalize(&batch.beads_dir)
+                    .unwrap_or_else(|_| batch.beads_dir.clone());
+                let mut batch_cli = cli.clone();
+                // Routed projects must resolve their own metadata-defined DB path
+                // instead of being forced back to the local override. Preserve the
+                // caller's explicit DB only for the local batch.
+                batch_cli.db = if normalized_batch_beads_dir == normalized_local_beads_dir {
+                    cli.db.clone()
+                } else {
+                    None
+                };
+                prepared_routes.push((
+                    batch.issue_inputs.clone(),
+                    prepare_single_route(
+                        &batch_args,
+                        &batch_cli,
+                        &batch.beads_dir,
+                        batch.is_external,
+                    )?,
+                ));
             }
-            routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
-        }
 
-        let updated_issues = if use_machine_output {
-            reorder_routed_items_by_requested_inputs(
+            let all_resolved_ids = prepared_routes
+                .iter()
+                .flat_map(|(_, route)| route.resolved_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            validate_multi_issue_external_ref_update(
+                args.external_ref.as_deref(),
+                &all_resolved_ids,
+            )?;
+
+            let use_machine_output = update_uses_machine_output(ctx);
+            let use_human_output = update_uses_human_output(ctx);
+
+            for (issue_inputs, prepared_route) in prepared_routes {
+                let route_output = execute_prepared_route(prepared_route, ctx)?;
+
+                routed_capacity_warnings.extend(route_output.capacity_warnings);
+
+                if use_machine_output {
+                    routed_updated_issues.push((issue_inputs.clone(), route_output.updated_issues));
+                } else if use_human_output {
+                    routed_render_items.push((issue_inputs.clone(), route_output.render_items));
+                }
+                routed_resolved_ids.push((issue_inputs, route_output.resolved_ids));
+            }
+
+            let updated_issues = if use_machine_output {
+                reorder_routed_items_by_requested_inputs(
+                    &target_inputs,
+                    routed_updated_issues,
+                    "update routing",
+                )?
+            } else {
+                Vec::new()
+            };
+            let render_items = if use_human_output {
+                reorder_routed_items_by_requested_inputs(
+                    &target_inputs,
+                    routed_render_items,
+                    "update routing",
+                )?
+            } else {
+                Vec::new()
+            };
+            let ordered_resolved_ids = reorder_routed_items_by_requested_inputs(
                 &target_inputs,
-                routed_updated_issues,
+                routed_resolved_ids,
                 "update routing",
-            )?
+            )?;
+            (
+                updated_issues,
+                render_items,
+                ordered_resolved_ids,
+                routed_capacity_warnings,
+            )
         } else {
-            Vec::new()
+            let route_output =
+                execute_prepared_route(prepare_single_route(args, cli, &beads_dir, false)?, ctx)?;
+            (
+                route_output.updated_issues,
+                route_output.render_items,
+                route_output.resolved_ids,
+                route_output.capacity_warnings,
+            )
         };
-        let render_items = if use_human_output {
-            reorder_routed_items_by_requested_inputs(
-                &target_inputs,
-                routed_render_items,
-                "update routing",
-            )?
-        } else {
-            Vec::new()
-        };
-        let ordered_resolved_ids = reorder_routed_items_by_requested_inputs(
-            &target_inputs,
-            routed_resolved_ids,
-            "update routing",
-        )?;
-        (updated_issues, render_items, ordered_resolved_ids)
-    } else {
-        let route_output =
-            execute_prepared_route(prepare_single_route(args, cli, &beads_dir, false)?, ctx)?;
-        (
-            route_output.updated_issues,
-            route_output.render_items,
-            route_output.resolved_ids,
-        )
-    };
+
+    let request_order = ordered_resolved_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    capacity_warnings.sort_by(|left, right| {
+        request_order
+            .get(left.issue_id.as_str())
+            .unwrap_or(&usize::MAX)
+            .cmp(
+                request_order
+                    .get(right.issue_id.as_str())
+                    .unwrap_or(&usize::MAX),
+            )
+            .then_with(|| left.capacity_kind.cmp(&right.capacity_kind))
+            .then_with(|| left.capacity_name.cmp(&right.capacity_name))
+    });
 
     if let Some(last_id) = ordered_resolved_ids.last() {
         crate::util::set_last_touched_id(&beads_dir, last_id);
     }
 
     if ctx.is_toon() {
-        ctx.toon(&updated_issues);
+        if capacity_warnings.is_empty() {
+            ctx.toon(&updated_issues);
+        } else {
+            ctx.toon(&UpdateWithCapacityWarnings {
+                updated: updated_issues,
+                warnings: capacity_warnings,
+            });
+        }
     } else if ctx.is_json() {
-        ctx.json_pretty(&updated_issues);
+        if capacity_warnings.is_empty() {
+            ctx.json_pretty(&updated_issues);
+        } else {
+            ctx.json_pretty(&UpdateWithCapacityWarnings {
+                updated: updated_issues,
+                warnings: capacity_warnings,
+            });
+        }
     } else if !ctx.is_quiet() {
         print_render_items(&render_items);
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
         // beads_rust#297: emit inherited governing context for any
         // bead that just transitioned into in_progress (via --claim or
         // --status in_progress). Done after the update summary so the
@@ -466,46 +523,59 @@ fn execute_prepared_route(
         || !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
     let parent_changes_cache = !matches!(prepared.resolved_parent, ParentUpdatePlan::Unchanged);
 
+    // Snapshot every row before the atomic field-update transaction. Human
+    // diffs are derived from these validated snapshots, preserving the #256
+    // defense while allowing the whole status batch to commit or roll back as
+    // one unit.
+    let mut issues_before = HashMap::with_capacity(prepared.resolved_ids.len());
     for id in &prepared.resolved_ids {
-        // Get issue before update for change tracking
         let issue_before_result = prepared.storage_ctx.storage.get_issue(id);
         let issue_before = preserve_blocked_cache_on_error(
             &mut prepared.storage_ctx.storage,
-            blocked_cache_dirty,
+            false,
             "update",
             issue_before_result,
         )?;
+        issues_before.insert(id.clone(), issue_before);
+    }
 
-        // Apply basic field updates
-        if !prepared.update.is_empty() {
-            let mut issue_update = prepared.update.clone();
-            issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
-            // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
-            // update / status-change audit events record the self-reported agent
-            // identity. Recorded ONLY — never gates or alters the transition.
-            prepared
-                .storage_ctx
-                .storage
-                .set_pending_event_attribution(prepared.attribution.clone());
-            let update_result = update_issue_with_recovery(
-                &mut prepared.storage_ctx,
-                !route_has_mutated,
-                "update",
-                id,
-                &issue_update,
-                &prepared.actor,
-            );
-            preserve_blocked_cache_on_error(
-                &mut prepared.storage_ctx.storage,
-                blocked_cache_dirty,
-                "update",
-                update_result,
-            )?;
-            if prepared.update.status.is_some() {
-                blocked_cache_dirty = true;
-            }
-            route_has_mutated = true;
+    let mut capacity_warnings = Vec::new();
+    if !prepared.update.is_empty() {
+        let mut issue_update = prepared.update.clone();
+        issue_update.skip_cache_rebuild = defer_blocked_cache_rebuild;
+        let atomic_updates = prepared
+            .resolved_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, issue_update.clone()))
+            .collect::<Vec<_>>();
+
+        prepared
+            .storage_ctx
+            .storage
+            .set_pending_event_attribution(prepared.attribution.clone());
+        let update_result = update_issues_atomically_with_recovery(
+            &mut prepared.storage_ctx,
+            true,
+            "update",
+            &atomic_updates,
+            &prepared.actor,
+        );
+        preserve_blocked_cache_on_error(
+            &mut prepared.storage_ctx.storage,
+            false,
+            "update",
+            update_result,
+        )?;
+        capacity_warnings = prepared.storage_ctx.storage.take_capacity_warnings();
+        if prepared.update.status.is_some() {
+            blocked_cache_dirty = true;
         }
+        route_has_mutated = true;
+    }
+
+    for id in &prepared.resolved_ids {
+        let issue_before = issues_before.remove(id).flatten();
 
         // Apply labels
         for label in &prepared.add_labels {
@@ -649,6 +719,7 @@ fn execute_prepared_route(
         updated_issues,
         render_items,
         resolved_ids,
+        capacity_warnings,
     })
 }
 
@@ -753,6 +824,7 @@ fn execute_bulk_label_only_route(
         updated_issues,
         render_items,
         resolved_ids,
+        capacity_warnings: Vec::new(),
     })
 }
 

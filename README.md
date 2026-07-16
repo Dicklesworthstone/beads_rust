@@ -641,10 +641,24 @@ count and reject only transitions that would exceed it. Admission thresholds
 are exclusive (`count < threshold`) and can inspect a different queue before a
 matching transition. Rejected multi-field updates roll back completely;
 transitions that drain an already-overfull queue remain allowed. Capacity is
-disabled when `workflow.capacity` is absent. This first enforcement layer uses
-repository scope and counts all matching issues; hierarchy-aware counts,
-exemptions, additional scopes, soft-limit warnings, and all-or-nothing batch
-preflight are tracked as subsequent phases of GitHub issue #384.
+disabled when `workflow.capacity` is absent.
+
+Soft thresholds admit the transition but emit actionable evidence. Human output
+prints a warning; JSON and TOON preserve their legacy shape when no warning is
+present and otherwise return the successful result together with a structured
+`warnings` array. Multi-target `update`/`--claim`, `close`, `reopen`, `defer`,
+and `undefer` operations preflight the final prospective state and commit every
+status mutation for one repository in a single transaction. A capacity-neutral
+swap therefore succeeds regardless of request order, while any hard-limit or
+validation failure rolls back the complete repository-local batch. Each route
+in a multi-repository command is an independent SQLite transaction, so an
+earlier repository may already be committed if a later route fails; br does not
+claim distributed atomicity across repositories.
+
+The current enforcement layer uses repository scope and counts all matching
+issues. Hierarchy-aware counts, audited exemptions, additional actor/harness/
+session/subtree scopes, and capacity observability remain subsequent phases of
+GitHub issue #384.
 
 ### Environment Variables
 

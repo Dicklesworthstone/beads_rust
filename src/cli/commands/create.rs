@@ -11,6 +11,7 @@ use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -107,6 +108,12 @@ enum ImportReferenceResolution {
     Ambiguous(Vec<String>),
 }
 
+#[derive(Serialize)]
+struct CreateWithCapacityWarnings<'a, T> {
+    created: &'a T,
+    warnings: &'a [crate::close_policy::WorkflowCapacityWarning],
+}
+
 /// Execute the create command.
 ///
 /// # Errors
@@ -177,6 +184,7 @@ pub fn execute_with_storage(
         retry_mutation_with_jsonl_recovery(&mut storage_ctx, true, "create", None, |storage| {
             create_issue_impl(storage, args, &config, description.clone())
         })?;
+    let capacity_warnings = storage_ctx.storage.take_capacity_warnings();
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;
@@ -201,7 +209,7 @@ pub fn execute_with_storage(
                 .ok_or_else(|| BeadsError::IssueNotFound {
                     id: issue.id.clone(),
                 })?;
-            ctx.toon(&full_issue);
+            emit_created_with_capacity_warnings(&full_issue, &capacity_warnings, ctx);
         }
     } else if ctx.is_json() {
         if args.dry_run {
@@ -213,7 +221,7 @@ pub fn execute_with_storage(
                 .ok_or_else(|| BeadsError::IssueNotFound {
                     id: issue.id.clone(),
                 })?;
-            ctx.json_pretty(&full_issue);
+            emit_created_with_capacity_warnings(&full_issue, &capacity_warnings, ctx);
         }
     } else if args.dry_run {
         ctx.info(&format!(
@@ -249,6 +257,11 @@ pub fn execute_with_storage(
             create_display_text(&issue.id),
             sanitize_terminal_inline(&issue.title)
         ));
+    }
+    if !ctx.is_json() && !ctx.is_toon() {
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
@@ -304,6 +317,27 @@ fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &Ou
 
 fn create_display_text(value: &str) -> String {
     sanitize_terminal_inline(value).into_owned()
+}
+
+fn emit_created_with_capacity_warnings<T: Serialize>(
+    created: &T,
+    warnings: &[crate::close_policy::WorkflowCapacityWarning],
+    ctx: &OutputContext,
+) {
+    if warnings.is_empty() {
+        if ctx.is_toon() {
+            ctx.toon(created);
+        } else {
+            ctx.json_pretty(created);
+        }
+    } else {
+        let payload = CreateWithCapacityWarnings { created, warnings };
+        if ctx.is_toon() {
+            ctx.toon(&payload);
+        } else {
+            ctx.json_pretty(&payload);
+        }
+    }
 }
 
 fn create_display_list<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
@@ -857,6 +891,7 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
+    let mut capacity_warnings = Vec::new();
 
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
@@ -1097,6 +1132,7 @@ fn execute_import(
             ));
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {
+                    capacity_warnings.extend(storage.take_capacity_warnings());
                     final_id = id;
                     created = true;
                     break;
@@ -1391,10 +1427,8 @@ fn execute_import(
         for (id, _) in created_ids {
             println!("{id}");
         }
-    } else if ctx.is_toon() {
-        ctx.toon(&created_issues);
-    } else if ctx.is_json() {
-        ctx.json_pretty(&created_issues);
+    } else if ctx.is_toon() || ctx.is_json() {
+        emit_created_with_capacity_warnings(&created_issues, &capacity_warnings, ctx);
     } else if !created_ids.is_empty() {
         if args.dry_run {
             ctx.info(&format!(
@@ -1411,6 +1445,11 @@ fn execute_import(
         }
         for (id, title) in created_ids {
             ctx.print_line(&create_issue_summary_line(&id, &title));
+        }
+    }
+    if !ctx.is_json() && !ctx.is_toon() {
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
     }
     auto_flush_after_create(&mut storage_ctx, ctx);

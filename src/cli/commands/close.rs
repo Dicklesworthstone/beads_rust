@@ -4,7 +4,7 @@ use crate::cli::CloseArgs as CliCloseArgs;
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-    report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
+    report_auto_flush_failure, resolve_issue_ids, update_issues_atomically_with_recovery,
 };
 use crate::close_policy::{
     self, AttributionTier, AttributionValues, CloseEvidence, ClosePolicy, PolicyDocument,
@@ -15,7 +15,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
-use crate::storage::{IssueUpdate, SqliteStorage};
+use crate::storage::{EventAttribution, IssueUpdate, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -255,6 +255,8 @@ pub struct CloseResult {
     pub closed: Vec<ClosedIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub skipped: Vec<SkippedIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 /// Result of closing with suggest-next.
@@ -264,6 +266,8 @@ pub struct CloseWithSuggestResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub skipped: Vec<SkippedIssue>,
     pub unblocked: Vec<UnblockedIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 /// An issue that became unblocked after closing.
@@ -297,6 +301,7 @@ struct CloseExecution {
     skipped: Vec<SkippedIssue>,
     unblocked: Vec<UnblockedIssue>,
     ordered_outcomes: Vec<CloseOutcome>,
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +315,7 @@ fn build_close_json_payload(
     closed_issues: Vec<ClosedIssue>,
     skipped_issues: Vec<SkippedIssue>,
     unblocked_issues: Vec<UnblockedIssue>,
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 ) -> Result<String> {
     let json = if args.suggest_next {
         // suggest_next is br-only, so always use the wrapped machine format.
@@ -317,9 +323,10 @@ fn build_close_json_payload(
             closed: closed_issues,
             skipped: skipped_issues,
             unblocked: unblocked_issues,
+            warnings: capacity_warnings,
         };
         serde_json::to_string_pretty(&result)?
-    } else if skipped_issues.is_empty() {
+    } else if skipped_issues.is_empty() && capacity_warnings.is_empty() {
         // Preserve bd-compatible array output for pure-success closes.
         serde_json::to_string_pretty(&closed_issues)?
     } else {
@@ -327,6 +334,7 @@ fn build_close_json_payload(
         let result = CloseResult {
             closed: closed_issues,
             skipped: skipped_issues,
+            warnings: capacity_warnings,
         };
         serde_json::to_string_pretty(&result)?
     };
@@ -339,8 +347,15 @@ fn render_close_json(
     closed_issues: Vec<ClosedIssue>,
     skipped_issues: Vec<SkippedIssue>,
     unblocked_issues: Vec<UnblockedIssue>,
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 ) -> Result<()> {
-    let json = build_close_json_payload(args, closed_issues, skipped_issues, unblocked_issues)?;
+    let json = build_close_json_payload(
+        args,
+        closed_issues,
+        skipped_issues,
+        unblocked_issues,
+        capacity_warnings,
+    )?;
     println!("{json}");
     Ok(())
 }
@@ -350,6 +365,7 @@ fn emit_close_structured_output(
     closed_issues: Vec<ClosedIssue>,
     skipped_issues: Vec<SkippedIssue>,
     unblocked_issues: Vec<UnblockedIssue>,
+    capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.suggest_next {
@@ -357,6 +373,7 @@ fn emit_close_structured_output(
             closed: closed_issues,
             skipped: skipped_issues,
             unblocked: unblocked_issues,
+            warnings: capacity_warnings,
         };
         if ctx.is_toon() {
             ctx.toon(&result);
@@ -369,13 +386,19 @@ fn emit_close_structured_output(
         return Ok(());
     }
 
-    if skipped_issues.is_empty() {
+    if skipped_issues.is_empty() && capacity_warnings.is_empty() {
         if ctx.is_toon() {
             ctx.toon(&closed_issues);
         } else if ctx.is_json() {
             ctx.json_pretty(&closed_issues);
         } else {
-            render_close_json(args, closed_issues, skipped_issues, unblocked_issues)?;
+            render_close_json(
+                args,
+                closed_issues,
+                skipped_issues,
+                unblocked_issues,
+                capacity_warnings,
+            )?;
         }
         return Ok(());
     }
@@ -383,6 +406,7 @@ fn emit_close_structured_output(
     let result = CloseResult {
         closed: closed_issues,
         skipped: skipped_issues,
+        warnings: capacity_warnings,
     };
     if ctx.is_toon() {
         ctx.toon(&result);
@@ -582,6 +606,7 @@ pub fn execute_with_args(
     let mut closed_issues = Vec::new();
     let mut skipped_issues = Vec::new();
     let mut unblocked_issues = Vec::new();
+    let mut capacity_warnings = Vec::new();
 
     if routed_batches.iter().any(|batch| batch.is_external) {
         let normalized_local_beads_dir =
@@ -611,10 +636,12 @@ pub fn execute_with_args(
             let CloseExecution {
                 unblocked,
                 ordered_outcomes,
+                capacity_warnings: route_warnings,
                 ..
             } = execution;
             routed_outcomes.push((batch.issue_inputs, ordered_outcomes));
             unblocked_issues.extend(unblocked);
+            capacity_warnings.extend(route_warnings);
         }
 
         let ordered_outcomes = reorder_routed_items_by_requested_inputs(
@@ -635,6 +662,7 @@ pub fn execute_with_args(
         closed_issues = execution.closed;
         skipped_issues = execution.skipped;
         unblocked_issues = execution.unblocked;
+        capacity_warnings = execution.capacity_warnings;
     }
 
     let closed_count = closed_issues.len();
@@ -652,7 +680,14 @@ pub fn execute_with_args(
     }
 
     if use_structured_output {
-        emit_close_structured_output(args, closed_issues, skipped_issues, unblocked_issues, ctx)?;
+        emit_close_structured_output(
+            args,
+            closed_issues,
+            skipped_issues,
+            unblocked_issues,
+            capacity_warnings,
+            ctx,
+        )?;
     } else if closed_issues.is_empty() && skipped_issues.is_empty() {
         ctx.info("No issues to close.");
     } else {
@@ -661,6 +696,9 @@ pub fn execute_with_args(
         }
         for skipped in &skipped_issues {
             ctx.warning(&skipped_human_message(skipped));
+        }
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
         if !unblocked_issues.is_empty() {
             ctx.newline();
@@ -760,8 +798,12 @@ fn execute_route(
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
+    let mut capacity_warnings = Vec::new();
 
-    for id in &resolved_ids {
+    let mut atomic_updates = Vec::new();
+    let mut planned_closes = Vec::new();
+    for (outcome_index, id) in resolved_ids.iter().enumerate() {
+        ordered_outcomes.push(None);
         tracing::info!(id = %id, "Closing issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);
@@ -776,7 +818,7 @@ fn execute_route(
                 id: id.clone(),
                 reason: "issue not found".to_string(),
             };
-            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(CloseOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         };
@@ -786,7 +828,7 @@ fn execute_route(
                 id: id.clone(),
                 reason: format!("already {}", issue.status.as_str()),
             };
-            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(CloseOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -808,7 +850,7 @@ fn execute_route(
                     total
                 ),
             };
-            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(CloseOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -849,7 +891,7 @@ fn execute_route(
                         suffix
                     ),
                 };
-                ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+                ordered_outcomes[outcome_index] = Some(CloseOutcome::Skipped(skipped.clone()));
                 skipped_issues.push(skipped);
                 continue;
             }
@@ -927,7 +969,7 @@ fn execute_route(
         }
     }
 
-    for id in &resolved_ids {
+    for (outcome_index, id) in resolved_ids.iter().enumerate() {
         let Some(issue) = open_issues.get(id) else {
             continue;
         };
@@ -961,7 +1003,7 @@ fn execute_route(
                 id: id.clone(),
                 reason,
             };
-            ordered_outcomes.push(CloseOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(CloseOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -990,21 +1032,38 @@ fn execute_route(
             ..Default::default()
         };
 
-        let update_result = update_issue_with_recovery(
+        atomic_updates.push((id.clone(), update));
+        planned_closes.push((
+            outcome_index,
+            id.clone(),
+            issue.clone(),
+            gates_fired,
+            now,
+            close_reason,
+        ));
+    }
+
+    if !atomic_updates.is_empty() {
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(EventAttribution::new(
+                attribution.agent_name.as_deref(),
+                attribution.harness.as_deref(),
+                attribution.model.as_deref(),
+            ));
+        let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,
-            !cache_dirty,
+            true,
             "close",
-            id,
-            &update,
+            &atomic_updates,
             &actor,
         );
-        preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "close",
-            update_result,
-        )?;
+        preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "close", update_result)?;
+        capacity_warnings = storage_ctx.storage.take_capacity_warnings();
         cache_dirty = true;
+    }
+
+    for (outcome_index, id, issue, gates_fired, now, close_reason) in planned_closes {
         tracing::info!(id = %id, reason = ?args.reason, "Issue closed");
 
         if policy_active {
@@ -1019,7 +1078,7 @@ fn execute_route(
                 None
             };
             let metadata_result = storage_ctx.storage.record_close_metadata(
-                id,
+                &id,
                 &attribution,
                 args.bypass_policy && !gates_fired.is_empty(),
                 bypass_reason,
@@ -1041,9 +1100,16 @@ fn execute_route(
             closed_at: now.to_rfc3339(),
             close_reason: Some(close_reason),
         };
-        ordered_outcomes.push(CloseOutcome::Closed(closed.clone()));
+        ordered_outcomes[outcome_index] = Some(CloseOutcome::Closed(closed.clone()));
         closed_issues.push(closed);
     }
+
+    let ordered_outcomes = ordered_outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| BeadsError::internal("close batch outcome was not populated"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if cache_dirty {
         tracing::info!(
@@ -1083,6 +1149,7 @@ fn execute_route(
                 skipped: skipped_issues,
                 unblocked: Vec::new(),
                 ordered_outcomes,
+                capacity_warnings,
             });
         };
 
@@ -1139,6 +1206,7 @@ fn execute_route(
         skipped: skipped_issues,
         unblocked: unblocked_issues,
         ordered_outcomes,
+        capacity_warnings,
     })
 }
 
@@ -1254,6 +1322,7 @@ mod tests {
                 close_reason: None,
             }],
             skipped: vec![],
+            warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
         // Empty skipped should be omitted due to skip_serializing_if
@@ -1269,6 +1338,7 @@ mod tests {
                 id: "bd-456".to_string(),
                 reason: "already closed".to_string(),
             }],
+            warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"skipped\""));
@@ -1298,6 +1368,7 @@ mod tests {
                 id: "bd-c".to_string(),
                 reason: "blocked by: bd-d".to_string(),
             }],
+            warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: CloseResult = serde_json::from_str(&json).unwrap();
@@ -1335,6 +1406,7 @@ mod tests {
                     priority: 2,
                 },
             ],
+            warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"unblocked\""));
@@ -1355,6 +1427,7 @@ mod tests {
                 reason: "not found".to_string(),
             }],
             unblocked: vec![],
+            warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
         // unblocked is not marked skip_serializing_if, so it should appear as empty array
@@ -1581,6 +1654,7 @@ mod tests {
                     reason: "already tombstone".to_string(),
                 },
             ],
+            warnings: vec![],
         };
         let json = serde_json::to_string_pretty(&result).unwrap();
         let parsed: CloseResult = serde_json::from_str(&json).unwrap();
@@ -1599,6 +1673,7 @@ mod tests {
                 closed_at: "2026-01-01T00:00:00Z".to_string(),
                 close_reason: Some("done".to_string()),
             }],
+            vec![],
             vec![],
             vec![],
         )
@@ -1622,6 +1697,7 @@ mod tests {
                 id: "bd-2".to_string(),
                 reason: "blocked by: bd-3".to_string(),
             }],
+            vec![],
             vec![],
         )
         .unwrap();
@@ -1716,6 +1792,57 @@ mod tests {
 
         assert_eq!(blocker.status, Status::Closed);
         assert_eq!(blocked_issue.status, Status::Closed);
+    }
+
+    #[test]
+    fn execute_route_preserves_request_order_for_mixed_close_outcomes() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-close-first", "First"), "tester")
+            .expect("create first");
+        let mut skipped = make_issue_with_status("bd-close-skip", "Skip", Status::Closed);
+        skipped.closed_at = Some(Utc::now());
+        storage
+            .create_issue(&skipped, "tester")
+            .expect("create skipped");
+        storage
+            .create_issue(&make_issue("bd-close-last", "Last"), "tester")
+            .expect("create last");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec![
+                "bd-close-first".to_string(),
+                "bd-close-skip".to_string(),
+                "bd-close-last".to_string(),
+            ],
+            ..CloseArgs::default()
+        };
+        let execution = execute_route(&args, &CliOverrides::default(), &ctx, &beads_dir, false)
+            .expect("mixed close batch");
+
+        assert!(matches!(
+            &execution.ordered_outcomes[0],
+            CloseOutcome::Closed(issue) if issue.id == "bd-close-first"
+        ));
+        assert!(matches!(
+            &execution.ordered_outcomes[1],
+            CloseOutcome::Skipped(issue) if issue.id == "bd-close-skip"
+        ));
+        assert!(matches!(
+            &execution.ordered_outcomes[2],
+            CloseOutcome::Closed(issue) if issue.id == "bd-close-last"
+        ));
     }
 
     #[test]

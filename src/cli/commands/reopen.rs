@@ -5,7 +5,7 @@ use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
     report_auto_flush_failure, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
-    update_issue_with_recovery,
+    update_issues_atomically_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -42,6 +42,8 @@ pub struct ReopenResult {
     pub reopened: Vec<ReopenedIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
     #[serde(skip)]
     ordered_outcomes: Vec<ReopenOutcome>,
 }
@@ -84,6 +86,7 @@ pub fn execute(
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
     let mut reopened_issues = Vec::new();
     let mut skipped_issues = Vec::new();
+    let mut capacity_warnings = Vec::new();
 
     if routed_batches.iter().any(|batch| batch.is_external) {
         let normalized_local_beads_dir =
@@ -111,6 +114,7 @@ pub fn execute(
                 batch.is_external,
             )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
+            capacity_warnings.extend(result.warnings);
         }
 
         let ordered_outcomes = reorder_routed_items_by_requested_inputs(
@@ -130,6 +134,7 @@ pub fn execute(
         let result = execute_route(&local_args, cli, ctx, &beads_dir, false)?;
         reopened_issues = result.reopened;
         skipped_issues = result.skipped;
+        capacity_warnings = result.warnings;
     }
 
     if let Some(last_reopened) = reopened_issues.last() {
@@ -140,6 +145,7 @@ pub fn execute(
         let result = ReopenResult {
             reopened: reopened_issues,
             skipped: skipped_issues,
+            warnings: capacity_warnings,
             ordered_outcomes: Vec::new(),
         };
         if ctx.is_toon() {
@@ -157,6 +163,9 @@ pub fn execute(
             args.reason.as_deref(),
             ctx,
         );
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     } else {
         for reopened in &reopened_issues {
             let id = reopen_issue_id_text(&reopened.id);
@@ -181,6 +190,9 @@ pub fn execute(
         }
         if reopened_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to reopen.");
+        }
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
     }
     Ok(())
@@ -209,8 +221,12 @@ fn execute_route(
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
+    let mut atomic_updates = Vec::new();
+    let mut planned_reopens = Vec::new();
 
     for id in &resolved_ids {
+        let outcome_index = ordered_outcomes.len();
+        ordered_outcomes.push(None);
         tracing::info!(id = %id, "Reopening issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);
@@ -225,7 +241,7 @@ fn execute_route(
                 id: id.clone(),
                 reason: "issue not found".to_string(),
             };
-            ordered_outcomes.push(ReopenOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(ReopenOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         };
@@ -236,7 +252,7 @@ fn execute_route(
                 id: id.clone(),
                 reason: "cannot reopen tombstone issue".to_string(),
             };
-            ordered_outcomes.push(ReopenOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(ReopenOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -247,7 +263,7 @@ fn execute_route(
                 id: id.clone(),
                 reason: format!("already {}", issue.status.as_str()),
             };
-            ordered_outcomes.push(ReopenOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(ReopenOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -267,8 +283,12 @@ fn execute_route(
             ..Default::default()
         };
 
-        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for the
-        // reopen status-change audit event. Recorded only — never gated.
+        atomic_updates.push((id.clone(), update));
+        planned_reopens.push((outcome_index, id.clone(), issue));
+    }
+
+    let mut capacity_warnings = Vec::new();
+    if !atomic_updates.is_empty() {
         storage_ctx
             .storage
             .set_pending_event_attribution(crate::storage::EventAttribution::new(
@@ -276,21 +296,19 @@ fn execute_route(
                 args.harness.as_deref(),
                 args.model.as_deref(),
             ));
-        let update_result = update_issue_with_recovery(
+        let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,
-            !cache_dirty,
+            true,
             "reopen",
-            id,
-            &update,
+            &atomic_updates,
             &actor,
         );
-        preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "reopen",
-            update_result,
-        )?;
+        preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "reopen", update_result)?;
+        capacity_warnings = storage_ctx.storage.take_capacity_warnings();
         cache_dirty = true;
+    }
+
+    for (outcome_index, id, issue) in planned_reopens {
         tracing::info!(id = %id, reason = ?args.reason, "Issue reopened");
 
         if let Some(ref reason) = args.reason {
@@ -301,7 +319,7 @@ fn execute_route(
                 !cache_dirty,
                 "reopen comment",
                 Some(id.as_str()),
-                |storage| storage.add_comment(id, &actor, &comment_text),
+                |storage| storage.add_comment(&id, &actor, &comment_text),
             );
             preserve_blocked_cache_on_error(
                 &mut storage_ctx.storage,
@@ -317,9 +335,16 @@ fn execute_route(
             status: "open".to_string(),
             closed_at: None,
         };
-        ordered_outcomes.push(ReopenOutcome::Reopened(reopened.clone()));
+        ordered_outcomes[outcome_index] = Some(ReopenOutcome::Reopened(reopened.clone()));
         reopened_issues.push(reopened);
     }
+
+    let ordered_outcomes = ordered_outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| BeadsError::internal("reopen batch outcome was not populated"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if cache_dirty {
         tracing::info!(
@@ -342,6 +367,7 @@ fn execute_route(
     Ok(ReopenResult {
         reopened: reopened_issues,
         skipped: skipped_issues,
+        warnings: capacity_warnings,
         ordered_outcomes,
     })
 }

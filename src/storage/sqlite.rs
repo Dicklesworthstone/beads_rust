@@ -93,6 +93,25 @@ struct CapacityViolationEvidence<'a> {
     policy_path: String,
 }
 
+#[derive(Debug)]
+struct CapacityWarningEvidence<'a> {
+    transition: CapacityTransition<'a>,
+    kind: &'a str,
+    name: &'a str,
+    current: u32,
+    prospective: u32,
+    soft_limit: u32,
+    hard_limit: Option<u32>,
+    policy_path: String,
+}
+
+#[derive(Debug, Clone)]
+struct CapacityBatchTransition {
+    issue_id: String,
+    from: Option<String>,
+    to: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockedCacheProjectionHealth {
     pub(crate) parity_status: String,
@@ -370,6 +389,11 @@ pub struct SqliteStorage {
     /// happens inside the same `BEGIN IMMEDIATE` transaction as the status
     /// mutation, closing the count-then-transition race from GitHub #384.
     workflow_capacity_policy: crate::close_policy::CapacityPolicy,
+    /// Advisory capacity evidence produced by the most recently committed
+    /// mutation. Cleared at the start of every mutation and consumed by the
+    /// command layer immediately after success, so warnings cannot leak into
+    /// an unrelated command.
+    last_capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -428,6 +452,7 @@ pub struct MutationContext {
     /// batch; direct reads compute blocked state in-memory if the marker remains.
     pub defer_cache_refresh: bool,
     pub force_flush: bool,
+    pub capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -647,6 +672,7 @@ impl MutationContext {
             cache_affected_ids: None,
             defer_cache_refresh: false,
             force_flush: false,
+            capacity_warnings: Vec::new(),
         }
     }
 
@@ -1082,6 +1108,7 @@ impl SqliteStorage {
             temp_db_path: None,
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            last_capacity_warnings: Vec::new(),
         })
     }
 
@@ -1116,6 +1143,7 @@ impl SqliteStorage {
             temp_db_path: None,
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            last_capacity_warnings: Vec::new(),
         }))
     }
 
@@ -1166,6 +1194,7 @@ impl SqliteStorage {
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            last_capacity_warnings: Vec::new(),
         })
     }
 
@@ -2089,6 +2118,13 @@ impl SqliteStorage {
         self.workflow_capacity_policy.clone()
     }
 
+    /// Consume advisory capacity evidence from the most recently committed
+    /// mutation. The vector follows deterministic policy order and is empty
+    /// when no soft threshold was reached.
+    pub fn take_capacity_warnings(&mut self) -> Vec<crate::close_policy::WorkflowCapacityWarning> {
+        std::mem::take(&mut self.last_capacity_warnings)
+    }
+
     fn count_capacity_statuses_in_tx(
         conn: &Connection,
         counts: &mut HashMap<String, u32>,
@@ -2176,6 +2212,81 @@ impl SqliteStorage {
                 policy_path: evidence.policy_path,
             }),
         }
+    }
+
+    fn capacity_warning(
+        evidence: CapacityWarningEvidence<'_>,
+    ) -> crate::close_policy::WorkflowCapacityWarning {
+        let transition = evidence.transition;
+        crate::close_policy::WorkflowCapacityWarning {
+            issue_id: transition.issue_id.to_string(),
+            from_status: transition.from.map(ToString::to_string),
+            to_status: transition.to.to_string(),
+            capacity_kind: evidence.kind.to_string(),
+            capacity_name: evidence.name.to_string(),
+            scope: "repository".to_string(),
+            counting_mode: "all".to_string(),
+            current: evidence.current,
+            prospective: evidence.prospective,
+            soft_limit: evidence.soft_limit,
+            hard_limit: evidence.hard_limit,
+            policy_path: evidence.policy_path,
+        }
+    }
+
+    fn collect_capacity_soft_warnings(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transition: CapacityTransition<'_>,
+        counts: &mut HashMap<String, u32>,
+    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
+        let mut warnings = Vec::new();
+        for (status, limit) in &policy.statuses {
+            let Some(soft_limit) = limit.soft else {
+                continue;
+            };
+            let members = [status.clone()];
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
+            let prospective =
+                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
+            if prospective > current && prospective >= soft_limit {
+                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
+                    transition,
+                    kind: "status",
+                    name: status,
+                    current,
+                    prospective,
+                    soft_limit,
+                    hard_limit: limit.hard,
+                    policy_path: format!("workflow.capacity.statuses.{status}"),
+                }));
+            }
+        }
+        for (name, group) in &policy.groups {
+            let Some(soft_limit) = group.soft else {
+                continue;
+            };
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
+            let prospective = Self::prospective_capacity_count(
+                current,
+                &group.statuses,
+                transition.from,
+                transition.to,
+            );
+            if prospective > current && prospective >= soft_limit {
+                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
+                    transition,
+                    kind: "group",
+                    name,
+                    current,
+                    prospective,
+                    soft_limit,
+                    hard_limit: group.hard,
+                    policy_path: format!("workflow.capacity.groups.{name}"),
+                }));
+            }
+        }
+        Ok(warnings)
     }
 
     fn enforce_status_hard_limits(
@@ -2340,9 +2451,9 @@ impl SqliteStorage {
         issue_id: &str,
         from: Option<&str>,
         to: &str,
-    ) -> Result<()> {
+    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
         if !policy.is_active() || from.is_some_and(|status| status.eq_ignore_ascii_case(to)) {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let transition = CapacityTransition { issue_id, from, to };
         let mut counts = HashMap::new();
@@ -2355,7 +2466,298 @@ impl SqliteStorage {
             Self::enforce_admission_statuses(conn, rule, transition, &mut counts)?;
             Self::enforce_admission_groups(conn, policy, rule, transition, &mut counts)?;
         }
+        Self::collect_capacity_soft_warnings(conn, policy, transition, &mut counts)
+    }
+
+    fn transition_enters_capacity(
+        transition: &CapacityBatchTransition,
+        statuses: &[String],
+    ) -> bool {
+        let contains = |candidate: &str| {
+            statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case(candidate))
+        };
+        !transition.from.as_deref().is_some_and(contains) && contains(&transition.to)
+    }
+
+    fn transition_drains_capacity(
+        transition: &CapacityBatchTransition,
+        statuses: &[String],
+    ) -> bool {
+        let contains = |candidate: &str| {
+            statuses
+                .iter()
+                .any(|status| status.eq_ignore_ascii_case(candidate))
+        };
+        transition.from.as_deref().is_some_and(contains) && !contains(&transition.to)
+    }
+
+    fn batch_prospective_capacity_count(
+        current: u32,
+        statuses: &[String],
+        transitions: &[CapacityBatchTransition],
+    ) -> Result<u32> {
+        let mut prospective = i64::from(current);
+        for transition in transitions {
+            if Self::transition_enters_capacity(transition, statuses) {
+                prospective += 1;
+            } else if Self::transition_drains_capacity(transition, statuses) {
+                prospective -= 1;
+            }
+        }
+        u32::try_from(prospective).map_err(|_| {
+            BeadsError::internal(format!(
+                "invalid prospective workflow capacity count {prospective}"
+            ))
+        })
+    }
+
+    fn batch_transition_ref(transition: &CapacityBatchTransition) -> CapacityTransition<'_> {
+        CapacityTransition {
+            issue_id: &transition.issue_id,
+            from: transition.from.as_deref(),
+            to: &transition.to,
+        }
+    }
+
+    /// Evaluate an explicitly described batch inside the caller's write
+    /// transaction.
+    ///
+    /// Direct-SQL command paths use this adapter so they share the same
+    /// final-state capacity semantics as [`Self::update_issues_atomically`]
+    /// without exposing the storage-internal transition representation.
+    pub(crate) fn enforce_workflow_capacity_batch_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[(String, Option<String>, String)],
+    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
+        let transitions = transitions
+            .iter()
+            .map(|(issue_id, from, to)| CapacityBatchTransition {
+                issue_id: issue_id.clone(),
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect::<Vec<_>>();
+        Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions)
+    }
+
+    fn evaluate_capacity_status_limits_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+        counts: &mut HashMap<String, u32>,
+        warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<()> {
+        for (status, limit) in &policy.statuses {
+            let members = [status.clone()];
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
+            let prospective =
+                Self::batch_prospective_capacity_count(current, &members, transitions)?;
+            let entering = transitions
+                .iter()
+                .find(|transition| Self::transition_enters_capacity(transition, &members));
+
+            if let (Some(hard_limit), Some(transition)) = (limit.hard, entering)
+                && prospective > current
+                && prospective > hard_limit
+            {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: "status",
+                    name: status,
+                    current,
+                    prospective,
+                    soft_limit: limit.soft,
+                    hard_limit,
+                    policy_path: format!("workflow.capacity.statuses.{status}"),
+                }));
+            }
+
+            if let (Some(soft_limit), Some(transition)) = (limit.soft, entering)
+                && prospective > current
+                && prospective >= soft_limit
+            {
+                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: "status",
+                    name: status,
+                    current,
+                    prospective,
+                    soft_limit,
+                    hard_limit: limit.hard,
+                    policy_path: format!("workflow.capacity.statuses.{status}"),
+                }));
+            }
+        }
         Ok(())
+    }
+
+    fn evaluate_capacity_group_limits_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+        counts: &mut HashMap<String, u32>,
+        warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<()> {
+        for (name, group) in &policy.groups {
+            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
+            let prospective =
+                Self::batch_prospective_capacity_count(current, &group.statuses, transitions)?;
+            let entering = transitions
+                .iter()
+                .find(|transition| Self::transition_enters_capacity(transition, &group.statuses));
+
+            if let (Some(hard_limit), Some(transition)) = (group.hard, entering)
+                && prospective > current
+                && prospective > hard_limit
+            {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: "group",
+                    name,
+                    current,
+                    prospective,
+                    soft_limit: group.soft,
+                    hard_limit,
+                    policy_path: format!("workflow.capacity.groups.{name}"),
+                }));
+            }
+
+            if let (Some(soft_limit), Some(transition)) = (group.soft, entering)
+                && prospective > current
+                && prospective >= soft_limit
+            {
+                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: "group",
+                    name,
+                    current,
+                    prospective,
+                    soft_limit,
+                    hard_limit: group.hard,
+                    policy_path: format!("workflow.capacity.groups.{name}"),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn enforce_capacity_admission_rules_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+        counts: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        for rule in &policy.admission {
+            let matching = transitions
+                .iter()
+                .filter(|transition| {
+                    Self::admission_transition_matches(rule, Self::batch_transition_ref(transition))
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                continue;
+            }
+
+            for (status, threshold) in &rule.require_below.statuses {
+                let members = [status.clone()];
+                let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
+                let prospective =
+                    Self::batch_prospective_capacity_count(current, &members, transitions)?;
+                let blocked_transition = matching
+                    .iter()
+                    .find(|transition| !Self::transition_drains_capacity(transition, &members));
+                if prospective >= *threshold
+                    && let Some(transition) = blocked_transition
+                {
+                    return Err(Self::capacity_violation(CapacityViolationEvidence {
+                        transition: Self::batch_transition_ref(transition),
+                        kind: "admission_status",
+                        name: status,
+                        current,
+                        prospective,
+                        soft_limit: None,
+                        hard_limit: *threshold,
+                        policy_path: format!(
+                            "workflow.capacity.admission.{}.require_below.statuses.{status}",
+                            rule.name
+                        ),
+                    }));
+                }
+            }
+
+            for (requested_name, threshold) in &rule.require_below.groups {
+                let Some((canonical_name, group)) = Self::capacity_group(policy, requested_name)
+                else {
+                    return Err(BeadsError::internal(format!(
+                        "validated workflow capacity group '{requested_name}' disappeared"
+                    )));
+                };
+                let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
+                let prospective =
+                    Self::batch_prospective_capacity_count(current, &group.statuses, transitions)?;
+                let blocked_transition = matching.iter().find(|transition| {
+                    !Self::transition_drains_capacity(transition, &group.statuses)
+                });
+                if prospective >= *threshold
+                    && let Some(transition) = blocked_transition
+                {
+                    return Err(Self::capacity_violation(CapacityViolationEvidence {
+                        transition: Self::batch_transition_ref(transition),
+                        kind: "admission_group",
+                        name: canonical_name,
+                        current,
+                        prospective,
+                        soft_limit: None,
+                        hard_limit: *threshold,
+                        policy_path: format!(
+                            "workflow.capacity.admission.{}.require_below.groups.{canonical_name}",
+                            rule.name
+                        ),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Preflight a complete routed batch against its final prospective state.
+    ///
+    /// Evaluating the final state (rather than each item in input order) is
+    /// essential for capacity-neutral swaps: a drain and an admission in the
+    /// same batch must not fail merely because the admitting ID appeared first.
+    /// This function is called inside the exact `BEGIN IMMEDIATE` transaction
+    /// that subsequently applies every update.
+    fn evaluate_workflow_capacity_batch_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
+        if !policy.is_active() || transitions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut counts = HashMap::new();
+        let mut warnings = Vec::new();
+        Self::evaluate_capacity_status_limits_in_tx(
+            conn,
+            policy,
+            transitions,
+            &mut counts,
+            &mut warnings,
+        )?;
+        Self::evaluate_capacity_group_limits_in_tx(
+            conn,
+            policy,
+            transitions,
+            &mut counts,
+            &mut warnings,
+        )?;
+        Self::enforce_capacity_admission_rules_in_tx(conn, policy, transitions, &mut counts)?;
+
+        Ok(warnings)
     }
 
     /// Remove and return any staged Tier 1 attribution without consuming it via
@@ -2385,6 +2787,11 @@ impl SqliteStorage {
     where
         F: FnMut(&Connection, &mut MutationContext) -> Result<R>,
     {
+        // A warning belongs exclusively to the mutation that produced it.
+        // Clear before BEGIN so failed/retried operations cannot expose stale
+        // evidence from an earlier command.
+        self.last_capacity_warnings.clear();
+
         // Disable FK enforcement before the transaction begins.  PRAGMA
         // foreign_keys can only be changed outside an active transaction.
         // fsqlite can surface false FK violations when its page buffer pool
@@ -2494,7 +2901,7 @@ impl SqliteStorage {
                 Self::upsert_metadata_key_in_tx(&storage.conn, NEEDS_FLUSH_KEY, "true")?;
             }
 
-            Ok((result, blocked_cache_plan))
+            Ok((result, blocked_cache_plan, ctx.capacity_warnings))
         });
 
         // Consume the staged attribution only now that the transaction has
@@ -2506,8 +2913,10 @@ impl SqliteStorage {
 
         // Re-enable FK enforcement after the transaction completes
         // (regardless of success or failure).
-        let (result, blocked_cache_plan) =
+        let (result, blocked_cache_plan, capacity_warnings) =
             Self::finish_foreign_key_suppressed_result(&self.conn, op, tx_result)?;
+
+        self.last_capacity_warnings = capacity_warnings;
 
         match blocked_cache_plan {
             Some(BlockedCacheRefreshPlan::Deferred) => {
@@ -2576,13 +2985,14 @@ impl SqliteStorage {
                 }
             }
 
-            Self::enforce_workflow_capacity_in_tx(
+            let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
                 conn,
                 &capacity_policy,
                 &issue.id,
                 None,
                 issue.status.as_str(),
             )?;
+            ctx.capacity_warnings.extend(capacity_warnings);
 
             let status_str = issue.status.as_str();
             let issue_type_str = issue.issue_type.as_str();
@@ -2874,464 +3284,531 @@ impl SqliteStorage {
     /// Returns an error if the issue doesn't exist or the update fails.
     #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
-        if updates.is_empty() {
-            // No-op update: this path returns WITHOUT calling `mutate()`, so we
-            // must clear any staged attribution ourselves. Otherwise a value set
-            // by `set_pending_event_attribution` would survive onto the NEXT,
-            // unrelated `mutate()` (#312 hardening, F2). Invariant: pending
-            // attribution is consumed by exactly one committing mutation, or
-            // cleared.
-            self.pending_event_attribution = None;
-            return self
-                .get_issue(id)?
-                .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() });
+        let updates = [(id.to_string(), updates.clone())];
+        self.update_issues_atomically(&updates, actor)?
+            .pop()
+            .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })
+    }
+
+    /// Update an ordered set of issues in one `BEGIN IMMEDIATE` transaction.
+    ///
+    /// Capacity is preflighted against the batch's final prospective state and
+    /// every field mutation, audit event, and dirty marker commits or rolls back
+    /// as a unit. Duplicate IDs are rejected because applying two updates to the
+    /// same row would make request-order semantics ambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without modifying any issue when any ID, validation,
+    /// claim guard, uniqueness check, or workflow-capacity rule fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn update_issues_atomically(
+        &mut self,
+        updates: &[(String, IssueUpdate)],
+        actor: &str,
+    ) -> Result<Vec<Issue>> {
+        self.last_capacity_warnings.clear();
+
+        let mut seen = HashSet::with_capacity(updates.len());
+        for (id, _) in updates {
+            if !seen.insert(id.as_str()) {
+                self.pending_event_attribution = None;
+                return Err(BeadsError::validation(
+                    "issue_ids",
+                    format!("duplicate issue ID in atomic update batch: {id}"),
+                ));
+            }
         }
 
-        let capacity_policy = self.workflow_capacity_policy.clone();
-        self.mutate("update_issue", actor, |conn, ctx| {
-            let mut issue = Self::get_issue_from_conn(conn, id)?.ok_or_else(|| {
-                // Issue #245: if `get_issue` (read path) can find the row but
-                // `get_issue_from_conn` inside a write transaction cannot, the
-                // database is likely corrupt (B-tree or index malformation).
-                // Surface a more helpful error than bare ISSUE_NOT_FOUND.
-                tracing::warn!(
-                    id = %id,
-                    "update_issue: row not found inside write transaction \
-                     (possible DB corruption — run `br doctor --repair`)"
-                );
-                BeadsError::IssueNotFound { id: id.to_string() }
-            })?;
+        if updates.iter().all(|(_, update)| update.is_empty()) {
+            // This path does not call `mutate()`, so explicitly consume staged
+            // attribution just like the historical single-update no-op path.
+            self.pending_event_attribution = None;
+        } else {
+            let capacity_policy = self.workflow_capacity_policy.clone();
+            self.mutate("update_issues_atomically", actor, |conn, ctx| {
+                let mut transitions = Vec::new();
+                for (id, update) in updates {
+                    let issue = Self::get_issue_from_conn(conn, id)?
+                        .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+                    if issue.status == Status::Tombstone && !update.is_empty() {
+                        return Err(BeadsError::Validation {
+                            field: "issue_id".to_string(),
+                            reason: format!("cannot update tombstone issue: {id}"),
+                        });
+                    }
+                    if let Some(status) = &update.status
+                        && issue.status != *status
+                    {
+                        transitions.push(CapacityBatchTransition {
+                            issue_id: id.clone(),
+                            from: Some(issue.status.as_str().to_string()),
+                            to: status.as_str().to_string(),
+                        });
+                    }
+                }
 
-            if issue.status == Status::Tombstone {
-                return Err(BeadsError::Validation {
-                    field: "issue_id".to_string(),
-                    reason: format!("cannot update tombstone issue: {id}"),
-                });
+                let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
+                    conn,
+                    &capacity_policy,
+                    &transitions,
+                )?;
+                ctx.capacity_warnings.extend(capacity_warnings);
+
+                for (id, update) in updates {
+                    if !update.is_empty() {
+                        Self::update_issue_in_tx(conn, ctx, id, update, actor)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+
+        updates
+            .iter()
+            .map(|(id, _)| {
+                self.get_issue(id)?
+                    .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn update_issue_in_tx(
+        conn: &Connection,
+        ctx: &mut MutationContext,
+        id: &str,
+        updates: &IssueUpdate,
+        actor: &str,
+    ) -> Result<()> {
+        let mut issue = Self::get_issue_from_conn(conn, id)?.ok_or_else(|| {
+            // Issue #245: if `get_issue` (read path) can find the row but
+            // `get_issue_from_conn` inside a write transaction cannot, the
+            // database is likely corrupt (B-tree or index malformation).
+            // Surface a more helpful error than bare ISSUE_NOT_FOUND.
+            tracing::warn!(
+                id = %id,
+                "update_issue: row not found inside write transaction \
+                 (possible DB corruption — run `br doctor --repair`)"
+            );
+            BeadsError::IssueNotFound { id: id.to_string() }
+        })?;
+
+        if issue.status == Status::Tombstone {
+            return Err(BeadsError::Validation {
+                field: "issue_id".to_string(),
+                reason: format!("cannot update tombstone issue: {id}"),
+            });
+        }
+
+        // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
+        // to prevent TOCTOU races where two agents both see "unassigned".
+        if updates.expect_unassigned {
+            let current_assignee = match conn.query_row_with_params(
+                "SELECT assignee FROM issues WHERE id = ?",
+                &[SqliteValue::from(id)],
+            ) {
+                Ok(row) => row.get(0).and_then(SqliteValue::as_text).map(String::from),
+                Err(FrankenError::QueryReturnedNoRows) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let trimmed = current_assignee
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let claim_actor = updates.claim_actor.as_deref().unwrap_or("");
+
+            match trimmed {
+                None => { /* unassigned, proceed with claim */ }
+                Some(current) if !updates.claim_exclusive && current == claim_actor => {
+                    /* same actor re-claim, idempotent */
+                }
+                Some(current) => {
+                    return Err(BeadsError::validation(
+                        "claim",
+                        format!("issue {id} already assigned to {current}"),
+                    ));
+                }
+            }
+        }
+
+        let mut set_clauses: Vec<String> = vec![];
+        let mut params: Vec<SqliteValue> = vec![];
+
+        // Helper to add update
+        let mut add_update = |field: &str, val: SqliteValue| {
+            set_clauses.push(format!("{field} = ?"));
+            params.push(val);
+        };
+
+        // Title
+        if let Some(ref title) = updates.title {
+            let old_title = issue.title.clone();
+            issue.title.clone_from(title);
+            add_update("title", SqliteValue::from(title.as_str()));
+            ctx.record_field_change(
+                EventType::Updated,
+                id,
+                Some(old_title),
+                Some(title.clone()),
+                Some("Title changed".to_string()),
+            );
+        }
+
+        // Simple text fields - use empty string instead of NULL for bd compatibility
+        if let Some(ref val) = updates.description {
+            issue.description.clone_from(val);
+            add_update(
+                "description",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
+        }
+        if let Some(ref val) = updates.design {
+            issue.design.clone_from(val);
+            add_update("design", SqliteValue::from(val.as_deref().unwrap_or("")));
+        }
+        if let Some(ref val) = updates.acceptance_criteria {
+            issue.acceptance_criteria.clone_from(val);
+            add_update(
+                "acceptance_criteria",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
+        }
+        if let Some(ref val) = updates.notes {
+            issue.notes.clone_from(val);
+            add_update("notes", SqliteValue::from(val.as_deref().unwrap_or("")));
+        }
+
+        // Status
+        if let Some(ref status) = updates.status {
+            let old_status_obj = issue.status.clone();
+            let old_status = old_status_obj.as_str().to_string();
+            let was_terminal = old_status_obj.is_terminal();
+            issue.status.clone_from(status);
+            add_update("status", SqliteValue::from(status.as_str()));
+
+            if status.as_str() != old_status {
+                ctx.record_field_change(
+                    EventType::StatusChanged,
+                    id,
+                    Some(old_status),
+                    Some(status.as_str().to_string()),
+                    None,
+                );
             }
 
-            // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
-            // to prevent TOCTOU races where two agents both see "unassigned".
+            // Record Closed event if status is now Closed and wasn't before
+            if *status == Status::Closed {
+                if !was_terminal {
+                    let reason = updates.close_reason.as_ref().and_then(Clone::clone);
+                    ctx.record_event(EventType::Closed, id, reason);
+                }
+
+                // Auto-set closed_at if not provided
+                if updates.closed_at.is_none() && issue.closed_at.is_none() {
+                    let now = Utc::now();
+                    issue.closed_at = Some(now);
+                    add_update("closed_at", SqliteValue::from(now.to_rfc3339()));
+                }
+
+                if issue.deleted_at.is_some() {
+                    issue.deleted_at = None;
+                    issue.deleted_by = None;
+                    issue.delete_reason = None;
+                    add_update("deleted_at", SqliteValue::Null);
+                    add_update("deleted_by", SqliteValue::Null);
+                    add_update("delete_reason", SqliteValue::Null);
+                }
+            } else if *status == Status::Tombstone {
+                let reason = updates.close_reason.as_ref().and_then(Clone::clone);
+
+                if !was_terminal {
+                    ctx.record_event(EventType::Deleted, id, reason.clone());
+                }
+
+                let now = Utc::now();
+                issue.deleted_at = Some(now);
+                issue.deleted_by = Some(actor.to_string());
+                issue.delete_reason.clone_from(&reason);
+                add_update("deleted_at", SqliteValue::from(now.to_rfc3339()));
+                add_update("deleted_by", SqliteValue::from(actor));
+                // Always update delete_reason if we are setting to Tombstone,
+                // using close_reason as fallback if provided.
+                add_update(
+                    "delete_reason",
+                    SqliteValue::from(reason.as_deref().unwrap_or("")),
+                );
+            } else {
+                if was_terminal && !status.is_terminal() {
+                    ctx.record_event(EventType::Reopened, id, None);
+                    conn.execute_with_params(
+                        "DELETE FROM close_metadata WHERE issue_id = ?",
+                        &[SqliteValue::from(id)],
+                    )?;
+                }
+                if issue.closed_at.is_some() && updates.closed_at.is_none() {
+                    // Reopening (or fixing state): Clear closed_at if it was set
+                    issue.closed_at = None;
+                    issue.close_reason = None;
+                    issue.closed_by_session = None;
+                    add_update("closed_at", SqliteValue::Null);
+                    add_update("close_reason", SqliteValue::from(""));
+                    add_update("closed_by_session", SqliteValue::from(""));
+                }
+                if issue.deleted_at.is_some() {
+                    issue.deleted_at = None;
+                    issue.deleted_by = None;
+                    issue.delete_reason = None;
+                    add_update("deleted_at", SqliteValue::Null);
+                    add_update("deleted_by", SqliteValue::Null);
+                    add_update("delete_reason", SqliteValue::Null);
+                }
+            }
+
+            if updates.skip_cache_rebuild {
+                ctx.invalidate_cache_deferred();
+            } else {
+                ctx.invalidate_cache();
+            }
+        }
+
+        // Priority
+        if let Some(priority) = updates.priority {
+            let old_priority = issue.priority.0;
+            if priority.0 != old_priority {
+                issue.priority = priority;
+                add_update("priority", SqliteValue::from(i64::from(priority.0)));
+                ctx.record_field_change(
+                    EventType::PriorityChanged,
+                    id,
+                    Some(old_priority.to_string()),
+                    Some(priority.0.to_string()),
+                    None,
+                );
+            }
+        }
+
+        // Issue type
+        if let Some(ref issue_type) = updates.issue_type {
+            issue.issue_type.clone_from(issue_type);
+            add_update("issue_type", SqliteValue::from(issue_type.as_str()));
+        }
+
+        // Assignee
+        if let Some(ref assignee_opt) = updates.assignee {
+            let old_assignee = issue.assignee.clone();
+            issue.assignee.clone_from(assignee_opt);
+            add_update(
+                "assignee",
+                assignee_opt
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+            );
+            if old_assignee != *assignee_opt {
+                ctx.record_field_change(
+                    EventType::AssigneeChanged,
+                    id,
+                    old_assignee,
+                    assignee_opt.clone(),
+                    None,
+                );
+            }
+        }
+
+        // Simple Option fields - use empty string instead of NULL for bd compatibility
+        if let Some(ref val) = updates.owner {
+            issue.owner.clone_from(val);
+            add_update("owner", SqliteValue::from(val.as_deref().unwrap_or("")));
+        }
+        if let Some(ref val) = updates.estimated_minutes {
+            issue.estimated_minutes = *val;
+            add_update(
+                "estimated_minutes",
+                val.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
+            );
+        }
+        if let Some(ref val) = updates.external_ref {
+            // Explicit uniqueness check for fsqlite
+            if let Some(ext_ref) = val {
+                let existing_ext = conn.query_with_params(
+                    "SELECT id FROM issues WHERE external_ref = ? AND id != ? LIMIT 1",
+                    &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
+                )?;
+                if let Some(existing_row) = existing_ext.first() {
+                    let other_id = existing_row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or_default()
+                        .to_string();
+                    return Err(BeadsError::Config(format!(
+                        "External reference '{ext_ref}' already exists on issue {other_id}"
+                    )));
+                }
+            }
+
+            issue.external_ref.clone_from(val);
+            add_update(
+                "external_ref",
+                val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+            );
+        }
+        if let Some(ref val) = updates.source_repo {
+            // `source_repo` is NOT NULL DEFAULT '.' so an explicit clear
+            // must fall back to "." rather than SQL NULL — otherwise the
+            // schema's NOT NULL constraint rejects the write.
+            let next = val.clone().unwrap_or_else(|| ".".to_string());
+            issue.source_repo = Some(next.clone());
+            add_update("source_repo", SqliteValue::from(next.as_str()));
+        }
+        if let Some(ref val) = updates.source_repo_path {
+            issue.source_repo_path.clone_from(val);
+            add_update(
+                "source_repo_path",
+                val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+            );
+        }
+        if let Some(ref val) = updates.agent_context {
+            issue.agent_context.clone_from(val);
+            add_update(
+                "agent_context",
+                val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+            );
+        }
+        // Use empty string instead of NULL for bd compatibility
+        if let Some(ref val) = updates.close_reason {
+            issue.close_reason.clone_from(val);
+            add_update(
+                "close_reason",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
+        }
+        if let Some(ref val) = updates.closed_by_session {
+            issue.closed_by_session.clone_from(val);
+            add_update(
+                "closed_by_session",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
+        }
+
+        // Tombstone fields
+        if let Some(ref val) = updates.deleted_at {
+            issue.deleted_at = *val;
+            add_update(
+                "deleted_at",
+                val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
+            );
+        }
+        // Use empty string instead of NULL for bd compatibility
+        if let Some(ref val) = updates.deleted_by {
+            issue.deleted_by.clone_from(val);
+            add_update(
+                "deleted_by",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
+        }
+        if let Some(ref val) = updates.delete_reason {
+            issue.delete_reason.clone_from(val);
+            add_update(
+                "delete_reason",
+                SqliteValue::from(val.as_deref().unwrap_or("")),
+            );
+        }
+
+        // Date fields
+        if let Some(ref val) = updates.due_at {
+            issue.due_at = *val;
+            add_update(
+                "due_at",
+                val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
+            );
+        }
+        if let Some(ref val) = updates.defer_until {
+            issue.defer_until = *val;
+            add_update(
+                "defer_until",
+                val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
+            );
+        }
+        if let Some(ref val) = updates.closed_at {
+            issue.closed_at = *val;
+            add_update(
+                "closed_at",
+                val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
+            );
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(());
+        }
+
+        // Update updated_at only when a stored field needs rewriting.
+        let updated_at = Utc::now();
+        issue.updated_at = updated_at;
+
+        IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
+
+        set_clauses.push("updated_at = ?".to_string());
+        params.push(SqliteValue::from(updated_at.to_rfc3339()));
+
+        // Update content hash
+        let new_hash = issue.compute_content_hash();
+        set_clauses.push("content_hash = ?".to_string());
+        params.push(SqliteValue::from(new_hash));
+
+        // Build and execute SQL. Claim operations use an additional
+        // compare-and-set predicate so exactly one contender can win even
+        // if two writers both observed the row as unassigned earlier.
+        let mut where_clause = "id = ?".to_string();
+        params.push(SqliteValue::from(id));
+        if updates.expect_unassigned {
+            where_clause.push_str(" AND (assignee IS NULL OR TRIM(assignee) = ''");
+            if !updates.claim_exclusive
+                && let Some(claim_actor) = updates
+                    .claim_actor
+                    .as_deref()
+                    .filter(|actor| !actor.is_empty())
+            {
+                where_clause.push_str(" OR assignee = ?");
+                params.push(SqliteValue::from(claim_actor));
+            }
+            where_clause.push(')');
+        }
+
+        let sql = format!(
+            "UPDATE issues SET {} WHERE {where_clause}",
+            set_clauses.join(", ")
+        );
+        let updated_rows = conn.execute_with_params(&sql, &params)?;
+        if updated_rows == 0 {
             if updates.expect_unassigned {
                 let current_assignee = match conn.query_row_with_params(
                     "SELECT assignee FROM issues WHERE id = ?",
                     &[SqliteValue::from(id)],
                 ) {
-                    Ok(row) => row.get(0).and_then(SqliteValue::as_text).map(String::from),
-                    Err(FrankenError::QueryReturnedNoRows) => None,
+                    Ok(row) => row
+                        .get(0)
+                        .and_then(SqliteValue::as_text)
+                        .map(String::from)
+                        .and_then(|assignee| {
+                            let trimmed = assignee.trim().to_string();
+                            (!trimmed.is_empty()).then_some(trimmed)
+                        })
+                        .unwrap_or_else(|| "<unknown>".to_string()),
+                    Err(FrankenError::QueryReturnedNoRows) => "<unknown>".to_string(),
                     Err(error) => return Err(error.into()),
                 };
-                let trimmed = current_assignee
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty());
-                let claim_actor = updates.claim_actor.as_deref().unwrap_or("");
-
-                match trimmed {
-                    None => { /* unassigned, proceed with claim */ }
-                    Some(current) if !updates.claim_exclusive && current == claim_actor => {
-                        /* same actor re-claim, idempotent */
-                    }
-                    Some(current) => {
-                        return Err(BeadsError::validation(
-                            "claim",
-                            format!("issue {id} already assigned to {current}"),
-                        ));
-                    }
-                }
+                return Err(BeadsError::validation(
+                    "claim",
+                    format!("issue {id} already assigned to {current_assignee}"),
+                ));
             }
 
-            if let Some(status) = &updates.status {
-                Self::enforce_workflow_capacity_in_tx(
-                    conn,
-                    &capacity_policy,
-                    id,
-                    Some(issue.status.as_str()),
-                    status.as_str(),
-                )?;
-            }
+            return Err(BeadsError::IssueNotFound { id: id.to_string() });
+        }
 
-            let mut set_clauses: Vec<String> = vec![];
-            let mut params: Vec<SqliteValue> = vec![];
+        ctx.mark_dirty(id);
 
-            // Helper to add update
-            let mut add_update = |field: &str, val: SqliteValue| {
-                set_clauses.push(format!("{field} = ?"));
-                params.push(val);
-            };
-
-            // Title
-            if let Some(ref title) = updates.title {
-                let old_title = issue.title.clone();
-                issue.title.clone_from(title);
-                add_update("title", SqliteValue::from(title.as_str()));
-                ctx.record_field_change(
-                    EventType::Updated,
-                    id,
-                    Some(old_title),
-                    Some(title.clone()),
-                    Some("Title changed".to_string()),
-                );
-            }
-
-            // Simple text fields - use empty string instead of NULL for bd compatibility
-            if let Some(ref val) = updates.description {
-                issue.description.clone_from(val);
-                add_update(
-                    "description",
-                    SqliteValue::from(val.as_deref().unwrap_or("")),
-                );
-            }
-            if let Some(ref val) = updates.design {
-                issue.design.clone_from(val);
-                add_update("design", SqliteValue::from(val.as_deref().unwrap_or("")));
-            }
-            if let Some(ref val) = updates.acceptance_criteria {
-                issue.acceptance_criteria.clone_from(val);
-                add_update(
-                    "acceptance_criteria",
-                    SqliteValue::from(val.as_deref().unwrap_or("")),
-                );
-            }
-            if let Some(ref val) = updates.notes {
-                issue.notes.clone_from(val);
-                add_update("notes", SqliteValue::from(val.as_deref().unwrap_or("")));
-            }
-
-            // Status
-            if let Some(ref status) = updates.status {
-                let old_status_obj = issue.status.clone();
-                let old_status = old_status_obj.as_str().to_string();
-                let was_terminal = old_status_obj.is_terminal();
-                issue.status.clone_from(status);
-                add_update("status", SqliteValue::from(status.as_str()));
-
-                if status.as_str() != old_status {
-                    ctx.record_field_change(
-                        EventType::StatusChanged,
-                        id,
-                        Some(old_status),
-                        Some(status.as_str().to_string()),
-                        None,
-                    );
-                }
-
-                // Record Closed event if status is now Closed and wasn't before
-                if *status == Status::Closed {
-                    if !was_terminal {
-                        let reason = updates.close_reason.as_ref().and_then(Clone::clone);
-                        ctx.record_event(EventType::Closed, id, reason);
-                    }
-
-                    // Auto-set closed_at if not provided
-                    if updates.closed_at.is_none() && issue.closed_at.is_none() {
-                        let now = Utc::now();
-                        issue.closed_at = Some(now);
-                        add_update("closed_at", SqliteValue::from(now.to_rfc3339()));
-                    }
-
-                    if issue.deleted_at.is_some() {
-                        issue.deleted_at = None;
-                        issue.deleted_by = None;
-                        issue.delete_reason = None;
-                        add_update("deleted_at", SqliteValue::Null);
-                        add_update("deleted_by", SqliteValue::Null);
-                        add_update("delete_reason", SqliteValue::Null);
-                    }
-                } else if *status == Status::Tombstone {
-                    let reason = updates.close_reason.as_ref().and_then(Clone::clone);
-
-                    if !was_terminal {
-                        ctx.record_event(EventType::Deleted, id, reason.clone());
-                    }
-
-                    let now = Utc::now();
-                    issue.deleted_at = Some(now);
-                    issue.deleted_by = Some(actor.to_string());
-                    issue.delete_reason.clone_from(&reason);
-                    add_update("deleted_at", SqliteValue::from(now.to_rfc3339()));
-                    add_update("deleted_by", SqliteValue::from(actor));
-                    // Always update delete_reason if we are setting to Tombstone,
-                    // using close_reason as fallback if provided.
-                    add_update(
-                        "delete_reason",
-                        SqliteValue::from(reason.as_deref().unwrap_or("")),
-                    );
-                } else {
-                    if was_terminal && !status.is_terminal() {
-                        ctx.record_event(EventType::Reopened, id, None);
-                        conn.execute_with_params(
-                            "DELETE FROM close_metadata WHERE issue_id = ?",
-                            &[SqliteValue::from(id)],
-                        )?;
-                    }
-                    if issue.closed_at.is_some() && updates.closed_at.is_none() {
-                        // Reopening (or fixing state): Clear closed_at if it was set
-                        issue.closed_at = None;
-                        issue.close_reason = None;
-                        issue.closed_by_session = None;
-                        add_update("closed_at", SqliteValue::Null);
-                        add_update("close_reason", SqliteValue::from(""));
-                        add_update("closed_by_session", SqliteValue::from(""));
-                    }
-                    if issue.deleted_at.is_some() {
-                        issue.deleted_at = None;
-                        issue.deleted_by = None;
-                        issue.delete_reason = None;
-                        add_update("deleted_at", SqliteValue::Null);
-                        add_update("deleted_by", SqliteValue::Null);
-                        add_update("delete_reason", SqliteValue::Null);
-                    }
-                }
-
-                if updates.skip_cache_rebuild {
-                    ctx.invalidate_cache_deferred();
-                } else {
-                    ctx.invalidate_cache();
-                }
-            }
-
-            // Priority
-            if let Some(priority) = updates.priority {
-                let old_priority = issue.priority.0;
-                if priority.0 != old_priority {
-                    issue.priority = priority;
-                    add_update("priority", SqliteValue::from(i64::from(priority.0)));
-                    ctx.record_field_change(
-                        EventType::PriorityChanged,
-                        id,
-                        Some(old_priority.to_string()),
-                        Some(priority.0.to_string()),
-                        None,
-                    );
-                }
-            }
-
-            // Issue type
-            if let Some(ref issue_type) = updates.issue_type {
-                issue.issue_type.clone_from(issue_type);
-                add_update("issue_type", SqliteValue::from(issue_type.as_str()));
-            }
-
-            // Assignee
-            if let Some(ref assignee_opt) = updates.assignee {
-                let old_assignee = issue.assignee.clone();
-                issue.assignee.clone_from(assignee_opt);
-                add_update(
-                    "assignee",
-                    assignee_opt
-                        .as_deref()
-                        .map_or(SqliteValue::Null, SqliteValue::from),
-                );
-                if old_assignee != *assignee_opt {
-                    ctx.record_field_change(
-                        EventType::AssigneeChanged,
-                        id,
-                        old_assignee,
-                        assignee_opt.clone(),
-                        None,
-                    );
-                }
-            }
-
-            // Simple Option fields - use empty string instead of NULL for bd compatibility
-            if let Some(ref val) = updates.owner {
-                issue.owner.clone_from(val);
-                add_update("owner", SqliteValue::from(val.as_deref().unwrap_or("")));
-            }
-            if let Some(ref val) = updates.estimated_minutes {
-                issue.estimated_minutes = *val;
-                add_update(
-                    "estimated_minutes",
-                    val.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
-                );
-            }
-            if let Some(ref val) = updates.external_ref {
-                // Explicit uniqueness check for fsqlite
-                if let Some(ext_ref) = val {
-                    let existing_ext = conn.query_with_params(
-                        "SELECT id FROM issues WHERE external_ref = ? AND id != ? LIMIT 1",
-                        &[SqliteValue::from(ext_ref.as_str()), SqliteValue::from(id)],
-                    )?;
-                    if let Some(existing_row) = existing_ext.first() {
-                        let other_id = existing_row
-                            .get(0)
-                            .and_then(SqliteValue::as_text)
-                            .unwrap_or_default()
-                            .to_string();
-                        return Err(BeadsError::Config(format!(
-                            "External reference '{ext_ref}' already exists on issue {other_id}"
-                        )));
-                    }
-                }
-
-                issue.external_ref.clone_from(val);
-                add_update(
-                    "external_ref",
-                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                );
-            }
-            if let Some(ref val) = updates.source_repo {
-                // `source_repo` is NOT NULL DEFAULT '.' so an explicit clear
-                // must fall back to "." rather than SQL NULL — otherwise the
-                // schema's NOT NULL constraint rejects the write.
-                let next = val.clone().unwrap_or_else(|| ".".to_string());
-                issue.source_repo = Some(next.clone());
-                add_update("source_repo", SqliteValue::from(next.as_str()));
-            }
-            if let Some(ref val) = updates.source_repo_path {
-                issue.source_repo_path.clone_from(val);
-                add_update(
-                    "source_repo_path",
-                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                );
-            }
-            if let Some(ref val) = updates.agent_context {
-                issue.agent_context.clone_from(val);
-                add_update(
-                    "agent_context",
-                    val.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                );
-            }
-            // Use empty string instead of NULL for bd compatibility
-            if let Some(ref val) = updates.close_reason {
-                issue.close_reason.clone_from(val);
-                add_update(
-                    "close_reason",
-                    SqliteValue::from(val.as_deref().unwrap_or("")),
-                );
-            }
-            if let Some(ref val) = updates.closed_by_session {
-                issue.closed_by_session.clone_from(val);
-                add_update(
-                    "closed_by_session",
-                    SqliteValue::from(val.as_deref().unwrap_or("")),
-                );
-            }
-
-            // Tombstone fields
-            if let Some(ref val) = updates.deleted_at {
-                issue.deleted_at = *val;
-                add_update(
-                    "deleted_at",
-                    val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
-                );
-            }
-            // Use empty string instead of NULL for bd compatibility
-            if let Some(ref val) = updates.deleted_by {
-                issue.deleted_by.clone_from(val);
-                add_update(
-                    "deleted_by",
-                    SqliteValue::from(val.as_deref().unwrap_or("")),
-                );
-            }
-            if let Some(ref val) = updates.delete_reason {
-                issue.delete_reason.clone_from(val);
-                add_update(
-                    "delete_reason",
-                    SqliteValue::from(val.as_deref().unwrap_or("")),
-                );
-            }
-
-            // Date fields
-            if let Some(ref val) = updates.due_at {
-                issue.due_at = *val;
-                add_update(
-                    "due_at",
-                    val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
-                );
-            }
-            if let Some(ref val) = updates.defer_until {
-                issue.defer_until = *val;
-                add_update(
-                    "defer_until",
-                    val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
-                );
-            }
-            if let Some(ref val) = updates.closed_at {
-                issue.closed_at = *val;
-                add_update(
-                    "closed_at",
-                    val.map_or(SqliteValue::Null, |d| SqliteValue::from(d.to_rfc3339())),
-                );
-            }
-
-            if set_clauses.is_empty() {
-                return Ok(());
-            }
-
-            // Update updated_at only when a stored field needs rewriting.
-            let updated_at = Utc::now();
-            issue.updated_at = updated_at;
-
-            IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
-
-            set_clauses.push("updated_at = ?".to_string());
-            params.push(SqliteValue::from(updated_at.to_rfc3339()));
-
-            // Update content hash
-            let new_hash = issue.compute_content_hash();
-            set_clauses.push("content_hash = ?".to_string());
-            params.push(SqliteValue::from(new_hash));
-
-            // Build and execute SQL. Claim operations use an additional
-            // compare-and-set predicate so exactly one contender can win even
-            // if two writers both observed the row as unassigned earlier.
-            let mut where_clause = "id = ?".to_string();
-            params.push(SqliteValue::from(id));
-            if updates.expect_unassigned {
-                where_clause.push_str(" AND (assignee IS NULL OR TRIM(assignee) = ''");
-                if !updates.claim_exclusive
-                    && let Some(claim_actor) = updates
-                        .claim_actor
-                        .as_deref()
-                        .filter(|actor| !actor.is_empty())
-                {
-                    where_clause.push_str(" OR assignee = ?");
-                    params.push(SqliteValue::from(claim_actor));
-                }
-                where_clause.push(')');
-            }
-
-            let sql = format!(
-                "UPDATE issues SET {} WHERE {where_clause}",
-                set_clauses.join(", ")
-            );
-            let updated_rows = conn.execute_with_params(&sql, &params)?;
-            if updated_rows == 0 {
-                if updates.expect_unassigned {
-                    let current_assignee = match conn.query_row_with_params(
-                        "SELECT assignee FROM issues WHERE id = ?",
-                        &[SqliteValue::from(id)],
-                    ) {
-                        Ok(row) => row
-                            .get(0)
-                            .and_then(SqliteValue::as_text)
-                            .map(String::from)
-                            .and_then(|assignee| {
-                                let trimmed = assignee.trim().to_string();
-                                (!trimmed.is_empty()).then_some(trimmed)
-                            })
-                            .unwrap_or_else(|| "<unknown>".to_string()),
-                        Err(FrankenError::QueryReturnedNoRows) => "<unknown>".to_string(),
-                        Err(error) => return Err(error.into()),
-                    };
-                    return Err(BeadsError::validation(
-                        "claim",
-                        format!("issue {id} already assigned to {current_assignee}"),
-                    ));
-                }
-
-                return Err(BeadsError::IssueNotFound { id: id.to_string() });
-            }
-
-            ctx.mark_dirty(id);
-
-            Ok(())
-        })?;
-
-        // Return updated issue
-        self.get_issue(id)?
-            .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })
+        Ok(())
     }
 
     /// Delete an issue by creating a tombstone.
@@ -3355,13 +3832,23 @@ impl SqliteStorage {
         }
 
         let was_terminal = issue.status.is_terminal();
+        let previous_status = issue.status.as_str().to_string();
         let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
         let mut tombstone_issue = issue;
         tombstone_issue.status = Status::Tombstone;
         let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
+        let capacity_policy = self.workflow_capacity_policy.clone();
         self.mutate("delete_issue", actor, |conn, ctx| {
+            let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
+                conn,
+                &capacity_policy,
+                id,
+                Some(&previous_status),
+                "tombstone",
+            )?;
+            ctx.capacity_warnings.extend(capacity_warnings);
             conn.execute_with_params(
                 "UPDATE issues SET
                     content_hash = ?,
@@ -13845,6 +14332,208 @@ mod tests {
         assert_eq!(active, 1);
     }
 
+    #[test]
+    fn workflow_capacity_atomic_batch_rejection_rolls_back_every_issue_and_field() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-cap-batch-active", Status::InProgress),
+            ("bd-cap-batch-open-1", Status::Open),
+            ("bd-cap-batch-open-2", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 2));
+
+        let update = IssueUpdate {
+            title: Some("must roll back".to_string()),
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let batch = [
+            ("bd-cap-batch-open-1".to_string(), update.clone()),
+            ("bd-cap-batch-open-2".to_string(), update),
+        ];
+        let error = storage
+            .update_issues_atomically(&batch, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(violation.prospective, 3);
+        assert_eq!(violation.issue_id, "bd-cap-batch-open-1");
+
+        for id in ["bd-cap-batch-open-1", "bd-cap-batch-open-2"] {
+            let issue = storage.get_issue(id).unwrap().unwrap();
+            assert_eq!(issue.status, Status::Open);
+            assert_eq!(issue.title, id);
+        }
+    }
+
+    #[test]
+    fn workflow_capacity_batch_preflight_allows_admission_before_matching_drain() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-cap-swap-active",
+                    "active",
+                    Status::InProgress,
+                    1,
+                    None,
+                    now,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .create_issue(
+                &make_issue("bd-cap-swap-open", "open", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+
+        // Admission intentionally appears first. Sequential evaluation would
+        // reject it at 2/1 even though the batch's final occupancy remains 1.
+        let batch = [
+            (
+                "bd-cap-swap-open".to_string(),
+                IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "bd-cap-swap-active".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Open),
+                    ..IssueUpdate::default()
+                },
+            ),
+        ];
+        storage.update_issues_atomically(&batch, "tester").unwrap();
+
+        assert_eq!(
+            storage
+                .get_issue("bd-cap-swap-open")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-cap-swap-active")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Open
+        );
+    }
+
+    #[test]
+    fn workflow_capacity_soft_warnings_are_structured_deterministic_and_consumed() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-cap-soft-1", "bd-cap-soft-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: Some(2),
+                hard: Some(3),
+            },
+        );
+        policy.groups.insert(
+            "active_work".to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: vec!["in_progress".to_string()],
+                soft: Some(1),
+                hard: None,
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issues_atomically(
+                &[
+                    ("bd-cap-soft-1".to_string(), update.clone()),
+                    ("bd-cap-soft-2".to_string(), update),
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        let warnings = storage.take_capacity_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].capacity_kind, "status");
+        assert_eq!(warnings[0].capacity_name, "in_progress");
+        assert_eq!(warnings[0].issue_id, "bd-cap-soft-1");
+        assert_eq!(warnings[0].current, 0);
+        assert_eq!(warnings[0].prospective, 2);
+        assert_eq!(warnings[0].soft_limit, 2);
+        assert_eq!(warnings[0].hard_limit, Some(3));
+        assert_eq!(warnings[1].capacity_kind, "group");
+        assert_eq!(warnings[1].capacity_name, "active_work");
+        assert!(storage.take_capacity_warnings().is_empty());
+    }
+
+    #[test]
+    fn atomic_batch_late_validation_failure_rolls_back_earlier_update() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-batch-valid", "bd-batch-invalid"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let batch = [
+            (
+                "bd-batch-valid".to_string(),
+                IssueUpdate {
+                    title: Some("would otherwise commit".to_string()),
+                    ..IssueUpdate::default()
+                },
+            ),
+            (
+                "bd-batch-invalid".to_string(),
+                IssueUpdate {
+                    title: Some(String::new()),
+                    ..IssueUpdate::default()
+                },
+            ),
+        ];
+        storage
+            .update_issues_atomically(&batch, "tester")
+            .unwrap_err();
+
+        assert_eq!(
+            storage.get_issue("bd-batch-valid").unwrap().unwrap().title,
+            "bd-batch-valid"
+        );
+    }
+
     type ReadyTextFields = (
         String,
         String,
@@ -23388,6 +24077,7 @@ mod tests {
             temp_db_path: None,
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            last_capacity_warnings: Vec::new(),
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
         let stamp = timestamp.to_rfc3339();

@@ -115,6 +115,8 @@ fn execute_status_with_storage_ctx(
 struct CloseEligibleResult {
     closed: Vec<String>,
     count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 fn execute_close_eligible(
@@ -157,12 +159,14 @@ fn execute_close_eligible(
             let result = CloseEligibleResult {
                 closed: Vec::new(),
                 count: 0,
+                warnings: Vec::new(),
             };
             ctx.toon(&result);
         } else if ctx.is_json() {
             let result = CloseEligibleResult {
                 closed: Vec::new(),
                 count: 0,
+                warnings: Vec::new(),
             };
             ctx.json_pretty(&result);
         } else if ctx.is_quiet() {
@@ -179,6 +183,7 @@ fn execute_close_eligible(
     let now_str = now.to_rfc3339();
     let reason = "All children completed";
     let closed_ids = close_eligible_epics_atomically(storage, &epics, &actor, &now_str, reason)?;
+    let capacity_warnings = storage.take_capacity_warnings();
 
     storage_ctx.flush_no_db_if_dirty()?;
 
@@ -186,22 +191,30 @@ fn execute_close_eligible(
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),
+            warnings: capacity_warnings.clone(),
         };
         ctx.toon(&result);
     } else if ctx.is_json() {
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),
+            warnings: capacity_warnings.clone(),
         };
         ctx.json_pretty(&result);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_close_result_rich(&closed_ids, ctx);
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     } else {
         println!("✓ Closed {} epic(s)", closed_ids.len());
         for id in &closed_ids {
             println!("  - {}", format_epic_id(id, false));
+        }
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
     }
     Ok(())
@@ -217,19 +230,29 @@ fn close_eligible_epics_atomically(
     let capacity_policy = storage.workflow_capacity_policy();
     let mut closed_ids = Vec::new();
 
-    // The capacity precondition and every close share this transaction. If a
-    // later epic would exceed a limit, earlier updates roll back with it.
+    // The final-state capacity precondition and every close share this
+    // transaction. A capacity-neutral batch is independent of epic order, and
+    // any rejection rolls back every update.
     storage.mutate("close_eligible_epics", actor, |conn, ctx| {
+        let capacity_transitions = epics
+            .iter()
+            .map(|epic_status| {
+                (
+                    epic_status.epic.id.clone(),
+                    Some(epic_status.epic.status.as_str().to_string()),
+                    "closed".to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let capacity_warnings = SqliteStorage::enforce_workflow_capacity_batch_in_tx(
+            conn,
+            &capacity_policy,
+            &capacity_transitions,
+        )?;
+        ctx.capacity_warnings.extend(capacity_warnings);
+
         for epic_status in epics {
             let id = &epic_status.epic.id;
-            SqliteStorage::enforce_workflow_capacity_in_tx(
-                conn,
-                &capacity_policy,
-                id,
-                Some(epic_status.epic.status.as_str()),
-                "closed",
-            )?;
-
             let rows = conn.execute_with_params(
                 "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
                 &[
@@ -730,6 +753,38 @@ mod tests {
         for id in ["bd-epic-cap-a", "bd-epic-cap-b"] {
             assert_eq!(storage.get_issue(id).unwrap().unwrap().status, Status::Open);
         }
+
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "closed".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: Some(3),
+                hard: Some(5),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let closed = close_eligible_epics_atomically(
+            &mut storage,
+            &epics,
+            "tester",
+            &Utc::now().to_rfc3339(),
+            "All children completed",
+        )
+        .unwrap();
+        assert_eq!(closed.len(), 2);
+
+        let warnings = storage.take_capacity_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one final-state warning is emitted per affected capacity"
+        );
+        assert_eq!(warnings[0].capacity_kind, "status");
+        assert_eq!(warnings[0].capacity_name, "closed");
+        assert_eq!(warnings[0].current, 2);
+        assert_eq!(warnings[0].prospective, 4);
+        assert_eq!(warnings[0].soft_limit, 3);
     }
 
     #[test]

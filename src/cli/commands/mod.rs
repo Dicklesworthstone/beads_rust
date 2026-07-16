@@ -277,21 +277,16 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
     }
 }
 
-pub(super) fn update_issue_with_recovery(
+pub(super) fn update_issues_atomically_with_recovery(
     storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,
     command: &str,
-    issue_id: &str,
-    update: &IssueUpdate,
+    updates: &[(String, IssueUpdate)],
     actor: &str,
-) -> crate::Result<Issue> {
-    retry_mutation_with_jsonl_recovery(
-        storage_ctx,
-        allow_recovery,
-        command,
-        Some(issue_id),
-        |storage| storage.update_issue(issue_id, update, actor),
-    )
+) -> crate::Result<Vec<Issue>> {
+    retry_mutation_with_jsonl_recovery(storage_ctx, allow_recovery, command, None, |storage| {
+        storage.update_issues_atomically(updates, actor)
+    })
 }
 
 fn should_attempt_mutation_jsonl_recovery(

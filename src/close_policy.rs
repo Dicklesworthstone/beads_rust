@@ -340,6 +340,48 @@ pub struct WorkflowCapacityViolation {
     pub policy_path: String,
 }
 
+/// Structured evidence emitted after a successful transition reaches or
+/// exceeds an advisory workflow-capacity threshold.
+///
+/// Warnings deliberately mirror the hard-rejection evidence so human and
+/// machine consumers can use one stable vocabulary. `hard_limit` remains
+/// optional because a project may configure an advisory ceiling without a
+/// corresponding hard stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCapacityWarning {
+    pub issue_id: String,
+    pub from_status: Option<String>,
+    pub to_status: String,
+    pub capacity_kind: String,
+    pub capacity_name: String,
+    pub scope: String,
+    pub counting_mode: String,
+    pub current: u32,
+    pub prospective: u32,
+    pub soft_limit: u32,
+    pub hard_limit: Option<u32>,
+    pub policy_path: String,
+}
+
+impl std::fmt::Display for WorkflowCapacityWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let from = self.from_status.as_deref().unwrap_or("<initial>");
+        write!(
+            f,
+            "transitioned {} from {} to {}; repository {} capacity '{}' has reached or exceeded its soft limit (current: {}, prospective: {}, soft: {}; policy: {}). Drain existing work before admitting more",
+            self.issue_id,
+            from,
+            self.to_status,
+            self.capacity_kind,
+            self.capacity_name,
+            self.current,
+            self.prospective,
+            self.soft_limit,
+            self.policy_path,
+        )
+    }
+}
+
 impl std::fmt::Display for WorkflowCapacityViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let from = self.from_status.as_deref().unwrap_or("<initial>");

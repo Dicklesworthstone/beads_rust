@@ -2112,6 +2112,243 @@ workflow:
 }
 
 #[test]
+fn e2e_workflow_capacity_batch_rejection_rolls_back_every_issue() {
+    let _log = common::test_log("e2e_workflow_capacity_batch_rejection_rolls_back_every_issue");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_batch_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let active_id = create_issue_with_description(
+        &workspace,
+        "Already active",
+        None,
+        None,
+        "capacity_batch_active",
+    );
+    let activate = run_br(
+        &workspace,
+        ["update", &active_id, "--status", "in_progress"],
+        "capacity_batch_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "activate failed: {}",
+        activate.stderr
+    );
+
+    let first_id = create_issue_with_description(
+        &workspace,
+        "First candidate",
+        None,
+        None,
+        "capacity_batch_first",
+    );
+    let second_id = create_issue_with_description(
+        &workspace,
+        "Second candidate",
+        None,
+        None,
+        "capacity_batch_second",
+    );
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 2
+",
+    )
+    .expect("write capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        [
+            "update",
+            &first_id,
+            &second_id,
+            "--status",
+            "in_progress",
+            "--title",
+            "must not commit",
+            "--json",
+        ],
+        "capacity_batch_reject",
+    );
+    assert!(!rejected.status.success(), "batch must fail");
+    assert_eq!(rejected.status.code(), Some(4));
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    assert_eq!(json["error"]["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(json["error"]["context"]["current"], 1);
+    assert_eq!(json["error"]["context"]["prospective"], 3);
+    assert_eq!(json["error"]["context"]["hard_limit"], 2);
+
+    for (id, expected_title, label) in [
+        (&first_id, "First candidate", "capacity_batch_show_first"),
+        (&second_id, "Second candidate", "capacity_batch_show_second"),
+    ] {
+        let show = run_br(&workspace, ["show", id, "--json"], label);
+        assert!(show.status.success(), "show failed: {}", show.stderr);
+        let shown: Value =
+            serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+        assert_eq!(shown[0]["status"], "open");
+        assert_eq!(shown[0]["title"], expected_title);
+    }
+}
+
+#[test]
+fn e2e_workflow_capacity_soft_limit_emits_structured_batch_warning() {
+    let _log = common::test_log("e2e_workflow_capacity_soft_limit_emits_structured_batch_warning");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_soft_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let first_id = create_issue_with_description(
+        &workspace,
+        "First soft candidate",
+        None,
+        None,
+        "capacity_soft_first",
+    );
+    let second_id = create_issue_with_description(
+        &workspace,
+        "Second soft candidate",
+        None,
+        None,
+        "capacity_soft_second",
+    );
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        soft: 2
+        hard: 3
+",
+    )
+    .expect("write capacity policy");
+
+    let updated = run_br(
+        &workspace,
+        [
+            "update",
+            &first_id,
+            &second_id,
+            "--status",
+            "in_progress",
+            "--json",
+        ],
+        "capacity_soft_update",
+    );
+    assert!(
+        updated.status.success(),
+        "update failed: {}",
+        updated.stderr
+    );
+    let payload: Value = serde_json::from_str(&extract_json_payload(&updated.stdout))
+        .expect("capacity warning json");
+    assert_eq!(payload["updated"].as_array().map(Vec::len), Some(2));
+    let warnings = payload["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    let warning = &warnings[0];
+    assert_eq!(warning["issue_id"], first_id);
+    assert_eq!(warning["from_status"], "open");
+    assert_eq!(warning["to_status"], "in_progress");
+    assert_eq!(warning["capacity_kind"], "status");
+    assert_eq!(warning["capacity_name"], "in_progress");
+    assert_eq!(warning["scope"], "repository");
+    assert_eq!(warning["counting_mode"], "all");
+    assert_eq!(warning["current"], 0);
+    assert_eq!(warning["prospective"], 2);
+    assert_eq!(warning["soft_limit"], 2);
+    assert_eq!(warning["hard_limit"], 3);
+    assert_eq!(
+        warning["policy_path"],
+        "workflow.capacity.statuses.in_progress"
+    );
+}
+
+#[test]
+fn e2e_workflow_capacity_create_preserves_legacy_shape_until_warning_exists() {
+    let _log = common::test_log(
+        "e2e_workflow_capacity_create_preserves_legacy_shape_until_warning_exists",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_create_shape_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, closed]
+  capacity:
+    statuses:
+      open:
+        soft: 2
+        hard: 3
+",
+    )
+    .expect("write capacity policy");
+
+    let first = run_br(
+        &workspace,
+        ["create", "Below soft limit", "--json"],
+        "capacity_create_below_soft",
+    );
+    assert!(
+        first.status.success(),
+        "first create failed: {}",
+        first.stderr
+    );
+    let first_payload: Value =
+        serde_json::from_str(&extract_json_payload(&first.stdout)).expect("first create json");
+    assert!(
+        first_payload["id"].is_string(),
+        "below the soft limit, create must retain its legacy direct-issue shape: {}",
+        first.stdout
+    );
+    assert!(first_payload.get("created").is_none());
+    assert!(first_payload.get("warnings").is_none());
+
+    let second = run_br(
+        &workspace,
+        ["create", "Reaches soft limit", "--json"],
+        "capacity_create_at_soft",
+    );
+    assert!(
+        second.status.success(),
+        "second create failed: {}",
+        second.stderr
+    );
+    let second_payload: Value =
+        serde_json::from_str(&extract_json_payload(&second.stdout)).expect("second create json");
+    assert!(second_payload["created"]["id"].is_string());
+    let warnings = second_payload["warnings"]
+        .as_array()
+        .expect("create warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["from_status"], Value::Null);
+    assert_eq!(warnings[0]["to_status"], "open");
+    assert_eq!(warnings[0]["current"], 1);
+    assert_eq!(warnings[0]["prospective"], 2);
+    assert_eq!(warnings[0]["soft_limit"], 2);
+    assert!(
+        !second
+            .stderr
+            .contains("has reached or exceeded its soft limit"),
+        "JSON mode must carry capacity evidence structurally rather than duplicate a human warning on stderr: {}",
+        second.stderr
+    );
+}
+
+#[test]
 fn e2e_structured_error_issue_not_found() {
     let _log = common::test_log("e2e_structured_error_issue_not_found");
     let workspace = BrWorkspace::new();

@@ -599,11 +599,29 @@ workflow:
   therefore cannot race another writer and roll back every field in the update.
 - Draining an overfull status/group is always allowed. JSONL import remains a
   state-replication path rather than a new-work admission path.
+- Reaching a soft threshold still commits. Human output emits an actionable
+  warning; JSON and TOON add a structured `warnings` array only when warnings
+  exist, preserving the legacy success shape below the threshold.
+- Each warning contains `issue_id`, `from_status`, `to_status`,
+  `capacity_kind`, `capacity_name`, `scope`, `counting_mode`, `current`,
+  `prospective`, `soft_limit`, optional `hard_limit`, and `policy_path`.
+  `update` wraps its normal array as `{updated, warnings}` and `create` as
+  `{created, warnings}`; commands that already return an object add `warnings`
+  to that object. The wrapper is never introduced below the soft threshold.
+- Multi-target `update`/`--claim`, `close`, `reopen`, `defer`, and `undefer`
+  commands evaluate the repository's final prospective state and commit all
+  status changes in one transaction. Hard-limit and late validation failures
+  roll back the entire repository-local batch; capacity-neutral swaps do not
+  depend on request order.
+- Routed commands transact each repository independently. There is no
+  distributed transaction across repositories, so an earlier route may already
+  be committed if a later route fails and cross-repository atomicity is
+  intentionally not claimed.
 - Omitting `workflow.capacity` preserves existing behavior exactly.
-- The initial enforcement layer has fixed `repository` scope and `all`
-  counting. Soft-limit warnings, atomic batch preflight, hierarchy-aware
-  counting, exemptions, and actor/assignee/harness/session/subtree scopes are
-  later phases tracked in GitHub issue #384.
+- The current enforcement layer has fixed `repository` scope and `all`
+  counting. Hierarchy-aware counting, audited exemptions, actor/assignee/
+  harness/session/subtree scopes, and capacity observability are later phases
+  tracked in GitHub issue #384.
 
 ---
 
