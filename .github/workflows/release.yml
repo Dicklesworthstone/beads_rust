@@ -567,7 +567,7 @@ jobs:
           ### Cargo Install
 
           ```bash
-          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --tag ${{ steps.asset_version.outputs.release_tag }} --locked
+          cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --tag ${{ steps.asset_version.outputs.release_tag }} --locked
           ```
 
           ### Manual Download

@@ -49,7 +49,7 @@ Complete installation instructions for `br` (beads_rust), including all supporte
 ### One-liner (Cargo)
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 ### One-liner (Build from Source)
@@ -68,15 +68,17 @@ The simplest method using Rust's package manager:
 
 ```bash
 # Install with all features (including self-update)
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 
 # Install without self-update feature
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --no-default-features
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --no-default-features
 ```
 
-Keep `--locked` on every source install. It makes Cargo use the dependency
-versions validated against beads_rust's pinned nightly instead of resolving a
-newer, potentially incompatible graph.
+Keep the explicit `beads_rust` package selector and `--locked` on every git
+source install. The selector avoids ambiguity with the repository's fuzz
+package, while `--locked` uses the dependency versions validated against
+beads_rust's pinned nightly instead of resolving a newer, potentially
+incompatible graph.
 
 **Requirements:**
 - Rust nightly toolchain
@@ -92,7 +94,7 @@ rustup install nightly
 rustup default nightly
 
 # Or use nightly for just this install
-rustup run nightly cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+rustup run nightly cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 ### Build from Source
@@ -183,7 +185,7 @@ rustup install nightly
 rustup default nightly
 
 # Install br
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 **Fedora/RHEL:**
@@ -197,7 +199,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 rustup install nightly
 rustup default nightly
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 **Arch Linux:**
@@ -209,7 +211,7 @@ sudo pacman -S rust
 # Install br
 rustup install nightly
 rustup default nightly
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 ### macOS
@@ -226,7 +228,7 @@ rustup install nightly
 rustup default nightly
 
 # Install br
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 **Apple Silicon (M1/M2/M3):**
@@ -252,7 +254,7 @@ rustup install nightly
 rustup default nightly
 
 # Install br
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 **With WSL2 (Recommended for Windows):**
@@ -264,7 +266,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 rustup install nightly
 rustup default nightly
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
 
 ---
@@ -358,7 +360,7 @@ br upgrade --force
 If you prefer to manage updates manually, build without the self_update feature:
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --no-default-features
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --no-default-features
 ```
 
 ---
@@ -405,7 +407,7 @@ Make sure you're running the cargo install command, not trying to build from a n
 
 ```bash
 # Correct: install from git
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 
 # Wrong: trying to build without cloning first
 cargo build  # This requires Cargo.toml in current directory
@@ -470,7 +472,7 @@ If `br upgrade` fails:
 
 ```bash
 # Manual update
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --locked --force
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --force
 ```
 
 ### Getting Help

@@ -267,10 +267,12 @@ fn test_cargo_metadata() {
     );
 }
 
-/// Source-install instructions must use the repository's validated lockfile.
+/// Source-install instructions must be unambiguous and use the validated lockfile.
 ///
 /// Without `--locked`, `cargo install` resolves a fresh dependency graph that
 /// can require compiler features newer than the deliberately pinned nightly.
+/// Git installs must also select `beads_rust` because the repository contains
+/// a second Cargo package for fuzzing.
 #[test]
 fn test_source_install_documentation_uses_locked_resolution() {
     for path in [
@@ -286,14 +288,24 @@ fn test_source_install_documentation_uses_locked_resolution() {
         let logical_lines = content.replace("\\\n", " ");
 
         for (line_index, line) in logical_lines.lines().enumerate() {
-            let is_source_install = line.contains("cargo install --path .")
-                || line.contains(
-                    "cargo install --git https://github.com/Dicklesworthstone/beads_rust.git",
-                );
+            let is_git_source_install = line.contains(
+                "cargo install --git https://github.com/Dicklesworthstone/beads_rust.git",
+            );
+            let is_source_install =
+                line.contains("cargo install --path .") || is_git_source_install;
             if is_source_install {
                 assert!(
                     line.contains("--locked"),
                     "{path}:{} source-install command must include --locked: {line}",
+                    line_index + 1
+                );
+            }
+            if is_git_source_install {
+                assert!(
+                    line.contains(
+                        "cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust",
+                    ),
+                    "{path}:{} git source-install command must select the beads_rust package: {line}",
                     line_index + 1
                 );
             }
