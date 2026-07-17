@@ -50,6 +50,26 @@ macro_rules! skip_if_no_bd {
     };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickBenchmarkReadiness {
+    Ready,
+    MissingBd,
+    MissingDataset,
+}
+
+const fn quick_benchmark_readiness(
+    bd_is_available: bool,
+    dataset_is_available: bool,
+) -> QuickBenchmarkReadiness {
+    if !bd_is_available {
+        QuickBenchmarkReadiness::MissingBd
+    } else if !dataset_is_available {
+        QuickBenchmarkReadiness::MissingDataset
+    } else {
+        QuickBenchmarkReadiness::Ready
+    }
+}
+
 /// Output from running a command
 #[derive(Debug, Clone)]
 pub struct CmdOutput {
@@ -1220,8 +1240,26 @@ fn benchmark_dataset_full() {
 /// Quick benchmark on beads_rust only for CI
 #[test]
 fn benchmark_dataset_quick() {
-    skip_if_no_bd!();
     init_test_logging();
+
+    let registry = DatasetRegistry::new();
+    match quick_benchmark_readiness(
+        bd_available(),
+        registry.is_available(KnownDataset::BeadsRust),
+    ) {
+        QuickBenchmarkReadiness::Ready => {}
+        QuickBenchmarkReadiness::MissingBd => {
+            eprintln!("Skipping benchmark_dataset_quick: 'bd' binary not found (expected in CI)");
+            return;
+        }
+        QuickBenchmarkReadiness::MissingDataset => {
+            eprintln!(
+                "Skipping benchmark_dataset_quick: beads_rust dataset not available \
+                 (no untracked .beads/beads.db in this checkout)"
+            );
+            return;
+        }
+    }
 
     info!("benchmark_dataset_quick: starting");
 
@@ -1249,6 +1287,28 @@ fn benchmark_dataset_quick() {
     run_regression_checks(std::slice::from_ref(&result));
 
     info!("benchmark_dataset_quick: completed successfully");
+}
+
+#[test]
+fn quick_benchmark_readiness_runs_only_with_both_preconditions() {
+    assert_eq!(
+        quick_benchmark_readiness(true, true),
+        QuickBenchmarkReadiness::Ready,
+        "an installed bd binary and an available registry dataset must run the benchmark"
+    );
+    assert_eq!(
+        quick_benchmark_readiness(false, true),
+        QuickBenchmarkReadiness::MissingBd
+    );
+    assert_eq!(
+        quick_benchmark_readiness(true, false),
+        QuickBenchmarkReadiness::MissingDataset
+    );
+    assert_eq!(
+        quick_benchmark_readiness(false, false),
+        QuickBenchmarkReadiness::MissingBd,
+        "report the missing executable before the dataset precondition"
+    );
 }
 
 /// Test that dataset benchmark infrastructure works
