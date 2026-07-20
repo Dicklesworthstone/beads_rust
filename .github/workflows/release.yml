@@ -94,7 +94,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: ${{ github.event_name != 'workflow_dispatch' || !inputs.skip_reliability_gates }}
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly
 
@@ -221,7 +221,7 @@ jobs:
           fetch-depth: 0  # Full history for vergen
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -607,7 +607,7 @@ jobs:
           syft dir:. -o spdx-json > artifacts/sbom.spdx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3.0.1
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           name: br ${{ steps.asset_version.outputs.release_tag }}
           tag_name: ${{ steps.asset_version.outputs.release_tag }}
@@ -645,7 +645,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly
 
