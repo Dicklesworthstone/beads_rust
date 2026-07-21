@@ -421,8 +421,7 @@ fn prepare_single_route(
         let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
         policy.workflow.validate_status(new_status.as_str())?;
         let transitions_enforced = policy.workflow.transitions_enforced();
-        let gates_enforced = policy.workflow.gates_enforced();
-        if transitions_enforced || gates_enforced {
+        if transitions_enforced {
             for id in &resolved_ids {
                 // The current status is the `from` state for the transition
                 // check. An issue that cannot be read (missing/unresolved)
@@ -436,19 +435,6 @@ fn prepare_single_route(
                     policy
                         .workflow
                         .validate_transition(current.as_deref(), new_status.as_str())?;
-                }
-                // Workflow gate enforcement (issue #312, layer 2). A move into a
-                // gated state is rejected until every required gate passes.
-                // Only consulted when there is a `from` state (gates guard a
-                // `from -> to` transition; a create has no `from` to gate).
-                if gates_enforced && let Some(from) = current.as_deref() {
-                    enforce_gates(
-                        &storage_ctx.storage,
-                        &policy.workflow,
-                        id,
-                        from,
-                        new_status.as_str(),
-                    )?;
                 }
             }
         }
@@ -867,50 +853,6 @@ fn validate_multi_issue_external_ref_update(
     Ok(())
 }
 
-/// Enforce workflow gates (issue #312, layer 2) for a single `from -> to`
-/// status change on `id`. Loads the issue's labels + priority, the recorded
-/// gate results, and rejects the move with a [`BeadsError::PolicyViolation`]
-/// when any required gate is unsatisfied. A no-op when the transition is not
-/// gated.
-fn enforce_gates(
-    storage: &SqliteStorage,
-    workflow: &crate::close_policy::Workflow,
-    id: &str,
-    from: &str,
-    to: &str,
-) -> Result<()> {
-    let required = workflow.required_gates_for(from, to, &[], 0);
-    // Cheap pre-check: skip the labels/priority/results queries entirely when
-    // the bare transition has no gate rule. (required_gates_for ignores
-    // conditional gates with empty labels; we re-check below with real data.)
-    let rule = workflow.gate_rule_for(from, to);
-    if rule.is_none() && required.is_empty() {
-        return Ok(());
-    }
-    let labels = storage.get_labels(id)?;
-    let priority = storage.get_issue(id)?.map_or(0, |issue| issue.priority.0);
-    let results = storage.get_gate_results(id)?;
-    let violations =
-        crate::close_policy::evaluate_gates(workflow, id, from, to, &labels, priority, &results);
-    if violations.is_empty() {
-        return Ok(());
-    }
-    let summary = if let [single] = violations.as_slice() {
-        single.message.clone()
-    } else {
-        let lines: Vec<String> = violations
-            .iter()
-            .map(|v| format!("- {}", v.message))
-            .collect();
-        format!("{} gate(s) failed:\n{}", violations.len(), lines.join("\n"))
-    };
-    Err(BeadsError::PolicyViolation {
-        issue_id: id.to_string(),
-        summary,
-        violations,
-    })
-}
-
 fn validate_route_runtime_guards(
     storage: &SqliteStorage,
     resolved_ids: &[String],
@@ -1296,6 +1238,8 @@ fn build_update(args: &UpdateArgs, actor: &str, claim_exclusive: bool) -> Result
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
+        transition_comment: args.transition_comment.clone(),
+        workflow_policy_bypass_reason: None,
         skip_cache_rebuild: false,
         expect_unassigned: args.claim,
         claim_exclusive: args.claim && claim_exclusive,

@@ -347,31 +347,7 @@ fn bench_update_issue(c: &mut Criterion) {
             let update = IssueUpdate {
                 title: Some(format!("Updated title {counter}")),
                 priority: Some(Priority(((counter % 4) + 1) as i32)),
-                status: None,
-                description: None,
-                design: None,
-                acceptance_criteria: None,
-                notes: None,
-                issue_type: None,
-                assignee: None,
-                owner: None,
-                estimated_minutes: None,
-                due_at: None,
-                defer_until: None,
-                external_ref: None,
-                source_repo: None,
-                source_repo_path: None,
-                agent_context: None,
-                closed_at: None,
-                close_reason: None,
-                closed_by_session: None,
-                deleted_at: None,
-                deleted_by: None,
-                delete_reason: None,
-                skip_cache_rebuild: false,
-                expect_unassigned: false,
-                claim_exclusive: false,
-                claim_actor: None,
+                ..IssueUpdate::default()
             };
             let _ = storage.update_issue(black_box(&id), black_box(&update), "benchmark");
             counter += 1;

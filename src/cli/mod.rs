@@ -1193,6 +1193,11 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub notes: Option<String>,
 
+    /// New comment bound atomically to the requested status transition.
+    /// Required when policy lists `transition_comment` for the transition.
+    #[arg(long, value_name = "COMMENT")]
+    pub transition_comment: Option<String>,
+
     /// Change status. Terminal states (`closed`, `tombstone`) are refused —
     /// use the dedicated `br close` / `br delete` commands so close-policy
     /// and dependency-rewiring are enforced (beads_rust#301).
@@ -1856,6 +1861,10 @@ pub struct EpicCloseEligibleArgs {
     /// Preview only, no changes
     #[arg(long)]
     pub dry_run: bool,
+
+    /// New comment committed atomically with every eligible epic close.
+    #[arg(long, value_name = "COMMENT")]
+    pub transition_comment: Option<String>,
 }
 
 /// Subcommands for the workflow gate engine (issue #312, layer 2).
@@ -1894,6 +1903,12 @@ pub struct GateReportArgs {
     /// Result status: pass or fail
     #[arg(long, value_enum)]
     pub status: GateStatus,
+
+    /// Target status this verdict is intended to authorize. May be omitted
+    /// only when policy has exactly one matching gated target from the issue's
+    /// current status for this gate.
+    #[arg(long, value_name = "STATUS", add = ArgValueCompleter::new(status_completer))]
+    pub to: Option<String>,
 
     /// Optional free-form note recorded with the result
     #[arg(long)]
@@ -2329,6 +2344,10 @@ pub struct DeferArgs {
     #[arg(long)]
     pub robot: bool,
 
+    /// New comment committed atomically with each defer transition.
+    #[arg(long, value_name = "COMMENT")]
+    pub transition_comment: Option<String>,
+
     // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
     // defer status-change audit event; NEVER gated or enforced on.
     /// Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only.
@@ -2354,6 +2373,10 @@ pub struct UndeferArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
+
+    /// New comment committed atomically with each undefer transition.
+    #[arg(long, value_name = "COMMENT")]
+    pub transition_comment: Option<String>,
 
     // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
     // undefer status-change audit event; NEVER gated or enforced on.
@@ -2526,6 +2549,11 @@ pub struct CloseArgs {
     /// Close reason
     #[arg(long, short = 'r')]
     pub reason: Option<String>,
+
+    /// New comment committed atomically with each close transition. This is
+    /// distinct from close metadata in `--reason`.
+    #[arg(long, value_name = "COMMENT")]
+    pub transition_comment: Option<String>,
 
     /// Close even if blocked by open dependencies
     #[arg(long, short = 'f')]

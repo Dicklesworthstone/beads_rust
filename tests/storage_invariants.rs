@@ -51,6 +51,9 @@ fn schema_tables_and_columns_exist() {
         "export_hashes",
         "blocked_issues_cache",
         "child_counters",
+        "close_metadata",
+        "gate_result_history",
+        "gate_results",
     ] {
         assert!(tables.contains(table), "missing table: {table}");
     }
@@ -74,6 +77,24 @@ fn schema_tables_and_columns_exist() {
         assert!(
             blocked_columns.contains(column),
             "missing blocked_issues_cache.{column}"
+        );
+    }
+
+    let gate_history_columns = column_names(&conn, "gate_result_history");
+    for column in [
+        "id",
+        "issue_id",
+        "from_status",
+        "to_status",
+        "status_revision",
+        "gate",
+        "provider",
+        "passed",
+        "recorded_at",
+    ] {
+        assert!(
+            gate_history_columns.contains(column),
+            "missing gate_result_history.{column}"
         );
     }
 }

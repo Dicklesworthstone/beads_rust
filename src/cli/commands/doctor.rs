@@ -2321,6 +2321,9 @@ fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Resul
         ("export_hashes", "issue_id"),
         ("blocked_issues_cache", "issue_id"),
         ("child_counters", "parent_id"),
+        ("close_metadata", "issue_id"),
+        ("gate_result_history", "issue_id"),
+        ("gate_results", "issue_id"),
     ];
     let mut cleaned = 0usize;
     let mut dependency_rows_cleaned = 0usize;

@@ -29,6 +29,8 @@ pub struct CloseArgs {
     pub ids: Vec<String>,
     /// Close reason
     pub reason: Option<String>,
+    /// New comment committed atomically with the close transition.
+    pub transition_comment: Option<String>,
     /// Force close even if blocked
     pub force: bool,
     /// Session ID for `closed_by_session` field
@@ -52,6 +54,7 @@ impl From<&CliCloseArgs> for CloseArgs {
         Self {
             ids: cli.ids.clone(),
             reason: cli.reason.clone(),
+            transition_comment: cli.transition_comment.clone(),
             force: cli.force,
             session: cli.session.clone(),
             suggest_next: cli.suggest_next,
@@ -164,15 +167,24 @@ fn evaluate_close_policy(
         }
     }
 
-    // Workflow gate engine (issue #312, layer 2). Only consulted when the
-    // project configures `workflow.gates` (and `workflow.strict`); a close is a
-    // transition `current -> closed`, so we enforce gates guarding that move.
-    if workflow.gates_enforced() {
+    // The storage transaction is the canonical gate/required-field chokepoint.
+    // Pre-evaluate these rules only for an explicit bypass so the warning and
+    // close metadata can name exactly what the operator bypassed without
+    // introducing a read-before-write race on the ordinary path.
+    if args.bypass_policy {
         let from = issue.status.as_str();
         let to = Status::Closed.as_str();
-        if workflow.gate_rule_for(from, to).is_some() {
+        violations.extend(close_policy::evaluate_transition_required_fields(
+            workflow,
+            issue_id,
+            Some(from),
+            to,
+            issue.acceptance_criteria.as_deref(),
+            args.transition_comment.as_deref(),
+        ));
+        if workflow.gates_enforced() && workflow.gate_rule_for(from, to).is_some() {
             let labels = storage.get_labels(issue_id)?;
-            let results = storage.get_gate_results(issue_id)?;
+            let results = storage.get_scoped_gate_results(issue_id, from, to)?;
             violations.extend(close_policy::evaluate_gates(
                 workflow,
                 issue_id,
@@ -769,7 +781,9 @@ fn execute_route(
     // Active when close-policy gates are enabled (issue #274) OR the workflow
     // gate engine is configured (issue #312, layer 2). The latter must also
     // trigger per-issue gate evaluation at close time.
-    let policy_active = policy_doc.close_policy.is_active() || policy_doc.workflow.gates_enforced();
+    let policy_active = policy_doc.close_policy.is_active()
+        || policy_doc.workflow.gates_enforced()
+        || !policy_doc.workflow.required_fields.is_empty();
     let attribution = resolve_attribution_for_close(args, &policy_doc);
     if args.bypass_policy && !policy_doc.allow_bypass {
         return Err(BeadsError::validation(
@@ -1028,6 +1042,12 @@ fn execute_route(
             closed_at: Some(Some(now)),
             close_reason: Some(Some(close_reason.clone())),
             closed_by_session: args.session.clone().map(Some),
+            transition_comment: args.transition_comment.clone(),
+            workflow_policy_bypass_reason: if args.bypass_policy {
+                args.bypass_reason.clone()
+            } else {
+                None
+            },
             skip_cache_rebuild: true,
             ..Default::default()
         };
@@ -1272,6 +1292,7 @@ mod tests {
         let args = CloseArgs::default();
         assert!(args.ids.is_empty());
         assert!(args.reason.is_none());
+        assert!(args.transition_comment.is_none());
         assert!(!args.force);
         assert!(args.session.is_none());
         assert!(!args.suggest_next);
@@ -1282,6 +1303,7 @@ mod tests {
         let args = CloseArgs {
             ids: vec!["bd-abc".to_string(), "bd-xyz".to_string()],
             reason: Some("Fixed in PR #123".to_string()),
+            transition_comment: Some("Verified in staging".to_string()),
             force: true,
             session: Some("session-456".to_string()),
             suggest_next: true,
@@ -1294,6 +1316,10 @@ mod tests {
         assert_eq!(args.ids.len(), 2);
         assert_eq!(args.ids[0], "bd-abc");
         assert_eq!(args.reason.as_deref(), Some("Fixed in PR #123"));
+        assert_eq!(
+            args.transition_comment.as_deref(),
+            Some("Verified in staging")
+        );
         assert!(args.force);
         assert_eq!(args.session.as_deref(), Some("session-456"));
         assert!(args.suggest_next);
@@ -1712,6 +1738,7 @@ mod tests {
         let args = CloseArgs {
             ids: vec!["bd-clone".to_string()],
             reason: Some("Clone test".to_string()),
+            transition_comment: Some("Fresh transition evidence".to_string()),
             force: true,
             session: Some("sess".to_string()),
             suggest_next: true,
@@ -1724,6 +1751,7 @@ mod tests {
         let cloned = args.clone();
         assert_eq!(cloned.ids, args.ids);
         assert_eq!(cloned.reason, args.reason);
+        assert_eq!(cloned.transition_comment, args.transition_comment);
         assert_eq!(cloned.force, args.force);
         assert_eq!(cloned.session, args.session);
         assert_eq!(cloned.suggest_next, args.suggest_next);
@@ -2483,7 +2511,17 @@ mod tests {
         {
             let storage = SqliteStorage::open(&db_path).expect("storage");
             storage
-                .record_gate_result("bd-1", "ci_green", "ci", true, None, "ci-bot")
+                .record_scoped_gate_result(
+                    "bd-1",
+                    "in_review",
+                    0,
+                    "closed",
+                    "ci_green",
+                    "ci",
+                    true,
+                    None,
+                    "ci-bot",
+                )
                 .expect("record pass");
         }
         let _guard = DirGuard::new(temp.path());

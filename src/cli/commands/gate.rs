@@ -14,19 +14,24 @@ use super::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale, resolve_issue_id,
 };
 use crate::cli::{GateCommands, GateListArgs, GateReportArgs, GateStatus};
-use crate::close_policy::{self, GateResult, Workflow};
+use crate::close_policy::{self, GateResult, GateResultRecord, Workflow};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
 use crate::util::id::{IdResolver, ResolverConfig};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// JSON payload for `br gate report`.
 #[derive(Debug, Serialize)]
 struct GateReportOutput {
+    id: i64,
     issue_id: String,
+    from_status: String,
+    to_status: String,
+    status_revision: i64,
     gate: String,
     provider: String,
     passed: bool,
@@ -57,7 +62,10 @@ struct GatedTransitionStatus {
 struct GateListOutput {
     issue_id: String,
     current_status: Option<String>,
-    results: Vec<GateResult>,
+    history: Vec<GateResultRecord>,
+    /// Pre-v15 unscoped verdicts retained for audit display only. They never
+    /// satisfy a transition.
+    legacy_results: Vec<GateResult>,
     /// Gated transitions out of `current_status` and their satisfaction. Empty
     /// when the project has no `workflow.gates` config or the current status
     /// could not be resolved.
@@ -112,6 +120,26 @@ fn execute_report(
     let resolver = build_resolver(&config_layer);
     let issue_id = resolve_issue_id(&storage_ctx.storage, &resolver, &args.id)?;
 
+    let issue =
+        storage_ctx
+            .storage
+            .get_issue(&issue_id)?
+            .ok_or_else(|| BeadsError::IssueNotFound {
+                id: issue_id.clone(),
+            })?;
+    let policy = close_policy::load_for_beads_dir(beads_dir)?;
+    let labels = storage_ctx.storage.get_labels(&issue_id)?;
+    let from_status = issue.status.as_str();
+    let status_revision = storage_ctx.storage.status_revision(&issue_id)?;
+    let to_status = resolve_gate_target(
+        &policy.workflow,
+        from_status,
+        args.to.as_deref(),
+        gate,
+        &labels,
+        issue.priority.0,
+    )?;
+
     let passed = matches!(args.status, GateStatus::Pass);
     let note = args
         .note
@@ -119,14 +147,26 @@ fn execute_report(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    storage_ctx
-        .storage
-        .record_gate_result(&issue_id, gate, provider, passed, note, &actor)?;
+    let record = storage_ctx.storage.record_scoped_gate_result(
+        &issue_id,
+        from_status,
+        status_revision,
+        &to_status,
+        gate,
+        provider,
+        passed,
+        note,
+        &actor,
+    )?;
 
     crate::util::set_last_touched_id(beads_dir, &issue_id);
 
     let output = GateReportOutput {
+        id: record.id,
         issue_id: issue_id.clone(),
+        from_status: record.from_status,
+        to_status: record.to_status,
+        status_revision: record.status_revision,
         gate: gate.to_string(),
         provider: provider.to_string(),
         passed,
@@ -140,14 +180,80 @@ fn execute_report(
     } else {
         let verdict = if passed { "pass" } else { "fail" };
         ctx.success(&format!(
-            "Recorded gate '{}' = {} (provider {}) for {}",
+            "Recorded gate '{}' = {} (provider {}) for {} [{} -> {}, revision {}]",
             sanitize_terminal_inline(gate),
             verdict,
             sanitize_terminal_inline(provider),
             sanitize_terminal_inline(&issue_id),
+            sanitize_terminal_inline(&output.from_status),
+            sanitize_terminal_inline(&output.to_status),
+            output.status_revision,
         ));
     }
     Ok(())
+}
+
+fn resolve_gate_target(
+    workflow: &Workflow,
+    from_status: &str,
+    requested_to: Option<&str>,
+    gate: &str,
+    labels: &[String],
+    priority: i32,
+) -> Result<String> {
+    let gate_is_required = |to: &str| {
+        workflow
+            .required_gates_for(from_status, to, labels, priority)
+            .iter()
+            .any(|spec| spec.id().eq_ignore_ascii_case(gate))
+    };
+
+    if let Some(requested) = requested_to {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Err(BeadsError::validation("to", "--to must not be empty"));
+        }
+        if !gate_is_required(requested) {
+            return Err(BeadsError::validation(
+                "to",
+                format!(
+                    "workflow does not require gate '{gate}' for transition '{from_status} -> {requested}'"
+                ),
+            ));
+        }
+        return Ok(requested.to_string());
+    }
+
+    let mut targets = BTreeMap::new();
+    for key in workflow.gates.keys() {
+        let Some((rule_from, rule_to)) = key.split_once("->") else {
+            continue;
+        };
+        let rule_from = rule_from.trim();
+        let rule_to = rule_to.trim();
+        if rule_from.eq_ignore_ascii_case(from_status) && gate_is_required(rule_to) {
+            targets
+                .entry(rule_to.to_ascii_lowercase())
+                .or_insert_with(|| rule_to.to_string());
+        }
+    }
+
+    match targets.len() {
+        1 => Ok(targets.into_values().next().unwrap_or_default()),
+        0 => Err(BeadsError::validation(
+            "to",
+            format!(
+                "no configured transition from '{from_status}' requires gate '{gate}'; add a workflow.gates rule or pass a gate name required by the current workflow"
+            ),
+        )),
+        _ => Err(BeadsError::validation(
+            "to",
+            format!(
+                "gate '{gate}' is required by multiple transitions from '{from_status}' ({}); pass --to <status> to select the intended target",
+                targets.into_values().collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
 }
 
 fn execute_list(
@@ -163,7 +269,8 @@ fn execute_list(
 
     let issue = storage_ctx.storage.get_issue(&issue_id)?;
     let current_status = issue.as_ref().map(|i| i.status.as_str().to_string());
-    let results = storage_ctx.storage.get_gate_results(&issue_id)?;
+    let history = storage_ctx.storage.get_gate_result_history(&issue_id)?;
+    let legacy_results = storage_ctx.storage.get_legacy_gate_results(&issue_id)?;
 
     // Compute required-gate status for each guarded transition out of the
     // current status, using the project's workflow.gates config. Absent
@@ -171,19 +278,36 @@ fn execute_list(
     let policy = close_policy::load_for_beads_dir(beads_dir)?;
     let labels = storage_ctx.storage.get_labels(&issue_id)?;
     let priority = issue.as_ref().map_or(0, |i| i.priority.0);
+    let mut results_by_target = BTreeMap::new();
+    if let Some(from) = current_status.as_deref() {
+        for key in policy.workflow.gates.keys() {
+            let Some((rule_from, rule_to)) = key.split_once("->") else {
+                continue;
+            };
+            if rule_from.trim().eq_ignore_ascii_case(from) {
+                results_by_target.insert(
+                    rule_to.trim().to_ascii_lowercase(),
+                    storage_ctx
+                        .storage
+                        .get_scoped_gate_results(&issue_id, from, rule_to.trim())?,
+                );
+            }
+        }
+    }
     let gated_transitions = compute_gated_transitions(
         &policy.workflow,
         &issue_id,
         current_status.as_deref(),
         &labels,
         priority,
-        &results,
+        &results_by_target,
     );
 
     let output = GateListOutput {
         issue_id: issue_id.clone(),
         current_status,
-        results,
+        history,
+        legacy_results,
         gated_transitions,
     };
 
@@ -207,7 +331,7 @@ fn compute_gated_transitions(
     current_status: Option<&str>,
     labels: &[String],
     priority: i32,
-    results: &[GateResult],
+    results_by_target: &BTreeMap<String, Vec<GateResult>>,
 ) -> Vec<GatedTransitionStatus> {
     let Some(from) = current_status else {
         return Vec::new();
@@ -228,6 +352,10 @@ fn compute_gated_transitions(
         if !rule_from.eq_ignore_ascii_case(from) {
             continue;
         }
+        let results = results_by_target
+            .get(&rule_to.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let violations = close_policy::evaluate_gates(
             workflow, issue_id, from, rule_to, labels, priority, results,
         );
@@ -255,19 +383,38 @@ fn compute_gated_transitions(
 
 fn print_gate_list_human(ctx: &OutputContext, output: &GateListOutput) {
     let id = sanitize_terminal_inline(&output.issue_id);
-    if output.results.is_empty() {
+    if output.history.is_empty() && output.legacy_results.is_empty() {
         ctx.info(&format!("No gate results recorded for {id}."));
     } else {
-        ctx.print_line(&format!("Gate results for {id}:"));
-        for result in &output.results {
+        ctx.print_line(&format!("Scoped gate history for {id}:"));
+        for result in &output.history {
             let verdict = if result.passed { "pass" } else { "fail" };
             let gate = sanitize_terminal_inline(&result.gate);
             let provider = sanitize_terminal_inline(&result.provider);
-            let mut line = format!("  {gate} [{provider}]: {verdict}");
+            let mut line = format!(
+                "  {gate} [{provider}]: {verdict} ({} -> {}, revision {})",
+                sanitize_terminal_inline(&result.from_status),
+                sanitize_terminal_inline(&result.to_status),
+                result.status_revision,
+            );
             if let Some(note) = &result.note {
                 line.push_str(&format!(" — {}", sanitize_terminal_inline(note)));
             }
             ctx.print_line(&line);
+        }
+        if !output.legacy_results.is_empty() {
+            ctx.warning(
+                "Legacy unscoped gate results follow; they are audit-only and cannot satisfy a transition.",
+            );
+            for result in &output.legacy_results {
+                let verdict = if result.passed { "pass" } else { "fail" };
+                ctx.print_line(&format!(
+                    "  {} [{}]: {} (legacy, unscoped)",
+                    sanitize_terminal_inline(&result.gate),
+                    sanitize_terminal_inline(&result.provider),
+                    verdict,
+                ));
+            }
         }
     }
 
@@ -320,6 +467,20 @@ mod tests {
         config::open_storage_with_cli(beads_dir, &CliOverrides::default()).expect("storage")
     }
 
+    fn write_gate_policy(beads_dir: &Path) {
+        fs::write(
+            beads_dir.join(close_policy::POLICY_FILE_NAME),
+            r#"workflow:
+  strict: true
+  gates:
+    "open -> closed":
+      require_all:
+        - ci_green
+"#,
+        )
+        .expect("write gate policy");
+    }
+
     fn make_issue(id: &str, status: Status) -> Issue {
         let now = chrono::Utc::now();
         Issue {
@@ -339,6 +500,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
+        write_gate_policy(&beads_dir);
         {
             let mut ctx = open_storage(&beads_dir);
             ctx.storage
@@ -351,6 +513,7 @@ mod tests {
             gate: "ci_green".to_string(),
             provider: "ci".to_string(),
             status: GateStatus::Pass,
+            to: Some("closed".to_string()),
             note: Some("build #42".to_string()),
             robot: true,
         };
@@ -358,7 +521,10 @@ mod tests {
         execute_report(&report, &CliOverrides::default(), &ctx, &beads_dir).unwrap();
 
         let storage_ctx = open_storage(&beads_dir);
-        let results = storage_ctx.storage.get_gate_results("bd-1").unwrap();
+        let results = storage_ctx
+            .storage
+            .get_scoped_gate_results("bd-1", "open", "closed")
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].gate, "ci_green");
         assert_eq!(results[0].provider, "ci");
@@ -371,6 +537,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
+        write_gate_policy(&beads_dir);
         {
             let mut ctx = open_storage(&beads_dir);
             ctx.storage
@@ -383,6 +550,7 @@ mod tests {
             gate: "ci_green".to_string(),
             provider: "ci".to_string(),
             status: GateStatus::Fail,
+            to: Some("closed".to_string()),
             note: None,
             robot: true,
         };
@@ -394,9 +562,20 @@ mod tests {
         execute_report(&pass, &CliOverrides::default(), &ctx, &beads_dir).unwrap();
 
         let storage_ctx = open_storage(&beads_dir);
-        let results = storage_ctx.storage.get_gate_results("bd-1").unwrap();
-        assert_eq!(results.len(), 1, "same (gate, provider) must overwrite");
+        let results = storage_ctx
+            .storage
+            .get_scoped_gate_results("bd-1", "open", "closed")
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the latest scoped verdict is effective"
+        );
         assert!(results[0].passed);
+        let history = storage_ctx.storage.get_gate_result_history("bd-1").unwrap();
+        assert_eq!(history.len(), 2, "gate history must remain append-only");
+        assert!(!history[0].passed);
+        assert!(history[1].passed);
     }
 
     #[test]
@@ -410,10 +589,35 @@ mod tests {
             gate: "   ".to_string(),
             provider: "ci".to_string(),
             status: GateStatus::Pass,
+            to: None,
             note: None,
             robot: true,
         };
         assert!(execute_report(&empty_gate, &CliOverrides::default(), &ctx, &beads_dir).is_err());
+    }
+
+    #[test]
+    fn report_target_must_disambiguate_multiple_guarded_transitions() {
+        let rule = GateRule {
+            require_all: vec![GateSpec::Named("ci_green".to_string())],
+            ..Default::default()
+        };
+        let workflow = Workflow {
+            strict: true,
+            gates: BTreeMap::from([
+                ("open -> in_review".to_string(), rule.clone()),
+                ("open -> closed".to_string(), rule),
+            ]),
+            ..Default::default()
+        };
+
+        let error = resolve_gate_target(&workflow, "open", None, "ci_green", &[], 2)
+            .expect_err("ambiguous gate target must be rejected");
+        assert!(error.to_string().contains("pass --to <status>"));
+
+        let target = resolve_gate_target(&workflow, "OPEN", Some("CLOSED"), "CI_GREEN", &[], 2)
+            .expect("an explicit target removes the ambiguity");
+        assert_eq!(target, "CLOSED");
     }
 
     #[test]
@@ -440,8 +644,9 @@ mod tests {
         };
 
         // No results yet: ci_green + min_reviewers required, security not (no label).
+        let no_results = BTreeMap::new();
         let transitions =
-            compute_gated_transitions(&workflow, "bd-1", Some("in_review"), &[], 2, &[]);
+            compute_gated_transitions(&workflow, "bd-1", Some("in_review"), &[], 2, &no_results);
         assert_eq!(transitions.len(), 1);
         let t = &transitions[0];
         assert_eq!(t.to, "closed");
@@ -466,16 +671,29 @@ mod tests {
                 note: None,
             },
         ];
-        let transitions =
-            compute_gated_transitions(&workflow, "bd-1", Some("in_review"), &[], 2, &results);
+        let results_by_target = BTreeMap::from([("closed".to_string(), results)]);
+        let transitions = compute_gated_transitions(
+            &workflow,
+            "bd-1",
+            Some("in_review"),
+            &[],
+            2,
+            &results_by_target,
+        );
         assert!(transitions[0].satisfied);
     }
 
     #[test]
     fn list_is_empty_without_gate_config() {
         let workflow = Workflow::default();
-        let transitions =
-            compute_gated_transitions(&workflow, "bd-1", Some("in_review"), &[], 2, &[]);
+        let transitions = compute_gated_transitions(
+            &workflow,
+            "bd-1",
+            Some("in_review"),
+            &[],
+            2,
+            &BTreeMap::new(),
+        );
         assert!(transitions.is_empty());
     }
 }

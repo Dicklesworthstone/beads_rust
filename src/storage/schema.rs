@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 14;
+pub const CURRENT_SCHEMA_VERSION: i32 = 15;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -286,6 +286,29 @@ pub const SCHEMA_SQL: &str = r"
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_gate_results_issue ON gate_results(issue_id);
+
+    -- Append-only, transition-scoped workflow gate history (GitHub #388).
+    -- `status_revision` is the latest status_changed event id observed when
+    -- the result is reported (zero for an imported/initial state). A result
+    -- can satisfy only the exact issue/from/to/revision tuple it records.
+    CREATE TABLE IF NOT EXISTS gate_result_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        from_status TEXT NOT NULL,
+        to_status TEXT NOT NULL,
+        status_revision INTEGER NOT NULL,
+        gate TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        recorded_by TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_result_history_issue
+        ON gate_result_history(issue_id, id);
+    CREATE INDEX IF NOT EXISTS idx_gate_result_history_scope
+        ON gate_result_history(issue_id, from_status, to_status, status_revision, id);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1648,6 +1671,37 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         rebuild_content_hashes_for_current_format(conn)?;
     }
 
+    // v15 (GitHub #388): preserve every workflow-gate verdict in an
+    // append-only table bound to an exact status revision and target
+    // transition. The legacy gate_results table is intentionally retained as
+    // historical, unscoped evidence; its rows never satisfy a v15 transition.
+    if user_version < 15 {
+        tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS gate_result_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                from_status TEXT NOT NULL,
+                to_status TEXT NOT NULL,
+                status_revision INTEGER NOT NULL,
+                gate TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                passed INTEGER NOT NULL DEFAULT 0,
+                note TEXT,
+                recorded_by TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_gate_result_history_issue
+                ON gate_result_history(issue_id, id);
+            CREATE INDEX IF NOT EXISTS idx_gate_result_history_scope
+                ON gate_result_history(issue_id, from_status, to_status, status_revision, id);
+        ",
+        )?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -2184,6 +2238,62 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM export_hashes")
             .unwrap();
         assert_eq!(export_row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
+    fn test_v15_adds_scoped_gate_history_without_reusing_legacy_results() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-gate-v15', 'Legacy gate', 'in_review', 2, 'task', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gate_results (issue_id, gate, provider, passed, recorded_by) \
+             VALUES ('bd-gate-v15', 'ci_green', 'ci', 1, 'legacy-bot')",
+        )
+        .unwrap();
+        conn.execute("DROP TABLE gate_result_history").unwrap();
+        conn.execute("PRAGMA user_version = 14").unwrap();
+
+        run_migrations(&conn, false).expect("v15 migration should succeed");
+
+        assert!(table_exists(&conn, "gate_result_history"));
+        for column in [
+            "id",
+            "issue_id",
+            "from_status",
+            "to_status",
+            "status_revision",
+            "gate",
+            "provider",
+            "passed",
+            "recorded_by",
+            "recorded_at",
+        ] {
+            assert!(
+                column_exists(&conn, "gate_result_history", column),
+                "v15 migration missing gate_result_history.{column}"
+            );
+        }
+        let history_count = conn
+            .query_row("SELECT COUNT(*) FROM gate_result_history")
+            .unwrap();
+        assert_eq!(
+            history_count.get(0).and_then(SqliteValue::as_integer),
+            Some(0),
+            "legacy unscoped results must not be promoted into an effective transition scope"
+        );
+        let legacy_count = conn.query_row("SELECT COUNT(*) FROM gate_results").unwrap();
+        assert_eq!(
+            legacy_count.get(0).and_then(SqliteValue::as_integer),
+            Some(1),
+            "migration must preserve legacy results for audit display"
+        );
     }
 
     /// Regression for beads_rust#290: legacy DBs that pre-date the

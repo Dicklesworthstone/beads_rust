@@ -659,6 +659,36 @@ in a multi-repository command is an independent SQLite transaction, so an
 earlier repository may already be committed if a later route fails; br does not
 claim distributed atomicity across repositories.
 
+Workflows can also require satisfied acceptance criteria and a fresh comment
+for an exact transition or every transition entering a target status. This is
+enabled by `required_fields` itself and does not require strict status mode:
+
+```yaml
+workflow:
+  required_fields:
+    in_review:
+      - transition_comment
+    "in_progress -> in_review":
+      - acceptance_criteria
+      - transition_comment
+```
+
+Pass the request-scoped comment with `br update --transition-comment`,
+`br close --transition-comment`, `br defer --transition-comment`, or
+`br undefer --transition-comment`; `br reopen --reason` is its transition
+comment, and `br epic close-eligible --transition-comment` applies one comment
+to every epic in its atomic batch. A historical comment never satisfies the
+rule. The prospective acceptance-criteria value must be non-empty and contain
+no unchecked markdown boxes. Any failure rolls back the status, other field
+updates, comments, and every sibling mutation in the repository-local batch.
+
+Named workflow gate verdicts are likewise bound to the issue's current status
+revision and an explicit target. Use `br gate report ... --to <STATUS>` when a
+gate can authorize multiple targets; the flag is optional only when the policy
+has one matching target. Leaving and later re-entering review invalidates prior
+passes without deleting their append-only audit history. Pre-v15 unscoped gate
+rows remain visible through `br gate list` but can never authorize a transition.
+
 The current enforcement layer uses repository scope and counts all matching
 issues. Hierarchy-aware counts, audited exemptions, additional actor/harness/
 session/subtree scopes, and capacity observability remain subsequent phases of

@@ -4,8 +4,7 @@ use crate::cli::ReopenArgs;
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-    report_auto_flush_failure, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
-    update_issues_atomically_with_recovery,
+    report_auto_flush_failure, resolve_issue_ids, update_issues_atomically_with_recovery,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
@@ -279,6 +278,10 @@ fn execute_route(
             deleted_at: Some(None),
             deleted_by: Some(None),
             delete_reason: Some(None),
+            transition_comment: args
+                .reason
+                .as_ref()
+                .map(|reason| format!("Reopened: {reason}")),
             skip_cache_rebuild: true,
             ..Default::default()
         };
@@ -310,24 +313,6 @@ fn execute_route(
 
     for (outcome_index, id, issue) in planned_reopens {
         tracing::info!(id = %id, reason = ?args.reason, "Issue reopened");
-
-        if let Some(ref reason) = args.reason {
-            let comment_text = format!("Reopened: {reason}");
-            tracing::debug!(id = %id, "Adding reopen comment");
-            let comment_result = retry_mutation_with_jsonl_recovery(
-                &mut storage_ctx,
-                !cache_dirty,
-                "reopen comment",
-                Some(id.as_str()),
-                |storage| storage.add_comment(&id, &actor, &comment_text),
-            );
-            preserve_blocked_cache_on_error(
-                &mut storage_ctx.storage,
-                cache_dirty,
-                "reopen",
-                comment_result,
-            )?;
-        }
 
         let reopened = ReopenedIssue {
             id: id.clone(),

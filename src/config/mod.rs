@@ -2327,7 +2327,7 @@ pub fn open_storage(
         false,
     )?;
     let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
-    storage.set_workflow_capacity_policy(workflow.capacity);
+    storage.set_workflow_policy(workflow);
     Ok((storage, startup.paths))
 }
 
@@ -2423,7 +2423,7 @@ impl OpenStorageResult {
         // intact — but recovery swaps in a brand-new `SqliteStorage`, which would
         // otherwise start with an empty pending slot and drop the attribution.
         let preserved_attribution = self.storage.take_pending_event_attribution();
-        let preserved_capacity_policy = self.storage.workflow_capacity_policy();
+        let preserved_workflow_policy = self.storage.workflow_policy();
 
         // Close the old connection before rebuilding at the same path.
         // fsqlite tracks pages by file path, so keeping the old connection
@@ -2441,8 +2441,7 @@ impl OpenStorageResult {
             self.allow_external_jsonl,
         )?;
         self.storage = storage;
-        self.storage
-            .set_workflow_capacity_policy(preserved_capacity_policy);
+        self.storage.set_workflow_policy(preserved_workflow_policy);
         if let Some(attribution) = preserved_attribution {
             self.storage.set_pending_event_attribution(attribution);
         }
@@ -2818,7 +2817,7 @@ fn open_storage_with_startup_config_impl(
         }
 
         let workflow = crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow;
-        storage.set_workflow_capacity_policy(workflow.capacity);
+        storage.set_workflow_policy(workflow);
 
         Ok(OpenStorageResult {
             storage,
@@ -2846,7 +2845,7 @@ fn open_storage_with_startup_config_impl(
             },
         )?;
         let workflow = crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow;
-        storage.set_workflow_capacity_policy(workflow.capacity);
+        storage.set_workflow_policy(workflow);
         Ok(OpenStorageResult {
             storage,
             paths,

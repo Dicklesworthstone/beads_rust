@@ -206,6 +206,17 @@ pub struct Workflow {
     /// block behave exactly as before layer 2.
     #[serde(default)]
     pub gates: std::collections::BTreeMap<String, GateRule>,
+    /// Fields that must be supplied or satisfied for a status transition
+    /// (GitHub #388). Keys may be an exact `"from -> to"` transition or a
+    /// bare target status that applies to every transition entering that
+    /// status. Exact and target rules compose, with duplicate fields removed.
+    ///
+    /// `transition_comment` is deliberately request-scoped: callers must
+    /// supply a non-empty comment with the status mutation, and storage writes
+    /// that comment in the same transaction as the transition. Historical
+    /// comments never satisfy this requirement.
+    #[serde(default)]
+    pub required_fields: std::collections::BTreeMap<String, Vec<TransitionRequiredField>>,
     /// Named status groups (issue #354). Currently only `ready` is consumed —
     /// it defines which statuses `br ready` (and the scheduler) treat as
     /// actionable work. When the `status_groups:` block (or the `ready:` key
@@ -451,6 +462,18 @@ pub struct GateRule {
     pub require_if: Vec<ConditionalGate>,
 }
 
+/// A field that workflow policy may require for a status transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionRequiredField {
+    /// The issue must have non-empty acceptance criteria with no unchecked
+    /// checklist items after applying the prospective update.
+    AcceptanceCriteria,
+    /// The transition request must carry a new, non-empty comment that is
+    /// committed atomically with the status change.
+    TransitionComment,
+}
+
 /// A single gate condition. Two shapes are accepted in YAML, mirroring the
 /// issue spec:
 ///
@@ -579,6 +602,25 @@ pub struct GateResult {
     pub note: Option<String>,
 }
 
+/// One append-only workflow-gate verdict bound to a status revision and
+/// target transition (GitHub #388).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateResultRecord {
+    pub id: i64,
+    pub issue_id: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub status_revision: i64,
+    pub gate: String,
+    pub provider: String,
+    pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_by: Option<String>,
+    pub recorded_at: String,
+}
+
 impl Workflow {
     /// True when gate enforcement is configured: `strict` is on *and* at least
     /// one `"from -> to"` gate rule is listed. Enforcement short-circuits on
@@ -636,6 +678,181 @@ impl Workflow {
         }
         out
     }
+
+    /// Compute required fields for one transition. Exact `from -> to` rules
+    /// and bare target-status rules compose; each field appears at most once.
+    #[must_use]
+    pub fn required_fields_for(
+        &self,
+        from: Option<&str>,
+        to: &str,
+    ) -> Vec<TransitionRequiredField> {
+        let mut required = Vec::new();
+        for (key, fields) in &self.required_fields {
+            let matches = if let Some((rule_from, rule_to)) = parse_transition_key(key) {
+                from.is_some_and(|actual_from| {
+                    rule_from.eq_ignore_ascii_case(actual_from) && rule_to.eq_ignore_ascii_case(to)
+                })
+            } else {
+                key.trim().eq_ignore_ascii_case(to)
+            };
+            if !matches {
+                continue;
+            }
+            for field in fields {
+                if !required.contains(field) {
+                    required.push(*field);
+                }
+            }
+        }
+        required
+    }
+
+    /// Validate transition-required-field policy at load time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for an empty key/list, malformed transition,
+    /// or a status outside a configured strict status vocabulary.
+    pub fn validate_required_fields(&self) -> Result<()> {
+        for (raw_key, fields) in &self.required_fields {
+            let key = raw_key.trim();
+            if key.is_empty() {
+                return Err(BeadsError::validation(
+                    "workflow.required_fields",
+                    "required-field rule keys must not be empty",
+                ));
+            }
+            if fields.is_empty() {
+                return Err(BeadsError::validation(
+                    "workflow.required_fields",
+                    format!("required-field rule '{key}' must name at least one field"),
+                ));
+            }
+
+            if key.match_indices("->").count() > 1 {
+                return Err(BeadsError::validation(
+                    "workflow.required_fields",
+                    format!(
+                        "malformed required-field transition '{key}' (expected exactly one 'from -> to' separator or a bare target status)"
+                    ),
+                ));
+            }
+
+            if let Some((from, to)) = parse_transition_key(key) {
+                if self.is_enforced() && (!self.allows(from) || !self.allows(to)) {
+                    return Err(BeadsError::validation(
+                        "workflow.required_fields",
+                        format!(
+                            "required-field transition '{key}' references a status outside the configured workflow: {}",
+                            self.allowed_list()
+                        ),
+                    ));
+                }
+            } else {
+                if key.contains("->") {
+                    return Err(BeadsError::validation(
+                        "workflow.required_fields",
+                        format!(
+                            "malformed required-field transition '{key}' (expected 'from -> to' or a bare target status)"
+                        ),
+                    ));
+                }
+                if self.is_enforced() && !self.allows(key) {
+                    return Err(BeadsError::validation(
+                        "workflow.required_fields",
+                        format!(
+                            "required-field target '{key}' is outside the configured workflow: {}",
+                            self.allowed_list()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Evaluate policy-required fields against the prospective issue state and
+/// request-scoped transition comment.
+#[must_use]
+pub fn evaluate_transition_required_fields(
+    workflow: &Workflow,
+    issue_id: &str,
+    from: Option<&str>,
+    to: &str,
+    acceptance_criteria: Option<&str>,
+    transition_comment: Option<&str>,
+) -> Vec<PolicyViolation> {
+    let required = workflow.required_fields_for(from, to);
+    let mut violations = Vec::new();
+
+    for field in required {
+        match field {
+            TransitionRequiredField::AcceptanceCriteria => {
+                let criteria = acceptance_criteria.map(str::trim).unwrap_or_default();
+                if criteria.is_empty() {
+                    violations.push(PolicyViolation {
+                        gate: "transition_acceptance_criteria_missing".to_string(),
+                        message: format!(
+                            "transition '{} -> {to}' requires non-empty acceptance criteria for {issue_id}",
+                            from.unwrap_or("initial")
+                        ),
+                        detail: Some(serde_json::json!({
+                            "issue_id": issue_id,
+                            "from": from,
+                            "to": to,
+                            "required_field": "acceptance_criteria",
+                            "reason": "missing",
+                        })),
+                    });
+                    continue;
+                }
+
+                // This value comes from the dedicated acceptance_criteria
+                // column, so every checklist item in it is a criterion even
+                // when operators organize the field with custom headings.
+                let unchecked = find_unchecked_checklist_items(criteria);
+                if !unchecked.is_empty() {
+                    violations.push(PolicyViolation {
+                        gate: "transition_acceptance_criteria_unchecked".to_string(),
+                        message: format!(
+                            "transition '{} -> {to}' requires all acceptance criteria to be satisfied for {issue_id}; {} unchecked item(s) remain",
+                            from.unwrap_or("initial"),
+                            unchecked.len()
+                        ),
+                        detail: Some(serde_json::json!({
+                            "issue_id": issue_id,
+                            "from": from,
+                            "to": to,
+                            "required_field": "acceptance_criteria",
+                            "reason": "unchecked",
+                            "unchecked": unchecked,
+                        })),
+                    });
+                }
+            }
+            TransitionRequiredField::TransitionComment => {
+                if transition_comment.map(str::trim).is_none_or(str::is_empty) {
+                    violations.push(PolicyViolation {
+                        gate: "transition_comment_missing".to_string(),
+                        message: format!(
+                            "transition '{} -> {to}' requires a new non-empty transition comment for {issue_id}",
+                            from.unwrap_or("initial")
+                        ),
+                        detail: Some(serde_json::json!({
+                            "issue_id": issue_id,
+                            "from": from,
+                            "to": to,
+                            "required_field": "transition_comment",
+                            "reason": "missing",
+                        })),
+                    });
+                }
+            }
+        }
+    }
+    violations
 }
 
 /// Parse a `"from -> to"` transition key into its two sides, trimming
@@ -691,9 +908,7 @@ pub fn evaluate_gates(
     for spec in &required {
         match spec {
             GateSpec::Named(name) => {
-                let passed = results
-                    .iter()
-                    .any(|r| r.gate.eq_ignore_ascii_case(name) && r.passed);
+                let passed = gate_spec_satisfied(spec, results);
                 if !passed {
                     let failing: Vec<&str> = results
                         .iter()
@@ -710,7 +925,7 @@ pub fn evaluate_gates(
                         message: format!(
                             "transition '{from}' -> '{to}' requires gate '{name}' to pass for {issue_id}, \
                              but {detail_note}. Record a result with \
-                             `br gate report {issue_id} --gate {name} --provider <name> --status pass`."
+                             `br gate report {issue_id} --gate {name} --provider <name> --status pass --to {to}`."
                         ),
                         detail: Some(serde_json::json!({
                             "issue_id": issue_id,
@@ -731,13 +946,13 @@ pub fn evaluate_gates(
                 reviewers.sort_unstable();
                 reviewers.dedup();
                 let count = u32::try_from(reviewers.len()).unwrap_or(u32::MAX);
-                if count < *n {
+                if !gate_spec_satisfied(spec, results) {
                     violations.push(PolicyViolation {
                         gate: format!("gate_{GATE_MIN_REVIEWERS}"),
                         message: format!(
                             "transition '{from}' -> '{to}' requires at least {n} reviewer(s) to pass for \
                              {issue_id}, but only {count} distinct reviewer(s) have. Record a review with \
-                             `br gate report {issue_id} --gate {GATE_MIN_REVIEWERS} --provider reviewer:<who> --status pass`."
+                             `br gate report {issue_id} --gate {GATE_MIN_REVIEWERS} --provider reviewer:<who> --status pass --to {to}`."
                         ),
                         detail: Some(serde_json::json!({
                             "issue_id": issue_id,
@@ -754,6 +969,28 @@ pub fn evaluate_gates(
         }
     }
     violations
+}
+
+/// Whether one required gate is satisfied by an effective scoped result set.
+/// Kept separate so storage can distinguish a genuinely missing gate from a
+/// pass that satisfied an earlier, now-stale status revision.
+#[must_use]
+pub(crate) fn gate_spec_satisfied(spec: &GateSpec, results: &[GateResult]) -> bool {
+    match spec {
+        GateSpec::Named(name) => results
+            .iter()
+            .any(|result| result.gate.eq_ignore_ascii_case(name) && result.passed),
+        GateSpec::MinReviewers(required) => {
+            let mut reviewers = results
+                .iter()
+                .filter(|result| result.passed && is_reviewer_provider(&result.provider))
+                .map(|result| result.provider.to_ascii_lowercase())
+                .collect::<Vec<_>>();
+            reviewers.sort_unstable();
+            reviewers.dedup();
+            u32::try_from(reviewers.len()).unwrap_or(u32::MAX) >= *required
+        }
+    }
 }
 
 /// True when `provider` is recognised as a reviewer for the `min_reviewers`
@@ -1806,6 +2043,25 @@ pub fn find_unchecked_acceptance_criteria(body: &str) -> Vec<String> {
     out
 }
 
+/// Locate every unchecked markdown checklist item outside fenced code.
+///
+/// Unlike [`find_unchecked_acceptance_criteria`], this deliberately ignores
+/// section headings. It is used only for the dedicated `acceptance_criteria`
+/// field, where the entire value is criteria by definition.
+fn find_unchecked_checklist_items(body: &str) -> Vec<String> {
+    let mut fence_marker = None;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if update_code_fence(line, &mut fence_marker) || fence_marker.is_some() {
+            continue;
+        }
+        if let Some(item) = parse_unchecked_box(line.trim_start()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
 fn has_markdown_heading_outside_fences(body: &str) -> bool {
     let mut fence_marker = None;
     for line in body.lines() {
@@ -1922,6 +2178,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
         BeadsError::Config(format!("failed to parse {}: {}", path.display(), err))
     })?;
     document.workflow.validate_capacity()?;
+    document.workflow.validate_required_fields()?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -2028,6 +2285,7 @@ impl PolicyNode {
                 // detection (their shape is validated at parse time by the
                 // typed `GateRule`/`GateSpec` deserialisers).
                 ("gates", Self::Scalar),
+                ("required_fields", Self::Scalar),
                 ("status_groups", Self::StatusGroups),
                 // Capacity owns a strict typed schema with
                 // `deny_unknown_fields`; its nested keys are validated by
@@ -2104,6 +2362,109 @@ mod tests {
             workflow.ready_status_group(),
             vec!["open".to_string(), "rework".to_string()]
         );
+    }
+
+    #[test]
+    fn transition_required_fields_compose_exact_and_target_rules() {
+        // Required fields are opt-in by the presence of the map itself. They
+        // intentionally do not depend on strict status-vocabulary enforcement.
+        let mut workflow = Workflow::default();
+        workflow.required_fields.insert(
+            "in_review".to_string(),
+            vec![TransitionRequiredField::TransitionComment],
+        );
+        workflow.required_fields.insert(
+            "in_progress -> in_review".to_string(),
+            vec![
+                TransitionRequiredField::AcceptanceCriteria,
+                TransitionRequiredField::TransitionComment,
+            ],
+        );
+
+        assert_eq!(
+            workflow.required_fields_for(Some("IN_PROGRESS"), "In_Review"),
+            vec![
+                TransitionRequiredField::AcceptanceCriteria,
+                TransitionRequiredField::TransitionComment,
+            ]
+        );
+        assert_eq!(
+            workflow.required_fields_for(Some("open"), "in_review"),
+            vec![TransitionRequiredField::TransitionComment]
+        );
+        assert!(
+            workflow
+                .required_fields_for(Some("open"), "closed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn transition_required_fields_report_missing_and_unchecked_values() {
+        let mut workflow = Workflow::default();
+        workflow.required_fields.insert(
+            "in_progress -> in_review".to_string(),
+            vec![
+                TransitionRequiredField::AcceptanceCriteria,
+                TransitionRequiredField::TransitionComment,
+            ],
+        );
+
+        let missing = evaluate_transition_required_fields(
+            &workflow,
+            "bd-1",
+            Some("in_progress"),
+            "in_review",
+            None,
+            Some("  "),
+        );
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0].gate, "transition_acceptance_criteria_missing");
+        assert_eq!(missing[1].gate, "transition_comment_missing");
+
+        let unchecked = evaluate_transition_required_fields(
+            &workflow,
+            "bd-1",
+            Some("in_progress"),
+            "in_review",
+            Some("## Phase one\n- [x] Built\n## Phase two\n- [ ] Verified\n"),
+            Some("Ready for a fresh review"),
+        );
+        assert_eq!(unchecked.len(), 1);
+        assert_eq!(
+            unchecked[0].gate,
+            "transition_acceptance_criteria_unchecked"
+        );
+        assert_eq!(
+            unchecked[0].detail.as_ref().unwrap()["unchecked"][0],
+            "Verified"
+        );
+
+        assert!(
+            evaluate_transition_required_fields(
+                &workflow,
+                "bd-1",
+                Some("in_progress"),
+                "in_review",
+                Some("- [x] Built\n- [X] Verified\n"),
+                Some("Ready for a fresh review"),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn transition_required_fields_reject_malformed_multi_arrow_rule() {
+        let mut workflow = Workflow {
+            strict: true,
+            ..Default::default()
+        };
+        workflow.required_fields.insert(
+            "open -> review -> closed".to_string(),
+            vec![TransitionRequiredField::TransitionComment],
+        );
+        let error = workflow.validate_required_fields().unwrap_err();
+        assert!(error.to_string().contains("exactly one"));
     }
 
     #[test]

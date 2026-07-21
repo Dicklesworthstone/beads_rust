@@ -304,6 +304,7 @@ fn execute_defer_route(
         let update = IssueUpdate {
             status: Some(Status::Deferred),
             defer_until: Some(defer_until),
+            transition_comment: args.transition_comment.clone(),
             skip_cache_rebuild: true,
             ..Default::default()
         };
@@ -597,6 +598,10 @@ fn execute_undefer_route(
         };
 
         let update = IssueUpdate {
+            transition_comment: status_update
+                .as_ref()
+                .and(args.transition_comment.as_ref())
+                .cloned(),
             status: status_update,
             defer_until: Some(None),
             skip_cache_rebuild: true,

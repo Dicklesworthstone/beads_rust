@@ -4,12 +4,11 @@ use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
-use crate::model::{EpicStatus, EventType, IssueType};
+use crate::model::{EpicStatus, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::{ListFilters, SqliteStorage};
+use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;
-use fsqlite_types::value::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 
@@ -180,9 +179,15 @@ fn execute_close_eligible(
     }
 
     let now = Utc::now();
-    let now_str = now.to_rfc3339();
     let reason = "All children completed";
-    let closed_ids = close_eligible_epics_atomically(storage, &epics, &actor, &now_str, reason)?;
+    let closed_ids = close_eligible_epics_atomically(
+        storage,
+        &epics,
+        &actor,
+        now,
+        reason,
+        args.transition_comment.as_deref(),
+    )?;
     let capacity_warnings = storage.take_capacity_warnings();
 
     storage_ctx.flush_no_db_if_dirty()?;
@@ -224,55 +229,32 @@ fn close_eligible_epics_atomically(
     storage: &mut SqliteStorage,
     epics: &[EpicStatus],
     actor: &str,
-    now: &str,
+    now: chrono::DateTime<Utc>,
     reason: &str,
+    transition_comment: Option<&str>,
 ) -> Result<Vec<String>> {
-    let capacity_policy = storage.workflow_capacity_policy();
-    let mut closed_ids = Vec::new();
+    let updates = epics
+        .iter()
+        .map(|epic_status| {
+            (
+                epic_status.epic.id.clone(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    closed_at: Some(Some(now)),
+                    close_reason: Some(Some(reason.to_string())),
+                    transition_comment: transition_comment.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
 
-    // The final-state capacity precondition and every close share this
-    // transaction. A capacity-neutral batch is independent of epic order, and
-    // any rejection rolls back every update.
-    storage.mutate("close_eligible_epics", actor, |conn, ctx| {
-        let capacity_transitions = epics
-            .iter()
-            .map(|epic_status| {
-                (
-                    epic_status.epic.id.clone(),
-                    Some(epic_status.epic.status.as_str().to_string()),
-                    "closed".to_string(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let capacity_warnings = SqliteStorage::enforce_workflow_capacity_batch_in_tx(
-            conn,
-            &capacity_policy,
-            &capacity_transitions,
-        )?;
-        ctx.capacity_warnings.extend(capacity_warnings);
-
-        for epic_status in epics {
-            let id = &epic_status.epic.id;
-            let rows = conn.execute_with_params(
-                "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
-                &[
-                    SqliteValue::from(now),
-                    SqliteValue::from(now),
-                    SqliteValue::from(reason),
-                    SqliteValue::from(id.as_str()),
-                ],
-            )?;
-
-            if rows > 0 {
-                closed_ids.push(id.clone());
-                ctx.record_event(EventType::Closed, id, Some(reason.to_string()));
-                ctx.mark_dirty(id);
-            }
-        }
-        ctx.invalidate_cache();
-        Ok(())
-    })?;
-    Ok(closed_ids)
+    // The shared storage chokepoint preflights required fields, transition
+    // gates, and final-state capacity for the entire batch before mutating any
+    // epic. It then records comments, status/close events, and dirty markers in
+    // that same transaction.
+    storage.update_issues_atomically(&updates, actor)?;
+    Ok(updates.into_iter().map(|(id, _)| id).collect())
 }
 
 fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
@@ -742,8 +724,9 @@ mod tests {
             &mut storage,
             &epics,
             "tester",
-            &Utc::now().to_rfc3339(),
+            Utc::now(),
             "All children completed",
+            None,
         )
         .unwrap_err();
         assert!(matches!(
@@ -768,8 +751,9 @@ mod tests {
             &mut storage,
             &epics,
             "tester",
-            &Utc::now().to_rfc3339(),
+            Utc::now(),
             "All children completed",
+            None,
         )
         .unwrap();
         assert_eq!(closed.len(), 2);

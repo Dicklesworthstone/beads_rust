@@ -2019,6 +2019,141 @@ fn e2e_structured_error_not_initialized() {
 }
 
 #[test]
+fn e2e_transition_required_fields_are_structured_fresh_and_atomic() {
+    let _log = common::test_log("e2e_transition_required_fields_are_structured_fresh_and_atomic");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "required_fields_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let issue = run_br(
+        &workspace,
+        ["create", "Review candidate"],
+        "required_fields_create",
+    );
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let id = parse_created_id(&issue.stdout);
+    let claim = run_br(
+        &workspace,
+        ["update", &id, "--status", "in_progress"],
+        "required_fields_claim",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    let old_comment = run_br(
+        &workspace,
+        [
+            "comments",
+            "add",
+            &id,
+            "--message",
+            "historical review note",
+        ],
+        "required_fields_old_comment",
+    );
+    assert!(
+        old_comment.status.success(),
+        "historical comment failed: {}",
+        old_comment.stderr
+    );
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r#"
+workflow:
+  required_fields:
+    "in_progress -> in_review":
+      - acceptance_criteria
+      - transition_comment
+"#,
+    )
+    .expect("write required-fields policy");
+
+    let missing_comment = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "in_review",
+            "--acceptance-criteria",
+            "- [x] Exercised",
+            "--json",
+        ],
+        "required_fields_missing_comment",
+    );
+    assert!(!missing_comment.status.success());
+    assert_eq!(missing_comment.status.code(), Some(4));
+    let json = parse_error_json(&missing_comment.stdout).expect("structured policy error");
+    assert!(verify_error_structure(&json));
+    assert_eq!(json["error"]["code"], "POLICY_VIOLATION");
+    assert_eq!(json["error"]["context"]["issue_id"], id);
+    let violations = json["error"]["context"]["violations"]
+        .as_array()
+        .expect("violations");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["gate"], "transition_comment_missing");
+    assert_eq!(
+        violations[0]["detail"]["required_field"],
+        "transition_comment"
+    );
+
+    let unchecked = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "in_review",
+            "--acceptance-criteria",
+            "- [ ] Still pending",
+            "--transition-comment",
+            "fresh attempt",
+        ],
+        "required_fields_unchecked_human",
+    );
+    assert!(!unchecked.status.success());
+    assert!(unchecked.stderr.contains("acceptance criteria"));
+    assert!(unchecked.stderr.contains("unchecked"));
+
+    let storage = SqliteStorage::open(&workspace.root.join(".beads").join("beads.db"))
+        .expect("open storage after rejected transitions");
+    let unchanged = storage.get_issue(&id).unwrap().unwrap();
+    assert_eq!(unchanged.status.as_str(), "in_progress");
+    assert!(unchanged.acceptance_criteria.is_none());
+    assert_eq!(storage.get_comments(&id).unwrap().len(), 1);
+    drop(storage);
+
+    let accepted = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "in_review",
+            "--acceptance-criteria",
+            "- [x] Exercised",
+            "--transition-comment",
+            "fresh attempt",
+        ],
+        "required_fields_accepted",
+    );
+    assert!(
+        accepted.status.success(),
+        "update failed: {}",
+        accepted.stderr
+    );
+    let storage = SqliteStorage::open(&workspace.root.join(".beads").join("beads.db"))
+        .expect("open storage after accepted transition");
+    let transitioned = storage.get_issue(&id).unwrap().unwrap();
+    assert_eq!(transitioned.status.as_str(), "in_review");
+    assert_eq!(
+        transitioned.acceptance_criteria.as_deref(),
+        Some("- [x] Exercised")
+    );
+    let comments = storage.get_comments(&id).unwrap();
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[1].body, "fresh attempt");
+}
+
+#[test]
 fn e2e_workflow_capacity_rejection_is_structured_and_atomic() {
     let _log = common::test_log("e2e_workflow_capacity_rejection_is_structured_and_atomic");
     let workspace = BrWorkspace::new();

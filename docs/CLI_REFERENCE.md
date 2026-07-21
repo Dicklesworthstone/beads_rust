@@ -380,6 +380,7 @@ br update [OPTIONS] [IDS]...
 | `--design <TEXT>` | Update design notes |
 | `--acceptance-criteria <TEXT>` | Update acceptance criteria |
 | `--notes <TEXT>` | Update additional notes |
+| `--transition-comment <TEXT>` | Add a fresh comment atomically with a status transition |
 | `-s, --status <STATUS>` | Change status |
 | `-p, --priority <N>` | Change priority |
 | `-t, --type <TYPE>` | Change issue type |
@@ -426,6 +427,7 @@ br close [OPTIONS] [IDS]...
 | Option | Description |
 |--------|-------------|
 | `-r, --reason <TEXT>` | Close reason |
+| `--transition-comment <TEXT>` | Add a fresh comment atomically with the close transition |
 | `-f, --force` | Close even if blocked by open dependencies |
 | `--suggest-next` | Return newly unblocked issues |
 | `--session <ID>` | Session ID for tracking |
@@ -944,7 +946,7 @@ br epic <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `status [--eligible-only]` | Show epic status with child progress and eligibility |
-| `close-eligible [--dry-run]` | Close epics that are eligible because all children are closed |
+| `close-eligible [--dry-run] [--transition-comment <TEXT>]` | Atomically close eligible epics; attach one fresh transition comment to each |
 
 ---
 
@@ -988,6 +990,7 @@ br undefer <IDS>... [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--until <DATE>` | Defer until date |
+| `--transition-comment <TEXT>` | Add a fresh comment atomically with each status transition |
 | `--robot` | Machine-readable output |
 
 ---
@@ -1048,7 +1051,7 @@ br gate list <ID> [OPTIONS]
 **Subcommands:**
 | Command | Description |
 |---------|-------------|
-| `report <ID> --gate <NAME> --provider <NAME> --status pass\|fail` | Record a gate result (external systems / reviewers report here) |
+| `report <ID> --gate <NAME> --provider <NAME> --status pass\|fail [--to <STATUS>]` | Append a transition-scoped gate result (external systems / reviewers report here) |
 | `list <ID>` | List recorded gate results and the computed required-gate status for the issue's next transitions |
 
 **`report` options:**
@@ -1057,6 +1060,7 @@ br gate list <ID> [OPTIONS]
 | `--gate <NAME>` | Gate name (e.g. `ci_green`, `security_sign_off`, `min_reviewers`) |
 | `--provider <NAME>` | Reporting provider (e.g. `ci`, `security`, `reviewer:alice`) |
 | `--status <pass\|fail>` | Result status |
+| `--to <STATUS>` | Target transition; optional only when exactly one configured target requires this gate |
 | `--note <TEXT>` | Optional free-form note recorded with the result |
 | `--robot` | Machine-readable JSON output |
 
@@ -1065,14 +1069,24 @@ br gate list <ID> [OPTIONS]
 |--------|-------------|
 | `--robot` | Machine-readable JSON output |
 
-A re-report from the same provider for the same gate overwrites the prior
-verdict. The built-in `min_reviewers` gate is satisfied by at least N distinct
+A re-report appends to immutable history; only the latest result from each
+`(gate, provider)` in the exact `(issue, source, target, status revision)` scope
+is effective. Leaving and later re-entering the source status creates a new
+revision, so an earlier review pass cannot authorize the new attempt. Legacy
+pre-v15 unscoped results remain audit-visible but never satisfy a transition.
+The built-in `min_reviewers` gate is satisfied by at least N distinct
 reviewer providers (provider name `reviewer`, or namespaced `reviewer:<who>` /
 `reviewer-<who>`) reporting `pass`. Example policy:
 
 ```yaml
 workflow:
   strict: true
+  required_fields:
+    in_review:
+      - transition_comment
+    "in_progress -> in_review":
+      - acceptance_criteria
+      - transition_comment
   gates:
     "in_review -> closed":
       require_all:
@@ -1084,6 +1098,16 @@ workflow:
         - priority: [0, 1]
           gate: security_sign_off
 ```
+
+`required_fields` accepts exact `"from -> to"` keys and bare target-status
+keys; matching rules compose. `acceptance_criteria` validates the prospective
+field value and rejects any unchecked markdown checklist item.
+`transition_comment` must be a new non-empty comment carried by the same
+request; old comments are intentionally ignored. Validation and comment/status
+mutation share one transaction, and a failed item rolls back the entire
+repository-local batch. Supply comments with `update`, `close`, `defer`, and
+`undefer` via `--transition-comment`; `reopen --reason` and
+`epic close-eligible --transition-comment` use the same atomic path.
 
 ---
 

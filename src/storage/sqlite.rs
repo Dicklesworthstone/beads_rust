@@ -389,6 +389,10 @@ pub struct SqliteStorage {
     /// happens inside the same `BEGIN IMMEDIATE` transaction as the status
     /// mutation, closing the count-then-transition race from GitHub #384.
     workflow_capacity_policy: crate::close_policy::CapacityPolicy,
+    /// Strict transition policy loaded by the command/config layer. This owns
+    /// attempt-scoped gates and transition-required fields; enforcement occurs
+    /// inside the same write transaction as the status change (GitHub #388).
+    workflow_transition_policy: crate::close_policy::Workflow,
     /// Advisory capacity evidence produced by the most recently committed
     /// mutation. Cleared at the start of every mutation and consumed by the
     /// command layer immediately after success, so warnings cannot leak into
@@ -1108,6 +1112,7 @@ impl SqliteStorage {
             temp_db_path: None,
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         })
     }
@@ -1143,6 +1148,7 @@ impl SqliteStorage {
             temp_db_path: None,
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         }))
     }
@@ -1194,6 +1200,7 @@ impl SqliteStorage {
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         })
     }
@@ -1220,6 +1227,9 @@ impl SqliteStorage {
             DROP TABLE IF EXISTS comments;
             DROP TABLE IF EXISTS labels;
             DROP TABLE IF EXISTS dependencies;
+            DROP TABLE IF EXISTS gate_result_history;
+            DROP TABLE IF EXISTS gate_results;
+            DROP TABLE IF EXISTS close_metadata;
             DROP TABLE IF EXISTS issues;
             ",
         )?;
@@ -1384,6 +1394,9 @@ impl SqliteStorage {
             ("export_hashes", "issue_id"),
             ("blocked_issues_cache", "issue_id"),
             ("child_counters", "parent_id"),
+            ("close_metadata", "issue_id"),
+            ("gate_result_history", "issue_id"),
+            ("gate_results", "issue_id"),
         ];
         if !ALLOWED_PAIRS.contains(&(table, column)) {
             return Err(crate::error::BeadsError::Config(format!(
@@ -1421,6 +1434,9 @@ impl SqliteStorage {
             ("export_hashes", "issue_id"),
             ("blocked_issues_cache", "issue_id"),
             ("child_counters", "parent_id"),
+            ("close_metadata", "issue_id"),
+            ("gate_result_history", "issue_id"),
+            ("gate_results", "issue_id"),
         ];
 
         let mut violations = Vec::new();
@@ -2013,79 +2029,327 @@ impl SqliteStorage {
         }))
     }
 
-    /// Record a workflow gate result (issue #312, layer 2 / beads_rust#319).
+    /// Append a workflow-gate verdict for the issue's current status revision
+    /// and one explicit target transition (GitHub #388).
     ///
-    /// Upserts one row per `(issue_id, gate, provider)`: a provider's
-    /// most-recent verdict for a named gate on an issue. A re-report from the
-    /// same provider for the same gate overwrites the prior verdict, so the
-    /// table always reflects the currently-effective gate state.
-    ///
-    /// Gate results are auxiliary, project-local metadata: like
-    /// `close_metadata`, they are not part of the JSONL sync surface (the
-    /// audit trail is the DB), so this writes directly rather than going
-    /// through the dirty-issue export path.
+    /// The current status and latest `status_changed` event id are read inside
+    /// the same `BEGIN IMMEDIATE` transaction as the insert and must still
+    /// match the caller's expected scope. A concurrent transition therefore
+    /// rejects the report instead of making its verdict land on the wrong
+    /// review cycle.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database write fails.
-    pub fn record_gate_result(
+    /// Returns an error if the issue is missing or the database write fails.
+    pub fn record_scoped_gate_result(
         &self,
         issue_id: &str,
+        expected_from_status: &str,
+        expected_status_revision: i64,
+        to_status: &str,
         gate: &str,
         provider: &str,
         passed: bool,
         note: Option<&str>,
         recorded_by: &str,
-    ) -> Result<()> {
-        self.conn.execute_with_params(
-            "INSERT OR REPLACE INTO gate_results (
-                issue_id, gate, provider, passed, note, recorded_by, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            &[
-                SqliteValue::from(issue_id),
-                SqliteValue::from(gate),
-                SqliteValue::from(provider),
-                SqliteValue::from(i64::from(passed)),
-                note.map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(recorded_by),
-            ],
-        )?;
-        Ok(())
+    ) -> Result<crate::close_policy::GateResultRecord> {
+        let to_status = to_status.trim().to_ascii_lowercase();
+        let gate = gate.trim();
+        let provider = provider.trim();
+        if to_status.is_empty() {
+            return Err(BeadsError::validation(
+                "to",
+                "gate target status must not be empty",
+            ));
+        }
+        if gate.is_empty() {
+            return Err(BeadsError::validation(
+                "gate",
+                "gate name must not be empty",
+            ));
+        }
+        if provider.is_empty() {
+            return Err(BeadsError::validation(
+                "provider",
+                "gate provider must not be empty",
+            ));
+        }
+        let mut recorded = None;
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            let issue = Self::get_issue_from_conn(conn, issue_id)?.ok_or_else(|| {
+                BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                }
+            })?;
+            let from_status = issue.status.as_str().trim().to_ascii_lowercase();
+            let status_revision = Self::status_revision_in_tx(conn, issue_id)?;
+            if !from_status.eq_ignore_ascii_case(expected_from_status.trim())
+                || status_revision != expected_status_revision
+            {
+                return Err(BeadsError::validation(
+                    "gate_scope",
+                    format!(
+                        "issue {issue_id} changed from status '{}' revision {} to status '{}' revision {} while the gate report was prepared; retry against the current transition attempt",
+                        expected_from_status.trim(),
+                        expected_status_revision,
+                        from_status,
+                        status_revision,
+                    ),
+                ));
+            }
+
+            conn.execute_with_params(
+                "INSERT INTO gate_result_history (
+                    issue_id, from_status, to_status, status_revision, gate,
+                    provider, passed, note, recorded_by, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(from_status.as_str()),
+                    SqliteValue::from(to_status.as_str()),
+                    SqliteValue::from(status_revision),
+                    SqliteValue::from(gate),
+                    SqliteValue::from(provider),
+                    SqliteValue::from(i64::from(passed)),
+                    note.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(recorded_by),
+                ],
+            )?;
+            let row = conn.query_row("SELECT last_insert_rowid()")?;
+            let id = row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    BeadsError::Config(
+                        "gate-result insert did not return last_insert_rowid".to_string(),
+                    )
+                })?;
+            let rows = conn.query_with_params(
+                "SELECT id, issue_id, from_status, to_status, status_revision,
+                        gate, provider, passed, note, recorded_by, recorded_at
+                 FROM gate_result_history WHERE id = ?",
+                &[SqliteValue::from(id)],
+            )?;
+            let row = rows.first().ok_or_else(|| {
+                BeadsError::Config(format!("gate-result history row {id} missing after insert"))
+            })?;
+            recorded = Some(gate_result_record_from_row(row)?);
+            Ok(())
+        })?;
+        recorded.ok_or_else(|| {
+            BeadsError::internal("gate-result transaction committed without a result row")
+        })
     }
 
-    /// Read every recorded gate result for `issue_id`, ordered by gate then
-    /// provider for deterministic output. Returns an empty vec when the
-    /// `gate_results` table is absent (e.g. a database that predates the v12
-    /// migration and has not been reopened) or no results exist.
+    fn status_revision_in_tx(conn: &Connection, issue_id: &str) -> Result<i64> {
+        let rows = conn.query_with_params(
+            "SELECT id FROM events
+             WHERE issue_id = ? AND event_type = 'status_changed'
+             ORDER BY id DESC LIMIT 1",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0))
+    }
+
+    /// Return the current status-revision id for an issue.
     ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
-    pub fn get_gate_results(&self, issue_id: &str) -> Result<Vec<crate::close_policy::GateResult>> {
+    pub fn status_revision(&self, issue_id: &str) -> Result<i64> {
+        Self::status_revision_in_tx(&self.conn, issue_id)
+    }
+
+    /// Return the latest verdict from each `(gate, provider)` for an exact
+    /// issue/from/to/current-revision scope. Earlier verdicts remain in the
+    /// append-only history but are not effective.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_scoped_gate_results(
+        &self,
+        issue_id: &str,
+        from_status: &str,
+        to_status: &str,
+    ) -> Result<Vec<crate::close_policy::GateResult>> {
+        let status_revision = self.status_revision(issue_id)?;
+        let from_status = from_status.trim().to_ascii_lowercase();
+        let to_status = to_status.trim().to_ascii_lowercase();
+        Self::get_scoped_gate_results_in_tx(
+            &self.conn,
+            issue_id,
+            &from_status,
+            &to_status,
+            status_revision,
+        )
+    }
+
+    fn get_scoped_gate_results_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        from_status: &str,
+        to_status: &str,
+        status_revision: i64,
+    ) -> Result<Vec<crate::close_policy::GateResult>> {
+        if !crate::storage::schema::table_exists(conn, "gate_result_history") {
+            return Ok(Vec::new());
+        }
+        let from_status = from_status.trim().to_ascii_lowercase();
+        let to_status = to_status.trim().to_ascii_lowercase();
+        let rows = conn.query_with_params(
+            "SELECT gate, provider, passed, note
+             FROM gate_result_history
+             WHERE issue_id = ? AND from_status = ? AND to_status = ?
+               AND status_revision = ?
+             ORDER BY id ASC",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(from_status.as_str()),
+                SqliteValue::from(to_status.as_str()),
+                SqliteValue::from(status_revision),
+            ],
+        )?;
+
+        let mut effective = BTreeMap::new();
+        for row in &rows {
+            let Some(gate) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(provider) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let result = crate::close_policy::GateResult {
+                gate: gate.to_string(),
+                provider: provider.to_string(),
+                passed: row
+                    .get(2)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or_default()
+                    != 0,
+                note: row.get(3).and_then(SqliteValue::as_text).map(String::from),
+            };
+            effective.insert(
+                (gate.to_ascii_lowercase(), provider.to_ascii_lowercase()),
+                result,
+            );
+        }
+        Ok(effective.into_values().collect())
+    }
+
+    fn prior_satisfying_gate_revisions_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        from_status: &str,
+        to_status: &str,
+        current_revision: i64,
+        spec: &crate::close_policy::GateSpec,
+    ) -> Result<Vec<i64>> {
+        let from_status = from_status.trim().to_ascii_lowercase();
+        let to_status = to_status.trim().to_ascii_lowercase();
+        let rows = conn.query_with_params(
+            "SELECT status_revision, gate, provider, passed, note
+             FROM gate_result_history
+             WHERE issue_id = ? AND from_status = ? AND to_status = ?
+               AND status_revision != ?
+             ORDER BY id ASC",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(from_status.as_str()),
+                SqliteValue::from(to_status.as_str()),
+                SqliteValue::from(current_revision),
+            ],
+        )?;
+        let mut by_revision =
+            BTreeMap::<i64, BTreeMap<(String, String), crate::close_policy::GateResult>>::new();
+        for row in &rows {
+            let Some(revision) = row.get(0).and_then(SqliteValue::as_integer) else {
+                continue;
+            };
+            let Some(gate) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(provider) = row.get(2).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            by_revision.entry(revision).or_default().insert(
+                (gate.to_ascii_lowercase(), provider.to_ascii_lowercase()),
+                crate::close_policy::GateResult {
+                    gate: gate.to_string(),
+                    provider: provider.to_string(),
+                    passed: row
+                        .get(3)
+                        .and_then(SqliteValue::as_integer)
+                        .unwrap_or_default()
+                        != 0,
+                    note: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+                },
+            );
+        }
+        Ok(by_revision
+            .into_iter()
+            .filter_map(|(revision, results)| {
+                let effective = results.into_values().collect::<Vec<_>>();
+                crate::close_policy::gate_spec_satisfied(spec, &effective).then_some(revision)
+            })
+            .collect())
+    }
+
+    /// Return append-only scoped gate history for an issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_gate_result_history(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<crate::close_policy::GateResultRecord>> {
+        if !crate::storage::schema::table_exists(&self.conn, "gate_result_history") {
+            return Ok(Vec::new());
+        }
+        let rows = self.conn.query_with_params(
+            "SELECT id, issue_id, from_status, to_status, status_revision,
+                    gate, provider, passed, note, recorded_by, recorded_at
+             FROM gate_result_history WHERE issue_id = ? ORDER BY id ASC",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        rows.iter().map(gate_result_record_from_row).collect()
+    }
+
+    /// Return pre-v15 unscoped gate rows for audit display only. These rows
+    /// are never consulted by transition enforcement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_legacy_gate_results(
+        &self,
+        issue_id: &str,
+    ) -> Result<Vec<crate::close_policy::GateResult>> {
         if !crate::storage::schema::table_exists(&self.conn, "gate_results") {
             return Ok(Vec::new());
         }
         let rows = self.conn.query_with_params(
-            "SELECT gate, provider, passed, note FROM gate_results \
+            "SELECT gate, provider, passed, note FROM gate_results
              WHERE issue_id = ? ORDER BY gate, provider",
             &[SqliteValue::from(issue_id)],
         )?;
         Ok(rows
             .iter()
             .filter_map(|row| {
-                let gate = row.get(0).and_then(SqliteValue::as_text)?.to_string();
-                let provider = row.get(1).and_then(SqliteValue::as_text)?.to_string();
-                let passed = row
-                    .get(2)
-                    .and_then(SqliteValue::as_integer)
-                    .unwrap_or_default()
-                    != 0;
-                let note = row.get(3).and_then(SqliteValue::as_text).map(String::from);
                 Some(crate::close_policy::GateResult {
-                    gate,
-                    provider,
-                    passed,
-                    note,
+                    gate: row.get(0).and_then(SqliteValue::as_text)?.to_string(),
+                    provider: row.get(1).and_then(SqliteValue::as_text)?.to_string(),
+                    passed: row
+                        .get(2)
+                        .and_then(SqliteValue::as_integer)
+                        .unwrap_or_default()
+                        != 0,
+                    note: row.get(3).and_then(SqliteValue::as_text).map(String::from),
                 })
             })
             .collect())
@@ -2111,11 +2375,18 @@ impl SqliteStorage {
         self.workflow_capacity_policy = policy;
     }
 
-    /// Snapshot the installed policy so a JSONL recovery storage swap can
-    /// preserve admission behavior for the retried mutation.
+    /// Install the full, already-validated workflow policy. Capacity is cloned
+    /// into its dedicated hot-path field while transition gates/required fields
+    /// remain available to transaction-time preflight.
+    pub fn set_workflow_policy(&mut self, policy: crate::close_policy::Workflow) {
+        self.workflow_capacity_policy = policy.capacity.clone();
+        self.workflow_transition_policy = policy;
+    }
+
+    /// Snapshot the installed full workflow policy across JSONL recovery.
     #[must_use]
-    pub(crate) fn workflow_capacity_policy(&self) -> crate::close_policy::CapacityPolicy {
-        self.workflow_capacity_policy.clone()
+    pub(crate) fn workflow_policy(&self) -> crate::close_policy::Workflow {
+        self.workflow_transition_policy.clone()
     }
 
     /// Consume advisory capacity evidence from the most recently committed
@@ -2519,28 +2790,6 @@ impl SqliteStorage {
             from: transition.from.as_deref(),
             to: &transition.to,
         }
-    }
-
-    /// Evaluate an explicitly described batch inside the caller's write
-    /// transaction.
-    ///
-    /// Direct-SQL command paths use this adapter so they share the same
-    /// final-state capacity semantics as [`Self::update_issues_atomically`]
-    /// without exposing the storage-internal transition representation.
-    pub(crate) fn enforce_workflow_capacity_batch_in_tx(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[(String, Option<String>, String)],
-    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
-        let transitions = transitions
-            .iter()
-            .map(|(issue_id, from, to)| CapacityBatchTransition {
-                issue_id: issue_id.clone(),
-                from: from.clone(),
-                to: to.clone(),
-            })
-            .collect::<Vec<_>>();
-        Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions)
     }
 
     fn evaluate_capacity_status_limits_in_tx(
@@ -3290,6 +3539,156 @@ impl SqliteStorage {
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })
     }
 
+    fn enforce_workflow_transition_batch_in_tx(
+        conn: &Connection,
+        workflow: &crate::close_policy::Workflow,
+        updates: &[(String, IssueUpdate)],
+    ) -> Result<()> {
+        for (id, update) in updates {
+            let Some(to_status) = update.status.as_ref() else {
+                if update.transition_comment.is_some()
+                    || update.workflow_policy_bypass_reason.is_some()
+                {
+                    return Err(BeadsError::validation(
+                        "status",
+                        format!(
+                            "issue {id}: transition comments and workflow-policy bypasses require a real status transition"
+                        ),
+                    ));
+                }
+                continue;
+            };
+
+            let issue = Self::get_issue_from_conn(conn, id)?
+                .ok_or_else(|| BeadsError::IssueNotFound { id: id.clone() })?;
+            if issue.status == *to_status {
+                if update.transition_comment.is_some()
+                    || update.workflow_policy_bypass_reason.is_some()
+                {
+                    return Err(BeadsError::validation(
+                        "status",
+                        format!(
+                            "issue {id}: transition comments and workflow-policy bypasses cannot be attached to a same-status update"
+                        ),
+                    ));
+                }
+                continue;
+            }
+
+            if let Some(reason) = update.workflow_policy_bypass_reason.as_deref() {
+                if reason.trim().is_empty() {
+                    return Err(BeadsError::validation(
+                        "bypass_reason",
+                        format!("issue {id}: workflow-policy bypass reason must not be empty"),
+                    ));
+                }
+                continue;
+            }
+
+            let from = issue.status.as_str();
+            let to = to_status.as_str();
+            let prospective_acceptance_criteria = update
+                .acceptance_criteria
+                .as_ref()
+                .map(|value| value.as_deref())
+                .unwrap_or(issue.acceptance_criteria.as_deref());
+            let mut violations = crate::close_policy::evaluate_transition_required_fields(
+                workflow,
+                id,
+                Some(from),
+                to,
+                prospective_acceptance_criteria,
+                update.transition_comment.as_deref(),
+            );
+
+            if workflow.gates_enforced() && workflow.gate_rule_for(from, to).is_some() {
+                let label_rows = conn.query_with_params(
+                    "SELECT label FROM labels WHERE issue_id = ? ORDER BY label",
+                    &[SqliteValue::from(id.as_str())],
+                )?;
+                let labels = label_rows
+                    .iter()
+                    .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+                    .collect::<Vec<_>>();
+                let priority = update.priority.map_or(issue.priority.0, |value| value.0);
+                let status_revision = Self::status_revision_in_tx(conn, id)?;
+                let results =
+                    Self::get_scoped_gate_results_in_tx(conn, id, from, to, status_revision)?;
+                let required_gates = workflow.required_gates_for(from, to, &labels, priority);
+                let mut gate_violations = crate::close_policy::evaluate_gates(
+                    workflow, id, from, to, &labels, priority, &results,
+                );
+                for violation in &mut gate_violations {
+                    let Some(gate_id) = violation.gate.strip_prefix("gate_") else {
+                        continue;
+                    };
+                    let Some(spec) = required_gates
+                        .iter()
+                        .find(|spec| spec.id().eq_ignore_ascii_case(gate_id))
+                    else {
+                        continue;
+                    };
+                    let stale_revisions = Self::prior_satisfying_gate_revisions_in_tx(
+                        conn,
+                        id,
+                        &from.to_ascii_lowercase(),
+                        &to.to_ascii_lowercase(),
+                        status_revision,
+                        spec,
+                    )?;
+                    if stale_revisions.is_empty() {
+                        continue;
+                    }
+                    violation.message.push_str(&format!(
+                        " A pass exists only for stale status revision(s) {}; report a fresh result for current revision {status_revision}.",
+                        stale_revisions
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                    if let Some(serde_json::Value::Object(detail)) = violation.detail.as_mut() {
+                        detail.insert(
+                            "reason".to_string(),
+                            serde_json::Value::String("stale_status_revision".to_string()),
+                        );
+                        detail.insert(
+                            "current_status_revision".to_string(),
+                            serde_json::Value::from(status_revision),
+                        );
+                        detail.insert(
+                            "stale_status_revisions".to_string(),
+                            serde_json::json!(stale_revisions),
+                        );
+                    }
+                }
+                violations.extend(gate_violations);
+            }
+
+            if !violations.is_empty() {
+                let summary = if let [single] = violations.as_slice() {
+                    single.message.clone()
+                } else {
+                    let lines = violations
+                        .iter()
+                        .map(|violation| format!("- {}", violation.message))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "{} workflow requirement(s) failed:\n{lines}",
+                        violations.len()
+                    )
+                };
+                return Err(BeadsError::PolicyViolation {
+                    issue_id: id.clone(),
+                    summary,
+                    violations,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Update an ordered set of issues in one `BEGIN IMMEDIATE` transaction.
     ///
     /// Capacity is preflighted against the batch's final prospective state and
@@ -3326,6 +3725,7 @@ impl SqliteStorage {
             self.pending_event_attribution = None;
         } else {
             let capacity_policy = self.workflow_capacity_policy.clone();
+            let workflow_policy = self.workflow_transition_policy.clone();
             self.mutate("update_issues_atomically", actor, |conn, ctx| {
                 let mut transitions = Vec::new();
                 for (id, update) in updates {
@@ -3347,6 +3747,8 @@ impl SqliteStorage {
                         });
                     }
                 }
+
+                Self::enforce_workflow_transition_batch_in_tx(conn, &workflow_policy, updates)?;
 
                 let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
                     conn,
@@ -3495,6 +3897,20 @@ impl SqliteStorage {
                     Some(status.as_str().to_string()),
                     None,
                 );
+
+                if let Some(comment) = updates.transition_comment.as_deref() {
+                    let comment = comment.trim();
+                    validate_new_comment(id, actor, comment)?;
+                    insert_comment_row(conn, id, actor, comment)?;
+                    ctx.record_event(EventType::Commented, id, Some(comment.to_string()));
+                }
+                if let Some(reason) = updates.workflow_policy_bypass_reason.as_deref() {
+                    ctx.record_event(
+                        EventType::Custom("workflow_policy_bypassed".to_string()),
+                        id,
+                        Some(reason.trim().to_string()),
+                    );
+                }
             }
 
             // Record Closed event if status is now Closed and wasn't before
@@ -11904,6 +12320,13 @@ pub struct IssueUpdate {
     pub deleted_at: Option<Option<DateTime<Utc>>>,
     pub deleted_by: Option<Option<String>>,
     pub delete_reason: Option<Option<String>>,
+    /// New comment bound to this status transition. Storage validates and
+    /// inserts it in the same transaction as the status change.
+    pub transition_comment: Option<String>,
+    /// Audited reason for explicitly bypassing workflow transition gates and
+    /// required fields. A non-empty value skips those checks for this issue and
+    /// records a `workflow_policy_bypassed` event in the same transaction.
+    pub workflow_policy_bypass_reason: Option<String>,
     /// If true, do not rebuild the blocked cache after update.
     /// Caller is responsible for rebuilding cache if needed.
     pub skip_cache_rebuild: bool,
@@ -11942,6 +12365,8 @@ impl IssueUpdate {
             && self.deleted_at.is_none()
             && self.deleted_by.is_none()
             && self.delete_reason.is_none()
+            && self.transition_comment.is_none()
+            && self.workflow_policy_bypass_reason.is_none()
             && !self.expect_unassigned
     }
 }
@@ -13862,6 +14287,42 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
     Ok(comment_id)
 }
 
+fn gate_result_record_from_row(
+    row: &fsqlite::Row,
+) -> Result<crate::close_policy::GateResultRecord> {
+    let required_text = |index: usize, name: &str| {
+        row.get(index)
+            .and_then(SqliteValue::as_text)
+            .map(String::from)
+            .ok_or_else(|| BeadsError::Config(format!("gate-result history row missing {name}")))
+    };
+    Ok(crate::close_policy::GateResultRecord {
+        id: row
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| BeadsError::Config("gate-result history row missing id".to_string()))?,
+        issue_id: required_text(1, "issue_id")?,
+        from_status: required_text(2, "from_status")?,
+        to_status: required_text(3, "to_status")?,
+        status_revision: row
+            .get(4)
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| {
+                BeadsError::Config("gate-result history row missing status_revision".to_string())
+            })?,
+        gate: required_text(5, "gate")?,
+        provider: required_text(6, "provider")?,
+        passed: row
+            .get(7)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or_default()
+            != 0,
+        note: row.get(8).and_then(SqliteValue::as_text).map(String::from),
+        recorded_by: row.get(9).and_then(SqliteValue::as_text).map(String::from),
+        recorded_at: required_text(10, "recorded_at")?,
+    })
+}
+
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     let row = match conn.query_row_with_params(
         "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
@@ -14076,6 +14537,305 @@ mod tests {
             },
         );
         policy
+    }
+
+    fn required_review_fields_workflow() -> crate::close_policy::Workflow {
+        // Presence of required_fields enables these checks independently of
+        // strict status-vocabulary enforcement.
+        let mut workflow = crate::close_policy::Workflow::default();
+        workflow.required_fields.insert(
+            "in_progress -> in_review".to_string(),
+            vec![
+                crate::close_policy::TransitionRequiredField::AcceptanceCriteria,
+                crate::close_policy::TransitionRequiredField::TransitionComment,
+            ],
+        );
+        workflow
+    }
+
+    #[test]
+    fn transition_required_fields_and_comment_commit_atomically() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(required_review_fields_workflow());
+        let issue = make_issue(
+            "bd-review",
+            "review candidate",
+            Status::InProgress,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .add_comment("bd-review", "tester", "an old historical comment")
+            .unwrap();
+
+        let missing = IssueUpdate {
+            status: Some(Status::Custom("in_review".to_string())),
+            ..Default::default()
+        };
+        let error = storage
+            .update_issue("bd-review", &missing, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::PolicyViolation { .. }));
+        let unchanged = storage.get_issue("bd-review").unwrap().unwrap();
+        assert_eq!(unchanged.status, Status::InProgress);
+        assert!(unchanged.acceptance_criteria.is_none());
+        assert_eq!(storage.get_comments("bd-review").unwrap().len(), 1);
+
+        let unchecked = IssueUpdate {
+            status: Some(Status::Custom("in_review".to_string())),
+            acceptance_criteria: Some(Some("- [ ] Exercise the real path".to_string())),
+            transition_comment: Some("fresh review attempt".to_string()),
+            ..Default::default()
+        };
+        storage
+            .update_issue("bd-review", &unchecked, "tester")
+            .unwrap_err();
+        let unchanged = storage.get_issue("bd-review").unwrap().unwrap();
+        assert_eq!(unchanged.status, Status::InProgress);
+        assert!(unchanged.acceptance_criteria.is_none());
+        assert_eq!(storage.get_comments("bd-review").unwrap().len(), 1);
+
+        let valid = IssueUpdate {
+            status: Some(Status::Custom("in_review".to_string())),
+            acceptance_criteria: Some(Some("- [x] Exercise the real path".to_string())),
+            transition_comment: Some("fresh review attempt".to_string()),
+            ..Default::default()
+        };
+        let transitioned = storage.update_issue("bd-review", &valid, "tester").unwrap();
+        assert_eq!(transitioned.status.as_str(), "in_review");
+        assert_eq!(
+            transitioned.acceptance_criteria.as_deref(),
+            Some("- [x] Exercise the real path")
+        );
+        let comments = storage.get_comments("bd-review").unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[1].body, "fresh review attempt");
+    }
+
+    #[test]
+    fn transition_required_fields_preflight_entire_batch_before_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(required_review_fields_workflow());
+        for id in ["bd-batch-a", "bd-batch-b"] {
+            let issue = make_issue(id, id, Status::InProgress, 2, None, Utc::now(), None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let updates = vec![
+            (
+                "bd-batch-a".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Custom("in_review".to_string())),
+                    acceptance_criteria: Some(Some("- [x] Complete".to_string())),
+                    transition_comment: Some("A is ready".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "bd-batch-b".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Custom("in_review".to_string())),
+                    acceptance_criteria: Some(Some("- [ ] Still pending".to_string())),
+                    transition_comment: Some("B is not actually ready".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ];
+        storage
+            .update_issues_atomically(&updates, "tester")
+            .unwrap_err();
+
+        for id in ["bd-batch-a", "bd-batch-b"] {
+            let issue = storage.get_issue(id).unwrap().unwrap();
+            assert_eq!(issue.status, Status::InProgress);
+            assert!(issue.acceptance_criteria.is_none());
+            assert!(storage.get_comments(id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn gate_pass_is_scoped_to_status_revision_and_history_is_preserved() {
+        let mut workflow = crate::close_policy::Workflow {
+            strict: true,
+            ..Default::default()
+        };
+        workflow.gates.insert(
+            "in_review -> closed".to_string(),
+            crate::close_policy::GateRule {
+                require_all: vec![crate::close_policy::GateSpec::Named("ci_green".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(workflow);
+        let issue = make_issue(
+            "bd-cycle",
+            "review cycle",
+            Status::Custom("in_review".to_string()),
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        let first = storage
+            .record_scoped_gate_result(
+                "bd-cycle",
+                "in_review",
+                0,
+                "closed",
+                "ci_green",
+                "ci",
+                true,
+                Some("cycle one"),
+                "ci-bot",
+            )
+            .unwrap();
+        assert_eq!(first.status_revision, 0);
+
+        for status in ["rework", "In_Review"] {
+            storage
+                .update_issue(
+                    "bd-cycle",
+                    &IssueUpdate {
+                        status: Some(Status::Custom(status.to_string())),
+                        ..Default::default()
+                    },
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        assert!(
+            storage
+                .get_scoped_gate_results("bd-cycle", "in_review", "closed")
+                .unwrap()
+                .is_empty(),
+            "the prior review cycle must not authorize the new status revision"
+        );
+        let error = storage
+            .update_issue(
+                "bd-cycle",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::PolicyViolation { violations, .. } = error else {
+            panic!("expected stale-gate policy violation, got {error:?}");
+        };
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("stale status revision"));
+        assert_eq!(
+            violations[0].detail.as_ref().unwrap()["reason"],
+            "stale_status_revision"
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-cycle")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "in_review"
+        );
+        let history = storage.get_gate_result_history("bd-cycle").unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].note.as_deref(), Some("cycle one"));
+
+        let stale_report = storage
+            .record_scoped_gate_result(
+                "bd-cycle",
+                "in_review",
+                first.status_revision,
+                "closed",
+                "ci_green",
+                "ci",
+                true,
+                Some("raced stale report"),
+                "ci-bot",
+            )
+            .unwrap_err();
+        assert!(stale_report.to_string().contains("retry"));
+        assert_eq!(
+            storage.get_gate_result_history("bd-cycle").unwrap().len(),
+            1,
+            "a raced report must not append history for the wrong attempt"
+        );
+
+        let current_revision = storage.status_revision("bd-cycle").unwrap();
+        let second = storage
+            .record_scoped_gate_result(
+                "bd-cycle",
+                "In_Review",
+                current_revision,
+                "closed",
+                "ci_green",
+                "ci",
+                true,
+                Some("cycle two"),
+                "ci-bot",
+            )
+            .unwrap();
+        assert!(second.status_revision > first.status_revision);
+        let closed = storage
+            .update_issue(
+                "bd-cycle",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(closed.status, Status::Closed);
+        assert_eq!(
+            storage.get_gate_result_history("bd-cycle").unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn workflow_policy_bypass_is_atomic_and_audited() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(required_review_fields_workflow());
+        let issue = make_issue(
+            "bd-bypass",
+            "emergency transition",
+            Status::InProgress,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .update_issue(
+                "bd-bypass",
+                &IssueUpdate {
+                    status: Some(Status::Custom("in_review".to_string())),
+                    workflow_policy_bypass_reason: Some("incident response".to_string()),
+                    ..Default::default()
+                },
+                "operator",
+            )
+            .unwrap();
+
+        let events = storage.get_events("bd-bypass", 0).unwrap();
+        let bypass = events
+            .iter()
+            .find(|event| {
+                event.event_type == EventType::Custom("workflow_policy_bypassed".to_string())
+            })
+            .expect("bypass event");
+        assert_eq!(bypass.actor, "operator");
+        assert_eq!(bypass.comment.as_deref(), Some("incident response"));
     }
 
     #[test]
@@ -24077,6 +24837,7 @@ mod tests {
             temp_db_path: None,
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();

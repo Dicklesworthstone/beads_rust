@@ -3023,6 +3023,9 @@ fn find_post_import_fk_violation(storage: &SqliteStorage) -> Result<Option<(Stri
         ("export_hashes", "issue_id"),
         ("blocked_issues_cache", "issue_id"),
         ("child_counters", "parent_id"),
+        ("close_metadata", "issue_id"),
+        ("gate_result_history", "issue_id"),
+        ("gate_results", "issue_id"),
     ];
 
     for (table, column) in fk_backed_tables {
