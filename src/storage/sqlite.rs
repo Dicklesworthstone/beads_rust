@@ -2551,6 +2551,40 @@ impl SqliteStorage {
         })
     }
 
+    /// Move an issue (and its children) to a new prefix.
+    ///
+    /// Keeps the remainder (hash + child path) when the new id is free in
+    /// the target prefix; returns an error on collision.
+    ///
+    /// Every table that stores issue IDs is updated in a single IMMEDIATE
+    /// transaction so the rename is atomic.
+    ///
+    /// Returns `(new_id, Vec<(old_child_id, new_child_id)>)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the issue does not exist, the new id already
+    /// exists, or any database operation fails.
+    pub fn reprefix_issue(
+        &mut self,
+        old_id: &str,
+        new_prefix: &str,
+        actor: &str,
+    ) -> Result<(String, Vec<(String, String)>)> {
+        use crate::util::id::split_prefix_remainder;
+
+        let (_, remainder) = split_prefix_remainder(old_id).ok_or_else(|| {
+            BeadsError::InvalidId {
+                id: old_id.to_string(),
+            }
+        })?;
+        let candidate = format!("{new_prefix}-{remainder}");
+
+        self.mutate("reprefix_issue", actor, |tx, ctx| {
+            reprefix_issue_inner(tx, ctx, old_id, &candidate)
+        })
+    }
+
     /// Get comments for an issue.
     ///
     /// # Errors
@@ -3624,6 +3658,150 @@ fn escape_like_pattern(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// Transaction-body for [`SqliteStorage::reprefix_issue`].
+///
+/// Extracted to a free function so the public method stays under the
+/// line-count threshold enforced by clippy.
+fn reprefix_issue_inner(
+    tx: &Transaction,
+    ctx: &mut MutationContext,
+    old_id: &str,
+    new_id: &str,
+) -> Result<(String, Vec<(String, String)>)> {
+    // Verify the issue exists.
+    let exists: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM issues WHERE id = ?)")
+        ?.query_row([old_id], |row| row.get(0))?;
+    if !exists {
+        return Err(BeadsError::IssueNotFound {
+            id: old_id.to_string(),
+        });
+    }
+
+    // Check collision on candidate.
+    let collision: bool = tx
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM issues WHERE id = ?)")
+        ?.query_row([new_id], |row| row.get(0))?;
+    if collision {
+        return Err(BeadsError::validation(
+            "reprefix",
+            format!(
+                "target id '{new_id}' already exists; \
+                 cannot reprefix (collision on remainder)"
+            ),
+        ));
+    }
+
+    // Collect child IDs (ids like old_id.N or old_id.N.M).
+    let old_prefix_dot = format!("{old_id}.");
+    let escaped = escape_like_pattern(old_id);
+    let pattern = format!("{escaped}.%");
+    let child_ids: Vec<String> = tx
+        .prepare("SELECT id FROM issues WHERE id LIKE ? ESCAPE '\\'")
+        ?.query_map([&pattern], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Build the rename map: root + children.
+    let mut rename_map: Vec<(String, String)> = Vec::with_capacity(1 + child_ids.len());
+    rename_map.push((old_id.to_string(), new_id.to_string()));
+
+    for child_old in &child_ids {
+        let suffix = child_old
+            .strip_prefix(&old_prefix_dot)
+            .unwrap_or(child_old);
+        let child_new = format!("{new_id}.{suffix}");
+        let child_collision: bool = tx
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM issues WHERE id = ?)")
+            ?.query_row([&child_new], |row| row.get(0))?;
+        if child_collision {
+            return Err(BeadsError::validation(
+                "reprefix",
+                format!("target child id '{child_new}' already exists; cannot reprefix"),
+            ));
+        }
+        rename_map.push((child_old.clone(), child_new));
+    }
+
+    // Defer FK checks to COMMIT time (allowed inside a transaction,
+    // unlike PRAGMA foreign_keys = OFF). By commit time all references
+    // are consistent so constraints pass.
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+
+    let now = Utc::now().to_rfc3339();
+    for (old, new) in &rename_map {
+        reprefix_rename_one(tx, old, new, &now)?;
+        ctx.mark_dirty(new);
+    }
+
+    // Audit event on the new root id.
+    ctx.record_field_change(
+        EventType::Custom("reprefixed".to_string()),
+        new_id,
+        Some(old_id.to_string()),
+        Some(new_id.to_string()),
+        Some(format!("Reprefixed from {old_id} to {new_id}")),
+    );
+    ctx.invalidate_cache();
+
+    let child_renames: Vec<(String, String)> = rename_map.into_iter().skip(1).collect();
+    Ok((new_id.to_string(), child_renames))
+}
+
+/// Rename a single issue ID across all tables.
+///
+/// Caller must set `PRAGMA defer_foreign_keys = ON` before calling
+/// so that FK constraints are checked at COMMIT, not on each UPDATE.
+fn reprefix_rename_one(
+    tx: &Transaction,
+    old: &str,
+    new: &str,
+    now: &str,
+) -> Result<()> {
+    // 1. issues PK
+    tx.execute(
+        "UPDATE issues SET id = ?, updated_at = ? WHERE id = ?",
+        rusqlite::params![new, now, old],
+    )?;
+    // 2. dependencies (both columns)
+    tx.execute(
+        "UPDATE dependencies SET issue_id = ? WHERE issue_id = ?",
+        rusqlite::params![new, old],
+    )?;
+    tx.execute(
+        "UPDATE dependencies SET depends_on_id = ? WHERE depends_on_id = ?",
+        rusqlite::params![new, old],
+    )?;
+    tx.execute(
+        "UPDATE labels SET issue_id = ? WHERE issue_id = ?",
+        rusqlite::params![new, old],
+    )?;
+    tx.execute(
+        "UPDATE comments SET issue_id = ? WHERE issue_id = ?",
+        rusqlite::params![new, old],
+    )?;
+    tx.execute(
+        "UPDATE events SET issue_id = ? WHERE issue_id = ?",
+        rusqlite::params![new, old],
+    )?;
+    tx.execute(
+        "DELETE FROM dirty_issues WHERE issue_id = ?",
+        rusqlite::params![old],
+    )?;
+    tx.execute(
+        "DELETE FROM export_hashes WHERE issue_id = ?",
+        rusqlite::params![old],
+    )?;
+    tx.execute(
+        "DELETE FROM blocked_issues_cache WHERE issue_id = ?",
+        rusqlite::params![old],
+    )?;
+    tx.execute(
+        "UPDATE child_counters SET parent_id = ? WHERE parent_id = ?",
+        rusqlite::params![new, old],
+    )?;
+    Ok(())
 }
 
 // ============================================================================
@@ -5386,5 +5564,134 @@ mod tests {
             next_for_child1, 2,
             "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
         );
+    }
+
+    // ==================== reprefix_issue tests ====================
+
+    #[test]
+    fn test_reprefix_basic() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue("old-abcd", "Test issue", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let (new_id, children) = storage.reprefix_issue("old-abcd", "new", "tester").unwrap();
+        assert_eq!(new_id, "new-abcd");
+        assert!(children.is_empty());
+
+        // Old id gone, new id exists.
+        assert!(storage.get_issue("old-abcd").unwrap().is_none());
+        let fetched = storage.get_issue("new-abcd").unwrap().unwrap();
+        assert_eq!(fetched.title, "Test issue");
+    }
+
+    #[test]
+    fn test_reprefix_deps_both_directions() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        let a = make_issue("pfx-aaaa", "A", Status::Open, 2, None, t1, None);
+        let b = make_issue("pfx-bbbb", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&a, "t").unwrap();
+        storage.create_issue(&b, "t").unwrap();
+
+        // A depends on B.
+        storage.add_dependency("pfx-aaaa", "pfx-bbbb", "blocks", "t").unwrap();
+
+        // Reprefix A.
+        storage.reprefix_issue("pfx-aaaa", "new", "t").unwrap();
+        let deps = storage.get_dependencies("new-aaaa").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0], "pfx-bbbb");
+
+        // Reprefix B — dep target should follow.
+        storage.reprefix_issue("pfx-bbbb", "new", "t").unwrap();
+        let deps2 = storage.get_dependencies("new-aaaa").unwrap();
+        assert_eq!(deps2[0], "new-bbbb");
+    }
+
+    #[test]
+    fn test_reprefix_labels_follow() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue("aa-xxxx", "Labeled", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "t").unwrap();
+        storage.add_label("aa-xxxx", "urgent", "t").unwrap();
+
+        storage.reprefix_issue("aa-xxxx", "bb", "t").unwrap();
+        let labels = storage.get_labels("bb-xxxx").unwrap();
+        assert!(labels.contains(&"urgent".to_string()));
+        assert!(storage.get_labels("aa-xxxx").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_reprefix_collision_rejected() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        let a = make_issue("old-hash", "A", Status::Open, 2, None, t1, None);
+        let b = make_issue("new-hash", "B", Status::Open, 2, None, t1, None);
+        storage.create_issue(&a, "t").unwrap();
+        storage.create_issue(&b, "t").unwrap();
+
+        let result = storage.reprefix_issue("old-hash", "new", "t");
+        assert!(result.is_err());
+        assert!(
+            format!("{}", result.unwrap_err()).contains("collision"),
+            "Error should mention collision"
+        );
+    }
+
+    #[test]
+    fn test_reprefix_not_found() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let result = storage.reprefix_issue("no-such", "pfx", "t");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reprefix_children_follow() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+
+        let parent = make_issue("ab-root", "Parent", Status::Open, 2, None, t1, None);
+        let child1 = make_issue("ab-root.1", "C1", Status::Open, 2, None, t1, None);
+        let child2 = make_issue("ab-root.2", "C2", Status::Open, 2, None, t1, None);
+        storage.create_issue(&parent, "t").unwrap();
+        storage.create_issue(&child1, "t").unwrap();
+        storage.create_issue(&child2, "t").unwrap();
+
+        // Link child to parent.
+        storage.add_dependency("ab-root.1", "ab-root", "parent-child", "t").unwrap();
+
+        let (new_id, children) = storage.reprefix_issue("ab-root", "cd", "t").unwrap();
+        assert_eq!(new_id, "cd-root");
+        assert_eq!(children.len(), 2);
+
+        // Children exist under new prefix.
+        assert!(storage.get_issue("cd-root.1").unwrap().is_some());
+        assert!(storage.get_issue("cd-root.2").unwrap().is_some());
+        // Old children gone.
+        assert!(storage.get_issue("ab-root.1").unwrap().is_none());
+
+        // Dependency updated.
+        let deps = storage.get_dependencies("cd-root.1").unwrap();
+        assert_eq!(deps[0], "cd-root");
+    }
+
+    #[test]
+    fn test_reprefix_audit_event() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let issue = make_issue("ev-abcd", "Evented", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage.reprefix_issue("ev-abcd", "nw", "tester").unwrap();
+        let events = storage.get_events("nw-abcd", 100).unwrap();
+        let reprefixed = events.iter().find(|e| e.event_type.as_str() == "reprefixed");
+        assert!(reprefixed.is_some(), "Should have a reprefixed audit event");
+        let ev = reprefixed.unwrap();
+        assert_eq!(ev.old_value.as_deref(), Some("ev-abcd"));
+        assert_eq!(ev.new_value.as_deref(), Some("nw-abcd"));
     }
 }

@@ -1438,6 +1438,10 @@ pub struct UpdateArgs {
     /// Issue ID prefix for partial-ID resolution (overrides BD_ISSUE_PREFIX env var)
     #[arg(long)]
     pub prefix: Option<String>,
+
+    /// Move issue to a different prefix namespace (e.g. --reprefix core)
+    #[arg(long)]
+    pub reprefix: Option<String>,
 }
 
 #[derive(Args, Debug)]

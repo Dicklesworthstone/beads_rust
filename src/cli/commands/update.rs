@@ -56,6 +56,19 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;
 
+    // --reprefix: move issue to a different prefix namespace.
+    if let Some(ref new_prefix) = args.reprefix {
+        return execute_reprefix(
+            args,
+            &resolved_ids,
+            new_prefix.trim(),
+            &actor,
+            &beads_dir,
+            &mut storage_ctx,
+            ctx,
+        );
+    }
+
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
     let has_updates = !update.is_empty()
@@ -156,6 +169,105 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     if ctx.is_json() {
         ctx.json_pretty(&updated_issues);
+    }
+
+    storage_ctx.flush_no_db_if_dirty()?;
+    Ok(())
+}
+
+/// JSON output for a reprefixed issue.
+#[derive(Serialize)]
+struct ReprefixOutput {
+    old_id: String,
+    new_id: String,
+    title: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<ReprefixChildOutput>,
+}
+
+/// JSON output for a reprefixed child.
+#[derive(Serialize)]
+struct ReprefixChildOutput {
+    old_id: String,
+    new_id: String,
+}
+
+/// Execute the --reprefix sub-flow: move an issue to a new prefix.
+fn execute_reprefix(
+    args: &UpdateArgs,
+    resolved_ids: &[String],
+    new_prefix: &str,
+    actor: &str,
+    beads_dir: &std::path::Path,
+    storage_ctx: &mut config::OpenStorageResult,
+    ctx: &OutputContext,
+) -> Result<()> {
+    // Guard: exactly one id.
+    if resolved_ids.len() != 1 {
+        return Err(BeadsError::validation(
+            "reprefix",
+            "--reprefix requires exactly one issue id",
+        ));
+    }
+
+    // Guard: incompatible with --claim.
+    if args.claim {
+        return Err(BeadsError::validation(
+            "reprefix",
+            "--reprefix cannot be combined with --claim",
+        ));
+    }
+
+    // Guard: reject reserved operator prefix.
+    config::assert_writable_prefix(new_prefix)?;
+
+    let old_id = &resolved_ids[0];
+
+    // Guard: reject if old_id is a child (contains \".\").
+    if old_id.contains('.') {
+        return Err(BeadsError::validation(
+            "reprefix",
+            "cannot reprefix a child issue directly; reprefix the root parent instead",
+        ));
+    }
+
+    // Guard: reject same prefix.
+    if let Some((current_prefix, _)) = crate::util::id::split_prefix_remainder(old_id) {
+        if current_prefix == new_prefix {
+            return Err(BeadsError::validation(
+                "reprefix",
+                format!("issue already has prefix '{new_prefix}'"),
+            ));
+        }
+    }
+
+    let storage = &mut storage_ctx.storage;
+    let (new_id, child_renames) = storage.reprefix_issue(old_id, new_prefix, actor)?;
+
+    // Update last-touched to new id.
+    crate::util::set_last_touched_id(beads_dir, &new_id);
+
+    if ctx.is_json() {
+        let issue = storage.get_issue(&new_id)?;
+        let title = issue.map_or_else(String::new, |i| i.title);
+        let output = ReprefixOutput {
+            old_id: old_id.clone(),
+            title,
+            children: child_renames
+                .iter()
+                .map(|(old, new)| ReprefixChildOutput {
+                    old_id: old.clone(),
+                    new_id: new.clone(),
+                })
+                .collect(),
+            new_id,
+        };
+        ctx.json_pretty(&output);
+    } else {
+        println!("Reprefixed {old_id} \u{2192} {new_id}");
+        for (old_child, new_child) in &child_renames {
+            println!("  child: {old_child} \u{2192} {new_child}");
+        }
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
