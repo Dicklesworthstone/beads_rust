@@ -1,11 +1,26 @@
 //! Active `bd watch` heartbeat tracking.
 //!
-//! Each running `bd watch` process owns a row in the `watchers` table
-//! and updates `last_seen` on every poll tick. `bd msg` checks this
-//! table to detect typos like `bd msg infra` when the live prefix is
-//! `infra1` — messages to non-watching prefixes would otherwise drop
-//! silently. Crashed watchers self-evict via TTL; clean shutdowns
-//! call [`unregister`] from a Drop guard.
+//! Each running `bd watch` process owns the single row for its prefix in
+//! the `watchers` table (`PRIMARY KEY (prefix)` — process identity is
+//! informational only; see the schema comment for why). `bd msg` checks
+//! this table to detect typos like `bd msg infra` when the live prefix
+//! is `infra1` — messages to non-watching prefixes would otherwise drop
+//! silently.
+//!
+//! [`heartbeat`] is a *self-healing* UPSERT: every poll tick it writes
+//! the full row again (not just `last_seen`). This is deliberate. A
+//! bare `UPDATE ... WHERE prefix = ? AND pid = ?` is a no-op against a
+//! row that no longer exists — if another process's [`sweep_stale`]
+//! deletes a live watcher's row (e.g. because a heartbeat stalled past
+//! the TTL under DB write-lock contention), the old bare-UPDATE
+//! heartbeat could never bring it back, leaving that watcher invisible
+//! to `bd who` / unreachable via `bd msg` forever even though it kept
+//! running and kept delivering messages. The UPSERT regenerates the row
+//! within one tick regardless of whether it was missing, stale, or
+//! claimed by a different (dead) pid.
+//!
+//! Clean shutdowns call [`unregister`] from a Drop guard; crashed
+//! watchers self-evict via TTL through [`sweep_stale`].
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -34,44 +49,57 @@ pub struct WatcherRow {
     pub git_remote: String,
 }
 
-/// Register a new watcher (prefix, pid). If a row already exists for
-/// this pair (e.g., a watcher restarted with the same PID), reset
-/// `started_at` / `last_seen` / `cwd` / `git_remote` to the new values.
+/// Self-healing heartbeat UPSERT for the (single) row owned by
+/// `prefix`.
+///
+/// Writes `prefix`, `pid`, `last_seen`, `cwd`, `git_remote`
+/// unconditionally, and either creates the row or claims/refreshes it
+/// via `ON CONFLICT(prefix) DO UPDATE`. This is called both to
+/// register a watcher at startup and on every poll tick afterward —
+/// there is no separate one-shot "register" step, so a row deleted out
+/// from under a live watcher (stale sweep racing a slow heartbeat,
+/// manual DB surgery, etc.) regenerates on the very next tick.
+///
+/// `started_at` semantics: if the existing row already belongs to
+/// `pid` (this is just a routine refresh), its `started_at` is left
+/// untouched — the caller's `my_started_at` argument is only used to
+/// seed a brand-new row or to overwrite a row that belongs to a
+/// *different* pid (claiming a stale/dead/evicted slot). Callers
+/// should therefore pass the same `my_started_at` (captured once at
+/// process startup) on every call.
 ///
 /// # Errors
 ///
 /// Returns an error if the DB write fails.
-pub fn register(
+pub fn heartbeat(
     conn: &Connection,
     prefix: &str,
     pid: i64,
+    my_started_at: DateTime<Utc>,
     now: DateTime<Utc>,
     cwd: &str,
     git_remote: &str,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5)
-         ON CONFLICT(prefix, pid) DO UPDATE SET started_at = excluded.started_at,
-                                                last_seen = excluded.last_seen,
-                                                cwd = excluded.cwd,
-                                                git_remote = excluded.git_remote",
-        params![prefix, pid, now.to_rfc3339(), cwd, git_remote],
-    )?;
-    Ok(())
-}
-
-/// Update `last_seen` for an existing watcher. No-op if the row was
-/// already evicted (e.g., the DB was wiped) — callers shouldn't fail
-/// on that.
-///
-/// # Errors
-///
-/// Returns an error if the DB write fails.
-pub fn heartbeat(conn: &Connection, prefix: &str, pid: i64, now: DateTime<Utc>) -> Result<()> {
-    conn.execute(
-        "UPDATE watchers SET last_seen = ?1 WHERE prefix = ?2 AND pid = ?3",
-        params![now.to_rfc3339(), prefix, pid],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(prefix) DO UPDATE SET
+             pid = excluded.pid,
+             started_at = CASE WHEN watchers.pid = excluded.pid
+                                THEN watchers.started_at
+                                ELSE excluded.started_at
+                           END,
+             last_seen = excluded.last_seen,
+             cwd = excluded.cwd,
+             git_remote = excluded.git_remote",
+        params![
+            prefix,
+            pid,
+            my_started_at.to_rfc3339(),
+            now.to_rfc3339(),
+            cwd,
+            git_remote,
+        ],
     )?;
     Ok(())
 }
@@ -104,9 +132,7 @@ pub fn is_active(
 ) -> Result<bool> {
     let cutoff = now - chrono::Duration::seconds(ttl_seconds);
     let exists: bool = conn
-        .prepare_cached(
-            "SELECT 1 FROM watchers WHERE prefix = ?1 AND last_seen >= ?2 LIMIT 1",
-        )?
+        .prepare_cached("SELECT 1 FROM watchers WHERE prefix = ?1 AND last_seen >= ?2 LIMIT 1")?
         .exists(params![prefix, cutoff.to_rfc3339()])?;
     Ok(exists)
 }
@@ -122,9 +148,8 @@ pub fn active_prefixes(
     ttl_seconds: i64,
 ) -> Result<Vec<String>> {
     let cutoff = now - chrono::Duration::seconds(ttl_seconds);
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT prefix FROM watchers WHERE last_seen >= ?1 ORDER BY prefix",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT prefix FROM watchers WHERE last_seen >= ?1 ORDER BY prefix")?;
     let rows = stmt
         .query_map([cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -145,6 +170,14 @@ pub fn active_prefixes(
 ///     row that registered a future timestamp must not win forever).
 ///
 /// Ties on `started_at` are broken by the caller on `pid`.
+///
+/// Because `watchers` now keys on prefix alone, at most one row can
+/// exist for `prefix` at any instant; this returns that row (if it
+/// belongs to someone else and out-ranks us) rather than picking a
+/// winner out of several coexisting rows. Callers MUST run this check
+/// (and act on it) *before* calling [`heartbeat`] for the same tick —
+/// heartbeating first would silently claim/overwrite the very row this
+/// query needed to see.
 ///
 /// # Errors
 ///
@@ -216,9 +249,8 @@ pub fn newest_other_watcher(
 ///
 /// Returns an error if the DB query fails.
 pub fn list_all(conn: &Connection) -> Result<Vec<WatcherRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT prefix, pid, started_at, last_seen, cwd, git_remote FROM watchers",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT prefix, pid, started_at, last_seen, cwd, git_remote FROM watchers")?;
     let rows = stmt
         .query_map([], row_to_watcher)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -232,11 +264,7 @@ pub fn list_all(conn: &Connection) -> Result<Vec<WatcherRow>> {
 /// # Errors
 ///
 /// Returns an error if the DB delete fails.
-pub fn sweep_stale(
-    conn: &Connection,
-    now: DateTime<Utc>,
-    ttl_seconds: i64,
-) -> Result<usize> {
+pub fn sweep_stale(conn: &Connection, now: DateTime<Utc>, ttl_seconds: i64) -> Result<usize> {
     let cutoff = now - chrono::Duration::seconds(ttl_seconds);
     let deleted = conn.execute(
         "DELETE FROM watchers WHERE last_seen < ?1",
@@ -257,7 +285,11 @@ fn row_to_watcher(row: &rusqlite::Row<'_>) -> rusqlite::Result<WatcherRow> {
         // went through the ghwatch-integration migration. Treat
         // failure as empty so we stay backward compatible with older
         // schemas that other tooling might still write.
-        cwd: row.get::<_, Option<String>>("cwd").ok().flatten().unwrap_or_default(),
+        cwd: row
+            .get::<_, Option<String>>("cwd")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         git_remote: row
             .get::<_, Option<String>>("git_remote")
             .ok()
@@ -288,14 +320,14 @@ mod tests {
     }
 
     #[test]
-    fn register_heartbeat_unregister_roundtrip() {
+    fn heartbeat_unregister_roundtrip() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 42, now, "", "").unwrap();
+        heartbeat(&conn, "arc1", 42, now, now, "", "").unwrap();
         assert!(is_active(&conn, "arc1", now, 60).unwrap());
 
         let later = now + chrono::Duration::seconds(10);
-        heartbeat(&conn, "arc1", 42, later).unwrap();
+        heartbeat(&conn, "arc1", 42, now, later, "", "").unwrap();
         assert_eq!(list_all(&conn).unwrap()[0].last_seen, later);
 
         unregister(&conn, "arc1", 42).unwrap();
@@ -306,32 +338,35 @@ mod tests {
     fn stale_row_not_active() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 1, now - chrono::Duration::seconds(120), "", "").unwrap();
+        let started = now - chrono::Duration::seconds(120);
+        heartbeat(&conn, "arc1", 1, started, started, "", "").unwrap();
         assert!(!is_active(&conn, "arc1", now, 60).unwrap());
         // But it's still in list_all (we GC via sweep, not on read).
         assert_eq!(list_all(&conn).unwrap().len(), 1);
     }
 
     #[test]
-    fn multiple_pids_per_prefix_allowed() {
+    fn distinct_prefixes_coexist() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 1, now, "", "").unwrap();
-        register(&conn, "arc1", 2, now, "", "").unwrap();
+        heartbeat(&conn, "arc1", 1, now, now, "", "").unwrap();
+        heartbeat(&conn, "app2", 2, now, now, "", "").unwrap();
         assert_eq!(list_all(&conn).unwrap().len(), 2);
         assert!(is_active(&conn, "arc1", now, 60).unwrap());
+        assert!(is_active(&conn, "app2", now, 60).unwrap());
 
-        // active_prefixes dedupes
-        let active = active_prefixes(&conn, now, 60).unwrap();
-        assert_eq!(active, vec!["arc1".to_string()]);
+        let mut active = active_prefixes(&conn, now, 60).unwrap();
+        active.sort();
+        assert_eq!(active, vec!["app2".to_string(), "arc1".to_string()]);
     }
 
     #[test]
     fn active_prefixes_skips_stale() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "fresh", 1, now, "", "").unwrap();
-        register(&conn, "stale", 2, now - chrono::Duration::seconds(300), "", "").unwrap();
+        heartbeat(&conn, "fresh", 1, now, now, "", "").unwrap();
+        let stale_start = now - chrono::Duration::seconds(300);
+        heartbeat(&conn, "stale", 2, stale_start, stale_start, "", "").unwrap();
         let active = active_prefixes(&conn, now, 60).unwrap();
         assert_eq!(active, vec!["fresh".to_string()]);
     }
@@ -340,34 +375,124 @@ mod tests {
     fn sweep_drops_only_stale() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "fresh", 1, now, "", "").unwrap();
-        register(&conn, "stale", 2, now - chrono::Duration::seconds(300), "", "").unwrap();
+        heartbeat(&conn, "fresh", 1, now, now, "", "").unwrap();
+        let stale_start = now - chrono::Duration::seconds(300);
+        heartbeat(&conn, "stale", 2, stale_start, stale_start, "", "").unwrap();
         let deleted = sweep_stale(&conn, now, 60).unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(list_all(&conn).unwrap().len(), 1);
     }
 
     #[test]
-    fn re_register_resets_timestamps() {
+    fn same_pid_refresh_preserves_started_at() {
+        // A routine tick from the SAME process must not disturb
+        // started_at even if (by caller bug) a different value were
+        // passed — the CASE branches on the existing row's pid, not
+        // on the argument, so this also guards against accidental
+        // started_at drift on every tick.
         let conn = open_mem();
         let t1 = Utc::now() - chrono::Duration::seconds(120);
-        register(&conn, "arc1", 1, t1, "", "").unwrap();
+        heartbeat(&conn, "arc1", 1, t1, t1, "", "").unwrap();
         let t2 = Utc::now();
-        register(&conn, "arc1", 1, t2, "", "").unwrap();
+        // Same pid, deliberately a different (wrong) my_started_at —
+        // must be ignored because the row is already ours.
+        heartbeat(&conn, "arc1", 1, t2, t2, "", "").unwrap();
         let row = &list_all(&conn).unwrap()[0];
-        assert_eq!(row.started_at, t2);
+        assert_eq!(
+            row.started_at, t1,
+            "own row's started_at must survive a refresh"
+        );
         assert_eq!(row.last_seen, t2);
     }
+
+    // ---- Incident regression: resurrection after row loss ----------
+
+    #[test]
+    fn heartbeat_after_delete_resurrects_row() {
+        // The core incident regression: sweep_stale (or any other
+        // deletion) removes a live watcher's row; the very next
+        // heartbeat must bring it back rather than being a silent
+        // UPDATE no-op.
+        let conn = open_mem();
+        let started = Utc::now() - chrono::Duration::seconds(10);
+        heartbeat(&conn, "arc1", 100, started, started, "cwd", "host/o/r").unwrap();
+        assert_eq!(list_all(&conn).unwrap().len(), 1);
+
+        // Simulate the row being deleted out from under the live
+        // watcher (e.g. a racing sweep_stale on another process).
+        conn.execute("DELETE FROM watchers WHERE prefix = 'arc1'", [])
+            .unwrap();
+        assert!(list_all(&conn).unwrap().is_empty());
+
+        let now = Utc::now();
+        heartbeat(&conn, "arc1", 100, started, now, "cwd", "host/o/r").unwrap();
+        let rows = list_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "row must be resurrected within one tick");
+        assert_eq!(rows[0].pid, 100);
+        assert_eq!(rows[0].started_at, started);
+        assert_eq!(rows[0].last_seen, now);
+    }
+
+    #[test]
+    fn sweep_then_heartbeat_resurrects() {
+        let conn = open_mem();
+        let started = Utc::now() - chrono::Duration::seconds(500);
+        heartbeat(&conn, "arc1", 7, started, started, "", "").unwrap();
+
+        let now = Utc::now();
+        let deleted = sweep_stale(&conn, now, 60).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(list_all(&conn).unwrap().is_empty());
+
+        heartbeat(&conn, "arc1", 7, started, now, "", "").unwrap();
+        let rows = list_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pid, 7);
+        assert_eq!(rows[0].last_seen, now);
+    }
+
+    #[test]
+    fn upsert_claims_row_from_old_pid() {
+        // Agent harness restarted `bd watch` with a new pid but the
+        // same prefix: the new process's heartbeat claims the
+        // existing row (new pid, new started_at) rather than
+        // colliding on a composite key.
+        let conn = open_mem();
+        let old_started = Utc::now() - chrono::Duration::seconds(300);
+        heartbeat(&conn, "arc1", 111, old_started, old_started, "old/cwd", "").unwrap();
+
+        let new_started = Utc::now();
+        heartbeat(
+            &conn,
+            "arc1",
+            222,
+            new_started,
+            new_started,
+            "new/cwd",
+            "host/o/r",
+        )
+        .unwrap();
+
+        let rows = list_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "still exactly one row for the prefix");
+        assert_eq!(rows[0].pid, 222);
+        assert_eq!(rows[0].started_at, new_started);
+        assert_eq!(rows[0].cwd, "new/cwd");
+        assert_eq!(rows[0].git_remote, "host/o/r");
+    }
+
+    // ---- Supersede semantics under single-row-per-prefix -----------
 
     #[test]
     fn live_newer_watcher_supersedes() {
         // A genuinely newer, fresh watcher should supersede the older one.
+        // Simulated by heartbeating as the "other" pid FIRST (my own
+        // pid never having written a row yet) — mirrors the real tick
+        // order: check before you (over)write.
         let conn = open_mem();
         let now = Utc::now();
         let mine = now - chrono::Duration::seconds(30);
-        register(&conn, "arc1", 1, mine, "", "").unwrap();
-        // Newer watcher, heartbeat fresh (last_seen = now).
-        register(&conn, "arc1", 2, now, "", "").unwrap();
+        heartbeat(&conn, "arc1", 2, now, now, "", "").unwrap();
         assert!(is_superseded(&conn, "arc1", 1, mine, now, 60).unwrap());
         let winner = newest_other_watcher(&conn, "arc1", 1, mine, now, 60)
             .unwrap()
@@ -383,12 +508,19 @@ mod tests {
         let conn = open_mem();
         let now = Utc::now();
         let mine = now - chrono::Duration::seconds(30);
-        register(&conn, "arc1", 1, mine, "", "").unwrap();
         // Dead duplicate: started_at newer than mine, but last_seen is
         // 5 minutes stale (well past the 60s TTL).
         let dead_started = now - chrono::Duration::seconds(10);
-        register(&conn, "arc1", 2, dead_started, "", "").unwrap();
-        heartbeat(&conn, "arc1", 2, now - chrono::Duration::seconds(300)).unwrap();
+        heartbeat(
+            &conn,
+            "arc1",
+            2,
+            dead_started,
+            now - chrono::Duration::seconds(300),
+            "",
+            "",
+        )
+        .unwrap();
         assert!(!is_superseded(&conn, "arc1", 1, mine, now, 60).unwrap());
         assert!(
             newest_other_watcher(&conn, "arc1", 1, mine, now, 60)
@@ -406,11 +538,9 @@ mod tests {
         let conn = open_mem();
         let now = Utc::now();
         let mine = now - chrono::Duration::seconds(30);
-        register(&conn, "arc1", 1, mine, "", "").unwrap();
         // Skewed watcher: started_at 10 minutes in the FUTURE, fresh heartbeat.
         let future = now + chrono::Duration::seconds(600);
-        register(&conn, "arc1", 2, future, "", "").unwrap();
-        heartbeat(&conn, "arc1", 2, now).unwrap();
+        heartbeat(&conn, "arc1", 2, future, now, "", "").unwrap();
         assert!(!is_superseded(&conn, "arc1", 1, mine, now, 60).unwrap());
         assert!(
             newest_other_watcher(&conn, "arc1", 1, mine, now, 60)
@@ -424,11 +554,13 @@ mod tests {
         // Two watchers that booted in the same instant must not both
         // decide to exit. The higher pid wins deterministically; the
         // lower pid sees itself superseded, the higher pid does not.
+        // Since only one row can exist per prefix, we compare each
+        // side's view against the other's row directly (pre-write).
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 5, now, "", "").unwrap();
-        register(&conn, "arc1", 9, now, "", "").unwrap();
-        // Lower pid (5) is superseded by the higher pid (9).
+
+        // From pid 5's perspective: pid 9's row already exists.
+        heartbeat(&conn, "arc1", 9, now, now, "", "").unwrap();
         assert!(is_superseded(&conn, "arc1", 5, now, now, 60).unwrap());
         assert_eq!(
             newest_other_watcher(&conn, "arc1", 5, now, now, 60)
@@ -437,10 +569,13 @@ mod tests {
                 .pid,
             9
         );
-        // Higher pid (9) is NOT superseded by the lower pid (5).
-        assert!(!is_superseded(&conn, "arc1", 9, now, now, 60).unwrap());
+
+        // From pid 9's perspective: pid 5's row exists instead.
+        let conn2 = open_mem();
+        heartbeat(&conn2, "arc1", 5, now, now, "", "").unwrap();
+        assert!(!is_superseded(&conn2, "arc1", 9, now, now, 60).unwrap());
         assert!(
-            newest_other_watcher(&conn, "arc1", 9, now, now, 60)
+            newest_other_watcher(&conn2, "arc1", 9, now, now, 60)
                 .unwrap()
                 .is_none()
         );
@@ -450,12 +585,183 @@ mod tests {
     fn only_watcher_is_not_superseded() {
         let conn = open_mem();
         let now = Utc::now();
-        register(&conn, "arc1", 1, now, "", "").unwrap();
+        heartbeat(&conn, "arc1", 1, now, now, "", "").unwrap();
         assert!(!is_superseded(&conn, "arc1", 1, now, now, 60).unwrap());
         assert!(
             newest_other_watcher(&conn, "arc1", 1, now, now, 60)
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn no_row_at_all_is_not_superseded() {
+        // A brand-new watcher on a prefix nobody has ever watched:
+        // the check must not error or spuriously supersede.
+        let conn = open_mem();
+        let now = Utc::now();
+        assert!(!is_superseded(&conn, "arc1", 1, now, now, 60).unwrap());
+    }
+
+    #[test]
+    fn two_racing_watchers_converge_to_one_survivor() {
+        // Simulates the actual tick sequence used by `bd watch`:
+        // check-newest-other, and only heartbeat if not superseded.
+        // Two watchers (different pids, different started_at) tick
+        // repeatedly; within a handful of ticks exactly one survives
+        // and the other never resumes writing once it observes it is
+        // superseded.
+        let conn = open_mem();
+        let base = Utc::now() - chrono::Duration::seconds(60);
+        let a_pid = 1;
+        let a_started = base;
+        let b_pid = 2;
+        let b_started = base + chrono::Duration::seconds(1); // B is newer -> should win
+
+        let ttl = 60;
+        let mut a_alive = true;
+        let mut b_alive = true;
+        let mut b_ticks = 0u32;
+
+        for i in 0..10 {
+            let now = base + chrono::Duration::seconds(2 + i);
+
+            if a_alive {
+                if newest_other_watcher(&conn, "arc1", a_pid, a_started, now, ttl)
+                    .unwrap()
+                    .is_some()
+                {
+                    a_alive = false; // superseded -> exits, never heartbeats again
+                } else {
+                    heartbeat(&conn, "arc1", a_pid, a_started, now, "", "").unwrap();
+                }
+            }
+            if b_alive {
+                if newest_other_watcher(&conn, "arc1", b_pid, b_started, now, ttl)
+                    .unwrap()
+                    .is_some()
+                {
+                    b_alive = false;
+                } else {
+                    heartbeat(&conn, "arc1", b_pid, b_started, now, "", "").unwrap();
+                    b_ticks += 1;
+                }
+            }
+        }
+
+        // B (the legitimately newer watcher) must never see itself
+        // superseded by the older A.
+        assert!(b_alive, "the newer watcher must never exit");
+        assert!(b_ticks > 0);
+        // A must have converged to "superseded" within the simulated
+        // ticks -- never both exiting, never both surviving.
+        assert!(!a_alive, "the older watcher must eventually exit");
+
+        let rows = list_all(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one surviving row for the prefix");
+        assert_eq!(rows[0].pid, b_pid);
+        assert_eq!(rows[0].started_at, b_started);
+    }
+
+    // ---- Migration: old composite-PK DBs upgrade cleanly -----------
+
+    #[test]
+    fn migration_collapses_duplicate_prefix_rows_to_freshest() {
+        use crate::storage::schema::apply_schema;
+
+        let conn = Connection::open_in_memory().unwrap();
+        // Build the OLD composite-PK shape by hand (what a pre-upgrade
+        // `bd` would have created), with a couple of other tables
+        // thrown in to prove the rebuild doesn't touch unrelated data.
+        conn.execute_batch(
+            "CREATE TABLE watchers (
+                prefix TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                cwd TEXT NOT NULL DEFAULT '',
+                git_remote TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (prefix, pid)
+             );
+             CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let now = Utc::now();
+        let old = now - chrono::Duration::seconds(120);
+        let mid = now - chrono::Duration::seconds(60);
+        conn.execute(
+            "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
+             VALUES ('arc1', 1, ?1, ?1, 'a', 'ra')",
+            params![old.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
+             VALUES ('arc1', 2, ?1, ?1, 'b', 'rb')",
+            params![mid.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
+             VALUES ('arc1', 3, ?1, ?1, 'c', 'rc')",
+            params![now.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
+             VALUES ('app2', 9, ?1, ?1, 'd', 'rd')",
+            params![now.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('unrelated', 'kept')",
+            [],
+        )
+        .unwrap();
+
+        apply_schema(&conn).unwrap();
+
+        let rows = list_all(&conn).unwrap();
+        assert_eq!(rows.len(), 2, "one row survives per prefix");
+        let arc1 = rows.iter().find(|r| r.prefix == "arc1").unwrap();
+        assert_eq!(arc1.pid, 3, "freshest (last_seen) row wins");
+        assert_eq!(arc1.cwd, "c");
+        let app2 = rows.iter().find(|r| r.prefix == "app2").unwrap();
+        assert_eq!(app2.pid, 9);
+
+        // Unrelated data untouched.
+        let kept: String = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'unrelated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "kept");
+
+        // New shape enforces uniqueness per prefix now.
+        let err = conn.execute(
+            "INSERT INTO watchers (prefix, pid, started_at, last_seen, cwd, git_remote)
+             VALUES ('arc1', 4, ?1, ?1, 'x', 'rx')",
+            params![now.to_rfc3339()],
+        );
+        assert!(
+            err.is_err(),
+            "prefix alone must now be the primary key (conflicting insert should fail)"
+        );
+
+        // Idempotent: re-applying schema on the already-migrated DB is a no-op.
+        apply_schema(&conn).unwrap();
+        assert_eq!(list_all(&conn).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_noop_on_fresh_schema() {
+        let conn = open_mem();
+        let now = Utc::now();
+        heartbeat(&conn, "arc1", 1, now, now, "", "").unwrap();
+        apply_schema(&conn).unwrap();
+        assert_eq!(list_all(&conn).unwrap().len(), 1);
     }
 }

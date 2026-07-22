@@ -157,9 +157,13 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let startup_reload_gen = {
         let (mut storage, _paths) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
-        storage.register_watcher(
+        // Registration is just the first heartbeat — heartbeat_watcher
+        // is a self-healing UPSERT, so there's no separate one-shot
+        // register step (see storage::watchers::heartbeat).
+        storage.heartbeat_watcher(
             &prefix,
             pid,
+            my_started_at,
             my_started_at,
             &watcher_cwd,
             &watcher_git_remote,
@@ -270,8 +274,6 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         if let Ok((mut storage, _paths)) =
             config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)
         {
-            let _ = storage.heartbeat_watcher(&prefix, pid, now);
-
             // Evict dead watcher rows before consulting the supersede
             // table. Without this, a crashed / kill -9'd duplicate
             // watch (which never ran its Drop unregister) — or one
@@ -282,6 +284,58 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
             // here keeps the table clean for `bd who` / `bd msg` too.
             let ttl = crate::storage::watchers::WATCHER_TTL_SECONDS;
             let _ = storage.sweep_stale_watchers(now, ttl);
+
+            // Supersede check MUST run before the heartbeat UPSERT
+            // below. `watchers` now keys on prefix alone, so a
+            // heartbeat is a claim: if we wrote first, this check
+            // would only ever see our own row and the older-watcher
+            // side would never notice it lost. Checking first (and
+            // skipping the write on loss) keeps two racing watchers
+            // race-tolerant — they converge to exactly one survivor
+            // within a few ticks, and the winner never sees itself as
+            // superseded.
+            if let Ok(Some(winner)) =
+                storage.newest_other_watcher(&prefix, pid, my_started_at, now, ttl)
+            {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let _ = writeln!(
+                    out,
+                    "[{}] BD_SUPERSEDED: another bd watch started for prefix \
+                     '{}' at {} (pid {}); exiting to avoid duplicate notifications.",
+                    now.to_rfc3339(),
+                    prefix,
+                    winner.started_at.to_rfc3339(),
+                    winner.pid,
+                );
+                if watch_beads {
+                    flush_batches(
+                        &mut batches,
+                        &prefix,
+                        format,
+                        now,
+                        true,
+                        debounce,
+                        debounce_max,
+                    )?;
+                }
+                break;
+            }
+
+            // Not superseded: (re)claim/refresh our row. Self-healing
+            // — if our row was deleted (the historical incident: a
+            // racing sweep evicted a perfectly alive watcher because
+            // its heartbeat stalled under DB write-lock contention),
+            // this recreates it within this single tick rather than
+            // silently no-op'ing like the old bare UPDATE did.
+            let _ = storage.heartbeat_watcher(
+                &prefix,
+                pid,
+                my_started_at,
+                now,
+                &watcher_cwd,
+                &watcher_git_remote,
+            );
 
             if let Ok(current_gen) =
                 crate::cli::commands::reload::read_generation(&storage)
@@ -320,34 +374,6 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_else(|| current_gen.to_string()),
                     jitter_secs,
-                );
-                if watch_beads {
-                    flush_batches(
-                        &mut batches,
-                        &prefix,
-                        format,
-                        now,
-                        true,
-                        debounce,
-                        debounce_max,
-                    )?;
-                }
-                break;
-            }
-
-            if let Ok(Some(winner)) =
-                storage.newest_other_watcher(&prefix, pid, my_started_at, now, ttl)
-            {
-                let stdout = std::io::stdout();
-                let mut out = stdout.lock();
-                let _ = writeln!(
-                    out,
-                    "[{}] BD_SUPERSEDED: another bd watch started for prefix \
-                     '{}' at {} (pid {}); exiting to avoid duplicate notifications.",
-                    now.to_rfc3339(),
-                    prefix,
-                    winner.started_at.to_rfc3339(),
-                    winner.pid,
                 );
                 if watch_beads {
                     flush_batches(
