@@ -3,7 +3,8 @@
 //! Visualizes dependency graphs with focus on reverse dependencies (dependents).
 //!
 //! - `br graph <issue-id>`: Show all dependents of an issue (what depends on it)
-//! - `br graph --all`: Show connected components for `open`/`in_progress`/`blocked`/`deferred` issues
+//! - `br graph --all`: Show connected components for all `open`/`in_progress`/`blocked` issues.
+//!   Add `--deferred` to also include deferred issues.
 
 use crate::cli::GraphArgs;
 use crate::config;
@@ -11,14 +12,14 @@ use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids, split_prefix_remainder};
+use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
 // Aliased to avoid colliding with `rich_rust::Style` imported via
 // rich_rust::prelude. The TUI Lines code uses RStyle/RModifier/RColor.
 use ratatui::style::{Color as RColor, Modifier as RModifier, Style as RStyle};
 use ratatui::text::{Line, Span};
 use rich_rust::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::debug;
 
 /// JSON output for a single node in the graph.
@@ -77,13 +78,9 @@ pub(crate) fn render_all_string(
 ) -> Result<String> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let components = compute_components(&storage_ctx.storage)?;
+    let components = compute_components(&storage_ctx.storage, args.deferred)?;
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
-    Ok(if args.no_cluster {
-        render_all_flat_str(&components, total_nodes, args)
-    } else {
-        render_all_clustered_str(&components, total_nodes, args)
-    })
+    Ok(render_all_flat_str(&components, total_nodes, args))
 }
 
 /// Same as `render_all_string` but returns styled ratatui Lines for
@@ -100,13 +97,9 @@ pub(crate) fn render_all_lines(
 ) -> Result<Vec<Line<'static>>> {
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let components = compute_components(&storage_ctx.storage)?;
+    let components = compute_components(&storage_ctx.storage, args.deferred)?;
     let total_nodes: usize = components.iter().map(|c| c.nodes.len()).sum();
-    Ok(if args.no_cluster {
-        render_all_flat_lines(&components, total_nodes, args)
-    } else {
-        render_all_clustered_lines(&components, total_nodes, args)
-    })
+    Ok(render_all_flat_lines(&components, total_nodes, args))
 }
 
 pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
@@ -250,15 +243,22 @@ fn graph_single(
     Ok(())
 }
 
-/// Show graph for all `open`/`in_progress`/`blocked`/`deferred` issues.
-#[allow(clippy::too_many_lines)]
-/// Compute the connected-component view of the open/in-progress/
-/// blocked/deferred issue graph. Shared by the stdout path and the
+/// Compute the connected-component view of the `open`/`in_progress`/`blocked`
+/// (and optionally `deferred`) issue graph. Shared by the stdout path and the
 /// TUI graph view. Empty result is valid (no issues found).
-fn compute_components(storage: &SqliteStorage) -> Result<Vec<ConnectedComponent>> {
+///
+/// Components are returned sorted by node count descending; ties are broken
+/// by the lexicographically smallest root id.
+#[allow(clippy::too_many_lines)]
+fn compute_components(storage: &SqliteStorage, include_deferred: bool) -> Result<Vec<ConnectedComponent>> {
+    let mut statuses = vec![Status::Open, Status::InProgress, Status::Blocked];
+    if include_deferred {
+        statuses.push(Status::Deferred);
+    }
     let filters = ListFilters {
-        statuses: Some(vec![Status::Open, Status::InProgress, Status::Blocked, Status::Deferred]),
+        statuses: Some(statuses),
         include_closed: false,
+        include_deferred,
         include_templates: false,
         ..Default::default()
     };
@@ -361,12 +361,18 @@ fn compute_components(storage: &SqliteStorage) -> Result<Vec<ConnectedComponent>
         });
     }
 
-    components.sort_by_key(|b| std::cmp::Reverse(b.nodes.len()));
+    components.sort_by(|a, b| {
+        b.nodes.len().cmp(&a.nodes.len()).then_with(|| {
+            let a_root = a.roots.iter().min().map_or("", String::as_str);
+            let b_root = b.roots.iter().min().map_or("", String::as_str);
+            a_root.cmp(b_root)
+        })
+    });
     Ok(components)
 }
 
 fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> Result<()> {
-    let components = compute_components(storage)?;
+    let components = compute_components(storage, args.deferred)?;
     debug!(count = components.len(), "Computed components for graph");
 
     if components.is_empty() {
@@ -380,7 +386,7 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
         } else if matches!(ctx.mode(), OutputMode::Rich) {
             render_no_issues_rich(ctx);
         } else {
-            println!("No open/in_progress/blocked/deferred issues found");
+            println!("No open/in_progress/blocked issues found");
         }
         return Ok(());
     }
@@ -398,35 +404,12 @@ fn graph_all(storage: &SqliteStorage, args: &GraphArgs, ctx: &OutputContext) -> 
     }
 
     if matches!(ctx.mode(), OutputMode::Rich) {
-        render_all_graph_rich_with_args(&components, total_nodes, args, ctx);
-    } else if args.no_cluster {
-        render_all_flat(&components, total_nodes, args);
+        render_all_graph_rich(&components, total_nodes, args, ctx);
     } else {
-        render_all_clustered(&components, total_nodes, args);
+        render_all_flat(&components, total_nodes, args);
     }
 
     Ok(())
-}
-
-/// Determine the "dominant prefix" of a component: most common prefix among its
-/// nodes. Ties broken alphabetically. Mixed-prefix components return ("<mixed>",
-/// vec of distinct prefixes).
-fn component_prefix(component: &ConnectedComponent) -> String {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for node in &component.nodes {
-        let prefix = split_prefix_remainder(&node.id)
-            .map(|(p, _)| p.to_string())
-            .unwrap_or_else(|| "(no-prefix)".to_string());
-        *counts.entry(prefix).or_insert(0) += 1;
-    }
-    if counts.len() > 1 {
-        return "<cross-prefix>".to_string();
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(p, _)| p)
-        .unwrap_or_else(|| "(no-prefix)".to_string())
 }
 
 fn terminal_cols() -> usize {
@@ -461,85 +444,7 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     format!("{trimmed}…")
 }
 
-/// Cluster components by dominant prefix and render with section headers.
-fn render_all_clustered(components: &[ConnectedComponent], total_nodes: usize, args: &GraphArgs) {
-    print!("{}", render_all_clustered_str(components, total_nodes, args));
-}
-
-fn render_all_clustered_str(
-    components: &[ConnectedComponent],
-    total_nodes: usize,
-    args: &GraphArgs,
-) -> String {
-    lines_to_plain(&render_all_clustered_lines(components, total_nodes, args))
-}
-
-/// Same content as `render_all_clustered_str` but yielding ratatui
-/// `Line`s with sensible color/style. The stdout path strips spans
-/// back to plain text via `lines_to_plain`; the TUI consumes Lines
-/// directly so the graph view shows color.
-fn render_all_clustered_lines(
-    components: &[ConnectedComponent],
-    total_nodes: usize,
-    args: &GraphArgs,
-) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    if components.is_empty() {
-        out.push(Line::from("(no beads)"));
-        return out;
-    }
-
-    out.push(Line::from(Span::styled(
-        format!(
-            "Dependency graph: {} issues in {} component(s)",
-            total_nodes,
-            components.len()
-        ),
-        RStyle::default().add_modifier(RModifier::BOLD),
-    )));
-
-    let mut groups: BTreeMap<String, Vec<&ConnectedComponent>> = BTreeMap::new();
-    for component in components {
-        groups
-            .entry(component_prefix(component))
-            .or_default()
-            .push(component);
-    }
-
-    let mut prefixes: Vec<String> = groups
-        .keys()
-        .filter(|p| *p != "<cross-prefix>")
-        .cloned()
-        .collect();
-    prefixes.sort();
-    if groups.contains_key("<cross-prefix>") {
-        prefixes.push("<cross-prefix>".to_string());
-    }
-
-    for prefix in &prefixes {
-        let comps = groups.get(prefix).expect("present");
-        let total_in_prefix: usize = comps.iter().map(|c| c.nodes.len()).sum();
-        let component_word = if comps.len() == 1 { "component" } else { "components" };
-        let header_text = format!(
-            "=== {prefix} ({n} {issue_word}, {c} {comp_word}) ===",
-            n = total_in_prefix,
-            issue_word = if total_in_prefix == 1 { "issue" } else { "issues" },
-            c = comps.len(),
-            comp_word = component_word,
-        );
-        out.push(Line::from(Span::styled(
-            header_text,
-            RStyle::default().add_modifier(RModifier::BOLD),
-        )));
-
-        for component in comps {
-            out.extend(render_component_text_lines(component, args, true));
-        }
-    }
-    out
-}
-
-/// Flat (non-clustered) view — preserves backwards compatibility via --no-cluster.
+/// Flat view — components sorted by size (descending), ties broken by smallest root id.
 fn render_all_flat(components: &[ConnectedComponent], total_nodes: usize, args: &GraphArgs) {
     print!("{}", render_all_flat_str(components, total_nodes, args));
 }
@@ -582,35 +487,6 @@ fn render_all_flat_lines(
             out.push(Line::raw(""));
         }
     }
-    out
-}
-
-fn render_component_text_lines(
-    component: &ConnectedComponent,
-    args: &GraphArgs,
-    indent: bool,
-) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    if args.compact {
-        let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
-        let prefix = if indent { "  " } else { "" };
-        out.push(Line::from(format!("{prefix}{}", ids.join(" → "))));
-        return out;
-    }
-
-    if indent && component.nodes.len() > 1 {
-        out.push(Line::from(Span::styled(
-            format!(
-                "  ── component ({n} {issue_word}, roots: {roots})",
-                n = component.nodes.len(),
-                issue_word = if component.nodes.len() == 1 { "issue" } else { "issues" },
-                roots = component.roots.join(", ")
-            ),
-            RStyle::default().add_modifier(RModifier::DIM),
-        )));
-    }
-    let base_indent = if indent { "    " } else { "  " };
-    out.extend(render_component_body_lines(component, args, base_indent));
     out
 }
 
@@ -902,106 +778,7 @@ fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputCont
     console.print_renderable(&panel);
 }
 
-fn render_all_graph_rich_with_args(
-    components: &[ConnectedComponent],
-    total_nodes: usize,
-    args: &GraphArgs,
-    ctx: &OutputContext,
-) {
-    if args.no_cluster {
-        render_all_graph_rich(components, total_nodes, args, ctx);
-        return;
-    }
-
-    let console = Console::default();
-    let theme = ctx.theme();
-    let width = ctx.width();
-
-    let mut content = Text::new("");
-
-    content.append_styled(
-        &format!(
-            "{total_nodes} issue{ip} across {comp_n} component{cp}\n",
-            ip = if total_nodes == 1 { "" } else { "s" },
-            comp_n = components.len(),
-            cp = if components.len() == 1 { "" } else { "s" },
-        ),
-        theme.section.clone(),
-    );
-
-    let mut groups: BTreeMap<String, Vec<&ConnectedComponent>> = BTreeMap::new();
-    for component in components {
-        groups
-            .entry(component_prefix(component))
-            .or_default()
-            .push(component);
-    }
-    let mut prefixes: Vec<String> = groups
-        .keys()
-        .filter(|p| *p != "<cross-prefix>")
-        .cloned()
-        .collect();
-    prefixes.sort();
-    if groups.contains_key("<cross-prefix>") {
-        prefixes.push("<cross-prefix>".to_string());
-    }
-
-    let title_cap = args.max_title.unwrap_or(60);
-
-    for prefix in &prefixes {
-        let comps = groups.get(prefix).expect("present");
-        let total_in_prefix: usize = comps.iter().map(|c| c.nodes.len()).sum();
-        content.append("\n");
-        content.append_styled(
-            &format!(
-                "{prefix} ({n} issue{ip}, {c} component{cp})\n",
-                n = total_in_prefix,
-                ip = if total_in_prefix == 1 { "" } else { "s" },
-                c = comps.len(),
-                cp = if comps.len() == 1 { "" } else { "s" },
-            ),
-            theme.emphasis.clone(),
-        );
-
-        for component in comps {
-            for node in &component.nodes {
-                let indent = "  ".repeat(node.depth + 1);
-                content.append(&indent);
-                content.append_styled(&node.id, theme.issue_id.clone());
-                content.append(" ");
-                let mut title = node.title.clone();
-                if !args.no_sender {
-                    if let Some(sender) = &node.sender {
-                        title.push_str(&format!(" (from: {sender})"));
-                    }
-                }
-                content.append(&truncate_with_ellipsis(&title, title_cap));
-                content.append(" ");
-                content.append_styled(
-                    &format!("[P{}]", node.priority),
-                    priority_style(node.priority, theme),
-                );
-                content.append(" ");
-                content.append_styled(
-                    &format!("[{}]", node.status),
-                    status_style(&node.status, theme),
-                );
-                if node.depth == 0 {
-                    content.append_styled(" (root)", theme.dimmed.clone());
-                }
-                content.append("\n");
-            }
-        }
-    }
-
-    let panel = Panel::from_rich_text(&content, width)
-        .title(Text::styled("Dependency Graph", theme.panel_title.clone()))
-        .box_style(theme.box_style);
-
-    console.print_renderable(&panel);
-}
-
-/// Legacy flat rich rendering (used when --no-cluster). Title width now honors `--max-title`.
+/// Flat rich rendering for `--all`. Title width honors `--max-title`.
 fn render_all_graph_rich(
     components: &[ConnectedComponent],
     total_nodes: usize,

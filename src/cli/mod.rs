@@ -2601,7 +2601,8 @@ pub struct GraphArgs {
     #[arg(add = ArgValueCompleter::new(open_issue_id_completer))]
     pub issue: Option<String>,
 
-    /// Show graph for all `open`/`in_progress`/`blocked` issues (connected components)
+    /// Show graph for all `open`/`in_progress`/`blocked` issues (connected components).
+    /// Components are sorted by size (largest first); cross-prefix edges appear in-line.
     #[arg(long)]
     pub all: bool,
 
@@ -2613,9 +2614,9 @@ pub struct GraphArgs {
     #[arg(long)]
     pub max_title: Option<usize>,
 
-    /// Skip prefix grouping. Restores the flat connected-component listing.
+    /// Include deferred issues in the graph (excluded by default).
     #[arg(long)]
-    pub no_cluster: bool,
+    pub deferred: bool,
 
     /// Hide the `(from: <prefix>)` sender annotation per bead.
     #[arg(long)]
