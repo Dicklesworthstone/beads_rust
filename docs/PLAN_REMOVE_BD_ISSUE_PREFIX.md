@@ -379,12 +379,24 @@ All five call sites invoke this instead of raw `env::var("BD_ISSUE_PREFIX")`.
 export `BD_ISSUE_PREFIX` must be updated to export `BD_AGENT_ID` at
 rollout. The operator owns that coordination.
 
-### 4d. `list.rs` and `ready.rs` scoping
+### 4d. `list.rs` and `ready.rs` scoping — OPERATOR RULING: remove scoping
 
 These two commands use `BD_ISSUE_PREFIX` to scope output to the agent's
-own prefix. After the change, they call `resolve_agent_identity().ok()`
-(returns `None` when unset, meaning no scoping — showing all prefixes).
-This matches the current behaviour when `BD_ISSUE_PREFIX` is unset.
+own prefix. **The operator ruled that identity-based default scoping is
+removed entirely** — agent IDs will rarely correspond to issue prefixes
+going forward, so scoping list output by identity is confusing, not
+helpful.
+
+Concretely for `list.rs`: delete `resolve_list_prefix()`'s env read and
+the implicit self-scoping behaviour. Default output shows ALL prefixes;
+`--prefix <p>` remains as an explicit filter. `--all-prefixes` becomes
+redundant (it described an escape from the now-removed default) — remove
+the flag or keep it as a hidden no-op alias; prefer removal. Do NOT wire
+list to `resolve_agent_identity()`.
+
+The same principle applies generally: no command's default output should
+silently scope by agent identity. Identity is for messaging/watch/
+presence sender resolution only.
 
 `ready.rs` is noted as being deleted in a parallel task. The plan accounts
 for it but implementers should skip it if it's gone by the time they land.
