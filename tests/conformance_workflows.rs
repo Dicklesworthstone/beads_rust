@@ -671,7 +671,7 @@ fn conformance_workflow_create_update_lifecycle() {
     info!("conformance_workflow_create_update_lifecycle passed");
 }
 
-/// Test: Create issues with dependencies, verify blocked/ready states.
+/// Test: Create issues with dependencies, verify blocked states.
 #[test]
 fn conformance_workflow_dependency_chain() {
     skip_if_no_bd!();
@@ -743,29 +743,8 @@ fn conformance_workflow_dependency_chain() {
     );
     assert_eq!(br_blocked_count, 2, "Expected 2 blocked issues (B and C)");
 
-    // Verify ready command shows only A
-    let (br_ready, bd_ready) = ws.run_step(7, &["ready", "--json"]);
-    assert!(br_ready.status.success());
-    assert!(bd_ready.status.success());
-
-    let br_ready_json = extract_json_payload(&br_ready.stdout);
-    let bd_ready_json = extract_json_payload(&bd_ready.stdout);
-
-    let br_ready_val: Value = serde_json::from_str(&br_ready_json).unwrap_or(Value::Array(vec![]));
-    let bd_ready_val: Value = serde_json::from_str(&bd_ready_json).unwrap_or(Value::Array(vec![]));
-
-    let br_ready_count = br_ready_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_ready_count = bd_ready_val.as_array().map(|a| a.len()).unwrap_or(0);
-
-    assert_eq!(
-        br_ready_count, bd_ready_count,
-        "Ready counts differ: br={}, bd={}",
-        br_ready_count, bd_ready_count
-    );
-    assert_eq!(br_ready_count, 1, "Expected 1 ready issue (A)");
-
     // Flush and compare JSONL
-    ws.flush_both(8);
+    ws.flush_both(7);
     let diff = ws.compare_jsonl();
     ws.write_log();
 

@@ -31,11 +31,21 @@ fn test_soft_defer_behavior() {
     let status = issue_details["status"].as_str().expect("status string");
     assert_eq!(status, "open", "Status should remain open");
 
-    // Check ready - should be excluded
-    let ready = run_br(&workspace, ["ready"], "ready");
+    // Check that the soft defer took effect (defer_until set) — this is the
+    // underlying condition storage uses to exclude an issue from readiness.
+    let show_deferred = run_br(&workspace, ["show", id, "--json"], "show_deferred");
+    let deferred_json: serde_json::Value =
+        serde_json::from_str(&show_deferred.stdout).expect("parse json");
+    let deferred_details = if deferred_json.is_array() {
+        &deferred_json[0]
+    } else {
+        &deferred_json
+    };
     assert!(
-        !ready.stdout.contains(id),
-        "Soft deferred issue should be excluded from ready"
+        deferred_details
+            .get("defer_until")
+            .is_some_and(|v| !v.is_null()),
+        "Soft deferred issue should have defer_until set"
     );
 
     // Try undefer

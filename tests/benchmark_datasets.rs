@@ -6,7 +6,7 @@
 //! Run with: cargo test benchmark_dataset --release -- --nocapture --ignored
 //!
 //! Measures:
-//! - Read-heavy workloads (list, search, ready, stats)
+//! - Read-heavy workloads (list, search, stats, blocked)
 //! - Write-heavy workloads (create, update, close)
 //! - Time + RSS for br and bd
 //! - Per-dataset comparison tables
@@ -570,35 +570,6 @@ fn benchmark_search(workspace: &DatasetBenchmarkWorkspace, config: &BenchConfig)
     )
 }
 
-fn benchmark_ready(workspace: &DatasetBenchmarkWorkspace, config: &BenchConfig) -> WorkloadResult {
-    let args = ["ready", "--json"];
-
-    // Warmup
-    for _ in 0..config.warmup_runs {
-        let _ = workspace.run_br(&args);
-        let _ = workspace.run_bd(&args);
-    }
-
-    // Timed runs
-    let br_durations: Vec<Duration> = (0..config.timed_runs)
-        .map(|_| workspace.time_br(&args))
-        .collect();
-    let bd_durations: Vec<Duration> = (0..config.timed_runs)
-        .map(|_| workspace.time_bd(&args))
-        .collect();
-
-    let br_rss = measure_rss("br", &workspace.br_root, &args);
-    let bd_rss = measure_rss("bd", &workspace.bd_root, &args);
-
-    WorkloadResult::new(
-        "ready --json",
-        TimingStats::from_durations(&br_durations),
-        TimingStats::from_durations(&bd_durations),
-        br_rss,
-        bd_rss,
-    )
-}
-
 fn benchmark_stats(workspace: &DatasetBenchmarkWorkspace, config: &BenchConfig) -> WorkloadResult {
     let args = ["stats", "--json"];
 
@@ -916,7 +887,6 @@ fn benchmark_dataset(
     let read_workloads = vec![
         benchmark_list(&workspace, config),
         benchmark_search(&workspace, config),
-        benchmark_ready(&workspace, config),
         benchmark_stats(&workspace, config),
         benchmark_blocked(&workspace, config),
     ];

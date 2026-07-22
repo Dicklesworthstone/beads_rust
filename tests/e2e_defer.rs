@@ -597,38 +597,6 @@ fn defer_nonexistent_error() {
 // =============================================================================
 
 #[test]
-fn deferred_not_in_ready() {
-    common::init_test_logging();
-    info!("deferred_not_in_ready: starting");
-    let (workspace, ids) = setup_workspace_with_multiple_issues();
-
-    // Defer one issue
-    let defer = run_br(&workspace, ["defer", &ids[0]], "defer_one");
-    assert!(defer.status.success());
-
-    let ready = run_br(&workspace, ["ready", "--json"], "ready");
-    assert!(ready.status.success());
-
-    let payload = extract_json_payload(&ready.stdout);
-    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
-
-    // Deferred issue should NOT appear in ready list
-    let ready_ids: Vec<&str> = issues.iter().filter_map(|i| i["id"].as_str()).collect();
-
-    assert!(
-        !ready_ids.contains(&ids[0].as_str()),
-        "deferred issue should not appear in ready list"
-    );
-
-    // Other issues should still be in ready
-    assert!(
-        ready_ids.contains(&ids[1].as_str()),
-        "non-deferred issues should be in ready list"
-    );
-    info!("deferred_not_in_ready: assertions passed");
-}
-
-#[test]
 fn deferred_not_blocked() {
     common::init_test_logging();
     info!("deferred_not_blocked: starting");
@@ -654,43 +622,3 @@ fn deferred_not_blocked() {
     info!("deferred_not_blocked: assertions passed");
 }
 
-#[test]
-fn undefer_appears_in_ready() {
-    common::init_test_logging();
-    info!("undefer_appears_in_ready: starting");
-    let (workspace, id) = setup_workspace_with_issue();
-
-    // Defer then undefer
-    let defer = run_br(&workspace, ["defer", &id], "defer");
-    assert!(defer.status.success());
-
-    let ready_before = run_br(&workspace, ["ready", "--json"], "ready_before");
-    let payload_before = extract_json_payload(&ready_before.stdout);
-    let issues_before: Vec<Value> =
-        serde_json::from_str(&payload_before).unwrap_or_else(|_| vec![]);
-    assert!(
-        !issues_before
-            .iter()
-            .filter_map(|i| i["id"].as_str())
-            .any(|x| x == id.as_str())
-    );
-
-    // Undefer
-    let undefer = run_br(&workspace, ["undefer", &id], "undefer");
-    assert!(undefer.status.success());
-
-    let ready_after = run_br(&workspace, ["ready", "--json"], "ready_after");
-    assert!(ready_after.status.success());
-
-    let payload_after = extract_json_payload(&ready_after.stdout);
-    let issues_after: Vec<Value> = serde_json::from_str(&payload_after).expect("valid json");
-
-    assert!(
-        issues_after
-            .iter()
-            .filter_map(|i| i["id"].as_str())
-            .any(|x| x == id.as_str()),
-        "undeferred issue should appear in ready list"
-    );
-    info!("undefer_appears_in_ready: assertions passed");
-}

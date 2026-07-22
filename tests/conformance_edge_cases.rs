@@ -691,16 +691,16 @@ fn conformance_large_dep_graph_100() {
     );
 
     // Check blocked status - only first node should be unblocked
-    let br_ready = workspace.run_br(["ready", "--json"], "ready");
-    let bd_ready = workspace.run_bd(["ready", "--json"], "ready");
+    let br_blocked = workspace.run_br(["blocked", "--json"], "blocked");
+    let bd_blocked = workspace.run_bd(["blocked", "--json"], "blocked");
 
-    assert!(br_ready.status.success());
-    assert!(bd_ready.status.success());
+    assert!(br_blocked.status.success());
+    assert!(bd_blocked.status.success());
 
-    // Both should have same number of ready issues (just 1)
-    let br_json: Value = serde_json::from_str(&extract_json_payload(&br_ready.stdout))
+    // Both should have same number of blocked issues (count - 1)
+    let br_json: Value = serde_json::from_str(&extract_json_payload(&br_blocked.stdout))
         .unwrap_or(Value::Array(vec![]));
-    let bd_json: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
+    let bd_json: Value = serde_json::from_str(&extract_json_payload(&bd_blocked.stdout))
         .unwrap_or(Value::Array(vec![]));
 
     let br_count = br_json.as_array().map(|a| a.len()).unwrap_or(0);
@@ -708,7 +708,7 @@ fn conformance_large_dep_graph_100() {
 
     assert_eq!(
         br_count, bd_count,
-        "br and bd should have same ready count: br={} bd={}",
+        "br and bd should have same blocked count: br={} bd={}",
         br_count, bd_count
     );
 

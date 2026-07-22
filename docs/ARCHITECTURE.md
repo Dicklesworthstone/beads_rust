@@ -49,7 +49,7 @@ This document describes the internal architecture of `beads_rust` (br), a Rust p
 ┌─────────────────────────────────────────────────────────────────┐
 │                         CLI Layer                                │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │
-│  │  create │ │  list   │ │  ready  │ │  sync   │ │  ...    │   │
+│  │  create │ │  list   │ │ blocked │ │  sync   │ │  ...    │   │
 │  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘   │
 └───────┼──────────┼──────────┼──────────┼──────────┼───────────┘
         │          │          │          │          │
@@ -90,7 +90,7 @@ src/
 │   └── commands/     # Individual command implementations
 │       ├── create.rs
 │       ├── list.rs
-│       ├── ready.rs
+│       ├── blocked.rs
 │       ├── sync.rs
 │       └── ...       # 30+ command files
 │

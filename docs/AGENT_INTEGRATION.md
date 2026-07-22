@@ -33,7 +33,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 1. **Always use `--json`** for programmatic access
 2. **Check exit codes** for success/failure
 3. **Parse structured errors** for recovery hints
-4. **Use `br ready`** to find actionable work
+4. **Use `br list --status open`** to find actionable work
 5. **Sync at session end** with `br sync --flush-only`
 
 ---
@@ -45,7 +45,7 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 br init --prefix myproj
 
 # Find work
-br ready --json --limit 5
+br list --status open --json --limit 5
 
 # Claim and work
 br update bd-123 --claim --json
@@ -73,10 +73,9 @@ br create "Title" --json
 
 # Equivalent (when the command supports --format)
 br list --format json
-br ready --format json
 
 # Robot mode alias (same as --json)
-br ready --robot
+br list --robot
 br close bd-123 --robot
 ```
 
@@ -85,14 +84,14 @@ br close bd-123 --robot
 Many read-style commands support TOON output via `--format toon`:
 
 ```bash
-br ready --format toon --limit 10
+br list --format toon --limit 10
 br show bd-123 --format toon
 ```
 
 Decode TOON to JSON when you need to pipe into JSON tools:
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br list --format toon --limit 10 | tru --decode | jq '.[0]'
 ```
 
 ### Environment Defaults
@@ -113,14 +112,14 @@ br list --json --limit 5   # JSON always wins
 ### JSON Output Characteristics
 
 - **Always valid JSON** - parseable even on errors
-- **Arrays for lists** - `br list`, `br ready`, `br search`
+- **Arrays for lists** - `br list`, `br blocked`, `br search`
 - **Objects for single items** - `br show`, `br create`
 - **Structured errors** - error object with code and hints
 
 ### Example Output
 
 ```bash
-$ br ready --json --limit 2
+$ br list --status open --json --limit 2
 ```
 ```json
 [
@@ -156,8 +155,8 @@ $ br ready --json --limit 2
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  1. DISCOVER                                                │
-│     br ready --json                                         │
-│     → Find unblocked, undeferred issues                     │
+│     br list --status open --json                            │
+│     → Find open issues to work on                           │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -250,14 +249,14 @@ def br_command(*args):
         raise RuntimeError(f"br error: {error.get('message', 'Unknown')}")
     return json.loads(result.stdout)
 
-# Find ready work
-ready = br_command('ready', '--limit', '5')
-for issue in ready:
+# Find open work
+open_issues = br_command('list', '--status', 'open', '--limit', '5')
+for issue in open_issues:
     print(f"{issue['id']}: {issue['title']}")
 
 # Claim first issue
-if ready:
-    br_command('update', ready[0]['id'], '--claim')
+if open_issues:
+    br_command('update', open_issues[0]['id'], '--claim')
 ```
 
 ### JavaScript/Node Example
@@ -273,21 +272,21 @@ function br(...args) {
   return JSON.parse(result);
 }
 
-// Find ready work
-const ready = br('ready', '--limit', '5');
-console.log(`Found ${ready.length} ready issues`);
+// Find open work
+const openIssues = br('list', '--status', 'open', '--limit', '5');
+console.log(`Found ${openIssues.length} open issues`);
 
 // Claim and work
-if (ready.length > 0) {
-  br('update', ready[0].id, '--claim');
+if (openIssues.length > 0) {
+  br('update', openIssues[0].id, '--claim');
 }
 ```
 
 ### jq Examples
 
 ```bash
-# Get IDs of all ready issues
-br ready --json | jq -r '.[].id'
+# Get IDs of all open issues
+br list --status open --json | jq -r '.[].id'
 
 # Get high-priority bugs
 br list --json -t bug -p 0 -p 1 | jq '.[] | "\(.id): \(.title)"'
@@ -383,7 +382,7 @@ br close bd-123 --quiet --json
 export BD_ACTOR="claude-agent"
 
 # Workflow
-br ready --json --limit 10
+br list --status open --json --limit 10
 br update <id> --claim
 # ... work ...
 br close <id> --reason "Completed by Claude"
@@ -397,7 +396,7 @@ br sync --flush-only
 br init --prefix cursor
 
 # Use with Cursor's tool system
-br ready --json
+br list --status open --json
 br show <id> --json
 ```
 
@@ -408,14 +407,14 @@ br show <id> --json
 export BD_ACTOR="aider-$(date +%Y%m%d)"
 
 # Check work before session
-br ready --json | head -5
+br list --status open --json | head -5
 ```
 
 ### GitHub Copilot Workspace
 
 ```bash
 # Copilot-friendly workflow
-br ready --json --assignee copilot
+br list --status open --json --assignee copilot
 br update <id> --status in_progress --assignee copilot
 ```
 
@@ -431,7 +430,7 @@ br update <id> --status in_progress --assignee copilot
 4. **Use `--claim`** for atomic status+assignee updates
 5. **Create discovered issues** with `--deps discovered-from:<id>`
 6. **Sync at session end** with `br sync --flush-only`
-7. **Use `br ready`** to find actionable work
+7. **Use `br list --status open`** to find actionable work
 8. **Include reasons** when closing issues
 
 ### DON'T
@@ -447,7 +446,7 @@ br update <id> --status in_progress --assignee copilot
 
 ```bash
 # Session start
-br ready --json > /tmp/session_start.json
+br list --status open --json > /tmp/session_start.json
 
 # Session end checklist
 br sync --flush-only
@@ -523,7 +522,7 @@ br dep remove bd-123 bd-456
 
 ```bash
 # Enable debug output
-RUST_LOG=debug br ready --json 2>debug.log
+RUST_LOG=debug br list --status open --json 2>debug.log
 
 # Verbose mode
 br sync --flush-only -vv

@@ -64,7 +64,6 @@
 | Command | Key Flags | Mutating | Test File(s) | Status |
 |---------|-----------|----------|--------------|--------|
 | `list` | `--status`, `--type`, `--assignee`, `--unassigned`, `--id`, `--label`, `--label-any`, `--priority`, `--priority-min`, `--priority-max`, `--title-contains`, `--desc-contains`, `--notes-contains`, `--all`, `--limit`, `--sort`, `--reverse`, `--deferred`, `--overdue`, `--long`, `--pretty`, `--format`, `--fields` | 📖 | `e2e_basic_lifecycle.rs`, `e2e_list_priority.rs`, `storage_list_filters.rs` | ✅ |
-| `ready` | `--limit`, `--assignee`, `--unassigned`, `--label`, `--label-any`, `--type`, `--priority`, `--sort`, `--include-deferred`, `--robot` | 📖 | `e2e_ready.rs`, `e2e_ready_limit.rs`, `storage_ready.rs` | ✅ |
 | `blocked` | `--limit`, `--detailed`, `--type`, `--priority`, `--label`, `--robot` | 📖 | `conformance.rs` | ✅ |
 | `search` | positional query + all list filters | 📖 | `e2e_basic_lifecycle.rs`, `storage_list_filters.rs` | ✅ |
 | `count` | `--by`, `--status`, `--type`, `--priority`, `--assignee`, `--unassigned`, `--include-closed`, `--include-templates`, `--title-contains` | 📖 | `conformance.rs` | ✅ |
@@ -264,7 +263,7 @@
 ### Read-Only Commands (Safe for Conformance)
 
 ```
-list, show, ready, blocked, search, count, stale, graph
+list, show, blocked, search, count, stale, graph
 dep list, dep tree, dep cycles
 label list, label list-all
 comments list
@@ -320,7 +319,6 @@ All commands support `--json` flag. Key shapes validated:
 |---------|---------------------|
 | `list --json` | `tests/snapshots/json_output.rs` |
 | `show --json` | `tests/snapshots/json_output.rs` |
-| `ready --json` | `tests/snapshots/json_output.rs` |
 | `blocked --json` | `conformance.rs` |
 | `stats --json` | `conformance.rs` |
 | Error output | `tests/snapshots/error_messages.rs` |

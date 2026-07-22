@@ -35,7 +35,7 @@ br list --json --limit 5   # JSON always wins
 Practical pattern:
 
 ```bash
-br ready --format json 2>ready.stderr.json | jq .
+br list --status open --format json 2>list.stderr.json | jq .
 ```
 
 ## Text wrapping (human output)

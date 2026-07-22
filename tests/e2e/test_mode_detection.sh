@@ -88,7 +88,7 @@ fi
 
 # Test 6: Multiple commands with --no-color
 log_section "TEST 6: Multiple commands with --no-color"
-for cmd in "list" "ready" "blocked" "stats"; do
+for cmd in "list" "blocked" "stats"; do
     OUTPUT=$(br $cmd --no-color 2>&1 || true)
     if has_ansi "$OUTPUT"; then
         log "✗ FAIL: $cmd has ANSI codes with --no-color"

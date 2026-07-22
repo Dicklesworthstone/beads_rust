@@ -20,7 +20,7 @@
 //!
 //! Read-heavy:
 //! - `list --json` - List all issues
-//! - `ready --json` - Get ready issues (dependency resolution)
+//! - `blocked --json` - Get blocked issues (dependency resolution)
 //! - `stats --json` - Project statistics
 //! - `search "keyword" --json` - Full-text search
 //!
@@ -51,7 +51,7 @@ use std::time::Instant;
 /// Metrics captured for a single command run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMetrics {
-    /// Command label (e.g., "list", "ready")
+    /// Command label (e.g., "list", "blocked")
     pub label: String,
     /// Binary used ("br" or "bd")
     pub binary: String,
@@ -226,10 +226,10 @@ fn run_read_workloads(br_path: &Path, bd_path: &Path, workspace: &Path) -> Vec<C
     );
     comparisons.push(make_comparison("list_open", br, bd));
 
-    // Ready issues (dependency resolution)
-    let br = run_with_metrics(br_path, &["ready", "--json"], workspace, "ready", "br");
-    let bd = run_with_metrics(bd_path, &["ready", "--json"], workspace, "ready", "bd");
-    comparisons.push(make_comparison("ready", br, bd));
+    // Blocked issues (dependency resolution)
+    let br = run_with_metrics(br_path, &["blocked", "--json"], workspace, "blocked", "br");
+    let bd = run_with_metrics(bd_path, &["blocked", "--json"], workspace, "blocked", "bd");
+    comparisons.push(make_comparison("blocked", br, bd));
 
     // Stats
     let br = run_with_metrics(br_path, &["stats", "--json"], workspace, "stats", "br");

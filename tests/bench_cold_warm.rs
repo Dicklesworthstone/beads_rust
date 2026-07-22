@@ -15,7 +15,7 @@
 //! # Measured Commands
 //!
 //! - `list --json` - List all issues (heavy DB read)
-//! - `ready --json` - Get ready issues (dependency resolution)
+//! - `blocked --json` - Get blocked issues (dependency resolution)
 //! - `stats --json` - Project statistics (aggregation)
 //! - `sync --status` - Check sync status (lightweight read)
 //!
@@ -109,7 +109,7 @@ pub struct Measurement {
     pub start_type: String,
     /// Which binary ("br" or "bd")
     pub binary: String,
-    /// Command label (e.g., "list", "ready")
+    /// Command label (e.g., "list", "blocked")
     pub command: String,
     /// Run index within this start type
     pub run_index: usize,
@@ -419,7 +419,7 @@ fn measure_cold_warm(
 /// Commands to benchmark for cold/warm analysis.
 const BENCHMARK_COMMANDS: &[(&str, &[&str])] = &[
     ("list", &["list", "--json"]),
-    ("ready", &["ready", "--json"]),
+    ("blocked", &["blocked", "--json"]),
     ("stats", &["stats", "--json"]),
     ("sync_status", &["sync", "--status"]),
 ];

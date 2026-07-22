@@ -73,14 +73,8 @@ log_section "TEST 5: JSON structure validation"
 br list --json | jq -e '.[0] | has("id", "title", "status", "priority")' > /dev/null
 log "✓ JSON structure valid - has required fields"
 
-# Test 6: Ready command
-log_section "TEST 6: Ready command"
-br ready --no-color | head -5
-br ready --json | jq -c 'length' > /dev/null
-log "✓ Ready command works"
-
-# Test 7: Blocked command
-log_section "TEST 7: Blocked command"
+# Test 6: Blocked command
+log_section "TEST 6: Blocked command"
 # Create dependency to test blocked
 ID1=$(br list --json | jq -r '.[0].id')
 ID2=$(br list --json | jq -r '.[1].id')
@@ -89,8 +83,8 @@ br blocked --no-color | head -5
 br blocked --json | jq -c 'length' > /dev/null
 log "✓ Blocked command works"
 
-# Test 8: Stats command
-log_section "TEST 8: Stats command"
+# Test 7: Stats command
+log_section "TEST 7: Stats command"
 br stats --no-color | head -10
 br stats --json 2>/dev/null | jq -e '.summary.total_issues' > /dev/null
 log "✓ Stats command works"

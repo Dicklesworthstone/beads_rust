@@ -26,7 +26,7 @@
 //!
 //! - list --json
 //! - show <id> --json
-//! - ready --json
+//! - blocked --json
 //! - stats --json
 //! - sync --status
 
@@ -330,7 +330,7 @@ fn get_first_issue_id(br_path: &Path, workspace: &Path) -> Option<String> {
 /// Commands to benchmark.
 const BENCHMARK_COMMANDS: &[(&str, &[&str])] = &[
     ("list", &["list", "--json"]),
-    ("ready", &["ready", "--json"]),
+    ("blocked", &["blocked", "--json"]),
     ("stats", &["stats", "--json"]),
     ("sync_status", &["sync", "--status"]),
 ];

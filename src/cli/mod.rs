@@ -705,9 +705,6 @@ pub enum Commands {
     Outbox(OutboxArgs),
 
     // ─── Find work ───
-    /// List ready issues (unblocked, not in-progress, not deferred)
-    Ready(ReadyArgs),
-
     /// List blocked issues
     Blocked(BlockedArgs),
 
@@ -2114,80 +2111,6 @@ pub struct UndeferArgs {
     pub robot: bool,
 }
 
-/// Arguments for the ready command.
-#[derive(Args, Debug, Clone, Default)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct ReadyArgs {
-    /// Maximum number of issues to return (default: 20, 0 = unlimited)
-    #[arg(long, default_value_t = 20)]
-    pub limit: usize,
-
-    /// Limit to a specific issue ID prefix. Defaults to `BD_ISSUE_PREFIX`
-    /// when set, so an agent sees only its own ready work.
-    #[arg(long, conflicts_with = "all_prefixes")]
-    pub prefix: Option<String>,
-
-    /// Show ready work across every prefix, ignoring `BD_ISSUE_PREFIX`.
-    #[arg(long, conflicts_with = "prefix")]
-    pub all_prefixes: bool,
-
-    /// Filter by assignee (no value = current actor)
-    #[arg(long, add = ArgValueCompleter::new(assignee_completer))]
-    pub assignee: Option<String>,
-
-    /// Show only unassigned issues
-    #[arg(long)]
-    pub unassigned: bool,
-
-    /// Filter by label (AND logic, can be repeated)
-    #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
-    pub label: Vec<String>,
-
-    /// Filter by label (OR logic, can be repeated)
-    #[arg(long, add = ArgValueCompleter::new(label_completer))]
-    pub label_any: Vec<String>,
-
-    /// Filter by issue type (can be repeated)
-    #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
-    pub type_: Vec<String>,
-
-    /// Filter by priority (can be repeated, 0-4 or P0-P4)
-    #[arg(long, short = 'p', add = ArgValueCompleter::new(priority_completer))]
-    pub priority: Vec<String>,
-
-    /// Sort policy: hybrid (default), priority, oldest
-    #[arg(long, default_value = "hybrid", value_enum)]
-    pub sort: SortPolicy,
-
-    /// Include deferred issues
-    #[arg(long)]
-    pub include_deferred: bool,
-
-    /// Filter to children of this parent issue ID
-    #[arg(long, add = ArgValueCompleter::new(issue_id_completer))]
-    pub parent: Option<String>,
-
-    /// Include all descendants (grandchildren, etc.) with --parent
-    #[arg(long, short = 'r')]
-    pub recursive: bool,
-
-    /// Truncate long lines instead of wrapping to terminal width
-    #[arg(long)]
-    pub no_wrap: bool,
-
-    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
-    #[arg(long, value_enum)]
-    pub format: Option<OutputFormatBasic>,
-
-    /// Show token savings stats when using TOON output
-    #[arg(long)]
-    pub stats: bool,
-
-    /// Machine-readable output (alias for --json)
-    #[arg(long)]
-    pub robot: bool,
-}
-
 /// Arguments for the blocked command.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Args, Debug, Clone, Default)]
@@ -2271,18 +2194,6 @@ pub struct ReopenArgs {
     /// Machine-readable output (alias for --json)
     #[arg(long)]
     pub robot: bool,
-}
-
-/// Sort policy for ready command.
-#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum SortPolicy {
-    /// P0/P1 first by `created_at`, then others by `created_at`
-    #[default]
-    Hybrid,
-    /// Sort by priority ASC, then `created_at` ASC
-    Priority,
-    /// Sort by `created_at` ASC only
-    Oldest,
 }
 
 /// Arguments for the sync command.

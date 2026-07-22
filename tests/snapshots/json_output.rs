@@ -37,22 +37,6 @@ fn snapshot_show_json() {
 }
 
 #[test]
-fn snapshot_ready_json() {
-    let workspace = init_workspace();
-    create_issue(&workspace, "Ready issue", "create_ready");
-
-    let output = run_br(&workspace, ["ready", "--json"], "ready_json");
-    assert!(
-        output.status.success(),
-        "ready json failed: {}",
-        output.stderr
-    );
-
-    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("ready_json_output", normalize_json(&json));
-}
-
-#[test]
 #[allow(clippy::similar_names)]
 fn snapshot_blocked_json() {
     let workspace = init_workspace();
@@ -428,21 +412,6 @@ fn snapshot_list_empty_json() {
 }
 
 #[test]
-fn snapshot_ready_empty_json() {
-    let workspace = init_workspace();
-
-    let output = run_br(&workspace, ["ready", "--json"], "ready_empty_json");
-    assert!(
-        output.status.success(),
-        "ready empty json failed: {}",
-        output.stderr
-    );
-
-    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("ready_empty_json_output", normalize_json(&json));
-}
-
-#[test]
 fn snapshot_blocked_empty_json() {
     let workspace = init_workspace();
 
@@ -564,62 +533,6 @@ fn snapshot_list_priority_ordering_json() {
                 window[0],
                 window[1]
             );
-        }
-    }
-}
-
-#[test]
-fn snapshot_ready_priority_ordering_json() {
-    let workspace = init_workspace();
-
-    // Create multiple ready issues with different priorities
-    let id_p3 = create_issue(&workspace, "Backlog ready task", "create_ready_p3");
-    let id_p1 = create_issue(&workspace, "Urgent ready task", "create_ready_p1");
-    let id_p2 = create_issue(&workspace, "Normal ready task", "create_ready_p2");
-
-    let _ = run_br(
-        &workspace,
-        ["update", &id_p3, "--priority", "3"],
-        "set_ready_p3",
-    );
-    let _ = run_br(
-        &workspace,
-        ["update", &id_p1, "--priority", "1"],
-        "set_ready_p1",
-    );
-    let _ = run_br(
-        &workspace,
-        ["update", &id_p2, "--priority", "2"],
-        "set_ready_p2",
-    );
-
-    let output = run_br(&workspace, ["ready", "--json"], "ready_priority_order_json");
-    assert!(
-        output.status.success(),
-        "ready priority ordering json failed: {}",
-        output.stderr
-    );
-
-    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    let normalized = normalize_json(&json);
-    assert_json_snapshot!("ready_priority_ordering_json_output", normalized);
-
-    // Ready uses hybrid sort: P0/P1 first, then others by created_at ASC.
-    // The snapshot locks down the exact ordering. Verify P0/P1 appear before P2+.
-    if let Value::Array(items) = &json {
-        let priorities: Vec<i64> = items
-            .iter()
-            .filter_map(|item| item.get("priority").and_then(Value::as_i64))
-            .collect();
-        let high_prio_end = priorities
-            .iter()
-            .position(|&p| p > 1)
-            .unwrap_or(priorities.len());
-        for &p in &priorities[..high_prio_end] {
-            assert!(p <= 1, "P0/P1 should appear in the first group, got P{p}");
-        }
-        for &p in &priorities[high_prio_end..] {
-            assert!(p > 1, "P2+ should appear in the second group, got P{p}");
         }
     }
 }

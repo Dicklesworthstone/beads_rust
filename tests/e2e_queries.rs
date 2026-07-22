@@ -16,8 +16,8 @@ fn parse_created_id(stdout: &str) -> String {
 
 #[test]
 #[allow(clippy::similar_names, clippy::too_many_lines)]
-fn e2e_queries_ready_stale_count_search() {
-    let _log = common::test_log("e2e_queries_ready_stale_count_search");
+fn e2e_queries_blocked_stale_count_search() {
+    let _log = common::test_log("e2e_queries_blocked_stale_count_search");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -121,41 +121,6 @@ fn e2e_queries_ready_stale_count_search() {
         "close update failed: {}",
         close_issue.stderr
     );
-
-    let ready = run_br(&workspace, ["ready", "--json"], "ready");
-    assert!(ready.status.success(), "ready failed: {}", ready.stderr);
-    let ready_payload = extract_json_payload(&ready.stdout);
-    let ready_json: Vec<Value> = serde_json::from_str(&ready_payload).expect("ready json");
-    assert!(ready_json.iter().any(|item| item["id"] == blocker_id));
-    assert!(!ready_json.iter().any(|item| item["id"] == blocked_id));
-    assert!(!ready_json.iter().any(|item| item["id"] == deferred_id));
-
-    let ready_text = run_br(&workspace, ["ready"], "ready_text");
-    assert!(
-        ready_text.status.success(),
-        "ready text failed: {}",
-        ready_text.stderr
-    );
-    assert!(
-        ready_text.stdout.contains("Ready work"),
-        "ready text missing header"
-    );
-
-    let ready_core = run_br(
-        &workspace,
-        ["ready", "--json", "--label", "core"],
-        "ready_label",
-    );
-    assert!(
-        ready_core.status.success(),
-        "ready label failed: {}",
-        ready_core.stderr
-    );
-    let ready_core_payload = extract_json_payload(&ready_core.stdout);
-    let ready_core_json: Vec<Value> =
-        serde_json::from_str(&ready_core_payload).expect("ready label json");
-    assert_eq!(ready_core_json.len(), 1);
-    assert_eq!(ready_core_json[0]["id"], blocker_id);
 
     let blocked = run_br(&workspace, ["blocked", "--json"], "blocked");
     assert!(

@@ -1,7 +1,7 @@
 //! E2E tests for the --wrap flag across various commands.
 //!
 //! Tests verify that:
-//! - --wrap flag is accepted by show, list, ready, comments, search, blocked
+//! - --wrap flag is accepted by show, list, comments, search, blocked
 //! - Default behavior (no --wrap) still truncates text
 //! - With --wrap, long content is not truncated
 //! - Different terminal widths are respected
@@ -167,33 +167,6 @@ fn e2e_show_with_wrap() {
         output.stdout.contains("detailed context"),
         "Description should be visible"
     );
-}
-
-// =============================================================================
-// BR READY --WRAP TESTS
-// =============================================================================
-
-#[test]
-fn e2e_ready_without_wrap() {
-    let workspace = BrWorkspace::new();
-    init_workspace_with_long_issues(&workspace);
-
-    let output = run_br_with_env(&workspace, ["ready"], [("COLUMNS", "60")], "ready_no_wrap");
-    assert!(output.status.success(), "ready failed");
-}
-
-#[test]
-fn e2e_ready_with_wrap() {
-    let workspace = BrWorkspace::new();
-    init_workspace_with_long_issues(&workspace);
-
-    let output = run_br_with_env(
-        &workspace,
-        ["ready", "--wrap"],
-        [("COLUMNS", "60")],
-        "ready_with_wrap",
-    );
-    assert!(output.status.success(), "ready --wrap failed");
 }
 
 // =============================================================================
@@ -398,9 +371,6 @@ fn e2e_wrap_empty_database() {
 
     // Test all wrap commands on empty database
     let output = run_br(&workspace, ["list", "--wrap"], "list_empty_wrap");
-    assert!(output.status.success());
-
-    let output = run_br(&workspace, ["ready", "--wrap"], "ready_empty_wrap");
     assert!(output.status.success());
 
     let output = run_br(&workspace, ["blocked", "--wrap"], "blocked_empty_wrap");

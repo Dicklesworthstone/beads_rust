@@ -1,7 +1,7 @@
 //! Synthetic scale-up benchmark suite for stress testing with large datasets.
 //!
 //! This module generates synthetic datasets (100k+ issues) by expanding patterns
-//! from real datasets, then exercises list/search/ready/sync operations at scale.
+//! from real datasets, then exercises list/search/blocked/sync operations at scale.
 //!
 //! # Usage
 //!
@@ -530,9 +530,9 @@ fn benchmark_synthetic(dataset: &SyntheticDataset, br_path: &Path) -> SyntheticB
     ));
     operations.push(run_operation(
         br_path,
-        &["ready", "--json"],
+        &["blocked", "--json"],
         workspace,
-        "ready",
+        "blocked",
     ));
     operations.push(run_operation(
         br_path,

@@ -13,13 +13,13 @@ br init --prefix bd
 Machine-readable:
 
 ```bash
-br ready --format json --limit 10
+br list --status open --format json --limit 10
 ```
 
 Token-efficient:
 
 ```bash
-br ready --format toon --limit 10
+br list --status open --format toon --limit 10
 ```
 
 ## 3) Claim + work
