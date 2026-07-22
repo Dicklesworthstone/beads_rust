@@ -52,7 +52,6 @@ scripts/e2e.sh --filter lifecycle # Run matching tests
 
 **Tests included:**
 - `e2e_basic_lifecycle` - Create/update/close/delete workflow
-- `e2e_ready` - Ready command behavior
 - `e2e_create_output` - Create command output format
 - `e2e_list_priority` - List with priority filtering
 - `e2e_errors` - Error handling and exit codes

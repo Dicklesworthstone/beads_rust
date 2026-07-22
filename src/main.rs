@@ -73,7 +73,6 @@ fn main() {
             commands::messaging::execute_outbox(&args, &overrides, &output_ctx)
         }
         Commands::Watch(args) => commands::watch::execute(&args, &overrides, &output_ctx),
-        Commands::Ready(args) => commands::ready::execute(&args, cli.json, &overrides, &output_ctx),
         Commands::Blocked(args) => {
             commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
@@ -217,7 +216,6 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
-        | Commands::Ready(_)
         | Commands::Blocked(_)
         | Commands::Count(_)
         | Commands::Stale(_)
@@ -493,7 +491,6 @@ mod tests {
         assert!(help.contains("create"));
         assert!(help.contains("list"));
         assert!(help.contains("sync"));
-        assert!(help.contains("ready"));
     }
 
     #[test]

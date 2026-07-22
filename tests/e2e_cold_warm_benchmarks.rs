@@ -14,7 +14,7 @@
 //!
 //! - `list --json` - List all issues
 //! - `show <id> --json` - Show single issue
-//! - `ready --json` - Get ready issues (dependency resolution)
+//! - `blocked --json` - Get blocked issues (dependency resolution)
 //! - `stats --json` - Project statistics
 //! - `sync --status` - Check sync status (read-only)
 //!
@@ -225,7 +225,7 @@ impl Default for BenchmarkConfig {
             warm_runs: 5,
             commands: vec![
                 "list --json".to_string(),
-                "ready --json".to_string(),
+                "blocked --json".to_string(),
                 "stats --json".to_string(),
                 "sync --status".to_string(),
             ],
@@ -642,7 +642,7 @@ fn cold_warm_benchmark_full() {
         warm_runs: 5,
         commands: vec![
             "list --json".to_string(),
-            "ready --json".to_string(),
+            "blocked --json".to_string(),
             "stats --json".to_string(),
             "sync --status".to_string(),
         ],

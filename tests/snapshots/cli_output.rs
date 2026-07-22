@@ -73,24 +73,6 @@ fn snapshot_show_output() {
 }
 
 #[test]
-fn snapshot_ready_output() {
-    let workspace = init_workspace();
-    // Create issues with different priorities using update
-    let id1 = create_issue(&workspace, "Critical bug", "create_p0");
-    let id2 = create_issue(&workspace, "High priority feature", "create_p1");
-    let id3 = create_issue(&workspace, "Medium task", "create_p2");
-
-    // Update priorities
-    let _ = run_br(&workspace, ["update", &id1, "--priority", "0"], "update_p0");
-    let _ = run_br(&workspace, ["update", &id2, "--priority", "1"], "update_p1");
-    let _ = run_br(&workspace, ["update", &id3, "--priority", "2"], "update_p2");
-
-    let output = run_br(&workspace, ["ready"], "ready_text");
-    assert!(output.status.success(), "ready failed: {}", output.stderr);
-    assert_snapshot!("ready_output", normalize_output(&output.stdout));
-}
-
-#[test]
 fn snapshot_blocked_output() {
     let workspace = init_workspace();
 

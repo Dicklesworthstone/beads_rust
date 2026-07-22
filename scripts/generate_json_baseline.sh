@@ -132,8 +132,7 @@ capture_fixture "list_priority_0_1" "High priority issues (P0-P1)" list --priori
 capture_fixture "show_single" "Single issue details" show "$ID1" --json
 capture_fixture "show_multiple" "Multiple issue details" show "$ID1" "$ID2" --json
 
-# Ready/Blocked commands
-capture_fixture "ready" "Issues ready to work on" ready --json
+# Blocked command
 capture_fixture "blocked" "Blocked issues" blocked --json
 
 # Stats command

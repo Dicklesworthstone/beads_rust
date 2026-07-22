@@ -70,30 +70,6 @@ fn e2e_json_flag_show() {
 }
 
 #[test]
-fn e2e_json_flag_ready() {
-    let _log = common::test_log("e2e_json_flag_ready");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    let create = run_br(&workspace, ["create", "Ready JSON test"], "create");
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-
-    // Ready with --json flag
-    let ready = run_br(&workspace, ["ready", "--json"], "ready_json");
-    assert!(
-        ready.status.success(),
-        "ready --json failed: {}",
-        ready.stderr
-    );
-
-    let payload = extract_json_payload(&ready.stdout);
-    // Should be valid JSON array (may be empty if issue not ready)
-    let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON array");
-}
-
-#[test]
 fn e2e_json_flag_blocked() {
     let _log = common::test_log("e2e_json_flag_blocked");
     let workspace = BrWorkspace::new();
@@ -334,29 +310,29 @@ fn e2e_no_db_flag_show() {
 }
 
 #[test]
-fn e2e_no_db_flag_ready() {
-    let _log = common::test_log("e2e_no_db_flag_ready");
+fn e2e_no_db_flag_blocked() {
+    let _log = common::test_log("e2e_no_db_flag_blocked");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let create = run_br(&workspace, ["create", "No-DB ready test"], "create");
+    let create = run_br(&workspace, ["create", "No-DB blocked test"], "create");
     assert!(create.status.success(), "create failed: {}", create.stderr);
 
     let sync = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
     assert!(sync.status.success(), "sync flush failed: {}", sync.stderr);
 
-    // Ready with --no-db flag
-    let ready = run_br(&workspace, ["--no-db", "ready", "--json"], "ready_no_db");
+    // Blocked with --no-db flag
+    let blocked = run_br(&workspace, ["--no-db", "blocked", "--json"], "blocked_no_db");
     assert!(
-        ready.status.success(),
-        "ready --no-db failed: {}",
-        ready.stderr
+        blocked.status.success(),
+        "blocked --no-db failed: {}",
+        blocked.stderr
     );
 
     // Should output valid JSON
-    let payload = extract_json_payload(&ready.stdout);
+    let payload = extract_json_payload(&blocked.stdout);
     let _json: Vec<Value> = serde_json::from_str(&payload).expect("valid JSON");
 }
 
@@ -768,7 +744,6 @@ fn e2e_json_stdout_is_clean_json() {
     // Verify multiple commands produce clean JSON stdout
     for (cmd, label) in [
         (vec!["list", "--json"], "list"),
-        (vec!["ready", "--json"], "ready"),
         (vec!["blocked", "--json"], "blocked"),
         (vec!["count", "--json"], "count"),
         (vec!["stats", "--json"], "stats"),
@@ -883,7 +858,7 @@ fn e2e_no_color_across_commands() {
     for (cmd, label) in [
         (vec!["list", "--no-color"], "list"),
         (vec!["show", &id, "--no-color"], "show"),
-        (vec!["ready", "--no-color"], "ready"),
+        (vec!["blocked", "--no-color"], "blocked"),
         (vec!["stats", "--no-color"], "stats"),
         (vec!["count", "--no-color"], "count"),
     ] {

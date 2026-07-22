@@ -9,7 +9,7 @@ This file shows small, copy/pasteable flows. For machine-readable examples, also
 ## List work (TOON -> JSON)
 
 ```bash
-br ready --format toon --limit 10 | tru --decode | jq '.[0]'
+br list --status open --format toon --limit 10 | tru --decode | jq '.[0]'
 ```
 
 ## Update status (JSON)

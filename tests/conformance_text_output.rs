@@ -4,7 +4,7 @@
 //! These tests verify br (Rust) produces identical human-readable text output
 //! to bd (Go) for stable commands with color/whitespace normalization.
 //!
-//! Commands tested: list, show, ready, blocked, stats, orphans
+//! Commands tested: list, show, blocked, stats, orphans
 
 mod common;
 
@@ -302,84 +302,6 @@ fn conformance_text_show() {
     assert!(
         result.matches,
         "Text output mismatch for 'show':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary, result.br_normalized, result.bd_normalized
-    );
-
-    workspace.finish(true);
-}
-
-/// Test: `ready` command with empty database
-#[test]
-fn conformance_text_ready_empty() {
-    skip_if_no_bd!();
-    common::init_test_logging();
-
-    let mut workspace = ConformanceWorkspace::new("conformance_text", "ready_empty");
-    workspace.init_both();
-
-    let br_ready = workspace.run_br(["ready"], "ready");
-    let bd_ready = workspace.run_bd(["ready"], "ready");
-
-    assert!(br_ready.success, "br ready failed: {}", br_ready.stderr);
-    assert!(bd_ready.success, "bd ready failed: {}", bd_ready.stderr);
-
-    let result = TextComparisonResult::compare(&br_ready.stdout, &bd_ready.stdout);
-
-    assert!(
-        result.matches,
-        "Text output mismatch for 'ready' (empty):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
-        result.diff_summary, result.br_normalized, result.bd_normalized
-    );
-
-    workspace.finish(true);
-}
-
-/// Test: `ready` command with issues
-#[test]
-fn conformance_text_ready_with_issues() {
-    skip_if_no_bd!();
-    common::init_test_logging();
-
-    let mut workspace = ConformanceWorkspace::new("conformance_text", "ready_with_issues");
-    workspace.init_both();
-
-    // Create issues with different priorities
-    workspace.run_br(
-        ["create", "High priority task", "--priority", "1"],
-        "create1",
-    );
-    workspace.run_bd(
-        ["create", "High priority task", "--priority", "1"],
-        "create1",
-    );
-    workspace.run_br(
-        ["create", "Medium priority task", "--priority", "2"],
-        "create2",
-    );
-    workspace.run_bd(
-        ["create", "Medium priority task", "--priority", "2"],
-        "create2",
-    );
-    workspace.run_br(
-        ["create", "Low priority task", "--priority", "3"],
-        "create3",
-    );
-    workspace.run_bd(
-        ["create", "Low priority task", "--priority", "3"],
-        "create3",
-    );
-
-    let br_ready = workspace.run_br(["ready"], "ready");
-    let bd_ready = workspace.run_bd(["ready"], "ready");
-
-    assert!(br_ready.success, "br ready failed: {}", br_ready.stderr);
-    assert!(bd_ready.success, "bd ready failed: {}", bd_ready.stderr);
-
-    let result = TextComparisonResult::compare(&br_ready.stdout, &bd_ready.stdout);
-
-    assert!(
-        result.matches,
-        "Text output mismatch for 'ready' (with issues):\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
         result.diff_summary, result.br_normalized, result.bd_normalized
     );
 
@@ -736,13 +658,13 @@ fn conformance_text_show_not_found() {
     workspace.finish(true);
 }
 
-/// Test: `ready` with limit
+/// Test: `blocked` with limit
 #[test]
-fn conformance_text_ready_with_limit() {
+fn conformance_text_blocked_with_limit() {
     skip_if_no_bd!();
     common::init_test_logging();
 
-    let mut workspace = ConformanceWorkspace::new("conformance_text", "ready_with_limit");
+    let mut workspace = ConformanceWorkspace::new("conformance_text", "blocked_with_limit");
     workspace.init_both();
 
     // Create multiple issues
@@ -752,26 +674,26 @@ fn conformance_text_ready_with_limit() {
         workspace.run_bd(["create", &title], &format!("create_{}", i));
     }
 
-    // Get only first 2 ready issues
-    let br_ready = workspace.run_br(["ready", "--limit", "2"], "ready");
-    let bd_ready = workspace.run_bd(["ready", "--limit", "2"], "ready");
+    // Get only first 2 blocked issues
+    let br_blocked = workspace.run_br(["blocked", "--limit", "2"], "blocked");
+    let bd_blocked = workspace.run_bd(["blocked", "--limit", "2"], "blocked");
 
     assert!(
-        br_ready.success,
-        "br ready --limit failed: {}",
-        br_ready.stderr
+        br_blocked.success,
+        "br blocked --limit failed: {}",
+        br_blocked.stderr
     );
     assert!(
-        bd_ready.success,
-        "bd ready --limit failed: {}",
-        bd_ready.stderr
+        bd_blocked.success,
+        "bd blocked --limit failed: {}",
+        bd_blocked.stderr
     );
 
-    let result = TextComparisonResult::compare(&br_ready.stdout, &bd_ready.stdout);
+    let result = TextComparisonResult::compare(&br_blocked.stdout, &bd_blocked.stdout);
 
     assert!(
         result.matches,
-        "Text output mismatch for 'ready --limit 2':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
+        "Text output mismatch for 'blocked --limit 2':\n{}\n\nbr output:\n{}\n\nbd output:\n{}",
         result.diff_summary, result.br_normalized, result.bd_normalized
     );
 

@@ -64,7 +64,6 @@ test_json_command() {
 
 # Core commands that produce JSON
 test_json_command "list"
-test_json_command "ready"
 test_json_command "blocked"
 test_json_command "stale"
 test_json_command "orphans"

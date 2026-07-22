@@ -57,7 +57,7 @@ You need to track issues for your project, but:
 ```bash
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
-br ready                             # See what's actionable
+br list --status open                # See what's actionable
 br close bd-abc123                   # Close when done
 br sync --flush-only                 # Export for git commit
 ```
@@ -98,17 +98,17 @@ br create "Set up database schema" --type task --priority 1
 # Auth depends on database schema
 br dep add bd-7f3a2c bd-e9b1d4
 
-# See what's ready to work on (not blocked)
-br ready
-# bd-e9b1d4  P1  task     Set up database schema
+# See what's blocked
+br blocked
+# bd-7f3a2c  P1  feature  Implement user auth  (blocked by bd-e9b1d4)
 
 # Claim and complete work
 br update bd-e9b1d4 --status in_progress
 br close bd-e9b1d4 --reason "Schema implemented"
 
 # Now auth is unblocked
-br ready
-# bd-7f3a2c  P1  feature  Implement user auth
+br blocked
+# (no output — nothing blocked)
 
 # Export to JSONL for git commit
 br sync --flush-only
@@ -165,7 +165,7 @@ Every command supports `--json` for AI coding agents:
 
 ```bash
 br list --json | jq '.[] | select(.priority <= 1)'
-br ready --json  # Structured output for agents
+br blocked --json  # Structured output for agents
 br show bd-abc123 --json
 ```
 
@@ -306,11 +306,11 @@ br create "Fix login timeout bug" \
 # Created: bd-a1b2c3
 ```
 
-### 3. Check Ready Work
+### 3. Check Open Work
 
 ```bash
-br ready
-# Shows issues that are open, not blocked, not deferred
+br list --status open
+# Shows issues that are open
 ```
 
 ### 4. Claim and Work
@@ -355,7 +355,6 @@ git commit -m "Fix: login timeout (bd-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `list` | List issues | `br list --status open --priority 0-1` |
-| `ready` | Actionable work | `br ready` |
 | `blocked` | Blocked issues | `br blocked` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
@@ -461,7 +460,7 @@ br config --edit
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                         CLI (br)                              │
-│  Commands: create, list, ready, close, sync, etc.            │
+│  Commands: create, list, blocked, close, sync, etc.          │
 └──────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -621,7 +620,7 @@ br works seamlessly with [beads_viewer](https://github.com/Dicklesworthstone/bea
 bv
 
 # Use br for CLI/scripting
-br ready --json | jq
+br list --json | jq
 ```
 
 ### Q: Can I use br with AI coding agents?
@@ -631,7 +630,7 @@ Yes! br is designed for AI agent integration:
 ```bash
 # Agents can use --json for structured output
 br list --json
-br ready --json
+br blocked --json
 br show bd-abc123 --json
 
 # Create issues programmatically
@@ -665,14 +664,14 @@ br sync --import-only
 # Issue A depends on Issue B (A is blocked until B is closed)
 br dep add bd-A bd-B
 
-# Now bd-A won't appear in `br ready` until bd-B is closed
-br ready  # Only shows bd-B
+# bd-A shows up in `br blocked` until bd-B is closed
+br blocked  # Shows bd-A, blocked by bd-B
 
 # Close the blocker
 br close bd-B
 
-# Now bd-A is ready
-br ready  # Shows bd-A
+# Now bd-A is unblocked
+br blocked  # No longer lists bd-A
 ```
 
 ### Q: How do I handle merge conflicts in JSONL?
@@ -740,7 +739,7 @@ Quick example:
 
 ```bash
 # Agent workflow
-br ready --json | jq '.[0]'           # Get top priority
+br list --status open --json | jq '.[0]'  # Get top priority
 br update bd-abc --status in_progress # Claim work
 # ... do work ...
 br close bd-abc --reason "Completed"  # Done

@@ -28,7 +28,6 @@ ARTIFACTS_DIR="${PROJECT_ROOT}/target/test-artifacts"
 # Quick subset of E2E tests (critical path, fast-running)
 QUICK_TESTS=(
     e2e_basic_lifecycle
-    e2e_ready
     e2e_create_output
     e2e_list_priority
     e2e_errors

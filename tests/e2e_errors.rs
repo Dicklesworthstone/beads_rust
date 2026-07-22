@@ -73,12 +73,12 @@ fn e2e_error_handling() {
     );
     assert!(!bad_priority.status.success());
 
-    let bad_ready_priority = run_br(
+    let bad_blocked_priority = run_br(
         &workspace,
-        ["ready", "--priority", "9"],
-        "ready_bad_priority",
+        ["blocked", "--priority", "9"],
+        "blocked_bad_priority",
     );
-    assert!(!bad_ready_priority.status.success());
+    assert!(!bad_blocked_priority.status.success());
 
     let bad_label = run_br(
         &workspace,

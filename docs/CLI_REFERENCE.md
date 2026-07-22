@@ -18,7 +18,6 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [reopen](#reopen)
   - [delete](#delete)
 - [Query Commands](#query-commands)
-  - [ready](#ready)
   - [blocked](#blocked)
   - [search](#search)
   - [count](#count)
@@ -364,42 +363,6 @@ br delete [OPTIONS] <IDS>...
 ---
 
 ## Query Commands
-
-### ready
-
-List issues ready to work on (unblocked, not deferred).
-
-```bash
-br ready [OPTIONS]
-```
-
-**Options:**
-| Option | Description |
-|--------|-------------|
-| `--limit <N>` | Maximum results (default: 20) |
-| `--assignee <NAME>` | Filter by assignee |
-| `--unassigned` | Show only unassigned |
-| `-l, --label <LABEL>` | Filter by label (AND logic) |
-| `--label-any <LABEL>` | Filter by label (OR logic) |
-| `-t, --type <TYPE>` | Filter by type |
-| `-p, --priority <N>` | Filter by priority |
-| `--sort <POLICY>` | Sort: hybrid (default), priority, oldest |
-| `--include-deferred` | Include deferred issues |
-| `--robot` | Machine-readable output |
-
-**Examples:**
-```bash
-# My ready work
-br ready --assignee $(whoami)
-
-# Unassigned high-priority
-br ready --unassigned -p 0 -p 1
-
-# JSON for agent integration
-br ready --json --limit 10
-```
-
----
 
 ### blocked
 
@@ -880,7 +843,7 @@ source ~/.bashrc
 
 ## JSON Output Schemas
 
-### Issue Object (list, show, ready)
+### Issue Object (list, show, blocked)
 
 ```json
 {

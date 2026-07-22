@@ -1230,23 +1230,23 @@ fn benchmark_search(config: &BenchmarkConfig) -> BenchmarkComparison {
     BenchmarkComparison::new("search", "Full-text search (50 issues)", br_stats, bd_stats)
 }
 
-/// Benchmark: ready command (unblocked issues)
-fn benchmark_ready(config: &BenchmarkConfig) -> BenchmarkComparison {
-    info!("benchmark_ready: starting");
+/// Benchmark: blocked command (blocked issues)
+fn benchmark_blocked(config: &BenchmarkConfig) -> BenchmarkComparison {
+    info!("benchmark_blocked: starting");
 
     let workspace = BenchmarkWorkspace::new();
     populate_workspace(&workspace, 30);
 
-    let br_stats = run_benchmark(config, || workspace.time_br(["ready", "--json"]));
+    let br_stats = run_benchmark(config, || workspace.time_br(["blocked", "--json"]));
 
-    let bd_stats = run_benchmark(config, || workspace.time_bd(["ready", "--json"]));
+    let bd_stats = run_benchmark(config, || workspace.time_bd(["blocked", "--json"]));
 
     info!(
-        "benchmark_ready: br_mean={:.2}ms bd_mean={:.2}ms",
+        "benchmark_blocked: br_mean={:.2}ms bd_mean={:.2}ms",
         br_stats.mean_ms, bd_stats.mean_ms
     );
 
-    BenchmarkComparison::new("ready", "Get ready issues (30 issues)", br_stats, bd_stats)
+    BenchmarkComparison::new("blocked", "Get blocked issues (30 issues)", br_stats, bd_stats)
 }
 
 /// Benchmark: sync --flush-only (export to JSONL)
@@ -1389,8 +1389,8 @@ fn benchmark_comparison_full() {
     println!("[8/12] Running search benchmark...");
     comparisons.push(benchmark_search(&config));
 
-    println!("[9/12] Running ready benchmark...");
-    comparisons.push(benchmark_ready(&config));
+    println!("[9/12] Running blocked benchmark...");
+    comparisons.push(benchmark_blocked(&config));
 
     println!("[10/12] Running sync_flush benchmark...");
     comparisons.push(benchmark_sync_flush(&config));

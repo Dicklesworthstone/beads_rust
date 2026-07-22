@@ -195,7 +195,7 @@ run_bd_comparison() {
 
     # Simple timing comparison on common operations
     local comparison_file="$ARTIFACTS_DIR/benchmark/bd_comparison.json"
-    local ops=("list --json" "ready --json" "stats --json")
+    local ops=("list --json" "blocked --json" "stats --json")
 
     echo "{" > "$comparison_file"
     echo "  \"operations\": [" >> "$comparison_file"

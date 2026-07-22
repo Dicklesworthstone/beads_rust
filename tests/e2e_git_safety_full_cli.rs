@@ -459,20 +459,6 @@ fn regression_full_cli_does_not_touch_git() {
     // ========================================================================
     eprintln!("\n[PHASE 3] Testing queries and filters...");
 
-    // ready
-    let (git_snap, head, count, _) =
-        check_git_safety!(&workspace, git_snap, head, count, ["ready"], "ready");
-
-    // ready --json
-    let (git_snap, head, count, _) = check_git_safety!(
-        &workspace,
-        git_snap,
-        head,
-        count,
-        ["ready", "--json"],
-        "ready_json"
-    );
-
     // blocked
     let (git_snap, head, count, _) =
         check_git_safety!(&workspace, git_snap, head, count, ["blocked"], "blocked");
