@@ -97,9 +97,17 @@ pub fn execute(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
         .ok()
         .and_then(|p| p.into_os_string().into_string().ok())
         .unwrap_or_default();
-    storage_ctx
-        .storage
-        .register_watcher(OPERATOR_PREFIX, pid, started_at, &cwd, "")?;
+    // Registration is just the first heartbeat — heartbeat_watcher is
+    // a self-healing UPSERT (see storage::watchers::heartbeat), so
+    // there's no separate one-shot register step.
+    storage_ctx.storage.heartbeat_watcher(
+        OPERATOR_PREFIX,
+        pid,
+        started_at,
+        started_at,
+        &cwd,
+        "",
+    )?;
     let _guard = WatcherGuard {
         beads_dir: beads_dir.clone(),
         pid,
@@ -137,11 +145,13 @@ pub fn execute(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     loop {
         thread::sleep(Duration::from_secs(POLL_INTERVAL_SECS));
         let now = Utc::now();
-        let _ = storage_ctx
-            .storage
-            .heartbeat_watcher(OPERATOR_PREFIX, pid, now);
         let ttl = crate::storage::watchers::WATCHER_TTL_SECONDS;
         let _ = storage_ctx.storage.sweep_stale_watchers(now, ttl);
+        // Supersede check MUST run before the heartbeat UPSERT below —
+        // `watchers` keys on prefix alone, so heartbeating first would
+        // claim the row before we ever got to see who held it. See
+        // the `bd watch` tick loop (cli/commands/watch.rs) for the
+        // full rationale; this REPL mirrors the same ordering.
         if let Ok(Some(winner)) = storage_ctx
             .storage
             .newest_other_watcher(OPERATOR_PREFIX, pid, started_at, now, ttl)
@@ -158,6 +168,10 @@ pub fn execute(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
             let _ = write_cursor(&mut storage_ctx.storage, cursor);
             return Ok(());
         }
+        let _ =
+            storage_ctx
+                .storage
+                .heartbeat_watcher(OPERATOR_PREFIX, pid, started_at, now, &cwd, "");
         cursor = drain_pending(
             &mut storage_ctx.storage,
             &mut out,

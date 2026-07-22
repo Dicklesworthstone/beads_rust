@@ -224,23 +224,13 @@ impl SqliteStorage {
         crate::storage::presence::all_presence(&self.conn)
     }
 
-    /// Register an active `bd watch` heartbeat.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the DB write fails.
-    pub fn register_watcher(
-        &mut self,
-        prefix: &str,
-        pid: i64,
-        now: chrono::DateTime<chrono::Utc>,
-        cwd: &str,
-        git_remote: &str,
-    ) -> Result<()> {
-        crate::storage::watchers::register(&self.conn, prefix, pid, now, cwd, git_remote)
-    }
-
-    /// Update `last_seen` for a running watcher.
+    /// Self-healing heartbeat UPSERT for `prefix`'s watcher row. Used
+    /// both to register a watcher at startup and to refresh it on
+    /// every poll tick afterward — there's no separate one-shot
+    /// register step, so a row deleted out from under a live watcher
+    /// (e.g. a racing stale-sweep) regenerates on the very next call.
+    /// See [`crate::storage::watchers::heartbeat`] for the full
+    /// `started_at` claim semantics.
     ///
     /// # Errors
     ///
@@ -249,9 +239,20 @@ impl SqliteStorage {
         &mut self,
         prefix: &str,
         pid: i64,
+        my_started_at: chrono::DateTime<chrono::Utc>,
         now: chrono::DateTime<chrono::Utc>,
+        cwd: &str,
+        git_remote: &str,
     ) -> Result<()> {
-        crate::storage::watchers::heartbeat(&self.conn, prefix, pid, now)
+        crate::storage::watchers::heartbeat(
+            &self.conn,
+            prefix,
+            pid,
+            my_started_at,
+            now,
+            cwd,
+            git_remote,
+        )
     }
 
     /// Remove a watcher row (clean shutdown).

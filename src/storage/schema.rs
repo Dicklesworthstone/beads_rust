@@ -236,14 +236,20 @@ pub const SCHEMA_SQL: &str = r"
     -- integration. `git_remote` is the canonicalized form
     -- (host/owner/repo) so it joins directly against
     -- ghwatch.watch_state.repo without an adapter expression.
+    -- PRIMARY KEY is prefix ALONE (not (prefix, pid)). Process identity
+    -- (pid) is the wrong key: agent harnesses restart `bd watch` freely
+    -- (new pid, same prefix), and a composite key just creates stale-row
+    -- churn. `pid` is kept as an informational column only. See
+    -- migrate_watchers_primary_key() for the existing-DB upgrade path
+    -- (old composite-PK tables are rebuilt keeping the freshest row per
+    -- prefix).
     CREATE TABLE IF NOT EXISTS watchers (
-        prefix TEXT NOT NULL,
+        prefix TEXT PRIMARY KEY,
         pid INTEGER NOT NULL,
         started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         cwd TEXT NOT NULL DEFAULT '',
-        git_remote TEXT NOT NULL DEFAULT '',
-        PRIMARY KEY (prefix, pid)
+        git_remote TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_watchers_last_seen ON watchers(last_seen);
     CREATE INDEX IF NOT EXISTS idx_watchers_git_remote
@@ -409,11 +415,65 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
     ensure_columns(conn, "messages", MESSAGE_COLUMNS)?;
     ensure_columns(conn, "watchers", WATCHER_COLUMNS)?;
 
+    // Old databases created the watchers table with a composite
+    // PRIMARY KEY (prefix, pid). The current schema keys on prefix
+    // alone (process identity is the wrong identity for a watcher —
+    // agent harnesses restart `bd watch` freely with a new pid but the
+    // same prefix). Rebuild in place, keeping only the freshest row
+    // per prefix, before SCHEMA_SQL's CREATE TABLE IF NOT EXISTS runs
+    // (which is a no-op against an already-existing table).
+    migrate_watchers_primary_key(conn)?;
+
     // Always drop idx_issues_ready so SCHEMA_SQL recreates it with the
     // current definition (including is_template filter). DROP INDEX is O(1)
     // and SCHEMA_SQL's CREATE INDEX is fast for typical issue counts.
     conn.execute("DROP INDEX IF EXISTS idx_issues_ready", [])?;
 
+    Ok(())
+}
+
+/// Detect and repair the old composite-PK `watchers` shape
+/// (`PRIMARY KEY (prefix, pid)`) left behind by databases created
+/// before watcher identity moved to prefix-alone. Standard sqlite
+/// table-rebuild dance: create the new-shape table, copy over the
+/// freshest row per prefix, drop the old table, rename into place.
+///
+/// A no-op on databases that don't have a `watchers` table yet, or
+/// that already have the single-column-PK shape.
+fn migrate_watchers_primary_key(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "watchers") {
+        return Ok(());
+    }
+
+    // pragma_table_info's `pk` column is the column's 1-indexed
+    // position within the PRIMARY KEY (0 when not part of it). A
+    // composite PK shows up as two columns with pk = 1 and pk = 2;
+    // any column with pk > 1 is proof the table predates the
+    // prefix-alone key.
+    let is_composite: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('watchers') WHERE pk > 1")
+        .and_then(|mut stmt| stmt.exists([]))
+        .unwrap_or(false);
+    if !is_composite {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE watchers_new (
+            prefix TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_seen DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            cwd TEXT NOT NULL DEFAULT '',
+            git_remote TEXT NOT NULL DEFAULT ''
+         );
+         INSERT OR REPLACE INTO watchers_new (prefix, pid, started_at, last_seen, cwd, git_remote)
+         SELECT prefix, pid, started_at, last_seen, cwd, git_remote
+         FROM watchers
+         ORDER BY last_seen ASC;
+         DROP TABLE watchers;
+         ALTER TABLE watchers_new RENAME TO watchers;",
+    )?;
     Ok(())
 }
 
