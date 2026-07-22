@@ -69,7 +69,7 @@
 | `search` | positional query + all list filters | 📖 | `e2e_basic_lifecycle.rs`, `storage_list_filters.rs` | ✅ |
 | `count` | `--by`, `--status`, `--type`, `--priority`, `--assignee`, `--unassigned`, `--include-closed`, `--include-templates`, `--title-contains` | 📖 | `conformance.rs` | ✅ |
 | `stale` | `--days`, `--status` | 📖 | `conformance.rs` | ✅ |
-| `graph` | positional ID, `--all`, `--compact` | 📖 | `e2e_graph.rs`, `e2e_graph_ordering.rs` | ✅ |
+| `graph` | positional ID, `--all`, `--compact`, `--deferred` | 📖 | `e2e_graph.rs`, `e2e_graph_ordering.rs` | ✅ |
 
 ---
 

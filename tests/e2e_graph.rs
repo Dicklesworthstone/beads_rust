@@ -403,3 +403,150 @@ fn e2e_graph_chain_depth() {
     assert_eq!(node_b["depth"], 1, "B should be at depth 1");
     assert_eq!(node_c["depth"], 2, "C should be at depth 2");
 }
+
+#[test]
+fn e2e_graph_all_cross_prefix_flat_rendering() {
+    let _log = common::test_log("e2e_graph_all_cross_prefix_flat_rendering");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Create issue with explicit prefix 'alpha'
+    let a = run_br(
+        &workspace,
+        ["create", "--prefix", "alpha", "Alpha issue"],
+        "create_a",
+    );
+    assert!(a.status.success(), "create a failed: {}", a.stderr);
+    let id_a = parse_created_id(&a.stdout);
+
+    // Create issue with explicit prefix 'beta'
+    let b = run_br(
+        &workspace,
+        ["create", "--prefix", "beta", "Beta issue"],
+        "create_b",
+    );
+    assert!(b.status.success(), "create b failed: {}", b.stderr);
+    let id_b = parse_created_id(&b.stdout);
+
+    // Create cross-prefix dep: B depends on A (different prefixes in same component)
+    let dep = run_br(&workspace, ["dep", "add", &id_b, &id_a], "dep_add");
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+
+    // Create a standalone issue in beta (separate component)
+    let c = run_br(
+        &workspace,
+        ["create", "--prefix", "beta", "Beta standalone"],
+        "create_c",
+    );
+    assert!(c.status.success(), "create c failed: {}", c.stderr);
+    let id_c = parse_created_id(&c.stdout);
+
+    let graph = run_br(&workspace, ["graph", "--all"], "graph_all");
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+
+    // Should show 2 components: {A,B} and {C}
+    assert!(
+        graph.stdout.contains("2 component"),
+        "Expected 2 components, got: {}",
+        graph.stdout
+    );
+
+    // Both cross-prefix issues should appear
+    assert!(
+        graph.stdout.contains(&id_a) && graph.stdout.contains(&id_b),
+        "Expected both alpha and beta issues in output, got: {}",
+        graph.stdout
+    );
+    assert!(
+        graph.stdout.contains(&id_c),
+        "Expected standalone beta issue in output, got: {}",
+        graph.stdout
+    );
+
+    // MUST NOT have old prefix-clustered section headers
+    assert!(
+        !graph.stdout.contains("=== "),
+        "Output must not contain prefix-section headers '=== ', got: {}",
+        graph.stdout
+    );
+    assert!(
+        !graph.stdout.contains("<cross-prefix>"),
+        "Output must not contain <cross-prefix> bucket, got: {}",
+        graph.stdout
+    );
+}
+
+#[test]
+fn e2e_graph_all_deferred_excluded_by_default() {
+    let _log = common::test_log("e2e_graph_all_deferred_excluded_by_default");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Create an open issue
+    let open = run_br(&workspace, ["create", "Open issue"], "create_open");
+    assert!(open.status.success(), "create open failed: {}", open.stderr);
+    let id_open = parse_created_id(&open.stdout);
+
+    // Create a deferred issue
+    let deferred = run_br(&workspace, ["create", "Deferred issue"], "create_deferred");
+    assert!(
+        deferred.status.success(),
+        "create deferred failed: {}",
+        deferred.stderr
+    );
+    let id_deferred = parse_created_id(&deferred.stdout);
+    let defer_it = run_br(
+        &workspace,
+        ["update", &id_deferred, "--status", "deferred"],
+        "update_deferred",
+    );
+    assert!(
+        defer_it.status.success(),
+        "update to deferred failed: {}",
+        defer_it.stderr
+    );
+
+    // Without --deferred, deferred issue must not appear
+    let graph_default = run_br(&workspace, ["graph", "--all"], "graph_default");
+    assert!(
+        graph_default.status.success(),
+        "graph failed: {}",
+        graph_default.stderr
+    );
+    assert!(
+        graph_default.stdout.contains(&id_open),
+        "Expected open issue in output, got: {}",
+        graph_default.stdout
+    );
+    assert!(
+        !graph_default.stdout.contains(&id_deferred),
+        "Deferred issue must not appear without --deferred flag, got: {}",
+        graph_default.stdout
+    );
+
+    // With --deferred, deferred issue must appear with status badge
+    let graph_deferred = run_br(
+        &workspace,
+        ["graph", "--all", "--deferred"],
+        "graph_with_deferred",
+    );
+    assert!(
+        graph_deferred.status.success(),
+        "graph --deferred failed: {}",
+        graph_deferred.stderr
+    );
+    assert!(
+        graph_deferred.stdout.contains(&id_deferred),
+        "Deferred issue must appear with --deferred flag, got: {}",
+        graph_deferred.stdout
+    );
+    assert!(
+        graph_deferred.stdout.contains("deferred"),
+        "Output must mention 'deferred' status, got: {}",
+        graph_deferred.stdout
+    );
+}
