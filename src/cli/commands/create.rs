@@ -71,12 +71,13 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         })?;
 
     // Cross-prefix provenance: when the calling agent's identity
-    // (BD_AGENT_ID) differs from the target --prefix, tag the new issue's
-    // `sender` with the agent id so watchers can tell this bead was filed
-    // by a different agent into this prefix's space. Silent (no sender)
-    // when BD_AGENT_ID is unset (e.g. the human operator's shell) or when
-    // it matches the target prefix.
-    let sender = config::resolve_agent_identity()
+    // (BD_AGENT_ID, or inferred from a live `bd watch` in this process's
+    // ancestry when unset) differs from the target --prefix, tag the new
+    // issue's `sender` with the agent id so watchers can tell this bead
+    // was filed by a different agent into this prefix's space. Silent (no
+    // sender) when no identity can be determined at all (e.g. the human
+    // operator's shell) or when it matches the target prefix.
+    let sender = config::resolve_agent_identity_with_storage(&storage_ctx.storage)
         .ok()
         .filter(|agent_id| agent_id != &prefix);
 
@@ -453,7 +454,7 @@ fn execute_import(
         })?;
 
     // See `execute()` for the cross-prefix provenance rationale.
-    let sender_override = config::resolve_agent_identity()
+    let sender_override = config::resolve_agent_identity_with_storage(&storage_ctx.storage)
         .ok()
         .filter(|agent_id| agent_id != &prefix);
 

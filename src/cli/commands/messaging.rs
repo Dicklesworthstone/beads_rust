@@ -3,13 +3,15 @@
 //! Messages are NOT issues. They round-trip locally only, expire after
 //! a TTL once read, and never enter the issue work-list.
 //!
-//! Sender identity comes strictly from `BD_AGENT_ID`. Project
-//! config / default-`"bd"` fallbacks are deliberately *not* honored
-//! here — a prefix-less environment used to silently send as `"bd"`,
-//! which made operator messages appear to come from a phantom agent.
-//! If the env var is missing, `bd msg` errors out; the operator's
-//! send path is the separate `bd admin msg` command, which forces
-//! `from = operator`.
+//! Sender identity comes from `BD_AGENT_ID`, with a fallback: when it's
+//! unset, identity is inferred from a live `bd watch` in this process's
+//! ancestry (see [`config::resolve_agent_identity_with_storage`]).
+//! Project config / default-`"bd"` fallbacks are deliberately *not*
+//! honored here — a prefix-less environment used to silently send as
+//! `"bd"`, which made operator messages appear to come from a phantom
+//! agent. If no identity can be determined by either means, `bd msg`
+//! errors out; the operator's send path is the separate `bd admin msg`
+//! command, which forces `from = operator`.
 
 use crate::cli::{InboxArgs, MsgArgs, OutboxArgs, OutputFormat, resolve_output_format_basic};
 use crate::config::{self, OPERATOR_PREFIX};
@@ -59,15 +61,17 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         return Err(BeadsError::validation("to", "recipient prefix is required"));
     }
 
-    let from = config::resolve_agent_identity()?;
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+
+    // Identity resolution needs storage now (the inference fallback
+    // reads the watchers table), so this must come after `open_storage`.
+    let from = config::resolve_agent_identity_with_storage(&storage_ctx.storage)?;
 
     let body = resolve_body(&args.body)?;
     if body.trim().is_empty() {
         return Err(BeadsError::validation("body", "message body is empty"));
     }
-
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     if let Some(reply) = &args.reply {
         if storage_ctx.storage.get_message(reply)?.is_none() {
@@ -229,8 +233,11 @@ pub fn execute_admin_msg(
     )
 }
 
-/// List received messages, or show one in full. The viewer's identity
-/// comes from `BD_AGENT_ID` (strict — see [`config::resolve_agent_identity`]).
+/// List received messages, or show one in full.
+///
+/// The viewer's identity comes from `BD_AGENT_ID`, falling back to
+/// live-`bd watch`-ancestry inference when unset (see
+/// [`config::resolve_agent_identity_with_storage`]).
 ///
 /// # Errors
 ///
@@ -240,8 +247,10 @@ pub fn execute_inbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let me = config::resolve_agent_identity()?;
-    execute_inbox_as(&me, args, cli, ctx)
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let me = config::resolve_agent_identity_with_storage(&storage_ctx.storage)?;
+    execute_inbox_as(&me, args, &mut storage_ctx, ctx)
 }
 
 /// `bd admin inbox` — the operator's inbox view.
@@ -254,18 +263,17 @@ pub fn execute_admin_inbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    execute_inbox_as(OPERATOR_PREFIX, args, cli, ctx)
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_inbox_as(OPERATOR_PREFIX, args, &mut storage_ctx, ctx)
 }
 
 fn execute_inbox_as(
     me: &str,
     args: &InboxArgs,
-    cli: &config::CliOverrides,
+    storage_ctx: &mut config::OpenStorageResult,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-
     // Sweep stale read messages on every inbox access — cheap, no daemon needed.
     let now = Utc::now();
     storage_ctx
@@ -334,8 +342,10 @@ pub fn execute_outbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let me = config::resolve_agent_identity()?;
-    execute_outbox_as(&me, args, cli, ctx)
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let me = config::resolve_agent_identity_with_storage(&storage_ctx.storage)?;
+    execute_outbox_as(&me, args, &storage_ctx, ctx)
 }
 
 /// `bd admin outbox` — list messages sent *as* the operator.
@@ -348,18 +358,17 @@ pub fn execute_admin_outbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    execute_outbox_as(OPERATOR_PREFIX, args, cli, ctx)
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    execute_outbox_as(OPERATOR_PREFIX, args, &storage_ctx, ctx)
 }
 
 fn execute_outbox_as(
     me: &str,
     args: &OutboxArgs,
-    cli: &config::CliOverrides,
+    storage_ctx: &config::OpenStorageResult,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-
     let format = resolve_output_format_basic(args.format, ctx.is_json(), false);
     let filter = MessageFilter {
         from_prefix: Some(me.to_string()),

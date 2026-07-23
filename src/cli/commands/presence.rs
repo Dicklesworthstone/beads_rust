@@ -31,16 +31,25 @@ pub fn execute_idle(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<
 }
 
 fn set_state(state: PresenceState, cli: &config::CliOverrides) -> Result<()> {
-    let Some(prefix) = config::resolve_agent_identity().ok() else {
+    let Ok(beads_dir) = config::discover_beads_dir_with_cli(cli) else {
+        return Ok(());
+    };
+    // Storage must be opened before identity resolution now — the
+    // fallback (BD_AGENT_ID unset) infers identity from the watchers
+    // table, which lives in this same DB. Any failure up to and
+    // including identity resolution stays a silent no-op, matching
+    // this command's "safe from any shell" contract; only a failure
+    // in the actual presence write propagates.
+    let Ok((mut storage, _paths)) =
+        config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)
+    else {
         return Ok(());
     };
 
-    let beads_dir = match config::discover_beads_dir_with_cli(cli) {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
+    let Some(prefix) = config::resolve_agent_identity_with_storage(&storage).ok() else {
+        return Ok(());
     };
-    let (mut storage, _paths) =
-        config::open_storage(&beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+
     storage.set_presence(&prefix, state, Utc::now())?;
     Ok(())
 }
