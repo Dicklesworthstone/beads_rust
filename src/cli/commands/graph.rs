@@ -463,16 +463,38 @@ fn render_all_flat_lines(
     args: &GraphArgs,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+
+    // Partition into multi-node components and singletons.
+    // compute_components sorts by size descending so singletons are already
+    // at the end, but we still partition explicitly to be safe.
+    let multi: Vec<&ConnectedComponent> =
+        components.iter().filter(|c| c.nodes.len() >= 2).collect();
+    let singletons: Vec<&ConnectedComponent> =
+        components.iter().filter(|c| c.nodes.len() == 1).collect();
+
+    // Summary header — M continues to count ALL components (spec requirement).
+    let singleton_suffix = if singletons.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} singleton{})",
+            singletons.len(),
+            if singletons.len() == 1 { "" } else { "s" }
+        )
+    };
     out.push(Line::from(Span::styled(
         format!(
-            "Dependency graph: {} issues in {} component(s)",
+            "Dependency graph: {} issues in {} component(s){}",
             total_nodes,
-            components.len()
+            components.len(),
+            singleton_suffix,
         ),
         RStyle::default().add_modifier(RModifier::BOLD),
     )));
     out.push(Line::raw(""));
-    for (i, component) in components.iter().enumerate() {
+
+    // Multi-node components (numbered 1..)
+    for (i, component) in multi.iter().enumerate() {
         if args.compact {
             let ids: Vec<&str> = component.nodes.iter().map(|n| n.id.as_str()).collect();
             out.push(Line::from(format!("Component {}: {}", i + 1, ids.join(", "))));
@@ -483,74 +505,116 @@ fn render_all_flat_lines(
                 component.nodes.len(),
                 component.roots.join(", ")
             )));
-            out.extend(render_component_body_lines(component, args, "  "));
+            out.extend(render_component_body_lines(component, args, "  ", true));
             out.push(Line::raw(""));
         }
     }
+
+    // Singleton block — one compact section for all 1-node components.
+    if !singletons.is_empty() {
+        // Collect and sort by id for deterministic output.
+        let mut singleton_nodes: Vec<&GraphNode> =
+            singletons.iter().flat_map(|c| c.nodes.iter()).collect();
+        singleton_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+
+        if args.compact {
+            let ids: Vec<&str> = singleton_nodes.iter().map(|n| n.id.as_str()).collect();
+            out.push(Line::from(format!("Singletons: {}", ids.join(", "))));
+        } else {
+            out.push(Line::from(format!(
+                "Singletons ({} issue{}):",
+                singletons.len(),
+                if singletons.len() == 1 { "" } else { "s" },
+            )));
+            for node in &singleton_nodes {
+                out.push(render_node_line(node, args, "  ", false));
+            }
+            out.push(Line::raw(""));
+        }
+    }
+
     out
+}
+
+/// Render a single node as a styled `Line`.
+///
+/// `base_indent` is the fixed left padding (e.g. `"  "`).
+/// `show_root_marker` controls whether depth-0 nodes get ` (root)` appended.
+fn render_node_line(
+    node: &GraphNode,
+    args: &GraphArgs,
+    base_indent: &str,
+    show_root_marker: bool,
+) -> Line<'static> {
+    let depth_indent = "  ".repeat(node.depth);
+    let priority_badge = format!("[P{}]", node.priority);
+    let status_badge = format!("[{}]", node.status);
+    let root_marker = if show_root_marker && node.depth == 0 {
+        " (root)"
+    } else {
+        ""
+    };
+
+    // Indent stays plain; the id gets cyan styling on its own span
+    // so it pops against the rest of the row.
+    let indent_text = format!("{base_indent}{depth_indent}");
+    let used_for_title_budget = indent_text.chars().count()
+        + node.id.chars().count()
+        + 2 // double space between id and priority
+        + priority_badge.chars().count()
+        + 2 // double space between pri and stat
+        + status_badge.chars().count()
+        + root_marker.chars().count()
+        + 1; // trailing space before title
+
+    let sender_suffix = if !args.no_sender {
+        node.sender
+            .as_ref()
+            .map(|s| format!(" (from: {s})"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let sender_w = sender_suffix.chars().count();
+    let title_cap = title_budget(args, used_for_title_budget + sender_w);
+    let title = truncate_with_ellipsis(&node.title, title_cap);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw(indent_text));
+    spans.push(Span::styled(node.id.clone(), id_style()));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(priority_badge, priority_style_for(node.priority)));
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(status_badge, status_style_for(&node.status)));
+    if !root_marker.is_empty() {
+        spans.push(Span::styled(
+            root_marker.to_string(),
+            RStyle::default().add_modifier(RModifier::DIM),
+        ));
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::raw(title));
+    if !sender_suffix.is_empty() {
+        spans.push(Span::styled(
+            sender_suffix,
+            RStyle::default().add_modifier(RModifier::DIM),
+        ));
+    }
+
+    Line::from(spans)
 }
 
 fn render_component_body_lines(
     component: &ConnectedComponent,
     args: &GraphArgs,
     base_indent: &str,
+    show_root_marker: bool,
 ) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    for node in &component.nodes {
-        let depth_indent = "  ".repeat(node.depth);
-        let priority_badge = format!("[P{}]", node.priority);
-        let status_badge = format!("[{}]", node.status);
-        let root_marker = if node.depth == 0 { " (root)" } else { "" };
-
-        // Indent stays plain; the id gets cyan styling on its own span
-        // so it pops against the rest of the row.
-        let indent_text = format!("{base_indent}{depth_indent}");
-        let used_for_title_budget = indent_text.chars().count()
-            + node.id.chars().count()
-            + 2 // double space between id and priority
-            + priority_badge.chars().count()
-            + 2 // double space between pri and stat
-            + status_badge.chars().count()
-            + root_marker.chars().count()
-            + 1; // trailing space before title
-
-        let sender_suffix = if !args.no_sender {
-            node.sender
-                .as_ref()
-                .map(|s| format!(" (from: {s})"))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let sender_w = sender_suffix.chars().count();
-        let title_cap = title_budget(args, used_for_title_budget + sender_w);
-        let title = truncate_with_ellipsis(&node.title, title_cap);
-
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        spans.push(Span::raw(indent_text));
-        spans.push(Span::styled(node.id.clone(), id_style()));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(priority_badge, priority_style_for(node.priority)));
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(status_badge, status_style_for(&node.status)));
-        if !root_marker.is_empty() {
-            spans.push(Span::styled(
-                root_marker.to_string(),
-                RStyle::default().add_modifier(RModifier::DIM),
-            ));
-        }
-        spans.push(Span::raw(" "));
-        spans.push(Span::raw(title));
-        if !sender_suffix.is_empty() {
-            spans.push(Span::styled(
-                sender_suffix,
-                RStyle::default().add_modifier(RModifier::DIM),
-            ));
-        }
-
-        out.push(Line::from(spans));
-    }
-    out
+    component
+        .nodes
+        .iter()
+        .map(|node| render_node_line(node, args, base_indent, show_root_marker))
+        .collect()
 }
 
 fn id_style() -> RStyle {
@@ -778,6 +842,48 @@ fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputCont
     console.print_renderable(&panel);
 }
 
+/// Append one node row to a rich `Text` buffer.
+///
+/// `use_depth_indent` — true for multi-node components (depth nesting);
+/// false for singletons (fixed single level).
+/// `show_root_marker` — true for multi-node, false for singletons.
+fn append_node_rich(
+    content: &mut Text,
+    node: &GraphNode,
+    args: &GraphArgs,
+    theme: &crate::output::Theme,
+    title_cap: usize,
+    use_depth_indent: bool,
+    show_root_marker: bool,
+) {
+    let indent = if use_depth_indent {
+        "  ".repeat(node.depth + 1)
+    } else {
+        "  ".to_string()
+    };
+    content.append(&indent);
+    content.append_styled(&node.id, theme.issue_id.clone());
+    content.append(" ");
+    let mut title = node.title.clone();
+    if !args.no_sender {
+        if let Some(sender) = &node.sender {
+            title.push_str(&format!(" (from: {sender})"));
+        }
+    }
+    let title = truncate_with_ellipsis(&title, title_cap);
+    content.append(&title);
+    content.append(" ");
+    let p_style = priority_style(node.priority, theme);
+    content.append_styled(&format!("[P{}]", node.priority), p_style);
+    content.append(" ");
+    let s_style = status_style(&node.status, theme);
+    content.append_styled(&format!("[{}]", node.status), s_style);
+    if show_root_marker && node.depth == 0 {
+        content.append_styled(" (root)", theme.dimmed.clone());
+    }
+    content.append("\n");
+}
+
 /// Flat rich rendering for `--all`. Title width honors `--max-title`.
 fn render_all_graph_rich(
     components: &[ConnectedComponent],
@@ -791,23 +897,39 @@ fn render_all_graph_rich(
 
     let mut content = Text::new("");
 
-    // Summary header
+    // Partition into multi-node components and singletons.
+    let multi: Vec<&ConnectedComponent> =
+        components.iter().filter(|c| c.nodes.len() >= 2).collect();
+    let singletons: Vec<&ConnectedComponent> =
+        components.iter().filter(|c| c.nodes.len() == 1).collect();
+
+    // Summary header — M counts ALL components.
+    let singleton_suffix = if singletons.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} singleton{})",
+            singletons.len(),
+            if singletons.len() == 1 { "" } else { "s" }
+        )
+    };
     content.append_styled(
         &format!(
-            "{} issue{} in {} component{}\n",
+            "{} issue{} in {} component{}{}\n",
             total_nodes,
             if total_nodes == 1 { "" } else { "s" },
             components.len(),
-            if components.len() == 1 { "" } else { "s" }
+            if components.len() == 1 { "" } else { "s" },
+            singleton_suffix,
         ),
         theme.section.clone(),
     );
 
-    // Render each component
-    for (i, component) in components.iter().enumerate() {
-        content.append("\n");
+    let title_cap = args.max_title.unwrap_or(60);
 
-        // Component header
+    // Render multi-node components (numbered 1..)
+    for (i, component) in multi.iter().enumerate() {
+        content.append("\n");
         content.append_styled(&format!("Component {}", i + 1), theme.emphasis.clone());
         content.append_styled(
             &format!(
@@ -818,41 +940,28 @@ fn render_all_graph_rich(
             ),
             theme.dimmed.clone(),
         );
-
-        // Render nodes in component
-        let title_cap = args.max_title.unwrap_or(60);
         for node in &component.nodes {
-            let indent = "  ".repeat(node.depth + 1);
-            content.append(&indent);
+            append_node_rich(&mut content, node, args, theme, title_cap, true, true);
+        }
+    }
 
-            // ID
-            content.append_styled(&node.id, theme.issue_id.clone());
-            content.append(" ");
-
-            // Title (with optional sender annotation, ellipsized to fit).
-            let mut title = node.title.clone();
-            if !args.no_sender {
-                if let Some(sender) = &node.sender {
-                    title.push_str(&format!(" (from: {sender})"));
-                }
-            }
-            let title = truncate_with_ellipsis(&title, title_cap);
-            content.append(&title);
-            content.append(" ");
-
-            // Priority badge
-            let priority_style = priority_style(node.priority, theme);
-            content.append_styled(&format!("[P{}]", node.priority), priority_style);
-            content.append(" ");
-
-            // Status badge
-            let status_style = status_style(&node.status, theme);
-            content.append_styled(&format!("[{}]", node.status), status_style);
-
-            if node.depth == 0 {
-                content.append_styled(" (root)", theme.dimmed.clone());
-            }
-            content.append("\n");
+    // Singleton block — one compact section for all 1-node components.
+    if !singletons.is_empty() {
+        let mut singleton_nodes: Vec<&GraphNode> =
+            singletons.iter().flat_map(|c| c.nodes.iter()).collect();
+        singleton_nodes.sort_by(|a, b| a.id.cmp(&b.id));
+        content.append("\n");
+        content.append_styled("Singletons", theme.emphasis.clone());
+        content.append_styled(
+            &format!(
+                " ({} issue{})\n",
+                singletons.len(),
+                if singletons.len() == 1 { "" } else { "s" },
+            ),
+            theme.dimmed.clone(),
+        );
+        for node in &singleton_nodes {
+            append_node_rich(&mut content, node, args, theme, title_cap, false, false);
         }
     }
 
