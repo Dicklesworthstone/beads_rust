@@ -20,9 +20,12 @@ pub struct IdConfig {
 }
 
 impl Default for IdConfig {
+    /// Prefix defaults to empty — there is no ambient default prefix.
+    /// Every production caller must supply an explicit prefix via
+    /// [`IdConfig::with_prefix`] (creation is always `--prefix`-mandatory).
     fn default() -> Self {
         Self {
-            prefix: "bd".to_string(),
+            prefix: String::new(),
             min_hash_length: 3,
             max_hash_length: 8,
             max_collision_prob: 0.25,
@@ -309,18 +312,6 @@ pub fn id_depth(id: &str) -> usize {
     )
 }
 
-/// Convenience function to generate an ID with default settings.
-#[must_use]
-pub fn generate_id(
-    title: &str,
-    description: Option<&str>,
-    creator: Option<&str>,
-    created_at: DateTime<Utc>,
-) -> String {
-    let generator = IdGenerator::with_defaults();
-    generator.generate(title, description, creator, created_at, 0, |_| false)
-}
-
 // ============================================================================
 // ID Parsing and Validation
 // ============================================================================
@@ -491,11 +482,14 @@ pub fn is_valid_id_format(id: &str) -> bool {
 // ============================================================================
 
 /// Configuration for ID resolution.
+///
+/// There is no ambient default prefix — resolution is prefix-agnostic
+/// (exact match, then substring match on the hash portion across all
+/// prefixes present in the store). See `IdResolver::resolve`.
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
-    /// Default prefix to use when input lacks one.
-    pub default_prefix: String,
-    /// Additional allowed prefixes for matching.
+    /// Additional allowed prefixes for matching (currently unused by
+    /// `resolve()`, kept for forward compatibility).
     pub allowed_prefixes: Vec<String>,
     /// Whether to allow substring matching on hash portion.
     pub allow_substring_match: bool,
@@ -504,20 +498,8 @@ pub struct ResolverConfig {
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
-            default_prefix: "bd".to_string(),
             allowed_prefixes: Vec::new(),
             allow_substring_match: true,
-        }
-    }
-}
-
-impl ResolverConfig {
-    /// Create a new resolver config with the given default prefix.
-    #[must_use]
-    pub fn with_prefix(prefix: impl Into<String>) -> Self {
-        Self {
-            default_prefix: prefix.into(),
-            ..Default::default()
         }
     }
 }
@@ -538,19 +520,17 @@ pub struct ResolvedId {
 pub enum MatchType {
     /// Exact match on full ID.
     Exact,
-    /// Matched after prepending the default prefix.
-    PrefixNormalized,
     /// Matched via substring on hash portion.
     Substring,
 }
 
 /// ID resolver that resolves partial IDs to full IDs.
 ///
-/// Resolution order:
+/// There is no ambient default prefix to prepend to bare input — resolution
+/// order is:
 /// 1. Exact ID match
-/// 2. Normalize: if missing prefix, prepend `default_prefix-` and retry
-/// 3. Substring match on hash portion across all prefixes
-/// 4. Ambiguity => error with candidate list
+/// 2. Substring match on hash portion across all prefixes
+/// 3. Ambiguity => error with candidate list
 #[derive(Debug, Clone)]
 pub struct IdResolver {
     config: ResolverConfig,
@@ -567,18 +547,6 @@ impl IdResolver {
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(ResolverConfig::default())
-    }
-
-    /// Create a new ID resolver with the given default prefix.
-    #[must_use]
-    pub fn with_prefix(prefix: impl Into<String>) -> Self {
-        Self::new(ResolverConfig::with_prefix(prefix))
-    }
-
-    /// Get the default prefix.
-    #[must_use]
-    pub fn default_prefix(&self) -> &str {
-        &self.config.default_prefix
     }
 
     /// Resolve a partial ID to a full ID.
@@ -626,19 +594,9 @@ impl IdResolver {
             });
         }
 
-        // Step 2: If no dash (missing prefix), prepend default prefix and retry
-        if !normalized.contains('-') {
-            let with_prefix = format!("{}-{}", self.config.default_prefix, normalized);
-            if exists_fn(&with_prefix) {
-                return Ok(ResolvedId {
-                    id: with_prefix,
-                    match_type: MatchType::PrefixNormalized,
-                    original_input: input.to_string(),
-                });
-            }
-        }
-
-        // Step 3: Substring match on hash portion
+        // Step 2: Substring match on hash portion (prefix-agnostic — this
+        // is what resolves a bare hash like `fvzl` to `wf2-fvzl` with no
+        // default prefix needed).
         if self.config.allow_substring_match {
             // Extract the potential hash portion (after dash, or entire input if no dash)
             let hash_pattern = split_prefix_remainder(&normalized)
@@ -669,7 +627,7 @@ impl IdResolver {
             }
         }
 
-        // Step 4: No match found
+        // Step 3: No match found
         Err(BeadsError::IssueNotFound {
             id: input.to_string(),
         })
@@ -776,13 +734,18 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_prefix_normalized() {
+    fn test_resolve_bare_hash_without_default_prefix() {
+        // No default prefix exists anywhere in this design. A bare hash
+        // that uniquely matches one issue's hash portion resolves via
+        // substring match — this is the operator's key workflow
+        // (`bd show fvzl` finding `wf2-fvzl`), and it must keep working
+        // with zero prefix configuration.
         let resolver = IdResolver::with_defaults();
         let result = resolver
-            .resolve("abc123", exists_in_mock, substring_in_mock)
+            .resolve("xyz789", exists_in_mock, substring_in_mock)
             .unwrap();
-        assert_eq!(result.id, "bd-abc123");
-        assert_eq!(result.match_type, MatchType::PrefixNormalized);
+        assert_eq!(result.id, "bd-xyz789");
+        assert_eq!(result.match_type, MatchType::Substring);
     }
 
     #[test]
@@ -843,15 +806,18 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_with_custom_prefix() {
+    fn test_resolve_prefix_agnostic_substring() {
+        // Resolution has no notion of a "home" prefix: a bare hash
+        // resolves purely by scanning all IDs regardless of which
+        // prefix they carry.
         let custom_db = vec!["proj-aaa111".to_string()];
         let exists = |id: &str| custom_db.contains(&id.to_string());
         let substring = |pattern: &str| find_matching_ids(&custom_db, pattern);
 
-        let resolver = IdResolver::with_prefix("proj");
+        let resolver = IdResolver::with_defaults();
         let result = resolver.resolve("aaa111", exists, substring).unwrap();
         assert_eq!(result.id, "proj-aaa111");
-        assert_eq!(result.match_type, MatchType::PrefixNormalized);
+        assert_eq!(result.match_type, MatchType::Substring);
     }
 
     #[test]
@@ -1054,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_id_generator_generate() {
-        let id_gen = IdGenerator::with_defaults();
+        let id_gen = IdGenerator::new(IdConfig::with_prefix("bd"));
         let now = Utc::now();
 
         let id = id_gen.generate(

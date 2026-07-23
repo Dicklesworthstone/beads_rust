@@ -152,15 +152,17 @@ fn scenario_config_set_and_get() {
     let init = ws.run_br(["init"], "init");
     init.assert_success();
 
-    // Set a config value
-    let set = ws.run_br(["config", "set", "issue_prefix=test_prefix"], "config_set");
+    // `issue_prefix` is no longer a meaningful config key (see
+    // docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md); use a generic key to exercise
+    // the same `config set`/`config get` round-trip behavior.
+    let set = ws.run_br(["config", "set", "greeting=test_value"], "config_set");
     set.assert_success();
 
     // Get the value back
-    let get = ws.run_br(["config", "get", "issue_prefix"], "config_get");
+    let get = ws.run_br(["config", "get", "greeting"], "config_get");
     get.assert_success();
     assert!(
-        get.stdout.contains("test_prefix"),
+        get.stdout.contains("test_value"),
         "config get should show set value: {}",
         get.stdout
     );

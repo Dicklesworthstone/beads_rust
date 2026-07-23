@@ -219,11 +219,11 @@ fn e2e_dep_tree_external_nodes() {
         init_ext.stderr
     );
     let external_config_path = external.root.join(".beads/config.yaml");
-    fs::write(&external_config_path, "issue_prefix: bd\n").expect("write ext config");
+    fs::write(&external_config_path, "").expect("write ext config");
 
     let config_path = workspace.root.join(".beads/config.yaml");
     let external_path = external.root.display();
-    let config = format!("issue_prefix: bd\nexternal_projects:\n  extproj: \"{external_path}\"\n");
+    let config = format!("external_projects:\n  extproj: \"{external_path}\"\n");
     fs::write(&config_path, config).expect("write config");
 
     let issue = run_br(&workspace, ["create", "Main issue"], "create_main_issue");
@@ -334,11 +334,11 @@ fn e2e_dep_list_external_nodes() {
         init_ext.stderr
     );
     let external_config_path = external.root.join(".beads/config.yaml");
-    fs::write(&external_config_path, "issue_prefix: bd\n").expect("write ext config");
+    fs::write(&external_config_path, "").expect("write ext config");
 
     let config_path = workspace.root.join(".beads/config.yaml");
     let external_path = external.root.display();
-    let config = format!("issue_prefix: bd\nexternal_projects:\n  extproj: \"{external_path}\"\n");
+    let config = format!("external_projects:\n  extproj: \"{external_path}\"\n");
     fs::write(&config_path, config).expect("write config");
 
     let issue = run_br(&workspace, ["create", "Main issue"], "create_main_issue");

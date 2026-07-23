@@ -8,11 +8,10 @@ use crate::error::{BeadsError, Result};
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::id::IdResolver;
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::path::Path;
 
 #[derive(Debug, Serialize)]
 struct LintResult {
@@ -92,7 +91,7 @@ pub fn execute(
         let filters = build_filters(args)?;
         storage.list_issues(&filters)?
     } else {
-        resolve_issues(storage, &beads_dir, args, cli)?
+        resolve_issues(storage, args)?
     };
 
     let summary = lint_issues(&issues);
@@ -259,15 +258,8 @@ fn build_filters(args: &LintArgs) -> Result<ListFilters> {
     Ok(filters)
 }
 
-fn resolve_issues(
-    storage: &SqliteStorage,
-    beads_dir: &Path,
-    args: &LintArgs,
-    cli: &config::CliOverrides,
-) -> Result<Vec<Issue>> {
-    let config_layer = config::load_config(beads_dir, Some(storage), cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+fn resolve_issues(storage: &SqliteStorage, args: &LintArgs) -> Result<Vec<Issue>> {
+    let resolver = IdResolver::with_defaults();
 
     let mut issues = Vec::new();
     for id_input in &args.ids {

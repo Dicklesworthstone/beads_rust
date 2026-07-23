@@ -835,7 +835,7 @@ fn bench_generate_id(c: &mut Criterion) {
 
 /// Benchmark ID prefix resolution against 100 known IDs.
 fn bench_resolve_id_prefix(c: &mut Criterion) {
-    use beads_rust::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+    use beads_rust::util::id::{IdResolver, find_matching_ids};
     use std::collections::HashSet;
 
     init_bench_logging();
@@ -846,7 +846,7 @@ fn bench_resolve_id_prefix(c: &mut Criterion) {
 
     let all_ids: Vec<String> = (0..100).map(|i| format!("bd-{i:06}")).collect();
     let id_set: HashSet<String> = all_ids.iter().cloned().collect();
-    let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+    let resolver = IdResolver::with_defaults();
     let mut counter = 0usize;
 
     group.bench_function("prefix_100", |b| {

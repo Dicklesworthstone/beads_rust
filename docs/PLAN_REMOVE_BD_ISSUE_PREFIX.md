@@ -1,6 +1,10 @@
 # Plan: Retire `BD_ISSUE_PREFIX` from Issue Creation; Explicit `--prefix` Everywhere
 
-## Status: REVISED — incorporates operator rulings
+## Status: IMPLEMENTED — steps 1-6 landed across two waves (identity/list
+## scoping first, then config-key removal + mandatory --prefix + docs).
+## This document is now a historical design record; the plan's inventory
+## reflects the codebase as it stood at authoring time, not necessarily
+## every current line number.
 
 ---
 

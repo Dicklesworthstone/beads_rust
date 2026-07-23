@@ -22,46 +22,16 @@ fn split_labels(values: &[String]) -> Vec<String> {
     labels
 }
 
-/// Execute the quick capture command.
-///
-/// # Errors
-///
-/// Returns an error if validation fails, the database cannot be opened, or creation fails.
-pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
-    let title = args.title.join(" ").trim().to_string();
-    if title.is_empty() {
-        return Err(BeadsError::validation("title", "cannot be empty"));
-    }
-
-    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let id_config = config::id_config_from_layer(&layer);
-    let default_priority = config::default_priority_from_layer(&layer)?;
-    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
-    let storage = &mut storage_ctx.storage;
-
-    let priority = if let Some(p) = args.priority {
-        Priority::from_str(&p)?
-    } else {
-        default_priority
-    };
-
-    let issue_type = if let Some(t) = args.type_ {
-        IssueType::from_str(&t)?
-    } else {
-        default_issue_type
-    };
-
-    let id_gen = IdGenerator::new(id_config);
-    let now = Utc::now();
-    let count = storage.count_issues()?;
-
-    let id = id_gen.generate(&title, None, None, now, count, |candidate| {
-        storage.id_exists(candidate).unwrap_or(false)
-    });
-
-    let mut issue = Issue {
+/// Build a fresh `Issue` for quick-capture with all optional fields at
+/// their defaults.
+fn build_quick_issue(
+    id: String,
+    title: String,
+    priority: Priority,
+    issue_type: IssueType,
+    now: chrono::DateTime<Utc>,
+) -> Issue {
+    Issue {
         id,
         title,
         description: None,
@@ -101,7 +71,63 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         labels: vec![],
         dependencies: vec![],
         comments: vec![],
+    }
+}
+
+/// Execute the quick capture command.
+///
+/// # Errors
+///
+/// Returns an error if validation fails, the database cannot be opened, or creation fails.
+pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+    let title = args.title.join(" ").trim().to_string();
+    if title.is_empty() {
+        return Err(BeadsError::validation("title", "cannot be empty"));
+    }
+
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
+    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+
+    // `--prefix` is mandatory for issue creation — there is no config or
+    // env fallback (BD_ISSUE_PREFIX has no effect).
+    let prefix = args
+        .prefix
+        .as_ref()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            BeadsError::validation("prefix", "--prefix is required for issue creation.")
+        })?;
+    config::assert_writable_prefix(&prefix)?;
+
+    let mut id_config = config::id_config_from_layer(&layer);
+    id_config.prefix = prefix;
+    let default_priority = config::default_priority_from_layer(&layer)?;
+    let default_issue_type = config::default_issue_type_from_layer(&layer)?;
+    let storage = &mut storage_ctx.storage;
+
+    let priority = if let Some(p) = args.priority {
+        Priority::from_str(&p)?
+    } else {
+        default_priority
     };
+
+    let issue_type = if let Some(t) = args.type_ {
+        IssueType::from_str(&t)?
+    } else {
+        default_issue_type
+    };
+
+    let id_gen = IdGenerator::new(id_config);
+    let now = Utc::now();
+    let count = storage.count_issues()?;
+
+    let id = id_gen.generate(&title, None, None, now, count, |candidate| {
+        storage.id_exists(candidate).unwrap_or(false)
+    });
+
+    let mut issue = build_quick_issue(id, title, priority, issue_type, now);
 
     // Resolve actor and set created_by
     let actor = config::resolve_actor(&layer);

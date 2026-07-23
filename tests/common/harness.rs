@@ -795,6 +795,7 @@ impl TestWorkspace {
             .into_iter()
             .map(|a| a.as_ref().to_string_lossy().to_string())
             .collect();
+        let args_vec = super::apply_default_test_prefix_shim(args_vec);
         cmd.args(&args_vec);
 
         cmd.envs(env_vars);
@@ -1165,6 +1166,7 @@ impl ConformanceWorkspace {
             .into_iter()
             .map(|a| a.as_ref().to_string_lossy().to_string())
             .collect();
+        let args_vec = super::apply_default_test_prefix_shim(args_vec);
         cmd.args(&args_vec);
 
         cmd.env("NO_COLOR", "1");
@@ -1237,6 +1239,7 @@ impl ConformanceWorkspace {
             .into_iter()
             .map(|a| a.as_ref().to_string_lossy().to_string())
             .collect();
+        let args_vec = super::apply_default_test_prefix_shim(args_vec);
         cmd.args(&args_vec);
 
         cmd.envs(env_vars);

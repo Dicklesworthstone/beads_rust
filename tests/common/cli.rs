@@ -78,6 +78,27 @@ where
     )
 }
 
+/// Run `br` with args passed VERBATIM \u2014 no `--prefix bd` auto-injection.
+///
+/// Use this (never the shimmed helpers above) for regression tests that
+/// specifically assert the mandatory-`--prefix` behavior: creation without
+/// `--prefix` must error, and `BD_ISSUE_PREFIX` must have zero effect.
+pub fn run_br_raw_with_env<I, S, E, K, V>(
+    workspace: &BrWorkspace,
+    args: I,
+    env_vars: E,
+    label: &str,
+) -> BrRun
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    run_br_full_impl(workspace, args, env_vars, None, label, false)
+}
+
 fn run_br_full<I, S, E, K, V>(
     workspace: &BrWorkspace,
     args: I,
@@ -92,9 +113,36 @@ where
     K: AsRef<OsStr>,
     V: AsRef<OsStr>,
 {
+    run_br_full_impl(workspace, args, env_vars, stdin_input, label, true)
+}
+
+fn run_br_full_impl<I, S, E, K, V>(
+    workspace: &BrWorkspace,
+    args: I,
+    env_vars: E,
+    stdin_input: Option<&str>,
+    label: &str,
+    apply_shim: bool,
+) -> BrRun
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
     cmd.current_dir(&workspace.root);
-    cmd.args(args);
+    let args_vec: Vec<String> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_string_lossy().to_string())
+        .collect();
+    let args_vec = if apply_shim {
+        super::apply_default_test_prefix_shim(args_vec)
+    } else {
+        args_vec
+    };
+    cmd.args(&args_vec);
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");

@@ -6,7 +6,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, Status};
 use crate::output::OutputContext;
 use crate::storage::{IssueUpdate, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::id::IdResolver;
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
 use chrono::{DateTime, Utc};
@@ -44,13 +44,14 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let mut config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
 
-    if let Some(prefix) = args.prefix.as_ref().map(|p| p.trim()).filter(|p| !p.is_empty()) {
-        config_layer
-            .runtime
-            .insert("issue_prefix".to_string(), prefix.to_string());
-    }
+    // `--prefix` no longer feeds a default-prefix-prepend resolution step
+    // (removed — see docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md §3c); partial-ID
+    // resolution is prefix-agnostic via substring match regardless. The
+    // flag is accepted for backwards compatibility but has no effect here;
+    // `--reprefix` (below) is the flag that actually moves an issue between
+    // prefix namespaces.
 
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
@@ -314,9 +315,8 @@ fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &I
     }
 }
 
-fn build_resolver(config_layer: &config::ConfigLayer, _storage: &SqliteStorage) -> IdResolver {
-    let id_config = config::id_config_from_layer(config_layer);
-    IdResolver::new(ResolverConfig::with_prefix(id_config.prefix))
+fn build_resolver(_config_layer: &config::ConfigLayer, _storage: &SqliteStorage) -> IdResolver {
+    IdResolver::with_defaults()
 }
 
 fn resolve_target_ids(

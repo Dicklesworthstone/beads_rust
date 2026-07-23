@@ -224,6 +224,8 @@ impl SyntheticDataset {
                         issue_type,
                         "--priority",
                         &priority.to_string(),
+                        "--prefix",
+                        "synth",
                     ])
                     .current_dir(&root)
                     .stdout(Stdio::piped())

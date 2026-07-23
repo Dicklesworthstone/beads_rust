@@ -7,7 +7,7 @@ use crate::format::ReadyIssue;
 use crate::model::{Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::IssueUpdate;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, find_matching_ids};
 use crate::util::time::parse_flexible_timestamp;
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -54,8 +54,7 @@ pub fn execute_defer(
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let actor = config::resolve_actor(&config_layer);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolver = IdResolver::with_defaults();
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let storage = &mut storage_ctx.storage;
 
@@ -198,8 +197,7 @@ pub fn execute_undefer(
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let actor = config::resolve_actor(&config_layer);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolver = IdResolver::with_defaults();
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let storage = &mut storage_ctx.storage;
 
@@ -591,7 +589,7 @@ mod tests {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -616,7 +614,7 @@ mod tests {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -641,7 +639,7 @@ mod tests {
         let _lock = TEST_DIR_LOCK.lock().expect("dir lock");
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(false, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");

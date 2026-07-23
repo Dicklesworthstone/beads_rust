@@ -18,9 +18,11 @@ pub struct CreateConfig {
     pub default_priority: Priority,
     pub default_issue_type: IssueType,
     pub actor: String,
-    /// Source prefix to tag onto the issue when the creator is deliberately
-    /// reaching across into a different prefix (e.g., app1 creating a bead
-    /// in app2's space via `--prefix=app2`). `None` for same-prefix creates.
+    /// Agent identity (`BD_AGENT_ID`) to tag onto the issue when the
+    /// creating agent's identity differs from the target `--prefix` (e.g.
+    /// agent `aa` creating a bead with `--prefix bb`). `None` when
+    /// `BD_AGENT_ID` is unset (e.g. the human operator's shell) or matches
+    /// the target prefix.
     pub sender: Option<String>,
 }
 
@@ -52,37 +54,45 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
     // We open storage even for dry-run to check ID collisions.
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let mut layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
 
-    let home_prefix = config::id_config_from_layer(&layer).prefix;
-    let cli_prefix = args
+    // `--prefix` is mandatory for issue creation — there is no config or
+    // env fallback (BD_ISSUE_PREFIX has no effect).
+    let prefix = args
         .prefix
         .as_ref()
         .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            BeadsError::validation(
+                "prefix",
+                "--prefix is required for issue creation.",
+            )
+        })?;
 
-    if let Some(prefix) = &cli_prefix {
-        layer
-            .runtime
-            .insert("issue_prefix".to_string(), prefix.clone());
-    }
+    // Cross-prefix provenance: when the calling agent's identity
+    // (BD_AGENT_ID) differs from the target --prefix, tag the new issue's
+    // `sender` with the agent id so watchers can tell this bead was filed
+    // by a different agent into this prefix's space. Silent (no sender)
+    // when BD_AGENT_ID is unset (e.g. the human operator's shell) or when
+    // it matches the target prefix.
+    let sender = config::resolve_agent_identity()
+        .ok()
+        .filter(|agent_id| agent_id != &prefix);
 
-    let sender = cli_prefix
-        .as_ref()
-        .filter(|p| *p != &home_prefix)
-        .map(|_| home_prefix.clone());
+    let mut id_config = config::id_config_from_layer(&layer);
+    id_config.prefix = prefix;
 
     let config = CreateConfig {
-        id_config: config::id_config_from_layer(&layer),
+        id_config,
         default_priority: config::default_priority_from_layer(&layer)?,
         default_issue_type: config::default_issue_type_from_layer(&layer)?,
         actor: config::resolve_actor(&layer),
         sender,
     };
 
-    // Reject the reserved `operator` prefix at the write boundary — both
-    // when an agent explicitly passes --prefix operator and when the
-    // environment has BD_ISSUE_PREFIX=operator.
+    // Reject the reserved `operator` prefix at the write boundary when an
+    // agent explicitly passes --prefix operator.
     config::assert_writable_prefix(&config.id_config.prefix)?;
 
     let issue = create_issue_impl(&mut storage_ctx.storage, args, &config)?;
@@ -429,27 +439,26 @@ fn execute_import(
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
-    let mut layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
+    let layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
 
-    let home_prefix = config::id_config_from_layer(&layer).prefix;
-    let cli_prefix = args
+    // `--prefix` is mandatory for bulk creation too — no config or env
+    // fallback.
+    let prefix = args
         .prefix
         .as_ref()
         .map(|p| p.trim().to_string())
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| {
+            BeadsError::validation("prefix", "--prefix is required for issue creation.")
+        })?;
 
-    if let Some(prefix) = &cli_prefix {
-        layer
-            .runtime
-            .insert("issue_prefix".to_string(), prefix.clone());
-    }
+    // See `execute()` for the cross-prefix provenance rationale.
+    let sender_override = config::resolve_agent_identity()
+        .ok()
+        .filter(|agent_id| agent_id != &prefix);
 
-    let sender_override = cli_prefix
-        .as_ref()
-        .filter(|p| *p != &home_prefix)
-        .map(|_| home_prefix.clone());
-
-    let id_config = config::id_config_from_layer(&layer);
+    let mut id_config = config::id_config_from_layer(&layer);
+    id_config.prefix = prefix;
     config::assert_writable_prefix(&id_config.prefix)?;
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;

@@ -375,18 +375,31 @@ pub struct ConfigLayer {
 
 **Startup-only keys** (cannot be stored in DB):
 - `no-db`, `no-daemon`, `no-auto-flush`
-- `db`, `actor`, `identity`
+- `db`, `actor`
 - `git.*`, `routing.*`, `sync.*`
 
 ### Key Configuration Options
 
+There is no `issue_prefix` config key. Issue prefixes are always explicit
+at creation time (`br create --prefix`, `br q --prefix`) — there is no
+project-wide default, DB row, YAML key, or environment variable fallback.
+`BD_ISSUE_PREFIX` has no effect on any command.
+
 | Key | Default | Description |
 |-----|---------|-------------|
-| `issue_prefix` | `bd` | ID prefix for new issues |
 | `default_priority` | `2` | Default priority (0-4) |
 | `default_type` | `task` | Default issue type |
 | `display.color` | auto | ANSI color output |
 | `lock-timeout` | `30000` | SQLite busy timeout (ms) |
+
+### Agent Identity
+
+`BD_AGENT_ID` is the sole identity source for messaging (`br msg`/`br
+inbox`/`br outbox`), `br watch`, and presence (`br working`/`br idle`).
+Set it to your agent's own prefix (e.g. `BD_AGENT_ID=myagent`). There is
+no config-file or DB fallback, and `BD_AGENT_ID=operator` is rejected
+(reserved for the human operator, who uses `br admin msg`/`br admin
+inbox` instead).
 
 ---
 

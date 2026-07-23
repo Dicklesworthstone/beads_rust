@@ -1,59 +1,26 @@
 mod common;
 
-use common::cli::{run_br_with_env, BrWorkspace};
-
-fn parse_created_id(stdout: &str) -> String {
-    let line = stdout.lines().next().unwrap_or("");
-    let normalized = line
-        .strip_prefix("✓ ")
-        .or_else(|| line.strip_prefix("✗ "))
-        .unwrap_or(line);
-    let id_part = normalized
-        .strip_prefix("Created ")
-        .and_then(|rest| rest.split(':').next())
-        .unwrap_or("");
-    id_part.trim().to_string()
-}
-
-/// Helper: run br with a specific prefix to override any ambient env.
-fn br(ws: &BrWorkspace, args: &[&str], label: &str) -> common::cli::BrRun {
-    // Set BD_ISSUE_PREFIX to a known value per-test using the env override.
-    // Individual tests set the prefix via --prefix on create or init.
-    // We clear BD_ISSUE_PREFIX by not setting it — but the env leaks.
-    // Instead, each test explicitly passes --prefix on commands that need it.
-    run_br_with_env(
-        ws,
-        args,
-        std::iter::empty::<(&str, &str)>(),
-        label,
-    )
-}
-
-/// Run br with a specific prefix env override.
-fn br_with_prefix(ws: &BrWorkspace, args: &[&str], prefix: &str, label: &str) -> common::cli::BrRun {
-    run_br_with_env(
-        ws,
-        args,
-        [("BD_ISSUE_PREFIX", prefix)],
-        label,
-    )
-}
+use common::cli::{BrWorkspace, run_br};
+use common::harness::parse_created_id;
 
 #[test]
 fn test_reprefix_e2e_basic() {
     let ws = BrWorkspace::new();
 
-    let r = br_with_prefix(&ws, &["init", "--prefix", "aa"], "aa", "init");
+    let r = run_br(&ws, ["init"], "init");
     assert!(r.status.success(), "init failed: {}", r.stderr);
 
-    let r = br_with_prefix(&ws, &["create", "Reprefix test"], "aa", "create");
+    let r = run_br(&ws, ["create", "Reprefix test", "--prefix", "aa"], "create");
     assert!(r.status.success(), "create failed: {}", r.stderr);
     let old_id = parse_created_id(&r.stdout);
-    assert!(old_id.starts_with("aa-"), "Expected aa- prefix, got {old_id}");
+    assert!(
+        old_id.starts_with("aa-"),
+        "Expected aa- prefix, got {old_id}"
+    );
     let remainder = old_id.strip_prefix("aa-").unwrap();
 
     // Reprefix to "bb"
-    let r = br_with_prefix(&ws, &["update", &old_id, "--reprefix", "bb"], "aa", "reprefix");
+    let r = run_br(&ws, ["update", &old_id, "--reprefix", "bb"], "reprefix");
     assert!(r.status.success(), "reprefix failed: {}", r.stderr);
     assert!(
         r.stdout.contains(&format!("bb-{remainder}")),
@@ -63,7 +30,7 @@ fn test_reprefix_e2e_basic() {
 
     // New id should resolve
     let new_id = format!("bb-{remainder}");
-    let r = br_with_prefix(&ws, &["show", &new_id], "aa", "show-new");
+    let r = run_br(&ws, ["show", &new_id], "show-new");
     assert!(r.status.success(), "show new id failed: {}", r.stderr);
     assert!(
         r.stdout.contains("Reprefix test"),
@@ -75,31 +42,33 @@ fn test_reprefix_e2e_basic() {
 fn test_reprefix_e2e_with_dependency() {
     let ws = BrWorkspace::new();
 
-    let r = br_with_prefix(&ws, &["init", "--prefix", "xx"], "xx", "init");
+    let r = run_br(&ws, ["init"], "init");
     assert!(r.status.success());
 
-    let r = br_with_prefix(&ws, &["create", "Blocker issue"], "xx", "create-blocker");
+    let r = run_br(
+        &ws,
+        ["create", "Blocker issue", "--prefix", "xx"],
+        "create-blocker",
+    );
     assert!(r.status.success());
     let blocker_id = parse_created_id(&r.stdout);
 
-    let r = br_with_prefix(&ws, &["create", "Blocked issue"], "xx", "create-blocked");
+    let r = run_br(
+        &ws,
+        ["create", "Blocked issue", "--prefix", "xx"],
+        "create-blocked",
+    );
     assert!(r.status.success());
     let blocked_id = parse_created_id(&r.stdout);
 
     // Add dependency: blocked depends on blocker
-    let r = br_with_prefix(
-        &ws,
-        &["dep", "add", &blocked_id, &blocker_id],
-        "xx",
-        "add-dep",
-    );
+    let r = run_br(&ws, ["dep", "add", &blocked_id, &blocker_id], "add-dep");
     assert!(r.status.success(), "dep add failed: {}", r.stderr);
 
     // Reprefix the blocker
-    let r = br_with_prefix(
+    let r = run_br(
         &ws,
-        &["update", &blocker_id, "--reprefix", "yy"],
-        "xx",
+        ["update", &blocker_id, "--reprefix", "yy"],
         "reprefix-blocker",
     );
     assert!(r.status.success(), "reprefix failed: {}", r.stderr);
@@ -108,7 +77,7 @@ fn test_reprefix_e2e_with_dependency() {
     let new_blocker = format!("yy-{blocker_remainder}");
 
     // Show the blocked issue -- its dependency should now point to new id
-    let r = br_with_prefix(&ws, &["show", &blocked_id, "--json"], "xx", "show-blocked");
+    let r = run_br(&ws, ["show", &blocked_id, "--json"], "show-blocked");
     assert!(r.status.success());
     assert!(
         r.stdout.contains(&new_blocker),
@@ -121,17 +90,16 @@ fn test_reprefix_e2e_with_dependency() {
 fn test_reprefix_e2e_operator_rejected() {
     let ws = BrWorkspace::new();
 
-    let r = br_with_prefix(&ws, &["init", "--prefix", "zz"], "zz", "init");
+    let r = run_br(&ws, ["init"], "init");
     assert!(r.status.success());
 
-    let r = br_with_prefix(&ws, &["create", "Test"], "zz", "create");
+    let r = run_br(&ws, ["create", "Test", "--prefix", "zz"], "create");
     assert!(r.status.success());
     let id = parse_created_id(&r.stdout);
 
-    let r = br_with_prefix(
+    let r = run_br(
         &ws,
-        &["update", &id, "--reprefix", "operator"],
-        "zz",
+        ["update", &id, "--reprefix", "operator"],
         "reprefix-operator",
     );
     assert!(
@@ -149,17 +117,16 @@ fn test_reprefix_e2e_operator_rejected() {
 fn test_reprefix_e2e_json_output() {
     let ws = BrWorkspace::new();
 
-    let r = br_with_prefix(&ws, &["init", "--prefix", "jj"], "jj", "init");
+    let r = run_br(&ws, ["init"], "init");
     assert!(r.status.success());
 
-    let r = br_with_prefix(&ws, &["create", "JSON test"], "jj", "create");
+    let r = run_br(&ws, ["create", "JSON test", "--prefix", "jj"], "create");
     assert!(r.status.success());
     let old_id = parse_created_id(&r.stdout);
 
-    let r = br_with_prefix(
+    let r = run_br(
         &ws,
-        &["update", &old_id, "--reprefix", "kk", "--json"],
-        "jj",
+        ["update", &old_id, "--reprefix", "kk", "--json"],
         "reprefix-json",
     );
     assert!(r.status.success(), "reprefix json failed: {}", r.stderr);
@@ -170,4 +137,68 @@ fn test_reprefix_e2e_json_output() {
     assert_eq!(json["old_id"].as_str().unwrap(), old_id);
     assert!(json["new_id"].as_str().unwrap().starts_with("kk-"));
     assert_eq!(json["title"].as_str().unwrap(), "JSON test");
+}
+
+/// Regression: creation without --prefix errors, and BD_ISSUE_PREFIX has no
+/// effect on creation (mandatory-prefix enforcement, config removal).
+///
+/// Uses `run_br_raw_with_env` deliberately — args pass through verbatim,
+/// bypassing the test harness's `--prefix bd` convenience shim (see
+/// `common::apply_default_test_prefix_shim`). Do not swap this for a
+/// shimmed helper; that would silently defeat the assertions below.
+#[test]
+fn test_create_requires_explicit_prefix_env_is_dead() {
+    let ws = BrWorkspace::new();
+
+    let r = run_br(&ws, ["init"], "init");
+    assert!(r.status.success());
+
+    // No --prefix at all: must error naming --prefix.
+    let r = common::cli::run_br_raw_with_env(
+        &ws,
+        ["create", "No prefix given"],
+        std::iter::empty::<(&str, &str)>(),
+        "create-no-prefix",
+    );
+    assert!(
+        !r.status.success(),
+        "create without --prefix must fail, got: {}",
+        r.stdout
+    );
+    assert!(
+        r.stderr.to_lowercase().contains("prefix"),
+        "error should mention --prefix: {}",
+        r.stderr
+    );
+
+    // BD_ISSUE_PREFIX set but no --prefix flag: still must error (env is dead).
+    let r = common::cli::run_br_raw_with_env(
+        &ws,
+        ["create", "Still no prefix"],
+        [("BD_ISSUE_PREFIX", "zzz")],
+        "create-env-ignored",
+    );
+    assert!(
+        !r.status.success(),
+        "BD_ISSUE_PREFIX must not satisfy the --prefix requirement"
+    );
+    assert!(
+        r.stderr.to_lowercase().contains("prefix"),
+        "error should mention --prefix: {}",
+        r.stderr
+    );
+
+    // With --prefix explicitly, BD_ISSUE_PREFIX must not override it.
+    let r = common::cli::run_br_raw_with_env(
+        &ws,
+        ["create", "Explicit wins", "--prefix", "real"],
+        [("BD_ISSUE_PREFIX", "zzz")],
+        "create-env-does-not-override",
+    );
+    assert!(r.status.success(), "create failed: {}", r.stderr);
+    let id = parse_created_id(&r.stdout);
+    assert!(
+        id.starts_with("real-"),
+        "Expected explicit --prefix 'real' to win over BD_ISSUE_PREFIX, got {id}"
+    );
 }

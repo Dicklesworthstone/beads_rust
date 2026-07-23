@@ -153,7 +153,6 @@ fn e2e_config_get_set() {
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
     // Use a unique test key that won't conflict with defaults
-    // Note: issue_prefix may have DB defaults that take precedence over YAML
     let set = run_br(
         &workspace,
         ["config", "set", "test_custom_key=TESTVALUE"],

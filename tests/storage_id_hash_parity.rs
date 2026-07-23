@@ -134,12 +134,14 @@ fn optimal_length_birthday_problem() {
 fn prefix_configuration_fixture() {
     let created_at = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap();
 
-    // Default prefix
-    let default_gen = IdGenerator::with_defaults();
+    // Explicit "bd" prefix (there is no ambient default prefix anymore;
+    // every generator must be constructed with an explicit prefix).
+    let default_config = IdConfig::with_prefix("bd");
+    let default_gen = IdGenerator::new(default_config);
     let id_default = default_gen.generate("Test", None, None, created_at, 0, |_| false);
     assert!(
         id_default.starts_with("bd-"),
-        "Default prefix should be bd-"
+        "Explicit bd prefix should produce bd-"
     );
     assert!(is_valid_id_format(&id_default));
 
@@ -167,7 +169,7 @@ fn prefix_configuration_fixture() {
 /// Test collision handling increases nonce and length.
 #[test]
 fn collision_handling_fixture() {
-    let generator = IdGenerator::with_defaults();
+    let generator = IdGenerator::new(IdConfig::with_prefix("bd"));
     let created_at = Utc.with_ymd_and_hms(2026, 1, 15, 10, 30, 0).unwrap();
 
     let mut generated: Vec<String> = Vec::new();

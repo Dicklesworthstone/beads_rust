@@ -237,7 +237,15 @@ fn create_br_workspace(br_path: &Path, issue_count: usize) -> std::io::Result<(T
         let priority = (i % 5).to_string();
 
         let _ = Command::new(br_path)
-            .args(["create", "--title", &title, "--priority", &priority])
+            .args([
+                "create",
+                "--title",
+                &title,
+                "--priority",
+                &priority,
+                "--prefix",
+                "bd",
+            ])
             .current_dir(&root)
             .output()?;
     }

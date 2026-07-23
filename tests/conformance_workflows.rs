@@ -435,9 +435,24 @@ impl WorkflowWorkspace {
 
     /// Initialize both br and bd workspaces with consistent prefix.
     pub fn init_both(&mut self) {
-        // Use explicit --prefix bd to ensure both tools use the same prefix.
-        // bd defaults to directory name, br defaults to "bd", so we need parity.
-        self.run_step(0, &["init", "--prefix", "bd"]);
+        // br's `init` no longer accepts `--prefix` (issue prefixes are
+        // mandatory-explicit on `create`/`q` only, never a project-wide
+        // default — see docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md). The Go `bd`
+        // tool being compared against still has its own project-default
+        // prefix concept, so seed it explicitly with `--prefix bd` to keep
+        // parity with what br's test helpers assume (`--prefix bd` on
+        // individual create/q calls below).
+        let br_out = self.run_br(&["init"]);
+        let bd_out = self.run_bd(&["init", "--prefix", "bd"]);
+
+        self.workflow_log.push(WorkflowStep {
+            step_num: 0,
+            command: "init".to_string(),
+            br_success: br_out.status.success(),
+            bd_success: bd_out.status.success(),
+            br_stdout_len: br_out.stdout.len(),
+            bd_stdout_len: bd_out.stdout.len(),
+        });
     }
 
     /// Run a command on both br and bd, logging the results.
@@ -461,7 +476,9 @@ impl WorkflowWorkspace {
     pub fn run_br(&self, args: &[&str]) -> CmdOutput {
         let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("br"));
         cmd.current_dir(&self.br_root);
-        cmd.args(args);
+        let args_vec: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let args_vec = common::apply_default_test_prefix_shim(args_vec);
+        cmd.args(&args_vec);
         cmd.env("NO_COLOR", "1");
         cmd.env("HOME", &self.br_root);
 

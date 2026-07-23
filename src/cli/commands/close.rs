@@ -6,7 +6,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::Status;
 use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, find_matching_ids};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -134,8 +134,7 @@ pub fn execute_with_args(
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let actor = config::resolve_actor(&config_layer);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolver = IdResolver::with_defaults();
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let storage = &mut storage_ctx.storage;
 

@@ -444,8 +444,11 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
     if no_db {
         let mut storage = SqliteStorage::open_memory()?;
-        let prefix = resolve_no_db_prefix(beads_dir, &paths.jsonl_path)?;
-        storage.set_config("issue_prefix", &prefix)?;
+        // No config-sourced prefix exists anymore; infer one from JSONL
+        // data (if present) purely to scope the in-memory store for import.
+        // Creation commands still require an explicit `--prefix` — this
+        // has no bearing on them.
+        let prefix = common_prefix_from_jsonl(&paths.jsonl_path)?;
 
         if paths.jsonl_path.is_file() {
             let import_config = ImportConfig {
@@ -458,7 +461,7 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
                 &mut storage,
                 &paths.jsonl_path,
                 &import_config,
-                Some(&prefix),
+                prefix.as_deref(),
             )?;
         }
 
@@ -479,32 +482,6 @@ pub fn open_storage_with_cli(beads_dir: &Path, cli: &CliOverrides) -> Result<Ope
 
 fn no_db_from_layer(layer: &ConfigLayer) -> Option<bool> {
     get_startup_value(layer, &["no-db", "no_db", "no.db"]).and_then(|value| parse_bool(value))
-}
-
-fn resolve_no_db_prefix(beads_dir: &Path, jsonl_path: &Path) -> Result<String> {
-    let project_layer = load_project_config(beads_dir)?;
-    if let Some(prefix) = get_value(&project_layer, &["issue_prefix", "issue-prefix", "prefix"]) {
-        let trimmed = prefix.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-
-    if let Some(prefix) = common_prefix_from_jsonl(jsonl_path)? {
-        return Ok(prefix);
-    }
-
-    if let Some(name) = beads_dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|name| name.to_str())
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        return Ok(name.to_string());
-    }
-
-    Ok("bd".to_string())
 }
 
 fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
@@ -540,8 +517,7 @@ fn common_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
         prefixes.insert(prefix.to_string());
         if prefixes.len() > 1 {
             return Err(BeadsError::Config(
-                "Mixed issue prefixes detected in JSONL. Set issue-prefix in .beads/config.yaml."
-                    .to_string(),
+                "Mixed issue prefixes detected in JSONL.".to_string(),
             ));
         }
     }
@@ -682,6 +658,17 @@ impl ConfigLayer {
                     insert_key_value(&mut layer, &variant, value.clone());
                 }
             }
+        }
+
+        // `BD_ISSUE_PREFIX` is no longer a config concept — issue prefixes
+        // are always explicit (`--prefix`), never sourced from the
+        // environment or any config layer. Blocklist every key variant the
+        // generic `BD_*` loop above may have produced so a lingering
+        // `BD_ISSUE_PREFIX` in an agent's environment can never leak into
+        // the runtime config.
+        for key in ["issue_prefix", "issue-prefix", "issue.prefix"] {
+            layer.runtime.remove(key);
+            layer.startup.remove(key);
         }
 
         if let Ok(value) = env::var("BEADS_FLUSH_DEBOUNCE") {
@@ -831,11 +818,9 @@ pub fn load_startup_config(beads_dir: &Path) -> Result<ConfigLayer> {
 /// Default config layer (lowest precedence).
 #[must_use]
 pub fn default_config_layer() -> ConfigLayer {
-    let mut layer = ConfigLayer::default();
-    layer
-        .runtime
-        .insert("issue_prefix".to_string(), "bd".to_string());
-    layer
+    // There is no ambient default issue prefix. Every creation path
+    // requires an explicit `--prefix`; see `IdConfig` in `util::id`.
+    ConfigLayer::default()
 }
 
 /// Load configuration with classic precedence order.
@@ -871,20 +856,21 @@ pub fn load_config(
 }
 
 /// Build ID generation config from a merged config layer.
+///
+/// The returned `IdConfig.prefix` is always empty — there is no config-
+/// sourced default prefix. Callers that mint new issue IDs must supply an
+/// explicit `--prefix` and set it on the returned config themselves (or
+/// use `IdConfig::with_prefix` directly). This function only resolves the
+/// hash-length / collision-probability knobs.
 #[must_use]
 pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
-    let prefix = get_value(layer, &["issue_prefix", "issue-prefix", "prefix"])
-        .cloned()
-        .filter(|p| !p.trim().is_empty())
-        .unwrap_or_else(|| "bd".to_string());
-
     let min_hash_length = parse_usize(layer, &["min_hash_length", "min-hash-length"]).unwrap_or(3);
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
     let max_collision_prob =
         parse_f64(layer, &["max_collision_prob", "max-collision-prob"]).unwrap_or(0.25);
 
     IdConfig {
-        prefix,
+        prefix: String::new(),
         min_hash_length,
         max_hash_length,
         max_collision_prob,
@@ -1296,39 +1282,39 @@ mod tests {
         let mut defaults = default_config_layer();
         defaults
             .runtime
-            .insert("issue_prefix".to_string(), "bd".to_string());
+            .insert("greeting".to_string(), "default".to_string());
 
         let mut db = ConfigLayer::default();
         db.runtime
-            .insert("issue_prefix".to_string(), "db".to_string());
+            .insert("greeting".to_string(), "db".to_string());
 
         let mut yaml = ConfigLayer::default();
         yaml.runtime
-            .insert("issue_prefix".to_string(), "yaml".to_string());
+            .insert("greeting".to_string(), "yaml".to_string());
 
         let mut env_layer = ConfigLayer::default();
         env_layer
             .runtime
-            .insert("issue_prefix".to_string(), "env".to_string());
+            .insert("greeting".to_string(), "env".to_string());
 
         let mut cli = ConfigLayer::default();
         cli.runtime
-            .insert("issue_prefix".to_string(), "cli".to_string());
+            .insert("greeting".to_string(), "cli".to_string());
 
         let merged = ConfigLayer::merge_layers(&[defaults, db, yaml, env_layer, cli]);
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "cli");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "cli");
     }
 
     #[test]
     fn yaml_startup_keys_are_separated() {
         let yaml = r"
 no-db: true
-issue_prefix: bd
+greeting: bd
 ";
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).expect("parse yaml");
         let layer = layer_from_yaml_value(&value);
         assert_eq!(layer.startup.get("no-db").unwrap(), "true");
-        assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "bd");
+        assert_eq!(layer.runtime.get("greeting").unwrap(), "bd");
     }
 
     #[test]
@@ -1348,9 +1334,6 @@ labels:
         let mut layer = ConfigLayer::default();
         layer
             .runtime
-            .insert("issue_prefix".to_string(), "br".to_string());
-        layer
-            .runtime
             .insert("min_hash_length".to_string(), "4".to_string());
         layer
             .runtime
@@ -1360,7 +1343,9 @@ labels:
             .insert("max_collision_prob".to_string(), "0.5".to_string());
 
         let config = id_config_from_layer(&layer);
-        assert_eq!(config.prefix, "br");
+        // There is no config-sourced prefix anymore — callers set it
+        // explicitly from `--prefix` after calling this function.
+        assert_eq!(config.prefix, "");
         assert_eq!(config.min_hash_length, 4);
         assert_eq!(config.max_hash_length, 10);
         assert!((config.max_collision_prob - 0.5).abs() < f64::EPSILON);
@@ -1403,12 +1388,12 @@ labels:
         let mut storage = SqliteStorage::open_memory().expect("storage");
         storage.set_config("no-db", "true").expect("set no-db");
         storage
-            .set_config("issue_prefix", "bd")
-            .expect("set issue_prefix");
+            .set_config("greeting", "bd")
+            .expect("set greeting");
 
         let layer = ConfigLayer::from_db(&storage).expect("db layer");
         assert!(!layer.startup.contains_key("no-db"));
-        assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "bd");
+        assert_eq!(layer.runtime.get("greeting").unwrap(), "bd");
     }
 
     #[test]
@@ -1438,16 +1423,22 @@ labels:
 
     #[test]
     fn precedence_default_is_lowest() {
-        // Verify that default layer values are overridden by any other layer
-        let defaults = default_config_layer();
-        assert_eq!(defaults.runtime.get("issue_prefix").unwrap(), "bd");
+        // Verify that default layer values are overridden by any other layer.
+        // `default_config_layer()` itself carries no baked-in values (there
+        // is no ambient default prefix or any other default runtime key
+        // anymore); we seed it here purely to exercise override ordering.
+        let mut defaults = default_config_layer();
+        assert!(defaults.runtime.is_empty());
+        defaults
+            .runtime
+            .insert("greeting".to_string(), "default".to_string());
 
         let mut db = ConfigLayer::default();
         db.runtime
-            .insert("issue_prefix".to_string(), "from_db".to_string());
+            .insert("greeting".to_string(), "from_db".to_string());
 
         let merged = ConfigLayer::merge_layers(&[defaults, db]);
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "from_db");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "from_db");
     }
 
     #[test]
@@ -1455,10 +1446,10 @@ labels:
         let defaults = default_config_layer();
         let mut db = ConfigLayer::default();
         db.runtime
-            .insert("issue_prefix".to_string(), "db_prefix".to_string());
+            .insert("greeting".to_string(), "db_value".to_string());
 
         let merged = ConfigLayer::merge_layers(&[defaults, db]);
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "db_prefix");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "db_value");
     }
 
     #[test]
@@ -1466,13 +1457,13 @@ labels:
         let defaults = default_config_layer();
         let mut db = ConfigLayer::default();
         db.runtime
-            .insert("issue_prefix".to_string(), "db_prefix".to_string());
+            .insert("greeting".to_string(), "db_value".to_string());
         let mut yaml = ConfigLayer::default();
         yaml.runtime
-            .insert("issue_prefix".to_string(), "yaml_prefix".to_string());
+            .insert("greeting".to_string(), "yaml_value".to_string());
 
         let merged = ConfigLayer::merge_layers(&[defaults, db, yaml]);
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "yaml_prefix");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "yaml_value");
     }
 
     #[test]
@@ -1480,14 +1471,14 @@ labels:
         let defaults = default_config_layer();
         let mut yaml = ConfigLayer::default();
         yaml.runtime
-            .insert("issue_prefix".to_string(), "yaml_prefix".to_string());
+            .insert("greeting".to_string(), "yaml_value".to_string());
         let mut env_layer = ConfigLayer::default();
         env_layer
             .runtime
-            .insert("issue_prefix".to_string(), "env_prefix".to_string());
+            .insert("greeting".to_string(), "env_value".to_string());
 
         let merged = ConfigLayer::merge_layers(&[defaults, yaml, env_layer]);
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "env_prefix");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "env_value");
     }
 
     #[test]
@@ -1495,20 +1486,20 @@ labels:
         let defaults = default_config_layer();
         let mut db = ConfigLayer::default();
         db.runtime
-            .insert("issue_prefix".to_string(), "db".to_string());
+            .insert("greeting".to_string(), "db".to_string());
         let mut yaml = ConfigLayer::default();
         yaml.runtime
-            .insert("issue_prefix".to_string(), "yaml".to_string());
+            .insert("greeting".to_string(), "yaml".to_string());
         let mut env_layer = ConfigLayer::default();
         env_layer
             .runtime
-            .insert("issue_prefix".to_string(), "env".to_string());
+            .insert("greeting".to_string(), "env".to_string());
         let mut cli = ConfigLayer::default();
         cli.runtime
-            .insert("issue_prefix".to_string(), "cli_wins".to_string());
+            .insert("greeting".to_string(), "cli_wins".to_string());
 
         let merged = ConfigLayer::merge_layers(&[defaults, db, yaml, env_layer, cli]);
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "cli_wins");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "cli_wins");
     }
 
     #[test]
@@ -1517,35 +1508,35 @@ labels:
 
         let mut db = ConfigLayer::default();
         db.runtime
-            .insert("issue_prefix".to_string(), "db".to_string());
+            .insert("greeting".to_string(), "db".to_string());
 
         let mut legacy = ConfigLayer::default();
         legacy
             .runtime
-            .insert("issue_prefix".to_string(), "legacy".to_string());
+            .insert("greeting".to_string(), "legacy".to_string());
 
         let mut user = ConfigLayer::default();
         user.runtime
-            .insert("issue_prefix".to_string(), "user".to_string());
+            .insert("greeting".to_string(), "user".to_string());
 
         let mut project = ConfigLayer::default();
         project
             .runtime
-            .insert("issue_prefix".to_string(), "project".to_string());
+            .insert("greeting".to_string(), "project".to_string());
 
         let mut env_layer = ConfigLayer::default();
         env_layer
             .runtime
-            .insert("issue_prefix".to_string(), "env".to_string());
+            .insert("greeting".to_string(), "env".to_string());
 
         let mut cli = ConfigLayer::default();
         cli.runtime
-            .insert("issue_prefix".to_string(), "cli".to_string());
+            .insert("greeting".to_string(), "cli".to_string());
 
         let merged =
             ConfigLayer::merge_layers(&[defaults, db, legacy, user, project, env_layer, cli]);
 
-        assert_eq!(merged.runtime.get("issue_prefix").unwrap(), "cli");
+        assert_eq!(merged.runtime.get("greeting").unwrap(), "cli");
     }
 
     #[test]
@@ -1681,10 +1672,10 @@ labels:
 
     #[test]
     fn normalize_key_handles_various_formats() {
-        assert_eq!(normalize_key("ISSUE_PREFIX"), "issue-prefix");
-        assert_eq!(normalize_key("issue-prefix"), "issue-prefix");
-        assert_eq!(normalize_key("issue_prefix"), "issue-prefix");
-        assert_eq!(normalize_key("  ISSUE_PREFIX  "), "issue-prefix");
+        assert_eq!(normalize_key("CUSTOM_KEY"), "custom-key");
+        assert_eq!(normalize_key("custom-key"), "custom-key");
+        assert_eq!(normalize_key("custom_key"), "custom-key");
+        assert_eq!(normalize_key("  CUSTOM_KEY  "), "custom-key");
     }
 
     #[test]
@@ -1732,8 +1723,8 @@ labels:
 
     #[test]
     fn is_startup_key_identifies_runtime_keys() {
-        assert!(!is_startup_key("issue_prefix"));
-        assert!(!is_startup_key("issue-prefix"));
+        assert!(!is_startup_key("custom_key"));
+        assert!(!is_startup_key("custom-key"));
         assert!(!is_startup_key("min_hash_length"));
         assert!(!is_startup_key("labels"));
     }
@@ -1995,12 +1986,12 @@ routing:
 
         fs::write(
             beads_dir.join("config.yaml"),
-            "issue_prefix: proj\nno-db: false\n",
+            "greeting: proj\nno-db: false\n",
         )
         .expect("write config");
 
         let layer = load_project_config(&beads_dir).expect("project config");
-        assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "proj");
+        assert_eq!(layer.runtime.get("greeting").unwrap(), "proj");
         assert_eq!(layer.startup.get("no-db").unwrap(), "false");
     }
 
@@ -2009,7 +2000,9 @@ routing:
         let layer = ConfigLayer::default();
         let config = id_config_from_layer(&layer);
 
-        assert_eq!(config.prefix, "bd");
+        // No config-sourced prefix anymore — always empty from this
+        // function; hash-length knobs still default sensibly.
+        assert_eq!(config.prefix, "");
         assert_eq!(config.min_hash_length, 3);
         assert_eq!(config.max_hash_length, 8);
         assert!((config.max_collision_prob - 0.25).abs() < f64::EPSILON);
@@ -2020,25 +2013,10 @@ routing:
         let mut layer = ConfigLayer::default();
         layer
             .runtime
-            .insert("issue-prefix".to_string(), "hyphen".to_string());
-        layer
-            .runtime
             .insert("min-hash-length".to_string(), "5".to_string());
 
         let config = id_config_from_layer(&layer);
-        assert_eq!(config.prefix, "hyphen");
         assert_eq!(config.min_hash_length, 5);
-    }
-
-    #[test]
-    fn id_config_accepts_legacy_prefix_key() {
-        let mut layer = ConfigLayer::default();
-        layer
-            .runtime
-            .insert("prefix".to_string(), "legacy".to_string());
-
-        let config = id_config_from_layer(&layer);
-        assert_eq!(config.prefix, "legacy");
     }
 
     // ==================== JSONL Discovery Tests ====================

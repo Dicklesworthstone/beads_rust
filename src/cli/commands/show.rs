@@ -5,7 +5,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{format_priority_label, format_status_icon_colored};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
-use crate::util::id::{IdResolver, ResolverConfig};
+use crate::util::id::IdResolver;
 use std::fmt::Write as FmtWrite;
 
 /// Execute the show command.
@@ -36,8 +36,7 @@ pub fn execute(
     }
 
     let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolver = IdResolver::with_defaults();
     let use_color = config::should_use_color(&config_layer);
     let output_format = resolve_output_format_basic(args.format, outer_ctx.is_json(), false);
     let quiet = cli.quiet.unwrap_or(false);
@@ -241,7 +240,7 @@ mod tests {
     use crate::format::{IssueDetails, IssueWithDependencyMetadata};
     use crate::model::{Comment, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
-    use crate::util::id::{IdResolver, ResolverConfig};
+    use crate::util::id::IdResolver;
     use chrono::{TimeZone, Utc};
     use tracing::info;
 
@@ -375,7 +374,7 @@ mod tests {
     fn test_show_resolves_full_id() {
         init_logging();
         info!("test_show_resolves_full_id: starting");
-        let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+        let resolver = IdResolver::with_defaults();
         let resolved_id = resolver
             .resolve("bd-abc123", |id| id == "bd-abc123", |_hash| Vec::new())
             .unwrap();
@@ -384,22 +383,10 @@ mod tests {
     }
 
     #[test]
-    fn test_show_resolves_prefixed_id() {
-        init_logging();
-        info!("test_show_resolves_prefixed_id: starting");
-        let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
-        let resolved_id = resolver
-            .resolve("abc123", |id| id == "bd-abc123", |_hash| Vec::new())
-            .unwrap();
-        assert_eq!(resolved_id.id, "bd-abc123");
-        info!("test_show_resolves_prefixed_id: assertions passed");
-    }
-
-    #[test]
     fn test_show_resolves_partial_id() {
         init_logging();
         info!("test_show_resolves_partial_id: starting");
-        let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+        let resolver = IdResolver::with_defaults();
         let resolved_id = resolver
             .resolve(
                 "abc",
@@ -421,7 +408,7 @@ mod tests {
     fn test_show_not_found_error() {
         init_logging();
         info!("test_show_not_found_error: starting");
-        let resolver = IdResolver::new(ResolverConfig::with_prefix("bd"));
+        let resolver = IdResolver::with_defaults();
         let result = resolver.resolve("missing", |_id| false, |_hash| Vec::new());
         assert!(result.is_err());
         info!("test_show_not_found_error: assertions passed");

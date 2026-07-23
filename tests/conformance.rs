@@ -153,7 +153,12 @@ where
 {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
     cmd.current_dir(cwd);
-    cmd.args(args);
+    let args_vec: Vec<String> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_string_lossy().to_string())
+        .collect();
+    let args_vec = common::apply_default_test_prefix_shim(args_vec);
+    cmd.args(&args_vec);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
     cmd.env("RUST_BACKTRACE", "1");
@@ -9413,11 +9418,11 @@ fn conformance_config_list() {
     let br_val: Value = serde_json::from_str(&br_json).expect("br config json");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("bd config json");
 
-    let br_prefix = br_val.get("issue_prefix").and_then(|v| v.as_str());
-    let bd_prefix = bd_val.get("issue_prefix").and_then(|v| v.as_str());
-
-    assert!(br_prefix.is_some(), "br config list missing issue_prefix");
-    assert!(bd_prefix.is_some(), "bd config list missing issue_prefix");
+    // `issue_prefix` is no longer a config key (see
+    // docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md) — just check both tools produce
+    // a JSON object for `config list`.
+    assert!(br_val.is_object(), "br config list should be a JSON object");
+    assert!(bd_val.is_object(), "bd config list should be a JSON object");
 
     log_timings("config_list", &br_config, &bd_config);
     info!("conformance_config_list passed");
@@ -9433,8 +9438,10 @@ fn conformance_config_get() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    let br_set = workspace.run_br(["config", "set", "issue_prefix=cfg_get"], "config_set");
-    let bd_set = workspace.run_bd(["config", "set", "issue_prefix", "cfg_get"], "config_set");
+    // `issue_prefix` is gone; use `default_priority` — a generic key both
+    // tools support — to exercise `config set`/`config get` conformance.
+    let br_set = workspace.run_br(["config", "set", "default_priority=1"], "config_set");
+    let bd_set = workspace.run_bd(["config", "set", "default_priority", "1"], "config_set");
 
     assert!(
         br_set.status.success(),
@@ -9447,8 +9454,8 @@ fn conformance_config_get() {
         bd_set.stderr
     );
 
-    let br_get = workspace.run_br(["config", "get", "issue_prefix", "--json"], "config_get");
-    let bd_get = workspace.run_bd(["config", "get", "issue_prefix", "--json"], "config_get");
+    let br_get = workspace.run_br(["config", "get", "default_priority", "--json"], "config_get");
+    let bd_get = workspace.run_bd(["config", "get", "default_priority", "--json"], "config_get");
 
     assert!(
         br_get.status.success(),
@@ -9479,8 +9486,8 @@ fn conformance_config_set() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    let br_set = workspace.run_br(["config", "set", "issue_prefix=cfg_set"], "config_set");
-    let bd_set = workspace.run_bd(["config", "set", "issue_prefix", "cfg_set"], "config_set");
+    let br_set = workspace.run_br(["config", "set", "default_priority=2"], "config_set");
+    let bd_set = workspace.run_bd(["config", "set", "default_priority", "2"], "config_set");
 
     assert!(
         br_set.status.success(),
@@ -9507,8 +9514,8 @@ fn conformance_config_get_after_set() {
     let workspace = ConformanceWorkspace::new();
     workspace.init_both();
 
-    let br_set = workspace.run_br(["config", "set", "issue_prefix=cfg_after"], "config_set");
-    let bd_set = workspace.run_bd(["config", "set", "issue_prefix", "cfg_after"], "config_set");
+    let br_set = workspace.run_br(["config", "set", "default_priority=3"], "config_set");
+    let bd_set = workspace.run_bd(["config", "set", "default_priority", "3"], "config_set");
 
     assert!(
         br_set.status.success(),
@@ -9521,8 +9528,8 @@ fn conformance_config_get_after_set() {
         bd_set.stderr
     );
 
-    let br_get = workspace.run_br(["config", "get", "issue_prefix", "--json"], "config_get");
-    let bd_get = workspace.run_bd(["config", "get", "issue_prefix", "--json"], "config_get");
+    let br_get = workspace.run_br(["config", "get", "default_priority", "--json"], "config_get");
+    let bd_get = workspace.run_bd(["config", "get", "default_priority", "--json"], "config_get");
 
     assert!(
         br_get.status.success(),
@@ -9594,22 +9601,15 @@ fn conformance_config_defaults() {
     let br_val: Value = serde_json::from_str(&br_json).expect("br config json");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("bd config json");
 
-    let br_prefix = br_val
-        .get("issue_prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let bd_prefix = bd_val
-        .get("issue_prefix")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
+    // `issue_prefix` is no longer a default config key. Just verify both
+    // tools produce a non-empty defaults object.
     assert!(
-        !br_prefix.is_empty(),
-        "br config defaults should include issue_prefix"
+        br_val.as_object().is_some_and(|m| !m.is_empty()),
+        "br config defaults should be non-empty"
     );
     assert!(
-        !bd_prefix.is_empty(),
-        "bd config defaults should include issue_prefix"
+        bd_val.as_object().is_some_and(|m| !m.is_empty()),
+        "bd config defaults should be non-empty"
     );
 
     log_timings("config_defaults", &br_config, &bd_config);

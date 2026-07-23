@@ -936,25 +936,17 @@ fn execute_import(
         show_progress,
     };
 
-    // Get expected prefix from config, or auto-detect from JSONL
-    let configured_prefix = storage.get_config("issue_prefix")?;
-    let prefix = if let Some(p) = configured_prefix {
-        p
-    } else {
-        // No prefix configured - try to auto-detect from JSONL for migration scenarios
-        if let Some(detected) = detect_prefix_from_jsonl(jsonl_path) {
-            info!(detected_prefix = %detected, "Auto-detected prefix from JSONL (no prefix configured)");
-            // Persist the detected prefix to config for future operations
-            storage.set_config("issue_prefix", &detected)?;
-            detected
-        } else {
-            "bd".to_string()
-        }
-    };
+    // Auto-detect prefix from JSONL data for rename-on-import purposes.
+    // There is no config-sourced prefix anymore (issue_prefix config key
+    // removed) — prefix expectations are entirely data-driven.
+    let prefix = detect_prefix_from_jsonl(jsonl_path);
+    if let Some(detected) = &prefix {
+        info!(detected_prefix = %detected, "Auto-detected prefix from JSONL");
+    }
 
     // Execute import
     info!(path = %jsonl_path.display(), "Importing from JSONL");
-    let import_result = import_from_jsonl(storage, jsonl_path, &import_config, Some(&prefix))?;
+    let import_result = import_from_jsonl(storage, jsonl_path, &import_config, prefix.as_deref())?;
 
     info!(
         created_or_updated = import_result.imported_count,
