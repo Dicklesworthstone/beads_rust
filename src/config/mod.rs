@@ -9,7 +9,10 @@
 //! 6. DB config table
 //! 7. Defaults
 
+mod identity;
 pub mod routing;
+
+pub use identity::resolve_agent_identity_with_storage;
 
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority};
@@ -77,12 +80,7 @@ pub fn resolve_agent_identity() -> Result<String> {
 fn resolve_agent_identity_from(env_value: Option<&str>) -> Result<String> {
     let trimmed = env_value.unwrap_or_default().trim();
     if trimmed.is_empty() {
-        return Err(BeadsError::validation(
-            "identity",
-            "BD_AGENT_ID is not set. Set it to your agent prefix \
-             (e.g. BD_AGENT_ID=myagent). If you're the human operator, \
-             use `bd admin msg` / `bd admin inbox` instead.",
-        ));
+        return Err(missing_agent_id_error(false));
     }
     if trimmed.eq_ignore_ascii_case(OPERATOR_PREFIX) {
         return Err(BeadsError::validation(
@@ -93,6 +91,23 @@ fn resolve_agent_identity_from(env_value: Option<&str>) -> Result<String> {
         ));
     }
     Ok(trimmed.to_string())
+}
+
+/// Shared "`BD_AGENT_ID` is not set" error text, used both by the
+/// strict env-only resolver and by [`identity::resolve_agent_identity_with_storage`]
+/// when the live-`bd watch`-ancestry fallback also comes up empty.
+fn missing_agent_id_error(no_watch_found_in_ancestry: bool) -> BeadsError {
+    let mut msg = String::from(
+        "BD_AGENT_ID is not set. Set it to your agent prefix \
+         (e.g. BD_AGENT_ID=myagent).",
+    );
+    if no_watch_found_in_ancestry {
+        msg.push_str(" No live `bd watch` was found in this process's ancestry.");
+    }
+    msg.push_str(
+        " If you're the human operator, use `bd admin msg` / `bd admin inbox` instead.",
+    );
+    BeadsError::validation("identity", msg)
 }
 
 /// Default database filename used when metadata is missing.

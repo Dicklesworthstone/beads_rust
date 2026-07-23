@@ -874,15 +874,18 @@ fn discover_git_remote(cwd: &str) -> String {
     crate::util::git::canonicalize_repo_url(raw.trim())
 }
 
-/// Strict prefix resolution for `bd watch`.
+/// Prefix resolution for `bd watch`.
 ///
 /// Unlike the rest of the CLI, watch refuses to fall back to project / user
 /// config or the default "bd". Reasoning: when an agent boots and starts a
 /// watch, the harness is *supposed* to set BD_AGENT_ID. Silently watching
 /// the wrong prefix would mean missing notifications addressed to the agent.
-/// Resolution order: `--prefix` flag first, then `BD_AGENT_ID` via
-/// [`config::resolve_agent_identity`].
-fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrides) -> Result<String> {
+/// Resolution order: `--prefix` flag, then `BD_AGENT_ID`, then inference
+/// from a live `bd watch` already in this process's ancestry (see
+/// [`config::resolve_agent_identity_with_storage`]) — e.g. a restarted
+/// monitor process that lost its env var but still has a sibling watch
+/// running under the same agent host process.
+fn resolve_prefix(args: &WatchArgs, beads_dir: &Path, cli: &config::CliOverrides) -> Result<String> {
     let candidate = if let Some(p) = args
         .prefix
         .as_ref()
@@ -891,7 +894,8 @@ fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrid
     {
         p.to_string()
     } else {
-        config::resolve_agent_identity().map_err(|e| {
+        let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
+        config::resolve_agent_identity_with_storage(&storage).map_err(|e| {
             let reason = match &e {
                 BeadsError::Validation { reason, .. } => reason.clone(),
                 other => other.to_string(),
