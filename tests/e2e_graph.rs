@@ -550,3 +550,171 @@ fn e2e_graph_all_deferred_excluded_by_default() {
         graph_deferred.stdout
     );
 }
+
+/// Mixed: one multi-node component (A→B) plus two singletons (C, D).
+/// - numbered `Component 1` present
+/// - `Singletons (2 issues)` block present, both singleton IDs listed
+/// - NO `Component 2` / `Component 3` headers (singletons consume no numbers)
+/// - summary line carries `(2 singletons)`
+#[test]
+fn e2e_graph_all_singletons_mixed() {
+    let _log = common::test_log("e2e_graph_all_singletons_mixed");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Multi-node component: A → B (B depends on A)
+    let a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(a.status.success(), "create a: {}", a.stderr);
+    let id_a = parse_created_id(&a.stdout);
+
+    let b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(b.status.success(), "create b: {}", b.stderr);
+    let id_b = parse_created_id(&b.stdout);
+
+    let dep = run_br(&workspace, ["dep", "add", &id_b, &id_a], "dep_ab");
+    assert!(dep.status.success(), "dep add: {}", dep.stderr);
+
+    // Two isolated singletons
+    let c = run_br(&workspace, ["create", "Singleton C"], "create_c");
+    assert!(c.status.success(), "create c: {}", c.stderr);
+    let id_c = parse_created_id(&c.stdout);
+
+    let d = run_br(&workspace, ["create", "Singleton D"], "create_d");
+    assert!(d.status.success(), "create d: {}", d.stderr);
+    let id_d = parse_created_id(&d.stdout);
+
+    let graph = run_br(&workspace, ["graph", "--all"], "graph_all");
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+
+    let out = &graph.stdout;
+
+    // Multi-node component gets numbered header
+    assert!(
+        out.contains("Component 1"),
+        "Expected 'Component 1' header, got:\n{out}"
+    );
+    // Both ids from the connected component appear
+    assert!(out.contains(&id_a), "Expected id_a in output, got:\n{out}");
+    assert!(out.contains(&id_b), "Expected id_b in output, got:\n{out}");
+
+    // Singleton block is present with correct count
+    assert!(
+        out.contains("Singletons (2 issues)"),
+        "Expected 'Singletons (2 issues)', got:\n{out}"
+    );
+    // Both singleton IDs listed
+    assert!(out.contains(&id_c), "Expected id_c in singletons, got:\n{out}");
+    assert!(out.contains(&id_d), "Expected id_d in singletons, got:\n{out}");
+
+    // Singletons must NOT get individual Component N headers
+    assert!(
+        !out.contains("Component 2"),
+        "id_c must not appear as 'Component 2', got:\n{out}"
+    );
+    assert!(
+        !out.contains("Component 3"),
+        "id_d must not appear as 'Component 3', got:\n{out}"
+    );
+
+    // Summary line shows singleton count
+    assert!(
+        out.contains("(2 singletons)"),
+        "Expected '(2 singletons)' in summary, got:\n{out}"
+    );
+}
+
+/// No-singleton case: two issues connected — no singletons at all.
+/// The `Singletons` header must not appear.
+#[test]
+fn e2e_graph_all_no_singletons() {
+    let _log = common::test_log("e2e_graph_all_no_singletons");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(a.status.success(), "create a: {}", a.stderr);
+    let id_a = parse_created_id(&a.stdout);
+
+    let b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(b.status.success(), "create b: {}", b.stderr);
+    let id_b = parse_created_id(&b.stdout);
+
+    let dep = run_br(&workspace, ["dep", "add", &id_b, &id_a], "dep_ab");
+    assert!(dep.status.success(), "dep add: {}", dep.stderr);
+
+    let graph = run_br(&workspace, ["graph", "--all"], "graph_all");
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+
+    let out = &graph.stdout;
+
+    // Both issues present
+    assert!(out.contains(&id_a), "Expected id_a, got:\n{out}");
+    assert!(out.contains(&id_b), "Expected id_b, got:\n{out}");
+
+    // No Singletons section
+    assert!(
+        !out.contains("Singletons"),
+        "'Singletons' header must not appear when no singletons exist, got:\n{out}"
+    );
+    // No singleton suffix in summary
+    assert!(
+        !out.contains("singleton"),
+        "'singleton' must not appear in summary when none exist, got:\n{out}"
+    );
+}
+
+/// All-singleton case: three isolated issues, no edges.
+/// - No `Component N` numbered headers
+/// - `Singletons (3 issues)` block with all ids
+#[test]
+fn e2e_graph_all_only_singletons() {
+    let _log = common::test_log("e2e_graph_all_only_singletons");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let a = run_br(&workspace, ["create", "Solo A"], "create_a");
+    assert!(a.status.success(), "create a: {}", a.stderr);
+    let id_a = parse_created_id(&a.stdout);
+
+    let b = run_br(&workspace, ["create", "Solo B"], "create_b");
+    assert!(b.status.success(), "create b: {}", b.stderr);
+    let id_b = parse_created_id(&b.stdout);
+
+    let c = run_br(&workspace, ["create", "Solo C"], "create_c");
+    assert!(c.status.success(), "create c: {}", c.stderr);
+    let id_c = parse_created_id(&c.stdout);
+
+    let graph = run_br(&workspace, ["graph", "--all"], "graph_all");
+    assert!(graph.status.success(), "graph failed: {}", graph.stderr);
+
+    let out = &graph.stdout;
+
+    // No numbered component headers
+    assert!(
+        !out.contains("Component 1"),
+        "No 'Component N' headers expected when all are singletons, got:\n{out}"
+    );
+
+    // Singletons section with correct count
+    assert!(
+        out.contains("Singletons (3 issues)"),
+        "Expected 'Singletons (3 issues)', got:\n{out}"
+    );
+
+    // All ids present
+    assert!(out.contains(&id_a), "Expected id_a, got:\n{out}");
+    assert!(out.contains(&id_b), "Expected id_b, got:\n{out}");
+    assert!(out.contains(&id_c), "Expected id_c, got:\n{out}");
+
+    // No (root) marker — singletons suppress it
+    assert!(
+        !out.contains("(root)"),
+        "'(root)' must not appear in the singletons block, got:\n{out}"
+    );
+}
