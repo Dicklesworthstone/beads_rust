@@ -405,7 +405,6 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     config::CliOverrides {
         db: cli.db.clone(),
         actor: cli.actor.clone(),
-        identity: None,
         json: Some(cli.json),
         display_color: if cli.no_color { Some(false) } else { None },
         quiet: Some(cli.quiet),

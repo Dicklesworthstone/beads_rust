@@ -55,6 +55,46 @@ pub fn assert_writable_prefix(prefix: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the calling agent's identity for messaging / watch / presence.
+///
+/// `BD_AGENT_ID` is the sole identity source — no compat fallback to
+/// `BD_ISSUE_PREFIX`, project config, or a hardcoded default. Prefix-less
+/// environments (the human operator's normal shell) are expected to fail
+/// here; the operator's send path is `bd admin msg` / `bd admin inbox`,
+/// which do not require identity.
+///
+/// # Errors
+///
+/// Returns a validation error if `BD_AGENT_ID` is unset/empty, or if it
+/// is set to the reserved [`OPERATOR_PREFIX`] value.
+pub fn resolve_agent_identity() -> Result<String> {
+    resolve_agent_identity_from(env::var("BD_AGENT_ID").ok().as_deref())
+}
+
+/// Testable core of [`resolve_agent_identity`], parameterized on the raw
+/// env value so unit tests don't need to mutate process-global env vars
+/// (which is racy under a parallel test runner).
+fn resolve_agent_identity_from(env_value: Option<&str>) -> Result<String> {
+    let trimmed = env_value.unwrap_or_default().trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation(
+            "identity",
+            "BD_AGENT_ID is not set. Set it to your agent prefix \
+             (e.g. BD_AGENT_ID=myagent). If you're the human operator, \
+             use `bd admin msg` / `bd admin inbox` instead.",
+        ));
+    }
+    if trimmed.eq_ignore_ascii_case(OPERATOR_PREFIX) {
+        return Err(BeadsError::validation(
+            "identity",
+            "BD_AGENT_ID=operator is reserved for the human operator; \
+             agents cannot adopt it. If you're the operator, use \
+             `bd admin msg` / `bd admin inbox` instead.",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Default database filename used when metadata is missing.
 const DEFAULT_DB_FILENAME: &str = "beads.db";
 /// Default JSONL filename used when metadata is missing.
@@ -647,9 +687,6 @@ impl ConfigLayer {
         if let Ok(value) = env::var("BEADS_FLUSH_DEBOUNCE") {
             insert_key_value(&mut layer, "flush-debounce", value);
         }
-        if let Ok(value) = env::var("BEADS_IDENTITY") {
-            insert_key_value(&mut layer, "identity", value);
-        }
         if let Ok(value) = env::var("BEADS_REMOTE_SYNC_INTERVAL") {
             insert_key_value(&mut layer, "remote-sync-interval", value);
         }
@@ -685,7 +722,6 @@ impl ConfigLayer {
 pub struct CliOverrides {
     pub db: Option<PathBuf>,
     pub actor: Option<String>,
-    pub identity: Option<String>,
     pub json: Option<bool>,
     pub display_color: Option<bool>,
     pub quiet: Option<bool>,
@@ -706,9 +742,6 @@ impl CliOverrides {
         }
         if let Some(actor) = &self.actor {
             insert_key_value(&mut layer, "actor", actor.clone());
-        }
-        if let Some(identity) = &self.identity {
-            insert_key_value(&mut layer, "identity", identity.clone());
         }
         if let Some(json) = self.json {
             insert_key_value(&mut layer, "json", json.to_string());
@@ -1047,7 +1080,6 @@ pub fn is_startup_key(key: &str) -> bool {
             | "json"
             | "db"
             | "actor"
-            | "identity"
             | "flush-debounce"
             | "lock-timeout"
             | "remote-sync-interval"
@@ -1197,6 +1229,41 @@ mod tests {
     use crate::model::{IssueType, Priority};
     use crate::storage::SqliteStorage;
     use tempfile::TempDir;
+
+    #[test]
+    fn resolve_agent_identity_rejects_missing_env() {
+        let err = resolve_agent_identity_from(None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("BD_AGENT_ID"), "got: {msg}");
+        assert!(msg.contains("bd admin msg"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_agent_identity_rejects_empty_env() {
+        assert!(resolve_agent_identity_from(Some("")).is_err());
+        assert!(resolve_agent_identity_from(Some("   ")).is_err());
+    }
+
+    #[test]
+    fn resolve_agent_identity_rejects_operator() {
+        let err = resolve_agent_identity_from(Some("operator")).unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+        // Case-insensitive.
+        assert!(resolve_agent_identity_from(Some("OPERATOR")).is_err());
+        assert!(resolve_agent_identity_from(Some("Operator")).is_err());
+    }
+
+    #[test]
+    fn resolve_agent_identity_trims_and_returns() {
+        assert_eq!(
+            resolve_agent_identity_from(Some(" arc3 ")).unwrap(),
+            "arc3".to_string()
+        );
+        assert_eq!(
+            resolve_agent_identity_from(Some("beads1")).unwrap(),
+            "beads1".to_string()
+        );
+    }
 
     #[test]
     fn metadata_defaults_when_missing() {
@@ -1658,7 +1725,6 @@ labels:
         assert!(is_startup_key("json"));
         assert!(is_startup_key("db"));
         assert!(is_startup_key("actor"));
-        assert!(is_startup_key("identity"));
         assert!(is_startup_key("lock-timeout"));
         assert!(is_startup_key("git.branch")); // prefix check
         assert!(is_startup_key("routing.policy")); // prefix check
@@ -1781,7 +1847,6 @@ labels:
             no_auto_flush: Some(true),
             no_auto_import: Some(true),
             lock_timeout: Some(5000),
-            identity: None,
         };
 
         let layer = cli.as_layer();
