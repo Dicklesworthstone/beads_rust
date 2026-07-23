@@ -18,6 +18,8 @@ fn test_list_sort_title_case_insensitive() {
         .current_dir(path)
         .arg("create")
         .arg("apple")
+        .arg("--prefix")
+        .arg("bd")
         .assert()
         .success();
 
@@ -26,6 +28,8 @@ fn test_list_sort_title_case_insensitive() {
         .current_dir(path)
         .arg("create")
         .arg("Banana")
+        .arg("--prefix")
+        .arg("bd")
         .assert()
         .success();
 

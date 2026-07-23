@@ -41,8 +41,8 @@ This guide covers how AI coding agents can effectively use `br` (beads_rust) for
 ## Quick Start for Agents
 
 ```bash
-# Initialize (if needed)
-br init --prefix myproj
+# Initialize (if needed) — issue prefixes are no longer set at init time
+br init
 
 # Find work
 br list --status open --json --limit 5
@@ -52,8 +52,8 @@ br update bd-123 --claim --json
 # ... do the work ...
 br close bd-123 --reason "Implemented feature X" --json
 
-# Create discovered work
-br create "Found bug during implementation" -t bug -p 1 --deps discovered-from:bd-123 --json
+# Create discovered work (--prefix is mandatory for every creation command)
+br create "Found bug during implementation" --prefix myproj -t bug -p 1 --deps discovered-from:bd-123 --json
 
 # Session end
 br sync --flush-only
@@ -69,7 +69,7 @@ br sync --flush-only
 # Flag on any command
 br list --json
 br show bd-123 --json
-br create "Title" --json
+br create "Title" --prefix myproj --json
 
 # Equivalent (when the command supports --format)
 br list --format json
@@ -169,7 +169,8 @@ $ br list --status open --json --limit 2
 │  3. WORK                                                    │
 │     Implement the task...                                   │
 │     → If you find new work:                                 │
-│       br create "New issue" --deps discovered-from:<id>     │
+│       br create "New issue" --prefix myproj \                │
+│         --deps discovered-from:<id>                         │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -198,8 +199,9 @@ br update bd-123 --status in_progress --assignee "$BD_ACTOR" --json
 ### Creating Related Issues
 
 ```bash
-# Bug discovered during feature work
+# Bug discovered during feature work (--prefix is mandatory)
 br create "Edge case causes crash" \
+  --prefix myproj \
   -t bug \
   -p 1 \
   --deps discovered-from:bd-123 \
@@ -207,6 +209,7 @@ br create "Edge case causes crash" \
 
 # Subtask for epic
 br create "Implement auth middleware" \
+  --prefix myproj \
   -t task \
   --parent bd-epic-456 \
   --json
@@ -363,8 +366,8 @@ These flags enable machine-friendly output:
 
 ```bash
 # Machine-friendly create
-br create "New issue" --silent
-# Output: bd-abc123
+br create "New issue" --prefix myproj --silent
+# Output: myproj-abc123
 
 # Quiet mode with JSON
 br close bd-123 --quiet --json
@@ -392,11 +395,12 @@ br sync --flush-only
 ### Cursor AI
 
 ```bash
-# Initialize in project
-br init --prefix cursor
+# Initialize in project (no --prefix on init; set it per-create instead)
+br init
 
 # Use with Cursor's tool system
 br list --status open --json
+br create "New task" --prefix cursor --json
 br show <id> --json
 ```
 
@@ -491,7 +495,14 @@ See [AGENTS.md](../AGENTS.md) for detailed bv integration.
 
 **"Database not initialized"**
 ```bash
-br init --prefix myproj
+br init
+```
+
+**"--prefix is required for issue creation"**
+```bash
+# Every creation command (br create, br q) requires an explicit --prefix.
+# There is no config file, DB row, or BD_ISSUE_PREFIX env var fallback.
+br create "My issue" --prefix myproj
 ```
 
 **"Issue not found"**
@@ -527,6 +538,30 @@ RUST_LOG=debug br list --status open --json 2>debug.log
 # Verbose mode
 br sync --flush-only -vv
 ```
+
+---
+
+## Migration from `BD_ISSUE_PREFIX`
+
+Older harnesses and skills exported `BD_ISSUE_PREFIX` to set a default
+issue prefix for creation and to scope `bd list`/`bd ready` output. Both
+uses are gone:
+
+- **Creation is always explicit.** `br create` and `br q` require
+  `--prefix <name>` on every invocation. There is no config file, DB row,
+  YAML key, or environment variable that supplies a default prefix.
+  `BD_ISSUE_PREFIX` is read by nothing and has zero effect.
+- **Identity uses `BD_AGENT_ID` instead.** Messaging (`br msg`/`br
+  inbox`/`br outbox`), `br watch`, and presence (`br working`/`br idle`)
+  resolve the calling agent's identity from `BD_AGENT_ID`, not
+  `BD_ISSUE_PREFIX`. Update harness/skill env exports accordingly:
+  `BD_AGENT_ID=myagent` instead of `BD_ISSUE_PREFIX=myagent`.
+- **`br list` no longer self-scopes by identity.** Default output shows
+  all prefixes; use `--prefix <name>` to filter explicitly.
+
+If your harness still sets `BD_ISSUE_PREFIX`, it is harmless (ignored)
+but you should migrate to `BD_AGENT_ID` and add explicit `--prefix` flags
+to any scripted `br create`/`br q` calls.
 
 ---
 

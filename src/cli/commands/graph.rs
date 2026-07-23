@@ -12,7 +12,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{DependencyType, Issue, Status};
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, find_matching_ids};
 // Aliased to avoid colliding with `rich_rust::Style` imported via
 // rich_rust::prelude. The TUI Lines code uses RStyle/RModifier/RColor.
 use ratatui::style::{Color as RColor, Modifier as RModifier, Style as RStyle};
@@ -106,9 +106,7 @@ pub fn execute(args: &GraphArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
-    let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolver = IdResolver::with_defaults();
     let all_ids = storage_ctx.storage.get_all_ids()?;
 
     if args.all {

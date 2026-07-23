@@ -317,8 +317,8 @@ fn edit_config() -> Result<()> {
         let default_content = r"# br configuration
 # See `br config --list` for available options
 
-# Issue ID prefix
-# issue_prefix: bd
+# See `br create --prefix` / `br q --prefix` — issue prefixes are always
+# explicit at creation time, never a project-wide default here.
 
 # Default priority for new issues (0-4)
 # default_priority: 2
@@ -768,7 +768,6 @@ fn show_config(
         }
 
         // Add computed values
-        all_keys.insert("_computed.prefix".to_string(), json!(id_config.prefix));
         all_keys.insert(
             "_computed.min_hash_length".to_string(),
             json!(id_config.min_hash_length),
@@ -807,7 +806,6 @@ fn show_config(
         render_config_table("Configuration", &entries, ctx);
 
         let computed_rows = vec![
-            ("prefix".to_string(), format_config_value(&id_config.prefix)),
             (
                 "min_hash_length".to_string(),
                 format_config_value(&id_config.min_hash_length.to_string()),
@@ -851,7 +849,6 @@ fn show_config(
         }
 
         println!("Computed values:");
-        println!("  prefix: {}", id_config.prefix);
         println!("  min_hash_length: {}", id_config.min_hash_length);
         println!("  max_hash_length: {}", id_config.max_hash_length);
         println!("  actor: {actor}");

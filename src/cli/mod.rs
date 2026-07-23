@@ -1061,10 +1061,6 @@ pub enum ShellType {
 /// Arguments for the `init` command.
 #[derive(Args, Debug, Clone, Default)]
 pub struct InitArgs {
-    /// Issue ID prefix (e.g., "bd")
-    #[arg(long)]
-    pub prefix: Option<String>,
-
     /// Overwrite existing DB
     #[arg(long)]
     pub force: bool,
@@ -1306,7 +1302,8 @@ pub struct CreateArgs {
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Option<String>,
 
-    /// Issue ID prefix for the new bead (overrides BD_ISSUE_PREFIX env var)
+    /// Issue ID prefix for the new bead (required; e.g. `--prefix demo`).
+    /// There is no default — env vars and config no longer supply one.
     #[arg(long)]
     pub prefix: Option<String>,
 
@@ -1335,6 +1332,11 @@ pub struct QuickArgs {
     /// Issue type (task, bug, feature, etc.)
     #[arg(long = "type", short = 't', add = ArgValueCompleter::new(issue_type_completer))]
     pub type_: Option<String>,
+
+    /// Issue ID prefix for the new bead (required; e.g. `--prefix demo`).
+    /// There is no default — env vars and config no longer supply one.
+    #[arg(long)]
+    pub prefix: Option<String>,
 
     /// Labels (no longer exposed via CLI; field kept for back-compat).
     #[arg(skip)]
@@ -1432,7 +1434,10 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub session: Option<String>,
 
-    /// Issue ID prefix for partial-ID resolution (overrides BD_ISSUE_PREFIX env var)
+    /// Issue ID prefix hint for partial-ID resolution (advisory only —
+    /// resolution is prefix-agnostic via substring match regardless of
+    /// this flag; no environment variable or config ever supplies a
+    /// default). Kept for compatibility with existing scripts.
     #[arg(long)]
     pub prefix: Option<String>,
 

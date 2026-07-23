@@ -13,12 +13,15 @@ fn e2e_config_precedence_env_project_user_db() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // DB layer (lowest non-default)
+    // DB layer (lowest non-default). `greeting` is an arbitrary generic
+    // key used purely to exercise layer-merge precedence (the
+    // `issue_prefix` config key no longer exists — see
+    // docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md).
     let db_path = workspace.root.join(".beads").join("beads.db");
     let mut storage = SqliteStorage::open(&db_path).expect("open db");
     storage
-        .set_config("issue_prefix", "DB")
-        .expect("set db issue_prefix");
+        .set_config("greeting", "DB")
+        .expect("set db greeting");
     storage
         .set_config("default_priority", "1")
         .expect("set db default_priority");
@@ -30,18 +33,17 @@ fn e2e_config_precedence_env_project_user_db() {
         .join("beads")
         .join("config.yaml");
     fs::create_dir_all(user_config.parent().unwrap()).expect("create user config dir");
-    fs::write(&user_config, "issue_prefix: USER\ndefault_priority: 2\n")
-        .expect("write user config");
+    fs::write(&user_config, "greeting: USER\ndefault_priority: 2\n").expect("write user config");
 
     // Project config layer (.beads/config.yaml)
     let project_config = workspace.root.join(".beads").join("config.yaml");
-    fs::write(&project_config, "issue_prefix: PROJECT\n").expect("write project config");
+    fs::write(&project_config, "greeting: PROJECT\n").expect("write project config");
 
-    // No env: project wins for issue_prefix
-    let get_project = run_br(&workspace, ["config", "get", "issue_prefix"], "get_project");
+    // No env: project wins for greeting
+    let get_project = run_br(&workspace, ["config", "get", "greeting"], "get_project");
     assert!(
         get_project.status.success(),
-        "config get issue_prefix failed: {}",
+        "config get greeting failed: {}",
         get_project.stderr
     );
     assert!(
@@ -69,13 +71,8 @@ fn e2e_config_precedence_env_project_user_db() {
     );
 
     // Env overrides project/user/DB
-    let env_vars = vec![("BD_ISSUE_PREFIX", "ENV")];
-    let get_env = run_br_with_env(
-        &workspace,
-        ["config", "get", "issue_prefix"],
-        env_vars,
-        "get_env",
-    );
+    let env_vars = vec![("BD_GREETING", "ENV")];
+    let get_env = run_br_with_env(&workspace, ["config", "get", "greeting"], env_vars, "get_env");
     assert!(
         get_env.status.success(),
         "config get with env failed: {}",
@@ -152,13 +149,13 @@ fn e2e_config_precedence_includes_legacy_layer() {
     let db_path = actual_workspace.root.join(".beads").join("beads.db");
     let mut storage = SqliteStorage::open(&db_path).expect("open db");
     storage
-        .set_config("issue_prefix", "DB")
-        .expect("set db issue_prefix");
+        .set_config("greeting", "DB")
+        .expect("set db greeting");
 
     // Legacy user config (~/.beads/config.yaml) in runner HOME
     let legacy_config = runner_workspace.root.join(".beads").join("config.yaml");
     fs::create_dir_all(legacy_config.parent().unwrap()).expect("create legacy config dir");
-    fs::write(&legacy_config, "issue_prefix: LEGACY\n").expect("write legacy config");
+    fs::write(&legacy_config, "greeting: LEGACY\n").expect("write legacy config");
 
     // User config layer (~/.config/beads/config.yaml) in runner HOME
     let user_config = runner_workspace
@@ -167,11 +164,11 @@ fn e2e_config_precedence_includes_legacy_layer() {
         .join("beads")
         .join("config.yaml");
     fs::create_dir_all(user_config.parent().unwrap()).expect("create user config dir");
-    fs::write(&user_config, "issue_prefix: USER\n").expect("write user config");
+    fs::write(&user_config, "greeting: USER\n").expect("write user config");
 
     // Project config layer (.beads/config.yaml) in actual workspace
     let project_config = actual_workspace.root.join(".beads").join("config.yaml");
-    fs::write(&project_config, "issue_prefix: PROJECT\n").expect("write project config");
+    fs::write(&project_config, "greeting: PROJECT\n").expect("write project config");
 
     // Use BEADS_DIR to point at actual workspace
     let beads_dir = actual_workspace.root.join(".beads");
@@ -180,13 +177,13 @@ fn e2e_config_precedence_includes_legacy_layer() {
     // Project overrides user/legacy/db
     let get_project = run_br_with_env(
         &runner_workspace,
-        ["config", "get", "issue_prefix"],
+        ["config", "get", "greeting"],
         env_vars.clone(),
         "get_project",
     );
     assert!(
         get_project.status.success(),
-        "config get issue_prefix failed: {}",
+        "config get greeting failed: {}",
         get_project.stderr
     );
     assert_eq!(get_project.stdout.trim(), "PROJECT");
@@ -194,11 +191,11 @@ fn e2e_config_precedence_includes_legacy_layer() {
     // Env overrides project/user/legacy/db
     let env_override = vec![
         ("BEADS_DIR", beads_dir.to_str().unwrap()),
-        ("BD_ISSUE_PREFIX", "ENV"),
+        ("BD_GREETING", "ENV"),
     ];
     let get_env = run_br_with_env(
         &runner_workspace,
-        ["config", "get", "issue_prefix"],
+        ["config", "get", "greeting"],
         env_override,
         "get_env",
     );
@@ -239,11 +236,11 @@ fn e2e_config_precedence_legacy_used_when_user_missing() {
         .join("beads")
         .join("config.yaml");
     fs::create_dir_all(user_config.parent().unwrap()).expect("create user config dir");
-    fs::write(&user_config, "issue_prefix: USER\n").expect("write user config");
+    fs::write(&user_config, "greeting: USER\n").expect("write user config");
 
     // Project config exists but does NOT set default_priority
     let project_config = actual_workspace.root.join(".beads").join("config.yaml");
-    fs::write(&project_config, "issue_prefix: PROJECT\n").expect("write project config");
+    fs::write(&project_config, "greeting: PROJECT\n").expect("write project config");
 
     let beads_dir = actual_workspace.root.join(".beads");
     let env_vars = vec![("BEADS_DIR", beads_dir.to_str().unwrap())];
@@ -263,7 +260,7 @@ fn e2e_config_precedence_legacy_used_when_user_missing() {
     assert_eq!(get_legacy.stdout.trim(), "3");
 
     // User should override legacy once the key is set
-    fs::write(&user_config, "issue_prefix: USER\ndefault_priority: 2\n")
+    fs::write(&user_config, "greeting: USER\ndefault_priority: 2\n")
         .expect("write user config with default_priority");
     let get_user = run_br_with_env(
         &runner_workspace,
@@ -277,4 +274,52 @@ fn e2e_config_precedence_legacy_used_when_user_missing() {
         get_user.stderr
     );
     assert_eq!(get_user.stdout.trim(), "2");
+}
+
+/// Regression: `BD_ISSUE_PREFIX` must have ZERO effect anywhere in the
+/// config cascade — the key is blocklisted in `ConfigLayer::from_env()`,
+/// and `issue_prefix` is not a recognized config key at all anymore.
+/// `config get issue_prefix` errors exactly like any other unknown key
+/// (existing behavior for `config get`; `config set` remains a generic
+/// YAML writer with no key validation — setting `issue_prefix` there is a
+/// harmless no-op, not an error, since nothing reads it back).
+#[test]
+fn e2e_config_precedence_bd_issue_prefix_env_is_inert() {
+    let _log = common::test_log("e2e_config_precedence_bd_issue_prefix_env_is_inert");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let get_env = run_br_with_env(
+        &workspace,
+        ["config", "get", "issue_prefix"],
+        vec![("BD_ISSUE_PREFIX", "zzz")],
+        "get_issue_prefix_env",
+    );
+    assert!(
+        !get_env.status.success(),
+        "issue_prefix is not a recognized config key; `config get` should \
+         error like any other unknown key, even with BD_ISSUE_PREFIX set"
+    );
+    assert!(
+        get_env.stdout.trim() != "zzz",
+        "BD_ISSUE_PREFIX must not populate the (removed) issue_prefix key, got: '{}'",
+        get_env.stdout
+    );
+
+    // Also confirm `config list` never shows an issue_prefix row derived
+    // from the env var.
+    let list_env = run_br_with_env(
+        &workspace,
+        ["config", "list"],
+        vec![("BD_ISSUE_PREFIX", "zzz")],
+        "list_with_issue_prefix_env",
+    );
+    assert!(list_env.status.success());
+    assert!(
+        !list_env.stdout.contains("zzz"),
+        "config list must not surface BD_ISSUE_PREFIX value, got: {}",
+        list_env.stdout
+    );
 }

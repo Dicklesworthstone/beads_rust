@@ -163,9 +163,15 @@ fn run_binary(binary: &str, cwd: &PathBuf, args: &[&str]) -> CmdOutput {
     };
 
     let start = Instant::now();
+    let args_vec: Vec<String> = args.iter().map(ToString::to_string).collect();
+    let args_vec = if binary == "br" {
+        common::apply_default_test_prefix_shim(args_vec)
+    } else {
+        args_vec
+    };
     let output = Command::new(&cmd_path)
         .current_dir(cwd)
-        .args(args)
+        .args(&args_vec)
         .env("NO_COLOR", "1")
         .env("HOME", cwd)
         .output()

@@ -381,10 +381,10 @@ fn e2e_config_command() {
     );
     // Config list output contains various settings sections
     assert!(
-        config_list.stdout.contains("prefix")
-            || config_list.stdout.contains("issue_prefix")
-            || config_list.stdout.contains("Configuration"),
-        "config list missing expected keys"
+        config_list.stdout.contains("configuration")
+            || config_list.stdout.contains("settings"),
+        "config list missing expected keys: {}",
+        config_list.stdout
     );
     // Should show settings sections
     assert!(

@@ -10,7 +10,7 @@ use crate::format::truncate_title;
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::util::id::{IdResolver, ResolverConfig, find_matching_ids};
+use crate::util::id::{IdResolver, find_matching_ids};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -33,8 +33,7 @@ pub fn execute(
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
     let use_color = config::should_use_color(&config_layer);
     let quiet = cli.quiet.unwrap_or(false);
-    let id_config = config::id_config_from_layer(&config_layer);
-    let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+    let resolver = IdResolver::with_defaults();
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let storage = &mut storage_ctx.storage;
 

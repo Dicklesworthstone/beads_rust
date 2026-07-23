@@ -36,7 +36,7 @@ fn main() {
     }
 
     let result = match cli.command {
-        Commands::Init(args) => commands::init::execute(args.prefix, args.force, None, &output_ctx),
+        Commands::Init(args) => commands::init::execute(args.force, None, &output_ctx),
         Commands::Working => commands::presence::execute_working(&overrides, &output_ctx),
         Commands::Idle => commands::presence::execute_idle(&overrides, &output_ctx),
         Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
@@ -134,7 +134,7 @@ fn dispatch_admin(
 ) -> Result<()> {
     use beads_rust::cli::AdminCommands as A;
     match command {
-        A::Init(args) => commands::init::execute(args.prefix, args.force, None, output_ctx),
+        A::Init(args) => commands::init::execute(args.force, None, output_ctx),
         A::Dash(args) => commands::dash::execute(&args, overrides, output_ctx),
         A::Graph(args) => commands::graph::execute(&args, overrides, output_ctx),
         A::Stats(args) | A::Status(args) => {
@@ -309,12 +309,14 @@ fn run_auto_import(
         return Ok(());
     }
 
-    let expected_prefix = storage.get_config("issue_prefix")?;
+    // No config-sourced expected prefix anymore (issue_prefix config key
+    // removed) — auto-import no longer validates against a project-wide
+    // default prefix.
     let outcome = auto_import_if_stale(
         &mut storage,
         &paths.beads_dir,
         &paths.jsonl_path,
-        expected_prefix.as_deref(),
+        None,
         allow_stale,
         no_auto_import,
     )?;

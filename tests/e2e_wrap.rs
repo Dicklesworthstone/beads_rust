@@ -11,8 +11,10 @@ mod common;
 use common::cli::{BrWorkspace, run_br, run_br_with_env};
 
 fn init_workspace_with_long_issues(workspace: &BrWorkspace) {
-    // Initialize
-    let output = run_br(workspace, ["init", "--prefix", "wrap"], "init");
+    // Initialize (`init` no longer accepts `--prefix`; the "wrap-" prefix
+    // used below and asserted on further down is now supplied explicitly
+    // on each `create` call instead).
+    let output = run_br(workspace, ["init"], "init");
     assert!(output.status.success(), "init failed: {}", output.stderr);
 
     // Create issue with a very long title
@@ -28,6 +30,8 @@ fn init_workspace_with_long_issues(workspace: &BrWorkspace) {
             "2",
             "-d",
             "This is also a very long description that contains multiple sentences and should span several lines when the wrap option is enabled because it provides detailed context about the issue being tracked.",
+            "--prefix",
+            "wrap",
         ],
         "create_long",
     );
@@ -36,7 +40,7 @@ fn init_workspace_with_long_issues(workspace: &BrWorkspace) {
     // Create a shorter issue for comparison
     let output = run_br(
         workspace,
-        ["create", "Short issue", "--type", "bug"],
+        ["create", "Short issue", "--type", "bug", "--prefix", "wrap"],
         "create_short",
     );
     assert!(output.status.success(), "create short failed");
@@ -336,8 +340,10 @@ fn e2e_wrap_very_wide_terminal() {
 fn e2e_wrap_with_unicode_content() {
     let workspace = BrWorkspace::new();
 
-    // Initialize
-    let output = run_br(&workspace, ["init", "--prefix", "uni"], "init_unicode");
+    // Initialize (`init` no longer accepts `--prefix`; the harness's
+    // `--prefix bd` convenience shim covers the create call below, and no
+    // assertion here depends on a specific prefix value).
+    let output = run_br(&workspace, ["init"], "init_unicode");
     assert!(output.status.success());
 
     // Create issue with unicode content (emoji, CJK, etc.)

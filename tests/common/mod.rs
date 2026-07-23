@@ -90,3 +90,33 @@ pub fn test_db_with_dir() -> (SqliteStorage, TempDir) {
     let storage = SqliteStorage::open(&db_path).expect("Failed to create test database");
     (storage, dir)
 }
+
+/// Test-convenience default: `bd create` / `bd q` now require an explicit
+/// `--prefix` in production (there is no config or env fallback anymore —
+/// see `docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md`). The overwhelming majority of
+/// existing tests don't care *which* prefix is used, only that creation
+/// succeeds, so this shim appends `--prefix bd` to `create`/`q` invocations
+/// that don't already specify one.
+///
+/// IMPORTANT: this must NOT be used by the regression tests that
+/// specifically assert the mandatory-`--prefix` error path (creation
+/// without `--prefix` must still error). Those tests use
+/// `common::cli::run_br_raw_with_env` (bypasses this shim entirely) —
+/// see `tests/e2e_reprefix.rs::test_create_requires_explicit_prefix_env_is_dead`.
+/// Do not "fix" that test by routing it through this shim.
+pub fn apply_default_test_prefix_shim(args: Vec<String>) -> Vec<String> {
+    // Global flags (e.g. `--db <path>`) can precede the subcommand, so we
+    // scan for `create`/`q` as a bare token rather than only checking
+    // args[0]. This intentionally does not try to distinguish a bare
+    // "create"/"q" token from one that happens to be a flag's value
+    // (e.g. `--title create`) — that pattern does not occur in this
+    // suite's fixtures.
+    let is_creation = args.iter().any(|a| a == "create" || a == "q");
+    if is_creation && !args.iter().any(|a| a == "--prefix") {
+        let mut with_prefix = args;
+        with_prefix.push("--prefix".to_string());
+        with_prefix.push("bd".to_string());
+        return with_prefix;
+    }
+    args
+}

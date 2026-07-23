@@ -143,15 +143,11 @@ fn build_schema_info(
     let mut ids = storage.get_all_ids().unwrap_or_default();
     let sample_issue_ids: Vec<String> = ids.drain(..ids.len().min(3)).collect();
 
-    let mut detected_prefix = config_map
-        .and_then(|map| map.get("issue_prefix").cloned())
-        .filter(|value| !value.trim().is_empty());
-
-    if detected_prefix.is_none() {
-        detected_prefix = sample_issue_ids
-            .first()
-            .and_then(|id| parse_id(id).ok().map(|parsed| parsed.prefix));
-    }
+    // issue_prefix config key is gone; the only signal left is the data
+    // itself — infer the prefix from the first sample issue ID.
+    let detected_prefix = sample_issue_ids
+        .first()
+        .and_then(|id| parse_id(id).ok().map(|parsed| parsed.prefix));
 
     SchemaInfo {
         tables: SCHEMA_TABLES.iter().map(ToString::to_string).collect(),
@@ -178,12 +174,6 @@ fn print_human(info: &InfoOutput) {
 
     if let Some(count) = info.issue_count {
         println!("Issue count: {count}");
-    }
-
-    if let Some(config_map) = &info.config {
-        if let Some(prefix) = config_map.get("issue_prefix") {
-            println!("Issue prefix: {prefix}");
-        }
     }
 
     if let Some(schema) = &info.schema {
@@ -228,15 +218,6 @@ fn render_info_rich(info: &InfoOutput, ctx: &OutputContext) {
     content.append_styled("Location    ", theme.dimmed.clone());
     content.append_styled(&info.beads_dir, theme.accent.clone());
     content.append("\n");
-
-    // Prefix (if available)
-    if let Some(config_map) = &info.config {
-        if let Some(prefix) = config_map.get("issue_prefix") {
-            content.append_styled("Prefix      ", theme.dimmed.clone());
-            content.append_styled(prefix, theme.issue_id.clone());
-            content.append("\n");
-        }
-    }
 
     content.append("\n");
 

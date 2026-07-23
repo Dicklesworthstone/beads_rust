@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::model::{Issue, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext};
 use crate::storage::ListFilters;
-use crate::util::id::normalize_id;
+use crate::util::id::{normalize_id, split_prefix_remainder};
 use regex::Regex;
 use rich_rust::prelude::*;
 use serde::Serialize;
@@ -58,9 +58,21 @@ pub fn execute(
     };
     let storage = &storage_ctx.storage;
 
-    // Get issue prefix from config
-    let config_layer = config::load_config(&beads_dir, Some(storage), cli)?;
-    let prefix = config::id_config_from_layer(&config_layer).prefix;
+    // Scan for ALL prefixes present in the DB (there is no single
+    // "the" project prefix anymore — see docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md
+    // §3d). Build a regex alternation across every distinct prefix found.
+    let all_ids = storage.get_all_ids().unwrap_or_default();
+    let mut prefixes: Vec<String> = all_ids
+        .iter()
+        .filter_map(|id| split_prefix_remainder(id).map(|(p, _)| p.to_string()))
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+
+    if prefixes.is_empty() {
+        output_empty(ctx.is_json() || args.robot, ctx);
+        return Ok(());
+    }
 
     // Check if we're in a git repo by running git rev-parse
     if !is_git_repo() {
@@ -69,7 +81,7 @@ pub fn execute(
     }
 
     // Get git log and extract issue references
-    let Ok(commit_refs) = get_git_commit_refs(&prefix) else {
+    let Ok(commit_refs) = get_git_commit_refs(&prefixes) else {
         output_empty(ctx.is_json() || args.robot, ctx);
         return Ok(());
     };
@@ -241,7 +253,7 @@ fn is_git_repo() -> bool {
 ///
 /// Returns Vec of (`commit_hash`, `commit_message`, `issue_id`) tuples.
 /// The list is ordered from most recent to oldest commit.
-fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
+fn get_git_commit_refs(prefixes: &[String]) -> Result<Vec<(String, String, String)>> {
     let mut child = Command::new("git")
         .args(["log", "--oneline", "HEAD"])
         .stdout(Stdio::piped())
@@ -252,7 +264,7 @@ fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
     })?;
 
     let reader = BufReader::new(stdout);
-    let refs = parse_git_log(reader, prefix)?;
+    let refs = parse_git_log(reader, prefixes)?;
 
     let status = child.wait()?;
     if !status.success() {
@@ -264,17 +276,24 @@ fn get_git_commit_refs(prefix: &str) -> Result<Vec<(String, String, String)>> {
 
 /// Parse git log output and extract issue ID references.
 ///
-/// Looks for patterns like `(bd-abc123)` or `bd-abc123` in commit messages.
-fn parse_git_log<R: BufRead>(reader: R, prefix: &str) -> Result<Vec<(String, String, String)>> {
+/// Looks for patterns like `(bd-abc123)` or `bd-abc123` in commit messages,
+/// across all prefixes currently present in the DB (there is no single
+/// default prefix to scan for).
+fn parse_git_log<R: BufRead>(
+    reader: R,
+    prefixes: &[String],
+) -> Result<Vec<(String, String, String)>> {
     // Pattern matches prefix-id including hierarchical IDs like bd-abc.1
     // We use word boundaries \b to avoid matching suffix/prefix (e.g. abd-123 or bd-123a)
     // although matching bd-123a is technically valid if 123a is the hash.
     // The previous regex forced parens: r"\(({}-[a-zA-Z0-9]+(?:\.[0-9]+)?)\)"
     // Use (?i) for case-insensitive matching (user input in commits varies)
-    let pattern = format!(
-        r"(?i)\b({}-[a-z0-9]+(?:\.[0-9]+)?)\b",
-        regex::escape(prefix)
-    );
+    let alternation = prefixes
+        .iter()
+        .map(|p| regex::escape(p))
+        .collect::<Vec<_>>()
+        .join("|");
+    let pattern = format!(r"(?i)\b((?:{alternation})-[a-z0-9]+(?:\.[0-9]+)?)\b");
     let re = Regex::new(&pattern)
         .map_err(|e| crate::error::BeadsError::Config(format!("Invalid regex pattern: {e}")))?;
 
@@ -342,7 +361,7 @@ def5678 Another commit
 ghi9012 Implement feature bd-xyz123
 jkl3456 Multi-ref (bd-foo) and bd-bar";
 
-        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), &["bd".to_string()]).unwrap();
 
         assert_eq!(refs.len(), 4);
         assert_eq!(refs[0].2, "bd-abc");
@@ -354,7 +373,7 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
     #[test]
     fn test_parse_git_log_hierarchical_ids() {
         let log = "abc1234 Fix child (bd-parent.1)";
-        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), &["bd".to_string()]).unwrap();
 
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].2, "bd-parent.1");
@@ -363,16 +382,30 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
     #[test]
     fn test_parse_git_log_custom_prefix() {
         let log = "abc1234 Fix issue (proj-xyz)";
-        let refs = parse_git_log(Cursor::new(log), "proj").unwrap();
+        let refs = parse_git_log(Cursor::new(log), &["proj".to_string()]).unwrap();
 
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].2, "proj-xyz");
     }
 
     #[test]
+    fn test_parse_git_log_multiple_prefixes() {
+        // orphans scans ALL prefixes present in the DB, not a single
+        // configured default — verify the alternation regex catches
+        // commits referencing any of them.
+        let log = "abc1234 Fix (bd-abc123)\ndef5678 Cross-project fix (wf2-fvzl)\n";
+        let refs = parse_git_log(Cursor::new(log), &["bd".to_string(), "wf2".to_string()])
+            .unwrap();
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].2, "bd-abc123");
+        assert_eq!(refs[1].2, "wf2-fvzl");
+    }
+
+    #[test]
     fn test_parse_git_log_no_matches() {
         let log = "abc1234 Regular commit without issue refs";
-        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), &["bd".to_string()]).unwrap();
 
         assert!(refs.is_empty());
     }
@@ -383,7 +416,7 @@ jkl3456 Multi-ref (bd-foo) and bd-bar";
 bbb Middle (bd-2)
 ccc Oldest (bd-1)";
 
-        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), &["bd".to_string()]).unwrap();
 
         // First occurrence of bd-1 should be from the latest commit
         assert_eq!(refs[0].0, "aaa");
@@ -401,7 +434,7 @@ ccc Oldest (bd-1)";
     #[test]
     fn test_parse_git_log_normalizes_case() {
         let log = "abc1234 Fix bug (BD-ABC)";
-        let refs = parse_git_log(Cursor::new(log), "bd").unwrap();
+        let refs = parse_git_log(Cursor::new(log), &["bd".to_string()]).unwrap();
         assert_eq!(refs[0].2, "bd-abc");
     }
 }

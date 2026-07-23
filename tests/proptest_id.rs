@@ -13,8 +13,7 @@ use std::fmt::Write as _;
 use tracing::info;
 
 use beads_rust::util::id::{
-    IdConfig, IdGenerator, compute_id_hash, generate_id, generate_id_seed, is_valid_id_format,
-    parse_id,
+    IdConfig, IdGenerator, compute_id_hash, generate_id_seed, is_valid_id_format, parse_id,
 };
 
 /// Initialize test logging for proptest (called once per test)
@@ -41,7 +40,8 @@ proptest! {
         );
 
         let now = Utc::now();
-        let id = generate_id(&title, None, None, now);
+        let generator = IdGenerator::new(IdConfig::with_prefix("bd"));
+        let id = generator.generate(&title, None, None, now, 0, |_| false);
 
         info!("proptest_id_valid: output_id={id}");
 
@@ -68,8 +68,9 @@ proptest! {
 
         let now = Utc::now();
 
-        let id1 = generate_id(&title, desc.as_deref(), creator.as_deref(), now);
-        let id2 = generate_id(&title, desc.as_deref(), creator.as_deref(), now);
+        let generator = IdGenerator::new(IdConfig::with_prefix("bd"));
+        let id1 = generator.generate(&title, desc.as_deref(), creator.as_deref(), now, 0, |_| false);
+        let id2 = generator.generate(&title, desc.as_deref(), creator.as_deref(), now, 0, |_| false);
 
         prop_assert_eq!(id1, id2, "Same inputs must produce same ID");
     }
@@ -87,8 +88,9 @@ proptest! {
 
         let now = Utc::now();
 
-        let id1 = generate_id(&title1, None, None, now);
-        let id2 = generate_id(&title2, None, None, now);
+        let generator = IdGenerator::new(IdConfig::with_prefix("bd"));
+        let id1 = generator.generate(&title1, None, None, now, 0, |_| false);
+        let id2 = generator.generate(&title2, None, None, now, 0, |_| false);
 
         // Note: This is probabilistic - collisions are possible but rare
         // We just verify IDs are generated (format validation already tested above)

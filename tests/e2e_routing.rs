@@ -165,11 +165,9 @@ fn e2e_routing_routes_jsonl_external_route() {
         init_external.stderr
     );
 
-    // Set a different prefix for external project
-    let external_config = external_workspace.root.join(".beads").join("config.yaml");
-    fs::write(&external_config, "issue_prefix: ext\n").expect("write external config");
-
-    // Create routes file in main workspace pointing to external workspace
+    // Route table expects issues in the external project to carry the
+    // "ext-" prefix; there is no more config-driven default prefix, so we
+    // pass --prefix explicitly on create instead of writing issue_prefix.
     let routes_path = main_workspace.root.join(".beads").join("routes.jsonl");
     let route_entry = format!(
         r#"{{"prefix":"ext-","path":"{}"}}"#,
@@ -187,6 +185,8 @@ fn e2e_routing_routes_jsonl_external_route() {
             "2",
             "--type",
             "task",
+            "--prefix",
+            "ext",
             "--json",
         ],
         "create_external",
@@ -561,11 +561,9 @@ fn e2e_routing_show_external_issue_not_found() {
         init_ext.stderr
     );
 
-    // Set a different prefix for external project
-    let external_config = external_workspace.root.join(".beads").join("config.yaml");
-    fs::write(&external_config, "issue_prefix: ext\n").expect("write external config");
-
     // Create routes file in main workspace pointing to external workspace
+    // (no config-driven prefix needed here — this test never creates an
+    // issue in the external project, just probes a nonexistent id).
     let routes_path = main_workspace.root.join(".beads").join("routes.jsonl");
     let route_entry = format!(
         r#"{{"prefix":"ext-","path":"{}"}}"#,

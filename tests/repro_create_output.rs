@@ -20,6 +20,8 @@ fn test_create_json_output_is_single_object() {
         .current_dir(path)
         .arg("create")
         .arg("Single Object Check")
+        .arg("--prefix")
+        .arg("bd")
         .arg("--json")
         .output()
         .expect("create issue");

@@ -271,18 +271,28 @@ where
 {
     let start = Instant::now();
 
+    let args_vec: Vec<String> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_string_lossy().to_string())
+        .collect();
+    let args_vec = if binary == "br" {
+        common::apply_default_test_prefix_shim(args_vec)
+    } else {
+        args_vec
+    };
+
     let output = if binary == "br" {
         let br_bin = assert_cmd::cargo::cargo_bin!("br");
         std::process::Command::new(&br_bin)
             .current_dir(cwd)
-            .args(args)
+            .args(&args_vec)
             .env("NO_COLOR", "1")
             .output()
             .expect("run br")
     } else {
         std::process::Command::new(binary)
             .current_dir(cwd)
-            .args(args)
+            .args(&args_vec)
             .env("NO_COLOR", "1")
             .env("HOME", cwd)
             .output()

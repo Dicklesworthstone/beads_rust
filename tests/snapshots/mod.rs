@@ -11,8 +11,12 @@ use std::fmt::{self, Write};
 use std::sync::LazyLock;
 
 pub fn init_workspace() -> BrWorkspace {
+    // `init` no longer accepts `--prefix` (issue prefixes are always
+    // explicit at creation time, never a project-wide default — see
+    // docs/PLAN_REMOVE_BD_ISSUE_PREFIX.md). `create_issue` below relies on
+    // the test harness's `--prefix bd` convenience shim.
     let workspace = BrWorkspace::new();
-    let init = run_br(&workspace, ["init", "--prefix", "bd"], "init");
+    let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
     workspace
 }

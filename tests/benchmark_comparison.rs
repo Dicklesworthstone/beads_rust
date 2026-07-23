@@ -408,7 +408,12 @@ where
 {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("br"));
     cmd.current_dir(cwd);
-    cmd.args(args);
+    let args_vec: Vec<String> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_string_lossy().to_string())
+        .collect();
+    let args_vec = common::apply_default_test_prefix_shim(args_vec);
+    cmd.args(&args_vec);
     cmd.env("NO_COLOR", "1");
     cmd.env("HOME", cwd);
 

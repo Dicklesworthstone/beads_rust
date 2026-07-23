@@ -11,12 +11,7 @@ use std::path::Path;
 /// # Errors
 ///
 /// Returns an error if the directory or database cannot be created.
-pub fn execute(
-    prefix: Option<String>,
-    force: bool,
-    root_dir: Option<&Path>,
-    ctx: &OutputContext,
-) -> Result<()> {
+pub fn execute(force: bool, root_dir: Option<&Path>, ctx: &OutputContext) -> Result<()> {
     let base_dir = root_dir.unwrap_or_else(|| Path::new("."));
     let beads_dir = base_dir.join(".beads");
 
@@ -43,17 +38,11 @@ pub fn execute(
     }
 
     // Initialize DB (creates file and applies schema)
-    let mut storage = SqliteStorage::open(&effective_db_path)?;
+    let _storage = SqliteStorage::open(&effective_db_path)?;
 
-    // Set prefix in config table if provided
-    // Normalize to lowercase since ID validation requires lowercase prefixes
-    let mut prefix_set = None;
-    if let Some(p) = prefix {
-        let normalized = p.to_ascii_lowercase();
-        crate::config::assert_writable_prefix(&normalized)?;
-        storage.set_config("issue_prefix", &normalized)?;
-        prefix_set = Some(normalized);
-    }
+    // Issue prefixes are no longer a project-wide config concept — every
+    // creation command requires an explicit `--prefix`. `init` no longer
+    // accepts or stores a prefix.
 
     // Write metadata.json
     let metadata_path = beads_dir.join("metadata.json");
@@ -71,7 +60,8 @@ pub fn execute(
     let config_existed = config_path.exists();
     if !config_existed {
         let config = r"# Beads Project Configuration
-# issue_prefix: bd
+# See `br create --prefix` / `br q --prefix` — issue prefixes are always
+# explicit at creation time, never a project-wide default.
 # default_priority: 2
 # default_type: task
 ";
@@ -118,13 +108,9 @@ last-touched
             config_existed,
             gitignore_existed,
             jsonl_existed,
-            prefix_set.as_deref(),
         );
-        render_init_rich(&beads_dir, &steps, prefix_set.as_deref(), ctx);
+        render_init_rich(&beads_dir, &steps, ctx);
     } else {
-        if let Some(p) = prefix_set.as_deref() {
-            println!("Prefix set to: {p}");
-        }
         println!("Initialized beads workspace in .beads/");
     }
 
@@ -152,7 +138,6 @@ fn build_init_steps(
     config_existed: bool,
     gitignore_existed: bool,
     jsonl_existed: bool,
-    prefix: Option<&str>,
 ) -> Vec<InitStep> {
     let mut steps = Vec::new();
 
@@ -213,22 +198,10 @@ fn build_init_steps(
         },
     });
 
-    if let Some(prefix) = prefix {
-        steps.push(InitStep {
-            label: format!("Issue prefix set to '{prefix}'"),
-            status: InitStepStatus::Updated,
-        });
-    }
-
     steps
 }
 
-fn render_init_rich(
-    beads_dir: &Path,
-    steps: &[InitStep],
-    prefix: Option<&str>,
-    ctx: &OutputContext,
-) {
+fn render_init_rich(beads_dir: &Path, steps: &[InitStep], ctx: &OutputContext) {
     let theme = ctx.theme();
     let mut content = Text::new("");
 
@@ -255,16 +228,14 @@ fn render_init_rich(
 
     content.append("\n");
     content.append_styled("Next steps:\n", theme.emphasis.clone());
-    content.append("  br create \"My first issue\"\n");
+    content.append("  br create \"My first issue\" --prefix myproj\n");
     content.append("  br list\n");
 
-    if prefix.is_none() {
-        content.append("\n");
-        content.append_styled(
-            "Tip: Set a custom prefix with `br init --prefix <name>`\n",
-            theme.dimmed.clone(),
-        );
-    }
+    content.append("\n");
+    content.append_styled(
+        "Tip: pass --prefix on `br create` / `br q` to set the issue prefix.\n",
+        theme.dimmed.clone(),
+    );
 
     let panel = Panel::from_rich_text(&content, ctx.width())
         .title(Text::new("Beads Initialized"))
@@ -301,7 +272,7 @@ mod tests {
         info!("test_init_creates_beads_directory: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result = execute(false, Some(temp_dir.path()), &ctx);
 
         assert!(result.is_ok());
         assert!(temp_dir.path().join(".beads").exists());
@@ -314,21 +285,23 @@ mod tests {
     }
 
     #[test]
-    fn test_init_with_prefix() {
+    fn test_init_stores_no_prefix_concept() {
+        // `init` no longer accepts or stores any issue prefix — there is no
+        // `issue_prefix` config key anymore. Every creation command
+        // requires an explicit `--prefix`.
         init_logging();
-        info!("test_init_with_prefix: starting");
+        info!("test_init_stores_no_prefix_concept: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = execute(Some("test".to_string()), false, Some(temp_dir.path()), &ctx);
+        let result = execute(false, Some(temp_dir.path()), &ctx);
 
         assert!(result.is_ok());
 
-        // Verify prefix was stored
         let db_path = temp_dir.path().join(".beads/beads.db");
         let storage = SqliteStorage::open(&db_path).unwrap();
         let prefix = storage.get_config("issue_prefix").unwrap();
-        assert_eq!(prefix, Some("test".to_string()));
-        info!("test_init_with_prefix: assertions passed");
+        assert_eq!(prefix, None, "init must not write an issue_prefix row");
+        info!("test_init_stores_no_prefix_concept: assertions passed");
     }
 
     #[test]
@@ -339,11 +312,11 @@ mod tests {
         let ctx = OutputContext::from_flags(false, false, true);
 
         // First init should succeed
-        let result1 = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result1 = execute(false, Some(temp_dir.path()), &ctx);
         assert!(result1.is_ok());
 
         // Second init without force should fail
-        let result2 = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result2 = execute(false, Some(temp_dir.path()), &ctx);
 
         assert!(result2.is_err());
         assert!(matches!(
@@ -361,29 +334,12 @@ mod tests {
         let ctx = OutputContext::from_flags(false, false, true);
 
         // First init
-        execute(
-            Some("first".to_string()),
-            false,
-            Some(temp_dir.path()),
-            &ctx,
-        )
-        .unwrap();
+        execute(false, Some(temp_dir.path()), &ctx).unwrap();
 
         // Second init with force
-        let result = execute(
-            Some("second".to_string()),
-            true,
-            Some(temp_dir.path()),
-            &ctx,
-        );
+        let result = execute(true, Some(temp_dir.path()), &ctx);
 
         assert!(result.is_ok());
-
-        // Verify new prefix
-        let db_path = temp_dir.path().join(".beads/beads.db");
-        let storage = SqliteStorage::open(&db_path).unwrap();
-        let prefix = storage.get_config("issue_prefix").unwrap();
-        assert_eq!(prefix, Some("second".to_string()));
         info!("test_init_force_overwrites_existing: assertions passed");
     }
 
@@ -393,7 +349,7 @@ mod tests {
         info!("test_metadata_json_content: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        execute(None, false, Some(temp_dir.path()), &ctx).unwrap();
+        execute(false, Some(temp_dir.path()), &ctx).unwrap();
 
         let metadata_path = temp_dir.path().join(".beads/metadata.json");
         let content = fs::read_to_string(metadata_path).unwrap();
@@ -410,7 +366,7 @@ mod tests {
         info!("test_gitignore_excludes_db_files: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        execute(None, false, Some(temp_dir.path()), &ctx).unwrap();
+        execute(false, Some(temp_dir.path()), &ctx).unwrap();
 
         let gitignore_path = temp_dir.path().join(".beads/.gitignore");
         let content = fs::read_to_string(gitignore_path).unwrap();

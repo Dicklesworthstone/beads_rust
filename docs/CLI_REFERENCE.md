@@ -87,16 +87,16 @@ br init [OPTIONS]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--prefix <PREFIX>` | Issue ID prefix (e.g., "bd", "proj") |
 | `--force` | Overwrite existing database |
+
+`init` no longer accepts `--prefix`. Issue prefixes are always explicit at
+creation time (`br create --prefix`, `br q --prefix`) — there is no
+project-wide default prefix.
 
 **Examples:**
 ```bash
-# Initialize with default prefix
+# Initialize a workspace
 br init
-
-# Initialize with custom prefix
-br init --prefix myproj
 
 # Force reinitialize
 br init --force
@@ -118,6 +118,7 @@ br create [OPTIONS] [TITLE]
 **Options:**
 | Option | Description |
 |--------|-------------|
+| `--prefix <PREFIX>` | **Required.** Issue ID prefix for the new bead (e.g. `demo`). No default — there is no config file, DB row, or `BD_ISSUE_PREFIX` env var fallback. |
 | `-t, --type <TYPE>` | Issue type (task, bug, feature, epic, chore, docs, question) |
 | `-p, --priority <PRIORITY>` | Priority (0-4 or P0-P4, where 0=critical) |
 | `-d, --description <TEXT>` | Issue description |
@@ -138,19 +139,19 @@ br create [OPTIONS] [TITLE]
 **Examples:**
 ```bash
 # Simple task
-br create "Fix login bug"
+br create "Fix login bug" --prefix myproj
 
 # High-priority bug with details
-br create "Critical security issue" -t bug -p 0 -d "XSS vulnerability in form input"
+br create "Critical security issue" --prefix myproj -t bug -p 0 -d "XSS vulnerability in form input"
 
 # Feature with assignee and labels
-br create "Add dark mode" -t feature -a alice -l "ui,enhancement"
+br create "Add dark mode" --prefix myproj -t feature -a alice -l "ui,enhancement"
 
 # Task with due date
-br create "Deploy to production" --due "+3d"
+br create "Deploy to production" --prefix myproj --due "+3d"
 
 # Bulk import from markdown
-br create -f issues.md
+br create -f issues.md --prefix myproj
 ```
 
 ---
@@ -160,15 +161,16 @@ br create -f issues.md
 Quick capture - create issue and print only the ID.
 
 ```bash
-br q [OPTIONS] <TITLE>
+br q [OPTIONS] --prefix <PREFIX> <TITLE>
 ```
 
 Same options as `create`, but outputs only the issue ID for scripting.
+`--prefix` is required here too — there is no default.
 
 **Example:**
 ```bash
 # Capture and immediately assign
-ISSUE=$(br q "Quick fix needed")
+ISSUE=$(br q "Quick fix needed" --prefix myproj)
 br update $ISSUE --assignee me
 ```
 
