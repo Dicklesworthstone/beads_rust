@@ -1,7 +1,7 @@
 //! Undocumented `bd working` / `bd idle` commands for lifecycle-hook
 //! presence tracking. See beads1-2leux for the design.
 //!
-//! Both no-op silently when `BD_ISSUE_PREFIX` isn't set, so hook configs
+//! Both no-op silently when `BD_AGENT_ID` isn't set, so hook configs
 //! that fire `bd working &` from any shell are safe.
 
 use crate::config;
@@ -15,7 +15,7 @@ use chrono::Utc;
 /// # Errors
 ///
 /// Returns an error only if storage open / write fails; missing
-/// `BD_ISSUE_PREFIX` is a silent success.
+/// `BD_AGENT_ID` is a silent success.
 pub fn execute_working(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     set_state(PresenceState::Working, cli)
 }
@@ -25,17 +25,13 @@ pub fn execute_working(cli: &config::CliOverrides, _ctx: &OutputContext) -> Resu
 /// # Errors
 ///
 /// Returns an error only if storage open / write fails; missing
-/// `BD_ISSUE_PREFIX` is a silent success.
+/// `BD_AGENT_ID` is a silent success.
 pub fn execute_idle(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
     set_state(PresenceState::Idle, cli)
 }
 
 fn set_state(state: PresenceState, cli: &config::CliOverrides) -> Result<()> {
-    let Some(prefix) = std::env::var("BD_ISSUE_PREFIX")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(prefix) = config::resolve_agent_identity().ok() else {
         return Ok(());
     };
 
