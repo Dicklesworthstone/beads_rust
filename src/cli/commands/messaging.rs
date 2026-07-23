@@ -3,7 +3,7 @@
 //! Messages are NOT issues. They round-trip locally only, expire after
 //! a TTL once read, and never enter the issue work-list.
 //!
-//! Sender identity comes strictly from `BD_ISSUE_PREFIX`. Project
+//! Sender identity comes strictly from `BD_AGENT_ID`. Project
 //! config / default-`"bd"` fallbacks are deliberately *not* honored
 //! here — a prefix-less environment used to silently send as `"bd"`,
 //! which made operator messages appear to come from a phantom agent.
@@ -59,7 +59,7 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         return Err(BeadsError::validation("to", "recipient prefix is required"));
     }
 
-    let from = resolve_msg_sender()?;
+    let from = config::resolve_agent_identity()?;
 
     let body = resolve_body(&args.body)?;
     if body.trim().is_empty() {
@@ -93,39 +93,6 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
         now,
         ctx,
     )
-}
-
-/// Strict sender resolution: `BD_ISSUE_PREFIX` only, no fallback. The
-/// `operator` value is rejected here too — operator's send path is
-/// `bd admin msg`, not bare `bd msg`. Reasoning: prefix-less envs
-/// (the operator's normal shell) used to send as `"bd"`, which made
-/// `from=bd` messages appear in agent inboxes attributed to a phantom
-/// agent. Failing loud forces the right command instead.
-fn resolve_msg_sender() -> Result<String> {
-    resolve_msg_sender_from(std::env::var("BD_ISSUE_PREFIX").ok().as_deref())
-}
-
-fn resolve_msg_sender_from(env_prefix: Option<&str>) -> Result<String> {
-    let trimmed = env_prefix.unwrap_or_default().trim();
-    if trimmed.is_empty() {
-        return Err(BeadsError::validation(
-            "from",
-            "BD_ISSUE_PREFIX is not set. `bd msg` needs to know who you \
-             are. If you're the human operator, use `bd admin msg` \
-             instead — it identifies you as 'operator' regardless of \
-             environment. If you're an agent, set BD_ISSUE_PREFIX to \
-             your assigned prefix.",
-        ));
-    }
-    if trimmed.eq_ignore_ascii_case(OPERATOR_PREFIX) {
-        return Err(BeadsError::validation(
-            "from",
-            "BD_ISSUE_PREFIX=operator is reserved for the human operator; \
-             agents cannot adopt it. If you're the operator, use \
-             `bd admin msg` instead of `bd msg`.",
-        ));
-    }
-    Ok(trimmed.to_string())
 }
 
 struct SendParams<'a> {
@@ -204,7 +171,7 @@ fn send_message(
 }
 
 /// `bd admin msg <to> <body>` — operator's send path. Identifies the
-/// sender as `operator` regardless of `BD_ISSUE_PREFIX`. The typo
+/// sender as `operator` regardless of `BD_AGENT_ID`. The typo
 /// guard is dropped: the operator may legitimately want to drop a
 /// message for an agent that isn't watching yet (will be picked up
 /// next time they boot `bd watch`).
@@ -263,7 +230,7 @@ pub fn execute_admin_msg(
 }
 
 /// List received messages, or show one in full. The viewer's identity
-/// comes from `BD_ISSUE_PREFIX` (strict — see [`resolve_msg_sender`]).
+/// comes from `BD_AGENT_ID` (strict — see [`config::resolve_agent_identity`]).
 ///
 /// # Errors
 ///
@@ -273,7 +240,7 @@ pub fn execute_inbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let me = resolve_msg_sender()?;
+    let me = config::resolve_agent_identity()?;
     execute_inbox_as(&me, args, cli, ctx)
 }
 
@@ -367,7 +334,7 @@ pub fn execute_outbox(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let me = resolve_msg_sender()?;
+    let me = config::resolve_agent_identity()?;
     execute_outbox_as(&me, args, cli, ctx)
 }
 
@@ -556,41 +523,6 @@ mod tests {
     fn resolve_body_joins_words() {
         let words = vec!["hello".to_string(), "world".to_string()];
         assert_eq!(resolve_body(&words).unwrap(), "hello world");
-    }
-
-    #[test]
-    fn resolve_msg_sender_rejects_missing_env() {
-        let err = resolve_msg_sender_from(None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("BD_ISSUE_PREFIX"), "got: {msg}");
-        assert!(msg.contains("bd admin msg"), "got: {msg}");
-    }
-
-    #[test]
-    fn resolve_msg_sender_rejects_empty_env() {
-        assert!(resolve_msg_sender_from(Some("")).is_err());
-        assert!(resolve_msg_sender_from(Some("   ")).is_err());
-    }
-
-    #[test]
-    fn resolve_msg_sender_rejects_operator() {
-        let err = resolve_msg_sender_from(Some("operator")).unwrap_err();
-        assert!(err.to_string().contains("reserved"));
-        // Case-insensitive.
-        assert!(resolve_msg_sender_from(Some("OPERATOR")).is_err());
-        assert!(resolve_msg_sender_from(Some("Operator")).is_err());
-    }
-
-    #[test]
-    fn resolve_msg_sender_trims_and_returns() {
-        assert_eq!(
-            resolve_msg_sender_from(Some(" arc3 ")).unwrap(),
-            "arc3".to_string()
-        );
-        assert_eq!(
-            resolve_msg_sender_from(Some("beads1")).unwrap(),
-            "beads1".to_string()
-        );
     }
 
     #[test]

@@ -850,12 +850,6 @@ fn emit_message_event<W: Write>(
     Ok(())
 }
 
-/// Strict prefix resolution for `bd watch`.
-///
-/// Unlike the rest of the CLI, watch refuses to fall back to project / user
-/// config or the default "bd". Reasoning: when an agent boots and starts a
-/// watch, the harness is *supposed* to set BD_ISSUE_PREFIX. Silently watching
-/// the wrong prefix would mean missing notifications addressed to the agent.
 /// Best-effort discovery of the canonical git remote URL for the
 /// directory `cwd`. Runs `git -C <cwd> remote get-url origin` and
 /// passes the result through the shared `canonicalize_repo_url`
@@ -880,6 +874,14 @@ fn discover_git_remote(cwd: &str) -> String {
     crate::util::git::canonicalize_repo_url(raw.trim())
 }
 
+/// Strict prefix resolution for `bd watch`.
+///
+/// Unlike the rest of the CLI, watch refuses to fall back to project / user
+/// config or the default "bd". Reasoning: when an agent boots and starts a
+/// watch, the harness is *supposed* to set BD_AGENT_ID. Silently watching
+/// the wrong prefix would mean missing notifications addressed to the agent.
+/// Resolution order: `--prefix` flag first, then `BD_AGENT_ID` via
+/// [`config::resolve_agent_identity`].
 fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrides) -> Result<String> {
     let candidate = if let Some(p) = args
         .prefix
@@ -888,24 +890,20 @@ fn resolve_prefix(args: &WatchArgs, _beads_dir: &Path, _cli: &config::CliOverrid
         .filter(|s| !s.is_empty())
     {
         p.to_string()
-    } else if let Ok(env_prefix) = std::env::var("BD_ISSUE_PREFIX") {
-        let trimmed = env_prefix.trim();
-        if trimmed.is_empty() {
-            return Err(BeadsError::validation(
-                "prefix",
-                "BD_ISSUE_PREFIX is not set and --prefix was not supplied. \
-                 Set BD_ISSUE_PREFIX in the agent environment so watch knows \
-                 which inbox to monitor.",
-            ));
-        }
-        trimmed.to_string()
     } else {
-        return Err(BeadsError::validation(
-            "prefix",
-            "BD_ISSUE_PREFIX is not set and --prefix was not supplied. \
-             Set BD_ISSUE_PREFIX in the agent environment so watch knows \
-             which inbox to monitor.",
-        ));
+        config::resolve_agent_identity().map_err(|e| {
+            let reason = match &e {
+                BeadsError::Validation { reason, .. } => reason.clone(),
+                other => other.to_string(),
+            };
+            BeadsError::validation(
+                "prefix",
+                format!(
+                    "{reason} (bd watch also accepts an explicit --prefix flag \
+                     instead of BD_AGENT_ID.)"
+                ),
+            )
+        })?
     };
 
     if candidate.eq_ignore_ascii_case(config::OPERATOR_PREFIX) {

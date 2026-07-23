@@ -995,7 +995,7 @@ pub enum AdminCommands {
     },
 
     /// Send a message *as* the operator. Identifies sender as
-    /// `operator` regardless of `BD_ISSUE_PREFIX`. Used by the human
+    /// `operator` regardless of `BD_AGENT_ID`. Used by the human
     /// operator to talk to agents; agents must keep using `bd msg`.
     Msg(MsgArgs),
 
@@ -1194,8 +1194,8 @@ pub struct OutboxArgs {
 /// Arguments for the `watch` command.
 #[derive(Args, Debug, Default)]
 pub struct WatchArgs {
-    /// Issue ID prefix to watch. Defaults to the resolved issue prefix
-    /// (BD_ISSUE_PREFIX env, project config, or "bd").
+    /// Issue ID prefix to watch. Defaults to the resolved agent identity
+    /// (BD_AGENT_ID env var).
     #[arg(long)]
     pub prefix: Option<String>,
 
@@ -1683,22 +1683,15 @@ pub struct ListArgs {
     #[arg(long)]
     pub notes_contains: Option<String>,
 
-    /// Include closed issues *and* widen to every prefix (default
-    /// excludes closed and scopes to `BD_ISSUE_PREFIX` when set).
-    /// Implies `--all-prefixes`.
+    /// Include closed issues (default excludes closed).
     #[arg(long, short = 'a')]
     pub all: bool,
 
-    /// Limit to a specific issue ID prefix. Defaults to
-    /// `BD_ISSUE_PREFIX` when set, so an agent sees only its own
-    /// beads. Only honored by `bd list`.
-    #[arg(long, conflicts_with = "all_prefixes")]
+    /// Limit output to a specific issue ID prefix. Default output
+    /// includes every prefix; this is purely an explicit filter (no
+    /// identity-based scoping).
+    #[arg(long)]
     pub prefix: Option<String>,
-
-    /// Show beads across every prefix, ignoring `BD_ISSUE_PREFIX`.
-    /// Only honored by `bd list`.
-    #[arg(long, conflicts_with = "prefix")]
-    pub all_prefixes: bool,
 
     /// Maximum number of results (0 = unlimited, default: 50)
     #[arg(long)]

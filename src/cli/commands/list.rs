@@ -16,32 +16,19 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 
-/// Resolve the prefix-scope for `bd list`:
-///   1. `--all` or `--all-prefixes` → no scoping
-///   2. `--prefix=X`              → scope to X
-///   3. `BD_ISSUE_PREFIX` env set → scope to it (the agent default,
-///      so an agent's JSON output doesn't include every other prefix's
-///      bead bodies)
-///   4. otherwise no scoping
+/// Resolve the prefix-scope for `bd list`.
+///
+/// There is no identity-based default scoping: agent IDs need not
+/// correspond to issue prefixes, so silently narrowing `bd list`
+/// output by the caller's identity would be confusing rather than
+/// helpful. Default output includes every prefix; `--prefix` remains
+/// available as an explicit filter.
 fn resolve_list_prefix(args: &ListArgs) -> Option<String> {
-    resolve_list_prefix_with(args, std::env::var("BD_ISSUE_PREFIX").ok().as_deref())
-}
-
-fn resolve_list_prefix_with(args: &ListArgs, env_prefix: Option<&str>) -> Option<String> {
-    if args.all || args.all_prefixes {
-        return None;
-    }
-    if let Some(p) = args
-        .prefix
+    args.prefix
         .as_ref()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-    {
-        return Some(p.to_string());
-    }
-    env_prefix
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Execute the list command.
@@ -93,10 +80,9 @@ pub fn execute(
         issues
     };
 
-    // Scope to the agent's own prefix by default (BD_ISSUE_PREFIX). An
-    // explicit --prefix overrides; --all / --all-prefixes drop scoping.
-    // This keeps `bd list --format=json` from dumping every other
-    // agent's bead descriptions into a calling agent's context.
+    // Explicit --prefix filter only. No identity-based default scoping
+    // (see resolve_list_prefix doc comment) — default output shows every
+    // prefix.
     if let Some(target) = resolve_list_prefix(args) {
         issues.retain(|issue| {
             split_prefix_remainder(&issue.id)
@@ -468,16 +454,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_list_prefix_uses_env_by_default() {
+    fn test_resolve_list_prefix_defaults_to_none() {
         init_logging();
-        info!("test_resolve_list_prefix_uses_env_by_default: starting");
+        info!("test_resolve_list_prefix_defaults_to_none: starting");
         let args = ListArgs::default();
-        assert_eq!(
-            resolve_list_prefix_with(&args, Some("demo1")),
-            Some("demo1".to_string())
-        );
-        assert_eq!(resolve_list_prefix_with(&args, None), None);
-        assert_eq!(resolve_list_prefix_with(&args, Some("  ")), None);
+        assert_eq!(resolve_list_prefix(&args), None);
+        info!("test_resolve_list_prefix_defaults_to_none: assertions passed");
     }
 
     #[test]
@@ -487,25 +469,17 @@ mod tests {
             prefix: Some("other1".to_string()),
             ..Default::default()
         };
-        assert_eq!(
-            resolve_list_prefix_with(&args, Some("demo1")),
-            Some("other1".to_string())
-        );
+        assert_eq!(resolve_list_prefix(&args), Some("other1".to_string()));
     }
 
     #[test]
-    fn test_resolve_list_prefix_all_drops_scope() {
+    fn test_resolve_list_prefix_trims_whitespace() {
         init_logging();
         let args = cli::ListArgs {
-            all: true,
+            prefix: Some("  ".to_string()),
             ..Default::default()
         };
-        assert_eq!(resolve_list_prefix_with(&args, Some("demo1")), None);
-        let args = cli::ListArgs {
-            all_prefixes: true,
-            ..Default::default()
-        };
-        assert_eq!(resolve_list_prefix_with(&args, Some("demo1")), None);
+        assert_eq!(resolve_list_prefix(&args), None);
     }
 
     #[test]
