@@ -312,6 +312,11 @@ const READY_PROJECTION_CONTENT_MISMATCH_FINDING: &str =
 const JSONL_REBUILD_AUTHORITY_ERROR_PREFIX: &str = "Cannot repair: JSONL authority is unsafe";
 const JSONL_REBUILD_REPEAT_ERROR_PREFIX: &str =
     "Cannot repair: previous JSONL rebuild verification failed";
+/// Emitted when `--dry-run` declines the rebuild. Nothing failed and neither
+/// store is implicated, so it is surfaced verbatim rather than being wrapped in
+/// a repair-failure message (`beads_rust-krdi`).
+const JSONL_REBUILD_DRY_RUN_SKIP_MESSAGE: &str =
+    "doctor --repair --dry-run skipped JSONL rebuild; no database writes were applied";
 const JSONL_REBUILD_VERIFICATION_FAILED_SUFFIX: &str = ".verification-failed.json";
 const ROOT_GITIGNORE_OFFENDING_PATTERNS: &[&str] = &[
     ".beads",
@@ -1103,7 +1108,16 @@ fn append_doctor_check_anomalies(check: &CheckResult, anomalies: &mut Vec<Anomal
         "sync.metadata" => {
             append_sync_metadata_anomalies(check, anomalies);
         }
-        "db.recovery_artifacts" if matches!(check.status, CheckStatus::Warn) => {
+        // `beads_rust-a53h`: the *aged* check is what identifies stale
+        // artifacts. Its sibling `db.recovery_artifacts` is information-only
+        // and lists every preserved backup regardless of age (see
+        // `check_recovery_artifacts_aged`'s doc comment), so driving the
+        // anomaly from it reported a backup written seconds earlier by the
+        // running repair as "stale recovery artifacts present" — dragging
+        // `workspace_health` to `degraded` and citing, as evidence of an
+        // unhealthy workspace, the forensic copies the repair had just made
+        // and already enumerated in `recovery_audit.verified_backups`.
+        "db.recovery_artifacts.aged" if matches!(check.status, CheckStatus::Warn) => {
             push_anomaly(anomalies, AnomalyClass::StaleRecoveryArtifacts);
         }
         "db.sidecars" if matches!(check.status, CheckStatus::Error) => {
@@ -1455,6 +1469,38 @@ fn repair_report_verified(report: &DoctorReport) -> bool {
     report.ok && !has_non_ok(&report.checks)
 }
 
+/// True when a `sync.metadata` WARN describes *only* the pending-export
+/// direction — the database is ahead of the JSONL, and nothing is waiting to be
+/// imported.
+///
+/// This is the benign half of the drift axis: the DB is a superset of the
+/// export, no data is at risk, and `sync --flush-only` (which the check's own
+/// message recommends) resolves it. The pending-*import* directions
+/// (`External changes pending import`, `Database and JSONL have diverged`) are
+/// deliberately excluded — after a rebuild *from* JSONL, a JSONL that still
+/// reads newer than the database means the rebuild did not land what it read.
+///
+/// Reads the structured `pending_export`/`pending_import` details rather than
+/// matching on message text. `check_sync_metadata` always populates both; if
+/// either is absent this returns false, so a hand-built or future report shape
+/// fails closed rather than silently verifying.
+fn is_pending_export_only_sync_metadata(check: &CheckResult) -> bool {
+    if check.name != "sync.metadata" || !matches!(check.status, CheckStatus::Warn) {
+        return false;
+    }
+    let detail_flag = |key: &str| {
+        check
+            .details
+            .as_ref()
+            .and_then(|details| details.get(key))
+            .and_then(serde_json::Value::as_bool)
+    };
+    match (detail_flag("pending_export"), detail_flag("pending_import")) {
+        (Some(pending_export), Some(pending_import)) => pending_export && !pending_import,
+        _ => false,
+    }
+}
+
 /// Findings that are EXPECTED to remain after a *successful* JSONL rebuild and
 /// therefore must not, on their own, fail post-repair verification (issue #375).
 ///
@@ -1467,13 +1513,31 @@ fn repair_report_verified(report: &DoctorReport) -> bool {
 ///   backups past the TTL.
 /// - `rust_log` (WARN): a nag about the *caller's* `RUST_LOG` environment,
 ///   unrelated to database health.
+/// - `sync.metadata` (WARN), pending-export direction only (`beads_rust-a53h`):
+///   the rebuild reconstructs the database from JSONL and then restores any
+///   unflushed tombstones that the JSONL does not carry, so the fresh database
+///   is legitimately ahead of the export with no `last_export_time` recorded.
+///   That is the repair working as designed — preserving local state it was
+///   asked not to lose — and it resolves with `sync --flush-only`. Treating it
+///   as a verification failure made `doctor --repair` exit 7 after succeeding,
+///   so no "repair until healthy" loop could ever converge, and every pass
+///   wrote three more backups plus a `.verification-failed.json` marker.
 ///
 /// Anything ERROR-level (corrupt rebuilt DB, schema/integrity/count failures)
 /// still flips `report.ok` to false and fails verification, so this only
 /// relaxes the "must be pristine" constraint for these known-benign warnings.
+/// Record loss specifically remains covered elsewhere: `counts.db_vs_jsonl`
+/// reports divergence, and `verify_rebuilt_database_postconditions` fails the
+/// rebuild outright on a count mismatch or orphaned reference.
 fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
-    matches!(check.status, CheckStatus::Warn)
-        && matches!(check.name.as_str(), "db.recovery_artifacts" | "rust_log")
+    if !matches!(check.status, CheckStatus::Warn) {
+        return false;
+    }
+    match check.name.as_str() {
+        "db.recovery_artifacts" | "rust_log" => true,
+        "sync.metadata" => is_pending_export_only_sync_metadata(check),
+        _ => false,
+    }
 }
 
 /// Post-repair verification for the JSONL-rebuild path.
@@ -2245,8 +2309,7 @@ fn repair_database_from_jsonl(
         )? {
             Some(result) => Ok(result),
             None => Err(BeadsError::Config(
-                "doctor --repair --dry-run skipped JSONL rebuild; no database writes were applied"
-                    .to_string(),
+                JSONL_REBUILD_DRY_RUN_SKIP_MESSAGE.to_string(),
             )),
         };
     }
@@ -2403,12 +2466,105 @@ fn preflight_jsonl_rebuild_authority(jsonl_path: &Path) -> Result<()> {
 }
 
 fn jsonl_rebuild_failure_outcome(err: &BeadsError) -> &'static str {
-    if let BeadsError::Config(message) = err
-        && message.starts_with(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX)
-    {
-        return "refused";
+    if let BeadsError::Config(message) = err {
+        if message.starts_with(JSONL_REBUILD_AUTHORITY_ERROR_PREFIX) {
+            return "refused";
+        }
+        if message == JSONL_REBUILD_DRY_RUN_SKIP_MESSAGE {
+            return "skipped";
+        }
     }
     "failed"
+}
+
+/// Errors that already carry their own accurate, actionable message and must be
+/// surfaced verbatim rather than wrapped in a repair-failure message: the
+/// preflight authority refusal and the `--dry-run` skip.
+fn jsonl_rebuild_error_is_self_describing(outcome: &str) -> bool {
+    matches!(outcome, "refused" | "skipped")
+}
+
+/// Peel `WithContext` wrappers so classification sees the originating error
+/// rather than the annotation layered over it.
+fn jsonl_rebuild_root_error(err: &BeadsError) -> &BeadsError {
+    match err {
+        BeadsError::WithContext { source, .. } => source
+            .downcast_ref::<BeadsError>()
+            .map_or(err, jsonl_rebuild_root_error),
+        _ => err,
+    }
+}
+
+/// True when a rebuild failed because the database family could not be opened
+/// or locked — not because anything is wrong with the JSONL.
+///
+/// The engine surfaces this as `unable to open database file`
+/// ([`FrankenError::CannotOpen`]) when a second `br` process, an editor plugin,
+/// or an MCP `br serve` session already holds the workspace. Matching on the
+/// variants rather than on message text keeps this stable across engine
+/// wording changes.
+fn is_database_unavailable_failure(err: &BeadsError) -> bool {
+    match jsonl_rebuild_root_error(err) {
+        BeadsError::DatabaseLocked { .. } => true,
+        BeadsError::Database(inner) => matches!(
+            inner,
+            FrankenError::CannotOpen { .. }
+                | FrankenError::DatabaseLocked { .. }
+                | FrankenError::LockFailed { .. }
+                | FrankenError::Busy
+        ),
+        _ => false,
+    }
+}
+
+/// True when the import rejected the JSONL's *contents*, so pointing the
+/// operator at the export is genuinely the right advice.
+fn is_jsonl_content_failure(err: &BeadsError) -> bool {
+    matches!(
+        jsonl_rebuild_root_error(err),
+        BeadsError::JsonlParse { .. }
+            | BeadsError::PrefixMismatch { .. }
+            | BeadsError::ImportCollision { .. }
+    )
+}
+
+/// Build the operator-facing message for a failed JSONL rebuild.
+///
+/// `beads_rust-krdi`: this was a single residual bucket that appended "The
+/// JSONL file may be corrupt. Try manually editing the JSONL to fix invalid
+/// records." to every error that was not an authority refusal — and that
+/// bucket is structurally the set of failures which are *not* JSONL
+/// corruption, because real corruption is caught earlier by
+/// [`preflight_jsonl_rebuild_authority`] and refused with its own message.
+/// The advice was therefore wrong for most of them, and actively harmful for
+/// the common one: a locked database sent the operator off to hand-edit a
+/// perfectly healthy export, and an agent parsing the message would conclude
+/// the export was corrupt.
+///
+/// Each branch now names the remedy that actually applies, and the residual
+/// case reports the failure without attributing a cause to either store.
+fn jsonl_rebuild_failure_message(err: &BeadsError) -> String {
+    if is_database_unavailable_failure(err) {
+        return format!(
+            "Repair import failed: {err}. \
+             The database could not be opened for writing — the JSONL is not implicated. \
+             Another process most likely holds this workspace: close other `br` \
+             invocations and any MCP `br serve` session, check `.beads/.write.lock`, \
+             then retry."
+        );
+    }
+    if is_jsonl_content_failure(err) {
+        return format!(
+            "Repair import failed: {err}. \
+             The import rejected records in the JSONL. \
+             Fix the offending records in `.beads/issues.jsonl`, then retry."
+        );
+    }
+    format!(
+        "Repair import failed: {err}. \
+         No database writes were applied; the workspace is unchanged. \
+         Re-run `br doctor --json` to inspect the current state."
+    )
 }
 
 fn write_jsonl_rebuild_verification_failed_marker(
@@ -3554,6 +3710,17 @@ fn fix_db_bloat_via_vacuum_if_warned(
             true
         }
         Err(err) => {
+            // `beads_rust-ymik`: log unconditionally. `ctx.warning` is
+            // suppressed in JSON mode, so a VACUUM the operator explicitly
+            // opted into with `--unsafe-auto-fix` could fail and leave no
+            // trace anywhere in the payload — after which the repair reports
+            // "No errors detected; nothing to repair." for a finding it had
+            // just been pointed at by name.
+            tracing::warn!(
+                error = %err,
+                db_path = %db_path.display(),
+                "db-bloat VACUUM failed; database left uncompacted"
+            );
             if !ctx.is_json() {
                 ctx.warning(&format!("Failed to VACUUM database: {err}"));
             }
@@ -11885,14 +12052,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 Some(err.to_string()),
             ));
             emit_recovery_audit_record(&recovery_audit);
-            if outcome == "refused" {
+            if jsonl_rebuild_error_is_self_describing(outcome) {
                 return Err(err);
             }
-            return Err(BeadsError::Config(format!(
-                "Repair import failed: {err}. \
-             The JSONL file may be corrupt. \
-             Try manually editing the JSONL to fix invalid records."
-            )));
+            return Err(BeadsError::Config(jsonl_rebuild_failure_message(&err)));
         }
     };
 
@@ -18873,6 +19036,124 @@ mod tests {
     }
 
     #[test]
+    fn locked_database_failure_does_not_blame_the_jsonl() {
+        // beads_rust-krdi: when another process holds the workspace the engine
+        // reports "unable to open database file". The old residual bucket told
+        // the operator the export was corrupt and to hand-edit it — advice that
+        // is both wrong and destructive to a healthy file.
+        let err = BeadsError::Database(FrankenError::CannotOpen {
+            path: PathBuf::from("/tmp/ws/.beads/beads.db"),
+        });
+        assert_eq!(
+            err.to_string(),
+            "Database error: unable to open database file: '/tmp/ws/.beads/beads.db'",
+            "the engine wording this classifier exists for"
+        );
+        assert!(is_database_unavailable_failure(&err));
+        assert!(!is_jsonl_content_failure(&err));
+
+        // The other ways the workspace can be held are classified the same way.
+        for held in [
+            BeadsError::Database(FrankenError::DatabaseLocked {
+                path: PathBuf::from("/tmp/ws/.beads/beads.db"),
+            }),
+            BeadsError::Database(FrankenError::LockFailed {
+                detail: "F_SETLK contention beyond busy_timeout".to_string(),
+            }),
+            BeadsError::Database(FrankenError::Busy),
+        ] {
+            assert!(
+                is_database_unavailable_failure(&held),
+                "should classify as unavailable: {held}"
+            );
+        }
+
+        let message = jsonl_rebuild_failure_message(&err);
+        assert!(
+            message.contains("the JSONL is not implicated"),
+            "message must clear the export: {message}"
+        );
+        assert!(
+            message.contains(".beads/.write.lock") && message.contains("br serve"),
+            "message must name the real remedy: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("jsonl file may be corrupt")
+                && !message.contains("manually editing"),
+            "message must not advise editing a healthy JSONL: {message}"
+        );
+    }
+
+    #[test]
+    fn jsonl_content_failure_still_points_at_the_export() {
+        // The one class where blaming the JSONL is correct keeps doing so.
+        let err = BeadsError::JsonlParse {
+            line: 12,
+            reason: "missing field `title`".to_string(),
+        };
+        assert!(is_jsonl_content_failure(&err));
+        assert!(!is_database_unavailable_failure(&err));
+
+        let message = jsonl_rebuild_failure_message(&err);
+        assert!(
+            message.contains(".beads/issues.jsonl") && message.contains("rejected records"),
+            "message should direct the operator at the export: {message}"
+        );
+    }
+
+    #[test]
+    fn unclassified_failure_attributes_no_cause() {
+        // The residual case must describe what happened without inventing a
+        // culprit, and must state that nothing was written.
+        let err = BeadsError::Config("run directory is not writable".to_string());
+        assert!(!is_database_unavailable_failure(&err));
+        assert!(!is_jsonl_content_failure(&err));
+
+        let message = jsonl_rebuild_failure_message(&err);
+        assert!(
+            message.contains("No database writes were applied"),
+            "message should state the workspace is unchanged: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("corrupt"),
+            "residual failures must not assert corruption: {message}"
+        );
+    }
+
+    #[test]
+    fn database_unavailable_classification_sees_through_context_wrappers() {
+        let wrapped = BeadsError::WithContext {
+            context: "rebuilding database family".to_string(),
+            source: Box::new(BeadsError::DatabaseLocked {
+                path: PathBuf::from("/tmp/ws/.beads/beads.db"),
+            }),
+        };
+        assert!(is_database_unavailable_failure(&wrapped));
+    }
+
+    #[test]
+    fn dry_run_skip_is_reported_as_skipped_not_as_a_failure() {
+        // beads_rust-krdi: `--repair --dry-run` declined to write. Nothing
+        // failed, so it must not be wrapped in a repair-failure message.
+        let err = BeadsError::Config(JSONL_REBUILD_DRY_RUN_SKIP_MESSAGE.to_string());
+        let outcome = jsonl_rebuild_failure_outcome(&err);
+        assert_eq!(outcome, "skipped");
+        assert!(jsonl_rebuild_error_is_self_describing(outcome));
+
+        // The authority refusal keeps its own verbatim treatment...
+        let refused = BeadsError::Config(format!(
+            "{JSONL_REBUILD_AUTHORITY_ERROR_PREFIX}: found 1 merge conflict marker(s)"
+        ));
+        assert!(jsonl_rebuild_error_is_self_describing(
+            jsonl_rebuild_failure_outcome(&refused)
+        ));
+        // ...while a genuine failure is still wrapped.
+        assert!(!jsonl_rebuild_error_is_self_describing(
+            jsonl_rebuild_failure_outcome(&BeadsError::Config("disk full".to_string()))
+        ));
+    }
+
+    #[test]
     fn test_repair_database_from_jsonl_restores_issue_prefix_from_jsonl() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -19481,6 +19762,122 @@ mod tests {
             }],
         };
         assert!(!jsonl_rebuild_repair_verified(&sidecar_error_report));
+    }
+
+    /// Build a `sync.metadata` WARN carrying the drift flags `check_sync_metadata`
+    /// emits, so the verification predicate is exercised against the real detail
+    /// shape rather than a hand-waved one.
+    fn sync_metadata_warn(pending_import: bool, pending_export: bool) -> CheckResult {
+        CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("Local changes exist but no export is recorded".to_string()),
+            details: Some(serde_json::json!({
+                "pending_import": pending_import,
+                "pending_export": pending_export,
+                "jsonl_newer": pending_import,
+                "db_newer": pending_export,
+                "dirty_issues": 1,
+            })),
+        }
+    }
+
+    fn report_with(checks: Vec<CheckResult>) -> DoctorReport {
+        DoctorReport {
+            ok: true,
+            workspace_health: None,
+            reliability_audit: None,
+            checks,
+        }
+    }
+
+    #[test]
+    fn jsonl_rebuild_verification_tolerates_pending_export_after_rebuild() {
+        // beads_rust-a53h: a rebuild restores unflushed tombstones that the
+        // JSONL does not carry, so the fresh database is legitimately ahead of
+        // the export with no last_export_time recorded. That is the repair
+        // preserving local state, not a defect, and it must not make a
+        // successful repair exit 7.
+        let report = report_with(vec![sync_metadata_warn(false, true)]);
+        assert!(jsonl_rebuild_repair_verified(&report));
+        // The strict verifier used by the light-repair path is unchanged.
+        assert!(!repair_report_verified(&report));
+    }
+
+    #[test]
+    fn jsonl_rebuild_verification_rejects_pending_import_after_rebuild() {
+        // The other drift direction stays fatal: we just rebuilt the database
+        // *from* the JSONL, so a JSONL that still reads newer means the rebuild
+        // did not land what it read.
+        assert!(!jsonl_rebuild_repair_verified(&report_with(vec![
+            sync_metadata_warn(true, false)
+        ])));
+        // Divergence (both directions) is likewise not benign.
+        assert!(!jsonl_rebuild_repair_verified(&report_with(vec![
+            sync_metadata_warn(true, true)
+        ])));
+    }
+
+    #[test]
+    fn sync_metadata_benignity_fails_closed_without_drift_details() {
+        // Missing details must not be read as "pending export only".
+        let no_details = CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("Local changes pending export".to_string()),
+            details: None,
+        };
+        assert!(!is_pending_export_only_sync_metadata(&no_details));
+        assert!(!jsonl_rebuild_repair_verified(&report_with(vec![
+            no_details
+        ])));
+
+        // So must details that carry only one half of the pair.
+        let half_details = CheckResult {
+            name: "sync.metadata".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("Local changes pending export".to_string()),
+            details: Some(serde_json::json!({ "pending_export": true })),
+        };
+        assert!(!is_pending_export_only_sync_metadata(&half_details));
+    }
+
+    #[test]
+    fn fresh_recovery_backups_are_not_classified_as_stale() {
+        // beads_rust-a53h: `db.recovery_artifacts` is information-only and
+        // lists every preserved backup regardless of age, including the one the
+        // running repair just wrote. Only the TTL-based `.aged` sibling may
+        // claim artifacts are stale.
+        let mut anomalies = Vec::new();
+        append_doctor_check_anomalies(
+            &CheckResult {
+                name: "db.recovery_artifacts".to_string(),
+                status: CheckStatus::Warn,
+                message: Some(
+                    "Preserved recovery artifacts remain for this database family (3 item(s))"
+                        .to_string(),
+                ),
+                details: None,
+            },
+            &mut anomalies,
+        );
+        assert!(
+            anomalies.is_empty(),
+            "a fresh preserved backup is the success signal of a repair, not a \
+             workspace anomaly: {anomalies:?}"
+        );
+
+        let mut aged_anomalies = Vec::new();
+        append_doctor_check_anomalies(
+            &CheckResult {
+                name: "db.recovery_artifacts.aged".to_string(),
+                status: CheckStatus::Warn,
+                message: Some("2 recovery artifact(s) older than 30 days".to_string()),
+                details: None,
+            },
+            &mut aged_anomalies,
+        );
+        assert_eq!(aged_anomalies, vec![AnomalyClass::StaleRecoveryArtifacts]);
     }
 
     #[test]

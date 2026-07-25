@@ -22,7 +22,7 @@ OK rust_log: RUST_LOG=error (quiet)
 OK permissions.beads_dir: `.beads/` and critical children are ID-REDACTED
 OK config.yaml: config.yaml parses cleanly (99 bytes)
 OK metadata.json: metadata.json parses cleanly (62 bytes); declared targets exist on disk
-OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable from .beads/ — not flagging
+HOST-DEPENDENT binary_version
 OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale
 OK routes.targets: No local or town routes.jsonl present (route targets are optional)
 OK startup_cache.health
@@ -57,4 +57,4 @@ OK audit.suspect_close_reasons
 OK counts.db_vs_jsonl: Both have 0 records
 OK sync.metadata: External changes pending import (empty JSONL, nothing to import)
 OK db.write_probe: No issues available for ID-REDACTED write probe
-OK sqlite3.integrity_check
+HOST-DEPENDENT sqlite3.integrity_check

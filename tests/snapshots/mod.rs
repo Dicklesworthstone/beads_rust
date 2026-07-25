@@ -104,6 +104,27 @@ static TMP_PID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(\.jsonl|\.db)\.\d+\.tmp").expect("pid tmp file regex"));
 static DURATION_MS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*(ms|µs|ns|s)").expect("duration regex"));
+/// `br doctor` checks whose result is determined by the machine the test runs
+/// on rather than by anything br did (`beads_rust-alur`). Both made the doctor
+/// golden pass on a developer box and fail on an rch remote worker:
+///
+/// - `sqlite3.integrity_check` shells out to the system `sqlite3` binary and
+///   degrades to a WARN when it is absent. Workers have no `sqlite3`.
+/// - `binary_version` reports either "matches (or is ahead of) Cargo.toml at
+///   <path> (<version>)" or "no beads_rust Cargo.toml reachable from .beads/ —
+///   not flagging", depending on whether a `beads_rust` manifest happens to sit
+///   above the temp workspace. rch sets `TMPDIR` *inside* the synced repo, so
+///   the worker takes the first branch and a developer box the second. It also
+///   leaks a bare version number that `VERSION_NUM_RE` does not catch, since
+///   that pattern requires a `version `/`br ` prefix.
+///
+/// Masking the whole result line — rather than skipping the test — keeps the
+/// other ~50 doctor checks under exact comparison everywhere. The check name is
+/// preserved, so the snapshot still fails if a check disappears or is renamed.
+static HOST_DEPENDENT_CHECK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(\s*)(?:OK|WARN|ERROR)\s+(sqlite3\.integrity_check|binary_version)\b.*$")
+        .expect("host-dependent check regex")
+});
 
 /// Configuration for text normalization.
 ///
@@ -141,6 +162,10 @@ pub struct TextNormConfig {
     pub mask_usernames: bool,
     /// Mask version numbers (e.g., "version 0.1.7" → "version X.Y.Z")
     pub mask_version_numbers: bool,
+    /// Mask check results whose status depends on optional tooling being
+    /// installed on the host rather than on anything br did
+    /// (`beads_rust-alur`).
+    pub mask_host_tooling: bool,
 }
 
 impl TextNormConfig {
@@ -164,6 +189,7 @@ impl TextNormConfig {
             mask_durations: false, // Keep durations by default
             mask_usernames: true,
             mask_version_numbers: true,
+            mask_host_tooling: true,
         }
     }
 
@@ -499,6 +525,14 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("version_numbers".to_string());
     }
 
+    // 13b. Mask check results determined by the host rather than by br.
+    if config.mask_host_tooling && HOST_DEPENDENT_CHECK_RE.is_match(&normalized) {
+        normalized = HOST_DEPENDENT_CHECK_RE
+            .replace_all(&normalized, "${1}HOST-DEPENDENT ${2}")
+            .to_string();
+        log.push("host_tooling".to_string());
+    }
+
     // 14. Strip trailing whitespace (per line)
     if config.strip_trailing_whitespace {
         let lines: Vec<&str> = normalized.lines().collect();
@@ -761,14 +795,22 @@ mod golden_snapshot_tests {
     /// `br doctor`'s `binary_version` check prints the bare `br <semver>` form
     /// rather than `version <semver>`. Leaving it unmasked pins the crate
     /// version into the doctor golden and breaks it on every release.
+    ///
+    /// The whole `binary_version` result line is now replaced outright, because
+    /// its *message* is host-dependent too and not just its version number
+    /// (`beads_rust-alur`) — which subsumes the original concern: no version can
+    /// survive if the line does not. Both properties are asserted here.
     #[test]
     fn test_mask_bare_br_version() {
         let input = "OK binary_version: Running br 0.2.19; no beads_rust Cargo.toml reachable";
         let snapshot = TextSnapshot::golden(input);
-        assert_eq!(
-            snapshot.normalized,
-            "OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable"
-        );
+        assert_eq!(snapshot.normalized, "HOST-DEPENDENT binary_version");
+        assert!(!snapshot.normalized.contains("0.2.19"));
+
+        // The bare `br <semver>` form is still masked wherever it appears
+        // outside a check-result line, which is what VERSION_NUM_RE is for.
+        let loose = TextSnapshot::golden("Running br 0.2.19 from /usr/local/bin");
+        assert_eq!(loose.normalized, "Running br X.Y.Z from /usr/local/bin");
     }
 
     /// Prerelease suffixes must be masked with the version they belong to,
@@ -971,5 +1013,74 @@ Issue bd-abc123 created
         assert!(snapshot.normalized.contains("Issue"));
         assert!(snapshot.normalized.contains("created"));
         assert!(snapshot.normalized.contains("Path:"));
+    }
+}
+
+#[cfg(test)]
+mod host_tooling_masking_tests {
+    use super::{TextNormConfig, normalize_output, normalize_text_with_log};
+
+    /// `beads_rust-alur`: `sqlite3.integrity_check` reports OK where the system
+    /// `sqlite3` binary exists and WARN where it does not, so the golden must
+    /// not encode either. Both host states must normalize to the same text.
+    #[test]
+    fn sqlite3_integrity_check_is_host_independent() {
+        let with_sqlite3 = "OK db.write_probe\nOK sqlite3.integrity_check\n";
+        let without_sqlite3 = "OK db.write_probe\n\
+             WARN sqlite3.integrity_check: sqlite3 not available; skipping orthogonal integrity validation\n";
+
+        assert_eq!(
+            normalize_output(with_sqlite3),
+            normalize_output(without_sqlite3),
+            "the golden must not encode whether the host has sqlite3 installed"
+        );
+        assert!(normalize_output(with_sqlite3).contains("HOST-DEPENDENT sqlite3.integrity_check"));
+    }
+
+    /// `beads_rust-alur`: `binary_version`'s message depends on whether a
+    /// `beads_rust` Cargo.toml sits above the temp workspace — true on rch
+    /// workers, which put `TMPDIR` inside the synced repo, false on a developer
+    /// box. Both forms must normalize to the same text.
+    #[test]
+    fn binary_version_message_is_host_independent() {
+        let in_repo = "OK binary_version: Running br 0.2.19; matches (or is ahead of) Cargo.toml at /data/projects/beads_rust/Cargo.toml (0.2.19)\n";
+        let outside_repo = "OK binary_version: Running br 0.2.19; no beads_rust Cargo.toml reachable from .beads/ — not flagging\n";
+
+        assert_eq!(
+            normalize_output(in_repo),
+            normalize_output(outside_repo),
+            "the golden must not encode where the temp workspace happened to live"
+        );
+        assert!(normalize_output(in_repo).contains("HOST-DEPENDENT binary_version"));
+        // The bare trailing version that VERSION_NUM_RE cannot catch must not
+        // survive into the golden.
+        assert!(!normalize_output(in_repo).contains("0.2.19"));
+    }
+
+    #[test]
+    fn masking_preserves_neighbouring_checks_and_the_check_name() {
+        let (normalized, log) = normalize_text_with_log(
+            "OK sqlite.integrity_check\nWARN sqlite3.integrity_check: sqlite3 not available\nOK db.sidecars\n",
+            &TextNormConfig::golden(),
+        );
+        // The engine's own integrity check is NOT host-dependent and must keep
+        // its real status.
+        assert!(normalized.contains("OK sqlite.integrity_check"));
+        assert!(normalized.contains("OK db.sidecars"));
+        // The check name survives, so removing or renaming the check still
+        // fails the snapshot.
+        assert!(normalized.contains("HOST-DEPENDENT sqlite3.integrity_check"));
+        assert!(log.contains(&"host_tooling".to_string()));
+    }
+
+    #[test]
+    fn masking_is_opt_out() {
+        // `minimal()` leaves the input untouched apart from ANSI/line-ending
+        // normalization — including the trailing newline, since it does not
+        // strip trailing whitespace.
+        let (normalized, log) =
+            normalize_text_with_log("OK sqlite3.integrity_check\n", &TextNormConfig::minimal());
+        assert_eq!(normalized, "OK sqlite3.integrity_check\n");
+        assert!(!log.contains(&"host_tooling".to_string()));
     }
 }
