@@ -676,6 +676,79 @@ fn e2e_update_claim_multiple_ids_is_all_or_nothing() {
     assert_eq!(second_after[0]["assignee"].as_str(), Some("bob"));
 }
 
+/// GitHub issue #393: the `--claim --json` echo must carry the resulting
+/// assignee so an agent can confirm the claim landed without a follow-up
+/// `br show`. The field is emitted unconditionally (null when unassigned) so
+/// "not claimed" and "not reported" stay distinguishable.
+#[test]
+fn e2e_update_claim_json_echo_reports_assignee() {
+    let _log = common::test_log("e2e_update_claim_json_echo_reports_assignee");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_claim_echo_assignee");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Claim echo target", "--json"],
+        "create_claim_echo_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let claim = run_br(
+        &workspace,
+        ["--actor", "testagent", "update", &id, "--claim", "--json"],
+        "claim_echo_assignee",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+
+    let claimed: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&claim.stdout)).expect("claim echo json");
+    assert_eq!(claimed.len(), 1, "expected one updated issue in the echo");
+    assert_eq!(claimed[0]["id"].as_str(), Some(id.as_str()));
+    assert_eq!(claimed[0]["status"].as_str(), Some("in_progress"));
+    assert_eq!(
+        claimed[0]["assignee"].as_str(),
+        Some("testagent"),
+        "claim echo must report the resulting assignee: {}",
+        claim.stdout
+    );
+
+    // A non-claim update on an unassigned issue still carries the key, as
+    // an explicit null rather than an omitted field.
+    let create_plain = run_br(
+        &workspace,
+        ["create", "Unassigned target", "--json"],
+        "create_unassigned_target",
+    );
+    assert!(
+        create_plain.status.success(),
+        "create failed: {}",
+        create_plain.stderr
+    );
+    let plain: Value =
+        serde_json::from_str(&extract_json_payload(&create_plain.stdout)).expect("create json");
+    let plain_id = plain["id"].as_str().expect("issue id").to_string();
+
+    let bump = run_br(
+        &workspace,
+        ["update", &plain_id, "--priority", "1", "--json"],
+        "update_unassigned_priority",
+    );
+    assert!(bump.status.success(), "update failed: {}", bump.stderr);
+    let bumped: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&bump.stdout)).expect("update echo json");
+    assert!(
+        bumped[0].get("assignee").is_some(),
+        "assignee key must be present even when unassigned: {}",
+        bump.stdout
+    );
+    assert!(bumped[0]["assignee"].is_null());
+}
+
 #[test]
 fn e2e_create_updates_last_touched_context() {
     let _log = common::test_log("e2e_create_updates_last_touched_context");

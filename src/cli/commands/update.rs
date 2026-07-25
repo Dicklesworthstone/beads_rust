@@ -23,12 +23,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// JSON output structure for updated issues.
+///
+/// `assignee` is always emitted (null when unassigned) rather than being
+/// skipped when absent. `br update --claim` sets the assignee, and an agent
+/// must be able to confirm the claim landed from the response alone; a field
+/// that disappears when unset would leave "not claimed" and "not reported"
+/// indistinguishable and force a verification `br show` round trip (GitHub
+/// issue #393).
 #[derive(Debug, Serialize)]
 struct UpdatedIssueOutput {
     id: String,
     title: String,
     status: String,
     priority: i32,
+    assignee: Option<String>,
     updated_at: DateTime<Utc>,
 }
 
@@ -39,6 +47,7 @@ impl From<&Issue> for UpdatedIssueOutput {
             title: issue.title.clone(),
             status: issue.status.as_str().to_string(),
             priority: issue.priority.0,
+            assignee: issue.assignee.clone(),
             updated_at: issue.updated_at,
         }
     }
