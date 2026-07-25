@@ -31,20 +31,11 @@ use tracing::info;
 // BENCHMARK INFRASTRUCTURE (adapted from conformance.rs)
 // ============================================================================
 
-/// Check if the `bd` (Go beads) binary is available on the system.
-/// Returns true if `bd version` runs successfully, false otherwise.
-fn bd_available() -> bool {
-    std::process::Command::new("bd")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Skip test if bd binary is not available (used in CI where only br is built)
+/// Skip test when `bd` is not a usable classic comparison reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping benchmark comparison: {reason}");
             return;
         }
     };
@@ -458,7 +449,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = std::process::Command::new("bd");
+    let mut cmd = std::process::Command::new(common::bd_binary_name());
     cmd.current_dir(cwd);
     cmd.args(args);
     cmd.env("NO_COLOR", "1");

@@ -12,6 +12,26 @@ use std::process::{Command, Stdio};
 /// Minimum bd version required for conformance testing.
 const MIN_BD_VERSION: &str = "0.5.0";
 
+/// First bd version that abandoned the "classic" architecture br is frozen against.
+///
+/// br is a port of *classic* beads: SQLite as primary storage with a JSONL export
+/// (see `README.md`). bd v0.50.0 switched its default backend to Dolt and made
+/// `no-db` (JSONL-only, no SQLite) the default for `bd init`. A v0.50+ binary is
+/// therefore not a valid conformance reference:
+///
+/// - `bd init` writes no `beads.db`, so the schema conformance suite has no
+///   database to introspect.
+/// - `config.yaml` changed shape entirely, so `conformance_init_config` compares
+///   two unrelated documents.
+/// - Every mutating command prints migration banners, test-data heuristics, and
+///   `beads.role not configured` advisories that classic bd never emitted, so the
+///   text conformance suite diffs advisory noise rather than issue rendering.
+///
+/// Comparing against such a binary produces dozens of failures that describe
+/// upstream's evolution, not a br defect. The bound is exclusive: bd must satisfy
+/// `MIN_BD_VERSION <= version < MAX_BD_VERSION_EXCLUSIVE`.
+const MAX_BD_VERSION_EXCLUSIVE: &str = "0.50.0";
+
 /// Binary version metadata captured from `--version --json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryVersion {
@@ -306,6 +326,80 @@ pub fn check_bd_version(version: &BinaryVersion) -> Result<(), String> {
     Ok(())
 }
 
+/// Name or path of the reference bd binary (`BD_BINARY`, else PATH lookup).
+pub fn bd_binary_name() -> String {
+    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+}
+
+/// Why the conformance suite cannot use the discovered `bd`, if it cannot.
+///
+/// This is the single gate every conformance and benchmark suite consults, so a
+/// misconfigured reference binary produces one actionable skip message instead of
+/// dozens of diffs against a binary that was never comparable.
+///
+/// Returns `None` when `bd` is a usable classic reference.
+pub fn bd_skip_reason() -> Option<String> {
+    let bd_bin = bd_binary_name();
+
+    let Some(stdout) = run_version_command(Path::new(&bd_bin), &["version"]) else {
+        return Some(format!(
+            "'{bd_bin}' did not respond to `bd version`. {REMEDY}"
+        ));
+    };
+
+    // `bd` aliased or symlinked to `br` would compare br against itself.
+    if looks_like_br(&stdout) {
+        return Some(format!(
+            "'{bd_bin}' is br, not Go bd — conformance would compare br against itself. {REMEDY}"
+        ));
+    }
+
+    let first_token = stdout
+        .split_whitespace()
+        .next()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !matches!(first_token.as_str(), "bd" | "beads") {
+        return Some(format!(
+            "'{bd_bin}' does not identify itself as bd (`bd version` printed {stdout:?}). {REMEDY}"
+        ));
+    }
+
+    let version = parse_plain_version(&stdout);
+    if version == "unknown" {
+        // Locally built bd without version stamping: trust the operator's choice.
+        return None;
+    }
+
+    if compare_versions(&version, MIN_BD_VERSION).is_lt() {
+        return Some(format!(
+            "bd {version} at '{bd_bin}' predates the conformance baseline \
+             (minimum {MIN_BD_VERSION}). {REMEDY}"
+        ));
+    }
+
+    if compare_versions(&version, MAX_BD_VERSION_EXCLUSIVE).is_ge() {
+        return Some(format!(
+            "bd {version} at '{bd_bin}' is past the classic architecture br is frozen against \
+             (requires < {MAX_BD_VERSION_EXCLUSIVE}). bd v0.50+ defaults to Dolt and to \
+             JSONL-only `no-db` mode, so it exposes no SQLite schema, writes a different \
+             config.yaml, and prints migration banners on every command. {REMEDY}"
+        ));
+    }
+
+    None
+}
+
+/// Operator remedy appended to every conformance skip message.
+const REMEDY: &str = "Point BD_BINARY at a classic Go bd, e.g. \
+     `git clone --depth 1 --branch v0.46.0 https://github.com/steveyegge/beads.git \
+     && cd beads && go build -o bd ./cmd/bd`.";
+
+/// Whether `bd` is usable as a conformance reference.
+pub fn bd_available() -> bool {
+    bd_skip_reason().is_none()
+}
+
 /// Simple semver-style version comparison.
 fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse = |s: &str| -> Vec<u32> {
@@ -364,6 +458,43 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.1.0"), Ordering::Greater);
         assert_eq!(compare_versions("0.1.0", "0.2.0"), Ordering::Less);
         assert_eq!(compare_versions("1.0.0", "0.5.0"), Ordering::Greater);
+    }
+
+    /// The classic-architecture window must accept the bd releases br was ported
+    /// against and reject the Dolt-default line, including the double-digit minor
+    /// versions that a naive lexicographic comparison would order wrongly.
+    #[test]
+    fn test_classic_bd_version_window() {
+        let in_window = |v: &str| {
+            compare_versions(v, MIN_BD_VERSION).is_ge()
+                && compare_versions(v, MAX_BD_VERSION_EXCLUSIVE).is_lt()
+        };
+
+        // Classic line: SQLite primary storage, JSONL export.
+        assert!(in_window("0.46.0"), "v0.46.0 is the documented reference");
+        assert!(in_window("0.5.0"), "minimum is inclusive");
+        assert!(in_window("0.49.6"), "last classic release");
+
+        // Dolt-default line.
+        assert!(!in_window("0.50.0"), "maximum is exclusive");
+        assert!(!in_window("0.50.3"), "upstream default install");
+        assert!(!in_window("0.59.0"));
+        assert!(!in_window("1.0.0"));
+
+        // Below the baseline.
+        assert!(!in_window("0.4.9"));
+    }
+
+    #[test]
+    fn test_bd_skip_reason_messages_are_actionable() {
+        // A reason, when present, must always name the remedy so an operator can
+        // act without reading this file.
+        if let Some(reason) = bd_skip_reason() {
+            assert!(
+                reason.contains("BD_BINARY"),
+                "skip reason must name BD_BINARY: {reason}"
+            );
+        }
     }
 
     #[test]

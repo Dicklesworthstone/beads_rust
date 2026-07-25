@@ -23,13 +23,13 @@ use tracing::info;
 #[path = "conformance.rs"]
 mod conformance;
 
-use conformance::{CompareMode, ConformanceWorkspace, bd_available, compare_json};
+use conformance::{CompareMode, ConformanceWorkspace, compare_json};
 
-/// Skip test if bd binary is not available (used in CI where only br is built)
+/// Skip test when `bd` is not a usable classic conformance reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping conformance test: {reason}");
             return;
         }
     };

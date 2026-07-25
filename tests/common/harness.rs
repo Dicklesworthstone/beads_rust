@@ -44,7 +44,7 @@ fn clear_inherited_br_env(cmd: &mut Command) {
 /// Get the path to the bd (Go beads) binary.
 /// Checks `BD_BINARY` environment variable first, falls back to "bd" for PATH lookup.
 fn bd_binary_path() -> String {
-    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+    super::binary_discovery::bd_binary_name()
 }
 
 /// Global mutex for artifact logging to prevent interleaving
