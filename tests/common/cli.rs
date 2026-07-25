@@ -98,9 +98,50 @@ pub struct BrWorkspace {
     pub log_dir: PathBuf,
 }
 
+/// Whether any ancestor of `start` (inclusive) is a beads workspace.
+pub fn is_inside_beads_workspace(start: &Path) -> bool {
+    start
+        .ancestors()
+        .any(|dir| dir.join(".beads").is_dir() || dir.join("_beads").is_dir())
+}
+
+/// A temp root guaranteed not to sit inside an existing beads workspace.
+///
+/// `br` resolves its workspace by walking every ancestor up to the filesystem
+/// root with no `.git`-style boundary (`config::discover_beads_dir_candidate_with_env`).
+/// A `TMPDIR` that lives inside a checkout therefore hands every workspace
+/// created here the enclosing repo's `.beads/`, and the tests that assert on an
+/// *uninitialized* workspace silently exercise the wrong one.
+///
+/// This is not hypothetical: rch points `TMPDIR` at `<repo>/.rch-tmp` for remote
+/// builds, so under remote execution `br list` in a "fresh" workspace returns
+/// the beads_rust repo's own issues and exits 0 where the test requires failure.
+///
+/// Prefer `TMPDIR`; fall back to a system temp root that is clean.
+pub fn isolated_temp_root() -> PathBuf {
+    let preferred = std::env::temp_dir();
+    if !is_inside_beads_workspace(&preferred) {
+        return preferred;
+    }
+
+    for fallback in ["/tmp", "/var/tmp"] {
+        let path = PathBuf::from(fallback);
+        if path.is_dir() && !is_inside_beads_workspace(&path) {
+            return path;
+        }
+    }
+
+    panic!(
+        "no beads-free temp root available: TMPDIR ({}) is inside a beads workspace \
+         and no system fallback is clean. Set TMPDIR to a directory outside any \
+         .beads/ tree before running the test suite.",
+        preferred.display()
+    );
+}
+
 impl BrWorkspace {
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("temp dir");
+        let temp_dir = TempDir::new_in(isolated_temp_root()).expect("temp dir");
         let root = temp_dir.path().to_path_buf();
         let log_dir = root.join("logs");
         fs::create_dir_all(&log_dir).expect("log dir");
@@ -347,8 +388,13 @@ pub fn parse_list_issues(stdout: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_clear_inherited_br_env, should_preserve_smoke_env};
+    use super::{
+        BrWorkspace, is_inside_beads_workspace, isolated_temp_root, should_clear_inherited_br_env,
+        should_preserve_smoke_env,
+    };
     use std::ffi::OsStr;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn inherited_beads_and_toon_env_are_cleared() {
@@ -403,5 +449,49 @@ mod tests {
                 "{key} should still be scrubbed in smoke mode"
             );
         }
+    }
+
+    /// Built from a synthetic tree rather than the beads_rust checkout: rch
+    /// excludes `.beads/` when syncing to remote workers, so "the repo tracks its
+    /// own issues" does not hold everywhere the suite runs.
+    #[test]
+    fn detects_paths_enclosed_by_a_beads_workspace() {
+        let root = TempDir::new_in(isolated_temp_root()).expect("temp dir");
+        let nested = root.path().join("a/b/c");
+        fs::create_dir_all(&nested).expect("nested dirs");
+        assert!(
+            !is_inside_beads_workspace(&nested),
+            "a plain temp tree must not look like a workspace"
+        );
+
+        for marker in [".beads", "_beads"] {
+            let workspace_marker = root.path().join(marker);
+            fs::create_dir_all(&workspace_marker).expect("workspace marker");
+            assert!(
+                is_inside_beads_workspace(&nested),
+                "a descendant of a `{marker}` workspace must be detected"
+            );
+            fs::remove_dir(&workspace_marker).expect("drop workspace marker");
+        }
+    }
+
+    /// Whatever root the harness picks must be usable and beads-free, otherwise
+    /// every "uninitialized workspace" assertion in the suite is meaningless.
+    #[test]
+    fn isolated_temp_root_is_beads_free_and_usable() {
+        let root = isolated_temp_root();
+        assert!(root.is_dir(), "temp root {} is not a directory", root.display());
+        assert!(
+            !is_inside_beads_workspace(&root),
+            "temp root {} sits inside a beads workspace",
+            root.display()
+        );
+
+        let workspace = BrWorkspace::new();
+        assert!(
+            !is_inside_beads_workspace(&workspace.root),
+            "workspace {} sits inside a beads workspace",
+            workspace.root.display()
+        );
     }
 }
