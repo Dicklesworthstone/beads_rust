@@ -109,7 +109,16 @@ fn build_text_contents(beads_dir: &std::path::Path) -> String {
         .sort_by_file_name()
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && !is_binary(e.path()))
+        // Engine-managed sidecars are excluded here for the same reason the
+        // directory listing and expected-file-set skip them: which ones the
+        // storage engine materializes is an implementation detail. `is_binary`
+        // alone does not catch them — fsqlite's `-fsqlite-ns-gate` is created
+        // empty, so it reads as a text file.
+        .filter(|e| {
+            e.file_type().is_file()
+                && !is_binary(e.path())
+                && !is_transient_sqlite(&e.file_name().to_string_lossy())
+        })
         .collect();
     entries.sort_by(|a, b| a.path().cmp(b.path()));
 
