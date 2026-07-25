@@ -1042,7 +1042,9 @@ pub struct CreateArgs {
     pub priority: Option<String>,
 
     /// Description
-    #[arg(long, short = 'd', visible_alias = "body")]
+    // Markdown bodies routinely begin with a list marker ("- item"), which
+    // clap otherwise parses as an unknown flag in the space-separated form.
+    #[arg(long, short = 'd', visible_alias = "body", allow_hyphen_values = true)]
     pub description: Option<String>,
 
     /// Read the issue description verbatim from a file (or `-` for stdin).
@@ -1146,7 +1148,9 @@ pub struct QuickArgs {
     pub labels: Vec<String>,
 
     /// Description
-    #[arg(long, short = 'd', visible_alias = "body")]
+    // Markdown bodies routinely begin with a list marker ("- item"), which
+    // clap otherwise parses as an unknown flag in the space-separated form.
+    #[arg(long, short = 'd', visible_alias = "body", allow_hyphen_values = true)]
     pub description: Option<String>,
 
     /// Parent issue ID (creates parent-child dep)
@@ -1170,7 +1174,9 @@ pub struct UpdateArgs {
     pub title: Option<String>,
 
     /// Update description
-    #[arg(long, short = 'd', visible_alias = "body")]
+    // Markdown bodies routinely begin with a list marker ("- item"), which
+    // clap otherwise parses as an unknown flag in the space-separated form.
+    #[arg(long, short = 'd', visible_alias = "body", allow_hyphen_values = true)]
     pub description: Option<String>,
 
     /// Set the issue description verbatim from a file (or `-` for stdin),
@@ -1182,20 +1188,20 @@ pub struct UpdateArgs {
     pub description_file: Option<PathBuf>,
 
     /// Update design notes
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub design: Option<String>,
 
     /// Update acceptance criteria
-    #[arg(long, visible_alias = "acceptance")]
+    #[arg(long, visible_alias = "acceptance", allow_hyphen_values = true)]
     pub acceptance_criteria: Option<String>,
 
     /// Update additional notes
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub notes: Option<String>,
 
     /// New comment bound atomically to the requested status transition.
     /// Required when policy lists `transition_comment` for the transition.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     /// Change status. Terminal states (`closed`, `tombstone`) are refused —
@@ -1863,7 +1869,7 @@ pub struct EpicCloseEligibleArgs {
     pub dry_run: bool,
 
     /// New comment committed atomically with every eligible epic close.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 }
 
@@ -2126,7 +2132,12 @@ pub struct CommentAddArgs {
     pub author: Option<String>,
 
     /// Comment text (alternative flag)
-    #[arg(long = "message", short = 'm', visible_alias = "content")]
+    #[arg(
+        long = "message",
+        short = 'm',
+        visible_alias = "content",
+        allow_hyphen_values = true
+    )]
     pub message: Option<String>,
 }
 
@@ -2345,7 +2356,7 @@ pub struct DeferArgs {
     pub robot: bool,
 
     /// New comment committed atomically with each defer transition.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
@@ -2375,7 +2386,7 @@ pub struct UndeferArgs {
     pub robot: bool,
 
     /// New comment committed atomically with each undefer transition.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
@@ -2547,12 +2558,12 @@ pub struct CloseArgs {
     pub ids: Vec<String>,
 
     /// Close reason
-    #[arg(long, short = 'r')]
+    #[arg(long, short = 'r', allow_hyphen_values = true)]
     pub reason: Option<String>,
 
     /// New comment committed atomically with each close transition. This is
     /// distinct from close metadata in `--reason`.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     /// Close even if blocked by open dependencies
@@ -2608,7 +2619,7 @@ pub struct ReopenArgs {
     pub ids: Vec<String>,
 
     /// Reason for reopening (stored as a comment)
-    #[arg(long, short = 'r')]
+    #[arg(long, short = 'r', allow_hyphen_values = true)]
     pub reason: Option<String>,
 
     /// Machine-readable output (alias for --json)
