@@ -818,8 +818,11 @@ impl TestWorkspace {
         clear_inherited_br_env(&mut cmd);
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
+        // See tests/common/cli.rs: debug tracing on stderr trips `br doctor`'s
+        // own `rust_log` check and corrupts stderr-matching assertions.
+        cmd.env("RUST_LOG", "error");
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("PATH", super::cli::deduplicated_br_path());
         cmd.env("HOME", &self.root);
 
         if let Some(input) = stdin_input {
@@ -1188,8 +1191,11 @@ impl ConformanceWorkspace {
 
         clear_inherited_br_env(&mut cmd);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
+        // See tests/common/cli.rs: debug tracing on stderr trips `br doctor`'s
+        // own `rust_log` check and corrupts stderr-matching assertions.
+        cmd.env("RUST_LOG", "error");
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("PATH", super::cli::deduplicated_br_path());
         cmd.env("HOME", cwd);
 
         let start = Instant::now();
@@ -1262,8 +1268,11 @@ impl ConformanceWorkspace {
         clear_inherited_br_env(&mut cmd);
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
+        // See tests/common/cli.rs: debug tracing on stderr trips `br doctor`'s
+        // own `rust_log` check and corrupts stderr-matching assertions.
+        cmd.env("RUST_LOG", "error");
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("PATH", super::cli::deduplicated_br_path());
         cmd.env("HOME", cwd);
 
         if let Some(input) = stdin_input {

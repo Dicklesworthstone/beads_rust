@@ -358,9 +358,9 @@ fn defer_until_invalid_error() {
         "defer with invalid time should fail"
     );
     assert!(
-        defer.stderr.to_lowercase().contains("invalid")
-            || defer.stderr.to_lowercase().contains("parse")
-            || defer.stderr.to_lowercase().contains("unrecognized"),
+        defer.stdout.to_lowercase().contains("invalid")
+            || defer.stdout.to_lowercase().contains("parse")
+            || defer.stdout.to_lowercase().contains("unrecognized"),
         "error should mention invalid time format"
     );
     info!("defer_until_invalid_error: assertions passed");
@@ -614,7 +614,7 @@ fn defer_nonexistent_error() {
 
     // Should fail with not found
     assert!(!defer.status.success());
-    assert!(defer.stderr.contains("not found") || defer.stderr.contains("matching"));
+    assert!(defer.stdout.contains("not found") || defer.stdout.contains("matching"));
     info!("defer_nonexistent_error: assertions passed");
 }
 

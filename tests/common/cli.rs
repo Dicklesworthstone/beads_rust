@@ -37,6 +37,42 @@ fn clear_inherited_br_env(cmd: &mut Command) {
     clear_inherited_br_env_except(cmd, &[]);
 }
 
+/// `$PATH` with every directory after the first that holds a `br` executable
+/// removed.
+///
+/// `br doctor` reports `br_path_dupes` when more than one `br` is reachable on
+/// `$PATH`, and since #292 any WARN flips `ok` to false and exits 1. A
+/// developer who has both `~/.local/bin/br` (install script) and
+/// `~/.cargo/bin/br` (`cargo install`) — the exact combination the README warns
+/// about — would therefore fail every "healthy workspace" doctor test for
+/// reasons that have nothing to do with the workspace under test.
+///
+/// Only later duplicates are dropped, so the first such directory survives and
+/// siblings living beside it (notably the Go `bd` binary used by the
+/// conformance suite) stay reachable. The dedicated
+/// `tests/doctor_fixtures/multiple_br_in_path` fixture builds its own `$PATH`
+/// and so still exercises the detection deliberately.
+pub fn deduplicated_br_path() -> std::ffi::OsString {
+    let Some(path) = std::env::var_os("PATH") else {
+        return std::ffi::OsString::new();
+    };
+    let mut seen_br_dir = false;
+    let kept: Vec<std::path::PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| {
+            let has_br = dir.join("br").is_file();
+            if !has_br {
+                return true;
+            }
+            if seen_br_dir {
+                return false;
+            }
+            seen_br_dir = true;
+            true
+        })
+        .collect();
+    std::env::join_paths(kept).unwrap_or(path)
+}
+
 fn clear_inherited_br_env_except(cmd: &mut Command, preserve: &[&str]) {
     for (key, _) in std::env::vars_os() {
         let key_str = key.to_string_lossy();
@@ -195,8 +231,16 @@ where
     cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
-    cmd.env("RUST_LOG", "beads_rust=debug");
+    // `error`, not `beads_rust=debug`. Debug tracing goes to stderr, which
+    // (a) `br doctor`'s own `rust_log` check flags as an agent-hostile
+    // setting — so every "healthy workspace" doctor assertion failed purely
+    // because the harness set it — and (b) drowns the assertions that match
+    // on stderr contents. Tests that specifically want verbose tracing pass
+    // RUST_LOG through `run_br_with_env`, which is applied above and so still
+    // wins over this default.
+    cmd.env("RUST_LOG", "error");
     cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("PATH", deduplicated_br_path());
     cmd.env("HOME", root);
 
     if let Some(input) = stdin_input {

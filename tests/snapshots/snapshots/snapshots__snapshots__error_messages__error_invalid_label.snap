@@ -1,8 +1,5 @@
 ---
 source: tests/snapshots/error_messages.rs
-assertion_line: 73
 expression: normalize_output(&output.stderr)
 ---
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
 Error: Validation failed: label: invalid characters (only alphanumeric, hyphen, underscore, colon allowed)

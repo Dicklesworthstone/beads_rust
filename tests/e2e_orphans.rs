@@ -650,9 +650,9 @@ fn e2e_orphans_fix_before_init_rejects_machine_output() {
         "orphans --fix --json should fail before init"
     );
     assert!(
-        orphans.stderr.contains("--fix is interactive"),
+        orphans.stdout.contains("--fix is interactive"),
         "expected interactive-mode error, got: {}",
-        orphans.stderr
+        orphans.stdout
     );
     info!("e2e_orphans_fix_before_init_rejects_machine_output: assertions passed");
 }
