@@ -2510,7 +2510,7 @@ fn preserved_tombstones_for_doctor_rebuild(
 }
 
 fn repair_recoverable_db_state(
-    _beads_dir: &Path,
+    beads_dir: &Path,
     db_path: &Path,
     report: &DoctorReport,
     mut session: Option<&mut DoctorRepairSession>,
@@ -2532,7 +2532,31 @@ fn repair_recoverable_db_state(
         return repair;
     }
 
-    let do_rebuild = |repair: &mut LocalRepairResult| match SqliteStorage::open(db_path) {
+    // A truncated/garbage `-wal` makes the engine refuse to open the
+    // database at all. The normal startup path quarantines that sidecar
+    // before opening; local repair must do the same or it silently skips
+    // the very repair the operator ran `--repair` for.
+    //
+    // Only retry when the main database file is itself a real SQLite image:
+    // if the primary file is not a database, moving its sidecar aside cannot
+    // help and the JSONL rebuild path owns that case.
+    let open_for_repair = || {
+        SqliteStorage::open(db_path).or_else(|first_err| {
+            if !db_file_has_sqlite_header(db_path) {
+                return Err(first_err);
+            }
+            crate::config::quarantine_truncated_wal_sidecar(db_path, beads_dir);
+            SqliteStorage::open(db_path).inspect_err(|_| {
+                tracing::debug!(
+                    path = %db_path.display(),
+                    first_error = %first_err,
+                    "Reopen after truncated-WAL quarantine still failed"
+                );
+            })
+        })
+    };
+
+    let do_rebuild = |repair: &mut LocalRepairResult| match open_for_repair() {
         Ok(mut storage) => {
             let force_rebuild = report_has_projection_content_mismatch_finding(report);
             let rebuild_result = if force_rebuild {
@@ -3291,13 +3315,47 @@ fn sqlite_journal_sidecar_path(db_path: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
+/// Whether `db_path` begins with the SQLite file header magic.
+///
+/// Used to tell "the database is fine but a sidecar blocks the open" apart
+/// from "this file was never a database", which need different repairs.
+fn db_file_has_sqlite_header(db_path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = fs::File::open(db_path) else {
+        return false;
+    };
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).is_ok() && &header == b"SQLite format 3\0"
+}
+
+/// Sidecars fsqlite maintains for its multi-process namespace admission
+/// (`-fsqlite-ns-gate`, `-fsqlite-ns-use`). They belong to the database file
+/// family and must be carried through backup/quarantine alongside the
+/// classic `-wal`/`-shm`/`-journal` trio.
+///
+/// The suffix list is owned by `config` so this walk and the compaction
+/// cleanup cannot drift apart.
+fn fsqlite_namespace_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
+    crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            PathBuf::from(sidecar)
+        })
+        .collect()
+}
+
 fn existing_sqlite_family_paths_for_legacy_op(db_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![db_path.to_path_buf()];
-    for sidecar in [
+    let sidecars = [
         sqlite_wal_sidecar_path(db_path),
         sqlite_shm_sidecar_path(db_path),
         sqlite_journal_sidecar_path(db_path),
-    ] {
+    ]
+    .into_iter()
+    .chain(fsqlite_namespace_sidecar_paths(db_path));
+    for sidecar in sidecars {
         if fs::symlink_metadata(&sidecar)
             .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         {
@@ -18321,7 +18379,20 @@ mod tests {
             .join("quarantine")
             .join(".beads")
             .join("beads.db-shm");
-        assert!(!shm_path.exists(), "orphan SHM source should be moved");
+        // The storage engine may immediately recreate its own `-shm` when the
+        // repair reopens the database, so the live path existing again is not
+        // a failure. What must hold is that the *orphan* bytes were moved out
+        // rather than left in place.
+        assert_ne!(
+            fs::read(&shm_path).ok().as_deref(),
+            Some(b"orphan shm".as_slice()),
+            "orphan SHM content should no longer be at the live sidecar path"
+        );
+        assert_eq!(
+            fs::read(&quarantine_path)?,
+            b"orphan shm",
+            "the quarantined copy should hold the orphan bytes"
+        );
         assert!(
             quarantine_path.is_file(),
             "orphan SHM should be quarantined at {}",
@@ -18942,6 +19013,30 @@ mod tests {
         );
     }
 
+    /// The `.beads/`-relative names of every database-family file that
+    /// actually exists on disk.
+    ///
+    /// Derived from a directory listing rather than a hardcoded list: which
+    /// sidecars the storage engine leaves behind is an fsqlite implementation
+    /// detail (0.1.18 added `-fsqlite-ns-gate` / `-fsqlite-ns-use` and now
+    /// also retains `-shm`). The contract these tests assert is "the legacy
+    /// audit covers the whole existing family", which must not have to be
+    /// restated every time the engine adds a sidecar.
+    fn on_disk_db_family_names(beads_dir: &Path, db_file_name: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for entry in fs::read_dir(beads_dir).unwrap() {
+            let entry = entry.unwrap();
+            if !entry.file_type().unwrap().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(db_file_name) {
+                names.insert(format!(".beads/{name}"));
+            }
+        }
+        names
+    }
+
     #[test]
     fn test_existing_sqlite_family_paths_for_legacy_op_includes_only_existing_sidecars() {
         let temp = TempDir::new().unwrap();
@@ -18994,11 +19089,7 @@ mod tests {
 
         assert_eq!(
             action_paths,
-            BTreeSet::from([
-                ".beads/beads.db".to_string(),
-                ".beads/beads.db-wal".to_string(),
-                ".beads/beads.db-journal".to_string(),
-            ]),
+            on_disk_db_family_names(&beads_dir, "beads.db"),
             "VACUUM legacy audit must cover the existing SQLite file family; actions={actions}"
         );
         assert_eq!(
@@ -19046,11 +19137,7 @@ mod tests {
 
         assert_eq!(
             action_paths,
-            BTreeSet::from([
-                ".beads/beads.db".to_string(),
-                ".beads/beads.db-wal".to_string(),
-                ".beads/beads.db-journal".to_string(),
-            ]),
+            on_disk_db_family_names(&beads_dir, "beads.db"),
             "REINDEX legacy audit must cover the existing SQLite file family; actions={actions}"
         );
         assert_eq!(
@@ -19089,10 +19176,17 @@ mod tests {
                 .unwrap();
         }
 
+        // A short garbage WAL both marks the backup content and blocks the
+        // engine from opening the database — the exact case the local repair
+        // now clears by quarantining the sidecar and retrying. (Journal-family
+        // backup coverage lives in the VACUUM and REINDEX tests, whose repair
+        // paths do not need a successful `SqliteStorage::open`.)
         let wal_path = sqlite_wal_sidecar_path(&db_path);
-        let journal_path = sqlite_journal_sidecar_path(&db_path);
         fs::write(&wal_path, b"wal-before-blocked-cache").unwrap();
-        fs::write(&journal_path, b"journal-before-blocked-cache").unwrap();
+
+        // The audit records the family as it existed going in; the repair may
+        // legitimately move a corrupt sidecar aside while it runs.
+        let expected_family = on_disk_db_family_names(&beads_dir, "beads.db");
 
         let report = DoctorReport {
             ok: true,
@@ -19128,21 +19222,13 @@ mod tests {
             .collect();
 
         assert_eq!(
-            action_paths,
-            BTreeSet::from([
-                ".beads/beads.db".to_string(),
-                ".beads/beads.db-wal".to_string(),
-                ".beads/beads.db-journal".to_string(),
-            ]),
+            action_paths, expected_family,
             "blocked-cache rebuild legacy audit must cover the existing SQLite file family; actions={actions}"
         );
         assert_eq!(
             fs::read(session.run.root.join("backups/.beads/beads.db-wal")).unwrap(),
-            b"wal-before-blocked-cache"
-        );
-        assert_eq!(
-            fs::read(session.run.root.join("backups/.beads/beads.db-journal")).unwrap(),
-            b"journal-before-blocked-cache"
+            b"wal-before-blocked-cache",
+            "the pre-repair WAL must be backed up verbatim before it is quarantined"
         );
     }
 

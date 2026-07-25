@@ -58,6 +58,9 @@ grep -A20 'fn is_allowed_sync_file' src/sync/path.rs
 Verify the allowlist only includes:
 - `.beads/*.db` (SQLite database)
 - `.beads/*.db-wal`, `.beads/*.db-shm`, `.beads/*.db-journal` (SQLite sidecar files)
+- `.beads/*.db-fsqlite-ns-gate`, `.beads/*.db-fsqlite-ns-use` (fsqlite multi-process
+  namespace admission sidecars; the engine creates and updates these for every
+  database path it opens, so sync observes them alongside the classic trio)
 - `.beads/*.jsonl` (JSONL export)
 - `.beads/*.jsonl.tmp` (atomic write temp files)
 - `.beads/.manifest.json` (optional manifest)

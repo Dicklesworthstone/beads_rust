@@ -728,7 +728,7 @@ fn open_when_db_file_is_missing(
 /// `WalCorrupt` during rebuild. Moving the sidecars out of the live
 /// database family lets SQLite recreate them on the next write while
 /// preserving the original bytes for operator inspection.
-fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
+pub(crate) fn quarantine_truncated_wal_sidecar(db_path: &Path, beads_dir: &Path) {
     match fs::symlink_metadata(db_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             tracing::warn!(
@@ -898,6 +898,16 @@ fn should_attempt_jsonl_recovery(open_err: &BeadsError, db_path: &Path, jsonl_pa
         open_err,
         BeadsError::Database(FrankenError::Internal(detail))
             if is_recoverable_database_internal_error(detail)
+    ) || matches!(
+        open_err,
+        // A member of the database family is a directory where the engine
+        // expects a regular file (e.g. a `-journal` directory left by a
+        // hostile or interrupted tool). fsqlite reports this as a plain I/O
+        // error rather than a corruption variant, but it is exactly the
+        // structural damage a JSONL rebuild repairs: recovery backs the whole
+        // family up and recreates it.
+        BeadsError::Database(FrankenError::Io(io_err))
+            if io_err.kind() == std::io::ErrorKind::IsADirectory
     )
 }
 
@@ -1893,6 +1903,48 @@ fn actual_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>
     Ok(actual)
 }
 
+/// Engine-managed sidecar files that live alongside a database file.
+///
+/// `-fsqlite-ns-gate` / `-fsqlite-ns-use` are fsqlite's multi-process
+/// namespace admission files; they are created for *any* database path the
+/// engine opens, including the `VACUUM INTO` temp target.
+/// Sidecars fsqlite maintains for multi-process namespace admission.
+///
+/// Single source of truth — `doctor`'s database-family walk reads the same
+/// constant so the two cannot drift apart.
+pub(crate) const FSQLITE_NAMESPACE_SIDECAR_SUFFIXES: &[&str] =
+    &["-fsqlite-ns-gate", "-fsqlite-ns-use"];
+
+/// The classic SQLite sidecars.
+pub(crate) const CLASSIC_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
+
+/// Every engine-managed sidecar suffix, classic and fsqlite-specific.
+pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static str> {
+    CLASSIC_SIDECAR_SUFFIXES
+        .iter()
+        .chain(FSQLITE_NAMESPACE_SIDECAR_SUFFIXES.iter())
+}
+
+/// Best-effort removal of every engine sidecar belonging to `db_path`.
+///
+/// Used both to drop the pre-compaction sidecars after an atomic swap and to
+/// clean up the temp target's sidecars, which `rename` leaves behind because
+/// it only moves the main file.
+fn remove_db_sidecars(db_path: &Path) {
+    for suffix in db_sidecar_suffixes() {
+        let sidecar = PathBuf::from(format!("{}{}", db_path.to_string_lossy(), suffix));
+        if fs::symlink_metadata(&sidecar).is_ok()
+            && let Err(err) = fs::remove_file(&sidecar)
+        {
+            tracing::debug!(
+                error = %err,
+                sidecar = %sidecar.display(),
+                "Failed to remove database sidecar; next open will re-derive it"
+            );
+        }
+    }
+}
+
 /// Compact a database at `db_path` by writing a fresh copy via `VACUUM
 /// INTO` to a temp file, atomically replacing the original, and returning a
 /// reopened storage connection.
@@ -1967,6 +2019,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // "concurrent rebuild holding the temp open" without coordinating
     // via the `.write.lock` we already depend on upstream.
     let _ = fs::remove_file(&temp_path);
+    remove_db_sidecars(&temp_path);
 
     let temp_path_display = temp_path.display().to_string();
     // Escape single quotes the SQL way (doubling) for the literal path
@@ -1983,6 +2036,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
             "`VACUUM INTO` compaction failed; keeping the in-place rebuild which may still show unused tail pages under upstream sqlite3"
         );
         let _ = fs::remove_file(&temp_path);
+        remove_db_sidecars(&temp_path);
         return Ok(storage);
     }
 
@@ -2007,6 +2061,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
             "Failed to atomically install compacted database; skipping VACUUM INTO compaction"
         );
         let _ = fs::remove_file(&temp_path);
+        remove_db_sidecars(&temp_path);
         // db_path is still the original file here (rename failed, so the
         // old file is intact). Reopen it so the caller gets a valid handle.
         return reopen_storage(db_path, lock_timeout).map_err(|reopen_err| {
@@ -2026,18 +2081,12 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // attempt. Best-effort: if a sidecar can't be removed, log and
     // continue — next open will still work because the compacted db_path
     // header declares the canonical layout.
-    for sidecar_suffix in &["-wal", "-shm", "-journal"] {
-        let sidecar = PathBuf::from(format!("{}{}", db_path.to_string_lossy(), sidecar_suffix));
-        if fs::symlink_metadata(&sidecar).is_ok()
-            && let Err(err) = fs::remove_file(&sidecar)
-        {
-            tracing::debug!(
-                error = %err,
-                sidecar = %sidecar.display(),
-                "Failed to remove pre-compaction sidecar after VACUUM INTO; next open will re-derive it"
-            );
-        }
-    }
+    remove_db_sidecars(db_path);
+    // `rename` moved only the temp file itself, so the engine sidecars the
+    // VACUUM target accumulated are now orphans next to the installed
+    // database. Left behind they leak one pair of files per compaction and
+    // trip the sync path allowlist.
+    remove_db_sidecars(&temp_path);
 
     reopen_storage(db_path, lock_timeout).map_err(|err| BeadsError::WithContext {
         context: format!(
