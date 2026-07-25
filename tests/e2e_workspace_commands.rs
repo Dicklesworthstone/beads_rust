@@ -465,11 +465,18 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
         "issues.jsonl should exist before repair test"
     );
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
-        .expect("insert duplicate config row a");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
-        .expect("insert duplicate config row b");
+    // Scoped so the injecting connection is closed before `doctor --repair`
+    // runs. The repair path rebuilds the database and needs an exclusive open;
+    // holding this connection across it makes the engine refuse with
+    // "unable to open database file" instead of repairing.
+    {
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+            .expect("insert duplicate config row a");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+            .expect("insert duplicate config row b");
+    }
 
     let pre_repair = run_br(&workspace, ["doctor", "--json"], "doctor_pre_repair_json");
     assert!(
@@ -684,9 +691,13 @@ fn e2e_doctor_repair_preserves_unflushed_tombstones() {
         ["doctor", "--repair", "--json"],
         "doctor_repair",
     );
+    // `doctor --repair --json` reports failures as a JSON envelope on stdout,
+    // so stderr alone says nothing about why a repair was refused.
     assert!(
         repaired.status.success(),
-        "doctor --repair failed: stderr={}",
+        "doctor --repair failed: exit={:?}\nstdout={}\nstderr={}",
+        repaired.status.code(),
+        repaired.stdout,
         repaired.stderr
     );
 
@@ -845,10 +856,16 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
             let beads_dir = workspace.root.join(".beads");
             let wal_path = beads_dir.join("beads.db-wal");
             fs::write(&wal_path, b"synthetic orphan wal").expect("seed anomalous wal");
-            assert!(
-                !beads_dir.join("beads.db-shm").exists(),
-                "fixture should keep the WAL anomaly isolated to a missing SHM sidecar"
-            );
+            // Which sidecars survive a clean exit is an fsqlite implementation
+            // detail, not a property this fixture may assert: 0.1.18 retains
+            // `-shm` where earlier versions dropped it. Establish the intended
+            // state instead of asserting the engine happened to leave it —
+            // an unusable WAL with no SHM to pair it — so the fixture means the
+            // same thing on every engine version.
+            let shm_path = beads_dir.join("beads.db-shm");
+            if shm_path.exists() {
+                fs::remove_file(&shm_path).expect("clear engine-managed SHM sidecar");
+            }
             wal_path
         };
 
