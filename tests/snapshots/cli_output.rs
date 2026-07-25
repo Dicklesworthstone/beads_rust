@@ -2,13 +2,36 @@ use super::common::cli::{BrWorkspace, run_br};
 use super::{create_issue, init_workspace, normalize_output};
 use insta::assert_snapshot;
 
-#[cfg(feature = "self_update")]
+/// `br --help` lists `serve` only when the optional `mcp` feature is compiled
+/// in, so the top-level command list is feature-set dependent. CI runs
+/// `cargo test --all-features` (`.github/workflows/ci.yml`) while the default
+/// developer build leaves `mcp` off, so freezing a single golden for both makes
+/// whichever build was not captured fail. Snapshot each feature set under its
+/// own name, mirroring how `self_update` is handled below.
+#[cfg(all(feature = "self_update", feature = "mcp"))]
 #[test]
 fn snapshot_help_output() {
     let workspace = BrWorkspace::new();
     let output = run_br(&workspace, ["--help"], "help");
     assert!(output.status.success(), "help failed: {}", output.stderr);
+    assert!(
+        output.stdout.contains("serve"),
+        "help should list the serve subcommand with the mcp feature"
+    );
     assert_snapshot!("help_output", normalize_output(&output.stdout));
+}
+
+#[cfg(all(feature = "self_update", not(feature = "mcp")))]
+#[test]
+fn snapshot_help_output_no_mcp() {
+    let workspace = BrWorkspace::new();
+    let output = run_br(&workspace, ["--help"], "help");
+    assert!(output.status.success(), "help failed: {}", output.stderr);
+    assert!(
+        !output.stdout.contains("serve"),
+        "help should not list the serve subcommand without the mcp feature"
+    );
+    assert_snapshot!("help_output_no_mcp", normalize_output(&output.stdout));
 }
 
 #[test]

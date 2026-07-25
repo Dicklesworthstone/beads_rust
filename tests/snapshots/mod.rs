@@ -63,8 +63,15 @@ static BUILD_PROFILE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\((dev|release)\)").expect("build profile regex"));
 static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
-static VERSION_NUM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
+/// Version numbers in human-readable output.
+///
+/// Covers both the `version 0.1.7` form and the bare `br 0.2.19` form that
+/// `br doctor`'s `binary_version` check prints. Without the latter the doctor
+/// snapshot carries the crate version verbatim and breaks on every release.
+static VERSION_NUM_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(version|br) \d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?")
+        .expect("version number regex")
+});
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 /// `tracing` source-location annotation that appears in dev builds after the
@@ -488,7 +495,7 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
     // 13. Mask version numbers
     if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
         normalized = VERSION_NUM_RE
-            .replace_all(&normalized, "version X.Y.Z")
+            .replace_all(&normalized, "$1 X.Y.Z")
             .to_string();
         log.push("version_numbers".to_string());
     }
@@ -750,6 +757,28 @@ mod golden_snapshot_tests {
         let snapshot = TextSnapshot::golden(input);
         assert_eq!(snapshot.normalized, "br version X.Y.Z (BUILD)");
         assert!(!snapshot.normalized.contains("abc1234"));
+    }
+
+    /// `br doctor`'s `binary_version` check prints the bare `br <semver>` form
+    /// rather than `version <semver>`. Leaving it unmasked pins the crate
+    /// version into the doctor golden and breaks it on every release.
+    #[test]
+    fn test_mask_bare_br_version() {
+        let input = "OK binary_version: Running br 0.2.19; no beads_rust Cargo.toml reachable";
+        let snapshot = TextSnapshot::golden(input);
+        assert_eq!(
+            snapshot.normalized,
+            "OK binary_version: Running br X.Y.Z; no beads_rust Cargo.toml reachable"
+        );
+    }
+
+    /// Prerelease suffixes must be masked with the version they belong to,
+    /// otherwise a `-rc.1` build leaves a dangling fragment in the golden.
+    #[test]
+    fn test_mask_prerelease_version() {
+        let input = "br version 0.2.19-rc.1";
+        let snapshot = TextSnapshot::golden(input);
+        assert_eq!(snapshot.normalized, "br version X.Y.Z");
     }
 
     #[test]
