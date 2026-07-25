@@ -19,7 +19,7 @@ use crate::storage::{BulkDependencyInsert, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -515,6 +515,14 @@ struct TreeNode {
     priority: i32,
     status: String,
     truncated: bool,
+    /// This occurrence's subtree was elided because the same issue was already
+    /// expanded elsewhere in the tree (GitHub #392).
+    ///
+    /// Distinct from `truncated`, which means "children exist but `--max-depth`
+    /// stopped us". A `repeat` node is reachable through more than one parent
+    /// (a diamond); it is still listed under every parent, but only its first
+    /// occurrence carries the expanded subtree.
+    repeat: bool,
 }
 
 /// JSON output for dep cycles
@@ -1349,6 +1357,7 @@ fn build_dep_tree_nodes_global(
     let (dependencies_by_issue, dependents_by_issue) = load_dep_tree_adjacency(storage)?;
 
     let mut nodes = Vec::new();
+    let mut expanded: HashSet<String> = HashSet::new();
 
     let mut queue = vec![DepTreeQueueItem {
         id: root_id.to_string(),
@@ -1390,6 +1399,31 @@ fn build_dep_tree_nodes_global(
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 
+        // Expand each issue at most once for the whole traversal. A node that
+        // is reachable through several parents still gets its own `TreeNode`
+        // under every parent, so diamonds stay visible, but only the first
+        // occurrence expands the subtree beneath it.
+        //
+        // Without this the traversal enumerates every distinct simple path
+        // from the root, so a graph with shared dependencies produces a node
+        // count that grows exponentially with `--max-depth` (GitHub #392: a
+        // 121-issue graph emitted 4.19M nodes at depth 40, and a real
+        // 1,850-issue graph exhausted 64 GiB of RAM). The correct bound is
+        // O(V + E).
+        //
+        // Claim the "already expanded" slot ONLY when this occurrence really
+        // expands. DFS can reach a node at a deeper position first; if a copy
+        // that is itself too deep to expand consumed the slot, a later
+        // shallower copy would be demoted to a childless repeat and its whole
+        // subtree would vanish from the tree.
+        let can_expand_here = item.depth < args.max_depth && !item.id.starts_with("external:");
+        let already_expanded = expanded.contains(&item.id);
+        let expand_now = can_expand_here && !already_expanded;
+        if expand_now {
+            expanded.insert(item.id.clone());
+        }
+        let repeat = already_expanded && !dependencies.is_empty();
+
         nodes.push(TreeNode {
             node_key: node_key.clone(),
             id: item.id.clone(),
@@ -1400,10 +1434,11 @@ fn build_dep_tree_nodes_global(
             priority,
             status,
             truncated,
+            repeat,
         });
 
-        // Don't expand if at max depth
-        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+        // Don't expand if at max depth, or if this subtree is already shown.
+        if expand_now {
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
@@ -1418,7 +1453,6 @@ fn build_dep_tree_nodes_global(
             sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
             // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
-                // No global visited check here
                 queue.push(DepTreeQueueItem {
                     id: dep_id,
                     depth: item.depth + 1,
@@ -1445,6 +1479,7 @@ fn try_build_dep_tree_nodes_local(
     metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
 
     let mut nodes = Vec::new();
+    let mut expanded: HashSet<String> = HashSet::new();
     let mut queue = vec![DepTreeQueueItem {
         id: root_id.to_string(),
         depth: 0,
@@ -1483,6 +1518,20 @@ fn try_build_dep_tree_nodes_local(
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 
+        // Mirrors `build_dep_tree_nodes_global`: expand each issue once, but
+        // still emit an occurrence under every parent (GitHub #392), and only
+        // claim the expansion slot when this occurrence actually expands. The
+        // two builders must stay byte-identical — `dep_tree_local_traversal
+        // _matches_global_nodes` compares their projections including
+        // `node_key`.
+        let can_expand_here = item.depth < args.max_depth && !item.id.starts_with("external:");
+        let already_expanded = expanded.contains(&item.id);
+        let expand_now = can_expand_here && !already_expanded;
+        if expand_now {
+            expanded.insert(item.id.clone());
+        }
+        let repeat = already_expanded && !dependencies.is_empty();
+
         nodes.push(TreeNode {
             node_key: node_key.clone(),
             id: item.id.clone(),
@@ -1493,9 +1542,10 @@ fn try_build_dep_tree_nodes_local(
             priority,
             status,
             truncated,
+            repeat,
         });
 
-        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+        if expand_now {
             if nodes.len().saturating_add(dependencies.len()) > LOCAL_DEP_TREE_NODE_LIMIT {
                 return Ok(None);
             }
@@ -1595,6 +1645,8 @@ fn dep_tree(
                 ""
             } else if node.truncated {
                 "├── (truncated) "
+            } else if node.repeat {
+                "├── (shown above) "
             } else {
                 "├── "
             };
@@ -1750,6 +1802,9 @@ fn build_tree_node_label(node: &TreeNode, theme: &Theme) -> Text {
     );
     if node.truncated {
         label.append_styled(" (truncated)", theme.dimmed.clone());
+    }
+    if node.repeat {
+        label.append_styled(" (shown above)", theme.dimmed.clone());
     }
     label
 }
@@ -2424,6 +2479,7 @@ mod tests {
         i32,
         String,
         bool,
+        bool,
     );
 
     fn tree_node_projection(nodes: &[TreeNode]) -> Vec<TreeNodeProjection> {
@@ -2440,6 +2496,7 @@ mod tests {
                     node.priority,
                     node.status.clone(),
                     node.truncated,
+                    node.repeat,
                 )
             })
             .collect()
@@ -2497,6 +2554,163 @@ mod tests {
 
         assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
         info!("test_dep_tree_local_traversal_matches_global_nodes: assertions passed");
+    }
+
+    /// GitHub #392: a "diamond ladder" (`A_i` depends on `B_i` and `C_i`; both
+    /// depend on `A_{i+1}`) used to emit one node per distinct simple path, so
+    /// the node count doubled with every rung and grew without bound as
+    /// `--max-depth` rose. The output is now bounded by the graph size no
+    /// matter how deep the traversal is allowed to go.
+    #[test]
+    fn test_dep_tree_diamond_ladder_is_bounded_by_graph_size() {
+        const RUNGS: usize = 12;
+
+        init_test_logging();
+        info!("test_dep_tree_diamond_ladder_is_bounded_by_graph_size: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let a_id = |i: usize| format!("bd-a{i:03}");
+        let b_id = |i: usize| format!("bd-b{i:03}");
+        let c_id = |i: usize| format!("bd-c{i:03}");
+
+        for index in 0..=RUNGS {
+            let issue = make_test_issue(&a_id(index), &format!("A{index}"));
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        for index in 0..RUNGS {
+            for id in [b_id(index), c_id(index)] {
+                let issue = make_test_issue(&id, &format!("Rung {index}"));
+                storage.create_issue(&issue, "tester").unwrap();
+            }
+        }
+        for index in 0..RUNGS {
+            for id in [b_id(index), c_id(index)] {
+                storage
+                    .add_dependency(&a_id(index), &id, "blocks", "tester")
+                    .unwrap();
+                storage
+                    .add_dependency(&id, &a_id(index + 1), "blocks", "tester")
+                    .unwrap();
+            }
+        }
+
+        let total_issues = 3 * RUNGS + 1;
+        // Each rung contributes A->B, A->C, B->A', C->A'.
+        let total_edges = 4 * RUNGS;
+        let root_issue = storage.get_issue(&a_id(0)).unwrap().unwrap();
+        let external_statuses = HashMap::new();
+
+        let node_count_at = |max_depth: usize| {
+            let args = dep_tree_test_args(&a_id(0), DepDirection::Down, max_depth);
+            build_dep_tree_nodes_global(&args, &storage, &a_id(0), &root_issue, &external_statuses)
+                .unwrap()
+        };
+
+        // Depth far beyond the ladder length: the pre-fix traversal emitted
+        // 2^RUNGS-scale node counts here.
+        let global = node_count_at(500);
+
+        // Every issue is expanded once, so the emitted occurrences are the root
+        // plus one per edge walked out of an expanded node — O(V + E), not one
+        // node per distinct simple path.
+        assert_eq!(
+            global.len(),
+            total_edges + 1,
+            "expected O(V+E) nodes for a {total_issues}-issue / {total_edges}-edge graph"
+        );
+
+        // The real regression signature: node count must not grow with depth
+        // once the traversal has covered the graph.
+        assert_eq!(
+            node_count_at(40).len(),
+            global.len(),
+            "node count must not grow with --max-depth"
+        );
+
+        // Every issue in the ladder is still reachable in the rendered tree.
+        let rendered: HashSet<&str> = global.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(rendered.len(), total_issues);
+
+        // The shared `A_{i+1}` rungs are reached through both B and C, so
+        // exactly one occurrence of each expands and the traversal is finite.
+        let repeats = global.iter().filter(|node| node.repeat).count();
+        assert!(
+            repeats > 0,
+            "diamond joins should be marked as repeat occurrences"
+        );
+
+        info!("test_dep_tree_diamond_ladder_is_bounded_by_graph_size: assertions passed");
+    }
+
+    /// A node reachable at two different depths must still expand at the
+    /// shallow one even if the deep occurrence was visited first.
+    ///
+    /// DFS reaches the deeper copy first here. If the traversal claimed the
+    /// "already expanded" slot for an occurrence that was itself too deep to
+    /// expand, the shallow copy would render as a childless repeat and the
+    /// subtree under it would disappear from the tree entirely.
+    #[test]
+    fn test_dep_tree_expands_shallow_occurrence_reached_after_deep_one() {
+        init_test_logging();
+        info!("test_dep_tree_expands_shallow_occurrence_reached_after_deep_one: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        for (id, title) in [
+            ("bd-root", "Root"),
+            ("bd-a-mid", "A mid"),
+            ("bd-x-shared", "X shared"),
+            ("bd-y-leaf", "Y leaf"),
+        ] {
+            let issue = make_test_issue(id, title);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // Root -> A (sorts first) and Root -> X directly; A -> X makes X
+        // reachable at depth 1 and depth 2. X -> Y is the subtree at risk.
+        storage
+            .add_dependency("bd-root", "bd-a-mid", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-root", "bd-x-shared", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-a-mid", "bd-x-shared", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-x-shared", "bd-y-leaf", "blocks", "tester")
+            .unwrap();
+
+        // Y sits at depth 2 via the shallow X, exactly at the depth limit.
+        let args = dep_tree_test_args("bd-root", DepDirection::Down, 2);
+        let root_issue = storage.get_issue("bd-root").unwrap().unwrap();
+        let external_statuses = HashMap::new();
+
+        let global = build_dep_tree_nodes_global(
+            &args,
+            &storage,
+            "bd-root",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap();
+        assert!(
+            global.iter().any(|node| node.id == "bd-y-leaf"),
+            "the subtree under the shallow occurrence must still be rendered: {:?}",
+            global.iter().map(|n| (&n.id, n.depth)).collect::<Vec<_>>()
+        );
+
+        let local = try_build_dep_tree_nodes_local(
+            &args,
+            &storage,
+            "bd-root",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap()
+        .expect("small tree should use local traversal");
+        assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
+
+        info!("test_dep_tree_expands_shallow_occurrence_reached_after_deep_one: assertions passed");
     }
 
     #[test]
@@ -2805,6 +3019,7 @@ mod tests {
             priority: 1,
             status: "blocked".to_string(),
             truncated: true,
+            repeat: false,
         };
         let theme = Theme::default();
         let label = build_tree_node_label(&node, &theme);

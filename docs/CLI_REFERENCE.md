@@ -895,6 +895,16 @@ br dep tree bd-123
 br dep cycles
 ```
 
+An issue reachable through more than one parent (a diamond) is listed under
+every parent, but only its first occurrence expands the subtree beneath it.
+Later occurrences are marked `(shown above)` in text output and carry
+`"repeat": true` in `--json`. This keeps the output bounded by the size of the
+dependency graph instead of by the number of distinct paths through it, which
+is what made deep traversals of shared-dependency graphs explode
+([#392](https://github.com/Dicklesworthstone/beads_rust/issues/392)).
+`truncated` is unrelated and still means "children exist but `--max-depth`
+stopped the walk".
+
 ---
 
 ### graph
