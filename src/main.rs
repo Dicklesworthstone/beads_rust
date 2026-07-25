@@ -1281,8 +1281,14 @@ fn lock_mode_octal(_lock_path: &Path) -> Option<String> {
 }
 
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
+    // `--lock-timeout` deliberately does NOT disable the fast path. The
+    // timeout governs how long to wait *when a lock is required*, and a
+    // read-only fast open acquires none; on a fast-open miss the fallback
+    // still takes the write lock and honors the timeout. Gating on it meant
+    // any scripted caller that passed `--lock-timeout` silently lost lock-free
+    // reads and serialized every read command behind an exclusive flock,
+    // which shows up as spurious lock-timeout failures under parallel reads.
     let read_only_fast_open = !cli.no_db
-        && cli.lock_timeout.is_none()
         && !read_only_fast_open_disabled_for_cli()
         && supports_read_only_fast_open(&cli.command)
         && cli.no_auto_import
