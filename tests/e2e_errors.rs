@@ -2019,6 +2019,7 @@ fn e2e_structured_error_not_initialized() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_transition_required_fields_are_structured_fresh_and_atomic() {
     let _log = common::test_log("e2e_transition_required_fields_are_structured_fresh_and_atomic");
     let workspace = BrWorkspace::new();

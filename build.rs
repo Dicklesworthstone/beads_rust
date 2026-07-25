@@ -4,12 +4,12 @@
 //! optional repository metadata.
 
 use std::{env, process::Command};
-use vergen_gix::{BuildBuilder, CargoBuilder, Emitter, RustcBuilder};
+use vergen_gix::{Build, Cargo, Emitter, Rustc};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let build = BuildBuilder::default().build_timestamp(true).build()?;
-    let cargo = CargoBuilder::default().target_triple(true).build()?;
-    let rustc = RustcBuilder::default().semver(true).build()?;
+    let build = Build::builder().build_timestamp(true).build();
+    let cargo = Cargo::builder().target_triple(true).build();
+    let rustc = Rustc::builder().semver(true).build();
 
     let mut emitter = Emitter::default();
     emitter

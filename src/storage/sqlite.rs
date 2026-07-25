@@ -2041,6 +2041,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the issue is missing or the database write fails.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_scoped_gate_result(
         &self,
         issue_id: &str,
@@ -3531,7 +3532,6 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the issue doesn't exist or the update fails.
-    #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
         let updates = [(id.to_string(), updates.clone())];
         self.update_issues_atomically(&updates, actor)?
@@ -3539,6 +3539,7 @@ impl SqliteStorage {
             .ok_or_else(|| BeadsError::IssueNotFound { id: id.to_string() })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn enforce_workflow_transition_batch_in_tx(
         conn: &Connection,
         workflow: &crate::close_policy::Workflow,
@@ -14657,6 +14658,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn gate_pass_is_scoped_to_status_revision_and_history_is_preserved() {
         let mut workflow = crate::close_policy::Workflow {
             strict: true,
