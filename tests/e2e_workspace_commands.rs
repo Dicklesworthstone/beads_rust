@@ -470,8 +470,7 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
     // holding this connection across it makes the engine refuse with
     // "unable to open database file" instead of repairing.
     {
-        let conn =
-            Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
         conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
             .expect("insert duplicate config row a");
         conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
@@ -881,7 +880,22 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
     // Parse the JSON output regardless of exit code.
     let doctor_json: Value =
         serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor json");
-    // Doctor should detect the sidecar anomaly (error or warning) or auto-repair it.
+
+    // The anomaly here is the WAL's *contents* (20 bytes of garbage), not the
+    // sidecar pairing. `db.sidecars` only classifies which sidecars exist, and
+    // a WAL without a matching SHM is the normal frankensqlite state, so it
+    // reports `ok` with an informational message. The content anomaly surfaces
+    // in the reliability audit as `truncated_wal`. Accept either signal: what
+    // must hold is that doctor reports the planted anomaly somewhere
+    // authoritative, not that one particular check changes status.
+    let audit_flags_truncated_wal = doctor_json["reliability_audit"]["anomalies"]
+        .as_array()
+        .is_some_and(|anomalies| {
+            anomalies
+                .iter()
+                .any(|anomaly| anomaly["code"] == "truncated_wal")
+        });
+
     if let Some(checks) = doctor_json["checks"].as_array() {
         let has_sidecar_check = checks.iter().any(|check| {
             check["name"] == "db.sidecars"
@@ -892,8 +906,10 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
         // If checks array exists and has items, expect to find the sidecar check
         if !checks.is_empty() {
             assert!(
-                has_sidecar_check,
-                "doctor should surface the sidecar anomaly: {doctor_json}"
+                has_sidecar_check || audit_flags_truncated_wal,
+                "doctor should surface the planted WAL anomaly either as a non-ok \
+                 db.sidecars check or as a `truncated_wal` reliability-audit anomaly: \
+                 {doctor_json}"
             );
         }
     }

@@ -22,7 +22,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 use tracing::info;
 

@@ -69,8 +69,7 @@ static OWNER_RE: LazyLock<Regex> =
 /// `br doctor`'s `binary_version` check prints. Without the latter the doctor
 /// snapshot carries the crate version verbatim and breaks on every release.
 static VERSION_NUM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b(version|br) \d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?")
-        .expect("version number regex")
+    Regex::new(r"\b(version|br) \d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?").expect("version number regex")
 });
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));

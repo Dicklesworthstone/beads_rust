@@ -225,7 +225,8 @@ fn normalize_bv_robot_output_masks_semver_pseudo_versions() {
 
 #[test]
 fn normalize_bv_robot_output_masks_data_hash() {
-    let raw = r#"{"generated_at":"2026-07-25T14:00:00Z","data_hash":"e81c9b30773152f2","id":"bd-one"}"#;
+    let raw =
+        r#"{"generated_at":"2026-07-25T14:00:00Z","data_hash":"e81c9b30773152f2","id":"bd-one"}"#;
 
     assert_eq!(
         normalize_bv_robot_output(raw),

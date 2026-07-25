@@ -480,7 +480,11 @@ mod tests {
     #[test]
     fn isolated_temp_root_is_beads_free_and_usable() {
         let root = isolated_temp_root();
-        assert!(root.is_dir(), "temp root {} is not a directory", root.display());
+        assert!(
+            root.is_dir(),
+            "temp root {} is not a directory",
+            root.display()
+        );
         assert!(
             !is_inside_beads_workspace(&root),
             "temp root {} sits inside a beads workspace",

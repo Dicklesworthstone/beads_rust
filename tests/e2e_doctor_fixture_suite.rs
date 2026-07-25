@@ -13,6 +13,9 @@
 //! test binary every time. The Rust test exists to wire the suite into
 //! `cargo test` and the CI pipeline.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -48,6 +51,15 @@ fn doctor_fixture_suite_passes() {
         // run all fixtures even if one fails so the diagnostic shows the
         // full failure inventory.
         .env("FAIL_FAST", "0")
+        // A host with `br` installed in more than one $PATH directory (the
+        // documented `~/.local/bin` vs `~/.cargo/bin` split) makes every
+        // fixture's `br doctor` emit a `br_path_dupes` WARN, which fails
+        // `healthy_workspace_baseline` for a reason that has nothing to do
+        // with the workspace under test. Drop only the later `br` directories,
+        // so `sqlite3`, `jq`, and `bash` stay reachable — several fixtures
+        // shell out to them. The `multiple_br_in_path` fixture builds its own
+        // $PATH, so duplicate detection is still exercised deliberately.
+        .env("PATH", common::cli::deduplicated_br_path())
         // Strip developer env that might confuse `br doctor` discovery.
         .env_remove("BD_DB")
         .env_remove("BD_DATABASE")

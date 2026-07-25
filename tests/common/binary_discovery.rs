@@ -10,7 +10,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Minimum bd version required for conformance testing.
-const MIN_BD_VERSION: &str = "0.5.0";
+///
+/// The suite is written against bd **v0.46.0** — the version named in the
+/// `#[ignore]` ledger in `tests/conformance.rs` and the one
+/// `.github/workflows/conformance.yml` pins. Older releases are missing flags
+/// the tests drive (`bd defer --until`, for one), so they produce failures that
+/// describe bd's history rather than a br defect.
+///
+/// This floor used to read `0.5.0`, which admitted the entire 0.4x line: the
+/// comparison is numeric per component, so `0.40.0` compares *greater* than
+/// `0.5.0` (40 > 5) and sailed through.
+const MIN_BD_VERSION: &str = "0.46.0";
 
 /// First bd version that abandoned the "classic" architecture br is frozen against.
 ///
@@ -471,9 +481,15 @@ mod tests {
         };
 
         // Classic line: SQLite primary storage, JSONL export.
-        assert!(in_window("0.46.0"), "v0.46.0 is the documented reference");
-        assert!(in_window("0.5.0"), "minimum is inclusive");
+        assert!(in_window("0.46.0"), "minimum is inclusive");
+        assert!(in_window("0.47.2"));
         assert!(in_window("0.49.6"), "last classic release");
+
+        // Pre-0.46 releases compare numerically per component, so a naive floor
+        // of "0.5.0" would admit the whole 0.4x line (40 > 5). They lack flags
+        // the suite drives, e.g. `bd defer --until`.
+        assert!(!in_window("0.40.0"), "0.4x must not slip past the floor");
+        assert!(!in_window("0.45.0"));
 
         // Dolt-default line.
         assert!(!in_window("0.50.0"), "maximum is exclusive");
