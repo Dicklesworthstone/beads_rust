@@ -3034,7 +3034,9 @@ fn check_sync_metadata(
 ) {
     // Get metadata for diagnostic details
     let last_import: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'last_import_time'")
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'last_import_time' ORDER BY rowid DESC LIMIT 1",
+        )
         .ok()
         .and_then(|row| {
             row.get(0)
@@ -3044,7 +3046,9 @@ fn check_sync_metadata(
         });
 
     let last_export: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'last_export_time'")
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'last_export_time' ORDER BY rowid DESC LIMIT 1",
+        )
         .ok()
         .and_then(|row| {
             row.get(0)
@@ -3054,7 +3058,9 @@ fn check_sync_metadata(
         });
 
     let jsonl_hash: Option<String> = conn
-        .query_row("SELECT value FROM metadata WHERE key = 'jsonl_content_hash'")
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'jsonl_content_hash' ORDER BY rowid DESC LIMIT 1",
+        )
         .ok()
         .and_then(|row| {
             row.get(0)

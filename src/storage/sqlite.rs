@@ -671,15 +671,12 @@ impl SqliteStorage {
     }
 
     fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
-        let updated = conn.execute_with_params(
-            "UPDATE metadata SET value = ? WHERE key = ? AND value != ?",
-            &[
-                SqliteValue::from(value),
-                SqliteValue::from(key),
-                SqliteValue::from(value),
-            ],
-        )?;
-        if updated == 0 && !Self::metadata_equals(conn, key, value)? {
+        if Self::metadata_key_exists(conn, key)? {
+            conn.execute_with_params(
+                "UPDATE metadata SET value = ? WHERE key = ?",
+                &[SqliteValue::from(value), SqliteValue::from(key)],
+            )?;
+        } else {
             conn.execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
@@ -718,7 +715,7 @@ impl SqliteStorage {
 
     fn metadata_equals(conn: &Connection, key: &str, expected: &str) -> Result<bool> {
         match conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row.get(0).and_then(SqliteValue::as_text) == Some(expected)),
@@ -8878,7 +8875,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
         match self.conn.query_row_with_params(
-            "SELECT value FROM metadata WHERE key = ?",
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
             &[SqliteValue::from(key)],
         ) {
             Ok(row) => Ok(row
@@ -20400,6 +20397,62 @@ mod tests {
             Some("false".to_string())
         );
         assert_eq!(storage.get_metadata(BLOCKED_CACHE_STATE_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn test_metadata_updates_harmonize_duplicate_rows() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("metadata-duplicates.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from("last_import_time"),
+                    SqliteValue::from("2026-06-05T07:15:43Z"),
+                ],
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from("last_import_time"),
+                    SqliteValue::from("2026-06-07T05:10:12Z"),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.get_metadata("last_import_time").unwrap(),
+            Some("2026-06-07T05:10:12Z".to_string())
+        );
+
+        storage
+            .set_metadata("last_import_time", "2026-06-07T05:22:00Z")
+            .unwrap();
+
+        let rows = storage
+            .conn
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
+                &[SqliteValue::from("last_import_time")],
+            )
+            .unwrap();
+        let values: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+            .collect();
+
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().all(|value| value == "2026-06-07T05:22:00Z"));
+        assert_eq!(
+            storage.get_metadata("last_import_time").unwrap(),
+            Some("2026-06-07T05:22:00Z".to_string())
+        );
     }
 
     /// Regression: the Drop checkpoint heuristic from #270 fires only
