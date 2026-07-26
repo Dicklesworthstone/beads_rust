@@ -10648,6 +10648,111 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Mirror of [`Self::get_blocking_dependents_for_issue_ids`]: for each id,
+    /// the issues it *depends on* rather than the issues that depend on it.
+    ///
+    /// Backs `br graph --dependencies` (`beads_rust-mf72`), which answers "what
+    /// is blocking this?" where the default walk answers "what does closing
+    /// this unblock?". The two queries are exact inverses, including the
+    /// `parent-child` special case, which the dependents query deliberately
+    /// walks the other way round.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocking_dependencies_for_issue_ids(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
+        let chunk_size = SQLITE_VAR_LIMIT.saturating_div(2).max(1);
+        for chunk in issue_ids.chunks(chunk_size) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT root_id, dependency_id, title, status, priority, type
+                 FROM (
+                     SELECT d.issue_id AS root_id,
+                            d.depends_on_id AS dependency_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.depends_on_id = i.id
+                      WHERE d.issue_id IN ({placeholders})
+                        AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                     UNION ALL
+                     SELECT d.depends_on_id AS root_id,
+                            d.issue_id AS dependency_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.issue_id = i.id
+                      WHERE d.depends_on_id IN ({placeholders})
+                        AND d.type = 'parent-child'
+                 )
+                 ORDER BY COALESCE(priority, 2) ASC, created_at DESC, dependency_id ASC",
+                placeholders = placeholders.join(",")
+            );
+            let mut params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            params.extend(
+                chunk
+                    .iter()
+                    .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+            );
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(root_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(dependency_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let dep_type = row
+                    .get(5)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("blocks")
+                    .to_string();
+                let title = row.get(2).and_then(SqliteValue::as_text);
+                let status = row.get(3).and_then(SqliteValue::as_text);
+                let priority = row.get(4).and_then(SqliteValue::as_integer);
+
+                let meta = match (title, status, priority) {
+                    (Some(title), Some(status), Some(priority)) => IssueWithDependencyMetadata {
+                        id: dependency_id.to_string(),
+                        title: title.to_string(),
+                        status: parse_status(Some(status)),
+                        priority: Priority(i32::try_from(priority).unwrap_or(2)),
+                        dep_type,
+                    },
+                    _ => IssueWithDependencyMetadata {
+                        id: dependency_id.to_string(),
+                        title: format!("[missing issue: {dependency_id}]"),
+                        status: Status::Tombstone,
+                        priority: Priority::MEDIUM,
+                        dep_type,
+                    },
+                };
+
+                map.entry(root_id.to_string()).or_default().push(meta);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count dependencies and dependents for multiple issues with one round-trip per chunk.
     ///
     /// # Errors

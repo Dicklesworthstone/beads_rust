@@ -1398,3 +1398,96 @@ fn test_dep_add_each_supported_type_against_full_matrix() {
         "expected {added_count} deps, got {deps:?}"
     );
 }
+
+// ============================================================================
+// DIRECTIONAL BATCH QUERIES (beads_rust-mf72)
+// ============================================================================
+
+/// `get_blocking_dependencies_for_issue_ids` backs `br graph --dependencies`
+/// and must be the exact inverse of the dependents query that backs the
+/// default walk. Asserting the inverse relation — rather than each query's
+/// rows independently — is what keeps the two graph directions consistent.
+#[test]
+fn blocking_dependencies_batch_is_the_inverse_of_blocking_dependents() {
+    let mut storage = test_db();
+
+    // A depends on B, B depends on C. C blocks B blocks A.
+    let (a, b, c) = (
+        fixtures::issue("dir-a"),
+        fixtures::issue("dir-b"),
+        fixtures::issue("dir-c"),
+    );
+    for issue in [&a, &b, &c] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+    storage
+        .add_dependency(&a.id, &b.id, DependencyType::Blocks.as_str(), "tester")
+        .unwrap();
+    storage
+        .add_dependency(&b.id, &c.id, DependencyType::Blocks.as_str(), "tester")
+        .unwrap();
+
+    let ids: Vec<String> = vec![a.id.clone(), b.id.clone(), c.id.clone()];
+    let dependents = storage.get_blocking_dependents_for_issue_ids(&ids).unwrap();
+    let dependencies = storage
+        .get_blocking_dependencies_for_issue_ids(&ids)
+        .unwrap();
+
+    let neighbours = |map: &std::collections::HashMap<
+        String,
+        Vec<beads_rust::format::IssueWithDependencyMetadata>,
+    >,
+                      id: &str|
+     -> Vec<String> {
+        let mut out: Vec<String> = map
+            .get(id)
+            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    };
+
+    // Dependents: who is blocked by me.
+    assert_eq!(neighbours(&dependents, &c.id), vec![b.id.clone()]);
+    assert_eq!(neighbours(&dependents, &b.id), vec![a.id.clone()]);
+    assert!(neighbours(&dependents, &a.id).is_empty());
+
+    // Dependencies: who blocks me. Exactly the reverse of the above.
+    assert_eq!(neighbours(&dependencies, &a.id), vec![b.id.clone()]);
+    assert_eq!(neighbours(&dependencies, &b.id), vec![c.id.clone()]);
+    assert!(neighbours(&dependencies, &c.id).is_empty());
+
+    // State the inverse relation directly: `x` is a dependent of `y` if and
+    // only if `y` is a dependency of `x`.
+    for id in &ids {
+        for neighbour in neighbours(&dependents, id) {
+            assert!(
+                neighbours(&dependencies, &neighbour).contains(id),
+                "{neighbour} lists {id} as a dependent but not the reverse"
+            );
+        }
+        for neighbour in neighbours(&dependencies, id) {
+            assert!(
+                neighbours(&dependents, &neighbour).contains(id),
+                "{neighbour} lists {id} as a dependency but not the reverse"
+            );
+        }
+    }
+}
+
+#[test]
+fn blocking_dependencies_batch_handles_empty_input_and_unknown_ids() {
+    let storage = test_db();
+    assert!(
+        storage
+            .get_blocking_dependencies_for_issue_ids(&[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .get_blocking_dependencies_for_issue_ids(&["dir-missing".to_string()])
+            .unwrap()
+            .is_empty()
+    );
+}

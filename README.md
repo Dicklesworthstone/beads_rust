@@ -493,6 +493,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `epic` | Manage epic rollups | `br epic status --eligible-only` |
 | `graph` | Show what an issue unblocks (its dependents) | `br graph br-abc123` |
+| `graph --dependencies` | Show what is blocking an issue | `br graph br-abc123 --dependencies` |
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |

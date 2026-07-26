@@ -3219,12 +3219,15 @@ pub struct QueryDeleteArgs {
 
 /// Arguments for the graph command.
 ///
-/// The traversal follows *dependents* — issues blocked by the root — so
-/// `br graph <id>` answers "what does closing this unblock?". An issue that is
-/// itself blocked and blocks nothing therefore reports no dependents; use
-/// `br dep tree <id>` or `br show <id>` to see what it is waiting on. This is a
-/// deliberate divergence from classic `bd`, whose `graph` walks dependencies
-/// (`beads_rust-mf72`).
+/// The traversal follows *dependents* by default — issues blocked by the root —
+/// so `br graph <id>` answers "what does closing this unblock?". An issue that
+/// is itself blocked and blocks nothing therefore reports no dependents. This
+/// is a deliberate divergence from classic `bd`, whose `graph` walks
+/// dependencies (`beads_rust-mf72`).
+///
+/// `--dependencies` walks the other way — "what is blocking this?" — so one
+/// command covers both directions. `br dep tree <id>` remains the
+/// dependency-shaped view for a single issue.
 #[derive(Args, Debug, Clone, Default)]
 pub struct GraphArgs {
     /// Issue ID (root of the dependents graph). Required unless --all is specified.
@@ -3234,6 +3237,10 @@ pub struct GraphArgs {
     /// Show graph for all `open`/`in_progress`/`blocked` issues (connected components)
     #[arg(long)]
     pub all: bool,
+
+    /// Walk dependencies instead of dependents: what is blocking this issue
+    #[arg(long, conflicts_with = "all")]
+    pub dependencies: bool,
 
     /// One line per issue (compact output)
     #[arg(long)]
