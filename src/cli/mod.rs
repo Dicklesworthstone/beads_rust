@@ -821,7 +821,7 @@ pub enum Commands {
         command: GateCommands,
     },
 
-    /// Visualize dependency graph
+    /// Visualize the dependents graph: what an issue unblocks
     Graph(GraphArgs),
 
     /// Manage local history backups
@@ -3218,9 +3218,16 @@ pub struct QueryDeleteArgs {
 }
 
 /// Arguments for the graph command.
+///
+/// The traversal follows *dependents* — issues blocked by the root — so
+/// `br graph <id>` answers "what does closing this unblock?". An issue that is
+/// itself blocked and blocks nothing therefore reports no dependents; use
+/// `br dep tree <id>` or `br show <id>` to see what it is waiting on. This is a
+/// deliberate divergence from classic `bd`, whose `graph` walks dependencies
+/// (`beads_rust-mf72`).
 #[derive(Args, Debug, Clone, Default)]
 pub struct GraphArgs {
-    /// Issue ID (root of graph). Required unless --all is specified.
+    /// Issue ID (root of the dependents graph). Required unless --all is specified.
     #[arg(add = ArgValueCompleter::new(open_issue_id_completer))]
     pub issue: Option<String>,
 
