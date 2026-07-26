@@ -3496,7 +3496,9 @@ mod tests {
 
     #[test]
     fn test_git_export_status_unavailable_outside_git_repo() {
-        let temp = TempDir::new().unwrap();
+        // Must sit outside any checkout: a TMPDIR inside one would make this
+        // temp dir part of a real git repo and the status would be available.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
         let jsonl_path = temp.path().join("issues.jsonl");
         fs::write(&jsonl_path, "{\"id\":\"bd-x\"}\n").unwrap();
 

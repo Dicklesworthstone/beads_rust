@@ -5084,7 +5084,9 @@ labels:
 
     #[test]
     fn discover_beads_dir_returns_error_when_not_found() {
-        let temp = TempDir::new().expect("tempdir");
+        // Discovery walks every ancestor with no boundary, so this must start
+        // outside any beads workspace or it finds the enclosing repo's.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
         // No .beads directory created
 
         let result = discover_beads_dir(Some(temp.path()));
@@ -5252,7 +5254,7 @@ labels:
 
     #[test]
     fn discover_beads_dir_with_cli_from_errors_for_external_cli_db_override_without_workspace() {
-        let temp = TempDir::new().expect("tempdir");
+        let temp = crate::util::test_helpers::isolated_temp_dir();
         let start = temp.path().join("nested").join("dir");
         fs::create_dir_all(&start).expect("create nested dir");
 
@@ -5279,7 +5281,7 @@ labels:
 
     #[test]
     fn discover_beads_dir_with_cli_from_errors_for_external_db_override_without_workspace() {
-        let temp = TempDir::new().expect("tempdir");
+        let temp = crate::util::test_helpers::isolated_temp_dir();
         let start = temp.path().join("nested").join("dir");
         fs::create_dir_all(&start).expect("create nested dir");
 
