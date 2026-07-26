@@ -730,6 +730,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "fm-state_files-recovery-artifacts-orphaned",
     ),
     (
+        "db.foreign_recovery_debris",
+        "fm-state_files-recovery-artifacts-orphaned",
+    ),
+    (
         "db.export_hash_cache",
         "fm-caches_indexes-export-hash-cache-divergence",
     ),
@@ -2123,6 +2127,177 @@ fn recovery_artifacts_for_db_family(beads_dir: &Path, db_path: &Path) -> Result<
 /// follow-up cycle. 30 days matches the pass-1 archaeology spec
 /// (`fm-state_files-recovery-artifacts-orphaned`).
 const RECOVERY_AGED_TTL_DAYS: u64 = 30;
+
+/// Upper bound on filesystem entries visited while sizing foreign debris, so a
+/// pathological tree cannot make `br doctor` slow. Reaching it sets
+/// `truncated`, and the reported byte count becomes a lower bound.
+const FOREIGN_DEBRIS_SCAN_LIMIT: usize = 4096;
+
+/// `beads_rust-jwrr`: recovery copies left inside `.beads/` by something other
+/// than br.
+///
+/// br writes exactly two directories — `.br_recovery/` and `.br_history/` —
+/// and never copies a directory tree. But `.beads/` accumulates manual backups
+/// from other tools and from ad-hoc agent sessions, with names like
+/// `recovery_<TS>`, `recovery_snapshot_<TS>`, `snapshot_<TS>`,
+/// `.beads_snapshot` and `<db>.rebuild_<TS>`. A session that runs
+/// `cp -r .beads .beads/recovery_<TS>` copies `.beads` into itself, so those
+/// trees nest and compound; one observed workspace reached gigabytes against a
+/// database of tens of megabytes.
+///
+/// br cannot safely remove any of it — it did not create it and cannot know
+/// what it is — so this is reported for the operator to act on and is never
+/// auto-repaired.
+fn is_foreign_recovery_debris_dir_name(name: &str) -> bool {
+    // br's own state directories are `.br_recovery` and `.br_history`; never
+    // report those as foreign.
+    if name.starts_with(".br_") {
+        return false;
+    }
+    name.starts_with("recovery") || name.starts_with("snapshot") || name.starts_with(".beads_snap")
+}
+
+/// Loose sibling copies of the database left by a manual rebuild. The `.bad_*`
+/// spelling is already covered by [`recovery_artifacts_for_db_family`].
+fn is_foreign_recovery_debris_file_name(name: &str, db_prefix: &str) -> bool {
+    name.starts_with(&format!("{db_prefix}.rebuild_"))
+}
+
+/// What [`check_foreign_recovery_debris`] found. Byte counts come from
+/// `fs::metadata` on regular files only; symlinks and specials are counted as
+/// entries but contribute no bytes.
+#[derive(Debug, Default)]
+struct ForeignRecoveryDebris {
+    directories: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+    bytes: u64,
+    truncated: bool,
+}
+
+impl ForeignRecoveryDebris {
+    fn is_empty(&self) -> bool {
+        self.directories.is_empty() && self.files.is_empty()
+    }
+}
+
+/// Add up the regular-file bytes under `root`, visiting at most `remaining`
+/// entries. Returns the bytes found and whether the budget ran out.
+fn bounded_tree_bytes(root: &Path, remaining: &mut usize) -> (u64, bool) {
+    let mut bytes = 0_u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if *remaining == 0 {
+                return (bytes, true);
+            }
+            *remaining -= 1;
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+                Ok(ft) if ft.is_file() => {
+                    bytes = bytes.saturating_add(entry.metadata().map_or(0, |m| m.len()));
+                }
+                _ => {}
+            }
+        }
+    }
+    (bytes, false)
+}
+
+/// Scan one level of `.beads/` for foreign recovery debris and size it.
+fn scan_foreign_recovery_debris(beads_dir: &Path, db_path: &Path) -> Result<ForeignRecoveryDebris> {
+    let db_prefix = db_family_prefix(db_path);
+    let mut found = ForeignRecoveryDebris::default();
+    let mut budget = FOREIGN_DEBRIS_SCAN_LIMIT;
+
+    if !beads_dir.is_dir() {
+        return Ok(found);
+    }
+    for entry in fs::read_dir(beads_dir)?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() && is_foreign_recovery_debris_dir_name(&name) {
+            let (bytes, truncated) = bounded_tree_bytes(&entry.path(), &mut budget);
+            found.bytes = found.bytes.saturating_add(bytes);
+            found.truncated |= truncated;
+            found.directories.push(entry.path());
+        } else if file_type.is_file() && is_foreign_recovery_debris_file_name(&name, db_prefix) {
+            found.bytes = found
+                .bytes
+                .saturating_add(entry.metadata().map_or(0, |m| m.len()));
+            found.files.push(entry.path());
+        }
+    }
+
+    found.directories.sort();
+    found.files.sort();
+    Ok(found)
+}
+
+/// Report foreign recovery debris as an **informational** `Ok` check.
+///
+/// Deliberately not a warning: br did not create these artifacts, cannot
+/// classify them, and must not make `br doctor` exit non-zero — breaking a CI
+/// gate — over leftovers from a different tool in an otherwise healthy
+/// workspace. The finding still appears in the human report and in `--json`,
+/// which is what the operator needs to reclaim the space themselves.
+fn check_foreign_recovery_debris(
+    beads_dir: &Path,
+    db_path: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Result<()> {
+    let found = scan_foreign_recovery_debris(beads_dir, db_path)?;
+    if found.is_empty() {
+        push_check(
+            checks,
+            "db.foreign_recovery_debris",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+        return Ok(());
+    }
+
+    let approx = if found.truncated { "at least " } else { "" };
+    let message = format!(
+        "{} foreign recovery artifact(s) in .beads/ were not created by br \
+         ({} director{}, {} file(s), {approx}{:.1} MB); br will not remove them",
+        found.directories.len() + found.files.len(),
+        found.directories.len(),
+        if found.directories.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        found.files.len(),
+        found.bytes as f64 / (1024.0 * 1024.0),
+    );
+    let display = |paths: &[PathBuf]| -> Vec<String> {
+        paths.iter().map(|p| p.display().to_string()).collect()
+    };
+    push_check(
+        checks,
+        "db.foreign_recovery_debris",
+        CheckStatus::Ok,
+        Some(message),
+        Some(serde_json::json!({
+            "directories": display(&found.directories),
+            "files": display(&found.files),
+            "bytes": found.bytes,
+            "bytes_are_lower_bound": found.truncated,
+            "remediation": "Inspect with `du -sh .beads/*` and remove what you \
+                            no longer need. br never created these and will \
+                            not delete them.",
+            "finding_id": "fm-state_files-recovery-artifacts-orphaned",
+        })),
+    );
+    Ok(())
+}
 
 /// Subset of `recovery_artifacts_for_db_family` whose mtime is older than
 /// `now - RECOVERY_AGED_TTL_DAYS`. Pure: no mutations, only `fs::metadata`
@@ -3729,12 +3904,32 @@ fn fix_db_bloat_via_vacuum_if_warned(
     }
 }
 
-/// Open the database, run `VACUUM`, close. Used by
+/// Compact the database via `VACUUM INTO` + atomic rename. Used by
 /// [`fix_db_bloat_via_vacuum_if_warned`] under the chokepoint's
 /// legacy-mutation wrapper so the DB family is snapshotted for undo.
+///
+/// `beads_rust-ote7`: this used to run an in-place `VACUUM`, which the engine
+/// refuses on any database whose header page count disagrees with its file
+/// length — "database image header page count 360 does not match file length
+/// page count 4968" — i.e. exactly the bloated databases this fixer exists to
+/// compact. The failure was reported as "No errors detected; nothing to
+/// repair."
+///
+/// In-place `VACUUM` only ever succeeded on such a file when some earlier
+/// command had already committed a write, because a commit makes the engine
+/// publish the *file-length-derived* page count into the header, absorbing any
+/// trailing bytes as database pages (see
+/// `docs/fsqlite_trailing_pages_report.md`). Depending on that is not a
+/// behavior worth preserving: it means the repair only worked after the
+/// database had already been silently corrupted.
+///
+/// `VACUUM INTO` needs no such precondition. It writes a fresh image from the
+/// logical page set, so trailing slack is simply not carried over, the product
+/// verifies `ok` under both the engine and the system `sqlite3`, and the
+/// original is untouched until the atomic rename.
 fn vacuum_database(db_path: &Path) -> Result<()> {
     let storage = SqliteStorage::open(db_path)?;
-    storage.execute_raw("VACUUM")?;
+    config::compact_database_via_vacuum_into_in_place(storage, db_path, None)?;
     Ok(())
 }
 
@@ -10910,6 +11105,14 @@ fn inspect_doctor_database(
             &err,
         );
     }
+    if let Err(err) = check_foreign_recovery_debris(beads_dir, db_path, checks) {
+        push_inspection_error(
+            checks,
+            "db.foreign_recovery_debris",
+            "Failed to inspect foreign recovery debris",
+            &err,
+        );
+    }
     if let Err(err) = check_database_sidecars(db_path, checks) {
         push_inspection_error(
             checks,
@@ -15579,6 +15782,216 @@ mod tests {
             .and_then(|d| d.get("ratio"))
             .and_then(serde_json::Value::as_u64);
         assert_eq!(ratio, Some(20));
+    }
+
+    /// `beads_rust-jwrr`: `.beads/` accumulates manual backups from other tools
+    /// and ad-hoc agent sessions. br must surface them without claiming them as
+    /// its own and without failing an otherwise healthy workspace.
+    #[test]
+    fn test_foreign_recovery_debris_is_reported_without_failing_the_workspace() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::write(&db_path, b"not a real db, only the name matters here").unwrap();
+
+        // br's own state directories must never be reported as foreign.
+        fs::create_dir_all(beads_dir.join(".br_recovery")).unwrap();
+        fs::create_dir_all(beads_dir.join(".br_history")).unwrap();
+
+        // The spellings observed in the wild, including the nesting that a
+        // `cp -r .beads .beads/recovery_<TS>` produces.
+        for dir in [
+            "recovery",
+            "recovery_20260319T032504Z",
+            "recovery_snapshot_20260322T032047Z",
+            "snapshot_20260322T032111Z",
+            ".beads_snapshot",
+        ] {
+            fs::create_dir_all(beads_dir.join(dir)).unwrap();
+        }
+        fs::write(
+            beads_dir.join("recovery_20260319T032504Z/payload.bin"),
+            vec![7_u8; 2048],
+        )
+        .unwrap();
+        fs::write(
+            beads_dir.join("beads.db.rebuild_20260321T073015Z"),
+            vec![1_u8; 1024],
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_foreign_recovery_debris(&beads_dir, &db_path, &mut checks).unwrap();
+        let check = find_check(&checks, "db.foreign_recovery_debris").expect("check present");
+
+        // Informational, never a warning: br did not create this and must not
+        // make `br doctor` exit non-zero over another tool's leftovers.
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+
+        let details = check.details.as_ref().expect("details");
+        let dirs: Vec<&str> = details["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dirs.len(),
+            5,
+            "all five spellings should be caught: {dirs:?}"
+        );
+        assert!(
+            !dirs
+                .iter()
+                .any(|d| d.contains(".br_recovery") || d.contains(".br_history")),
+            "br's own directories must not be reported as foreign: {dirs:?}"
+        );
+        assert_eq!(details["files"].as_array().unwrap().len(), 1);
+        // 2048 bytes inside the debris tree + the 1024-byte rebuild sibling.
+        assert_eq!(details["bytes"].as_u64(), Some(3072));
+        assert_eq!(details["bytes_are_lower_bound"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn test_clean_workspace_reports_no_foreign_recovery_debris() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".br_recovery")).unwrap();
+        fs::create_dir_all(beads_dir.join(".br_history")).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::write(&db_path, b"db").unwrap();
+        fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
+        // A legitimate br backup sibling belongs to `db.recovery_artifacts`,
+        // not to this check.
+        fs::write(beads_dir.join("beads.db.bad_20260312T000000Z"), b"x").unwrap();
+
+        let mut checks = Vec::new();
+        check_foreign_recovery_debris(&beads_dir, &db_path, &mut checks).unwrap();
+        let check = find_check(&checks, "db.foreign_recovery_debris").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(check.message.is_none(), "{check:?}");
+        // `push_check` always stamps a `finding_id`, so the absence of debris
+        // is expressed by the payload keys being absent, not by `details`.
+        if let Some(details) = check.details.as_ref() {
+            assert!(details.get("directories").is_none(), "{check:?}");
+            assert!(details.get("files").is_none(), "{check:?}");
+            assert!(details.get("bytes").is_none(), "{check:?}");
+        }
+    }
+
+    #[test]
+    fn test_foreign_debris_name_predicates() {
+        assert!(is_foreign_recovery_debris_dir_name("recovery"));
+        assert!(is_foreign_recovery_debris_dir_name(
+            "recovery_20260319T032504Z"
+        ));
+        assert!(is_foreign_recovery_debris_dir_name(
+            "recovery_20260322T032013Z_codex_beads_repair"
+        ));
+        assert!(is_foreign_recovery_debris_dir_name(
+            "snapshot_20260322T032111Z"
+        ));
+        assert!(is_foreign_recovery_debris_dir_name(".beads_snapshot"));
+        // br's own state, and unrelated entries.
+        assert!(!is_foreign_recovery_debris_dir_name(".br_recovery"));
+        assert!(!is_foreign_recovery_debris_dir_name(".br_history"));
+        assert!(!is_foreign_recovery_debris_dir_name("issues.jsonl"));
+        assert!(!is_foreign_recovery_debris_dir_name(".doctor"));
+
+        assert!(is_foreign_recovery_debris_file_name(
+            "beads.db.rebuild_20260321T073015Z",
+            "beads.db"
+        ));
+        // `.bad_*` is already owned by `db.recovery_artifacts`.
+        assert!(!is_foreign_recovery_debris_file_name(
+            "beads.db.bad_20260312T000000Z",
+            "beads.db"
+        ));
+        assert!(!is_foreign_recovery_debris_file_name(
+            "beads.db", "beads.db"
+        ));
+    }
+
+    /// `beads_rust-ote7`: `vacuum_database` must compact a database that carries
+    /// whole zero pages past its logical end — the exact shape `db_bloat` fires
+    /// on. In-place `VACUUM` refuses those with "database image header page
+    /// count N does not match file length page count M", and the refusal used
+    /// to surface as "No errors detected; nothing to repair."
+    #[test]
+    fn test_vacuum_database_compacts_a_database_with_trailing_pages() {
+        const APPENDED_PAGES: u32 = 64;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+
+        // A real, valid database with something in it.
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            for i in 0..50 {
+                let mut issue = sample_issue(&format!("bd-bloat{i:03}"), "bloat fixture issue");
+                issue.description = Some("x".repeat(4096));
+                storage.create_issue(&issue, "test").unwrap();
+            }
+            storage.checkpoint_full().ok();
+        }
+        let header_pages_before = database_header_page_count(&db_path);
+        let logical_size = fs::metadata(&db_path).unwrap().len();
+
+        // Append whole zero pages past the logical end. SQLite reads the extent
+        // from the header and ignores these; the file is still valid.
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&db_path).unwrap();
+            f.write_all(&vec![0_u8; 4096 * APPENDED_PAGES as usize])
+                .unwrap();
+            f.flush().unwrap();
+        }
+        let bloated_size = fs::metadata(&db_path).unwrap().len();
+        assert!(
+            bloated_size > logical_size,
+            "fixture should have grown: {bloated_size} vs {logical_size}"
+        );
+
+        vacuum_database(&db_path).expect("vacuum must compact a trailing-pages database");
+
+        let after = fs::metadata(&db_path).unwrap().len();
+        assert!(
+            after < bloated_size,
+            "VACUUM should reclaim the appended slack: {after} still >= {bloated_size}"
+        );
+        // The appended pages must be dropped, not adopted into the database.
+        // The page count is not compared to `header_pages_before` directly:
+        // that reading can lag the true extent by a few pages depending on when
+        // the WAL was folded in. What must hold is that the 64 appended pages
+        // did not become part of the database.
+        let header_pages_after = database_header_page_count(&db_path);
+        assert!(
+            header_pages_after < header_pages_before + APPENDED_PAGES,
+            "compaction absorbed the appended pages: {header_pages_after} \
+             (was {header_pages_before}, appended {APPENDED_PAGES})"
+        );
+        // The decisive invariant: the compacted file has no slack left at all,
+        // so the header's extent and the file length agree exactly. That is
+        // precisely what in-place VACUUM could not achieve on this input.
+        assert_eq!(
+            u64::from(header_pages_after) * 4096,
+            after,
+            "compacted file should contain exactly its logical pages"
+        );
+        // And the data must survive.
+        let storage = SqliteStorage::open(&db_path).unwrap();
+        assert!(storage.get_issue("bd-bloat000").unwrap().is_some());
+        assert!(storage.get_issue("bd-bloat049").unwrap().is_some());
+    }
+
+    /// Read the page count from the SQLite header (page 1, offset 28) without
+    /// going through the engine, so the assertion above is independent of
+    /// whatever the engine believes the extent to be.
+    fn database_header_page_count(db_path: &Path) -> u32 {
+        let bytes = fs::read(db_path).unwrap();
+        u32::from_be_bytes([bytes[28], bytes[29], bytes[30], bytes[31]])
     }
 
     #[test]

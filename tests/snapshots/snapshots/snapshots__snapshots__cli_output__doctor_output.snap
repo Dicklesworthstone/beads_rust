@@ -41,6 +41,7 @@ OK db_bloat
 OK wal_size
 OK db.recovery_artifacts
 OK db.recovery_artifacts.aged
+OK db.foreign_recovery_debris
 OK db.sidecars
 OK schema.tables
 OK schema.columns
