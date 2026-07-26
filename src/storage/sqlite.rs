@@ -1,7 +1,7 @@
 //! `SQLite` storage implementation.
 
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueDetails, IssueWithDependencyMetadata};
+use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
@@ -22,7 +22,7 @@ use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -86,6 +86,8 @@ struct CapacityViolationEvidence<'a> {
     transition: CapacityTransition<'a>,
     kind: &'a str,
     name: &'a str,
+    counting_mode: &'static str,
+    aggregate_parents_excluded: Option<u32>,
     current: u32,
     prospective: u32,
     soft_limit: Option<u32>,
@@ -98,6 +100,8 @@ struct CapacityWarningEvidence<'a> {
     transition: CapacityTransition<'a>,
     kind: &'a str,
     name: &'a str,
+    counting_mode: &'static str,
+    aggregate_parents_excluded: Option<u32>,
     current: u32,
     prospective: u32,
     soft_limit: u32,
@@ -110,6 +114,470 @@ struct CapacityBatchTransition {
     issue_id: String,
     from: Option<String>,
     to: String,
+    /// New issue type when the same mutation creates the issue or changes
+    /// its type; `None` means "use the type already stored". Only weighted
+    /// counting reads this.
+    issue_type: Option<String>,
+}
+
+/// Current-vs-prospective occupancy for one capacity, as produced by
+/// [`CapacityCountEngine::counts`].
+#[derive(Debug, Clone, Copy)]
+struct CapacityCountPair {
+    current: u32,
+    prospective: u32,
+    /// Prospective active issues excluded as hierarchy aggregates
+    /// (`leaf_work`/`roots` only).
+    aggregate_parents_excluded: Option<u32>,
+}
+
+/// Transaction-scoped counting engine for workflow capacity (GitHub #384
+/// phase 3).
+///
+/// One engine wraps one enforcement call: the batch's transitions are fixed
+/// at construction and every configured capacity asks it for a
+/// [`CapacityCountPair`]. Mode `all` keeps the phase-1 fast path (memoized
+/// `COUNT(*)` plus per-transition ±1 arithmetic). The hierarchy modes load
+/// the issue set and the parent-child graph once inside the same
+/// transaction, condense strongly connected components so an imported
+/// dependency cycle can never make active work invisible to capacity, and
+/// evaluate the actual and the prospective status maps over that one
+/// condensation.
+struct CapacityCountEngine<'a> {
+    conn: &'a Connection,
+    counting: &'a crate::close_policy::CapacityCounting,
+    transitions: &'a [CapacityBatchTransition],
+    /// Mode `all`: memoized per-status `COUNT(*)` results.
+    status_counts: HashMap<String, u32>,
+    /// Hierarchy modes: lazily loaded graph snapshot.
+    hierarchy: Option<CapacityHierarchyState>,
+    /// Hierarchy modes: memoized results per canonical status set.
+    memo: HashMap<String, CapacityCountPair>,
+}
+
+impl<'a> CapacityCountEngine<'a> {
+    fn new(
+        conn: &'a Connection,
+        counting: &'a crate::close_policy::CapacityCounting,
+        transitions: &'a [CapacityBatchTransition],
+    ) -> Self {
+        Self {
+            conn,
+            counting,
+            transitions,
+            status_counts: HashMap::new(),
+            hierarchy: None,
+            memo: HashMap::new(),
+        }
+    }
+
+    const fn transitions(&self) -> &'a [CapacityBatchTransition] {
+        self.transitions
+    }
+
+    const fn mode_str(&self) -> &'static str {
+        self.counting.hierarchy.as_str()
+    }
+
+    /// Current and prospective occupancy for one capacity's status set.
+    fn counts(&mut self, statuses: &[String]) -> Result<CapacityCountPair> {
+        use crate::close_policy::CapacityCountingMode;
+
+        if matches!(self.counting.hierarchy, CapacityCountingMode::All) {
+            let current = SqliteStorage::count_capacity_statuses_in_tx(
+                self.conn,
+                &mut self.status_counts,
+                statuses,
+            )?;
+            let prospective = SqliteStorage::batch_prospective_capacity_count(
+                current,
+                statuses,
+                self.transitions,
+            )?;
+            return Ok(CapacityCountPair {
+                current,
+                prospective,
+                aggregate_parents_excluded: None,
+            });
+        }
+
+        let canonical: BTreeSet<String> = statuses
+            .iter()
+            .map(|status| status.trim().to_lowercase())
+            .filter(|status| !status.is_empty())
+            .collect();
+        let key = canonical.iter().cloned().collect::<Vec<_>>().join("\u{1}");
+        if let Some(pair) = self.memo.get(&key) {
+            return Ok(*pair);
+        }
+
+        if self.hierarchy.is_none() {
+            self.hierarchy = Some(CapacityHierarchyState::load(self.conn, self.transitions)?);
+        }
+        let Some(state) = self.hierarchy.as_ref() else {
+            return Err(BeadsError::internal(
+                "capacity hierarchy state missing after load",
+            ));
+        };
+
+        let pair = match self.counting.hierarchy {
+            CapacityCountingMode::All => {
+                return Err(BeadsError::internal(
+                    "capacity counting mode 'all' reached the hierarchy path",
+                ));
+            }
+            CapacityCountingMode::Weighted => {
+                let current = state.weighted_count(
+                    &canonical,
+                    &state.actual_status,
+                    &state.actual_type,
+                    &self.counting.weights,
+                )?;
+                let prospective = state.weighted_count(
+                    &canonical,
+                    &state.prospective_status,
+                    &state.prospective_type,
+                    &self.counting.weights,
+                )?;
+                CapacityCountPair {
+                    current,
+                    prospective,
+                    aggregate_parents_excluded: None,
+                }
+            }
+            mode @ (CapacityCountingMode::LeafWork | CapacityCountingMode::Roots) => {
+                let (current, _) = state.hierarchy_count(&canonical, &state.actual_status, mode)?;
+                let (prospective, excluded) =
+                    state.hierarchy_count(&canonical, &state.prospective_status, mode)?;
+                CapacityCountPair {
+                    current,
+                    prospective,
+                    aggregate_parents_excluded: Some(excluded),
+                }
+            }
+        };
+        self.memo.insert(key, pair);
+        Ok(pair)
+    }
+}
+
+/// Issue-graph snapshot used by the hierarchy-aware counting modes.
+///
+/// Nodes are every issue in the repository plus every parent-child edge
+/// endpoint plus every transition subject (so an issue being created in
+/// this same transaction participates as an isolated node). Missing nodes
+/// carry an empty status and are therefore never active.
+struct CapacityHierarchyState {
+    ids: Vec<String>,
+    actual_status: Vec<String>,
+    prospective_status: Vec<String>,
+    actual_type: Vec<String>,
+    prospective_type: Vec<String>,
+    /// Strongly connected component members, in Tarjan emission order: a
+    /// component is emitted only after every component it can reach, so
+    /// descendant components always precede their ancestors.
+    comp_members: Vec<Vec<usize>>,
+    /// Deduplicated condensation edges, parent component -> child component.
+    comp_children: Vec<Vec<usize>>,
+}
+
+impl CapacityHierarchyState {
+    fn intern(
+        id: &str,
+        ids: &mut Vec<String>,
+        index_of: &mut HashMap<String, usize>,
+        actual_status: &mut Vec<String>,
+        actual_type: &mut Vec<String>,
+    ) -> usize {
+        if let Some(&index) = index_of.get(id) {
+            return index;
+        }
+        let index = ids.len();
+        index_of.insert(id.to_string(), index);
+        ids.push(id.to_string());
+        actual_status.push(String::new());
+        actual_type.push(String::new());
+        index
+    }
+
+    fn load(conn: &Connection, transitions: &[CapacityBatchTransition]) -> Result<Self> {
+        let mut ids = Vec::new();
+        let mut index_of: HashMap<String, usize> = HashMap::new();
+        let mut actual_status = Vec::new();
+        let mut actual_type = Vec::new();
+
+        let rows = conn.query("SELECT id, status, issue_type FROM issues")?;
+        for row in &rows {
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            let status = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            let issue_type = row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            let index = Self::intern(
+                id,
+                &mut ids,
+                &mut index_of,
+                &mut actual_status,
+                &mut actual_type,
+            );
+            actual_status[index] = status;
+            actual_type[index] = issue_type;
+        }
+
+        let edge_map = SqliteStorage::load_local_parent_child_edges_impl(conn)?;
+        for (parent, children) in &edge_map {
+            Self::intern(
+                parent,
+                &mut ids,
+                &mut index_of,
+                &mut actual_status,
+                &mut actual_type,
+            );
+            for child in children {
+                Self::intern(
+                    child,
+                    &mut ids,
+                    &mut index_of,
+                    &mut actual_status,
+                    &mut actual_type,
+                );
+            }
+        }
+        for transition in transitions {
+            Self::intern(
+                &transition.issue_id,
+                &mut ids,
+                &mut index_of,
+                &mut actual_status,
+                &mut actual_type,
+            );
+        }
+
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+        for (parent, kids) in &edge_map {
+            let Some(&parent_index) = index_of.get(parent.as_str()) else {
+                continue;
+            };
+            for kid in kids {
+                let Some(&kid_index) = index_of.get(kid.as_str()) else {
+                    continue;
+                };
+                if parent_index != kid_index {
+                    children[parent_index].push(kid_index);
+                }
+            }
+        }
+
+        let mut prospective_status = actual_status.clone();
+        let mut prospective_type = actual_type.clone();
+        for transition in transitions {
+            let Some(&index) = index_of.get(transition.issue_id.as_str()) else {
+                continue;
+            };
+            prospective_status[index] = transition.to.trim().to_lowercase();
+            if let Some(issue_type) = &transition.issue_type {
+                prospective_type[index] = issue_type.trim().to_lowercase();
+            }
+        }
+
+        let (comp_members, comp_children) = Self::condense(&children);
+
+        Ok(Self {
+            ids,
+            actual_status,
+            prospective_status,
+            actual_type,
+            prospective_type,
+            comp_members,
+            comp_children,
+        })
+    }
+
+    /// Iterative Tarjan strongly-connected-components condensation.
+    ///
+    /// The dependency graph forbids parent-child cycles at mutation time,
+    /// but imported or hand-edited data can still contain them; treating a
+    /// cycle as one component means its active members always count instead
+    /// of silently excluding each other.
+    fn condense(children: &[Vec<usize>]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+        let node_count = children.len();
+        let mut next_index = 0usize;
+        let mut indices = vec![usize::MAX; node_count];
+        let mut lowlink = vec![0usize; node_count];
+        let mut on_stack = vec![false; node_count];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut comp_of = vec![usize::MAX; node_count];
+        let mut comp_members: Vec<Vec<usize>> = Vec::new();
+        let mut call_stack: Vec<(usize, usize)> = Vec::new();
+
+        for start in 0..node_count {
+            if indices[start] != usize::MAX {
+                continue;
+            }
+            call_stack.push((start, 0));
+            while let Some(frame) = call_stack.last_mut() {
+                let node = frame.0;
+                if indices[node] == usize::MAX {
+                    indices[node] = next_index;
+                    lowlink[node] = next_index;
+                    next_index += 1;
+                    stack.push(node);
+                    on_stack[node] = true;
+                }
+                if frame.1 < children[node].len() {
+                    let child = children[node][frame.1];
+                    frame.1 += 1;
+                    if indices[child] == usize::MAX {
+                        call_stack.push((child, 0));
+                    } else if on_stack[child] {
+                        lowlink[node] = lowlink[node].min(indices[child]);
+                    }
+                } else {
+                    call_stack.pop();
+                    if let Some(&(parent, _)) = call_stack.last() {
+                        lowlink[parent] = lowlink[parent].min(lowlink[node]);
+                    }
+                    if lowlink[node] == indices[node] {
+                        let comp_index = comp_members.len();
+                        let mut members = Vec::new();
+                        while let Some(member) = stack.pop() {
+                            on_stack[member] = false;
+                            comp_of[member] = comp_index;
+                            members.push(member);
+                            if member == node {
+                                break;
+                            }
+                        }
+                        comp_members.push(members);
+                    }
+                }
+            }
+        }
+
+        let mut comp_children: Vec<Vec<usize>> = vec![Vec::new(); comp_members.len()];
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        for node in 0..node_count {
+            for &child in &children[node] {
+                let parent_comp = comp_of[node];
+                let child_comp = comp_of[child];
+                if parent_comp != child_comp && seen.insert((parent_comp, child_comp)) {
+                    comp_children[parent_comp].push(child_comp);
+                }
+            }
+        }
+        (comp_members, comp_children)
+    }
+
+    /// Count occupancy for one status set under `leaf_work` or `roots`.
+    ///
+    /// Returns `(counted, aggregate_excluded)` where `aggregate_excluded`
+    /// is the number of active issues that did not count because a
+    /// relative in the same capacity already covers their work stream.
+    fn hierarchy_count(
+        &self,
+        statuses: &BTreeSet<String>,
+        status_of: &[String],
+        mode: crate::close_policy::CapacityCountingMode,
+    ) -> Result<(u32, u32)> {
+        use crate::close_policy::CapacityCountingMode;
+
+        let comp_count = self.comp_members.len();
+        let mut active_members = vec![0u64; comp_count];
+        let mut total_active = 0u64;
+        for (comp, members) in self.comp_members.iter().enumerate() {
+            for &member in members {
+                if statuses.contains(status_of[member].as_str()) {
+                    active_members[comp] += 1;
+                    total_active += 1;
+                }
+            }
+        }
+
+        let counted: u64 = match mode {
+            CapacityCountingMode::LeafWork => {
+                // Emission order puts descendant components first, so every
+                // child flag is final before its parent is examined.
+                let mut has_active_descendant = vec![false; comp_count];
+                let mut counted = 0u64;
+                for comp in 0..comp_count {
+                    for &child in &self.comp_children[comp] {
+                        if active_members[child] > 0 || has_active_descendant[child] {
+                            has_active_descendant[comp] = true;
+                            break;
+                        }
+                    }
+                    if active_members[comp] > 0 && !has_active_descendant[comp] {
+                        counted += active_members[comp];
+                    }
+                }
+                counted
+            }
+            CapacityCountingMode::Roots => {
+                // Reverse emission order puts ancestor components first, so
+                // each component's flag is final before it propagates down.
+                let mut has_active_ancestor = vec![false; comp_count];
+                for comp in (0..comp_count).rev() {
+                    if active_members[comp] > 0 || has_active_ancestor[comp] {
+                        for &child in &self.comp_children[comp] {
+                            has_active_ancestor[child] = true;
+                        }
+                    }
+                }
+                let mut counted = 0u64;
+                for comp in 0..comp_count {
+                    if active_members[comp] > 0 && !has_active_ancestor[comp] {
+                        counted += active_members[comp];
+                    }
+                }
+                counted
+            }
+            CapacityCountingMode::All | CapacityCountingMode::Weighted => {
+                return Err(BeadsError::internal(
+                    "hierarchy_count called with a non-hierarchy counting mode",
+                ));
+            }
+        };
+
+        let counted = u32::try_from(counted).map_err(|_| {
+            BeadsError::internal("workflow capacity hierarchy count overflowed u32")
+        })?;
+        let excluded =
+            u32::try_from(total_active.saturating_sub(u64::from(counted))).map_err(|_| {
+                BeadsError::internal("workflow capacity aggregate exclusion overflowed u32")
+            })?;
+        Ok((counted, excluded))
+    }
+
+    /// Sum explicit weights over the active issues of one status set.
+    fn weighted_count(
+        &self,
+        statuses: &BTreeSet<String>,
+        status_of: &[String],
+        type_of: &[String],
+        weights: &crate::close_policy::CapacityWeights,
+    ) -> Result<u32> {
+        let mut total = 0u64;
+        for index in 0..self.ids.len() {
+            if statuses.contains(status_of[index].as_str()) {
+                total += u64::from(weights.weight_for(&self.ids[index], &type_of[index]));
+            }
+        }
+        u32::try_from(total)
+            .map_err(|_| BeadsError::internal("workflow capacity weighted count overflowed u32"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +984,7 @@ struct IssueDetailRelationPresence {
     has_dependencies: bool,
     has_dependents: bool,
     has_comments: bool,
+    has_children: bool,
     parent: Option<String>,
 }
 
@@ -2435,26 +2904,6 @@ impl SqliteStorage {
         Ok(total)
     }
 
-    fn prospective_capacity_count(
-        current: u32,
-        statuses: &[String],
-        from: Option<&str>,
-        to: &str,
-    ) -> u32 {
-        let contains = |candidate: &str| {
-            statuses
-                .iter()
-                .any(|status| status.eq_ignore_ascii_case(candidate))
-        };
-        let was_counted = from.is_some_and(contains);
-        let will_count = contains(to);
-        match (was_counted, will_count) {
-            (false, true) => current.saturating_add(1),
-            (true, false) => current.saturating_sub(1),
-            _ => current,
-        }
-    }
-
     fn capacity_group<'a>(
         policy: &'a crate::close_policy::CapacityPolicy,
         name: &str,
@@ -2476,7 +2925,8 @@ impl SqliteStorage {
                 capacity_kind: evidence.kind.to_string(),
                 capacity_name: evidence.name.to_string(),
                 scope: "repository".to_string(),
-                counting_mode: "all".to_string(),
+                counting_mode: evidence.counting_mode.to_string(),
+                aggregate_parents_excluded: evidence.aggregate_parents_excluded,
                 current: evidence.current,
                 prospective: evidence.prospective,
                 soft_limit: evidence.soft_limit,
@@ -2497,131 +2947,14 @@ impl SqliteStorage {
             capacity_kind: evidence.kind.to_string(),
             capacity_name: evidence.name.to_string(),
             scope: "repository".to_string(),
-            counting_mode: "all".to_string(),
+            counting_mode: evidence.counting_mode.to_string(),
+            aggregate_parents_excluded: evidence.aggregate_parents_excluded,
             current: evidence.current,
             prospective: evidence.prospective,
             soft_limit: evidence.soft_limit,
             hard_limit: evidence.hard_limit,
             policy_path: evidence.policy_path,
         }
-    }
-
-    fn collect_capacity_soft_warnings(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
-        let mut warnings = Vec::new();
-        for (status, limit) in &policy.statuses {
-            let Some(soft_limit) = limit.soft else {
-                continue;
-            };
-            let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
-            if prospective > current && prospective >= soft_limit {
-                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
-                    transition,
-                    kind: "status",
-                    name: status,
-                    current,
-                    prospective,
-                    soft_limit,
-                    hard_limit: limit.hard,
-                    policy_path: format!("workflow.capacity.statuses.{status}"),
-                }));
-            }
-        }
-        for (name, group) in &policy.groups {
-            let Some(soft_limit) = group.soft else {
-                continue;
-            };
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective = Self::prospective_capacity_count(
-                current,
-                &group.statuses,
-                transition.from,
-                transition.to,
-            );
-            if prospective > current && prospective >= soft_limit {
-                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
-                    transition,
-                    kind: "group",
-                    name,
-                    current,
-                    prospective,
-                    soft_limit,
-                    hard_limit: group.hard,
-                    policy_path: format!("workflow.capacity.groups.{name}"),
-                }));
-            }
-        }
-        Ok(warnings)
-    }
-
-    fn enforce_status_hard_limits(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (status, limit) in &policy.statuses {
-            let Some(hard_limit) = limit.hard else {
-                continue;
-            };
-            let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
-            if prospective > current && prospective > hard_limit {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "status",
-                    name: status,
-                    current,
-                    prospective,
-                    soft_limit: limit.soft,
-                    hard_limit,
-                    policy_path: format!("workflow.capacity.statuses.{status}"),
-                }));
-            }
-        }
-        Ok(())
-    }
-
-    fn enforce_group_hard_limits(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (name, group) in &policy.groups {
-            let Some(hard_limit) = group.hard else {
-                continue;
-            };
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective = Self::prospective_capacity_count(
-                current,
-                &group.statuses,
-                transition.from,
-                transition.to,
-            );
-            if prospective > current && prospective > hard_limit {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "group",
-                    name,
-                    current,
-                    prospective,
-                    soft_limit: group.soft,
-                    hard_limit,
-                    policy_path: format!("workflow.capacity.groups.{name}"),
-                }));
-            }
-        }
-        Ok(())
     }
 
     fn admission_transition_matches(
@@ -2642,103 +2975,33 @@ impl SqliteStorage {
                 .any(|candidate| candidate.eq_ignore_ascii_case(transition.to))
     }
 
-    fn enforce_admission_statuses(
-        conn: &Connection,
-        rule: &crate::close_policy::CapacityAdmissionRule,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (status, threshold) in &rule.require_below.statuses {
-            let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
-            if prospective >= *threshold && prospective >= current {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "admission_status",
-                    name: status,
-                    current,
-                    prospective,
-                    soft_limit: None,
-                    hard_limit: *threshold,
-                    policy_path: format!(
-                        "workflow.capacity.admission.{}.require_below.statuses.{status}",
-                        rule.name
-                    ),
-                }));
-            }
-        }
-        Ok(())
-    }
-
-    fn enforce_admission_groups(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        rule: &crate::close_policy::CapacityAdmissionRule,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (requested_name, threshold) in &rule.require_below.groups {
-            let Some((canonical_name, group)) = Self::capacity_group(policy, requested_name) else {
-                return Err(BeadsError::internal(format!(
-                    "validated workflow capacity group '{requested_name}' disappeared"
-                )));
-            };
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective = Self::prospective_capacity_count(
-                current,
-                &group.statuses,
-                transition.from,
-                transition.to,
-            );
-            if prospective >= *threshold && prospective >= current {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "admission_group",
-                    name: canonical_name,
-                    current,
-                    prospective,
-                    soft_limit: None,
-                    hard_limit: *threshold,
-                    policy_path: format!(
-                        "workflow.capacity.admission.{}.require_below.groups.{canonical_name}",
-                        rule.name
-                    ),
-                }));
-            }
-        }
-        Ok(())
-    }
-
     /// Evaluate every repository-level capacity affected by a status change.
     ///
     /// This function must only be called while the caller holds the same
     /// `BEGIN IMMEDIATE` transaction that will perform the mutation.  Counts
     /// therefore observe all prior commits and cannot race another writer for
-    /// the last slot.
+    /// the last slot.  A single transition is exactly a one-element batch, so
+    /// this delegates to the batch evaluator; `issue_type` carries the type of
+    /// an issue being created (or retyped) in the same mutation so weighted
+    /// counting can resolve its weight before the row exists.
     pub(crate) fn enforce_workflow_capacity_in_tx(
         conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
         issue_id: &str,
         from: Option<&str>,
         to: &str,
+        issue_type: Option<&str>,
     ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
         if !policy.is_active() || from.is_some_and(|status| status.eq_ignore_ascii_case(to)) {
             return Ok(Vec::new());
         }
-        let transition = CapacityTransition { issue_id, from, to };
-        let mut counts = HashMap::new();
-        Self::enforce_status_hard_limits(conn, policy, transition, &mut counts)?;
-        Self::enforce_group_hard_limits(conn, policy, transition, &mut counts)?;
-        for rule in &policy.admission {
-            if !Self::admission_transition_matches(rule, transition) {
-                continue;
-            }
-            Self::enforce_admission_statuses(conn, rule, transition, &mut counts)?;
-            Self::enforce_admission_groups(conn, policy, rule, transition, &mut counts)?;
-        }
-        Self::collect_capacity_soft_warnings(conn, policy, transition, &mut counts)
+        let transitions = [CapacityBatchTransition {
+            issue_id: issue_id.to_string(),
+            from: from.map(ToString::to_string),
+            to: to.to_string(),
+            issue_type: issue_type.map(ToString::to_string),
+        }];
+        Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions)
     }
 
     fn transition_enters_capacity(
@@ -2793,32 +3056,48 @@ impl SqliteStorage {
         }
     }
 
+    /// The transition a capacity change is attributed to: the first one that
+    /// enters the capacity, or — when hierarchy counting raised the count
+    /// without any direct entry — the first transition in the batch, so a
+    /// real increase is never silently unenforced.
+    fn blamed_capacity_transition<'a>(
+        engine: &CapacityCountEngine<'a>,
+        statuses: &[String],
+    ) -> Option<&'a CapacityBatchTransition> {
+        engine
+            .transitions()
+            .iter()
+            .find(|transition| Self::transition_enters_capacity(transition, statuses))
+            .or_else(|| engine.transitions().first())
+    }
+
     fn evaluate_capacity_status_limits_in_tx(
-        conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[CapacityBatchTransition],
-        counts: &mut HashMap<String, u32>,
+        engine: &mut CapacityCountEngine<'_>,
         warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
     ) -> Result<()> {
         for (status, limit) in &policy.statuses {
             let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::batch_prospective_capacity_count(current, &members, transitions)?;
-            let entering = transitions
-                .iter()
-                .find(|transition| Self::transition_enters_capacity(transition, &members));
+            let pair = engine.counts(&members)?;
+            // Under `all`, a rising count always has an entering transition.
+            // Hierarchy counting can raise a capacity without one — closing a
+            // child shared by two active parents makes both parents start
+            // counting — so fall back to the first transition in the batch
+            // rather than letting the increase escape enforcement.
+            let entering = Self::blamed_capacity_transition(engine, &members);
 
             if let (Some(hard_limit), Some(transition)) = (limit.hard, entering)
-                && prospective > current
-                && prospective > hard_limit
+                && pair.prospective > pair.current
+                && pair.prospective > hard_limit
             {
                 return Err(Self::capacity_violation(CapacityViolationEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "status",
                     name: status,
-                    current,
-                    prospective,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit: limit.soft,
                     hard_limit,
                     policy_path: format!("workflow.capacity.statuses.{status}"),
@@ -2826,15 +3105,17 @@ impl SqliteStorage {
             }
 
             if let (Some(soft_limit), Some(transition)) = (limit.soft, entering)
-                && prospective > current
-                && prospective >= soft_limit
+                && pair.prospective > pair.current
+                && pair.prospective >= soft_limit
             {
                 warnings.push(Self::capacity_warning(CapacityWarningEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "status",
                     name: status,
-                    current,
-                    prospective,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit,
                     hard_limit: limit.hard,
                     policy_path: format!("workflow.capacity.statuses.{status}"),
@@ -2845,30 +3126,26 @@ impl SqliteStorage {
     }
 
     fn evaluate_capacity_group_limits_in_tx(
-        conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[CapacityBatchTransition],
-        counts: &mut HashMap<String, u32>,
+        engine: &mut CapacityCountEngine<'_>,
         warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
     ) -> Result<()> {
         for (name, group) in &policy.groups {
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective =
-                Self::batch_prospective_capacity_count(current, &group.statuses, transitions)?;
-            let entering = transitions
-                .iter()
-                .find(|transition| Self::transition_enters_capacity(transition, &group.statuses));
+            let pair = engine.counts(&group.statuses)?;
+            let entering = Self::blamed_capacity_transition(engine, &group.statuses);
 
             if let (Some(hard_limit), Some(transition)) = (group.hard, entering)
-                && prospective > current
-                && prospective > hard_limit
+                && pair.prospective > pair.current
+                && pair.prospective > hard_limit
             {
                 return Err(Self::capacity_violation(CapacityViolationEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "group",
                     name,
-                    current,
-                    prospective,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit: group.soft,
                     hard_limit,
                     policy_path: format!("workflow.capacity.groups.{name}"),
@@ -2876,15 +3153,17 @@ impl SqliteStorage {
             }
 
             if let (Some(soft_limit), Some(transition)) = (group.soft, entering)
-                && prospective > current
-                && prospective >= soft_limit
+                && pair.prospective > pair.current
+                && pair.prospective >= soft_limit
             {
                 warnings.push(Self::capacity_warning(CapacityWarningEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "group",
                     name,
-                    current,
-                    prospective,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit,
                     hard_limit: group.hard,
                     policy_path: format!("workflow.capacity.groups.{name}"),
@@ -2895,13 +3174,12 @@ impl SqliteStorage {
     }
 
     fn enforce_capacity_admission_rules_in_tx(
-        conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[CapacityBatchTransition],
-        counts: &mut HashMap<String, u32>,
+        engine: &mut CapacityCountEngine<'_>,
     ) -> Result<()> {
         for rule in &policy.admission {
-            let matching = transitions
+            let matching = engine
+                .transitions()
                 .iter()
                 .filter(|transition| {
                     Self::admission_transition_matches(rule, Self::batch_transition_ref(transition))
@@ -2913,21 +3191,21 @@ impl SqliteStorage {
 
             for (status, threshold) in &rule.require_below.statuses {
                 let members = [status.clone()];
-                let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-                let prospective =
-                    Self::batch_prospective_capacity_count(current, &members, transitions)?;
+                let pair = engine.counts(&members)?;
                 let blocked_transition = matching
                     .iter()
                     .find(|transition| !Self::transition_drains_capacity(transition, &members));
-                if prospective >= *threshold
+                if pair.prospective >= *threshold
                     && let Some(transition) = blocked_transition
                 {
                     return Err(Self::capacity_violation(CapacityViolationEvidence {
                         transition: Self::batch_transition_ref(transition),
                         kind: "admission_status",
                         name: status,
-                        current,
-                        prospective,
+                        counting_mode: engine.mode_str(),
+                        aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                        current: pair.current,
+                        prospective: pair.prospective,
                         soft_limit: None,
                         hard_limit: *threshold,
                         policy_path: format!(
@@ -2945,21 +3223,21 @@ impl SqliteStorage {
                         "validated workflow capacity group '{requested_name}' disappeared"
                     )));
                 };
-                let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-                let prospective =
-                    Self::batch_prospective_capacity_count(current, &group.statuses, transitions)?;
+                let pair = engine.counts(&group.statuses)?;
                 let blocked_transition = matching.iter().find(|transition| {
                     !Self::transition_drains_capacity(transition, &group.statuses)
                 });
-                if prospective >= *threshold
+                if pair.prospective >= *threshold
                     && let Some(transition) = blocked_transition
                 {
                     return Err(Self::capacity_violation(CapacityViolationEvidence {
                         transition: Self::batch_transition_ref(transition),
                         kind: "admission_group",
                         name: canonical_name,
-                        current,
-                        prospective,
+                        counting_mode: engine.mode_str(),
+                        aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                        current: pair.current,
+                        prospective: pair.prospective,
                         soft_limit: None,
                         hard_limit: *threshold,
                         policy_path: format!(
@@ -2989,23 +3267,11 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
-        let mut counts = HashMap::new();
+        let mut engine = CapacityCountEngine::new(conn, &policy.counting, transitions);
         let mut warnings = Vec::new();
-        Self::evaluate_capacity_status_limits_in_tx(
-            conn,
-            policy,
-            transitions,
-            &mut counts,
-            &mut warnings,
-        )?;
-        Self::evaluate_capacity_group_limits_in_tx(
-            conn,
-            policy,
-            transitions,
-            &mut counts,
-            &mut warnings,
-        )?;
-        Self::enforce_capacity_admission_rules_in_tx(conn, policy, transitions, &mut counts)?;
+        Self::evaluate_capacity_status_limits_in_tx(policy, &mut engine, &mut warnings)?;
+        Self::evaluate_capacity_group_limits_in_tx(policy, &mut engine, &mut warnings)?;
+        Self::enforce_capacity_admission_rules_in_tx(policy, &mut engine)?;
 
         Ok(warnings)
     }
@@ -3241,6 +3507,7 @@ impl SqliteStorage {
                 &issue.id,
                 None,
                 issue.status.as_str(),
+                Some(issue.issue_type.as_str()),
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
 
@@ -3745,6 +4012,10 @@ impl SqliteStorage {
                             issue_id: id.clone(),
                             from: Some(issue.status.as_str().to_string()),
                             to: status.as_str().to_string(),
+                            issue_type: update
+                                .issue_type
+                                .as_ref()
+                                .map(|issue_type| issue_type.as_str().to_string()),
                         });
                     }
                 }
@@ -4264,6 +4535,7 @@ impl SqliteStorage {
                 id,
                 Some(&previous_status),
                 "tombstone",
+                None,
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
             conn.execute_with_params(
@@ -11573,6 +11845,11 @@ impl SqliteStorage {
             vec![]
         };
         let parent = relation_presence.parent;
+        let rollup = if relation_presence.has_children {
+            self.derived_rollup(id)?
+        } else {
+            None
+        };
 
         Ok(Some(IssueDetails {
             issue,
@@ -11582,6 +11859,108 @@ impl SqliteStorage {
             comments,
             events,
             parent,
+            rollup,
+        }))
+    }
+
+    /// Derived parent-child subtree rollup (GitHub #384 phase 3).
+    ///
+    /// Returns `None` when the issue has no local parent-child children.
+    /// The derived status is the furthest-along non-terminal descendant
+    /// status: position in the declared `workflow.statuses` order when the
+    /// project configures one, otherwise a built-in
+    /// `draft < deferred < open < blocked < in_progress` ladder (statuses
+    /// outside the order rank lowest; ties resolve to the lexicographically
+    /// greatest name). When every descendant is terminal
+    /// (`closed`/`tombstone`) the rollup is `closed`. Traversal uses a
+    /// visited set, so imported dependency cycles terminate and the issue
+    /// itself is never counted as its own descendant.
+    pub fn derived_rollup(&self, issue_id: &str) -> Result<Option<RollupSummary>> {
+        // Walk the subtree level by level against `idx_dependencies_depends_on_type`
+        // instead of loading the repository's whole edge map: showing a handful
+        // of issues in a large project should touch only their own subtrees.
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(issue_id.to_string());
+        let mut frontier: Vec<String> = vec![issue_id.to_string()];
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+
+        while !frontier.is_empty() {
+            let mut next: Vec<String> = Vec::new();
+            for chunk in frontier.chunks(SQLITE_VAR_LIMIT) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT d.issue_id, i.status
+                     FROM dependencies d
+                     JOIN issues i ON d.issue_id = i.id
+                     WHERE d.depends_on_id IN ({placeholders})
+                       AND d.type = 'parent-child'"
+                );
+                let params: Vec<SqliteValue> = chunk
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect();
+                let rows = self.conn.query_with_params(&sql, &params)?;
+                for row in &rows {
+                    let Some(child) = row.get(0).and_then(SqliteValue::as_text) else {
+                        continue;
+                    };
+                    // A visited set keeps an imported parent-child cycle from
+                    // looping and stops the issue counting itself.
+                    if !visited.insert(child.to_string()) {
+                        continue;
+                    }
+                    let status = row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .trim()
+                        .to_lowercase();
+                    if !status.is_empty() {
+                        *counts.entry(status).or_insert(0) += 1;
+                    }
+                    next.push(child.to_string());
+                }
+            }
+            frontier = next;
+        }
+
+        if counts.is_empty() {
+            return Ok(None);
+        }
+
+        let workflow_order: Vec<String> = self
+            .workflow_transition_policy
+            .statuses
+            .iter()
+            .map(|status| status.trim().to_lowercase())
+            .collect();
+        let rank = |status: &str| -> i64 {
+            if workflow_order.is_empty() {
+                match status {
+                    "draft" => 1,
+                    "deferred" => 2,
+                    "open" => 3,
+                    "blocked" => 4,
+                    "in_progress" => 5,
+                    _ => 0,
+                }
+            } else {
+                workflow_order
+                    .iter()
+                    .position(|candidate| candidate == status)
+                    .map_or(-1, |position| i64::try_from(position).unwrap_or(i64::MAX))
+            }
+        };
+        let status = counts
+            .keys()
+            .filter(|status| !matches!(status.as_str(), "closed" | "tombstone"))
+            .max_by(|left, right| rank(left).cmp(&rank(right)).then_with(|| left.cmp(right)))
+            .cloned()
+            .unwrap_or_else(|| "closed".to_string());
+
+        Ok(Some(RollupSummary {
+            status,
+            descendants: counts,
         }))
     }
 
@@ -11592,10 +11971,13 @@ impl SqliteStorage {
                  EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?),
                  EXISTS(SELECT 1 FROM dependencies WHERE depends_on_id = ?),
                  EXISTS(SELECT 1 FROM comments WHERE issue_id = ?),
+                 EXISTS(SELECT 1 FROM dependencies
+                        WHERE depends_on_id = ? AND type = 'parent-child'),
                  (SELECT depends_on_id FROM dependencies
                   WHERE issue_id = ? AND type = 'parent-child'
                   ORDER BY rowid DESC LIMIT 1)",
             &[
+                SqliteValue::from(id),
                 SqliteValue::from(id),
                 SqliteValue::from(id),
                 SqliteValue::from(id),
@@ -11609,7 +11991,8 @@ impl SqliteStorage {
             has_dependencies: row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
             has_dependents: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
             has_comments: row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
-            parent: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+            has_children: row.get(4).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+            parent: row.get(5).and_then(SqliteValue::as_text).map(String::from),
         })
     }
 
@@ -15360,6 +15743,630 @@ mod tests {
         assert_eq!(warnings[1].capacity_kind, "group");
         assert_eq!(warnings[1].capacity_name, "active_work");
         assert!(storage.take_capacity_warnings().is_empty());
+        // `all` counting must not advertise hierarchy evidence.
+        assert_eq!(warnings[0].counting_mode, "all");
+        assert!(warnings[0].aggregate_parents_excluded.is_none());
+    }
+
+    /// Build the epic -> parent -> {child A, child B} shape from the GitHub
+    /// #384 hierarchy example, with `prefix`-scoped IDs.
+    fn seed_capacity_hierarchy(storage: &mut SqliteStorage, prefix: &str, statuses: [Status; 4]) {
+        let now = Utc::now();
+        let ids = [
+            format!("{prefix}-epic"),
+            format!("{prefix}-parent"),
+            format!("{prefix}-child-a"),
+            format!("{prefix}-child-b"),
+        ];
+        for (id, status) in ids.iter().zip(statuses) {
+            let mut issue = make_issue(id, id, status, 1, None, now, None);
+            if issue.status == Status::Closed {
+                issue.closed_at = Some(now);
+            }
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency(&ids[1], &ids[0], "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency(&ids[2], &ids[1], "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency(&ids[3], &ids[1], "parent-child", "tester")
+            .unwrap();
+    }
+
+    fn leaf_work_group_policy(
+        name: &str,
+        statuses: &[&str],
+        hard: u32,
+    ) -> crate::close_policy::CapacityPolicy {
+        let mut policy = crate::close_policy::CapacityPolicy {
+            counting: crate::close_policy::CapacityCounting {
+                hierarchy: crate::close_policy::CapacityCountingMode::LeafWork,
+                weights: crate::close_policy::CapacityWeights::default(),
+            },
+            ..crate::close_policy::CapacityPolicy::default()
+        };
+        policy.groups.insert(
+            name.to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: statuses.iter().map(|s| (*s).to_string()).collect(),
+                soft: None,
+                hard: Some(hard),
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn capacity_leaf_work_counts_the_github_384_example_as_two_slots() {
+        // Epic: in_progress / Parent: in_progress / A: in_progress /
+        // B: in_review. The issue body specifies this consumes two slots
+        // under leaf_work, not four.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-lw",
+            [
+                Status::InProgress,
+                Status::InProgress,
+                Status::InProgress,
+                Status::Custom("in_review".to_string()),
+            ],
+        );
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress", "in_review"],
+            2,
+        ));
+
+        // A fresh leaf admitted into the group makes it 3 > hard 2.
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-lw-solo", "solo", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-lw-solo",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.counting_mode, "leaf_work");
+        assert_eq!(violation.current, 2, "epic and parent are aggregates");
+        assert_eq!(violation.prospective, 3);
+        // Epic and parent are active but excluded as aggregates.
+        assert_eq!(violation.aggregate_parents_excluded, Some(2));
+    }
+
+    #[test]
+    fn capacity_leaf_work_starts_counting_a_parent_when_its_last_child_leaves() {
+        // Draining the final active descendant must not free a slot: the
+        // active parent stops being an aggregate and begins counting itself.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-lw2",
+            [
+                Status::Closed,
+                Status::InProgress,
+                Status::InProgress,
+                Status::Closed,
+            ],
+        );
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            1,
+        ));
+
+        // Only child A counts right now; the parent is an aggregate.
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-lw2-solo", "solo", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let admit = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let blocked = storage
+            .update_issue("bd-lw2-solo", &admit, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = blocked else {
+            panic!("unexpected capacity error: {blocked:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(violation.aggregate_parents_excluded, Some(1));
+
+        // Closing child A leaves the parent as the sole counted issue, so
+        // the count stays 1 and admitting a fresh issue still fails.
+        storage
+            .update_issue(
+                "bd-lw2-child-a",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        let still_blocked = storage
+            .update_issue("bd-lw2-solo", &admit, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = still_blocked else {
+            panic!("unexpected capacity error: {still_blocked:?}");
+        };
+        assert_eq!(
+            violation.current, 1,
+            "parent must begin counting once its last active descendant leaves"
+        );
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+    }
+
+    #[test]
+    fn capacity_leaf_work_enforces_an_increase_caused_only_by_a_drain() {
+        // A child shared by two active parents is the one case where a
+        // transition that only *leaves* the capacity still raises the count:
+        // closing it turns both parents from aggregates into counted work.
+        // The hard limit must still be enforced.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-shared-p1", "bd-shared-p2", "bd-shared-child"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        // Two parents for one child: reachable through import, not through
+        // `--parent`, which replaces the existing edge.
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at)
+                 VALUES ('bd-shared-child', 'bd-shared-p1', 'parent-child', '2026-01-01T00:00:00Z'),
+                        ('bd-shared-child', 'bd-shared-p2', 'parent-child', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            1,
+        ));
+
+        // Only the shared child counts today: both parents are aggregates.
+        let error = storage
+            .update_issue(
+                "bd-shared-child",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(
+            violation.prospective, 2,
+            "both parents begin counting once the shared child leaves"
+        );
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+        assert_eq!(
+            storage
+                .get_issue("bd-shared-child")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress,
+            "rejection must roll back"
+        );
+    }
+
+    #[test]
+    fn capacity_leaf_work_ignores_blocks_edges() {
+        // Only parent-child edges participate: a `blocks` edge between two
+        // active leaves must never suppress one of them.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-lwb-1", "bd-lwb-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-lwb-2", "bd-lwb-1", "blocks", "tester")
+            .unwrap();
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            2,
+        ));
+
+        storage
+            .create_issue(
+                &make_issue("bd-lwb-3", "third", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-lwb-3",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 2, "blocks edges must not aggregate");
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+    }
+
+    #[test]
+    fn capacity_roots_counts_the_highest_active_ancestor() {
+        // Same tree as the leaf_work example: under `roots` the epic is the
+        // single counted work stream.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-roots",
+            [
+                Status::InProgress,
+                Status::InProgress,
+                Status::InProgress,
+                Status::InProgress,
+            ],
+        );
+        let mut policy = leaf_work_group_policy("active_work", &["in_progress"], 1);
+        policy.counting.hierarchy = crate::close_policy::CapacityCountingMode::Roots;
+        storage.set_workflow_capacity_policy(policy);
+
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-roots-solo", "solo", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-roots-solo",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.counting_mode, "roots");
+        assert_eq!(violation.current, 1, "one active work stream");
+        assert_eq!(violation.prospective, 2);
+        assert_eq!(violation.aggregate_parents_excluded, Some(3));
+    }
+
+    #[test]
+    fn capacity_weighted_applies_issue_and_type_weights() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut epic = make_issue("bd-w-epic", "epic", Status::InProgress, 1, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").unwrap();
+        for id in ["bd-w-1", "bd-w-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let mut weights = crate::close_policy::CapacityWeights {
+            default: Some(1),
+            ..crate::close_policy::CapacityWeights::default()
+        };
+        // An epic represents no independent execution; bd-w-2 is double-weight.
+        weights.types.insert("epic".to_string(), 0);
+        weights.issues.insert("bd-w-2".to_string(), 2);
+        let mut policy = crate::close_policy::CapacityPolicy {
+            counting: crate::close_policy::CapacityCounting {
+                hierarchy: crate::close_policy::CapacityCountingMode::Weighted,
+                weights,
+            },
+            ..crate::close_policy::CapacityPolicy::default()
+        };
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(3),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        // Weighted current = 0 (epic) + 1 + 2 = 3; one more unit exceeds 3.
+        storage
+            .create_issue(
+                &make_issue("bd-w-3", "third", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-w-3",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.counting_mode, "weighted");
+        assert_eq!(violation.current, 3);
+        assert_eq!(violation.prospective, 4);
+        assert!(
+            violation.aggregate_parents_excluded.is_none(),
+            "weighted counting has no aggregate exclusion"
+        );
+    }
+
+    #[test]
+    fn capacity_weighted_counts_a_created_issue_before_its_row_exists() {
+        // Creation must resolve the new issue's weight from the requested
+        // type, not from a row that does not exist yet.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut weights = crate::close_policy::CapacityWeights::default();
+        weights.types.insert("epic".to_string(), 5);
+        let mut policy = crate::close_policy::CapacityPolicy {
+            counting: crate::close_policy::CapacityCounting {
+                hierarchy: crate::close_policy::CapacityCountingMode::Weighted,
+                weights,
+            },
+            ..crate::close_policy::CapacityPolicy::default()
+        };
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(4),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let mut epic = make_issue("bd-wc-epic", "epic", Status::InProgress, 1, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        let error = storage.create_issue(&epic, "tester").unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 0);
+        assert_eq!(violation.prospective, 5);
+        assert!(storage.get_issue("bd-wc-epic").unwrap().is_none());
+    }
+
+    #[test]
+    fn capacity_hierarchy_counts_every_member_of_a_dependency_cycle() {
+        // Imported data can contain a parent-child cycle. Condensing the
+        // cycle into one component keeps its active members visible instead
+        // of letting them cancel each other out.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-cyc-1", "bd-cyc-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        // Bypass the cycle guard the way a JSONL import would.
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at)
+                 VALUES ('bd-cyc-1', 'bd-cyc-2', 'parent-child', '2026-01-01T00:00:00Z'),
+                        ('bd-cyc-2', 'bd-cyc-1', 'parent-child', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            2,
+        ));
+
+        storage
+            .create_issue(
+                &make_issue("bd-cyc-3", "third", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-cyc-3",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(
+            violation.current, 2,
+            "both cycle members must remain counted"
+        );
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+    }
+
+    #[test]
+    fn capacity_leaf_work_batch_is_evaluated_on_the_final_state() {
+        // A batch that activates a parent and closes its only active child
+        // is capacity-neutral under leaf_work regardless of request order.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-lwbatch",
+            [
+                Status::Closed,
+                Status::Open,
+                Status::InProgress,
+                Status::Closed,
+            ],
+        );
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            1,
+        ));
+
+        storage
+            .update_issues_atomically(
+                &[
+                    (
+                        "bd-lwbatch-parent".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::InProgress),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    (
+                        "bd-lwbatch-child-a".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::Closed),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                ],
+                "tester",
+            )
+            .expect("capacity-neutral hierarchy swap must be admitted");
+
+        assert_eq!(
+            storage
+                .get_issue("bd-lwbatch-parent")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress
+        );
+    }
+
+    #[test]
+    fn derived_rollup_reports_subtree_status_without_mutating_the_parent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-rollup",
+            [
+                Status::Open,
+                Status::Open,
+                Status::InProgress,
+                Status::Closed,
+            ],
+        );
+
+        let epic = storage
+            .get_issue_details("bd-rollup-epic", false, false, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(epic.issue.status, Status::Open, "explicit status is intact");
+        let rollup = epic.rollup.expect("epic has children");
+        assert_eq!(rollup.status, "in_progress");
+        assert_eq!(rollup.descendants.get("in_progress"), Some(&1));
+        assert_eq!(rollup.descendants.get("open"), Some(&1));
+        assert_eq!(rollup.descendants.get("closed"), Some(&1));
+
+        // A leaf has no children and therefore no rollup.
+        let leaf = storage
+            .get_issue_details("bd-rollup-child-a", false, false, 0)
+            .unwrap()
+            .unwrap();
+        assert!(leaf.rollup.is_none());
+    }
+
+    #[test]
+    fn derived_rollup_terminates_on_a_parent_child_cycle() {
+        // The subtree walk must not loop on imported cyclic data, and the
+        // issue itself must never appear among its own descendants.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-rc-1", "bd-rc-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at)
+                 VALUES ('bd-rc-1', 'bd-rc-2', 'parent-child', '2026-01-01T00:00:00Z'),
+                        ('bd-rc-2', 'bd-rc-1', 'parent-child', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+
+        let rollup = storage
+            .derived_rollup("bd-rc-1")
+            .unwrap()
+            .expect("cyclic parent still has a child");
+        assert_eq!(rollup.status, "in_progress");
+        assert_eq!(
+            rollup.descendants.get("in_progress"),
+            Some(&1),
+            "only the other cycle member counts as a descendant"
+        );
+    }
+
+    #[test]
+    fn derived_rollup_is_closed_when_every_descendant_is_terminal() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-rollup2",
+            [Status::Open, Status::Closed, Status::Closed, Status::Closed],
+        );
+
+        let rollup = storage
+            .get_issue_details("bd-rollup2-epic", false, false, 0)
+            .unwrap()
+            .unwrap()
+            .rollup
+            .expect("epic has children");
+        assert_eq!(rollup.status, "closed");
+        assert_eq!(rollup.descendants.get("closed"), Some(&3));
     }
 
     #[test]

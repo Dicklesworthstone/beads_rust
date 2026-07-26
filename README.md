@@ -690,10 +690,35 @@ has one matching target. Leaving and later re-entering review invalidates prior
 passes without deleting their append-only audit history. Pre-v15 unscoped gate
 rows remain visible through `br gate list` but can never authorize a transition.
 
-The current enforcement layer uses repository scope and counts all matching
-issues. Hierarchy-aware counts, audited exemptions, additional actor/harness/
-session/subtree scopes, and capacity observability remain subsequent phases of
-GitHub issue #384.
+Capacity counts every matching issue by default. `workflow.capacity.counting.
+hierarchy` measures occupancy across `parent-child` edges instead, so an
+aggregate parent and its executable child do not each consume a slot:
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: leaf_work   # all | leaf_work | roots | weighted
+```
+
+Under `leaf_work` an active leaf counts one and a parent with active counted
+descendants counts zero, so an epic → parent → {child, child} tree consumes
+two slots rather than four; the parent starts counting once its last active
+descendant leaves. `roots` counts each work stream by its highest active
+ancestor, and `weighted` sums explicit `counting.weights` (per issue, then
+per type, then a default), where a weight of `0` is the audited way to say a
+parent carries no independent execution. Only `parent-child` edges
+participate — `blocks` and `related` never affect counting — and the walk
+happens inside the same transaction as admission. Under `leaf_work`/`roots`,
+capacity evidence reports `counting_mode` plus `aggregate_parents_excluded`.
+
+`br show --json` also exposes a derived `rollup` for any issue with local
+children (`{"status": "in_progress", "descendants": {...}}`), letting an epic
+stay `open` while reporting that its subtree has started.
+
+The current enforcement layer uses repository scope. Audited exemptions,
+additional actor/harness/session/subtree scopes, and capacity observability
+remain subsequent phases of GitHub issue #384.
 
 ### Environment Variables
 

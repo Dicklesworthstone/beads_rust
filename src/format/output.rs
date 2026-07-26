@@ -155,6 +155,25 @@ pub struct IssueDetails {
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Derived parent-child subtree rollup; present only when the issue has
+    /// local parent-child children (GitHub #384 phase 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollup: Option<RollupSummary>,
+}
+
+/// Derived parent-child subtree rollup for a parent issue (GitHub #384
+/// phase 3: hierarchy observability).
+///
+/// The rollup reports what a parent's subtree is effectively doing without
+/// mutating the parent's explicit status: an epic can stay `open` while its
+/// rollup says `in_progress` because a descendant started.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RollupSummary {
+    /// Furthest-along non-terminal descendant status in workflow order, or
+    /// `closed` when every descendant is terminal.
+    pub status: String,
+    /// Count of strict parent-child descendants by stored status.
+    pub descendants: std::collections::BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -317,11 +336,13 @@ mod tests {
             comments: vec![],
             events: vec![],
             parent: Some("bd-parent".to_string()),
+            rollup: None,
         };
 
         let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("\"parent\":\"bd-parent\""));
         assert!(json.contains("\"labels\":[\"backend\"]"));
+        assert!(!json.contains("\"rollup\""));
     }
 
     #[test]

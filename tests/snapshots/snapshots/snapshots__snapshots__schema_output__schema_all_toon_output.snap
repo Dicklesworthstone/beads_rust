@@ -990,6 +990,11 @@ schemas:
         items:
           "$ref": #/$defs/Event
       parent.type[2]: string,"null"
+      rollup:
+        description: "Derived parent-child subtree rollup; present only when the issue has\nlocal parent-child children (GitHub #384 phase 3)."
+        anyOf[2]:
+          - "$ref": #/$defs/RollupSummary
+          - type: "null"
     required[8]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level
     "$defs":
       Status:
@@ -1094,6 +1099,21 @@ schemas:
             type[2]: string,"null"
         required[5]: id,issue_id,event_type,actor,created_at
       EventType.type: string
+      RollupSummary:
+        description: "Derived parent-child subtree rollup for a parent issue (GitHub #384\nphase 3: hierarchy observability).\n\nThe rollup reports what a parent's subtree is effectively doing without\nmutating the parent's explicit status: an epic can stay `open` while its\nrollup says `in_progress` because a descendant started."
+        type: object
+        properties:
+          status:
+            description: "Furthest-along non-terminal descendant status in workflow order, or\n`closed` when every descendant is terminal."
+            type: string
+          descendants:
+            description: Count of strict parent-child descendants by stored status.
+            type: object
+            additionalProperties:
+              type: integer
+              format: uint32
+              minimum: 0
+        required[2]: status,descendants
   IssueWithCounts:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: IssueWithCounts

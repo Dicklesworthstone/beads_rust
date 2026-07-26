@@ -21,7 +21,7 @@ Commands:
   doctor        Run diagnostics and optionally repair issues
   epic          Epic management commands
   gate          Workflow gate engine: record and inspect gate results (issue #312)
-  graph         Visualize dependency graph
+  graph         Visualize the dependents graph: what an issue unblocks
   history       Manage local history backups
   info          Show diagnostic metadata about the workspace
   init          Initialize a beads workspace

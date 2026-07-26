@@ -620,10 +620,87 @@ workflow:
   be committed if a later route fails and cross-repository atomicity is
   intentionally not claimed.
 - Omitting `workflow.capacity` preserves existing behavior exactly.
-- The current enforcement layer has fixed `repository` scope and `all`
-  counting. Hierarchy-aware counting, audited exemptions, actor/assignee/
-  harness/session/subtree scopes, and capacity observability are later phases
-  tracked in GitHub issue #384.
+- The current enforcement layer has fixed `repository` scope. Audited
+  exemptions, actor/assignee/harness/session/subtree scopes, and capacity
+  observability are later phases tracked in GitHub issue #384.
+
+**Hierarchy-aware counting (`workflow.capacity.counting`):**
+
+By default every matching issue counts. `counting.hierarchy` changes how
+occupancy is measured so an aggregate parent and its executable child do not
+each consume a slot. Only `parent-child` dependency edges participate;
+`blocks` and `related` edges never affect counting.
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: leaf_work
+    groups:
+      active_work:
+        statuses: [in_progress, in_review]
+        hard: 8
+```
+
+| Mode | Behavior |
+|------|----------|
+| `all` | Every matching issue counts. The default; unchanged from earlier phases. |
+| `leaf_work` | An issue does not count while a descendant is already counted in the same capacity. Active leaves count one, aggregate parents count zero, and a parent begins counting when its last active descendant leaves. |
+| `roots` | Count active work streams by their highest matching ancestor: an issue counts only when no ancestor is active in the same capacity. |
+| `weighted` | Sum explicit `counting.weights` over matching issues. |
+
+For a group containing `in_progress` and `in_review`, an epic → parent →
+{child A `in_progress`, child B `in_review`} tree consumes two `leaf_work`
+slots, not four.
+
+Weights are resolved per issue as: `counting.weights.issues.<id>`, then
+`counting.weights.types.<type>` (case-insensitive), then
+`counting.weights.default`, then `1`. A weight of `0` is the explicit,
+visible way to declare that a parent represents no independent execution
+beyond its children. Configuring `counting.weights` without
+`hierarchy: weighted` is rejected while loading the policy rather than
+silently ignored.
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: weighted
+      weights:
+        default: 1
+        types:
+          epic: 0
+        issues:
+          br-migration: 3
+```
+
+- Hierarchy counting runs inside the same `BEGIN IMMEDIATE` transaction as
+  admission, so concurrent transitions cannot disagree about the tree.
+- Each issue is counted at most once per capacity. Parent-child cycles from
+  imported data are condensed into one component, so every active member of a
+  cycle stays counted rather than cancelling out.
+- Under `leaf_work` and `roots`, capacity evidence adds
+  `aggregate_parents_excluded`: the number of active issues that did not count
+  because a relative already covers their work stream. `counting_mode` reports
+  the active mode. Under `all` both the field and the message text are
+  unchanged from earlier phases.
+
+**Derived rollup status:**
+
+`br show --json` adds a `rollup` object to any issue that has local
+parent-child children, without mutating the issue's own status:
+
+```json
+{"id":"br-epic","status":"open",
+ "rollup":{"status":"in_progress","descendants":{"in_progress":1,"closed":2}}}
+```
+
+`rollup.status` is the furthest-along non-terminal descendant status —
+ranked by position in `workflow.statuses` when configured, otherwise by a
+built-in `draft < deferred < open < blocked < in_progress` ladder — or
+`closed` when every descendant is terminal. `rollup.descendants` counts the
+whole strict subtree by stored status. Issues without children omit the key
+entirely, and the JSONL fallback show paths do not emit it.
 
 ---
 

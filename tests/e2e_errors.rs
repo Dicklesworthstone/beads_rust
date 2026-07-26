@@ -2485,6 +2485,128 @@ workflow:
 }
 
 #[test]
+fn e2e_workflow_capacity_leaf_work_excludes_aggregate_parents_and_reports_rollup() {
+    // GitHub #384 phase 3, end to end: an epic -> parent -> child chain
+    // occupies one leaf_work slot, not three, and `br show` reports the
+    // parent's derived rollup without mutating its explicit status.
+    let _log = common::test_log(
+        "e2e_workflow_capacity_leaf_work_excludes_aggregate_parents_and_reports_rollup",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_leaf_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic_id =
+        create_issue_with_description(&workspace, "Epic", Some("epic"), None, "capacity_leaf_epic");
+    let parent_id =
+        create_issue_with_description(&workspace, "Parent", None, None, "capacity_leaf_parent");
+    let child_id =
+        create_issue_with_description(&workspace, "Child", None, None, "capacity_leaf_child");
+    let fresh_id =
+        create_issue_with_description(&workspace, "Fresh", None, None, "capacity_leaf_fresh");
+
+    for (child, parent, label) in [
+        (&parent_id, &epic_id, "capacity_leaf_dep_parent"),
+        (&child_id, &parent_id, "capacity_leaf_dep_child"),
+    ] {
+        let dep = run_br(
+            &workspace,
+            ["dep", "add", child, parent, "--type", "parent-child"],
+            label,
+        );
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    }
+
+    // Activate the whole chain before the policy exists so the pre-existing
+    // state is what hierarchy counting has to interpret.
+    let activate = run_br(
+        &workspace,
+        [
+            "update",
+            &epic_id,
+            &parent_id,
+            &child_id,
+            "--status",
+            "in_progress",
+        ],
+        "capacity_leaf_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "activate failed: {}",
+        activate.stderr
+    );
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    counting:
+      hierarchy: leaf_work
+    statuses:
+      in_progress:
+        hard: 1
+",
+    )
+    .expect("write hierarchy capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        ["update", &fresh_id, "--status", "in_progress", "--json"],
+        "capacity_leaf_reject",
+    );
+    assert!(
+        !rejected.status.success(),
+        "admitting a fourth active issue must fail"
+    );
+    assert_eq!(rejected.status.code(), Some(4));
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    let error = &json["error"];
+    assert_eq!(error["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(error["context"]["counting_mode"], "leaf_work");
+    // Three issues are in_progress, but the epic and the parent are
+    // aggregates: only the leaf counts.
+    assert_eq!(error["context"]["current"], 1);
+    assert_eq!(error["context"]["prospective"], 2);
+    assert_eq!(error["context"]["aggregate_parents_excluded"], 2);
+
+    // The rejected transition left no trace.
+    let show_fresh = run_br(
+        &workspace,
+        ["show", &fresh_id, "--json"],
+        "capacity_leaf_show_fresh",
+    );
+    let fresh: Value =
+        serde_json::from_str(&extract_json_payload(&show_fresh.stdout)).expect("show fresh json");
+    assert_eq!(fresh[0]["status"], "open");
+
+    // The parent keeps its own status and gains a derived rollup.
+    let show_parent = run_br(
+        &workspace,
+        ["show", &parent_id, "--json"],
+        "capacity_leaf_show_parent",
+    );
+    let parent: Value =
+        serde_json::from_str(&extract_json_payload(&show_parent.stdout)).expect("show parent json");
+    assert_eq!(parent[0]["status"], "in_progress");
+    assert_eq!(parent[0]["rollup"]["status"], "in_progress");
+    assert_eq!(parent[0]["rollup"]["descendants"]["in_progress"], 1);
+
+    // A childless leaf has no rollup key at all.
+    let show_child = run_br(
+        &workspace,
+        ["show", &child_id, "--json"],
+        "capacity_leaf_show_child",
+    );
+    let child: Value =
+        serde_json::from_str(&extract_json_payload(&show_child.stdout)).expect("show child json");
+    assert!(child[0].get("rollup").is_none());
+}
+
+#[test]
 fn e2e_structured_error_issue_not_found() {
     let _log = common::test_log("e2e_structured_error_issue_not_found");
     let workspace = BrWorkspace::new();

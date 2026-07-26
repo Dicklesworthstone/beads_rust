@@ -242,16 +242,19 @@ pub struct Workflow {
     pub capacity: CapacityPolicy,
 }
 
-/// Repository-level workflow capacity policy (GitHub #384, phase 1).
+/// Repository-level workflow capacity policy (GitHub #384).
 ///
-/// The first phase intentionally implements the race-sensitive core: hard
-/// limits for individual statuses and named groups, plus transition-scoped
-/// admission rules that inspect other queues.  Hierarchy-aware counting,
-/// exemptions, and actor/harness/subtree scopes are represented by later
-/// phases of the tracked epic rather than silently approximated here.
+/// Phase 1 implements the race-sensitive core: hard limits for individual
+/// statuses and named groups, plus transition-scoped admission rules that
+/// inspect other queues.  Phase 3 adds hierarchy-aware counting over
+/// parent-child edges via [`CapacityCounting`].  Exemptions and
+/// actor/harness/subtree scopes are represented by later phases of the
+/// tracked epic rather than silently approximated here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CapacityPolicy {
+    /// How occupancy is counted across parent-child hierarchies.
+    pub counting: CapacityCounting,
     /// Per-status soft/hard limits, keyed by a declared workflow status.
     pub statuses: std::collections::BTreeMap<String, CapacityLimit>,
     /// Named multi-status capacity pools.
@@ -334,6 +337,96 @@ pub struct CapacityAdmissionRule {
     pub require_below: CapacityRequirements,
 }
 
+/// Hierarchy-aware counting configuration for capacity evaluation
+/// (GitHub #384, phase 3: "Hierarchy-aware counting").
+///
+/// Only `parent-child` dependency edges participate in hierarchy
+/// accounting; `blocks` and `related` edges never affect counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityCounting {
+    /// Counting mode applied to every configured capacity.
+    pub hierarchy: CapacityCountingMode,
+    /// Explicit weights; only meaningful under `hierarchy: weighted`.
+    pub weights: CapacityWeights,
+}
+
+/// Counting mode for capacity occupancy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityCountingMode {
+    /// Every matching issue counts (the phase-1 behavior and the default).
+    #[default]
+    All,
+    /// An issue does not count while a parent-child descendant is already
+    /// counted in the same capacity: active leaves count one, aggregate
+    /// parents count zero, and a parent begins counting when its last
+    /// active descendant leaves the capacity.
+    LeafWork,
+    /// Count active work streams by their highest matching ancestor: an
+    /// active issue counts only when no parent-child ancestor is active in
+    /// the same capacity.
+    Roots,
+    /// Sum explicit per-issue / per-type weights over matching issues.
+    Weighted,
+}
+
+impl CapacityCountingMode {
+    /// Stable wire string used in structured evidence (`counting_mode`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::LeafWork => "leaf_work",
+            Self::Roots => "roots",
+            Self::Weighted => "weighted",
+        }
+    }
+}
+
+/// Explicit occupancy weights for [`CapacityCountingMode::Weighted`].
+///
+/// Zero weights are deliberately legal: they are the audited, visible way
+/// to declare that a parent or epic represents no independent execution
+/// beyond its children.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityWeights {
+    /// Weight for issues with no per-issue or per-type entry (1 when absent).
+    pub default: Option<u32>,
+    /// Weight per issue type, matched case-insensitively.
+    pub types: std::collections::BTreeMap<String, u32>,
+    /// Weight per issue ID (exact match); wins over type and default.
+    pub issues: std::collections::BTreeMap<String, u32>,
+}
+
+impl CapacityWeights {
+    /// Whether any weight is explicitly configured.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.default.is_some() || !self.types.is_empty() || !self.issues.is_empty()
+    }
+
+    /// Resolve the effective weight for one issue: per-issue entry, then
+    /// per-type entry (case-insensitive), then the configured default,
+    /// then 1.
+    #[must_use]
+    pub fn weight_for(&self, issue_id: &str, issue_type: &str) -> u32 {
+        if let Some(weight) = self.issues.get(issue_id) {
+            return *weight;
+        }
+        if let Some(weight) = self
+            .types
+            .iter()
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case(issue_type.trim()))
+            .map(|(_, weight)| *weight)
+        {
+            return weight;
+        }
+        self.default.unwrap_or(1)
+    }
+}
+
 /// Structured evidence for a hard workflow-capacity rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowCapacityViolation {
@@ -344,6 +437,10 @@ pub struct WorkflowCapacityViolation {
     pub capacity_name: String,
     pub scope: String,
     pub counting_mode: String,
+    /// Prospective active issues excluded from the count as hierarchy
+    /// aggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_parents_excluded: Option<u32>,
     pub current: u32,
     pub prospective: u32,
     pub soft_limit: Option<u32>,
@@ -367,6 +464,10 @@ pub struct WorkflowCapacityWarning {
     pub capacity_name: String,
     pub scope: String,
     pub counting_mode: String,
+    /// Prospective active issues excluded from the count as hierarchy
+    /// aggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_parents_excluded: Option<u32>,
     pub current: u32,
     pub prospective: u32,
     pub soft_limit: u32,
@@ -374,12 +475,25 @@ pub struct WorkflowCapacityWarning {
     pub policy_path: String,
 }
 
+/// Human-readable qualifier appended to capacity diagnostics when a
+/// non-default counting mode produced the numbers. Empty for `all` so the
+/// phase-1 message text stays byte-stable.
+fn counting_mode_display_suffix(counting_mode: &str, excluded: Option<u32>) -> String {
+    if counting_mode == "all" {
+        return String::new();
+    }
+    excluded.map_or_else(
+        || format!(", counting: {counting_mode}"),
+        |excluded| format!(", counting: {counting_mode}, aggregate-excluded: {excluded}"),
+    )
+}
+
 impl std::fmt::Display for WorkflowCapacityWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let from = self.from_status.as_deref().unwrap_or("<initial>");
         write!(
             f,
-            "transitioned {} from {} to {}; repository {} capacity '{}' has reached or exceeded its soft limit (current: {}, prospective: {}, soft: {}; policy: {}). Drain existing work before admitting more",
+            "transitioned {} from {} to {}; repository {} capacity '{}' has reached or exceeded its soft limit (current: {}, prospective: {}, soft: {}{}; policy: {}). Drain existing work before admitting more",
             self.issue_id,
             from,
             self.to_status,
@@ -388,6 +502,7 @@ impl std::fmt::Display for WorkflowCapacityWarning {
             self.current,
             self.prospective,
             self.soft_limit,
+            counting_mode_display_suffix(&self.counting_mode, self.aggregate_parents_excluded),
             self.policy_path,
         )
     }
@@ -396,10 +511,12 @@ impl std::fmt::Display for WorkflowCapacityWarning {
 impl std::fmt::Display for WorkflowCapacityViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let from = self.from_status.as_deref().unwrap_or("<initial>");
+        let counting =
+            counting_mode_display_suffix(&self.counting_mode, self.aggregate_parents_excluded);
         if self.capacity_kind.starts_with("admission_") {
             return write!(
                 f,
-                "cannot transition {} from {} to {}: repository admission guard '{}' requires the observed queue to remain below {} (current: {}, prospective: {}; policy: {})",
+                "cannot transition {} from {} to {}: repository admission guard '{}' requires the observed queue to remain below {} (current: {}, prospective: {}{}; policy: {})",
                 self.issue_id,
                 from,
                 self.to_status,
@@ -407,12 +524,13 @@ impl std::fmt::Display for WorkflowCapacityViolation {
                 self.hard_limit,
                 self.current,
                 self.prospective,
+                counting,
                 self.policy_path,
             );
         }
         write!(
             f,
-            "cannot transition {} from {} to {}: repository {} capacity '{}' would exceed its hard limit (current: {}, prospective: {}, hard: {}; policy: {})",
+            "cannot transition {} from {} to {}: repository {} capacity '{}' would exceed its hard limit (current: {}, prospective: {}, hard: {}{}; policy: {})",
             self.issue_id,
             from,
             self.to_status,
@@ -421,6 +539,7 @@ impl std::fmt::Display for WorkflowCapacityViolation {
             self.current,
             self.prospective,
             self.hard_limit,
+            counting,
             self.policy_path,
         )
     }
@@ -1102,6 +1221,10 @@ impl Workflow {
     /// a name/list is empty, thresholds are zero or inverted, or admission rule
     /// names collide case-insensitively.
     pub fn validate_capacity(&self) -> Result<()> {
+        // Counting configuration is validated even when no limit is active:
+        // a typo'd weights block must fail loudly rather than lie dormant
+        // until an operator adds their first hard limit.
+        validate_capacity_counting(&self.capacity.counting)?;
         if !self.capacity.is_active() {
             return Ok(());
         }
@@ -1292,6 +1415,36 @@ impl Workflow {
 
 fn capacity_validation_error(reason: impl Into<String>) -> BeadsError {
     BeadsError::validation("workflow.capacity", reason)
+}
+
+fn validate_capacity_counting(counting: &CapacityCounting) -> Result<()> {
+    if counting.weights.is_configured() && counting.hierarchy != CapacityCountingMode::Weighted {
+        return Err(capacity_validation_error(format!(
+            "counting.weights requires counting.hierarchy: weighted (found '{}')",
+            counting.hierarchy.as_str()
+        )));
+    }
+    let mut type_names = std::collections::HashSet::new();
+    for type_name in counting.weights.types.keys() {
+        if type_name.trim().is_empty() {
+            return Err(capacity_validation_error(
+                "counting.weights.types keys cannot be empty",
+            ));
+        }
+        if !type_names.insert(type_name.trim().to_lowercase()) {
+            return Err(capacity_validation_error(format!(
+                "counting.weights.types entry '{type_name}' is duplicated case-insensitively"
+            )));
+        }
+    }
+    for issue_id in counting.weights.issues.keys() {
+        if issue_id.trim().is_empty() {
+            return Err(capacity_validation_error(
+                "counting.weights.issues keys cannot be empty",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn declared_capacity_statuses(statuses: &[String]) -> Result<std::collections::HashSet<String>> {
@@ -3616,6 +3769,124 @@ capacity:
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn capacity_counting_defaults_to_all_and_parses_every_mode() {
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  statuses:
+    in_progress:
+      hard: 2
+",
+        )
+        .unwrap();
+        assert_eq!(
+            workflow.capacity.counting.hierarchy,
+            CapacityCountingMode::All
+        );
+        workflow.validate_capacity().unwrap();
+
+        for (configured, expected) in [
+            ("leaf_work", CapacityCountingMode::LeafWork),
+            ("roots", CapacityCountingMode::Roots),
+            ("all", CapacityCountingMode::All),
+        ] {
+            let workflow: Workflow = serde_yml::from_str(&format!(
+                r"
+statuses: [open, in_progress]
+capacity:
+  counting:
+    hierarchy: {configured}
+  statuses:
+    in_progress:
+      hard: 2
+"
+            ))
+            .unwrap();
+            assert_eq!(workflow.capacity.counting.hierarchy, expected);
+            assert_eq!(workflow.capacity.counting.hierarchy.as_str(), configured);
+            workflow.validate_capacity().unwrap();
+        }
+    }
+
+    #[test]
+    fn capacity_counting_rejects_unknown_modes_and_misplaced_weights() {
+        let error = serde_yml::from_str::<Workflow>(
+            r"
+statuses: [open, in_progress]
+capacity:
+  counting:
+    hierarchy: leafwork
+",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("leafwork"), "{error}");
+
+        // Weights without `hierarchy: weighted` are a silent no-op unless
+        // validation rejects them.
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  counting:
+    hierarchy: leaf_work
+    weights:
+      types:
+        epic: 0
+  statuses:
+    in_progress:
+      hard: 2
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("counting.weights requires counting.hierarchy: weighted"),
+            "{error}"
+        );
+
+        // Counting is validated even with no limits configured at all.
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  counting:
+    weights:
+      default: 2
+",
+        )
+        .unwrap();
+        assert!(!workflow.capacity.is_active());
+        assert!(workflow.validate_capacity().is_err());
+    }
+
+    #[test]
+    fn capacity_weight_resolution_prefers_issue_then_type_then_default() {
+        let mut weights = CapacityWeights {
+            default: Some(3),
+            ..CapacityWeights::default()
+        };
+        weights.types.insert("Epic".to_string(), 0);
+        weights.issues.insert("bd-1".to_string(), 7);
+
+        assert_eq!(weights.weight_for("bd-1", "task"), 7, "per-issue wins");
+        assert_eq!(weights.weight_for("bd-2", "epic"), 0, "type is next");
+        assert_eq!(
+            weights.weight_for("bd-2", "EPIC"),
+            0,
+            "type is case-insensitive"
+        );
+        assert_eq!(weights.weight_for("bd-2", "task"), 3, "default applies");
+        assert_eq!(
+            CapacityWeights::default().weight_for("bd-2", "task"),
+            1,
+            "unconfigured weight is 1"
+        );
     }
 
     #[test]
