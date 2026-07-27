@@ -1538,7 +1538,12 @@ fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
         return false;
     }
     match check.name.as_str() {
-        "db.recovery_artifacts" | "rust_log" => true,
+        // `br_path_dupes` reports the host's $PATH shape (two `br` installs).
+        // A database rebuild cannot change $PATH, so treating the warning as
+        // a verification failure made `--repair` exit 7 on dual-install
+        // hosts even when the rebuilt database was fully healthy
+        // (beads_rust-ozdh). The warning still surfaces in the report.
+        "db.recovery_artifacts" | "rust_log" | "br_path_dupes" => true,
         "sync.metadata" => is_pending_export_only_sync_metadata(check),
         _ => false,
     }

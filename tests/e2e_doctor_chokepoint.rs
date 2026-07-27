@@ -28,6 +28,8 @@
 //! `.gitignore` isolates the WP3-rewired chokepoint flow without
 //! dragging the as-yet-unmigrated repair paths into the assertion.
 
+mod common;
+
 use assert_cmd::Command;
 use beads_rust::cli::commands::doctor_subsystems::mutate::{
     Capabilities, DbArg, MutateContext, Op, mutate,
@@ -53,6 +55,10 @@ fn br_cmd(cwd: &Path) -> Command {
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "warn");
     cmd.env("HOME", cwd);
+    // Hermetic $PATH: a developer host with two `br` installs (install
+    // script + cargo install) otherwise trips the `br_path_dupes` doctor
+    // warning inside every spawned doctor run (beads_rust-ozdh).
+    cmd.env("PATH", common::cli::deduplicated_br_path());
     // Strip any inherited beads / bd env that might redirect storage.
     for (key, _) in std::env::vars_os() {
         let key_s = key.to_string_lossy();
@@ -948,6 +954,7 @@ fn chokepoint_db_exec_undo_replay() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .output()
         .expect("invoke br doctor undo");
     assert!(
@@ -1023,6 +1030,7 @@ fn chokepoint_repair_acquires_workspace_lock() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1069,6 +1077,7 @@ fn chokepoint_repair_acquires_workspace_lock() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1128,6 +1137,7 @@ fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1227,6 +1237,7 @@ fn chokepoint_refuse_gate_blocks_downgrade() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1326,6 +1337,7 @@ fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1385,6 +1397,7 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
