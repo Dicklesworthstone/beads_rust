@@ -176,6 +176,21 @@ pub enum BeadsError {
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
 
+    /// Some requested items were applied and the rest were skipped.
+    ///
+    /// A partially applied batch must never report success. The caller asked
+    /// for N transitions and got fewer, so the exit status has to carry that:
+    /// otherwise a skip is visible only as a warning on stderr, and a caller
+    /// that branches on `$?` — or that follows `docs/agent/ERRORS.md` and
+    /// parses stdout because the exit code was `0` — reads the partial batch
+    /// as a complete success.
+    #[error("Partially applied: {closed} closed, {skipped} skipped — {summary}")]
+    CloseIncomplete {
+        closed: usize,
+        skipped: usize,
+        summary: String,
+    },
+
     // === Policy Errors ===
     /// One or more closure-time policy gates fired.
     ///

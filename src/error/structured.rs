@@ -126,6 +126,8 @@ pub enum ErrorCode {
     ShuttingDown,
     /// All requested items were skipped; nothing to do
     NothingToDo,
+    /// Some requested items were applied and the rest were skipped
+    CloseIncomplete,
 
     // === Policy Errors (exit code 4) ===
     /// Closure-time policy gate fired (issue #274)
@@ -185,6 +187,7 @@ impl ErrorCode {
             // Operational
             Self::ShuttingDown => "SHUTTING_DOWN",
             Self::NothingToDo => "NOTHING_TO_DO",
+            Self::CloseIncomplete => "CLOSE_INCOMPLETE",
             // Policy
             Self::PolicyViolation => "POLICY_VIOLATION",
             Self::WorkflowCapacityExceeded => "WORKFLOW_CAPACITY_EXCEEDED",
@@ -241,7 +244,8 @@ impl ErrorCode {
             | Self::AmbiguousId
             | Self::IdCollision
             | Self::InvalidId
-            | Self::NothingToDo => 3,
+            | Self::NothingToDo
+            | Self::CloseIncomplete => 3,
             Self::ShuttingDown => 130,
             // Validation (4)
             Self::ValidationFailed
@@ -662,6 +666,22 @@ impl StructuredError {
             BeadsError::NothingToDo { reason } => {
                 (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
             }
+            BeadsError::CloseIncomplete {
+                closed,
+                skipped,
+                summary,
+            } => (
+                ErrorCode::CloseIncomplete,
+                // The counts ride in the envelope so stderr alone is a
+                // sufficient account of the partial batch: a caller that
+                // discards stdout on a non-zero exit still learns how many
+                // transitions landed and which ones did not.
+                Some(json!({
+                    "closed": closed,
+                    "skipped": skipped,
+                    "reason": summary,
+                })),
+            ),
             BeadsError::PolicyViolation {
                 issue_id,
                 summary,
@@ -764,27 +784,8 @@ impl StructuredError {
                 }
                 Some(format!("Use --force to delete '{id}' anyway."))
             }
-            BeadsError::NothingToDo { reason } => {
-                // The reason string carries the per-issue skip explanations
-                // (issue #380). Pick the hint that matches what actually
-                // happened instead of unconditionally claiming "already
-                // closed or not found" — that wording sent operators hunting
-                // for a nonexistent state bug when the skip was really a
-                // dependency block.
-                if reason.contains("blocked by") {
-                    Some(
-                        "Skipped issue(s) have open blocking dependencies. Close the blockers first, or re-run with --force to close anyway."
-                            .to_string(),
-                    )
-                } else if reason.contains("open children") || reason.contains("child issue") {
-                    Some(
-                        "Skipped issue(s) have open children. Close the children first, or re-run with --force to close anyway."
-                            .to_string(),
-                    )
-                } else {
-                    Some("All specified issues were already closed or not found.".to_string())
-                }
-            }
+            BeadsError::NothingToDo { reason } => Some(skip_reason_hint(reason)),
+            BeadsError::CloseIncomplete { summary, .. } => Some(skip_reason_hint(summary)),
             BeadsError::ShuttingDown => {
                 Some("Retry after starting a fresh br process.".to_string())
             }
@@ -793,6 +794,32 @@ impl StructuredError {
             )),
             _ => None,
         }
+    }
+}
+
+/// Pick the actionable hint for a batch whose per-issue skip reasons are
+/// rendered into `reasons`.
+///
+/// The reason string carries the per-issue skip explanations (issue #380).
+/// The hint has to match what actually happened instead of unconditionally
+/// claiming "already closed or not found" — that wording sent operators
+/// hunting for a nonexistent state bug when the skip was really a dependency
+/// block, and it is the last line of the output, which is where CLIs
+/// conventionally put the actionable summary.
+///
+/// Shared by [`BeadsError::NothingToDo`] (nothing landed) and
+/// [`BeadsError::CloseIncomplete`] (some landed): the skip reasons mean the
+/// same thing in both, so the hint must not depend on how many siblings
+/// happened to succeed.
+fn skip_reason_hint(reasons: &str) -> String {
+    if reasons.contains("blocked by") {
+        "Skipped issue(s) have open blocking dependencies. Close the blockers first, or re-run with --force to close anyway."
+            .to_string()
+    } else if reasons.contains("open children") || reasons.contains("child issue") {
+        "Skipped issue(s) have open children. Close the children first, or re-run with --force to close anyway."
+            .to_string()
+    } else {
+        "Skipped issue(s) were already closed or not found.".to_string()
     }
 }
 
