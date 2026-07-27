@@ -606,8 +606,9 @@ workflow:
   warning; JSON and TOON add a structured `warnings` array only when warnings
   exist, preserving the legacy success shape below the threshold.
 - Each warning contains `issue_id`, `from_status`, `to_status`,
-  `capacity_kind`, `capacity_name`, `scope`, `counting_mode`, `current`,
-  `prospective`, `soft_limit`, optional `hard_limit`, and `policy_path`.
+  `capacity_kind`, `capacity_name`, `scope`, optional `scope_key`,
+  `counting_mode`, `current`, `prospective`, `soft_limit`, optional
+  `hard_limit`, and `policy_path`.
   `update` wraps its normal array as `{updated, warnings}` and `create` as
   `{created, warnings}`; commands that already return an object add `warnings`
   to that object. The wrapper is never introduced below the soft threshold.
@@ -625,9 +626,62 @@ workflow:
   [capacity](#capacity)) let a named issue enter a named capacity without
   consuming a slot; evidence then reports counted and exempt totals
   separately.
-- The current enforcement layer has fixed `repository` scope. Additional
-  actor/assignee/harness/session/subtree scopes and capacity observability
-  are later phases tracked in GitHub issue #384.
+- Optional multi-agent admission scopes are configured under
+  `workflow.capacity.scopes` (see below). Capacity observability remains a
+  subsequent phase of GitHub issue #384.
+
+**Multi-agent admission scopes (`workflow.capacity.scopes`):**
+
+Beyond the repository totals, capacity limits can partition occupancy by who
+is doing the work:
+
+```yaml
+workflow:
+  statuses: [open, in_progress, in_review, rework, closed]
+  capacity:
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+      harness:
+        groups:
+          active_work:
+            statuses: [in_progress, in_review, rework]
+            hard: 6
+      subtree:
+        statuses:
+          in_progress:
+            soft: 2
+```
+
+- Recognized scopes: `repository`, `actor`, `assignee`, `harness`,
+  `session`, and `subtree`. Each scope carries its own `statuses`/`groups`
+  limit tables; every applicable scope composes with (never replaces) the
+  repository-level limits, and a transition must satisfy all of them inside
+  the same admission transaction.
+- Partition keys: `actor` uses the resolved CLI actor; `harness` uses the
+  self-reported `--harness`/`BR_HARNESS` attribution; `session` uses the
+  env-only `BR_SESSION` attribution; `assignee` uses the issue's prospective
+  assignee; `subtree` uses the issue's root ancestor over parent-child
+  edges. Every committed status transition records its admitting
+  actor/agent/harness/session in the project-local `capacity_occupancy`
+  table (never synced to JSONL, never written by import), and scoped counts
+  are measured against those records.
+- This is admission control for cooperating agent harnesses, not
+  authentication or process supervision: attribution is self-reported, and
+  a transition that carries no key for a scope is not subject to that
+  scope's limits (`actor` always has a key; `assignee` skips unassigned
+  transitions).
+- Only partitions whose count would increase are checked, so departures,
+  cross-partition handoffs, and same-key finish-and-claim swaps in one
+  batch remain admissible at the cap. Active exemptions free their issue's
+  slot in every scope measuring the same capacity.
+- Scoped counting is plain per-issue occupancy: `counting.hierarchy` modes
+  and `admission` rules remain repository-scope features. Scoped evidence
+  reports `counting_mode: "all"`, carries the partition key in `scope_key`,
+  and uses `workflow.capacity.scopes.<scope>...` policy paths; repository
+  evidence keeps its pre-scope shape byte-for-byte (no `scope_key` field).
 
 **Hierarchy-aware counting (`workflow.capacity.counting`):**
 

@@ -278,6 +278,17 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
     }
 }
 
+/// Self-reported session identity for capacity occupancy and the `session`
+/// capacity scope (GitHub #384 phase 5). Env-only (`BR_SESSION`): a CLI flag
+/// would collide with `br close --session`, which records close metadata,
+/// and session identity is a harness-level property anyway.
+pub(super) fn session_attribution_from_env() -> Option<String> {
+    std::env::var("BR_SESSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(super) fn update_issues_atomically_with_recovery(
     storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,
@@ -838,6 +849,7 @@ mod tests {
                 Some("agent-recovered"),
                 None,
                 Some("opus-4"),
+                None,
             ));
 
         retry_mutation_with_jsonl_recovery(

@@ -500,6 +500,7 @@ fn prepare_single_route(
             args.agent_name.as_deref(),
             args.harness.as_deref(),
             args.model.as_deref(),
+            super::session_attribution_from_env().as_deref(),
         ),
         _routed_write_lock: routed_write_lock,
     })

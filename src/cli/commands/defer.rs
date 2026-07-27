@@ -321,6 +321,7 @@ fn execute_defer_route(
                 args.agent_name.as_deref(),
                 args.harness.as_deref(),
                 args.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
             ));
         let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,
@@ -620,6 +621,7 @@ fn execute_undefer_route(
                 args.agent_name.as_deref(),
                 args.harness.as_deref(),
                 args.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
             ));
         let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,

@@ -585,6 +585,7 @@ pub fn create_issue_impl(
             args.agent_name.as_deref(),
             args.harness.as_deref(),
             args.model.as_deref(),
+            super::session_attribution_from_env().as_deref(),
         ));
 
         // 8. Create (atomic)
@@ -1129,6 +1130,7 @@ fn execute_import(
                 args.agent_name.as_deref(),
                 args.harness.as_deref(),
                 args.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
             ));
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {

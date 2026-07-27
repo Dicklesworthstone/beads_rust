@@ -1070,6 +1070,7 @@ fn execute_route(
                 attribution.agent_name.as_deref(),
                 attribution.harness.as_deref(),
                 attribution.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
             ));
         let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,

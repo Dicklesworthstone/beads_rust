@@ -86,6 +86,11 @@ struct CapacityViolationEvidence<'a> {
     transition: CapacityTransition<'a>,
     kind: &'a str,
     name: &'a str,
+    /// Scope partition the numbers were counted in (GitHub #384 phase 5).
+    scope: &'static str,
+    /// Partition key within a non-repository scope; `None` keeps the
+    /// pre-scope evidence shape byte-stable.
+    scope_key: Option<String>,
     counting_mode: &'static str,
     aggregate_parents_excluded: Option<u32>,
     exempt: Option<u32>,
@@ -101,6 +106,11 @@ struct CapacityWarningEvidence<'a> {
     transition: CapacityTransition<'a>,
     kind: &'a str,
     name: &'a str,
+    /// Scope partition the numbers were counted in (GitHub #384 phase 5).
+    scope: &'static str,
+    /// Partition key within a non-repository scope; `None` keeps the
+    /// pre-scope evidence shape byte-stable.
+    scope_key: Option<String>,
     counting_mode: &'static str,
     aggregate_parents_excluded: Option<u32>,
     exempt: Option<u32>,
@@ -120,6 +130,133 @@ struct CapacityBatchTransition {
     /// its type; `None` means "use the type already stored". Only weighted
     /// counting reads this.
     issue_type: Option<String>,
+    /// Assignee currently stored on the issue (`None` for creates). Only
+    /// assignee-scope counting reads this (GitHub #384 phase 5).
+    current_assignee: Option<String>,
+    /// Assignee after this mutation commits. Only assignee-scope counting
+    /// reads this.
+    prospective_assignee: Option<String>,
+}
+
+/// The acting attribution one CLI mutation carries into capacity-scope
+/// admission (GitHub #384 phase 5). A batch shares one acting context: the
+/// actor comes from normal actor resolution and the rest is the
+/// self-reported Tier-1 attribution. Scoped admission is cooperation, not
+/// authentication — a missing key simply makes that scope inapplicable.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CapacityActingContext {
+    actor: Option<String>,
+    harness: Option<String>,
+    session: Option<String>,
+}
+
+impl CapacityActingContext {
+    pub(crate) fn new(actor: &str, attribution: &EventAttribution) -> Self {
+        fn normalized(value: &str) -> Option<String> {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Self {
+            actor: normalized(actor),
+            harness: attribution.harness.clone(),
+            session: attribution.session.clone(),
+        }
+    }
+}
+
+/// Current and prospective assignee of one enforced transition, for
+/// assignee-scope counting (GitHub #384 phase 5).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CapacityTransitionAssignee<'a> {
+    pub(crate) current: Option<&'a str>,
+    pub(crate) prospective: Option<&'a str>,
+}
+
+/// How one capacity scope partitions occupancy (GitHub #384 phase 5).
+#[derive(Debug)]
+enum CapacityScopeKeying {
+    /// One partition covering the whole repository.
+    Repository,
+    /// A single acting-attribution partition (actor/harness/session key).
+    Acting(String),
+    /// Partitioned by the issue's assignee.
+    Assignee,
+    /// Partitioned by the issue's root ancestor over parent-child edges.
+    Subtree,
+}
+
+/// One scoped status/group limit being enforced.
+struct ScopedCapacityCheck<'a> {
+    kind_str: &'static str,
+    name: &'a str,
+    members: &'a [String],
+    limit: crate::close_policy::CapacityLimit,
+    scope: crate::close_policy::CapacityScopeKind,
+    keying: &'a CapacityScopeKeying,
+    policy_path: String,
+}
+
+/// Occupancy attribution loaded for one batch issue.
+#[derive(Debug, Clone)]
+struct CapacityOccupancyRow {
+    actor: Option<String>,
+    harness: Option<String>,
+    session: Option<String>,
+}
+
+/// Root-ancestor index over parent-child edges for subtree capacity
+/// scoping (GitHub #384 phase 5).
+///
+/// The root of an issue is the deterministic (lexicographically smallest)
+/// terminal ancestor reachable over parent-child edges; an issue with no
+/// parents — including one being created in this very mutation — is its own
+/// root, and a pure ancestor cycle uses its smallest member. Loaded at most
+/// once per enforcement call, inside the admission transaction.
+struct CapacitySubtreeIndex {
+    parents_by_child: HashMap<String, Vec<String>>,
+    memo: std::cell::RefCell<HashMap<String, String>>,
+}
+
+impl CapacitySubtreeIndex {
+    fn load(conn: &Connection) -> Result<Self> {
+        let children_by_parent = SqliteStorage::load_local_parent_child_edges_impl(conn)?;
+        let parents_by_child = SqliteStorage::build_parents_by_child(&children_by_parent);
+        Ok(Self {
+            parents_by_child,
+            memo: std::cell::RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Deterministic subtree root for `issue_id`.
+    fn root_of(&self, issue_id: &str) -> String {
+        if let Some(root) = self.memo.borrow().get(issue_id) {
+            return root.clone();
+        }
+
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = vec![issue_id.to_string()];
+        let mut terminals: Vec<String> = Vec::new();
+        while let Some(current) = frontier.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            match self.parents_by_child.get(&current) {
+                Some(parents) if !parents.is_empty() => {
+                    frontier.extend(parents.iter().cloned());
+                }
+                _ => terminals.push(current),
+            }
+        }
+        let root = terminals
+            .into_iter()
+            .min()
+            .or_else(|| visited.into_iter().min())
+            .unwrap_or_else(|| issue_id.to_string());
+        self.memo
+            .borrow_mut()
+            .insert(issue_id.to_string(), root.clone());
+        root
+    }
 }
 
 /// Current-vs-prospective occupancy for one capacity, as produced by
@@ -1043,22 +1180,35 @@ pub struct SqliteStorage {
 
 /// Context for a mutation operation, tracking side effects.
 /// Tier 1 attribution captured on status-mutating commands (issue #312,
-/// Layer 3 capture-only). Self-reported agent/harness/model identity that is
-/// recorded onto emitted audit events as a trail ONLY — it is never gated or
-/// enforced on. Empty/whitespace-only inputs are coerced to `None` so absent
-/// attribution never produces blank-string noise in the audit log.
+/// Layer 3). Self-reported agent/harness/model/session identity recorded
+/// onto emitted audit events and the capacity-occupancy row. Since GitHub
+/// #384 phase 5, the harness/session values (plus the resolved actor) also
+/// key OPTIONAL capacity scopes — cooperative admission control, not
+/// authentication: attribution stays self-reported and a missing value
+/// simply makes the corresponding scope inapplicable. Empty/whitespace-only
+/// inputs are coerced to `None` so absent attribution never produces
+/// blank-string noise in the audit log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventAttribution {
     pub agent_name: Option<String>,
     pub harness: Option<String>,
     pub model: Option<String>,
+    /// Self-reported session identity (`BR_SESSION`). Feeds the capacity
+    /// occupancy record and the `session` capacity scope; deliberately NOT
+    /// written to the events table, whose schema is shared with classic bd.
+    pub session: Option<String>,
 }
 
 impl EventAttribution {
     /// Build attribution from raw CLI/env inputs, normalizing empty or
     /// whitespace-only values to `None`.
     #[must_use]
-    pub fn new(agent_name: Option<&str>, harness: Option<&str>, model: Option<&str>) -> Self {
+    pub fn new(
+        agent_name: Option<&str>,
+        harness: Option<&str>,
+        model: Option<&str>,
+        session: Option<&str>,
+    ) -> Self {
         let norm = |v: Option<&str>| {
             v.map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -1068,13 +1218,17 @@ impl EventAttribution {
             agent_name: norm(agent_name),
             harness: norm(harness),
             model: norm(model),
+            session: norm(session),
         }
     }
 
     /// True when no attribution value was supplied.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.agent_name.is_none() && self.harness.is_none() && self.model.is_none()
+        self.agent_name.is_none()
+            && self.harness.is_none()
+            && self.model.is_none()
+            && self.session.is_none()
     }
 }
 
@@ -1873,6 +2027,7 @@ impl SqliteStorage {
             DROP TABLE IF EXISTS gate_results;
             DROP TABLE IF EXISTS capacity_exemption_history;
             DROP TABLE IF EXISTS capacity_exemptions;
+            DROP TABLE IF EXISTS capacity_occupancy;
             DROP TABLE IF EXISTS close_metadata;
             DROP TABLE IF EXISTS issues;
             ",
@@ -3010,6 +3165,25 @@ impl SqliteStorage {
     /// GitHub #384: "Unauthorized, expired, or reasonless exemptions fail" —
     /// the checks here are the grant-time half; enforcement re-filters by
     /// provider so a later policy edit withdraws recorded grants too.
+    /// True when any capacity scope declares a limit for this canonical
+    /// status/group name (GitHub #384 phase 5): a capacity limited only
+    /// within a scope is still a real capacity an exemption can free.
+    fn capacity_name_is_scoped(
+        policy: &crate::close_policy::CapacityPolicy,
+        kind: &str,
+        name: &str,
+    ) -> bool {
+        policy.scopes.values().any(|scope| {
+            let keys: Vec<&String> = if kind == "status" {
+                scope.statuses.keys().collect()
+            } else {
+                scope.groups.keys().collect()
+            };
+            keys.into_iter()
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(name))
+        })
+    }
+
     fn validate_capacity_exemption_request(
         &self,
         capacity_kind: &str,
@@ -3056,7 +3230,8 @@ impl SqliteStorage {
                         .keys()
                         .any(|status| status.trim().eq_ignore_ascii_case(&name))
                 });
-                if !named_by_limit && !named_by_admission {
+                let named_by_scope = Self::capacity_name_is_scoped(policy, "status", &name);
+                if !named_by_limit && !named_by_admission && !named_by_scope {
                     return Err(BeadsError::validation(
                         "capacity",
                         format!(
@@ -3068,7 +3243,8 @@ impl SqliteStorage {
                 }
             }
             "group" => {
-                if Self::capacity_group(policy, &name).is_none() {
+                let named_by_scope = Self::capacity_name_is_scoped(policy, "group", &name);
+                if Self::capacity_group(policy, &name).is_none() && !named_by_scope {
                     return Err(BeadsError::validation(
                         "capacity",
                         format!(
@@ -3881,7 +4057,8 @@ impl SqliteStorage {
                 to_status: transition.to.to_string(),
                 capacity_kind: evidence.kind.to_string(),
                 capacity_name: evidence.name.to_string(),
-                scope: "repository".to_string(),
+                scope: evidence.scope.to_string(),
+                scope_key: evidence.scope_key,
                 counting_mode: evidence.counting_mode.to_string(),
                 aggregate_parents_excluded: evidence.aggregate_parents_excluded,
                 exempt: evidence.exempt,
@@ -3904,7 +4081,8 @@ impl SqliteStorage {
             to_status: transition.to.to_string(),
             capacity_kind: evidence.kind.to_string(),
             capacity_name: evidence.name.to_string(),
-            scope: "repository".to_string(),
+            scope: evidence.scope.to_string(),
+            scope_key: evidence.scope_key,
             counting_mode: evidence.counting_mode.to_string(),
             aggregate_parents_excluded: evidence.aggregate_parents_excluded,
             exempt: evidence.exempt,
@@ -3943,6 +4121,7 @@ impl SqliteStorage {
     /// this delegates to the batch evaluator; `issue_type` carries the type of
     /// an issue being created (or retyped) in the same mutation so weighted
     /// counting can resolve its weight before the row exists.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enforce_workflow_capacity_in_tx(
         conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
@@ -3950,6 +4129,8 @@ impl SqliteStorage {
         from: Option<&str>,
         to: &str,
         issue_type: Option<&str>,
+        assignee: CapacityTransitionAssignee<'_>,
+        acting: &CapacityActingContext,
     ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
         if !policy.is_active() || from.is_some_and(|status| status.eq_ignore_ascii_case(to)) {
             return Ok(Vec::new());
@@ -3959,8 +4140,10 @@ impl SqliteStorage {
             from: from.map(ToString::to_string),
             to: to.to_string(),
             issue_type: issue_type.map(ToString::to_string),
+            current_assignee: assignee.current.map(ToString::to_string),
+            prospective_assignee: assignee.prospective.map(ToString::to_string),
         }];
-        Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions)
+        Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions, acting)
     }
 
     fn transition_enters_capacity(
@@ -4053,6 +4236,8 @@ impl SqliteStorage {
                     transition: Self::batch_transition_ref(transition),
                     kind: "status",
                     name: status,
+                    scope: "repository",
+                    scope_key: None,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
                     exempt: pair.exempt,
@@ -4072,6 +4257,8 @@ impl SqliteStorage {
                     transition: Self::batch_transition_ref(transition),
                     kind: "status",
                     name: status,
+                    scope: "repository",
+                    scope_key: None,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
                     exempt: pair.exempt,
@@ -4103,6 +4290,8 @@ impl SqliteStorage {
                     transition: Self::batch_transition_ref(transition),
                     kind: "group",
                     name,
+                    scope: "repository",
+                    scope_key: None,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
                     exempt: pair.exempt,
@@ -4122,6 +4311,8 @@ impl SqliteStorage {
                     transition: Self::batch_transition_ref(transition),
                     kind: "group",
                     name,
+                    scope: "repository",
+                    scope_key: None,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
                     exempt: pair.exempt,
@@ -4165,6 +4356,8 @@ impl SqliteStorage {
                         transition: Self::batch_transition_ref(transition),
                         kind: "admission_status",
                         name: status,
+                        scope: "repository",
+                        scope_key: None,
                         counting_mode: engine.mode_str(),
                         aggregate_parents_excluded: pair.aggregate_parents_excluded,
                         exempt: pair.exempt,
@@ -4198,6 +4391,8 @@ impl SqliteStorage {
                         transition: Self::batch_transition_ref(transition),
                         kind: "admission_group",
                         name: canonical_name,
+                        scope: "repository",
+                        scope_key: None,
                         counting_mode: engine.mode_str(),
                         aggregate_parents_excluded: pair.aggregate_parents_excluded,
                         exempt: pair.exempt,
@@ -4227,6 +4422,7 @@ impl SqliteStorage {
         conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
         transitions: &[CapacityBatchTransition],
+        acting: &CapacityActingContext,
     ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
         if !policy.is_active() || transitions.is_empty() {
             return Ok(Vec::new());
@@ -4238,8 +4434,473 @@ impl SqliteStorage {
         Self::evaluate_capacity_status_limits_in_tx(policy, &mut engine, &mut warnings)?;
         Self::evaluate_capacity_group_limits_in_tx(policy, &mut engine, &mut warnings)?;
         Self::enforce_capacity_admission_rules_in_tx(policy, &mut engine)?;
+        Self::evaluate_capacity_scope_limits_in_tx(
+            conn,
+            policy,
+            transitions,
+            &exemptions,
+            acting,
+            &mut warnings,
+        )?;
 
         Ok(warnings)
+    }
+
+    /// Evaluate every configured capacity scope (GitHub #384 phase 5).
+    ///
+    /// Scoped counting is plain per-issue occupancy within one partition:
+    /// hierarchy-aware counting modes and admission rules remain repository
+    /// features. Each scope's limits compose with the repository limits —
+    /// a transition must satisfy all of them. Only partitions whose count
+    /// would INCREASE are checked, so departures and cross-partition
+    /// handoffs can always proceed.
+    #[allow(clippy::too_many_lines)]
+    fn evaluate_capacity_scope_limits_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+        exemptions: &CapacityExemptionIndex,
+        acting: &CapacityActingContext,
+        warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<()> {
+        use crate::close_policy::CapacityScopeKind;
+
+        if policy.scopes.is_empty() {
+            return Ok(());
+        }
+
+        // Lazily built shared inputs.
+        let mut occupancy: Option<HashMap<String, CapacityOccupancyRow>> = None;
+        let mut subtree: Option<CapacitySubtreeIndex> = None;
+
+        for (scope_name, scope_policy) in &policy.scopes {
+            let Some(kind) = CapacityScopeKind::parse(scope_name) else {
+                return Err(BeadsError::internal(format!(
+                    "validated workflow capacity scope '{scope_name}' is unrecognized"
+                )));
+            };
+            if !scope_policy.is_active() {
+                continue;
+            }
+
+            let keying: CapacityScopeKeying = match kind {
+                CapacityScopeKind::Repository => CapacityScopeKeying::Repository,
+                CapacityScopeKind::Actor => match &acting.actor {
+                    Some(actor) => CapacityScopeKeying::Acting(actor.clone()),
+                    None => continue,
+                },
+                CapacityScopeKind::Harness => match &acting.harness {
+                    Some(harness) => CapacityScopeKeying::Acting(harness.clone()),
+                    None => continue,
+                },
+                CapacityScopeKind::Session => match &acting.session {
+                    Some(session) => CapacityScopeKeying::Acting(session.clone()),
+                    None => continue,
+                },
+                CapacityScopeKind::Assignee => CapacityScopeKeying::Assignee,
+                CapacityScopeKind::Subtree => CapacityScopeKeying::Subtree,
+            };
+
+            if matches!(
+                kind,
+                CapacityScopeKind::Harness | CapacityScopeKind::Session
+            ) && occupancy.is_none()
+            {
+                occupancy = Some(Self::load_capacity_occupancy_for_batch_in_tx(
+                    conn,
+                    transitions,
+                )?);
+            }
+            if matches!(kind, CapacityScopeKind::Actor) && occupancy.is_none() {
+                occupancy = Some(Self::load_capacity_occupancy_for_batch_in_tx(
+                    conn,
+                    transitions,
+                )?);
+            }
+            if matches!(kind, CapacityScopeKind::Subtree) && subtree.is_none() {
+                subtree = Some(CapacitySubtreeIndex::load(conn)?);
+            }
+
+            for (status, limit) in &scope_policy.statuses {
+                let members = [status.clone()];
+                Self::enforce_one_scoped_capacity_in_tx(
+                    conn,
+                    &ScopedCapacityCheck {
+                        kind_str: "status",
+                        name: status,
+                        members: &members,
+                        limit: *limit,
+                        scope: kind,
+                        keying: &keying,
+                        policy_path: format!(
+                            "workflow.capacity.scopes.{}.statuses.{status}",
+                            kind.as_str()
+                        ),
+                    },
+                    transitions,
+                    exemptions,
+                    occupancy.as_ref(),
+                    subtree.as_ref(),
+                    warnings,
+                )?;
+            }
+            for (name, group) in &scope_policy.groups {
+                Self::enforce_one_scoped_capacity_in_tx(
+                    conn,
+                    &ScopedCapacityCheck {
+                        kind_str: "group",
+                        name,
+                        members: &group.statuses,
+                        limit: group.limit(),
+                        scope: kind,
+                        keying: &keying,
+                        policy_path: format!(
+                            "workflow.capacity.scopes.{}.groups.{name}",
+                            kind.as_str()
+                        ),
+                    },
+                    transitions,
+                    exemptions,
+                    occupancy.as_ref(),
+                    subtree.as_ref(),
+                    warnings,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce one scoped capacity across every partition key the batch
+    /// could increase.
+    #[allow(clippy::too_many_lines)]
+    fn enforce_one_scoped_capacity_in_tx(
+        conn: &Connection,
+        check: &ScopedCapacityCheck<'_>,
+        transitions: &[CapacityBatchTransition],
+        exemptions: &CapacityExemptionIndex,
+        occupancy: Option<&HashMap<String, CapacityOccupancyRow>>,
+        subtree: Option<&CapacitySubtreeIndex>,
+        warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<()> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let canonical_name = check.name.trim().to_lowercase();
+        let exempt_ids = exemptions.exempt_ids(check.kind_str, &canonical_name);
+        let is_exempt = |issue_id: &str| exempt_ids.is_some_and(|ids| ids.contains(issue_id));
+
+        // Scope key of a transition, in the entering and draining direction.
+        let enter_key = |transition: &CapacityBatchTransition| -> Option<String> {
+            match check.keying {
+                CapacityScopeKeying::Repository => Some(String::new()),
+                CapacityScopeKeying::Acting(key) => Some(key.clone()),
+                CapacityScopeKeying::Assignee => transition
+                    .prospective_assignee
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(ToString::to_string),
+                CapacityScopeKeying::Subtree => {
+                    subtree.map(|index| index.root_of(&transition.issue_id))
+                }
+            }
+        };
+        let drain_key = |transition: &CapacityBatchTransition| -> Option<String> {
+            match check.keying {
+                CapacityScopeKeying::Repository => Some(String::new()),
+                CapacityScopeKeying::Acting(_) => occupancy
+                    .and_then(|rows| rows.get(&transition.issue_id))
+                    .and_then(|row| match check.scope {
+                        CapacityScopeKind::Actor => row.actor.clone(),
+                        CapacityScopeKind::Harness => row.harness.clone(),
+                        CapacityScopeKind::Session => row.session.clone(),
+                        _ => None,
+                    }),
+                CapacityScopeKeying::Assignee => transition
+                    .current_assignee
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(ToString::to_string),
+                CapacityScopeKeying::Subtree => {
+                    subtree.map(|index| index.root_of(&transition.issue_id))
+                }
+            }
+        };
+
+        // Partition keys that gain occupancy from this batch. For the acting
+        // scopes this is at most the single acting key; for assignee/subtree
+        // it is the distinct keys of entering transitions.
+        let mut candidate_keys: Vec<String> = Vec::new();
+        for transition in transitions {
+            if is_exempt(&transition.issue_id) {
+                continue;
+            }
+            if Self::transition_enters_capacity(transition, check.members)
+                && let Some(key) = enter_key(transition)
+                && !candidate_keys.contains(&key)
+            {
+                candidate_keys.push(key);
+            }
+        }
+
+        for key in candidate_keys {
+            let population = Self::scoped_capacity_population_in_tx(
+                conn,
+                check.members,
+                check.keying,
+                check.scope,
+                &key,
+                subtree,
+            )?;
+            let exempt_count = exempt_ids.map_or(0_u32, |ids| {
+                u32::try_from(population.intersection(ids).count()).unwrap_or(u32::MAX)
+            });
+            let current = u32::try_from(population.len())
+                .unwrap_or(u32::MAX)
+                .saturating_sub(exempt_count);
+
+            let mut prospective = i64::from(current);
+            let mut blamed: Option<&CapacityBatchTransition> = None;
+            for transition in transitions {
+                if is_exempt(&transition.issue_id) {
+                    continue;
+                }
+                if Self::transition_enters_capacity(transition, check.members)
+                    && enter_key(transition).as_deref() == Some(key.as_str())
+                {
+                    prospective += 1;
+                    if blamed.is_none() {
+                        blamed = Some(transition);
+                    }
+                } else if Self::transition_drains_capacity(transition, check.members)
+                    && drain_key(transition).as_deref() == Some(key.as_str())
+                    && population.contains(&transition.issue_id)
+                {
+                    prospective -= 1;
+                }
+            }
+            let prospective = u32::try_from(prospective.max(0)).unwrap_or(u32::MAX);
+            let Some(transition) = blamed.or_else(|| transitions.first()) else {
+                continue;
+            };
+            let scope_key =
+                (!matches!(check.keying, CapacityScopeKeying::Repository)).then(|| key.clone());
+
+            if let Some(hard_limit) = check.limit.hard
+                && prospective > current
+                && prospective > hard_limit
+            {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: check.kind_str,
+                    name: check.name,
+                    scope: check.scope.as_str(),
+                    scope_key,
+                    counting_mode: "all",
+                    aggregate_parents_excluded: None,
+                    exempt: (exempt_count > 0).then_some(exempt_count),
+                    current,
+                    prospective,
+                    soft_limit: check.limit.soft,
+                    hard_limit,
+                    policy_path: check.policy_path.clone(),
+                }));
+            }
+
+            if let Some(soft_limit) = check.limit.soft
+                && prospective > current
+                && prospective >= soft_limit
+            {
+                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: check.kind_str,
+                    name: check.name,
+                    scope: check.scope.as_str(),
+                    scope_key,
+                    counting_mode: "all",
+                    aggregate_parents_excluded: None,
+                    exempt: (exempt_count > 0).then_some(exempt_count),
+                    current,
+                    prospective,
+                    soft_limit,
+                    hard_limit: check.limit.hard,
+                    policy_path: check.policy_path.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Issue ids currently occupying `members` within one scope partition.
+    fn scoped_capacity_population_in_tx(
+        conn: &Connection,
+        members: &[String],
+        keying: &CapacityScopeKeying,
+        scope: crate::close_policy::CapacityScopeKind,
+        key: &str,
+        subtree: Option<&CapacitySubtreeIndex>,
+    ) -> Result<HashSet<String>> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let mut population = HashSet::new();
+        let mut seen = HashSet::new();
+        for status in members {
+            let canonical = status.trim().to_lowercase();
+            if canonical.is_empty() || !seen.insert(canonical.clone()) {
+                continue;
+            }
+            match keying {
+                CapacityScopeKeying::Repository => {
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ?",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKeying::Assignee => {
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ? AND assignee = ?",
+                        &[
+                            SqliteValue::from(canonical.as_str()),
+                            SqliteValue::from(key),
+                        ],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKeying::Acting(_) => {
+                    let column = match scope {
+                        CapacityScopeKind::Actor => "actor",
+                        CapacityScopeKind::Harness => "harness",
+                        CapacityScopeKind::Session => "session",
+                        _ => {
+                            return Err(BeadsError::internal(
+                                "acting capacity scope resolved to a non-acting kind",
+                            ));
+                        }
+                    };
+                    let sql = format!(
+                        "SELECT i.id FROM issues i \
+                         JOIN capacity_occupancy o ON o.issue_id = i.id \
+                         WHERE i.status = ? AND o.{column} = ?"
+                    );
+                    let rows = conn.query_with_params(
+                        &sql,
+                        &[
+                            SqliteValue::from(canonical.as_str()),
+                            SqliteValue::from(key),
+                        ],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKeying::Subtree => {
+                    let Some(index) = subtree else {
+                        return Err(BeadsError::internal(
+                            "subtree capacity scope evaluated without a loaded hierarchy",
+                        ));
+                    };
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ?",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text)
+                            && index.root_of(id) == key
+                        {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(population)
+    }
+
+    /// Load the occupancy attribution rows for every issue in the batch, so
+    /// drains can be keyed to the partition that originally admitted them.
+    fn load_capacity_occupancy_for_batch_in_tx(
+        conn: &Connection,
+        transitions: &[CapacityBatchTransition],
+    ) -> Result<HashMap<String, CapacityOccupancyRow>> {
+        let mut rows_by_issue = HashMap::new();
+        for transition in transitions {
+            let result = conn.query_row_with_params(
+                "SELECT actor, harness, session FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from(transition.issue_id.as_str())],
+            );
+            match result {
+                Ok(row) => {
+                    let text = |index: usize| {
+                        row.get(index)
+                            .and_then(SqliteValue::as_text)
+                            .map(ToString::to_string)
+                    };
+                    rows_by_issue.insert(
+                        transition.issue_id.clone(),
+                        CapacityOccupancyRow {
+                            actor: text(0),
+                            harness: text(1),
+                            session: text(2),
+                        },
+                    );
+                }
+                Err(FrankenError::QueryReturnedNoRows) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(rows_by_issue)
+    }
+
+    /// Record who moved an issue into its current status, inside the same
+    /// write transaction (GitHub #384 phase 5). Delete-then-insert mirrors
+    /// `replace_dirty_issue_marker`; `ON CONFLICT` upserts are avoided for
+    /// engine compatibility. Deliberately NOT called by the JSONL import
+    /// path: import is state replication, not admission.
+    pub(crate) fn record_capacity_occupancy_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        actor: &str,
+        attribution: &EventAttribution,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM capacity_occupancy WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let normalized_actor = actor.trim();
+        let optional = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from)
+        };
+        conn.execute_with_params(
+            "INSERT INTO capacity_occupancy \
+             (issue_id, actor, agent_name, harness, session, recorded_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                if normalized_actor.is_empty() {
+                    SqliteValue::Null
+                } else {
+                    SqliteValue::from(normalized_actor)
+                },
+                optional(&attribution.agent_name),
+                optional(&attribution.harness),
+                optional(&attribution.session),
+                SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str()),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Remove and return any staged Tier 1 attribution without consuming it via
@@ -4467,6 +5128,7 @@ impl SqliteStorage {
                 }
             }
 
+            let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
             let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
                 conn,
                 &capacity_policy,
@@ -4474,6 +5136,11 @@ impl SqliteStorage {
                 None,
                 issue.status.as_str(),
                 Some(issue.issue_type.as_str()),
+                CapacityTransitionAssignee {
+                    current: None,
+                    prospective: issue.assignee.as_deref(),
+                },
+                &acting,
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
 
@@ -4539,6 +5206,10 @@ impl SqliteStorage {
                     issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
+
+            // GitHub #384 phase 5: creation admits the issue into its
+            // initial status; record the admitting attribution.
+            Self::record_capacity_occupancy_in_tx(conn, &issue.id, &ctx.actor, &ctx.attribution)?;
 
             // Update child counter if this is a hierarchical ID
             if let Ok(parsed) = parse_id(&issue.id)
@@ -4982,16 +5653,23 @@ impl SqliteStorage {
                                 .issue_type
                                 .as_ref()
                                 .map(|issue_type| issue_type.as_str().to_string()),
+                            current_assignee: issue.assignee.clone(),
+                            prospective_assignee: match &update.assignee {
+                                Some(prospective) => prospective.clone(),
+                                None => issue.assignee.clone(),
+                            },
                         });
                     }
                 }
 
                 Self::enforce_workflow_transition_batch_in_tx(conn, &workflow_policy, updates)?;
 
+                let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
                 let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
                     conn,
                     &capacity_policy,
                     &transitions,
+                    &acting,
                 )?;
                 ctx.capacity_warnings.extend(capacity_warnings);
 
@@ -4999,6 +5677,17 @@ impl SqliteStorage {
                     if !update.is_empty() {
                         Self::update_issue_in_tx(conn, ctx, id, update, actor)?;
                     }
+                }
+
+                // GitHub #384 phase 5: record who moved each issue into its
+                // new status so scoped capacities can key future admissions.
+                for transition in &transitions {
+                    Self::record_capacity_occupancy_in_tx(
+                        conn,
+                        &transition.issue_id,
+                        &ctx.actor,
+                        &ctx.attribution,
+                    )?;
                 }
 
                 // GitHub #384 phase 4: leaving the applicable status ends an
@@ -5509,7 +6198,9 @@ impl SqliteStorage {
         let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
         let capacity_policy = self.workflow_capacity_policy.clone();
+        let tombstone_assignee = tombstone_issue.assignee.clone();
         self.mutate("delete_issue", actor, |conn, ctx| {
+            let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
             let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
                 conn,
                 &capacity_policy,
@@ -5517,6 +6208,11 @@ impl SqliteStorage {
                 Some(&previous_status),
                 "tombstone",
                 None,
+                CapacityTransitionAssignee {
+                    current: tombstone_assignee.as_deref(),
+                    prospective: tombstone_assignee.as_deref(),
+                },
+                &acting,
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
             // GitHub #384 phase 4: tombstoning leaves every status, so any
@@ -5554,6 +6250,9 @@ impl SqliteStorage {
                 "DELETE FROM close_metadata WHERE issue_id = ?",
                 &[SqliteValue::from(id)],
             )?;
+            // GitHub #384 phase 5: the tombstone transition is a status
+            // change like any other; record its admission attribution.
+            Self::record_capacity_occupancy_in_tx(conn, id, &ctx.actor, &ctx.attribution)?;
 
             if !was_terminal {
                 ctx.record_event(
@@ -17783,6 +18482,457 @@ mod tests {
         );
     }
 
+    fn scoped_status_capacity(
+        scope: &str,
+        status: &str,
+        soft: Option<u32>,
+        hard: Option<u32>,
+    ) -> crate::close_policy::CapacityPolicy {
+        let mut scope_policy = crate::close_policy::CapacityScopePolicy::default();
+        scope_policy.statuses.insert(
+            status.to_string(),
+            crate::close_policy::CapacityLimit { soft, hard },
+        );
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.scopes.insert(scope.to_string(), scope_policy);
+        policy
+    }
+
+    fn to_in_progress() -> IssueUpdate {
+        IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        }
+    }
+
+    fn expect_capacity_violation(
+        error: &BeadsError,
+    ) -> &crate::close_policy::WorkflowCapacityViolation {
+        match error {
+            BeadsError::WorkflowCapacityExceeded { violation } => violation,
+            other => panic!("expected a workflow capacity violation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn capacity_scope_actor_limits_each_actor_partition_independently() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-sca-1", "bd-sca-2", "bd-sca-3", "bd-sca-4"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "actor",
+            "in_progress",
+            None,
+            Some(2),
+        ));
+
+        for id in ["bd-sca-1", "bd-sca-2"] {
+            storage
+                .update_issues_atomically(&[(id.to_string(), to_in_progress())], "alice")
+                .expect("alice is under her cap");
+        }
+        let error = storage
+            .update_issues_atomically(&[("bd-sca-3".to_string(), to_in_progress())], "alice")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "actor");
+        assert_eq!(violation.scope_key.as_deref(), Some("alice"));
+        assert_eq!(violation.current, 2);
+        assert_eq!(violation.prospective, 3);
+        assert_eq!(
+            violation.policy_path,
+            "workflow.capacity.scopes.actor.statuses.in_progress"
+        );
+        assert_eq!(
+            storage.get_issue("bd-sca-3").unwrap().unwrap().status,
+            Status::Open,
+            "rejected transition must not modify issue state"
+        );
+
+        // A different actor has an independent partition.
+        storage
+            .update_issues_atomically(&[("bd-sca-4".to_string(), to_in_progress())], "bob")
+            .expect("bob's partition is empty");
+    }
+
+    #[test]
+    fn capacity_scope_finish_and_claim_swap_is_scope_neutral() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-scs-1", "bd-scs-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "actor",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+        storage
+            .update_issues_atomically(&[("bd-scs-1".to_string(), to_in_progress())], "alice")
+            .unwrap();
+
+        // One batch: alice releases her slot and claims another issue.
+        storage
+            .update_issues_atomically(
+                &[
+                    (
+                        "bd-scs-1".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::Open),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    ("bd-scs-2".to_string(), to_in_progress()),
+                ],
+                "alice",
+            )
+            .expect("a scope-neutral swap must be admitted at the cap");
+    }
+
+    #[test]
+    fn capacity_scope_assignee_keys_on_prospective_assignee_and_skips_unassigned() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-scg-1", "bd-scg-2", "bd-scg-3", "bd-scg-4"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "assignee",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        let claim_for = |assignee: &str| IssueUpdate {
+            status: Some(Status::InProgress),
+            assignee: Some(Some(assignee.to_string())),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issues_atomically(&[("bd-scg-1".to_string(), claim_for("bob"))], "op")
+            .expect("bob's first claim fits");
+        let error = storage
+            .update_issues_atomically(&[("bd-scg-2".to_string(), claim_for("bob"))], "op")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "assignee");
+        assert_eq!(violation.scope_key.as_deref(), Some("bob"));
+
+        storage
+            .update_issues_atomically(&[("bd-scg-3".to_string(), claim_for("carol"))], "op")
+            .expect("carol's partition is independent");
+        // No prospective assignee → the assignee scope is inapplicable.
+        storage
+            .update_issues_atomically(&[("bd-scg-4".to_string(), to_in_progress())], "op")
+            .expect("unassigned transitions are not subject to the assignee scope");
+    }
+
+    #[test]
+    fn capacity_scope_harness_and_session_key_on_attribution_and_skip_when_absent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-sch-1", "bd-sch-2", "bd-sch-3"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "harness",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            Some("swarm-h1"),
+            None,
+            None,
+        ));
+        storage
+            .update_issues_atomically(&[("bd-sch-1".to_string(), to_in_progress())], "op")
+            .expect("first harness claim fits");
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            Some("swarm-h1"),
+            None,
+            None,
+        ));
+        let error = storage
+            .update_issues_atomically(&[("bd-sch-2".to_string(), to_in_progress())], "op")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "harness");
+        assert_eq!(violation.scope_key.as_deref(), Some("swarm-h1"));
+
+        // No harness attribution → the harness scope is inapplicable. The
+        // staged attribution deliberately survives the failed mutation above
+        // (post-recovery retry semantics), so clear it first.
+        let _ = storage.take_pending_event_attribution();
+        storage
+            .update_issues_atomically(&[("bd-sch-3".to_string(), to_in_progress())], "op")
+            .expect("attribution-free transitions skip the harness scope");
+
+        // Session scope behaves identically, keyed on the session value.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-scn-1", "bd-scn-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "session",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            None,
+            None,
+            Some("sess-9"),
+        ));
+        storage
+            .update_issues_atomically(&[("bd-scn-1".to_string(), to_in_progress())], "op")
+            .unwrap();
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            None,
+            None,
+            Some("sess-9"),
+        ));
+        let error = storage
+            .update_issues_atomically(&[("bd-scn-2".to_string(), to_in_progress())], "op")
+            .unwrap_err();
+        assert_eq!(
+            expect_capacity_violation(&error).scope_key.as_deref(),
+            Some("sess-9")
+        );
+    }
+
+    #[test]
+    fn capacity_scope_subtree_counts_by_root_ancestor() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-sct-root", "bd-sct-a", "bd-sct-b", "bd-sct-other"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-sct-a", "bd-sct-root", "parent-child", "seed")
+            .unwrap();
+        storage
+            .add_dependency("bd-sct-b", "bd-sct-root", "parent-child", "seed")
+            .unwrap();
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "subtree",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        storage
+            .update_issues_atomically(&[("bd-sct-a".to_string(), to_in_progress())], "op")
+            .expect("first active leaf in the subtree fits");
+        let error = storage
+            .update_issues_atomically(&[("bd-sct-b".to_string(), to_in_progress())], "op")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "subtree");
+        assert_eq!(violation.scope_key.as_deref(), Some("bd-sct-root"));
+
+        // An issue outside the subtree has its own root partition.
+        storage
+            .update_issues_atomically(&[("bd-sct-other".to_string(), to_in_progress())], "op")
+            .expect("a different subtree is unaffected");
+    }
+
+    #[test]
+    fn capacity_scope_exemption_frees_the_scoped_slot() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-sce-held", Status::InProgress),
+            ("bd-sce-next", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "alice")
+                .unwrap();
+        }
+        let mut policy = scoped_status_capacity("actor", "in_progress", None, Some(1));
+        policy.exemptions.providers = vec!["operator".to_string()];
+        storage.set_workflow_capacity_policy(policy);
+
+        // Alice occupies her only slot; without an exemption the claim fails.
+        let error = storage
+            .update_issues_atomically(&[("bd-sce-next".to_string(), to_in_progress())], "alice")
+            .unwrap_err();
+        assert_eq!(
+            expect_capacity_violation(&error).scope_key.as_deref(),
+            Some("alice")
+        );
+
+        storage
+            .grant_capacity_exemption(
+                "bd-sce-held",
+                "status",
+                "in_progress",
+                "operator",
+                "externally blocked long-runner",
+                Some(now + chrono::Duration::hours(2)),
+                "human-lead",
+            )
+            .unwrap();
+        let violation_free = storage
+            .update_issues_atomically(&[("bd-sce-next".to_string(), to_in_progress())], "alice")
+            .expect("an exempted issue frees its scoped slot too");
+        drop(violation_free);
+    }
+
+    #[test]
+    fn capacity_scope_soft_limit_warns_with_scope_evidence() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-scw-1", "one", Status::Open, 1, None, now, None),
+                "seed",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "actor",
+            "in_progress",
+            Some(1),
+            None,
+        ));
+
+        storage
+            .update_issues_atomically(&[("bd-scw-1".to_string(), to_in_progress())], "alice")
+            .expect("soft limits never reject");
+        let warnings = storage.take_capacity_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one scoped warning: {warnings:?}"
+        );
+        assert_eq!(warnings[0].scope, "actor");
+        assert_eq!(warnings[0].scope_key.as_deref(), Some("alice"));
+        assert_eq!(
+            warnings[0].policy_path,
+            "workflow.capacity.scopes.actor.statuses.in_progress"
+        );
+        assert!(
+            warnings[0].to_string().contains("for 'alice'"),
+            "human text names the partition key: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn capacity_scope_repository_entry_composes_with_top_level_limits() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-scr-1", "bd-scr-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "repository",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        storage
+            .update_issues_atomically(&[("bd-scr-1".to_string(), to_in_progress())], "alice")
+            .unwrap();
+        // The repository scope ignores the acting partition: a different
+        // actor is still bound by the shared limit.
+        let error = storage
+            .update_issues_atomically(&[("bd-scr-2".to_string(), to_in_progress())], "bob")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "repository");
+        assert_eq!(violation.scope_key, None);
+        assert_eq!(
+            violation.policy_path,
+            "workflow.capacity.scopes.repository.statuses.in_progress"
+        );
+    }
+
+    #[test]
+    fn capacity_occupancy_records_the_admitting_attribution() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-occ-1", "one", Status::Open, 1, None, now, None),
+                "creator",
+            )
+            .unwrap();
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-7"),
+            Some("swarm-h1"),
+            Some("opus-4"),
+            Some("sess-1"),
+        ));
+        storage
+            .update_issues_atomically(&[("bd-occ-1".to_string(), to_in_progress())], "alice")
+            .unwrap();
+
+        let row = storage
+            .conn
+            .query_row_with_params(
+                "SELECT actor, agent_name, harness, session \
+                 FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from("bd-occ-1")],
+            )
+            .expect("occupancy row exists after a status transition");
+        let text = |index: usize| {
+            row.get(index)
+                .and_then(SqliteValue::as_text)
+                .map(ToString::to_string)
+        };
+        assert_eq!(text(0).as_deref(), Some("alice"));
+        assert_eq!(text(1).as_deref(), Some("agent-7"));
+        assert_eq!(text(2).as_deref(), Some("swarm-h1"));
+        assert_eq!(text(3).as_deref(), Some("sess-1"));
+    }
+
     #[test]
     fn derived_rollup_reports_subtree_status_without_mutating_the_parent() {
         let mut storage = SqliteStorage::open_memory().unwrap();
@@ -28886,6 +30036,7 @@ mod tests {
             Some("agent-7"),
             Some("codex-cli"),
             Some("opus-4"),
+            None,
         ));
         storage.create_issue(&issue, "tester").expect("create");
 
@@ -28918,6 +30069,7 @@ mod tests {
             Some("agent-9"),
             None,
             Some("opus-4"),
+            None,
         ));
         let update = IssueUpdate {
             status: Some(Status::InProgress),
@@ -28946,7 +30098,12 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
 
         // First create stages attribution...
-        storage.set_pending_event_attribution(EventAttribution::new(Some("agent-x"), None, None));
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-x"),
+            None,
+            None,
+            None,
+        ));
         let first = make_issue("bd-attr-3", "First", Status::Open, 2, None, now, None);
         storage
             .create_issue(&first, "tester")
@@ -28971,12 +30128,12 @@ mod tests {
 
     #[test]
     fn event_attribution_normalizes_blank_inputs_to_none() {
-        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"));
+        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"), None);
         assert!(attribution.agent_name.is_none());
         assert!(attribution.harness.is_none());
         assert_eq!(attribution.model.as_deref(), Some("opus-4"));
         assert!(!attribution.is_empty());
-        assert!(EventAttribution::new(None, None, None).is_empty());
+        assert!(EventAttribution::new(None, None, None, None).is_empty());
     }
 
     // ---- #312 hardening (F1): attribution survives a non-committing mutation
@@ -28995,6 +30152,7 @@ mod tests {
             Some("agent-retry"),
             None,
             Some("opus-4"),
+            None,
         ));
 
         // A mutation whose closure fails with a non-transient error: it rolls
@@ -29052,6 +30210,7 @@ mod tests {
         // staged slot so it cannot leak onto the next, unrelated mutation (F2).
         storage.set_pending_event_attribution(EventAttribution::new(
             Some("agent-leak"),
+            None,
             None,
             None,
         ));

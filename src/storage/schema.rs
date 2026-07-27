@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 16;
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -350,6 +350,29 @@ pub const SCHEMA_SQL: &str = r"
     );
     CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
         ON capacity_exemption_history(issue_id, id);
+
+    -- Capacity occupancy attribution (GitHub #384 phase 5). One row per
+    -- issue recording who moved it into its CURRENT status (acting actor
+    -- plus self-reported agent/harness/session attribution). Written on
+    -- every committed status transition; scoped capacity limits count
+    -- against these keys. Project-local — never synced to JSONL, and
+    -- deliberately not written by JSONL import (import is state
+    -- replication, not admission).
+    CREATE TABLE IF NOT EXISTS capacity_occupancy (
+        issue_id TEXT PRIMARY KEY,
+        actor TEXT,
+        agent_name TEXT,
+        harness TEXT,
+        session TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_actor
+        ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_harness
+        ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
+        ON capacity_occupancy(session) WHERE session IS NOT NULL;
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1790,6 +1813,36 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         )?;
     }
 
+    // v17 (GitHub #384 phase 5): capacity occupancy attribution. One row per
+    // issue recording who moved it into its current status, so actor/
+    // harness/session capacity scopes can count occupancy inside the
+    // admission transaction. Pure additive — a new table only.
+    if user_version < 17 {
+        tracing::info!(
+            "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS capacity_occupancy (
+                issue_id TEXT PRIMARY KEY,
+                actor TEXT,
+                agent_name TEXT,
+                harness TEXT,
+                session TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_actor
+                ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_harness
+                ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
+                ON capacity_occupancy(session) WHERE session IS NOT NULL;
+        ",
+        )?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -2430,6 +2483,34 @@ mod tests {
             assert!(
                 column_exists(&conn, "capacity_exemption_history", column),
                 "v16 migration missing capacity_exemption_history.{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v17_adds_capacity_occupancy_table() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP TABLE capacity_occupancy").unwrap();
+        conn.execute("PRAGMA user_version = 16").unwrap();
+
+        run_migrations(&conn, false).expect("v17 migration should succeed");
+
+        assert!(table_exists(&conn, "capacity_occupancy"));
+        for column in [
+            "issue_id",
+            "actor",
+            "agent_name",
+            "harness",
+            "session",
+            "recorded_at",
+        ] {
+            assert!(
+                column_exists(&conn, "capacity_occupancy", column),
+                "v17 migration missing capacity_occupancy.{column}"
             );
         }
     }

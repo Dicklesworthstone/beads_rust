@@ -247,9 +247,9 @@ pub struct Workflow {
 /// Phase 1 implements the race-sensitive core: hard limits for individual
 /// statuses and named groups, plus transition-scoped admission rules that
 /// inspect other queues.  Phase 3 adds hierarchy-aware counting over
-/// parent-child edges via [`CapacityCounting`].  Exemptions and
-/// actor/harness/subtree scopes are represented by later phases of the
-/// tracked epic rather than silently approximated here.
+/// parent-child edges via [`CapacityCounting`].  Phase 4 adds audited
+/// issue-specific exemptions via [`CapacityExemptionPolicy`].  Phase 5 adds
+/// optional multi-agent admission scopes via [`CapacityScopePolicy`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CapacityPolicy {
@@ -263,13 +263,101 @@ pub struct CapacityPolicy {
     pub admission: Vec<CapacityAdmissionRule>,
     /// Audited issue-specific exemption authorization (GitHub #384 phase 4).
     pub exemptions: CapacityExemptionPolicy,
+    /// Optional multi-agent admission scopes (GitHub #384 phase 5), keyed by
+    /// scope name: `repository`, `actor`, `assignee`, `harness`, `session`,
+    /// or `subtree`. Each scope carries its own status/group limits that
+    /// compose with (never replace) the repository-level limits above.
+    pub scopes: std::collections::BTreeMap<String, CapacityScopePolicy>,
 }
 
 impl CapacityPolicy {
     /// Whether any capacity behavior is configured.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        !self.statuses.is_empty() || !self.groups.is_empty() || !self.admission.is_empty()
+        // Any declared scope key counts, even one with no limits yet:
+        // an empty scope must fail validation loudly rather than lie
+        // dormant until the operator adds its first threshold.
+        !self.statuses.is_empty()
+            || !self.groups.is_empty()
+            || !self.admission.is_empty()
+            || !self.scopes.is_empty()
+    }
+}
+
+/// Status/group limits for one admission scope (GitHub #384 phase 5).
+///
+/// Scoped counting is plain per-issue occupancy: hierarchy-aware counting
+/// modes and admission rules remain repository-scope features. Scopes are
+/// admission control for cooperating agent harnesses, not process
+/// supervision — actor/harness/session keys come from self-reported
+/// attribution, and a transition that carries no key for a scope is not
+/// subject to that scope's limits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityScopePolicy {
+    /// Per-status soft/hard limits within one scope partition.
+    pub statuses: std::collections::BTreeMap<String, CapacityLimit>,
+    /// Named multi-status pools within one scope partition.
+    pub groups: std::collections::BTreeMap<String, CapacityGroup>,
+}
+
+impl CapacityScopePolicy {
+    /// Whether this scope declares any limit.
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        !self.statuses.is_empty() || !self.groups.is_empty()
+    }
+}
+
+/// The scope dimensions a capacity limit can partition on (GitHub #384
+/// phase 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityScopeKind {
+    /// The whole repository — identical semantics to the top-level limits.
+    Repository,
+    /// Partitioned by the acting CLI actor (`--actor` / `BD_ACTOR` / user).
+    Actor,
+    /// Partitioned by the issue's (prospective) assignee.
+    Assignee,
+    /// Partitioned by the self-reported harness (`--harness` / `BR_HARNESS`).
+    Harness,
+    /// Partitioned by the self-reported session (`BR_SESSION`).
+    Session,
+    /// Partitioned by the issue's root ancestor over parent-child edges.
+    Subtree,
+}
+
+impl CapacityScopeKind {
+    /// Every recognized scope name, in canonical order.
+    pub const ALL: [Self; 6] = [
+        Self::Repository,
+        Self::Actor,
+        Self::Assignee,
+        Self::Harness,
+        Self::Session,
+        Self::Subtree,
+    ];
+
+    /// Canonical lowercase name used in policy keys and evidence.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Repository => "repository",
+            Self::Actor => "actor",
+            Self::Assignee => "assignee",
+            Self::Harness => "harness",
+            Self::Session => "session",
+            Self::Subtree => "subtree",
+        }
+    }
+
+    /// Parse a policy key (case-insensitive, trimmed).
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let target = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str().eq_ignore_ascii_case(target))
     }
 }
 
@@ -318,7 +406,7 @@ impl CapacityExemptionPolicy {
 }
 
 /// Soft and hard occupancy thresholds for one capacity.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CapacityLimit {
     /// Advisory threshold. Phase 2 exposes successful-transition warnings.
@@ -482,6 +570,12 @@ pub struct WorkflowCapacityViolation {
     pub capacity_kind: String,
     pub capacity_name: String,
     pub scope: String,
+    /// Partition key within a non-repository scope (GitHub #384 phase 5):
+    /// the acting actor/harness/session, the issue's prospective assignee,
+    /// or the subtree root id. Absent for repository-scope evidence, keeping
+    /// the pre-scope shape byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_key: Option<String>,
     pub counting_mode: String,
     /// Prospective active issues excluded from the count as hierarchy
     /// aggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).
@@ -515,6 +609,11 @@ pub struct WorkflowCapacityWarning {
     pub capacity_kind: String,
     pub capacity_name: String,
     pub scope: String,
+    /// Partition key within a non-repository scope (GitHub #384 phase 5).
+    /// Absent for repository-scope evidence, keeping the pre-scope shape
+    /// byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_key: Option<String>,
     pub counting_mode: String,
     /// Prospective active issues excluded from the count as hierarchy
     /// aggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).
@@ -554,6 +653,13 @@ fn exempt_display_suffix(exempt: Option<u32>) -> String {
     exempt.map_or_else(String::new, |excluded| format!(", exempt: {excluded}"))
 }
 
+/// Human-readable qualifier naming the scope partition key for scoped
+/// capacity diagnostics (GitHub #384 phase 5). Empty for repository-scope
+/// evidence so pre-scope message text stays byte-stable.
+fn scope_key_display_suffix(scope_key: Option<&str>) -> String {
+    scope_key.map_or_else(String::new, |key| format!(" for '{key}'"))
+}
+
 impl std::fmt::Display for WorkflowCapacityWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let from = self.from_status.as_deref().unwrap_or("<initial>");
@@ -564,12 +670,14 @@ impl std::fmt::Display for WorkflowCapacityWarning {
         );
         write!(
             f,
-            "transitioned {} from {} to {}; repository {} capacity '{}' has reached or exceeded its soft limit (current: {}, prospective: {}, soft: {}{}; policy: {}). Drain existing work before admitting more",
+            "transitioned {} from {} to {}; {} {} capacity '{}'{} has reached or exceeded its soft limit (current: {}, prospective: {}, soft: {}{}; policy: {}). Drain existing work before admitting more",
             self.issue_id,
             from,
             self.to_status,
+            self.scope,
             self.capacity_kind,
             self.capacity_name,
+            scope_key_display_suffix(self.scope_key.as_deref()),
             self.current,
             self.prospective,
             self.soft_limit,
@@ -590,10 +698,11 @@ impl std::fmt::Display for WorkflowCapacityViolation {
         if self.capacity_kind.starts_with("admission_") {
             return write!(
                 f,
-                "cannot transition {} from {} to {}: repository admission guard '{}' requires the observed queue to remain below {} (current: {}, prospective: {}{}; policy: {})",
+                "cannot transition {} from {} to {}: {} admission guard '{}' requires the observed queue to remain below {} (current: {}, prospective: {}{}; policy: {})",
                 self.issue_id,
                 from,
                 self.to_status,
+                self.scope,
                 self.capacity_name,
                 self.hard_limit,
                 self.current,
@@ -604,12 +713,14 @@ impl std::fmt::Display for WorkflowCapacityViolation {
         }
         write!(
             f,
-            "cannot transition {} from {} to {}: repository {} capacity '{}' would exceed its hard limit (current: {}, prospective: {}, hard: {}{}; policy: {})",
+            "cannot transition {} from {} to {}: {} {} capacity '{}'{} would exceed its hard limit (current: {}, prospective: {}, hard: {}{}; policy: {})",
             self.issue_id,
             from,
             self.to_status,
+            self.scope,
             self.capacity_kind,
             self.capacity_name,
+            scope_key_display_suffix(self.scope_key.as_deref()),
             self.current,
             self.prospective,
             self.hard_limit,
@@ -1371,6 +1482,7 @@ impl Workflow {
             &declared_statuses,
             &group_names,
         )?;
+        validate_capacity_scopes(&self.capacity.scopes, &declared_statuses)?;
         Ok(())
     }
 
@@ -1659,6 +1771,45 @@ fn validate_capacity_groups(
         validate_capacity_limit(&group.limit(), &format!("groups.{name}"), false)?;
     }
     Ok(names)
+}
+
+fn validate_capacity_scopes(
+    scopes: &std::collections::BTreeMap<String, CapacityScopePolicy>,
+    declared_statuses: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let mut names = std::collections::HashSet::new();
+    for (name, scope) in scopes {
+        let Some(kind) = CapacityScopeKind::parse(name) else {
+            return Err(capacity_validation_error(format!(
+                "capacity scope '{name}' is not recognized; valid scopes are \
+                 repository, actor, assignee, harness, session, and subtree"
+            )));
+        };
+        if !names.insert(kind.as_str()) {
+            return Err(capacity_validation_error(format!(
+                "capacity scope '{name}' is duplicated case-insensitively"
+            )));
+        }
+        if !scope.is_active() {
+            return Err(capacity_validation_error(format!(
+                "capacity scope '{name}' must declare at least one status or group limit"
+            )));
+        }
+        validate_status_capacities(&scope.statuses, declared_statuses)
+            .map_err(|err| capacity_scope_validation_context(name, err))?;
+        validate_capacity_groups(&scope.groups, declared_statuses)
+            .map_err(|err| capacity_scope_validation_context(name, err))?;
+    }
+    Ok(())
+}
+
+fn capacity_scope_validation_context(scope: &str, err: BeadsError) -> BeadsError {
+    match err {
+        BeadsError::Validation { reason, .. } => {
+            capacity_validation_error(format!("scope '{scope}': {reason}"))
+        }
+        other => other,
+    }
 }
 
 fn validate_capacity_admission_rules(
@@ -3951,6 +4102,7 @@ capacity:
             capacity_kind: "status".to_string(),
             capacity_name: "in_progress".to_string(),
             scope: "repository".to_string(),
+            scope_key: None,
             counting_mode: "all".to_string(),
             aggregate_parents_excluded: None,
             exempt: None,
@@ -4156,6 +4308,146 @@ capacity:
             error.to_string().contains("duplicated case-insensitively"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn loader_parses_and_validates_capacity_scopes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r"
+workflow:
+  statuses: [open, in_progress, in_review, closed]
+  capacity:
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+      harness:
+        groups:
+          active_work:
+            statuses: [in_progress, in_review]
+            hard: 3
+      subtree:
+        statuses:
+          in_progress:
+            soft: 1
+";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("scope policy must load");
+        let capacity = &policy.workflow.capacity;
+        assert!(capacity.is_active(), "scopes alone activate capacity");
+        assert_eq!(
+            capacity.scopes["actor"].statuses["in_progress"].hard,
+            Some(2)
+        );
+        assert_eq!(
+            capacity.scopes["harness"].groups["active_work"].hard,
+            Some(3)
+        );
+        assert_eq!(
+            capacity.scopes["subtree"].statuses["in_progress"].soft,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn capacity_scope_validation_rejects_bad_shapes() {
+        let expect_error = |yaml: &str, needle: &str| {
+            let workflow: Workflow = serde_yml::from_str(yaml).unwrap();
+            let error = workflow.validate_capacity().unwrap_err();
+            assert!(
+                error.to_string().contains(needle),
+                "expected '{needle}' in: {error}"
+            );
+        };
+
+        expect_error(
+            r"
+statuses: [open, in_progress]
+capacity:
+  scopes:
+    fleet:
+      statuses:
+        in_progress:
+          hard: 1
+",
+            "not recognized",
+        );
+        expect_error(
+            r"
+statuses: [open, in_progress]
+capacity:
+  scopes:
+    actor: {}
+",
+            "at least one status or group limit",
+        );
+        expect_error(
+            r"
+statuses: [open, in_progress]
+capacity:
+  scopes:
+    actor:
+      statuses:
+        shipping:
+          hard: 1
+",
+            "scope 'actor'",
+        );
+        expect_error(
+            r"
+statuses: [open, in_progress]
+capacity:
+  scopes:
+    actor:
+      statuses:
+        in_progress:
+          hard: 1
+    ACTOR:
+      statuses:
+        in_progress:
+          hard: 2
+",
+            "duplicated case-insensitively",
+        );
+    }
+
+    #[test]
+    fn capacity_scope_evidence_display_names_the_partition_key() {
+        let violation = WorkflowCapacityViolation {
+            issue_id: "bd-1".to_string(),
+            from_status: Some("open".to_string()),
+            to_status: "in_progress".to_string(),
+            capacity_kind: "status".to_string(),
+            capacity_name: "in_progress".to_string(),
+            scope: "actor".to_string(),
+            scope_key: Some("alice".to_string()),
+            counting_mode: "all".to_string(),
+            aggregate_parents_excluded: None,
+            exempt: None,
+            current: 2,
+            prospective: 3,
+            soft_limit: None,
+            hard_limit: 2,
+            policy_path: "workflow.capacity.scopes.actor.statuses.in_progress".to_string(),
+        };
+        let rendered = violation.to_string();
+        assert!(
+            rendered.contains("actor status capacity 'in_progress' for 'alice'"),
+            "{rendered}"
+        );
+
+        // Repository-scope evidence keeps the pre-scope text byte-stable.
+        let mut repository = violation;
+        repository.scope = "repository".to_string();
+        repository.scope_key = None;
+        repository.policy_path = "workflow.capacity.statuses.in_progress".to_string();
+        let rendered = repository.to_string();
+        assert!(
+            rendered.contains("repository status capacity 'in_progress' would exceed"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("for '"), "{rendered}");
     }
 
     // =========================================================================

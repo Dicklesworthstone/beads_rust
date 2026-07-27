@@ -745,9 +745,33 @@ evidence reports counted and exempt totals separately, leaving the applicable
 status ends the exemption, and expired exemptions count again. See
 `docs/CLI_REFERENCE.md` (the `capacity` command) for full semantics.
 
-The current enforcement layer uses repository scope. Additional
-actor/harness/session/subtree scopes and capacity observability remain
-subsequent phases of GitHub issue #384.
+Optional **multi-agent admission scopes** partition capacity beyond the
+repository total — per acting actor, per issue assignee, per self-reported
+harness (`--harness`/`BR_HARNESS`) or session (`BR_SESSION`), or per
+subtree root over parent-child edges:
+
+```yaml
+workflow:
+  capacity:
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+      harness:
+        statuses:
+          in_progress:
+            hard: 6
+```
+
+Every applicable scope composes with the repository limits inside the same
+admission transaction; a partition with no key (e.g. no harness reported)
+is simply not subject to that scope. This is cooperative admission control,
+not process supervision — attribution stays self-reported. Scoped evidence
+carries the partition key as `scope_key` and a
+`workflow.capacity.scopes.<scope>...` policy path. See
+`docs/CLI_REFERENCE.md` for full semantics. Capacity observability remains
+a subsequent phase of GitHub issue #384.
 
 ### Environment Variables
 
