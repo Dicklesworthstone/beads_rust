@@ -398,6 +398,9 @@ impl SyntheticDataset {
         let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
             .args(["init"])
             .current_dir(&root)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
+            .env("PATH", common::cli::deduplicated_br_path())
             .output()?;
 
         if !init_output.status.success() {
@@ -495,6 +498,9 @@ impl SyntheticDataset {
         let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
             .args(["init"])
             .current_dir(&root)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
+            .env("PATH", common::cli::deduplicated_br_path())
             .output()?;
 
         if !init_output.status.success() {
@@ -1039,6 +1045,12 @@ fn run_br_status<const N: usize>(
         .current_dir(workspace)
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "error")
+        // A host with `br` in more than one $PATH directory makes every
+        // spawned `br doctor` emit a `br_path_dupes` WARN, failing corpus
+        // generation for a reason unrelated to the workspace under test.
+        // Mirror tests/e2e_doctor_fixture_suite.rs and drop later
+        // duplicates only.
+        .env("PATH", common::cli::deduplicated_br_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1059,6 +1071,8 @@ fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<boo
         .args(["sync", "--status", "--json"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .env("PATH", common::cli::deduplicated_br_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1356,6 +1370,7 @@ fn run_measured_br_command(
         .current_dir(workspace)
         .env("NO_COLOR", "1")
         .env("RUST_LOG", "error")
+        .env("PATH", common::cli::deduplicated_br_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
