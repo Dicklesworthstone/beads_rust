@@ -8455,35 +8455,39 @@ fn parse_cargo_toml_package_field(body: &str, field: &str) -> Option<String> {
 /// minute on the largest real-world workspaces.
 const DEFAULT_STALE_LOCK_THRESHOLD_SECS: u64 = 300;
 
-/// Detector: `.beads/.write.lock` exists as a regular file whose mtime
-/// is older than the staleness threshold. Pass-1 archaeology filed
-/// `fm-concurrency_primitives-orphaned-write-lock` (P1): a crashed
-/// `br` writer (kill -9, OOM, panic-abort in release mode) leaves
-/// the advisory flock file on disk, wedging subsequent writers until
-/// an operator removes it manually.
+/// Detector for `fm-concurrency_primitives-orphaned-write-lock`.
 ///
-/// Detect-only. The doctor NEVER removes `.write.lock` automatically:
-/// touching a lock file that a live process holds would corrupt that
-/// process's locking discipline. The operator must verify no `br`
-/// process is active in this workspace, then move the file aside
-/// themselves (the canonical fix is `mv .beads/.write.lock
-/// .beads/.write.lock.stale-<ISO8601>`).
+/// `.beads/.write.lock` is a persistent lock *target*, not a record that
+/// a lock is held: `blocking_write_lock` opens it once and takes an
+/// advisory flock, and flock acquisition never updates mtime. The kernel
+/// releases an advisory flock when the owning fd closes — including on
+/// kill -9, OOM, and abort — so a leftover regular file with an old
+/// mtime does not wedge anything; the next writer's `try_lock` succeeds
+/// immediately (GitHub #395, and the `mcp_serve_stale_write_lock`
+/// fixture's repair contract states the same model).
 ///
-/// Conservative-by-design:
-/// - Only mtime-based staleness check. We do NOT introspect
-///   /proc/locks (Linux-only) or spawn lsof (would change behavior
-///   under heredoc-style test isolation).
-/// - Outside-source-tree mtime checks rely on `SystemTime::now()` and
-///   `metadata.modified()` — both Unix + Windows + macOS safe.
-/// - If the threshold env var is set to a non-parseable value we
-///   silently fall back to the default rather than panic.
-/// - Missing file = Ok (no lock, no contention).
+/// Classification therefore PROBES instead of trusting mtime: a
+/// non-blocking `try_lock` on the existing file. Acquired → the lock is
+/// free, regardless of file age (released instantly; the probe is the
+/// same primitive `blocking_write_lock` fast-paths on). Would-block → a
+/// live process holds it — frequently this very doctor run, whose
+/// startup acquires the workspace lock to serialize with writers (flock
+/// conflicts across open file descriptions even within one process), and
+/// in any case a held advisory lock is never an orphan. Only when
+/// the probe itself cannot run does the old mtime heuristic surface as a
+/// warn — and even then the guidance is to investigate holders, never to
+/// move the file aside: renaming a lock file while a holder has the old
+/// inode locked would let the next writer create and lock a NEW inode,
+/// splitting mutual exclusion across two files.
+///
+/// Detect-only. The doctor NEVER removes or renames `.write.lock`.
 ///
 /// Status mapping:
-/// - `ok` — file missing OR exists but mtime is within the threshold.
-/// - `warn` — file exists, is a regular file, and mtime is older than
-///   the threshold. Surfaces the path, mtime as RFC3339, age in
-///   seconds, threshold, and the canonical operator-fix command.
+/// - `ok` — file missing; not a regular file (sibling detectors own
+///   those); mtime within threshold; probe acquired (free); or probe
+///   would-block (live holder).
+/// - `warn` — mtime in the future (clock skew), or mtime older than the
+///   threshold AND the probe could not run.
 fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let lock_path = beads_dir.join(".write.lock");
 
@@ -8523,8 +8527,37 @@ fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     }
 
-    // Stale candidate. Emit warn with the canonical operator-fix.
-    push_write_lock_stale(&lock_path, modified, age_secs, threshold_secs, checks);
+    // Stale-mtime candidate: probe before classifying (GitHub #395).
+    match probe_write_lock_is_free(&lock_path) {
+        Some(true) => push_write_lock_free_despite_age(&lock_path, age_secs, checks),
+        Some(false) => push_write_lock_held_by_live_process(&lock_path, age_secs, checks),
+        None => {
+            push_write_lock_stale_unprobed(&lock_path, modified, age_secs, threshold_secs, checks);
+        }
+    }
+}
+
+/// Non-blocking probe of the advisory flock on an EXISTING lock file.
+///
+/// `Some(true)` — acquired (and immediately released on drop): the lock
+/// is free. `Some(false)` — would block: a live process holds it. `None`
+/// — the probe could not run (open or lock error), so the caller must
+/// fall back to the mtime heuristic. Never creates the file: a doctor
+/// check must not mutate the workspace.
+#[allow(clippy::incompatible_msrv)]
+fn probe_write_lock_is_free(lock_path: &Path) -> Option<bool> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .truncate(false)
+        .open(lock_path)
+        .ok()?;
+    match file.try_lock() {
+        Ok(()) => Some(true),
+        Err(std::fs::TryLockError::WouldBlock) => Some(false),
+        Err(std::fs::TryLockError::Error(_)) => None,
+    }
 }
 
 fn push_write_lock_missing(checks: &mut Vec<CheckResult>) {
@@ -8608,7 +8641,52 @@ fn push_write_lock_fresh(
     );
 }
 
-fn push_write_lock_stale(
+fn push_write_lock_free_despite_age(
+    lock_path: &Path,
+    age_secs: u64,
+    checks: &mut Vec<CheckResult>,
+) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some(format!(
+            ".beads/.write.lock file is {age_secs}s old but the advisory lock is FREE \
+             (non-blocking probe acquired it). Lock acquisition never updates mtime, \
+             so file age alone is not evidence of an orphan."
+        )),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "age_secs": age_secs,
+            "reason": "probe_acquired_free",
+        })),
+    );
+}
+
+fn push_write_lock_held_by_live_process(
+    lock_path: &Path,
+    age_secs: u64,
+    checks: &mut Vec<CheckResult>,
+) {
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some(
+            ".beads/.write.lock is currently held by a live process (non-blocking \
+             probe would block) — possibly this doctor run itself, which holds the \
+             workspace lock while checking; a held advisory lock is never an orphan"
+                .to_string(),
+        ),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "age_secs": age_secs,
+            "reason": "probe_would_block_live_holder",
+        })),
+    );
+}
+
+fn push_write_lock_stale_unprobed(
     lock_path: &Path,
     modified: std::time::SystemTime,
     age_secs: u64,
@@ -8617,14 +8695,15 @@ fn push_write_lock_stale(
 ) {
     let mtime_rfc3339 = chrono::DateTime::<chrono::Utc>::from(modified)
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let stale_suffix = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     push_check(
         checks,
         "write_lock",
         CheckStatus::Warn,
         Some(format!(
-            ".beads/.write.lock is {age_secs}s old (threshold {threshold_secs}s) and looks orphaned. \
-             Verify no live `br` process is in this workspace, then move the lock aside manually."
+            ".beads/.write.lock is {age_secs}s old (threshold {threshold_secs}s) and the \
+             lock state could not be probed. Investigate whether a process holds it; do \
+             NOT move or rename the file — a holder keeps the old inode locked while the \
+             next writer would create and lock a new one, splitting mutual exclusion."
         )),
         Some(serde_json::json!({
             "path": lock_path.display().to_string(),
@@ -8632,11 +8711,8 @@ fn push_write_lock_stale(
             "age_secs": age_secs,
             "threshold_secs": threshold_secs,
             "reason": "stale_mtime",
-            "recommended_fix": format!(
-                "After verifying no `br` is running here: mv {p} {p}.stale-{stale_suffix}",
-                p = lock_path.display(),
-            ),
-            "verify_no_br_running": "pgrep -af 'br ' | grep -v doctor | grep -v grep",
+            "probe": "failed",
+            "investigate_holders": "lsof -- .beads/.write.lock; pgrep -af 'br ' | grep -v doctor | grep -v grep",
             "env_override": "BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS",
         })),
     );
@@ -21860,6 +21936,83 @@ version = "2026-05-11-abc123"
             matches!(check.status, CheckStatus::Ok),
             "symlink .write.lock should defer to TOCTOU detector; got {:?}",
             check.status
+        );
+    }
+
+    /// GitHub #395: flock acquisition never updates mtime, so an old but
+    /// FREE lock file must classify Ok via the non-blocking probe, not
+    /// warn forever on the mtime heuristic.
+    #[test]
+    fn check_orphaned_write_lock_old_but_free_probes_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock_path = beads_dir.join(".write.lock");
+        fs::write(&lock_path, b"").unwrap();
+        // Back-date far past any threshold.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600_000);
+        let file = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(file);
+
+        let mut checks = Vec::new();
+        check_orphaned_write_lock(&beads_dir, &mut checks);
+        let check = find_check(&checks, "write_lock").expect("write_lock present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "an ancient but free lock must be Ok; got {:?} ({:?})",
+            check.status,
+            check.message
+        );
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str()),
+            Some("probe_acquired_free")
+        );
+    }
+
+    /// GitHub #395: a lock held by a live process reports Ok (busy
+    /// workspace), never a stale-orphan warn.
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn check_orphaned_write_lock_live_holder_probes_ok() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let lock_path = beads_dir.join(".write.lock");
+        fs::write(&lock_path, b"").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600_000);
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        holder
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        holder.lock().unwrap();
+
+        let mut checks = Vec::new();
+        check_orphaned_write_lock(&beads_dir, &mut checks);
+        drop(holder);
+        let check = find_check(&checks, "write_lock").expect("write_lock present");
+        assert!(
+            matches!(check.status, CheckStatus::Ok),
+            "a live holder must be Ok; got {:?} ({:?})",
+            check.status,
+            check.message
+        );
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str()),
+            Some("probe_would_block_live_holder")
         );
     }
 

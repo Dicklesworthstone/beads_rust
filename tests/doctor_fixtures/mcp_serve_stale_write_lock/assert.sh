@@ -44,14 +44,18 @@ case "$stage" in
     detect)
         assert_lock_artifacts_preserved
         out=$("$tool_bin" doctor --json 2>/dev/null) || true
+        # GitHub #395: the killed `br serve` owner's advisory flock was
+        # released by the kernel, so the planted stale-mtime lock file is
+        # FREE and wedges nothing. The write_lock detector now probes the
+        # flock instead of trusting mtime and must classify this ok.
         echo "$out" | jq -e '
           .checks[]
           | select(.name == "write_lock")
-          | select(.status == "warn")
-          | select(.details.reason == "stale_mtime")
+          | select(.status == "ok")
+          | select(.details.reason == "probe_acquired_free" or .details.reason == "probe_would_block_live_holder")
           | select(.details.finding_id == "fm-concurrency_primitives-orphaned-write-lock")
         ' >/dev/null || {
-            echo "ASSERT FAIL[$stage]: stale MCP write lock was not reported by write_lock detector" >&2
+            echo "ASSERT FAIL[$stage]: free stale MCP write lock must probe ok (GH #395)" >&2
             echo "$out" | jq '.checks[] | select(.name == "write_lock")' >&2
             exit 1
         }
