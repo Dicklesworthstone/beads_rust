@@ -1600,3 +1600,178 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         String::from_utf8_lossy(&undo.stderr)
     );
 }
+
+// ---------------------------------------------------------------------------
+// GitHub #394 — dirty unflushed issues must survive recovery rebuilds.
+//
+// Reproduction shape from the report: one issue flushed to JSONL, a second
+// created with `--no-auto-flush` (dirty, DB-only), then the main DB gets
+// page-level corruption. Both implicit rebuild families — `doctor --repair`'s
+// JSONL rebuild and the startup auto-recovery probe — replay only the JSONL,
+// so before the fix the DB-only issue vanished silently while the repair
+// reported `repaired:true, verified:true`.
+// ---------------------------------------------------------------------------
+
+/// Seed the #394 workspace: `flushed fine` in DB+JSONL, `db-only issue`
+/// dirty in the DB only, then corrupt page 2 of the checkpointed DB.
+/// Returns the dirty issue's id.
+fn seed_dirty_issue_and_corrupt_db(root: &Path) -> String {
+    br_init(root);
+
+    let flushed = br_cmd(root)
+        .args(["create", "--title", "flushed fine", "--priority", "2"])
+        .output()
+        .expect("br create spawned");
+    assert!(flushed.status.success(), "br create (flushed) failed");
+    let flush = br_cmd(root)
+        .args(["sync", "--flush-only"])
+        .output()
+        .expect("br sync spawned");
+    assert!(flush.status.success(), "br sync --flush-only failed");
+
+    let dirty = br_cmd(root)
+        .args([
+            "create",
+            "--title",
+            "db-only issue",
+            "--priority",
+            "2",
+            "--no-auto-flush",
+        ])
+        .output()
+        .expect("br create spawned");
+    assert!(dirty.status.success(), "br create (dirty) failed");
+
+    let list = br_cmd(root)
+        .args(["list", "--json"])
+        .output()
+        .expect("br list spawned");
+    assert!(list.status.success(), "br list --json failed");
+    let listed = parse_trailing_json(&String::from_utf8_lossy(&list.stdout));
+    let dirty_id = listed["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .find(|issue| issue["title"] == "db-only issue")
+        .and_then(|issue| issue["id"].as_str())
+        .expect("dirty issue id")
+        .to_string();
+
+    // Checkpoint the WAL into the main DB, then corrupt a user page the
+    // same way the vacuum test above does.
+    let db_path = root.join(".beads").join("beads.db");
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open db rw");
+        let junk = vec![0xffu8; 200];
+        f.write_at(&junk, 4096).expect("corrupt page-2");
+    }
+
+    dirty_id
+}
+
+#[test]
+fn repair_rebuild_preserves_dirty_unflushed_issue() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
+
+    let out = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
+        .output()
+        .expect("br doctor --repair spawned");
+    assert!(
+        out.status.success(),
+        "br doctor --repair must verify after preserving the dirty issue: \
+         stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repair = parse_trailing_json(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(repair["repaired"], true, "repair payload: {repair}");
+    assert_eq!(repair["verified"], true, "repair payload: {repair}");
+    assert_eq!(
+        repair["preserved_dirty_issues"], 1,
+        "repair payload: {repair}"
+    );
+
+    // The preserved issue is alive in the rebuilt store...
+    let show = br_cmd(&root)
+        .args(["show", &dirty_id, "--json"])
+        .output()
+        .expect("br show spawned");
+    assert!(
+        show.status.success(),
+        "preserved issue {dirty_id} vanished across --repair: stderr={}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+
+    // ...still marked dirty, and the next flush exports it to the JSONL.
+    let status = br_cmd(&root)
+        .args(["sync", "--status", "--json"])
+        .output()
+        .expect("br sync --status spawned");
+    let status_json = parse_trailing_json(&String::from_utf8_lossy(&status.stdout));
+    assert_eq!(
+        status_json["dirty_count"], 1,
+        "preserved issue must be re-marked dirty: {status_json}"
+    );
+    let flush = br_cmd(&root)
+        .args(["sync", "--flush-only"])
+        .output()
+        .expect("br sync spawned");
+    assert!(flush.status.success(), "post-repair flush failed");
+    let jsonl =
+        fs::read_to_string(root.join(".beads").join("issues.jsonl")).expect("read issues.jsonl");
+    assert!(
+        jsonl.contains("db-only issue"),
+        "flush after repair must export the preserved issue; jsonl:\n{jsonl}"
+    );
+}
+
+#[test]
+fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
+    // Same corruption, but recovered by the startup probe's automatic
+    // rebuild (config-layer `rebuild_with_tombstone_preservation`) when a
+    // plain read command opens the workspace — no doctor involved.
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
+
+    let list = br_cmd(&root)
+        .args(["list", "--json"])
+        .output()
+        .expect("br list spawned");
+    assert!(
+        list.status.success(),
+        "br list must auto-recover: stderr={}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed = parse_trailing_json(&String::from_utf8_lossy(&list.stdout));
+    let titles: Vec<&str> = listed["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter_map(|issue| issue["title"].as_str())
+        .collect();
+    assert!(
+        titles.contains(&"db-only issue"),
+        "dirty issue {dirty_id} lost across startup auto-recovery; titles: {titles:?}"
+    );
+    assert!(titles.contains(&"flushed fine"), "titles: {titles:?}");
+
+    let status = br_cmd(&root)
+        .args(["sync", "--status", "--json"])
+        .output()
+        .expect("br sync --status spawned");
+    let status_json = parse_trailing_json(&String::from_utf8_lossy(&status.stdout));
+    assert_eq!(
+        status_json["dirty_count"], 1,
+        "preserved issue must stay dirty for the next flush: {status_json}"
+    );
+}

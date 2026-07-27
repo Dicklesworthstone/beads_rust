@@ -16,10 +16,12 @@ use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
-    ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
-    blocking_write_lock_with_timeout, compute_jsonl_hash, export_to_jsonl_with_policy,
-    finalize_export, import_from_jsonl, preflight_import, restore_tombstones_after_rebuild,
-    scan_jsonl_for_tombstone_filter, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedIssue, auto_flush,
+    blocking_write_lock_with_timeout, compute_jsonl_hash, dirty_issues_missing_from_jsonl,
+    export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
+    restore_dirty_issues_after_rebuild, restore_tombstones_after_rebuild,
+    scan_jsonl_for_tombstone_filter, snapshot_dirty_live_issues, snapshot_tombstones,
+    tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
@@ -1032,13 +1034,14 @@ fn rebuild_or_defer_after_probe_error(
                 probe_error = %probe_err,
                 "Post-open database probe failed; rebuilding from JSONL"
             );
-            // Best-effort tombstone snapshot. If the probe failed the
-            // storage may be in a strange state, but `snapshot_tombstones`
-            // itself is fault-tolerant (warn+empty on enumeration
-            // failure, warn+partial on per-tombstone failure), so we try
-            // anyway: the worst case is the same as the old behavior (no
-            // preservation), the best case is we rescue the unflushed
-            // tombstones the old code lost silently.
+            // Best-effort tombstone + dirty-issue snapshot. If the probe
+            // failed the storage may be in a strange state, but the
+            // snapshot helpers are fault-tolerant (warn+empty on
+            // enumeration failure, warn+partial on per-issue failure), so
+            // we try anyway: the worst case is the same as the old
+            // behavior (no preservation), the best case is we rescue the
+            // unflushed tombstones and unflushed local edits the old code
+            // lost silently (GitHub #394).
             let storage = rebuild_with_tombstone_preservation(
                 storage,
                 beads_dir,
@@ -1063,8 +1066,11 @@ fn rebuild_or_defer_after_probe_error(
     }
 }
 
-/// Snapshot unflushed tombstones from `storage`, drop the old connection,
-/// rebuild from JSONL, and restore the preserved tombstones atomically.
+/// Snapshot unflushed tombstones and dirty live issues from `storage`,
+/// drop the old connection, rebuild from JSONL, and restore the preserved
+/// state atomically. Without the dirty-issue half, an automatic rebuild
+/// would silently drop any local creation or edit that had not yet been
+/// flushed to the JSONL (GitHub #394).
 fn rebuild_with_tombstone_preservation(
     storage: SqliteStorage,
     beads_dir: &Path,
@@ -1073,7 +1079,8 @@ fn rebuild_with_tombstone_preservation(
     bootstrap_layer: &ConfigLayer,
     allow_external_jsonl: bool,
 ) -> Result<SqliteStorage> {
-    let preserved_tombstones = preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
+    let (preserved_tombstones, preserved_dirty_issues) =
+        preserved_unflushed_state(&storage, &paths.jsonl_path);
     drop(storage);
     let mut storage = rebuild_database_from_jsonl(
         beads_dir,
@@ -1083,6 +1090,7 @@ fn rebuild_with_tombstone_preservation(
         allow_external_jsonl,
     )?;
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
+    restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
     Ok(storage)
 }
 
@@ -1105,22 +1113,26 @@ fn rebuild_database_from_jsonl(
     .map(|(storage, _, _)| storage)
 }
 
-/// Snapshot local tombstones that have not yet been flushed to JSONL.
+/// Snapshot local tombstones and dirty live issues that have not yet been
+/// flushed to JSONL.
 ///
-/// Returns an empty vector and logs a debug/warn entry on any failure —
+/// Returns empty vectors and logs a debug/warn entry on any failure —
 /// this is a preservation path, not a correctness invariant, so we always
 /// prefer to proceed with the rebuild rather than fail the whole command
-/// because we couldn't read a tombstone or couldn't read the JSONL. The
-/// returned vector is filtered so only tombstones that are *not* already
-/// flushed to JSONL as tombstones survive (the already-flushed ones will
-/// come back via the rebuild's own `import_from_jsonl`).
-fn preserved_unflushed_tombstones(
+/// because we couldn't read an issue or couldn't read the JSONL. The
+/// returned vectors are filtered so only state the JSONL cannot reproduce
+/// survives: tombstones not already flushed as tombstones, and dirty live
+/// issues whose row is absent from the JSONL or strictly newer than its
+/// JSONL copy (everything else comes back via the rebuild's own
+/// `import_from_jsonl`).
+fn preserved_unflushed_state(
     storage: &SqliteStorage,
     jsonl_path: &Path,
-) -> Vec<PreservedTombstone> {
-    let snapshot = snapshot_tombstones(storage);
-    if snapshot.is_empty() {
-        return snapshot;
+) -> (Vec<PreservedIssue>, Vec<PreservedIssue>) {
+    let tombstone_snapshot = snapshot_tombstones(storage);
+    let dirty_snapshot = snapshot_dirty_live_issues(storage);
+    if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
+        return (tombstone_snapshot, dirty_snapshot);
     }
     let jsonl_filter = if jsonl_path.is_file() {
         match scan_jsonl_for_tombstone_filter(jsonl_path) {
@@ -1128,13 +1140,13 @@ fn preserved_unflushed_tombstones(
             Err(err) => {
                 // The rebuild itself will also parse the JSONL and
                 // re-surface any parse error (e.g. conflict markers) with
-                // a proper diagnostic. For the purposes of tombstone
-                // preservation, fall back to treating the JSONL as empty
-                // so every snapshotted tombstone is kept; if the rebuild
-                // ultimately fails, the backup set has our back.
+                // a proper diagnostic. For the purposes of preservation,
+                // fall back to treating the JSONL as empty so every
+                // snapshotted issue is kept; if the rebuild ultimately
+                // fails, the backup set has our back.
                 tracing::debug!(
                     error = %err,
-                    "Could not scan JSONL for tombstone filter during startup auto-rebuild; preserving all snapshotted tombstones and letting the rebuild surface the JSONL error"
+                    "Could not scan JSONL for tombstone filter during startup auto-rebuild; preserving all snapshotted state and letting the rebuild surface the JSONL error"
                 );
                 JsonlTombstoneFilter::default()
             }
@@ -1142,7 +1154,10 @@ fn preserved_unflushed_tombstones(
     } else {
         JsonlTombstoneFilter::default()
     };
-    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
+    (
+        tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
+        dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
+    )
 }
 
 pub(crate) fn repair_database_from_jsonl(
