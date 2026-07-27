@@ -63,7 +63,12 @@ fn execute_inner(args: &CountArgs, ctx: &OutputContext, storage: &SqliteStorage)
     let types = parse_trimmed_values(&args.types)?;
     let priorities = parse_trimmed_values(&args.priority)?;
 
-    if !statuses.is_empty() {
+    // `--status all` is the same meta-value `br lint` accepts: no status
+    // filter, every status included (beads_rust-6ilv).
+    if super::status_filter_requests_all(&args.status) {
+        filters.include_closed = true;
+        filters.include_deferred = true;
+    } else if !statuses.is_empty() {
         if statuses.iter().any(Status::is_terminal) {
             filters.include_closed = true;
         }

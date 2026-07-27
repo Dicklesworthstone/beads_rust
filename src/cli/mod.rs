@@ -1691,7 +1691,7 @@ pub fn resolve_output_format_basic_with_outer_mode(
 #[derive(Args, Debug, Default, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ListArgs {
-    /// Filter by status (can be repeated)
+    /// Filter by status (can be repeated; 'all' matches every status)
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Vec<String>,
 
@@ -2406,7 +2406,7 @@ pub struct CountArgs {
     #[arg(long)]
     pub by_label: bool,
 
-    /// Filter by status (repeatable or comma-separated)
+    /// Filter by status (repeatable or comma-separated; 'all' matches every status)
     #[arg(long, value_delimiter = ',', add = ArgValueCompleter::new(status_completer_delimited))]
     pub status: Vec<String>,
 

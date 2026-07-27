@@ -278,6 +278,17 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
     }
 }
 
+/// Whether a CLI status filter contains the `all` meta-value
+/// (case-insensitive), meaning "every status" — the same convention
+/// `br lint --status all` uses. Without this, `all` would parse as the
+/// custom status literal `Custom("all")` and silently match nothing
+/// (beads_rust-6ilv).
+pub(super) fn status_filter_requests_all(statuses: &[String]) -> bool {
+    statuses
+        .iter()
+        .any(|status| status.trim().eq_ignore_ascii_case("all"))
+}
+
 /// Self-reported session identity for capacity occupancy and the `session`
 /// capacity scope (GitHub #384 phase 5). Env-only (`BR_SESSION`): a CLI flag
 /// would collide with `br close --session`, which records close metadata,

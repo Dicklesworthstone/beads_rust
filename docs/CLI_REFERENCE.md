@@ -286,7 +286,7 @@ br list [OPTIONS]
 **Filter Options:**
 | Option | Description |
 |--------|-------------|
-| `-s, --status <STATUS>` | Filter by status (can repeat) |
+| `-s, --status <STATUS>` | Filter by status (can repeat; `all` matches every status) |
 | `-t, --type <TYPE>` | Filter by issue type (can repeat) |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Show only unassigned issues |

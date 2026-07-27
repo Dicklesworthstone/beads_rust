@@ -414,7 +414,10 @@ fn normalize_whitespace(input: &str) -> String {
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     validate_sort_key(args.sort.as_deref())?;
 
-    let statuses = if args.status.is_empty() {
+    // `--status all` is the same meta-value `br lint` accepts: no status
+    // filter, every status included (beads_rust-6ilv).
+    let all_statuses = super::status_filter_requests_all(&args.status);
+    let statuses = if args.status.is_empty() || all_statuses {
         None
     } else {
         Some(
@@ -447,6 +450,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     };
 
     let include_closed = args.all
+        || all_statuses
         || statuses
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));

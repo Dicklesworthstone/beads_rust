@@ -215,6 +215,78 @@ fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
 }
 
 #[test]
+fn e2e_list_and_count_status_all_matches_every_status() {
+    let _log = common::test_log("e2e_list_and_count_status_all_matches_every_status");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "status_all_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // One open, one in_progress, one closed issue.
+    let mut ids = Vec::new();
+    for title in ["Open one", "Working one", "Closed one"] {
+        let create = run_br(&workspace, ["create", title], "status_all_create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        ids.push(parse_created_id(&create.stdout));
+    }
+    let claim = run_br(
+        &workspace,
+        ["update", &ids[1], "--status", "in_progress"],
+        "status_all_claim",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    let close = run_br(
+        &workspace,
+        ["close", &ids[2], "--reason", "done"],
+        "status_all_close",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    // `--status all` must return every issue (beads_rust-6ilv: it used to
+    // parse as the literal custom status "all" and silently match nothing).
+    let list = run_br(
+        &workspace,
+        ["list", "--status", "all", "--json"],
+        "status_all_list",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let issues = parse_list_issues(&list.stdout);
+    assert_eq!(
+        issues.len(),
+        3,
+        "--status all must match every status: {issues:?}"
+    );
+
+    let count = run_br(
+        &workspace,
+        ["count", "--status", "all", "--json"],
+        "status_all_count",
+    );
+    assert!(count.status.success(), "count failed: {}", count.stderr);
+    let count_json: Value =
+        serde_json::from_str(common::cli::extract_json_payload(&count.stdout).as_str())
+            .expect("count JSON");
+    let total = count_json
+        .get("count")
+        .or_else(|| count_json.get("total"))
+        .and_then(Value::as_u64)
+        .expect("count total");
+    assert_eq!(total, 3, "count --status all must match every status");
+
+    let search = run_br(
+        &workspace,
+        ["search", "one", "--status", "all", "--json"],
+        "status_all_search",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+    assert!(
+        search.stdout.contains(&ids[2]),
+        "search --status all must include closed issues: {}",
+        search.stdout
+    );
+}
+
+#[test]
 fn e2e_basic_lifecycle() {
     let _log = common::test_log("e2e_basic_lifecycle");
     let workspace = BrWorkspace::new();
