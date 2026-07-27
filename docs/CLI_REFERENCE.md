@@ -627,8 +627,19 @@ workflow:
   consuming a slot; evidence then reports counted and exempt totals
   separately.
 - Optional multi-agent admission scopes are configured under
-  `workflow.capacity.scopes` (see below). Capacity observability remains a
-  subsequent phase of GitHub issue #384.
+  `workflow.capacity.scopes` (see below).
+- Occupancy is observable without mutating anything: once any capacity is
+  configured, `br stats --json` and `br coordination status --json` carry a
+  `capacity` array (one row per repository capacity plus one per occupied
+  scope partition) with `counted`, `aggregate_parents_excluded`, `exempt`,
+  `soft_limit`, `hard_limit`, `remaining`, and a `state` of
+  `healthy`/`soft-limit`/`at-hard`/`over-hard`; human `br stats` prints the
+  matching CAPACITY/COUNTED/AGGREGATES/EXEMPT/SOFT/HARD/REMAINING/STATE
+  table. The block is absent when no capacity is configured, keeping the
+  legacy payload shapes byte-stable, and the snapshot never writes (lazy
+  exemption expiry stays pending for the next enforcement observation).
+  The complete GitHub #384 acceptance matrix lives in
+  [GH384_ACCEPTANCE_MATRIX.md](GH384_ACCEPTANCE_MATRIX.md).
 
 **Multi-agent admission scopes (`workflow.capacity.scopes`):**
 

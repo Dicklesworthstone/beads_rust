@@ -41,9 +41,9 @@ mod text;
 pub mod theme;
 
 pub use output::{
-    BlockedIssue, BlockedIssueOutput, Breakdown, BreakdownEntry, IssueDetails, IssueWithCounts,
-    IssueWithDependencyMetadata, ListPage, ReadyIssue, RecentActivity, RollupSummary, StaleIssue,
-    Statistics, StatsSummary, TreeNode,
+    BlockedIssue, BlockedIssueOutput, Breakdown, BreakdownEntry, CapacityStat, IssueDetails,
+    IssueWithCounts, IssueWithDependencyMetadata, ListPage, ReadyIssue, RecentActivity,
+    RollupSummary, StaleIssue, Statistics, StatsSummary, TreeNode,
 };
 pub use text::{
     TextFormatOptions, format_issue_line, format_issue_line_with, format_issue_long_with,

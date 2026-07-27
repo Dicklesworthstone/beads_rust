@@ -316,6 +316,11 @@ schemas:
         type: array
         items:
           "$ref": #/$defs/CoordinationClaimRow
+      capacity:
+        description: "Workflow capacity occupancy (GitHub #384 phase 6). Absent when no\ncapacity is configured, preserving the pre-capacity\n`br.coordination.v1` payload shape."
+        type: array
+        items:
+          "$ref": #/$defs/CapacityStat
     required[4]: schema_version,generated_at,summary,claims
     "$defs":
       CoordinationSummary:
@@ -631,6 +636,62 @@ schemas:
         oneOf[2]{description,type,const}:
           Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
           Claim the issue after the audit comment is recorded.,string,claim_issue
+      CapacityStat:
+        description: "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included)."
+        type: object
+        properties:
+          name:
+            description: The status or group name.
+            type: string
+          kind:
+            description: `status` or `group`.
+            type: string
+          scope:
+            description: "Scope partition dimension (`repository`, `actor`, ...)."
+            type: string
+          scope_key:
+            description: Partition key within a non-repository scope.
+            type[2]: string,"null"
+          counted:
+            description: Occupancy excluding exemptions (and hierarchy aggregates).
+            type: integer
+            format: uint32
+            minimum: 0
+          aggregate_parents_excluded:
+            description: Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          exempt:
+            description: "Occupancy excluded by active, authorized exemptions."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          soft_limit:
+            description: "Advisory threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          hard_limit:
+            description: "Enforced threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          remaining:
+            description: "`hard_limit - counted`, clamped at zero; absent without a hard limit."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          state:
+            description: `healthy` | `soft-limit` | `at-hard` | `over-hard`.
+            type: string
+          counting_mode:
+            description: Counting mode the numbers were computed under.
+            type: string
+          policy_path:
+            description: Policy location of the limit.
+            type: string
+        required[7]: name,kind,scope,counted,state,counting_mode,policy_path
   CountGroup:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: CountGroup
@@ -1414,6 +1475,11 @@ schemas:
       recent_activity.anyOf[2]:
         - "$ref": #/$defs/RecentActivity
         - type: "null"
+      capacity:
+        description: "Workflow capacity occupancy (GitHub #384). Absent when no capacity\nis configured, preserving the pre-capacity payload shape."
+        type: array
+        items:
+          "$ref": #/$defs/CapacityStat
     required[1]: summary
     "$defs":
       StatsSummary:
@@ -1521,6 +1587,62 @@ schemas:
             format: uint
             minimum: 0
         required[7]: hours_tracked,commit_count,issues_created,issues_closed,issues_updated,issues_reopened,total_changes
+      CapacityStat:
+        description: "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included)."
+        type: object
+        properties:
+          name:
+            description: The status or group name.
+            type: string
+          kind:
+            description: `status` or `group`.
+            type: string
+          scope:
+            description: "Scope partition dimension (`repository`, `actor`, ...)."
+            type: string
+          scope_key:
+            description: Partition key within a non-repository scope.
+            type[2]: string,"null"
+          counted:
+            description: Occupancy excluding exemptions (and hierarchy aggregates).
+            type: integer
+            format: uint32
+            minimum: 0
+          aggregate_parents_excluded:
+            description: Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          exempt:
+            description: "Occupancy excluded by active, authorized exemptions."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          soft_limit:
+            description: "Advisory threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          hard_limit:
+            description: "Enforced threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          remaining:
+            description: "`hard_limit - counted`, clamped at zero; absent without a hard limit."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          state:
+            description: `healthy` | `soft-limit` | `at-hard` | `over-hard`.
+            type: string
+          counting_mode:
+            description: Counting mode the numbers were computed under.
+            type: string
+          policy_path:
+            description: Policy location of the limit.
+            type: string
+        required[7]: name,kind,scope,counted,state,counting_mode,policy_path
   SyncReconcileReceipt:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: SyncReconcileReceipt

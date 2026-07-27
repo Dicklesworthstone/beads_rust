@@ -266,6 +266,186 @@ fn e2e_capacity_scope_harness_and_session_key_on_env_attribution() {
     );
 }
 
+/// Every backticked test name in the GH-384 acceptance matrix must exist as
+/// a real test function, so renames cannot silently rot the matrix.
+#[test]
+fn gh384_acceptance_matrix_names_real_tests() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let matrix = fs::read_to_string(root.join("docs/GH384_ACCEPTANCE_MATRIX.md"))
+        .expect("read acceptance matrix");
+
+    let mut names: Vec<String> = Vec::new();
+    for segment in matrix.split('`').skip(1).step_by(2) {
+        // Backticked segments that look like test identifiers.
+        if !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && segment.contains('_')
+            && !segment.starts_with("beads_rust-")
+        {
+            names.push(segment.to_string());
+        }
+    }
+    assert!(
+        names.len() >= 30,
+        "matrix should reference a substantial test set, found {}",
+        names.len()
+    );
+
+    let mut haystack = String::new();
+    for file in [
+        "src/storage/sqlite.rs",
+        "src/close_policy.rs",
+        "src/error/structured.rs",
+        "tests/e2e_workflow_capacity_scopes.rs",
+        "tests/e2e_workflow_capacity_exemptions.rs",
+        "tests/e2e_errors.rs",
+    ] {
+        haystack.push_str(&fs::read_to_string(root.join(file)).expect("read source"));
+    }
+
+    let missing: Vec<&String> = names
+        .iter()
+        .filter(|name| {
+            // Skip non-test identifiers the matrix mentions (bead ids etc.).
+            name.starts_with("workflow_capacity")
+                || name.starts_with("capacity_")
+                || name.starts_with("e2e_capacity")
+                || name.starts_with("e2e_workflow_capacity")
+                || name.starts_with("loader_parses")
+                || name.starts_with("gh384_")
+        })
+        .filter(|name| !haystack.contains(&format!("fn {name}(")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "acceptance matrix names tests that do not exist: {missing:?}"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_capacity_observability_in_stats_and_coordination() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "obs_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // Before any capacity is configured, the stats payload keeps its
+    // pre-capacity shape (no `capacity` key at all).
+    let bare = run_br(&workspace, ["stats", "--json"], "obs_stats_bare");
+    assert!(bare.status.success(), "stats failed: {}", bare.stderr);
+    let bare_json: Value =
+        serde_json::from_str(&extract_json_payload(&bare.stdout)).expect("stats JSON");
+    assert!(
+        bare_json.get("capacity").is_none(),
+        "unconfigured capacity must stay absent: {bare_json}"
+    );
+
+    // Configure a repository hard limit + an actor scope, occupy one slot.
+    let first = create_issue(&workspace, "Occupied slot", "obs_create_1");
+    let _second = create_issue(&workspace, "Waiting slot", "obs_create_2");
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        soft: 1
+        hard: 2
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+",
+    )
+    .expect("write policy");
+    let claim = run_br(
+        &workspace,
+        [
+            "--actor",
+            "alice",
+            "update",
+            &first,
+            "--status",
+            "in_progress",
+        ],
+        "obs_claim",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+
+    // `br stats --json` reports the GH-384 table fields.
+    let stats = run_br(&workspace, ["stats", "--json"], "obs_stats");
+    assert!(stats.status.success(), "stats failed: {}", stats.stderr);
+    let stats_json: Value =
+        serde_json::from_str(&extract_json_payload(&stats.stdout)).expect("stats JSON");
+    let capacity = stats_json["capacity"]
+        .as_array()
+        .expect("capacity array present once configured");
+    let repo_row = capacity
+        .iter()
+        .find(|row| row["scope"] == "repository" && row["name"] == "in_progress")
+        .unwrap_or_else(|| panic!("repository capacity row missing: {capacity:?}"));
+    assert_eq!(repo_row["counted"].as_u64(), Some(1), "{repo_row}");
+    assert_eq!(repo_row["soft_limit"].as_u64(), Some(1), "{repo_row}");
+    assert_eq!(repo_row["hard_limit"].as_u64(), Some(2), "{repo_row}");
+    assert_eq!(repo_row["remaining"].as_u64(), Some(1), "{repo_row}");
+    assert_eq!(repo_row["state"].as_str(), Some("soft-limit"), "{repo_row}");
+    assert!(repo_row.get("scope_key").is_none(), "{repo_row}");
+    let actor_row = capacity
+        .iter()
+        .find(|row| row["scope"] == "actor")
+        .unwrap_or_else(|| panic!("occupied actor partition row missing: {capacity:?}"));
+    assert_eq!(
+        actor_row["scope_key"].as_str(),
+        Some("alice"),
+        "{actor_row}"
+    );
+    assert_eq!(actor_row["counted"].as_u64(), Some(1), "{actor_row}");
+    assert_eq!(actor_row["state"].as_str(), Some("healthy"), "{actor_row}");
+
+    // The human table renders when configured.
+    let text = run_br(&workspace, ["stats", "--no-color"], "obs_stats_text");
+    assert!(text.status.success(), "stats text failed: {}", text.stderr);
+    assert!(
+        text.stdout.contains("Capacity:") && text.stdout.contains("REMAINING"),
+        "human stats must include the capacity table: {}",
+        text.stdout
+    );
+
+    // `br coordination status --json` carries the same block.
+    let coordination = run_br(
+        &workspace,
+        ["coordination", "status", "--json"],
+        "obs_coordination",
+    );
+    assert!(
+        coordination.status.success(),
+        "coordination failed: {}",
+        coordination.stderr
+    );
+    let coordination_json: Value =
+        serde_json::from_str(&extract_json_payload(&coordination.stdout))
+            .expect("coordination JSON");
+    assert_eq!(
+        coordination_json["schema_version"].as_str(),
+        Some("br.coordination.v1"),
+        "{coordination_json}"
+    );
+    let coordination_capacity = coordination_json["capacity"]
+        .as_array()
+        .expect("coordination capacity array present once configured");
+    assert!(
+        coordination_capacity
+            .iter()
+            .any(|row| row["scope"] == "repository" && row["counted"].as_u64() == Some(1)),
+        "coordination must report the repository capacity: {coordination_capacity:?}"
+    );
+}
+
 #[test]
 fn e2e_capacity_scope_soft_limit_warns_in_json_without_rejecting() {
     let workspace = BrWorkspace::new();

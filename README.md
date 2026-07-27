@@ -769,9 +769,12 @@ admission transaction; a partition with no key (e.g. no harness reported)
 is simply not subject to that scope. This is cooperative admission control,
 not process supervision — attribution stays self-reported. Scoped evidence
 carries the partition key as `scope_key` and a
-`workflow.capacity.scopes.<scope>...` policy path. See
-`docs/CLI_REFERENCE.md` for full semantics. Capacity observability remains
-a subsequent phase of GitHub issue #384.
+`workflow.capacity.scopes.<scope>...` policy path. Once any capacity is
+configured, `br stats` and `br coordination status` report per-capacity
+occupancy (counted/exempt/limits/remaining/state, including occupied scope
+partitions) in human, JSON, and TOON output. See `docs/CLI_REFERENCE.md`
+for full semantics and `docs/GH384_ACCEPTANCE_MATRIX.md` for the complete
+GitHub #384 acceptance matrix.
 
 ### Environment Variables
 

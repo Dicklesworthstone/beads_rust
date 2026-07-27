@@ -249,6 +249,85 @@ pub struct RecentActivity {
     pub total_changes: usize,
 }
 
+/// Observed occupancy of one workflow capacity (GitHub #384 phase 6).
+///
+/// One row per repository capacity plus one row per occupied partition of
+/// each scoped capacity, mirroring the enforcement engine's counting
+/// (exemptions and hierarchy modes included).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct CapacityStat {
+    /// The status or group name.
+    pub name: String,
+    /// `status` or `group`.
+    pub kind: String,
+    /// Scope partition dimension (`repository`, `actor`, ...).
+    pub scope: String,
+    /// Partition key within a non-repository scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_key: Option<String>,
+    /// Occupancy excluding exemptions (and hierarchy aggregates).
+    pub counted: u32,
+    /// Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_parents_excluded: Option<u32>,
+    /// Occupancy excluded by active, authorized exemptions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt: Option<u32>,
+    /// Advisory threshold, if configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limit: Option<u32>,
+    /// Enforced threshold, if configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_limit: Option<u32>,
+    /// `hard_limit - counted`, clamped at zero; absent without a hard limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<u32>,
+    /// `healthy` | `soft-limit` | `at-hard` | `over-hard`.
+    pub state: String,
+    /// Counting mode the numbers were computed under.
+    pub counting_mode: String,
+    /// Policy location of the limit.
+    pub policy_path: String,
+}
+
+impl CapacityStat {
+    /// Derive the display/state fields from a storage snapshot row.
+    #[must_use]
+    pub fn from_snapshot(row: crate::storage::sqlite::CapacitySnapshotRow) -> Self {
+        let counted = row.counted;
+        let soft_hit = row.soft.is_some_and(|soft| counted >= soft);
+        let state = row.hard.map_or_else(
+            || if soft_hit { "soft-limit" } else { "healthy" },
+            |hard| {
+                if counted > hard {
+                    "over-hard"
+                } else if counted == hard {
+                    "at-hard"
+                } else if soft_hit {
+                    "soft-limit"
+                } else {
+                    "healthy"
+                }
+            },
+        );
+        Self {
+            name: row.name,
+            kind: row.kind,
+            scope: row.scope,
+            scope_key: row.scope_key,
+            counted,
+            aggregate_parents_excluded: row.aggregate_parents_excluded,
+            exempt: row.exempt,
+            soft_limit: row.soft,
+            hard_limit: row.hard,
+            remaining: row.hard.map(|hard| hard.saturating_sub(counted)),
+            state: state.to_string(),
+            counting_mode: row.counting_mode,
+            policy_path: row.policy_path,
+        }
+    }
+}
+
 /// Aggregate statistics output.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Statistics {
@@ -257,6 +336,10 @@ pub struct Statistics {
     pub breakdowns: Vec<Breakdown>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recent_activity: Option<RecentActivity>,
+    /// Workflow capacity occupancy (GitHub #384). Absent when no capacity
+    /// is configured, preserving the pre-capacity payload shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capacity: Vec<CapacityStat>,
 }
 
 #[cfg(test)]

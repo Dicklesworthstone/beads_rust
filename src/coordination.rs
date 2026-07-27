@@ -375,6 +375,11 @@ pub struct CoordinationStatusOutput {
     pub generated_at: DateTime<Utc>,
     pub summary: CoordinationSummary,
     pub claims: Vec<CoordinationClaimRow>,
+    /// Workflow capacity occupancy (GitHub #384 phase 6). Absent when no
+    /// capacity is configured, preserving the pre-capacity
+    /// `br.coordination.v1` payload shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capacity: Vec<crate::format::CapacityStat>,
 }
 
 impl CoordinationStatusOutput {
@@ -391,6 +396,7 @@ impl CoordinationStatusOutput {
             generated_at,
             summary,
             claims,
+            capacity: Vec::new(),
         }
     }
 }

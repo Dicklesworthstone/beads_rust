@@ -204,6 +204,42 @@ struct CapacityOccupancyRow {
     session: Option<String>,
 }
 
+/// Observed occupancy of one configured capacity (GitHub #384 phase 6).
+///
+/// Produced by [`SqliteStorage::capacity_snapshot`] for the observability
+/// surfaces (`br stats`, `br coordination status`). One row per repository
+/// capacity, plus one row per OCCUPIED partition of each scoped capacity.
+#[derive(Debug, Clone)]
+pub struct CapacitySnapshotRow {
+    /// `status` or `group`.
+    pub kind: String,
+    /// The status or group name.
+    pub name: String,
+    /// Scope partition dimension (`repository`, `actor`, ...).
+    pub scope: String,
+    /// Partition key within a non-repository scope.
+    pub scope_key: Option<String>,
+    /// Occupancy excluding exemptions (and hierarchy aggregates).
+    pub counted: u32,
+    /// Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+    pub aggregate_parents_excluded: Option<u32>,
+    /// Occupancy excluded by active, authorized exemptions.
+    pub exempt: Option<u32>,
+    /// Advisory threshold, if configured.
+    pub soft: Option<u32>,
+    /// Enforced threshold, if configured.
+    pub hard: Option<u32>,
+    /// Counting mode the numbers were computed under.
+    pub counting_mode: String,
+    /// Policy location of the limit.
+    pub policy_path: String,
+}
+
+/// Maximum partition rows reported per scoped capacity in a snapshot.
+/// Mirrors the doctor `IdDelta` preview discipline: operators want the
+/// first partitions, not an unbounded dump.
+const CAPACITY_SNAPSHOT_PARTITION_LIMIT: usize = 50;
+
 /// Root-ancestor index over parent-child edges for subtree capacity
 /// scoping (GitHub #384 phase 5).
 ///
@@ -3772,6 +3808,26 @@ impl SqliteStorage {
         conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
     ) -> Result<CapacityExemptionIndex> {
+        Self::load_capacity_exemption_index(conn, policy, true)
+    }
+
+    /// Read-only exemption index for observability surfaces (`br stats`,
+    /// `br coordination status`): expired exemptions stop counting exactly
+    /// like enforcement, but the audited lazy-expire records stay pending
+    /// for the next committed enforcement observation — a read command must
+    /// not write.
+    fn load_capacity_exemption_index_read_only(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+    ) -> Result<CapacityExemptionIndex> {
+        Self::load_capacity_exemption_index(conn, policy, false)
+    }
+
+    fn load_capacity_exemption_index(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        record_lazy_expirations: bool,
+    ) -> Result<CapacityExemptionIndex> {
         if !policy.exemptions.is_enabled()
             || !crate::storage::schema::table_exists(conn, "capacity_exemptions")
         {
@@ -3822,6 +3878,9 @@ impl SqliteStorage {
                 .insert(issue_id.to_string());
         }
 
+        if !record_lazy_expirations {
+            expired.clear();
+        }
         for (issue_id, kind, name, provider, expires_at) in expired {
             conn.execute_with_params(
                 "UPDATE capacity_exemptions
@@ -4860,6 +4919,252 @@ impl SqliteStorage {
             }
         }
         Ok(rows_by_issue)
+    }
+
+    /// Observed occupancy of every configured capacity (GitHub #384
+    /// phase 6). Read-only: reuses the enforcement counting engine with an
+    /// empty transition batch, honors exemptions and hierarchy counting
+    /// exactly like admission, and never writes (lazy exemption expiry
+    /// stays pending for the next enforcement observation). Scoped
+    /// capacities report one row per occupied partition, deterministic
+    /// order, capped at [`CAPACITY_SNAPSHOT_PARTITION_LIMIT`] per capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a database query fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn capacity_snapshot(&self) -> Result<Vec<CapacitySnapshotRow>> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let policy = self.workflow_capacity_policy.clone();
+        if !policy.is_active() {
+            return Ok(Vec::new());
+        }
+        let conn = &self.conn;
+        let exemptions = Self::load_capacity_exemption_index_read_only(conn, &policy)?;
+        let transitions: [CapacityBatchTransition; 0] = [];
+        let mut engine =
+            CapacityCountEngine::new(conn, &policy.counting, &transitions, &exemptions);
+        let mut rows = Vec::new();
+
+        for (status, limit) in &policy.statuses {
+            let members = [status.clone()];
+            let pair = engine.counts("status", status, &members)?;
+            rows.push(CapacitySnapshotRow {
+                kind: "status".to_string(),
+                name: status.clone(),
+                scope: "repository".to_string(),
+                scope_key: None,
+                counted: pair.current,
+                aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                exempt: pair.exempt,
+                soft: limit.soft,
+                hard: limit.hard,
+                counting_mode: engine.mode_str().to_string(),
+                policy_path: format!("workflow.capacity.statuses.{status}"),
+            });
+        }
+        for (name, group) in &policy.groups {
+            let pair = engine.counts("group", name, &group.statuses)?;
+            rows.push(CapacitySnapshotRow {
+                kind: "group".to_string(),
+                name: name.clone(),
+                scope: "repository".to_string(),
+                scope_key: None,
+                counted: pair.current,
+                aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                exempt: pair.exempt,
+                soft: group.soft,
+                hard: group.hard,
+                counting_mode: engine.mode_str().to_string(),
+                policy_path: format!("workflow.capacity.groups.{name}"),
+            });
+        }
+
+        let mut subtree: Option<CapacitySubtreeIndex> = None;
+        for (scope_name, scope_policy) in &policy.scopes {
+            let Some(scope_kind) = CapacityScopeKind::parse(scope_name) else {
+                continue;
+            };
+            if matches!(scope_kind, CapacityScopeKind::Subtree) && subtree.is_none() {
+                subtree = Some(CapacitySubtreeIndex::load(conn)?);
+            }
+            let checks = scope_policy
+                .statuses
+                .iter()
+                .map(|(status, limit)| {
+                    (
+                        "status",
+                        status.clone(),
+                        vec![status.clone()],
+                        *limit,
+                        format!(
+                            "workflow.capacity.scopes.{}.statuses.{status}",
+                            scope_kind.as_str()
+                        ),
+                    )
+                })
+                .chain(scope_policy.groups.iter().map(|(name, group)| {
+                    (
+                        "group",
+                        name.clone(),
+                        group.statuses.clone(),
+                        group.limit(),
+                        format!(
+                            "workflow.capacity.scopes.{}.groups.{name}",
+                            scope_kind.as_str()
+                        ),
+                    )
+                }));
+            for (kind_str, name, members, limit, policy_path) in checks {
+                Self::snapshot_scoped_capacity(
+                    conn,
+                    &exemptions,
+                    subtree.as_ref(),
+                    scope_kind,
+                    kind_str,
+                    &name,
+                    &members,
+                    limit,
+                    &policy_path,
+                    &mut rows,
+                )?;
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Append one snapshot row per occupied partition of a scoped capacity.
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_scoped_capacity(
+        conn: &Connection,
+        exemptions: &CapacityExemptionIndex,
+        subtree: Option<&CapacitySubtreeIndex>,
+        scope_kind: crate::close_policy::CapacityScopeKind,
+        kind_str: &'static str,
+        name: &str,
+        members: &[String],
+        limit: crate::close_policy::CapacityLimit,
+        policy_path: &str,
+        rows: &mut Vec<CapacitySnapshotRow>,
+    ) -> Result<()> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let mut keys = Self::scoped_partition_keys(conn, members, scope_kind, subtree)?;
+        keys.sort();
+        keys.dedup();
+        keys.truncate(CAPACITY_SNAPSHOT_PARTITION_LIMIT);
+
+        let canonical_name = name.trim().to_lowercase();
+        let exempt_ids = exemptions.exempt_ids(kind_str, &canonical_name);
+        for key in keys {
+            let keying = match scope_kind {
+                CapacityScopeKind::Repository => CapacityScopeKeying::Repository,
+                CapacityScopeKind::Actor
+                | CapacityScopeKind::Harness
+                | CapacityScopeKind::Session => CapacityScopeKeying::Acting(key.clone()),
+                CapacityScopeKind::Assignee => CapacityScopeKeying::Assignee,
+                CapacityScopeKind::Subtree => CapacityScopeKeying::Subtree,
+            };
+            let population = Self::scoped_capacity_population_in_tx(
+                conn, members, &keying, scope_kind, &key, subtree,
+            )?;
+            let exempt_count = exempt_ids.map_or(0_u32, |ids| {
+                u32::try_from(population.intersection(ids).count()).unwrap_or(u32::MAX)
+            });
+            let counted = u32::try_from(population.len())
+                .unwrap_or(u32::MAX)
+                .saturating_sub(exempt_count);
+            let scope_key =
+                (!matches!(scope_kind, CapacityScopeKind::Repository)).then(|| key.clone());
+            rows.push(CapacitySnapshotRow {
+                kind: kind_str.to_string(),
+                name: name.to_string(),
+                scope: scope_kind.as_str().to_string(),
+                scope_key,
+                counted,
+                aggregate_parents_excluded: None,
+                exempt: (exempt_count > 0).then_some(exempt_count),
+                soft: limit.soft,
+                hard: limit.hard,
+                counting_mode: "all".to_string(),
+                policy_path: policy_path.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Distinct occupied partition keys for one scoped capacity.
+    fn scoped_partition_keys(
+        conn: &Connection,
+        members: &[String],
+        scope_kind: crate::close_policy::CapacityScopeKind,
+        subtree: Option<&CapacitySubtreeIndex>,
+    ) -> Result<Vec<String>> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let mut keys: HashSet<String> = HashSet::new();
+        let mut seen = HashSet::new();
+        for status in members {
+            let canonical = status.trim().to_lowercase();
+            if canonical.is_empty() || !seen.insert(canonical.clone()) {
+                continue;
+            }
+            match scope_kind {
+                CapacityScopeKind::Repository => {
+                    keys.insert(String::new());
+                }
+                CapacityScopeKind::Assignee => {
+                    let rows = conn.query_with_params(
+                        "SELECT DISTINCT assignee FROM issues \
+                         WHERE status = ? AND assignee IS NOT NULL AND assignee != ''",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(key) = row.get(0).and_then(SqliteValue::as_text) {
+                            keys.insert(key.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKind::Actor
+                | CapacityScopeKind::Harness
+                | CapacityScopeKind::Session => {
+                    let column = match scope_kind {
+                        CapacityScopeKind::Actor => "actor",
+                        CapacityScopeKind::Harness => "harness",
+                        _ => "session",
+                    };
+                    let sql = format!(
+                        "SELECT DISTINCT o.{column} FROM capacity_occupancy o \
+                         JOIN issues i ON i.id = o.issue_id \
+                         WHERE i.status = ? AND o.{column} IS NOT NULL"
+                    );
+                    let rows =
+                        conn.query_with_params(&sql, &[SqliteValue::from(canonical.as_str())])?;
+                    for row in &rows {
+                        if let Some(key) = row.get(0).and_then(SqliteValue::as_text) {
+                            keys.insert(key.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKind::Subtree => {
+                    let Some(index) = subtree else {
+                        continue;
+                    };
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ?",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            keys.insert(index.root_of(id));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(keys.into_iter().collect())
     }
 
     /// Record who moved an issue into its current status, inside the same
@@ -18931,6 +19236,34 @@ mod tests {
         assert_eq!(text(1).as_deref(), Some("agent-7"));
         assert_eq!(text(2).as_deref(), Some("swarm-h1"));
         assert_eq!(text(3).as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn workflow_capacity_same_status_update_does_not_affect_capacity() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-same-1", "held", Status::InProgress, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+
+        // The status is already at its hard limit; a same-status update must
+        // not be treated as a new admission.
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            title: Some("still held".to_string()),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-same-1", &update, "tester")
+            .expect("same-status updates do not consume capacity");
+        assert_eq!(
+            storage.get_issue("bd-same-1").unwrap().unwrap().title,
+            "still held"
+        );
     }
 
     #[test]
