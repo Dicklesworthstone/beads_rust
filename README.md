@@ -716,9 +716,34 @@ capacity evidence reports `counting_mode` plus `aggregate_parents_excluded`.
 children (`{"status": "in_progress", "descendants": {...}}`), letting an epic
 stay `open` while reporting that its subtree has started.
 
-The current enforcement layer uses repository scope. Audited exemptions,
-additional actor/harness/session/subtree scopes, and capacity observability
-remain subsequent phases of GitHub issue #384.
+Audited issue-specific **capacity exemptions** let one named issue occupy one
+named capacity without consuming a slot — the escape hatch for a long-lived
+external blocker that legitimately stays in a limited status:
+
+```yaml
+workflow:
+  capacity:
+    exemptions:
+      providers: [operator]     # who may grant; empty disables granting
+      require_expiry: true      # optional: every grant must carry an expiry
+```
+
+```bash
+br capacity exempt br-abc --status blocked \
+  --provider operator \
+  --reason "Awaiting an external regulatory decision" \
+  --expires 2026-08-15
+```
+
+Grants, renewals, revocations, and observed expirations are all recorded in an
+append-only audit table. Exempt issues stay visible in queue metrics, capacity
+evidence reports counted and exempt totals separately, leaving the applicable
+status ends the exemption, and expired exemptions count again. See
+`docs/CLI_REFERENCE.md` (the `capacity` command) for full semantics.
+
+The current enforcement layer uses repository scope. Additional
+actor/harness/session/subtree scopes and capacity observability remain
+subsequent phases of GitHub issue #384.
 
 ### Environment Variables
 

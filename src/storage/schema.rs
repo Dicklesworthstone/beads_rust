@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+pub const CURRENT_SCHEMA_VERSION: i32 = 16;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -309,6 +309,47 @@ pub const SCHEMA_SQL: &str = r"
         ON gate_result_history(issue_id, id);
     CREATE INDEX IF NOT EXISTS idx_gate_result_history_scope
         ON gate_result_history(issue_id, from_status, to_status, status_revision, id);
+
+    -- Audited issue-specific capacity exemptions (GitHub #384 phase 4).
+    -- One row per (issue, capacity): the latest exemption state. Like
+    -- gate_results, project-local auxiliary metadata — never synced to
+    -- JSONL. A re-grant replaces the state row; the append-only history
+    -- table below preserves every action.
+    CREATE TABLE IF NOT EXISTS capacity_exemptions (
+        issue_id TEXT NOT NULL,
+        capacity_kind TEXT NOT NULL,
+        capacity_name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        granted_by TEXT NOT NULL,
+        granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME,
+        ended_at DATETIME,
+        ended_action TEXT,
+        ended_by TEXT,
+        PRIMARY KEY (issue_id, capacity_kind, capacity_name),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_capacity_exemptions_capacity
+        ON capacity_exemptions(capacity_kind, capacity_name);
+
+    -- Append-only capacity-exemption audit history: grant, renew, revoke,
+    -- expire, and left_status actions with actor/provider attribution.
+    CREATE TABLE IF NOT EXISTS capacity_exemption_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        capacity_kind TEXT NOT NULL,
+        capacity_name TEXT NOT NULL,
+        action TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        reason TEXT,
+        actor TEXT NOT NULL,
+        expires_at DATETIME,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
+        ON capacity_exemption_history(issue_id, id);
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1702,6 +1743,53 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         )?;
     }
 
+    // v16 (GitHub #384 phase 4): audited issue-specific capacity exemptions.
+    // A state table holds the latest exemption per (issue, capacity); an
+    // append-only history table preserves every grant/renew/revoke/expire/
+    // left_status action. Pure additive — new tables only, no row rewrites.
+    if user_version < 16 {
+        tracing::info!(
+            "Migrating database to schema version 16 (capacity exemptions - GitHub #384 phase 4)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS capacity_exemptions (
+                issue_id TEXT NOT NULL,
+                capacity_kind TEXT NOT NULL,
+                capacity_name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                granted_by TEXT NOT NULL,
+                granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME,
+                ended_at DATETIME,
+                ended_action TEXT,
+                ended_by TEXT,
+                PRIMARY KEY (issue_id, capacity_kind, capacity_name),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capacity_exemptions_capacity
+                ON capacity_exemptions(capacity_kind, capacity_name);
+            CREATE TABLE IF NOT EXISTS capacity_exemption_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                capacity_kind TEXT NOT NULL,
+                capacity_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                reason TEXT,
+                actor TEXT NOT NULL,
+                expires_at DATETIME,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
+                ON capacity_exemption_history(issue_id, id);
+        ",
+        )?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -2291,6 +2379,59 @@ mod tests {
             Some(1),
             "migration must preserve legacy results for audit display"
         );
+    }
+
+    #[test]
+    fn test_v16_adds_capacity_exemption_tables() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP TABLE capacity_exemption_history")
+            .unwrap();
+        conn.execute("DROP TABLE capacity_exemptions").unwrap();
+        conn.execute("PRAGMA user_version = 15").unwrap();
+
+        run_migrations(&conn, false).expect("v16 migration should succeed");
+
+        assert!(table_exists(&conn, "capacity_exemptions"));
+        for column in [
+            "issue_id",
+            "capacity_kind",
+            "capacity_name",
+            "provider",
+            "reason",
+            "granted_by",
+            "granted_at",
+            "expires_at",
+            "ended_at",
+            "ended_action",
+            "ended_by",
+        ] {
+            assert!(
+                column_exists(&conn, "capacity_exemptions", column),
+                "v16 migration missing capacity_exemptions.{column}"
+            );
+        }
+        assert!(table_exists(&conn, "capacity_exemption_history"));
+        for column in [
+            "id",
+            "issue_id",
+            "capacity_kind",
+            "capacity_name",
+            "action",
+            "provider",
+            "reason",
+            "actor",
+            "expires_at",
+            "recorded_at",
+        ] {
+            assert!(
+                column_exists(&conn, "capacity_exemption_history", column),
+                "v16 migration missing capacity_exemption_history.{column}"
+            );
+        }
     }
 
     /// Regression for beads_rust#290: legacy DBs that pre-date the

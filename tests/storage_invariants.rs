@@ -54,6 +54,8 @@ fn schema_tables_and_columns_exist() {
         "close_metadata",
         "gate_result_history",
         "gate_results",
+        "capacity_exemptions",
+        "capacity_exemption_history",
     ] {
         assert!(tables.contains(table), "missing table: {table}");
     }
@@ -95,6 +97,45 @@ fn schema_tables_and_columns_exist() {
         assert!(
             gate_history_columns.contains(column),
             "missing gate_result_history.{column}"
+        );
+    }
+
+    let exemption_columns = column_names(&conn, "capacity_exemptions");
+    for column in [
+        "issue_id",
+        "capacity_kind",
+        "capacity_name",
+        "provider",
+        "reason",
+        "granted_by",
+        "granted_at",
+        "expires_at",
+        "ended_at",
+        "ended_action",
+        "ended_by",
+    ] {
+        assert!(
+            exemption_columns.contains(column),
+            "missing capacity_exemptions.{column}"
+        );
+    }
+
+    let exemption_history_columns = column_names(&conn, "capacity_exemption_history");
+    for column in [
+        "id",
+        "issue_id",
+        "capacity_kind",
+        "capacity_name",
+        "action",
+        "provider",
+        "reason",
+        "actor",
+        "expires_at",
+        "recorded_at",
+    ] {
+        assert!(
+            exemption_history_columns.contains(column),
+            "missing capacity_exemption_history.{column}"
         );
     }
 }

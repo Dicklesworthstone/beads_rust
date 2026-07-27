@@ -14,6 +14,7 @@ pub mod agents;
 pub mod audit;
 pub mod blocked;
 pub mod capabilities;
+pub mod capacity;
 pub mod changelog;
 pub mod close;
 pub mod comments;

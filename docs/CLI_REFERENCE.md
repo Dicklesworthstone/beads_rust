@@ -35,6 +35,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
   - [gate](#gate)
+  - [capacity](#capacity)
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
@@ -620,9 +621,13 @@ workflow:
   be committed if a later route fails and cross-repository atomicity is
   intentionally not claimed.
 - Omitting `workflow.capacity` preserves existing behavior exactly.
-- The current enforcement layer has fixed `repository` scope. Audited
-  exemptions, actor/assignee/harness/session/subtree scopes, and capacity
-  observability are later phases tracked in GitHub issue #384.
+- Audited issue-specific exemptions (`br capacity exempt`, see
+  [capacity](#capacity)) let a named issue enter a named capacity without
+  consuming a slot; evidence then reports counted and exempt totals
+  separately.
+- The current enforcement layer has fixed `repository` scope. Additional
+  actor/assignee/harness/session/subtree scopes and capacity observability
+  are later phases tracked in GitHub issue #384.
 
 **Hierarchy-aware counting (`workflow.capacity.counting`):**
 
@@ -1195,6 +1200,78 @@ mutation share one transaction, and a failed item rolls back the entire
 repository-local batch. Supply comments with `update`, `close`, `defer`, and
 `undefer` via `--transition-comment`; `reopen --reason` and
 `epic close-eligible --transition-comment` use the same atomic path.
+
+---
+
+### capacity
+
+Audited issue-specific capacity exemptions (GitHub #384 phase 4). A
+long-lived external blocker may legitimately remain in a limited status;
+an exemption lets that one issue occupy one named capacity without
+consuming a slot, while staying visible in queue metrics. Exemption records
+are project-local metadata (like gate results) and are not synced through
+JSONL.
+
+```bash
+br capacity exempt <ID> --status <NAME>|--group <NAME> --provider <P> --reason <TEXT> [--expires <WHEN>]
+br capacity renew <ID> --status <NAME>|--group <NAME> --provider <P> [--expires <WHEN>] [--reason <TEXT>]
+br capacity revoke <ID> --status <NAME>|--group <NAME> --provider <P> [--reason <TEXT>]
+br capacity exemptions [<ID>] [--history]
+```
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `exempt <ID>` | Grant an exemption: one issue, one named capacity. Requires an authorized `--provider` and a non-empty `--reason`. |
+| `renew <ID>` | Extend an active exemption's expiry. Expired or ended exemptions cannot be renewed — grant a new one so the audit trail shows the gap. |
+| `revoke <ID>` | Withdraw an active exemption. Deliberately not provider-gated so cleanup stays possible after policy edits; provider and actor are still recorded. |
+| `exemptions [<ID>]` | List exemption state (`active`, `expired`, `revoked`, `left_status`) and, with `--history`, the append-only audit trail. |
+
+**Common options:**
+| Option | Description |
+|--------|-------------|
+| `--status <NAME>` | The named status capacity (a status with a configured limit, or one observed by an admission rule) |
+| `--group <NAME>` | The named capacity group from `workflow.capacity.groups` |
+| `--provider <NAME>` | Approving provider; grants/renewals require it to be listed in policy |
+| `--reason <TEXT>` | Rationale recorded with the action (mandatory for grants) |
+| `--expires <WHEN>` | Expiry: RFC3339, `YYYY-MM-DD`, or relative (`+7d`) |
+| `--robot` | Machine-readable JSON output |
+
+Authorization lives in `.beads/policy.yaml`:
+
+```yaml
+workflow:
+  statuses: [open, in_progress, blocked, closed]
+  capacity:
+    statuses:
+      blocked:
+        hard: 12
+    exemptions:
+      providers: [operator]     # empty/absent disables granting entirely
+      require_expiry: true      # optional: every grant must carry an expiry
+      max_ttl_seconds: 1209600  # optional: cap the expiry horizon
+```
+
+Semantics:
+
+- An active, authorized exemption removes its issue from the named
+  capacity's counted total everywhere that capacity is measured — its own
+  limit and any admission rule observing the same status or group. Evidence
+  and warnings then carry a separate `exempt` total alongside
+  `current`/`prospective` (and `aggregate_parents_excluded` under hierarchy
+  counting, where an exempted issue still suppresses its ancestors, so an
+  exemption can only lower a count, never raise one).
+- Leaving the applicable status set ends the exemption in the same
+  transaction, with an audited `left_status` record; re-entry needs a new
+  grant.
+- Expired exemptions count again immediately; the audited `expire` record
+  is written by the first committed observation.
+- Removing a provider from `exemptions.providers` withdraws the effect of
+  every exemption it granted without rewriting audit history; re-listing
+  the provider restores them.
+- Ordinary labels can never grant an exemption, and grant/renew/revoke/
+  expire actions all land in the append-only `capacity_exemption_history`
+  audit table.
 
 ---
 

@@ -391,6 +391,9 @@ fn main() {
             }
         }
         Commands::Gate { command } => commands::gate::execute(&command, &overrides, &output_ctx),
+        Commands::Capacity { command } => {
+            commands::capacity::execute(&command, &overrides, &output_ctx)
+        }
         Commands::Label { command } => {
             if let Some(res) = storage_result.as_ref() {
                 match commands::label::execute_with_storage(
@@ -981,6 +984,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Label { .. }
         | Commands::Epic { .. }
         | Commands::Gate { .. }
+        | Commands::Capacity { .. }
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }

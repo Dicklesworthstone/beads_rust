@@ -88,6 +88,7 @@ struct CapacityViolationEvidence<'a> {
     name: &'a str,
     counting_mode: &'static str,
     aggregate_parents_excluded: Option<u32>,
+    exempt: Option<u32>,
     current: u32,
     prospective: u32,
     soft_limit: Option<u32>,
@@ -102,6 +103,7 @@ struct CapacityWarningEvidence<'a> {
     name: &'a str,
     counting_mode: &'static str,
     aggregate_parents_excluded: Option<u32>,
+    exempt: Option<u32>,
     current: u32,
     prospective: u32,
     soft_limit: u32,
@@ -129,6 +131,40 @@ struct CapacityCountPair {
     /// Prospective active issues excluded as hierarchy aggregates
     /// (`leaf_work`/`roots` only).
     aggregate_parents_excluded: Option<u32>,
+    /// Prospective occupancy excluded because the issues hold active,
+    /// authorized exemptions for this capacity (GitHub #384 phase 4).
+    /// `None` when no exemption affected the numbers.
+    exempt: Option<u32>,
+}
+
+/// Active, authorized capacity exemptions loaded once per enforcement call
+/// (GitHub #384 phase 4).
+///
+/// Only exemptions that are unended, unexpired, and whose granting provider
+/// is still listed in `workflow.capacity.exemptions.providers` participate:
+/// removing a provider from policy silently withdraws its grants without
+/// rewriting audit history. The exempted issues' statuses are captured here
+/// so `all`-mode counting can subtract them without loading the full issue
+/// set.
+#[derive(Debug, Default)]
+struct CapacityExemptionIndex {
+    /// `(kind, canonical capacity name)` -> issue ids holding an active,
+    /// authorized exemption for that capacity.
+    by_capacity: HashMap<(String, String), HashSet<String>>,
+    /// Actual status (trimmed, lowercased) of every exempted issue.
+    status_of: HashMap<String, String>,
+}
+
+impl CapacityExemptionIndex {
+    /// The exempted issue ids for one capacity identity, if any.
+    fn exempt_ids(&self, kind: &str, canonical_name: &str) -> Option<&HashSet<String>> {
+        if self.by_capacity.is_empty() {
+            return None;
+        }
+        self.by_capacity
+            .get(&(kind.to_string(), canonical_name.to_string()))
+            .filter(|ids| !ids.is_empty())
+    }
 }
 
 /// Transaction-scoped counting engine for workflow capacity (GitHub #384
@@ -147,11 +183,13 @@ struct CapacityCountEngine<'a> {
     conn: &'a Connection,
     counting: &'a crate::close_policy::CapacityCounting,
     transitions: &'a [CapacityBatchTransition],
+    /// Active, authorized exemptions consulted per capacity identity.
+    exemptions: &'a CapacityExemptionIndex,
     /// Mode `all`: memoized per-status `COUNT(*)` results.
     status_counts: HashMap<String, u32>,
     /// Hierarchy modes: lazily loaded graph snapshot.
     hierarchy: Option<CapacityHierarchyState>,
-    /// Hierarchy modes: memoized results per canonical status set.
+    /// Memoized results per capacity identity + canonical status set.
     memo: HashMap<String, CapacityCountPair>,
 }
 
@@ -160,11 +198,13 @@ impl<'a> CapacityCountEngine<'a> {
         conn: &'a Connection,
         counting: &'a crate::close_policy::CapacityCounting,
         transitions: &'a [CapacityBatchTransition],
+        exemptions: &'a CapacityExemptionIndex,
     ) -> Self {
         Self {
             conn,
             counting,
             transitions,
+            exemptions,
             status_counts: HashMap::new(),
             hierarchy: None,
             memo: HashMap::new(),
@@ -179,36 +219,132 @@ impl<'a> CapacityCountEngine<'a> {
         self.counting.hierarchy.as_str()
     }
 
-    /// Current and prospective occupancy for one capacity's status set.
-    fn counts(&mut self, statuses: &[String]) -> Result<CapacityCountPair> {
-        use crate::close_policy::CapacityCountingMode;
-
-        if matches!(self.counting.hierarchy, CapacityCountingMode::All) {
-            let current = SqliteStorage::count_capacity_statuses_in_tx(
-                self.conn,
-                &mut self.status_counts,
-                statuses,
-            )?;
-            let prospective = SqliteStorage::batch_prospective_capacity_count(
-                current,
-                statuses,
-                self.transitions,
-            )?;
-            return Ok(CapacityCountPair {
-                current,
-                prospective,
-                aggregate_parents_excluded: None,
-            });
+    /// Prospective status of one exempted issue: the batch transition's
+    /// target when the issue transitions in this batch, else its actual
+    /// status from the index snapshot.
+    fn exempt_prospective_status(&self, issue_id: &str) -> Option<String> {
+        if let Some(transition) = self
+            .transitions
+            .iter()
+            .find(|transition| transition.issue_id == issue_id)
+        {
+            return Some(transition.to.trim().to_lowercase());
         }
+        self.exemptions.status_of.get(issue_id).cloned()
+    }
+
+    /// Occupancy for one capacity under mode `all` with exemptions applied:
+    /// exempted issues are subtracted from the current count and their
+    /// transitions never move the counted total.
+    fn all_mode_counts_with_exemptions(
+        &mut self,
+        canonical: &BTreeSet<String>,
+        statuses: &[String],
+        exempt_ids: &HashSet<String>,
+    ) -> Result<CapacityCountPair> {
+        let raw_current = SqliteStorage::count_capacity_statuses_in_tx(
+            self.conn,
+            &mut self.status_counts,
+            statuses,
+        )?;
+        let exempt_current = u32::try_from(
+            exempt_ids
+                .iter()
+                .filter(|id| {
+                    self.exemptions
+                        .status_of
+                        .get(id.as_str())
+                        .is_some_and(|status| canonical.contains(status.as_str()))
+                })
+                .count(),
+        )
+        .map_err(|_| BeadsError::internal("workflow capacity exempt count overflowed u32"))?;
+        let current = raw_current.saturating_sub(exempt_current);
+
+        let mut prospective = i64::from(current);
+        for transition in self.transitions {
+            if exempt_ids.contains(&transition.issue_id) {
+                continue;
+            }
+            if SqliteStorage::transition_enters_capacity(transition, statuses) {
+                prospective += 1;
+            } else if SqliteStorage::transition_drains_capacity(transition, statuses) {
+                prospective -= 1;
+            }
+        }
+        let prospective = u32::try_from(prospective).map_err(|_| {
+            BeadsError::internal(format!(
+                "invalid prospective workflow capacity count {prospective}"
+            ))
+        })?;
+
+        let exempt_prospective = u32::try_from(
+            exempt_ids
+                .iter()
+                .filter(|id| {
+                    self.exempt_prospective_status(id)
+                        .is_some_and(|status| canonical.contains(status.as_str()))
+                })
+                .count(),
+        )
+        .map_err(|_| BeadsError::internal("workflow capacity exempt count overflowed u32"))?;
+
+        Ok(CapacityCountPair {
+            current,
+            prospective,
+            aggregate_parents_excluded: None,
+            exempt: (exempt_prospective > 0).then_some(exempt_prospective),
+        })
+    }
+
+    /// Current and prospective occupancy for one named capacity's status
+    /// set. `kind`/`name` identify the capacity so issue-specific
+    /// exemptions scoped to it can be applied.
+    fn counts(&mut self, kind: &str, name: &str, statuses: &[String]) -> Result<CapacityCountPair> {
+        use crate::close_policy::CapacityCountingMode;
 
         let canonical: BTreeSet<String> = statuses
             .iter()
             .map(|status| status.trim().to_lowercase())
             .filter(|status| !status.is_empty())
             .collect();
-        let key = canonical.iter().cloned().collect::<Vec<_>>().join("\u{1}");
+        let canonical_name = name.trim().to_lowercase();
+        let key = format!(
+            "{kind}\u{1}{canonical_name}\u{1}{}",
+            canonical.iter().cloned().collect::<Vec<_>>().join("\u{1}")
+        );
         if let Some(pair) = self.memo.get(&key) {
             return Ok(*pair);
+        }
+        let exempt_ids = self
+            .exemptions
+            .exempt_ids(kind, &canonical_name)
+            .cloned()
+            .unwrap_or_default();
+
+        if matches!(self.counting.hierarchy, CapacityCountingMode::All) {
+            let pair = if exempt_ids.is_empty() {
+                let current = SqliteStorage::count_capacity_statuses_in_tx(
+                    self.conn,
+                    &mut self.status_counts,
+                    statuses,
+                )?;
+                let prospective = SqliteStorage::batch_prospective_capacity_count(
+                    current,
+                    statuses,
+                    self.transitions,
+                )?;
+                CapacityCountPair {
+                    current,
+                    prospective,
+                    aggregate_parents_excluded: None,
+                    exempt: None,
+                }
+            } else {
+                self.all_mode_counts_with_exemptions(&canonical, statuses, &exempt_ids)?
+            };
+            self.memo.insert(key, pair);
+            return Ok(pair);
         }
 
         if self.hierarchy.is_none() {
@@ -227,32 +363,41 @@ impl<'a> CapacityCountEngine<'a> {
                 ));
             }
             CapacityCountingMode::Weighted => {
-                let current = state.weighted_count(
+                let (current, _) = state.weighted_count(
                     &canonical,
                     &state.actual_status,
                     &state.actual_type,
                     &self.counting.weights,
+                    &exempt_ids,
                 )?;
-                let prospective = state.weighted_count(
+                let (prospective, exempt_prospective) = state.weighted_count(
                     &canonical,
                     &state.prospective_status,
                     &state.prospective_type,
                     &self.counting.weights,
+                    &exempt_ids,
                 )?;
                 CapacityCountPair {
                     current,
                     prospective,
                     aggregate_parents_excluded: None,
+                    exempt: (exempt_prospective > 0).then_some(exempt_prospective),
                 }
             }
             mode @ (CapacityCountingMode::LeafWork | CapacityCountingMode::Roots) => {
-                let (current, _) = state.hierarchy_count(&canonical, &state.actual_status, mode)?;
-                let (prospective, excluded) =
-                    state.hierarchy_count(&canonical, &state.prospective_status, mode)?;
+                let (current, _, _) =
+                    state.hierarchy_count(&canonical, &state.actual_status, mode, &exempt_ids)?;
+                let (prospective, excluded, exempt_prospective) = state.hierarchy_count(
+                    &canonical,
+                    &state.prospective_status,
+                    mode,
+                    &exempt_ids,
+                )?;
                 CapacityCountPair {
                     current,
                     prospective,
                     aggregate_parents_excluded: Some(excluded),
+                    exempt: (exempt_prospective > 0).then_some(exempt_prospective),
                 }
             }
         };
@@ -483,35 +628,45 @@ impl CapacityHierarchyState {
 
     /// Count occupancy for one status set under `leaf_work` or `roots`.
     ///
-    /// Returns `(counted, aggregate_excluded)` where `aggregate_excluded`
+    /// Returns `(counted, aggregate_excluded, exempt)`. `aggregate_excluded`
     /// is the number of active issues that did not count because a
     /// relative in the same capacity already covers their work stream.
+    /// `exempt` is the number of active issues in counting components that
+    /// were excluded by an issue-specific exemption (GitHub #384 phase 4).
+    /// Exempted issues stay *active* for suppression purposes — an
+    /// exemption can therefore never raise a count, only lower it.
     fn hierarchy_count(
         &self,
         statuses: &BTreeSet<String>,
         status_of: &[String],
         mode: crate::close_policy::CapacityCountingMode,
-    ) -> Result<(u32, u32)> {
+        exempt_ids: &HashSet<String>,
+    ) -> Result<(u32, u32, u32)> {
         use crate::close_policy::CapacityCountingMode;
 
         let comp_count = self.comp_members.len();
         let mut active_members = vec![0u64; comp_count];
+        let mut exempt_members = vec![0u64; comp_count];
         let mut total_active = 0u64;
         for (comp, members) in self.comp_members.iter().enumerate() {
             for &member in members {
                 if statuses.contains(status_of[member].as_str()) {
                     active_members[comp] += 1;
                     total_active += 1;
+                    if exempt_ids.contains(self.ids[member].as_str()) {
+                        exempt_members[comp] += 1;
+                    }
                 }
             }
         }
 
-        let counted: u64 = match mode {
+        let (counted, exempt): (u64, u64) = match mode {
             CapacityCountingMode::LeafWork => {
                 // Emission order puts descendant components first, so every
                 // child flag is final before its parent is examined.
                 let mut has_active_descendant = vec![false; comp_count];
                 let mut counted = 0u64;
+                let mut exempt = 0u64;
                 for comp in 0..comp_count {
                     for &child in &self.comp_children[comp] {
                         if active_members[child] > 0 || has_active_descendant[child] {
@@ -520,10 +675,11 @@ impl CapacityHierarchyState {
                         }
                     }
                     if active_members[comp] > 0 && !has_active_descendant[comp] {
-                        counted += active_members[comp];
+                        counted += active_members[comp] - exempt_members[comp];
+                        exempt += exempt_members[comp];
                     }
                 }
-                counted
+                (counted, exempt)
             }
             CapacityCountingMode::Roots => {
                 // Reverse emission order puts ancestor components first, so
@@ -537,12 +693,14 @@ impl CapacityHierarchyState {
                     }
                 }
                 let mut counted = 0u64;
+                let mut exempt = 0u64;
                 for comp in 0..comp_count {
                     if active_members[comp] > 0 && !has_active_ancestor[comp] {
-                        counted += active_members[comp];
+                        counted += active_members[comp] - exempt_members[comp];
+                        exempt += exempt_members[comp];
                     }
                 }
-                counted
+                (counted, exempt)
             }
             CapacityCountingMode::All | CapacityCountingMode::Weighted => {
                 return Err(BeadsError::internal(
@@ -554,29 +712,44 @@ impl CapacityHierarchyState {
         let counted = u32::try_from(counted).map_err(|_| {
             BeadsError::internal("workflow capacity hierarchy count overflowed u32")
         })?;
+        let exempt = u32::try_from(exempt)
+            .map_err(|_| BeadsError::internal("workflow capacity exempt count overflowed u32"))?;
         let excluded =
-            u32::try_from(total_active.saturating_sub(u64::from(counted))).map_err(|_| {
-                BeadsError::internal("workflow capacity aggregate exclusion overflowed u32")
-            })?;
-        Ok((counted, excluded))
+            u32::try_from(total_active.saturating_sub(u64::from(counted) + u64::from(exempt)))
+                .map_err(|_| {
+                    BeadsError::internal("workflow capacity aggregate exclusion overflowed u32")
+                })?;
+        Ok((counted, excluded, exempt))
     }
 
-    /// Sum explicit weights over the active issues of one status set.
+    /// Sum explicit weights over the active issues of one status set,
+    /// splitting exempted issues' weights into a separate total.
     fn weighted_count(
         &self,
         statuses: &BTreeSet<String>,
         status_of: &[String],
         type_of: &[String],
         weights: &crate::close_policy::CapacityWeights,
-    ) -> Result<u32> {
+        exempt_ids: &HashSet<String>,
+    ) -> Result<(u32, u32)> {
         let mut total = 0u64;
+        let mut exempt = 0u64;
         for index in 0..self.ids.len() {
             if statuses.contains(status_of[index].as_str()) {
-                total += u64::from(weights.weight_for(&self.ids[index], &type_of[index]));
+                let weight = u64::from(weights.weight_for(&self.ids[index], &type_of[index]));
+                if exempt_ids.contains(self.ids[index].as_str()) {
+                    exempt += weight;
+                } else {
+                    total += weight;
+                }
             }
         }
-        u32::try_from(total)
-            .map_err(|_| BeadsError::internal("workflow capacity weighted count overflowed u32"))
+        let total = u32::try_from(total)
+            .map_err(|_| BeadsError::internal("workflow capacity weighted count overflowed u32"))?;
+        let exempt = u32::try_from(exempt).map_err(|_| {
+            BeadsError::internal("workflow capacity exempt weight total overflowed u32")
+        })?;
+        Ok((total, exempt))
     }
 }
 
@@ -1698,6 +1871,8 @@ impl SqliteStorage {
             DROP TABLE IF EXISTS dependencies;
             DROP TABLE IF EXISTS gate_result_history;
             DROP TABLE IF EXISTS gate_results;
+            DROP TABLE IF EXISTS capacity_exemption_history;
+            DROP TABLE IF EXISTS capacity_exemptions;
             DROP TABLE IF EXISTS close_metadata;
             DROP TABLE IF EXISTS issues;
             ",
@@ -1866,6 +2041,8 @@ impl SqliteStorage {
             ("close_metadata", "issue_id"),
             ("gate_result_history", "issue_id"),
             ("gate_results", "issue_id"),
+            ("capacity_exemption_history", "issue_id"),
+            ("capacity_exemptions", "issue_id"),
         ];
         if !ALLOWED_PAIRS.contains(&(table, column)) {
             return Err(crate::error::BeadsError::Config(format!(
@@ -1906,6 +2083,8 @@ impl SqliteStorage {
             ("close_metadata", "issue_id"),
             ("gate_result_history", "issue_id"),
             ("gate_results", "issue_id"),
+            ("capacity_exemption_history", "issue_id"),
+            ("capacity_exemptions", "issue_id"),
         ];
 
         let mut violations = Vec::new();
@@ -2825,6 +3004,784 @@ impl SqliteStorage {
             .collect())
     }
 
+    /// Validate one grant/renew request against the installed capacity
+    /// policy and return the canonical `(kind, name)` pair to store.
+    ///
+    /// GitHub #384: "Unauthorized, expired, or reasonless exemptions fail" —
+    /// the checks here are the grant-time half; enforcement re-filters by
+    /// provider so a later policy edit withdraws recorded grants too.
+    fn validate_capacity_exemption_request(
+        &self,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<(String, String)> {
+        let policy = &self.workflow_capacity_policy;
+        if !policy.exemptions.is_enabled() {
+            return Err(BeadsError::validation(
+                "workflow.capacity.exemptions",
+                "capacity exemptions are not enabled: list authorized providers under \
+                 workflow.capacity.exemptions.providers in .beads/policy.yaml",
+            ));
+        }
+        let provider = provider.trim();
+        if !policy.exemptions.authorizes(provider) {
+            return Err(BeadsError::validation(
+                "provider",
+                format!(
+                    "provider '{provider}' is not authorized to manage capacity exemptions; \
+                     authorized providers: {}",
+                    policy.exemptions.providers.join(", ")
+                ),
+            ));
+        }
+        let kind = capacity_kind.trim().to_lowercase();
+        let name = capacity_name.trim().to_lowercase();
+        if name.is_empty() {
+            return Err(BeadsError::validation(
+                "capacity",
+                "capacity name must not be empty",
+            ));
+        }
+        match kind.as_str() {
+            "status" => {
+                let named_by_limit = policy
+                    .statuses
+                    .keys()
+                    .any(|status| status.trim().eq_ignore_ascii_case(&name));
+                let named_by_admission = policy.admission.iter().any(|rule| {
+                    rule.require_below
+                        .statuses
+                        .keys()
+                        .any(|status| status.trim().eq_ignore_ascii_case(&name))
+                });
+                if !named_by_limit && !named_by_admission {
+                    return Err(BeadsError::validation(
+                        "capacity",
+                        format!(
+                            "status '{name}' has no configured capacity limit and is not \
+                             observed by any admission rule; an exemption from it would \
+                             have no effect"
+                        ),
+                    ));
+                }
+            }
+            "group" => {
+                if Self::capacity_group(policy, &name).is_none() {
+                    return Err(BeadsError::validation(
+                        "capacity",
+                        format!(
+                            "capacity group '{name}' is not configured in workflow.capacity.groups"
+                        ),
+                    ));
+                }
+            }
+            other => {
+                return Err(BeadsError::validation(
+                    "capacity",
+                    format!("capacity kind '{other}' must be 'status' or 'group'"),
+                ));
+            }
+        }
+        if policy.exemptions.require_expiry && expires_at.is_none() {
+            return Err(BeadsError::validation(
+                "expires",
+                "policy requires every capacity exemption to carry an expiration \
+                 (workflow.capacity.exemptions.require_expiry)",
+            ));
+        }
+        if let Some(expiry) = expires_at {
+            let now = Utc::now();
+            if expiry <= now {
+                return Err(BeadsError::validation(
+                    "expires",
+                    "capacity exemption expiry must be in the future",
+                ));
+            }
+            if let Some(max_ttl) = policy.exemptions.max_ttl_seconds {
+                let horizon =
+                    now + chrono::Duration::seconds(i64::try_from(max_ttl).unwrap_or(i64::MAX));
+                if expiry > horizon {
+                    return Err(BeadsError::validation(
+                        "expires",
+                        format!(
+                            "capacity exemption expiry exceeds the policy maximum of \
+                             {max_ttl} seconds from now \
+                             (workflow.capacity.exemptions.max_ttl_seconds)"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok((kind, name))
+    }
+
+    /// Read the state row for one `(issue, capacity)` exemption and derive
+    /// its display state at `now`. Listing never mutates: expiry is only
+    /// *marked* inside enforcement and mutating exemption commands.
+    fn capacity_exemption_record_from_conn(
+        conn: &Connection,
+        issue_id: &str,
+        kind: &str,
+        name: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<crate::close_policy::CapacityExemptionRecord>> {
+        let rows = conn.query_with_params(
+            "SELECT issue_id, capacity_kind, capacity_name, provider, reason,
+                    granted_by, granted_at, expires_at, ended_at, ended_action, ended_by
+             FROM capacity_exemptions
+             WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(kind),
+                SqliteValue::from(name),
+            ],
+        )?;
+        Ok(rows
+            .first()
+            .and_then(|row| Self::capacity_exemption_record_from_row(row, now)))
+    }
+
+    fn capacity_exemption_record_from_row(
+        row: &fsqlite::Row,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<crate::close_policy::CapacityExemptionRecord> {
+        let text = |index: usize| {
+            row.get(index)
+                .and_then(SqliteValue::as_text)
+                .map(String::from)
+        };
+        let expires_at = text(7);
+        let ended_action = text(9);
+        let state = ended_action.as_deref().map_or_else(
+            || {
+                let has_expired = expires_at.as_deref().is_some_and(|raw| {
+                    chrono::DateTime::parse_from_rfc3339(raw)
+                        .map_or(true, |dt| dt.with_timezone(&Utc) <= now)
+                });
+                if has_expired { "expired" } else { "active" }.to_string()
+            },
+            |action| match action {
+                "revoked" | "expired" | "left_status" => action.to_string(),
+                other => other.to_string(),
+            },
+        );
+        Some(crate::close_policy::CapacityExemptionRecord {
+            issue_id: text(0)?,
+            capacity_kind: text(1)?,
+            capacity_name: text(2)?,
+            provider: text(3)?,
+            reason: text(4).unwrap_or_default(),
+            granted_by: text(5).unwrap_or_default(),
+            granted_at: text(6).unwrap_or_default(),
+            expires_at,
+            ended_at: text(8),
+            ended_action,
+            ended_by: text(10),
+            state,
+        })
+    }
+
+    /// Grant (or re-grant) an audited issue-specific capacity exemption
+    /// (GitHub #384 phase 4). A re-grant replaces the state row; every
+    /// action lands in the append-only history table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when exemptions are disabled, the
+    /// provider is unauthorized, the capacity is not configured, the reason
+    /// is empty, or the expiry violates policy; `IssueNotFound` when the
+    /// issue does not exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_capacity_exemption(
+        &self,
+        issue_id: &str,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        reason: &str,
+        expires_at: Option<chrono::DateTime<Utc>>,
+        actor: &str,
+    ) -> Result<crate::close_policy::CapacityExemptionRecord> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(BeadsError::validation(
+                "reason",
+                "a capacity exemption requires a non-empty --reason",
+            ));
+        }
+        let (kind, name) = self.validate_capacity_exemption_request(
+            capacity_kind,
+            capacity_name,
+            provider,
+            expires_at,
+        )?;
+        let provider = provider.trim().to_string();
+        let expires_text = expires_at.map(|dt| dt.to_rfc3339());
+        let mut record = None;
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            if Self::get_issue_from_conn(conn, issue_id)?.is_none() {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                });
+            }
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO capacity_exemptions (
+                    issue_id, capacity_kind, capacity_name, provider, reason,
+                    granted_by, granted_at, expires_at, ended_at, ended_action, ended_by
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, NULL, NULL, NULL)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(actor),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'grant', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(actor),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            record = Self::capacity_exemption_record_from_conn(
+                conn,
+                issue_id,
+                &kind,
+                &name,
+                Utc::now(),
+            )?;
+            Ok(())
+        })?;
+        record.ok_or_else(|| {
+            BeadsError::internal("capacity exemption grant committed without a state row")
+        })
+    }
+
+    /// Renew an active exemption's expiry (GitHub #384 phase 4). An expired
+    /// or ended exemption cannot be renewed — grant a new one, so the audit
+    /// trail shows the gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the exemption is missing, ended, or
+    /// expired, or when the provider/expiry violates policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn renew_capacity_exemption(
+        &self,
+        issue_id: &str,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        reason: Option<&str>,
+        expires_at: Option<chrono::DateTime<Utc>>,
+        actor: &str,
+    ) -> Result<crate::close_policy::CapacityExemptionRecord> {
+        let (kind, name) = self.validate_capacity_exemption_request(
+            capacity_kind,
+            capacity_name,
+            provider,
+            expires_at,
+        )?;
+        let provider = provider.trim().to_string();
+        let expires_text = expires_at.map(|dt| dt.to_rfc3339());
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        let mut record = None;
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            let now = Utc::now();
+            let existing =
+                Self::capacity_exemption_record_from_conn(conn, issue_id, &kind, &name, now)?
+                    .ok_or_else(|| {
+                        BeadsError::validation(
+                            "capacity",
+                            format!(
+                                "no capacity exemption exists for {issue_id} on {kind} '{name}'; \
+                                 grant one first"
+                            ),
+                        )
+                    })?;
+            if existing.state != "active" {
+                Self::mark_capacity_exemption_expired_if_needed(conn, &existing)?;
+                return Err(BeadsError::validation(
+                    "capacity",
+                    format!(
+                        "capacity exemption for {issue_id} on {kind} '{name}' is {}; \
+                         grant a new exemption instead of renewing",
+                        existing.state
+                    ),
+                ));
+            }
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions SET provider = ?, expires_at = ?
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(provider.as_str()),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'renew', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    reason.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(actor),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            record = Self::capacity_exemption_record_from_conn(
+                conn,
+                issue_id,
+                &kind,
+                &name,
+                Utc::now(),
+            )?;
+            Ok(())
+        })?;
+        record.ok_or_else(|| {
+            BeadsError::internal("capacity exemption renewal committed without a state row")
+        })
+    }
+
+    /// Mark an observed-expired exemption ended with an audited `expire`
+    /// history record. No-op when the record is not in the derived
+    /// `expired` state or is already ended.
+    fn mark_capacity_exemption_expired_if_needed(
+        conn: &Connection,
+        record: &crate::close_policy::CapacityExemptionRecord,
+    ) -> Result<()> {
+        if record.state != "expired" || record.ended_at.is_some() {
+            return Ok(());
+        }
+        conn.execute_with_params(
+            "UPDATE capacity_exemptions
+             SET ended_at = CURRENT_TIMESTAMP, ended_action = 'expired', ended_by = 'system'
+             WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+               AND ended_at IS NULL",
+            &[
+                SqliteValue::from(record.issue_id.as_str()),
+                SqliteValue::from(record.capacity_kind.as_str()),
+                SqliteValue::from(record.capacity_name.as_str()),
+            ],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO capacity_exemption_history (
+                issue_id, capacity_kind, capacity_name, action, provider,
+                reason, actor, expires_at, recorded_at
+            ) VALUES (?, ?, ?, 'expire', ?, ?, 'system', ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(record.issue_id.as_str()),
+                SqliteValue::from(record.capacity_kind.as_str()),
+                SqliteValue::from(record.capacity_name.as_str()),
+                SqliteValue::from(record.provider.as_str()),
+                SqliteValue::from("expiration observed during exemption management"),
+                record
+                    .expires_at
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke an active exemption (GitHub #384 phase 4). Revocation is
+    /// deliberately *not* provider-gated: withdrawing privilege must stay
+    /// possible even after policy edits; the provider and actor are still
+    /// recorded for audit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the exemption is missing or already
+    /// ended/expired.
+    pub fn revoke_capacity_exemption(
+        &self,
+        issue_id: &str,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> Result<crate::close_policy::CapacityExemptionRecord> {
+        let kind = capacity_kind.trim().to_lowercase();
+        let name = capacity_name.trim().to_lowercase();
+        let provider = provider.trim().to_string();
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        let mut record = None;
+        Self::with_connection_write_transaction(&self.conn, |conn| {
+            let now = Utc::now();
+            let existing =
+                Self::capacity_exemption_record_from_conn(conn, issue_id, &kind, &name, now)?
+                    .ok_or_else(|| {
+                        BeadsError::validation(
+                            "capacity",
+                            format!(
+                                "no capacity exemption exists for {issue_id} on {kind} '{name}'"
+                            ),
+                        )
+                    })?;
+            if existing.state != "active" {
+                Self::mark_capacity_exemption_expired_if_needed(conn, &existing)?;
+                return Err(BeadsError::validation(
+                    "capacity",
+                    format!(
+                        "capacity exemption for {issue_id} on {kind} '{name}' is already {}",
+                        existing.state
+                    ),
+                ));
+            }
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions
+                 SET ended_at = CURRENT_TIMESTAMP, ended_action = 'revoked', ended_by = ?
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(actor),
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'revoke', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    reason.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(actor),
+                    existing
+                        .expires_at
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            record = Self::capacity_exemption_record_from_conn(
+                conn,
+                issue_id,
+                &kind,
+                &name,
+                Utc::now(),
+            )?;
+            Ok(())
+        })?;
+        record.ok_or_else(|| {
+            BeadsError::internal("capacity exemption revocation committed without a state row")
+        })
+    }
+
+    /// List exemption state rows, optionally restricted to one issue, with
+    /// display state derived at read time (never mutating).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_capacity_exemptions(
+        &self,
+        issue_id: Option<&str>,
+    ) -> Result<Vec<crate::close_policy::CapacityExemptionRecord>> {
+        if !crate::storage::schema::table_exists(&self.conn, "capacity_exemptions") {
+            return Ok(Vec::new());
+        }
+        let base = "SELECT issue_id, capacity_kind, capacity_name, provider, reason,
+                    granted_by, granted_at, expires_at, ended_at, ended_action, ended_by
+             FROM capacity_exemptions";
+        let rows = if let Some(issue_id) = issue_id {
+            self.conn.query_with_params(
+                &format!(
+                    "{base} WHERE issue_id = ? ORDER BY issue_id, capacity_kind, capacity_name"
+                ),
+                &[SqliteValue::from(issue_id)],
+            )?
+        } else {
+            self.conn.query(&format!(
+                "{base} ORDER BY issue_id, capacity_kind, capacity_name"
+            ))?
+        };
+        let now = Utc::now();
+        Ok(rows
+            .iter()
+            .filter_map(|row| Self::capacity_exemption_record_from_row(row, now))
+            .collect())
+    }
+
+    /// Append-only exemption history, optionally restricted to one issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_capacity_exemption_history(
+        &self,
+        issue_id: Option<&str>,
+    ) -> Result<Vec<crate::close_policy::CapacityExemptionHistoryRecord>> {
+        if !crate::storage::schema::table_exists(&self.conn, "capacity_exemption_history") {
+            return Ok(Vec::new());
+        }
+        let base = "SELECT id, issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+             FROM capacity_exemption_history";
+        let rows = if let Some(issue_id) = issue_id {
+            self.conn.query_with_params(
+                &format!("{base} WHERE issue_id = ? ORDER BY id"),
+                &[SqliteValue::from(issue_id)],
+            )?
+        } else {
+            self.conn.query(&format!("{base} ORDER BY id"))?
+        };
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let text = |index: usize| {
+                    row.get(index)
+                        .and_then(SqliteValue::as_text)
+                        .map(String::from)
+                };
+                Some(crate::close_policy::CapacityExemptionHistoryRecord {
+                    id: row.get(0).and_then(SqliteValue::as_integer)?,
+                    issue_id: text(1)?,
+                    capacity_kind: text(2)?,
+                    capacity_name: text(3)?,
+                    action: text(4)?,
+                    provider: text(5).unwrap_or_default(),
+                    reason: text(6),
+                    actor: text(7).unwrap_or_default(),
+                    expires_at: text(8),
+                    recorded_at: text(9).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// Load the active, authorized capacity exemptions consulted by one
+    /// enforcement call (GitHub #384 phase 4).
+    ///
+    /// Runs inside the caller's `BEGIN IMMEDIATE` transaction. Expired rows
+    /// observed here are marked ended and receive an append-only `expire`
+    /// history record — the audited form of "expired exemptions count
+    /// again". Rows whose provider is no longer authorized are skipped but
+    /// left untouched: re-listing the provider restores their effect.
+    fn load_capacity_exemption_index_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+    ) -> Result<CapacityExemptionIndex> {
+        if !policy.exemptions.is_enabled()
+            || !crate::storage::schema::table_exists(conn, "capacity_exemptions")
+        {
+            return Ok(CapacityExemptionIndex::default());
+        }
+        let rows = conn.query(
+            "SELECT issue_id, capacity_kind, capacity_name, provider, expires_at
+             FROM capacity_exemptions WHERE ended_at IS NULL",
+        )?;
+        let now = Utc::now();
+        let mut index = CapacityExemptionIndex::default();
+        let mut expired: Vec<(String, String, String, String, String)> = Vec::new();
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(kind) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(name) = row.get(2).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let provider = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+            let expires_at = row.get(4).and_then(SqliteValue::as_text);
+            // An unparseable expiry is treated as already expired: counting
+            // again is the fail-safe direction for a corrupt record.
+            let has_expired = expires_at.is_some_and(|raw| {
+                chrono::DateTime::parse_from_rfc3339(raw)
+                    .map_or(true, |dt| dt.with_timezone(&Utc) <= now)
+            });
+            if has_expired {
+                expired.push((
+                    issue_id.to_string(),
+                    kind.to_string(),
+                    name.to_string(),
+                    provider.to_string(),
+                    expires_at.unwrap_or_default().to_string(),
+                ));
+                continue;
+            }
+            if !policy.exemptions.authorizes(provider) {
+                continue;
+            }
+            index
+                .by_capacity
+                .entry((kind.to_string(), name.to_string()))
+                .or_default()
+                .insert(issue_id.to_string());
+        }
+
+        for (issue_id, kind, name, provider, expires_at) in expired {
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions
+                 SET ended_at = CURRENT_TIMESTAMP, ended_action = 'expired', ended_by = 'system'
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'expire', ?, ?, 'system', ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    SqliteValue::from("expiration observed during capacity enforcement"),
+                    if expires_at.is_empty() {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::from(expires_at.as_str())
+                    },
+                ],
+            )?;
+        }
+
+        let exempt_ids: HashSet<String> = index.by_capacity.values().flatten().cloned().collect();
+        for id in &exempt_ids {
+            let rows = conn.query_with_params(
+                "SELECT status FROM issues WHERE id = ?",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+            if let Some(status) = rows
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(SqliteValue::as_text)
+            {
+                index
+                    .status_of
+                    .insert(id.clone(), status.trim().to_lowercase());
+            }
+        }
+        Ok(index)
+    }
+
+    /// End every active exemption whose applicable status set the issue is
+    /// leaving in this transition (GitHub #384: "Leaving the applicable
+    /// status ends the exemption"). A `status`-kind exemption's applicable
+    /// set is its named status; a `group`-kind exemption's is the group's
+    /// configured status list. Runs inside the mutation transaction so the
+    /// ending commits atomically with the departure itself.
+    fn end_departed_capacity_exemptions_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        issue_id: &str,
+        from: &str,
+        to: &str,
+        actor: &str,
+    ) -> Result<()> {
+        let from_canonical = from.trim().to_lowercase();
+        let to_canonical = to.trim().to_lowercase();
+        if from_canonical == to_canonical || from_canonical.is_empty() {
+            return Ok(());
+        }
+        if !crate::storage::schema::table_exists(conn, "capacity_exemptions") {
+            return Ok(());
+        }
+        let rows = conn.query_with_params(
+            "SELECT capacity_kind, capacity_name, provider, expires_at
+             FROM capacity_exemptions WHERE issue_id = ? AND ended_at IS NULL",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        for row in &rows {
+            let Some(kind) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let provider = row.get(2).and_then(SqliteValue::as_text).unwrap_or("");
+            let expires_at = row.get(3).and_then(SqliteValue::as_text);
+            let departed = match kind {
+                "status" => name == from_canonical && name != to_canonical,
+                "group" => Self::capacity_group(policy, name).is_some_and(|(_, group)| {
+                    let contains = |candidate: &str| {
+                        group
+                            .statuses
+                            .iter()
+                            .any(|status| status.trim().eq_ignore_ascii_case(candidate))
+                    };
+                    contains(&from_canonical) && !contains(&to_canonical)
+                }),
+                _ => false,
+            };
+            if !departed {
+                continue;
+            }
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions
+                 SET ended_at = CURRENT_TIMESTAMP, ended_action = 'left_status', ended_by = ?
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(actor),
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind),
+                    SqliteValue::from(name),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'left_status', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind),
+                    SqliteValue::from(name),
+                    SqliteValue::from(provider),
+                    SqliteValue::from(format!(
+                        "issue left the applicable status set ({from_canonical} -> {to_canonical})"
+                    )),
+                    SqliteValue::from(actor),
+                    expires_at.map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Stage Tier 1 attribution for the next mutation (issue #312, Layer 3
     /// capture-only). The values are stamped onto every audit event produced by
     /// the immediately following `create`/`update`/status-mutating call, then
@@ -2927,6 +3884,7 @@ impl SqliteStorage {
                 scope: "repository".to_string(),
                 counting_mode: evidence.counting_mode.to_string(),
                 aggregate_parents_excluded: evidence.aggregate_parents_excluded,
+                exempt: evidence.exempt,
                 current: evidence.current,
                 prospective: evidence.prospective,
                 soft_limit: evidence.soft_limit,
@@ -2949,6 +3907,7 @@ impl SqliteStorage {
             scope: "repository".to_string(),
             counting_mode: evidence.counting_mode.to_string(),
             aggregate_parents_excluded: evidence.aggregate_parents_excluded,
+            exempt: evidence.exempt,
             current: evidence.current,
             prospective: evidence.prospective,
             soft_limit: evidence.soft_limit,
@@ -3078,7 +4037,7 @@ impl SqliteStorage {
     ) -> Result<()> {
         for (status, limit) in &policy.statuses {
             let members = [status.clone()];
-            let pair = engine.counts(&members)?;
+            let pair = engine.counts("status", status, &members)?;
             // Under `all`, a rising count always has an entering transition.
             // Hierarchy counting can raise a capacity without one — closing a
             // child shared by two active parents makes both parents start
@@ -3096,6 +4055,7 @@ impl SqliteStorage {
                     name: status,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
                     current: pair.current,
                     prospective: pair.prospective,
                     soft_limit: limit.soft,
@@ -3114,6 +4074,7 @@ impl SqliteStorage {
                     name: status,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
                     current: pair.current,
                     prospective: pair.prospective,
                     soft_limit,
@@ -3131,7 +4092,7 @@ impl SqliteStorage {
         warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
     ) -> Result<()> {
         for (name, group) in &policy.groups {
-            let pair = engine.counts(&group.statuses)?;
+            let pair = engine.counts("group", name, &group.statuses)?;
             let entering = Self::blamed_capacity_transition(engine, &group.statuses);
 
             if let (Some(hard_limit), Some(transition)) = (group.hard, entering)
@@ -3144,6 +4105,7 @@ impl SqliteStorage {
                     name,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
                     current: pair.current,
                     prospective: pair.prospective,
                     soft_limit: group.soft,
@@ -3162,6 +4124,7 @@ impl SqliteStorage {
                     name,
                     counting_mode: engine.mode_str(),
                     aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
                     current: pair.current,
                     prospective: pair.prospective,
                     soft_limit,
@@ -3191,7 +4154,7 @@ impl SqliteStorage {
 
             for (status, threshold) in &rule.require_below.statuses {
                 let members = [status.clone()];
-                let pair = engine.counts(&members)?;
+                let pair = engine.counts("status", status, &members)?;
                 let blocked_transition = matching
                     .iter()
                     .find(|transition| !Self::transition_drains_capacity(transition, &members));
@@ -3204,6 +4167,7 @@ impl SqliteStorage {
                         name: status,
                         counting_mode: engine.mode_str(),
                         aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                        exempt: pair.exempt,
                         current: pair.current,
                         prospective: pair.prospective,
                         soft_limit: None,
@@ -3223,7 +4187,7 @@ impl SqliteStorage {
                         "validated workflow capacity group '{requested_name}' disappeared"
                     )));
                 };
-                let pair = engine.counts(&group.statuses)?;
+                let pair = engine.counts("group", canonical_name, &group.statuses)?;
                 let blocked_transition = matching.iter().find(|transition| {
                     !Self::transition_drains_capacity(transition, &group.statuses)
                 });
@@ -3236,6 +4200,7 @@ impl SqliteStorage {
                         name: canonical_name,
                         counting_mode: engine.mode_str(),
                         aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                        exempt: pair.exempt,
                         current: pair.current,
                         prospective: pair.prospective,
                         soft_limit: None,
@@ -3267,7 +4232,8 @@ impl SqliteStorage {
             return Ok(Vec::new());
         }
 
-        let mut engine = CapacityCountEngine::new(conn, &policy.counting, transitions);
+        let exemptions = Self::load_capacity_exemption_index_in_tx(conn, policy)?;
+        let mut engine = CapacityCountEngine::new(conn, &policy.counting, transitions, &exemptions);
         let mut warnings = Vec::new();
         Self::evaluate_capacity_status_limits_in_tx(policy, &mut engine, &mut warnings)?;
         Self::evaluate_capacity_group_limits_in_tx(policy, &mut engine, &mut warnings)?;
@@ -4034,6 +5000,21 @@ impl SqliteStorage {
                         Self::update_issue_in_tx(conn, ctx, id, update, actor)?;
                     }
                 }
+
+                // GitHub #384 phase 4: leaving the applicable status ends an
+                // issue's capacity exemption, atomically with the departure.
+                for transition in &transitions {
+                    if let Some(from) = transition.from.as_deref() {
+                        Self::end_departed_capacity_exemptions_in_tx(
+                            conn,
+                            &capacity_policy,
+                            &transition.issue_id,
+                            from,
+                            &transition.to,
+                            actor,
+                        )?;
+                    }
+                }
                 Ok(())
             })?;
         }
@@ -4538,6 +5519,17 @@ impl SqliteStorage {
                 None,
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
+            // GitHub #384 phase 4: tombstoning leaves every status, so any
+            // active exemption whose applicable set contained the previous
+            // status ends here, atomically with the delete.
+            Self::end_departed_capacity_exemptions_in_tx(
+                conn,
+                &capacity_policy,
+                id,
+                &previous_status,
+                "tombstone",
+                actor,
+            )?;
             conn.execute_with_params(
                 "UPDATE issues SET
                     content_hash = ?,
@@ -15750,6 +16742,435 @@ mod tests {
 
     /// Build the epic -> parent -> {child A, child B} shape from the GitHub
     /// #384 hierarchy example, with `prefix`-scoped IDs.
+    fn exemptable_hard_status_capacity(
+        status: &str,
+        hard: u32,
+    ) -> crate::close_policy::CapacityPolicy {
+        let mut policy = hard_status_capacity(status, hard);
+        policy.exemptions.providers = vec!["operator".to_string()];
+        policy
+    }
+
+    #[test]
+    fn capacity_exemption_admits_beyond_hard_limit_and_separates_counted_exempt_totals() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-ex-active", Status::InProgress),
+            ("bd-ex-hotfix", Status::Open),
+            ("bd-ex-normal", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+
+        storage
+            .grant_capacity_exemption(
+                "bd-ex-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "externally mandated hotfix",
+                Some(now + chrono::Duration::hours(2)),
+                "human-lead",
+            )
+            .unwrap();
+
+        // The exempted issue enters a full capacity without consuming a slot.
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-ex-hotfix", &update, "tester")
+            .unwrap();
+
+        // A normal issue is still rejected, and the evidence separates the
+        // counted total from the exempt total (GitHub #384: "Reports show
+        // counted and exempt totals separately").
+        let error = storage
+            .update_issue("bd-ex-normal", &update, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1, "exempt issue must not be counted");
+        assert_eq!(violation.prospective, 2);
+        assert_eq!(violation.exempt, Some(1));
+        assert!(
+            violation.to_string().contains("exempt: 1"),
+            "human evidence missing exempt total: {violation}"
+        );
+    }
+
+    #[test]
+    fn capacity_exemption_ends_when_issue_leaves_the_applicable_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exl-active", Status::InProgress),
+            ("bd-exl-hotfix", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+        storage
+            .grant_capacity_exemption(
+                "bd-exl-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "one admission only",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exl-hotfix", &enter, "tester")
+            .unwrap();
+
+        // Leaving the applicable status ends the exemption, audited, in the
+        // same transaction as the departure.
+        let leave = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exl-hotfix", &leave, "tester")
+            .unwrap();
+        let records = storage
+            .list_capacity_exemptions(Some("bd-exl-hotfix"))
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "left_status");
+        let history = storage
+            .get_capacity_exemption_history(Some("bd-exl-hotfix"))
+            .unwrap();
+        assert_eq!(
+            history.last().map(|entry| entry.action.as_str()),
+            Some("left_status")
+        );
+
+        // Re-entry counts again: without a fresh grant the full capacity
+        // rejects it.
+        let error = storage
+            .update_issue("bd-exl-hotfix", &enter, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+    }
+
+    #[test]
+    fn capacity_exemption_expires_lazily_with_audited_record_and_counts_again() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exp-active", Status::InProgress),
+            ("bd-exp-hotfix", Status::Open),
+            ("bd-exp-normal", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+        storage
+            .grant_capacity_exemption(
+                "bd-exp-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "will expire",
+                Some(now + chrono::Duration::hours(2)),
+                "human-lead",
+            )
+            .unwrap();
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exp-hotfix", &enter, "tester")
+            .unwrap();
+
+        // Simulate the clock passing the expiry.
+        SqliteStorage::with_connection_write_transaction(&storage.conn, |conn| {
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions SET expires_at = ? WHERE issue_id = ?",
+                &[
+                    SqliteValue::from((now - chrono::Duration::hours(1)).to_rfc3339()),
+                    SqliteValue::from("bd-exp-hotfix"),
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Expired exemptions count again: the hotfix now occupies a slot, so
+        // the next admission sees current=2 with no exempt total.
+        let error = storage
+            .update_issue("bd-exp-normal", &enter, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 2);
+        assert_eq!(violation.exempt, None);
+
+        // The rejected mutation rolled its own expiry marking back with it,
+        // but listing derives `expired` from the record without mutating.
+        let records = storage
+            .list_capacity_exemptions(Some("bd-exp-hotfix"))
+            .unwrap();
+        assert_eq!(records[0].state, "expired");
+        assert!(records[0].ended_at.is_none(), "read paths never mutate");
+
+        // The first *committed* observation persists the audited expire
+        // record: draining the overfull status is allowed and commits.
+        let drain = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exp-active", &drain, "tester")
+            .unwrap();
+        let records = storage
+            .list_capacity_exemptions(Some("bd-exp-hotfix"))
+            .unwrap();
+        assert_eq!(records[0].state, "expired");
+        assert!(records[0].ended_at.is_some());
+        let history = storage
+            .get_capacity_exemption_history(Some("bd-exp-hotfix"))
+            .unwrap();
+        assert_eq!(
+            history.last().map(|entry| entry.action.as_str()),
+            Some("expire")
+        );
+    }
+
+    #[test]
+    fn capacity_exemption_effect_is_withdrawn_when_provider_leaves_policy() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exw-active", Status::InProgress),
+            ("bd-exw-hotfix", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+        storage
+            .grant_capacity_exemption(
+                "bd-exw-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "granted before the policy change",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+
+        // Removing the provider from policy silently withdraws its grants
+        // without touching the audit history.
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-exw-hotfix", &enter, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+    }
+
+    #[test]
+    fn capacity_exemption_grant_enforces_expiry_policy() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-exg", "issue", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let mut policy = exemptable_hard_status_capacity("in_progress", 1);
+        policy.exemptions.require_expiry = true;
+        policy.exemptions.max_ttl_seconds = Some(3600);
+        storage.set_workflow_capacity_policy(policy);
+
+        let no_expiry = storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "missing expiry",
+                None,
+                "human-lead",
+            )
+            .unwrap_err();
+        assert!(no_expiry.to_string().contains("require_expiry"));
+
+        let too_long = storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "beyond the cap",
+                Some(now + chrono::Duration::hours(48)),
+                "human-lead",
+            )
+            .unwrap_err();
+        assert!(too_long.to_string().contains("max_ttl_seconds"));
+
+        let in_the_past = storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "already over",
+                Some(now - chrono::Duration::hours(1)),
+                "human-lead",
+            )
+            .unwrap_err();
+        assert!(in_the_past.to_string().contains("future"));
+
+        storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "within the cap",
+                Some(now + chrono::Duration::minutes(30)),
+                "human-lead",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn capacity_exemption_applies_to_admission_observations_of_the_same_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exa-review", Status::Custom("in_review".to_string())),
+            ("bd-exa-next", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy
+            .admission
+            .push(crate::close_policy::CapacityAdmissionRule {
+                name: "drain_review_before_starting".to_string(),
+                transitions: crate::close_policy::CapacityTransitionMatcher {
+                    from: vec!["open".to_string()],
+                    to: vec!["in_progress".to_string()],
+                },
+                require_below: crate::close_policy::CapacityRequirements {
+                    statuses: std::collections::BTreeMap::from([("in_review".to_string(), 1)]),
+                    groups: std::collections::BTreeMap::new(),
+                },
+            });
+        policy.exemptions.providers = vec!["operator".to_string()];
+        storage.set_workflow_capacity_policy(policy);
+
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-exa-next", &enter, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+
+        // Exempting the long-lived review item from the observed queue lets
+        // fresh work start without draining it.
+        storage
+            .grant_capacity_exemption(
+                "bd-exa-review",
+                "status",
+                "in_review",
+                "operator",
+                "awaiting an external regulatory decision",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+        storage
+            .update_issue("bd-exa-next", &enter, "tester")
+            .unwrap();
+    }
+
+    #[test]
+    fn capacity_exemption_under_leaf_work_excludes_only_counting_members() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-lwx-parent", Status::InProgress),
+            ("bd-lwx-child", Status::InProgress),
+            ("bd-lwx-new", Status::Open),
+            ("bd-lwx-extra", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-lwx-child", "bd-lwx-parent", "parent-child", "tester")
+            .unwrap();
+        let mut policy = exemptable_hard_status_capacity("in_progress", 1);
+        policy.counting.hierarchy = crate::close_policy::CapacityCountingMode::LeafWork;
+        storage.set_workflow_capacity_policy(policy);
+
+        // leaf_work counts only the child; exempting it frees the slot while
+        // the parent stays aggregate-excluded (the exempt issue remains
+        // active for suppression, so an exemption can never raise a count).
+        storage
+            .grant_capacity_exemption(
+                "bd-lwx-child",
+                "status",
+                "in_progress",
+                "operator",
+                "external dependency stalls this leaf",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-lwx-new", &enter, "tester")
+            .unwrap();
+
+        let error = storage
+            .update_issue("bd-lwx-extra", &enter, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(violation.exempt, Some(1));
+        assert_eq!(violation.aggregate_parents_excluded, Some(1));
+    }
+
     fn seed_capacity_hierarchy(storage: &mut SqliteStorage, prefix: &str, statuses: [Status; 4]) {
         let now = Utc::now();
         let ids = [

@@ -261,6 +261,8 @@ pub struct CapacityPolicy {
     pub groups: std::collections::BTreeMap<String, CapacityGroup>,
     /// Transition-scoped cross-queue admission guards.
     pub admission: Vec<CapacityAdmissionRule>,
+    /// Audited issue-specific exemption authorization (GitHub #384 phase 4).
+    pub exemptions: CapacityExemptionPolicy,
 }
 
 impl CapacityPolicy {
@@ -268,6 +270,50 @@ impl CapacityPolicy {
     #[must_use]
     pub fn is_active(&self) -> bool {
         !self.statuses.is_empty() || !self.groups.is_empty() || !self.admission.is_empty()
+    }
+}
+
+/// Authorization policy for audited issue-specific capacity exemptions
+/// (GitHub #384 phase 4).
+///
+/// Exemptions are never implicit: an empty `providers` list disables
+/// granting entirely, and a recorded exemption only excludes its issue from
+/// counting while the granting provider remains listed here. Removing a
+/// provider from the policy therefore withdraws every exemption it granted
+/// without rewriting the audit history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CapacityExemptionPolicy {
+    /// Providers authorized to grant, renew, and revoke exemptions
+    /// (matched case-insensitively, e.g. `operator`, `release-manager`).
+    /// Empty disables granting entirely — ordinary labels or unlisted
+    /// actors can never create an exemption.
+    pub providers: Vec<String>,
+    /// When `true`, every grant and renewal must carry an explicit
+    /// expiration; open-ended exemptions are rejected.
+    pub require_expiry: bool,
+    /// Upper bound on how far in the future a grant or renewal may set its
+    /// expiry, in seconds. `None` leaves the horizon to the operator.
+    pub max_ttl_seconds: Option<u64>,
+}
+
+impl CapacityExemptionPolicy {
+    /// Whether any provider is authorized to grant exemptions.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.providers.is_empty()
+    }
+
+    /// True when `provider` (case-insensitively, ignoring surrounding
+    /// whitespace) is authorized by this policy.
+    #[must_use]
+    pub fn authorizes(&self, provider: &str) -> bool {
+        let target = provider.trim();
+        !target.is_empty()
+            && self
+                .providers
+                .iter()
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(target))
     }
 }
 
@@ -441,6 +487,12 @@ pub struct WorkflowCapacityViolation {
     /// aggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate_parents_excluded: Option<u32>,
+    /// Prospective occupancy excluded because the issues hold active,
+    /// authorized exemptions for this capacity (absent when zero, keeping
+    /// the pre-exemption evidence shape byte-stable). Same unit as
+    /// `current`/`prospective`: issue counts, or weights under `weighted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt: Option<u32>,
     pub current: u32,
     pub prospective: u32,
     pub soft_limit: Option<u32>,
@@ -468,6 +520,12 @@ pub struct WorkflowCapacityWarning {
     /// aggregates (`leaf_work`/`roots` only; absent under `all`/`weighted`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate_parents_excluded: Option<u32>,
+    /// Prospective occupancy excluded because the issues hold active,
+    /// authorized exemptions for this capacity (absent when zero, keeping
+    /// the pre-exemption evidence shape byte-stable). Same unit as
+    /// `current`/`prospective`: issue counts, or weights under `weighted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exempt: Option<u32>,
     pub current: u32,
     pub prospective: u32,
     pub soft_limit: u32,
@@ -488,9 +546,22 @@ fn counting_mode_display_suffix(counting_mode: &str, excluded: Option<u32>) -> S
     )
 }
 
+/// Human-readable qualifier appended to capacity diagnostics when active
+/// exemptions excluded occupancy from the counted totals. Empty when no
+/// exemption affected the numbers so pre-exemption message text stays
+/// byte-stable.
+fn exempt_display_suffix(exempt: Option<u32>) -> String {
+    exempt.map_or_else(String::new, |excluded| format!(", exempt: {excluded}"))
+}
+
 impl std::fmt::Display for WorkflowCapacityWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let from = self.from_status.as_deref().unwrap_or("<initial>");
+        let counting = format!(
+            "{}{}",
+            counting_mode_display_suffix(&self.counting_mode, self.aggregate_parents_excluded),
+            exempt_display_suffix(self.exempt),
+        );
         write!(
             f,
             "transitioned {} from {} to {}; repository {} capacity '{}' has reached or exceeded its soft limit (current: {}, prospective: {}, soft: {}{}; policy: {}). Drain existing work before admitting more",
@@ -502,7 +573,7 @@ impl std::fmt::Display for WorkflowCapacityWarning {
             self.current,
             self.prospective,
             self.soft_limit,
-            counting_mode_display_suffix(&self.counting_mode, self.aggregate_parents_excluded),
+            counting,
             self.policy_path,
         )
     }
@@ -511,8 +582,11 @@ impl std::fmt::Display for WorkflowCapacityWarning {
 impl std::fmt::Display for WorkflowCapacityViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let from = self.from_status.as_deref().unwrap_or("<initial>");
-        let counting =
-            counting_mode_display_suffix(&self.counting_mode, self.aggregate_parents_excluded);
+        let counting = format!(
+            "{}{}",
+            counting_mode_display_suffix(&self.counting_mode, self.aggregate_parents_excluded),
+            exempt_display_suffix(self.exempt),
+        );
         if self.capacity_kind.starts_with("admission_") {
             return write!(
                 f,
@@ -737,6 +811,59 @@ pub struct GateResultRecord {
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recorded_by: Option<String>,
+    pub recorded_at: String,
+}
+
+/// The latest capacity-exemption state for one `(issue, capacity)` pair
+/// (GitHub #384 phase 4). Like `gate_results`, this is project-local
+/// auxiliary metadata: never synced through JSONL. The append-only
+/// companion [`CapacityExemptionHistoryRecord`] preserves every action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityExemptionRecord {
+    pub issue_id: String,
+    /// `status` or `group` — the capacity family the exemption names.
+    pub capacity_kind: String,
+    /// Canonical (trimmed, lowercased) status or group name.
+    pub capacity_name: String,
+    /// Authorizing provider from `workflow.capacity.exemptions.providers`.
+    pub provider: String,
+    /// Mandatory human rationale recorded at grant time.
+    pub reason: String,
+    /// Actor who ran the granting command (audit attribution).
+    pub granted_by: String,
+    pub granted_at: String,
+    /// RFC3339 expiry; `None` only when policy does not require one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Set when the exemption stopped applying (revoked, expired, or the
+    /// issue left the applicable status set).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// Why it ended: `revoked`, `expired`, or `left_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_by: Option<String>,
+    /// Derived display state: `active`, `expired`, `revoked`, or
+    /// `left_status`. Computed at read time so listing never mutates.
+    pub state: String,
+}
+
+/// One append-only capacity-exemption audit action (GitHub #384 phase 4):
+/// `grant`, `renew`, `revoke`, `expire`, or `left_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityExemptionHistoryRecord {
+    pub id: i64,
+    pub issue_id: String,
+    pub capacity_kind: String,
+    pub capacity_name: String,
+    pub action: String,
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
     pub recorded_at: String,
 }
 
@@ -1223,8 +1350,10 @@ impl Workflow {
     pub fn validate_capacity(&self) -> Result<()> {
         // Counting configuration is validated even when no limit is active:
         // a typo'd weights block must fail loudly rather than lie dormant
-        // until an operator adds their first hard limit.
+        // until an operator adds their first hard limit. Exemption
+        // authorization gets the same treatment.
         validate_capacity_counting(&self.capacity.counting)?;
+        validate_capacity_exemptions(&self.capacity.exemptions)?;
         if !self.capacity.is_active() {
             return Ok(());
         }
@@ -1443,6 +1572,28 @@ fn validate_capacity_counting(counting: &CapacityCounting) -> Result<()> {
                 "counting.weights.issues keys cannot be empty",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_capacity_exemptions(exemptions: &CapacityExemptionPolicy) -> Result<()> {
+    let mut providers = std::collections::HashSet::new();
+    for provider in &exemptions.providers {
+        if provider.trim().is_empty() {
+            return Err(capacity_validation_error(
+                "exemptions.providers entries cannot be empty",
+            ));
+        }
+        if !providers.insert(provider.trim().to_lowercase()) {
+            return Err(capacity_validation_error(format!(
+                "exemptions.providers entry '{provider}' is duplicated case-insensitively"
+            )));
+        }
+    }
+    if exemptions.max_ttl_seconds == Some(0) {
+        return Err(capacity_validation_error(
+            "exemptions.max_ttl_seconds must be greater than zero when set",
+        ));
     }
     Ok(())
 }
@@ -3718,6 +3869,103 @@ workflow:
             policy.workflow.capacity.admission[0].name,
             "drain_downstream"
         );
+    }
+
+    #[test]
+    fn loader_parses_capacity_exemption_policy_and_authorizes_case_insensitively() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml = r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 3
+    exemptions:
+      providers: [Operator, release-manager]
+      require_expiry: true
+      max_ttl_seconds: 86400
+";
+        std::fs::write(dir.path().join(POLICY_FILE_NAME), yaml).unwrap();
+        let policy = load_for_beads_dir(dir.path()).expect("exemption policy must load");
+        let exemptions = &policy.workflow.capacity.exemptions;
+        assert!(exemptions.is_enabled());
+        assert!(exemptions.require_expiry);
+        assert_eq!(exemptions.max_ttl_seconds, Some(86400));
+        assert!(exemptions.authorizes("operator"));
+        assert!(exemptions.authorizes("  RELEASE-MANAGER  "));
+        assert!(!exemptions.authorizes("intruder"));
+        assert!(!exemptions.authorizes(""));
+    }
+
+    #[test]
+    fn capacity_exemptions_validation_rejects_duplicates_and_zero_ttl() {
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  exemptions:
+    providers: [operator, OPERATOR]
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(
+            error.to_string().contains("duplicated case-insensitively"),
+            "{error}"
+        );
+
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+statuses: [open, in_progress]
+capacity:
+  exemptions:
+    providers: [operator]
+    max_ttl_seconds: 0
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(error.to_string().contains("max_ttl_seconds"), "{error}");
+
+        // An exemptions block alone (no limits) must still validate loudly
+        // rather than lie dormant, mirroring the counting block.
+        let workflow: Workflow = serde_yml::from_str(
+            r"
+capacity:
+  exemptions:
+    providers: ['  ']
+",
+        )
+        .unwrap();
+        let error = workflow.validate_capacity().unwrap_err();
+        assert!(error.to_string().contains("cannot be empty"), "{error}");
+    }
+
+    #[test]
+    fn capacity_evidence_display_appends_exempt_total_only_when_present() {
+        let mut warning = WorkflowCapacityWarning {
+            issue_id: "bd-1".to_string(),
+            from_status: Some("open".to_string()),
+            to_status: "in_progress".to_string(),
+            capacity_kind: "status".to_string(),
+            capacity_name: "in_progress".to_string(),
+            scope: "repository".to_string(),
+            counting_mode: "all".to_string(),
+            aggregate_parents_excluded: None,
+            exempt: None,
+            current: 2,
+            prospective: 3,
+            soft_limit: 2,
+            hard_limit: None,
+            policy_path: "workflow.capacity.statuses.in_progress".to_string(),
+        };
+        assert!(
+            !warning.to_string().contains("exempt"),
+            "no-exemption text must stay byte-stable: {warning}"
+        );
+        warning.exempt = Some(2);
+        assert!(warning.to_string().contains(", exempt: 2"), "{warning}");
     }
 
     #[test]

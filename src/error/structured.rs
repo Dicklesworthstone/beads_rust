@@ -1114,6 +1114,7 @@ mod tests {
                 scope: "repository".to_string(),
                 counting_mode: "all".to_string(),
                 aggregate_parents_excluded: None,
+                exempt: None,
                 current: 2,
                 prospective: 3,
                 soft_limit: Some(1),
@@ -1138,6 +1139,9 @@ mod tests {
         // `all` counting omits the hierarchy field entirely, so phase-1/2
         // consumers see the exact evidence shape they saw before phase 3.
         assert!(context.get("aggregate_parents_excluded").is_none());
+        // Likewise, no active exemption means no `exempt` field: phase-4
+        // evidence stays byte-identical for repos without exemptions.
+        assert!(context.get("exempt").is_none());
     }
 
     #[test]
@@ -1152,6 +1156,7 @@ mod tests {
                 scope: "repository".to_string(),
                 counting_mode: "leaf_work".to_string(),
                 aggregate_parents_excluded: Some(2),
+                exempt: Some(1),
                 current: 2,
                 prospective: 3,
                 soft_limit: None,
@@ -1164,10 +1169,11 @@ mod tests {
         let context = structured.context.expect("capacity evidence");
         assert_eq!(context["counting_mode"], "leaf_work");
         assert_eq!(context["aggregate_parents_excluded"], 2);
+        assert_eq!(context["exempt"], 1);
         assert!(
             err.to_string()
-                .contains("counting: leaf_work, aggregate-excluded: 2"),
-            "hierarchy evidence missing from message: {err}"
+                .contains("counting: leaf_work, aggregate-excluded: 2, exempt: 1"),
+            "hierarchy and exemption evidence missing from message: {err}"
         );
     }
 
