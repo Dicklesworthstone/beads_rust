@@ -35,6 +35,19 @@ case "$stage" in
       echo "$out" | jq '.checks[] | select(.name == "write_lock") | .details' >&2
       exit 1
     }
+    # Pin the declared FM id to the check (coverage manifest contract).
+    # The warn path (stale_unprobed) is unreachable on a workspace whose
+    # startup succeeds — an unopenable lock degrades doctor startup
+    # before this check runs — so the probe fixture is where the
+    # `fm-concurrency_primitives-orphaned-write-lock` id is pinned.
+    echo "$out" | jq -e '
+      .checks[] | select(.name == "write_lock")
+      | select(.details.finding_id == "fm-concurrency_primitives-orphaned-write-lock")
+    ' >/dev/null || {
+      echo "ASSERT FAIL[$stage]: write_lock finding_id drifted from fm-concurrency_primitives-orphaned-write-lock" >&2
+      echo "$out" | jq '.checks[] | select(.name == "write_lock") | .details' >&2
+      exit 1
+    }
     # The old move-aside advice was the inode-split hazard; it must be gone.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")

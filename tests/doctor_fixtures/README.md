@@ -78,3 +78,12 @@ specific fixtures regardless of the marker file.
 The pass-3 design intent is to fold a per-fixture replay assertion INTO
 each fixture's `assert.sh post_repair` stage in a future pass. Until then
 the env-gated suite-level gate is the documented mechanism.
+
+## Coverage manifest
+
+[`COVERAGE.md`](COVERAGE.md) maps every declared `fm-` finding id to the
+fixture(s) exercising it (empirical, beads_rust-yx0b). The drift gate
+`tests/e2e_doctor_fixture_suite.rs::fixture_coverage_manifest_is_complete`
+fails when a new finding id lacks a manifest row, a manifest row names a
+missing fixture, or a fixture directory is never mentioned in the
+manifest — update `COVERAGE.md` alongside new checks and fixtures.
