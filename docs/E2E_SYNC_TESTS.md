@@ -21,6 +21,7 @@ The e2e sync test suite verifies several critical safety properties:
 | `tests/e2e_sync_fuzz_edge_cases.rs` | Malformed JSONL, path traversal, conflict markers |
 | `tests/e2e_sync_failure_injection.rs` | Read-only dirs, permission errors, atomic guarantees |
 | `tests/e2e_sync_preflight_integration.rs` | Preflight checks catch safety issues before writes |
+| `tests/e2e_sync_reconcile.rs` | Additive `--reconcile`: false-equal repair, event preservation, dry-run zero-mutation, witness rollback |
 
 ## Running the Tests
 
@@ -54,6 +55,9 @@ cargo test --test e2e_sync_failure_injection --release
 
 # Preflight integration tests
 cargo test --test e2e_sync_preflight_integration --release
+
+# Additive reconcile tests (br sync --reconcile / --dry-run)
+cargo test --test e2e_sync_reconcile --release
 ```
 
 ### Run a Specific Test
@@ -254,6 +258,24 @@ Tests early validation:
 - Path traversal rejection
 - Export safety checks
 - Actionable error messages
+
+### 6. Reconcile Tests (`e2e_sync_reconcile.rs`)
+
+Tests the additive `br sync --reconcile` mode (beads_rust-3r45):
+
+- False-equal cached-hash repair: `--import-only` skips, reconcile recovers
+- The CASS-shaped fixture: 1,732 DB issues + 1,915-row JSONL → created=183,
+  updated=5, all 315 audit events preserved byte-for-byte
+- Timestamp classification (newer updates, equal/older/tombstone skips)
+- Content-hash-only drift → uncertified local win + `needs_flush`
+- Relation import on created rows; unsuperseded relations survive
+- Scoped dangling-dependency cleanup (only rows reconcile wrote)
+- Malformed JSON / conflict markers / duplicate ids reject with a
+  byte-identical DB family
+- Dry-run mutates zero files (including `-wal`/`-shm`) and is deterministic
+- Plan/apply witness rollback on concurrent DB or JSONL change
+- Write-lock contention fails apply cleanly; read-only dry-run proceeds
+- External JSONL path policy, read-only JSONL, empty DB/JSONL, 2K+ row bulk
 
 ## Troubleshooting
 

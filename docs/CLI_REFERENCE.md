@@ -1297,6 +1297,7 @@ br sync [OPTIONS]
 | `--flush-only` | Export database to JSONL |
 | `--import-only` | Import JSONL into database |
 | `--merge` | Three-way merge `.beads/beads.base.jsonl`, SQLite, and JSONL |
+| `--reconcile` | Additively reconcile JSONL into the database (lossless, previewable) |
 | `--status` | Show sync status (read-only) |
 
 **Options:**
@@ -1311,6 +1312,7 @@ br sync [OPTIONS]
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
 | `--rename-prefix` | During import, rewrite mismatched issue IDs into the configured default prefix |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
+| `--dry-run` | With `--reconcile`, preview the plan without any mutation |
 | `--robot` | Machine-readable output |
 
 **Merge semantics:**
@@ -1318,6 +1320,17 @@ br sync [OPTIONS]
 - Without an explicit conflict policy, semantic conflicts stop the command. This covers both-modified, delete-vs-modify, and convergent same-ID creation conflicts.
 - `--force-db` keeps local SQLite changes for conflicts, `--force-jsonl` keeps JSONL changes for conflicts, and `--force` chooses the side with the newer timestamp.
 - `--force-db`, `--force-jsonl`, and `--force` are mutually exclusive for `--merge`.
+
+**Reconcile semantics:**
+- `--reconcile` classifies every JSONL row against full issue state — never the cached content hash — so it repairs the "false equal" state where `br sync --status` reports synchronized while the JSONL holds rows the database never imported.
+- Classification is timestamp-newer-wins with tombstone protection: JSONL-only rows are created, strictly newer JSONL rows update in place, and everything else is skipped. Deletion is structurally impossible in this mode.
+- Apply runs in one write transaction bound to plan-time witnesses (JSONL content hash + stat, event-table shape). Any divergence between plan and apply rolls the whole transaction back.
+- Audit events are never created, modified, or deleted; the apply transaction verifies the events table is byte-stable and aborts otherwise.
+- Existing dependencies, labels, comments, dirty markers, and tombstones survive unless superseded by an applied row. Database-only issues are never touched; they (and skipped rows whose local copy still diverges) mark the database for a future flush.
+- No JSONL, base snapshot, manifest, or history writes ever happen; the same transaction repairs the stored content hash and stat witness so the staleness short-circuit becomes truthful again.
+- `--dry-run` is read-only: no write transaction, no metadata/cache/dirty changes, no file writes of any kind.
+- Both modes emit a versioned receipt (`br.sync.reconcile.v1` — see `br schema all`, key `SyncReconcileReceipt`) with source/target witnesses, created/updated/skipped/deleted counts (deleted is always 0), bounded id previews, relation counts, and before/after event counts.
+- `--force`, `--rename-prefix`, and `--orphans` are rejected with `--reconcile`; dangling dependency references are cleaned only from rows the reconcile itself wrote.
 
 **Rebuild semantics:**
 - `--rebuild` is valid only with explicit import mode: `br sync --import-only --rebuild`.
@@ -1347,6 +1360,10 @@ br sync --import-only --rebuild
 
 # Rebuild while rewriting imported IDs to the configured prefix
 br sync --import-only --rebuild --rename-prefix
+
+# Preview an additive reconcile (read-only), then apply it
+br sync --reconcile --dry-run --json
+br sync --reconcile --json
 
 # Check sync status
 br sync --status

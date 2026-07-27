@@ -175,6 +175,10 @@ br sync --import-only
 # Merge divergent DB and JSONL edits using the saved base snapshot
 br sync --merge
 
+# Additively pull JSONL rows the database is missing (previewable, lossless)
+br sync --reconcile --dry-run
+br sync --reconcile
+
 # Rebuild SQLite from authoritative JSONL after recovery/corruption
 br sync --import-only --rebuild
 
@@ -810,7 +814,8 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 ```
 
 Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
-`--merge`, `--status`, or `--witness` so the data direction is explicit.
+`--merge`, `--reconcile`, `--status`, or `--witness` so the data direction is
+explicit.
 
 ### Safety Model
 
@@ -874,12 +879,21 @@ If you want to preserve imported IDs exactly as-is, omit `--rename-prefix`.
 # Check sync status
 br sync --status
 
+# Lossless recovery: preview, then additively pull the missing/newer rows
+# (never deletes, never writes JSONL, preserves all audit events)
+br sync --reconcile --dry-run
+br sync --reconcile
+
 # Force import (may lose local changes)
 br sync --import-only --force
 
 # If JSONL is authoritative, rebuild SQLite to match it exactly
 br sync --import-only --rebuild
 ```
+
+The reconcile path also repairs the "false equal" state where `br sync
+--status` reports synchronized (the stored content hash matches the file)
+while the JSONL still holds rows the database never imported.
 
 `--rebuild` is an explicit import-mode operation. It is valid only with
 `--import-only`; after import it removes database entries that are absent from

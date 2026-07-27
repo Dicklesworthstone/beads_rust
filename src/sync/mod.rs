@@ -4723,6 +4723,633 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
 }
 
 // ============================================================================
+// Additive Reconciliation (beads_rust-3r45)
+// ============================================================================
+
+/// Schema marker for `br sync --reconcile` receipts.
+pub const SYNC_RECONCILE_SCHEMA_VERSION: &str = "br.sync.reconcile.v1";
+
+/// Per-row action kind planned by additive reconciliation.
+///
+/// Deletion is structurally impossible in this mode: there is no variant for
+/// it, and the applier only ever routes through the import-path upserts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileActionKind {
+    /// JSONL row has no DB counterpart; insert it.
+    Create,
+    /// JSONL row is strictly newer than its DB counterpart; update in place.
+    Update,
+    /// DB counterpart is strictly newer; leave it alone.
+    SkipOlder,
+    /// Timestamps are equal; leave the DB row alone.
+    SkipEqual,
+    /// DB counterpart is a tombstone; tombstone protection wins.
+    SkipTombstone,
+}
+
+/// One planned JSONL-row action bound to a target issue id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileAction {
+    /// 1-based JSONL line number the row was parsed from.
+    pub line: usize,
+    /// Issue id as written in the JSONL row.
+    pub incoming_id: String,
+    /// DB issue id the action applies to (differs from `incoming_id` when the
+    /// collision detector matched by `external_ref` or content hash).
+    pub target_id: String,
+    /// Planned action.
+    pub kind: ReconcileActionKind,
+}
+
+/// Witnesses a reconcile plan was computed against.
+///
+/// The applier re-verifies every field before mutating anything and rolls the
+/// transaction back on any mismatch, so a plan can never be applied to state
+/// it was not computed from.
+#[derive(Debug, Clone)]
+pub struct ReconcileWitness {
+    /// Whitespace-normalized SHA-256 of the JSONL content (same function the
+    /// stored `jsonl_content_hash` metadata uses).
+    pub jsonl_content_hash: String,
+    /// RFC3339 mtime of the JSONL file at plan time.
+    pub jsonl_mtime_witness: String,
+    /// Byte size of the JSONL file at plan time.
+    pub jsonl_size: u64,
+    /// Total issue rows in the DB at plan time (including tombstones).
+    pub db_issue_count: usize,
+    /// Total event rows at plan time.
+    pub events_count: u64,
+    /// Highest event rowid at plan time.
+    pub events_max_id: Option<i64>,
+}
+
+/// Read-only additive reconciliation plan.
+#[derive(Debug, Clone)]
+pub struct ReconcilePlan {
+    /// Non-empty JSONL rows parsed (including ephemeral rows).
+    pub record_count: usize,
+    /// Ephemeral (`-wisp-`) rows excluded from planning.
+    pub ephemeral_skipped: usize,
+    /// Ordered per-row actions (ephemeral rows excluded).
+    pub actions: Vec<ReconcileAction>,
+    /// Exportable DB issue ids absent from the JSONL row set (sorted). These
+    /// are never touched by apply; they only inform the `needs_flush` repair.
+    pub db_only_ids: Vec<String>,
+    /// Label rows carried by planned create/update rows.
+    pub labels_planned: usize,
+    /// Dependency rows carried by planned create/update rows.
+    pub dependencies_planned: usize,
+    /// Comment rows carried by planned create/update rows.
+    pub comments_planned: usize,
+    /// Whether the stored `jsonl_content_hash` metadata already matches the
+    /// file. True together with a non-empty create/update set is exactly the
+    /// false-equal state this mode exists to repair.
+    pub stored_hash_matches_jsonl: bool,
+    /// Bound witnesses for apply-time verification.
+    pub witness: ReconcileWitness,
+}
+
+impl ReconcilePlan {
+    /// Count planned actions of one kind.
+    #[must_use]
+    pub fn count_kind(&self, kind: ReconcileActionKind) -> usize {
+        self.actions.iter().filter(|a| a.kind == kind).count()
+    }
+
+    /// Whether apply would change any issue row.
+    #[must_use]
+    pub fn has_row_changes(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a.kind,
+                ReconcileActionKind::Create | ReconcileActionKind::Update
+            )
+        })
+    }
+
+    /// Sorted target ids for one action kind.
+    #[must_use]
+    pub fn target_ids_for_kind(&self, kind: ReconcileActionKind) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .actions
+            .iter()
+            .filter(|a| a.kind == kind)
+            .map(|a| a.target_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+/// Outcome of applying an additive reconcile plan.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileApplyOutcome {
+    /// Issues inserted.
+    pub created: usize,
+    /// Issues updated in place.
+    pub updated: usize,
+    /// Rows skipped because the DB copy is strictly newer.
+    pub skipped_older: usize,
+    /// Rows skipped because timestamps are equal.
+    pub skipped_equal: usize,
+    /// Rows skipped by tombstone protection.
+    pub skipped_tombstone: usize,
+    /// Ephemeral rows excluded.
+    pub ephemeral_skipped: usize,
+    /// Label rows written for applied issues.
+    pub labels_imported: usize,
+    /// Dependency rows written for applied issues.
+    pub dependencies_imported: usize,
+    /// Comment rows written for applied issues.
+    pub comments_imported: usize,
+    /// Export-hash rows recorded for rows whose DB copy now matches JSONL.
+    pub export_hashes_recorded: usize,
+    /// Skipped rows whose DB copy differs from JSONL (local wins that still
+    /// need a future flush).
+    pub uncertified_local_wins: usize,
+    /// Dangling dependency rows removed from just-written issues.
+    pub orphan_dependencies_cleaned: usize,
+    /// Blocked-cache rows after rebuild (0 when no rebuild was needed).
+    pub blocked_cache_entries: usize,
+    /// Child-counter rows after rebuild (0 when no rebuild was needed).
+    pub child_counter_entries: usize,
+    /// Event rows after apply (must equal the plan's `events_count`).
+    pub events_after: u64,
+    /// Whether `needs_flush` was set because local state still diverges from
+    /// JSONL (db-only rows or uncertified local wins).
+    pub needs_flush_set: bool,
+    /// Whether the import metadata (content hash + witness + import time) was
+    /// repaired in the apply transaction.
+    pub metadata_repaired: bool,
+}
+
+fn reconcile_kind_for_action(action: &CollisionAction) -> ReconcileActionKind {
+    match action {
+        CollisionAction::Insert => ReconcileActionKind::Create,
+        CollisionAction::Update { .. } => ReconcileActionKind::Update,
+        CollisionAction::Skip { reason } => {
+            if reason.starts_with("Tombstone") {
+                ReconcileActionKind::SkipTombstone
+            } else if reason.starts_with("Equal timestamps") {
+                ReconcileActionKind::SkipEqual
+            } else {
+                ReconcileActionKind::SkipOlder
+            }
+        }
+    }
+}
+
+fn reconcile_config_error(message: impl Into<String>) -> BeadsError {
+    BeadsError::Config(message.into())
+}
+
+/// Classify every non-ephemeral JSONL row against the current DB state.
+///
+/// Shared by the read-only planner and the in-transaction apply verifier so
+/// both sides are guaranteed to run the identical classification. The
+/// callback receives each parsed issue together with its classified action;
+/// classification uses the same collision detector and timestamp-newer-wins
+/// action table as `--import-only` with `force_upsert` disabled.
+fn for_each_reconcile_classified_row<F>(
+    input_path: &Path,
+    config: &ImportConfig,
+    metadata: &ImportMetadataMaps,
+    mut handle: F,
+) -> Result<(usize, usize)>
+where
+    F: FnMut(usize, Issue, &CollisionAction, &str) -> Result<()>,
+{
+    let mut seen_external_refs = HashSet::new();
+    let mut record_count = 0usize;
+    let mut ephemeral_skipped = 0usize;
+
+    for_each_jsonl_import_issue(input_path, |line_num, mut issue| {
+        record_count += 1;
+        if issue.ephemeral {
+            ephemeral_skipped += 1;
+            return Ok(());
+        }
+
+        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(&issue);
+        let collision = detect_collision(
+            &issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let action = determine_action(&collision, &issue, &metadata.meta_by_id, false)?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        handle(line_num, issue, &action, &target_id)
+    })?;
+
+    Ok((record_count, ephemeral_skipped))
+}
+
+/// Plan an additive JSONL→DB reconciliation without any mutation.
+///
+/// The planner parses and validates the JSONL, classifies every row with the
+/// import collision detector (timestamp-newer-wins, tombstone protection, no
+/// force), and binds the resulting plan to content/stat witnesses of both
+/// sides. It compares full issue state instead of trusting the cached
+/// `jsonl_content_hash` metadata, so it sees divergence that the
+/// `--import-only` staleness short-circuit is structurally blind to.
+///
+/// The planner opens no write transaction and writes nothing: no metadata, no
+/// JSONL, no base snapshot, no dirty markers, no caches.
+///
+/// # Errors
+///
+/// Returns an error if path validation fails, the JSONL is missing, contains
+/// conflict markers, malformed JSON, duplicate ids or duplicate external
+/// refs, or if the JSONL file changes while planning.
+pub fn plan_additive_reconcile(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+) -> Result<ReconcilePlan> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl)?;
+    }
+    if !input_path.is_file() {
+        return Err(reconcile_config_error(format!(
+            "Cannot reconcile: JSONL file not found at {}",
+            input_path.display()
+        )));
+    }
+    ensure_no_conflict_markers(input_path)?;
+
+    // Reconcile never renames prefixes or ids; run the structural validation
+    // pass (duplicate-id detection, parseability) with prefix checks off.
+    let mut validation_config = config.clone();
+    validation_config.skip_prefix_validation = true;
+    validation_config.rename_on_import = false;
+    collect_import_validation_plan(input_path, &validation_config, None)?;
+
+    // Bind the source witness before classification so a concurrent JSONL
+    // writer is detected by the re-stat below.
+    let observed = observed_jsonl_witness(input_path)?;
+    let jsonl_content_hash = compute_jsonl_hash(input_path)?;
+
+    let metadata = load_import_metadata_maps(storage)?;
+
+    let mut actions = Vec::new();
+    let mut jsonl_target_ids = HashSet::new();
+    let mut labels_planned = 0usize;
+    let mut dependencies_planned = 0usize;
+    let mut comments_planned = 0usize;
+
+    let (record_count, ephemeral_skipped) = for_each_reconcile_classified_row(
+        input_path,
+        config,
+        &metadata,
+        |line_num, issue, action, target_id| {
+            let kind = reconcile_kind_for_action(action);
+            if matches!(
+                kind,
+                ReconcileActionKind::Create | ReconcileActionKind::Update
+            ) {
+                labels_planned += issue.labels.len();
+                dependencies_planned += issue.dependencies.len();
+                comments_planned += issue.comments.len();
+            }
+            jsonl_target_ids.insert(target_id.to_string());
+            actions.push(ReconcileAction {
+                line: line_num,
+                incoming_id: issue.id,
+                target_id: target_id.to_string(),
+                kind,
+            });
+            Ok(())
+        },
+    )?;
+
+    let mut db_only_ids: Vec<String> = storage
+        .get_non_ephemeral_issue_ids()?
+        .into_iter()
+        .filter(|id| !jsonl_target_ids.contains(id))
+        .collect();
+    db_only_ids.sort();
+
+    let stored_hash_matches_jsonl = storage
+        .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+        .as_deref()
+        == Some(jsonl_content_hash.as_str());
+    let db_issue_count = storage.count_all_issues()?;
+    let (events_count, events_max_id) = storage.events_table_witness()?;
+
+    // Re-stat: reject the plan if the JSONL changed underneath the scan.
+    let final_observed = observed_jsonl_witness(input_path)?;
+    if final_observed.mtime_witness != observed.mtime_witness
+        || final_observed.size != observed.size
+    {
+        return Err(reconcile_config_error(format!(
+            "JSONL file {} changed while planning reconciliation; re-run the command",
+            input_path.display()
+        )));
+    }
+
+    Ok(ReconcilePlan {
+        record_count,
+        ephemeral_skipped,
+        actions,
+        db_only_ids,
+        labels_planned,
+        dependencies_planned,
+        comments_planned,
+        stored_hash_matches_jsonl,
+        witness: ReconcileWitness {
+            jsonl_content_hash,
+            jsonl_mtime_witness: observed.mtime_witness,
+            jsonl_size: observed.size,
+            db_issue_count,
+            events_count,
+            events_max_id,
+        },
+    })
+}
+
+/// Apply a previously computed additive reconcile plan.
+///
+/// The applier re-verifies the plan's JSONL and DB witnesses, re-runs the
+/// classification inside a single write transaction, and rolls everything
+/// back if any row classifies differently from the plan. Writes go through
+/// the import-path upserts only: no table resets, no deletes of unsuperseded
+/// rows, no manufactured events, no JSONL/base writes, no VACUUM. The same
+/// transaction repairs the import metadata (content hash, stat witness,
+/// import time) so the stale-hash short-circuit stops reporting a false
+/// equal, and sets `needs_flush` when local state still diverges from JSONL
+/// (db-only rows or newer local rows).
+///
+/// # Errors
+///
+/// Returns an error (with the transaction rolled back and foreign keys
+/// restored) if the JSONL or DB changed since planning, if any row action
+/// diverges from the plan, if event rows changed during apply, or if any
+/// database operation fails.
+pub fn apply_additive_reconcile(
+    storage: &mut SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+    plan: &ReconcilePlan,
+) -> Result<ReconcileApplyOutcome> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl)?;
+    }
+    ensure_no_conflict_markers(input_path)?;
+
+    verify_reconcile_jsonl_witness(input_path, plan)?;
+
+    // Build the cross-reference rename map from the verified plan: rows whose
+    // collision target differs from their written id (external_ref or
+    // content-hash matches) must have their relation references rewritten the
+    // same way `--import-only` does.
+    let collision_renames: HashMap<String, String> = plan
+        .actions
+        .iter()
+        .filter(|a| a.incoming_id != a.target_id)
+        .map(|a| (a.incoming_id.clone(), a.target_id.clone()))
+        .collect();
+
+    // Imported rows may reference issues that appear later in the stream, so
+    // FK enforcement is deferred exactly like the import path.
+    storage
+        .execute_raw("PRAGMA foreign_keys = OFF")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Failed to disable foreign key enforcement before reconcile".to_string(),
+            source: Box::new(source),
+        })?;
+
+    let apply_result = storage.with_write_transaction(|storage| {
+        run_reconcile_apply_tx(storage, input_path, config, plan, &collision_renames)
+    });
+
+    let validate_foreign_keys = apply_result.is_ok();
+    let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
+
+    let outcome = match (apply_result, fk_restore_result) {
+        (Ok(outcome), Ok(())) => outcome,
+        (Ok(_), Err(fk_err)) => return Err(fk_err),
+        (Err(apply_err), Ok(())) => return Err(apply_err),
+        (Err(apply_err), Err(fk_err)) => {
+            tracing::error!(
+                error = %fk_err,
+                "Failed to restore foreign key enforcement after failed reconcile"
+            );
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "reconcile failed, and SQLite foreign key enforcement could not be re-enabled: {fk_err}"
+                ),
+                source: Box::new(apply_err),
+            });
+        }
+    };
+
+    tracing::info!(
+        created = outcome.created,
+        updated = outcome.updated,
+        skipped_older = outcome.skipped_older,
+        skipped_equal = outcome.skipped_equal,
+        skipped_tombstone = outcome.skipped_tombstone,
+        events = outcome.events_after,
+        needs_flush_set = outcome.needs_flush_set,
+        "Additive reconcile applied"
+    );
+
+    Ok(outcome)
+}
+
+fn verify_reconcile_jsonl_witness(input_path: &Path, plan: &ReconcilePlan) -> Result<()> {
+    let observed = observed_jsonl_witness(input_path)?;
+    if observed.mtime_witness != plan.witness.jsonl_mtime_witness
+        || observed.size != plan.witness.jsonl_size
+    {
+        return Err(reconcile_config_error(format!(
+            "JSONL file {} changed since the reconcile plan was computed; re-run the command",
+            input_path.display()
+        )));
+    }
+    let current_hash = compute_jsonl_hash(input_path)?;
+    if current_hash != plan.witness.jsonl_content_hash {
+        return Err(reconcile_config_error(format!(
+            "JSONL content at {} no longer matches the reconcile plan; re-run the command",
+            input_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_reconcile_apply_tx(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+    plan: &ReconcilePlan,
+    collision_renames: &HashMap<String, String>,
+) -> Result<ReconcileApplyOutcome> {
+    // DB witness: the events table must be exactly as planned.
+    let (events_before, events_max_before) = storage.events_table_witness()?;
+    if events_before != plan.witness.events_count || events_max_before != plan.witness.events_max_id
+    {
+        return Err(reconcile_config_error(
+            "database events changed since the reconcile plan was computed; re-run the command",
+        ));
+    }
+
+    // Fresh in-transaction metadata: classification must be re-derived from
+    // live state, then compared row-by-row against the plan.
+    let metadata = load_import_metadata_maps(storage)?;
+
+    let mut outcome = ReconcileApplyOutcome::default();
+    let mut import_result = ImportResult::default();
+    let mut export_hash_batch: Vec<(String, String)> = Vec::new();
+    let mut export_hash_ids = HashSet::new();
+    let mut applied_ids: Vec<String> = Vec::new();
+    let mut action_index = 0usize;
+
+    let (record_count, ephemeral_skipped) = for_each_reconcile_classified_row(
+        input_path,
+        config,
+        &metadata,
+        |line_num, mut issue, action, target_id| {
+            let planned = plan.actions.get(action_index).ok_or_else(|| {
+                reconcile_config_error(
+                    "JSONL gained rows since the reconcile plan was computed; re-run the command",
+                )
+            })?;
+            let kind = reconcile_kind_for_action(action);
+            if planned.line != line_num
+                || planned.incoming_id != issue.id
+                || planned.target_id != target_id
+                || planned.kind != kind
+            {
+                return Err(reconcile_config_error(format!(
+                    "database or JSONL changed between plan and apply at line {line_num} \
+                     (planned {:?} {} -> {}, found {:?} {} -> {}); transaction rolled back",
+                    planned.kind, planned.incoming_id, planned.target_id, kind, issue.id, target_id,
+                )));
+            }
+            action_index += 1;
+
+            let computed_hash = crate::util::content_hash(&issue);
+            apply_collision_renames(&mut issue, collision_renames);
+            process_import_action(storage, action, &issue, &mut import_result)?;
+
+            match kind {
+                ReconcileActionKind::Create | ReconcileActionKind::Update => {
+                    applied_ids.push(target_id.to_string());
+                }
+                ReconcileActionKind::SkipOlder
+                | ReconcileActionKind::SkipEqual
+                | ReconcileActionKind::SkipTombstone => {}
+            }
+
+            if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+                storage,
+                action,
+                target_id,
+                &issue,
+                &computed_hash,
+            )? {
+                if export_hash_ids.insert(export_id.clone()) {
+                    export_hash_batch.push((export_id, export_hash));
+                }
+            } else {
+                outcome.uncertified_local_wins += 1;
+            }
+            Ok(())
+        },
+    )?;
+
+    if action_index != plan.actions.len() {
+        return Err(reconcile_config_error(
+            "JSONL lost rows since the reconcile plan was computed; re-run the command",
+        ));
+    }
+
+    if !export_hash_batch.is_empty() {
+        storage.set_changed_export_hashes_in_tx(&export_hash_batch)?;
+    }
+
+    outcome.created = import_result.created_count;
+    outcome.updated = import_result.updated_count;
+    outcome.skipped_older = plan.count_kind(ReconcileActionKind::SkipOlder);
+    outcome.skipped_equal = plan.count_kind(ReconcileActionKind::SkipEqual);
+    outcome.skipped_tombstone = import_result.tombstone_skipped;
+    outcome.ephemeral_skipped = ephemeral_skipped;
+    outcome.labels_imported = import_result.labels_imported;
+    outcome.dependencies_imported = import_result.dependencies_imported;
+    outcome.comments_imported = import_result.comments_imported;
+    outcome.export_hashes_recorded = export_hash_ids.len();
+    if record_count != plan.record_count {
+        return Err(reconcile_config_error(
+            "JSONL record count changed since the reconcile plan was computed; re-run the command",
+        ));
+    }
+
+    if !applied_ids.is_empty() {
+        applied_ids.sort();
+        applied_ids.dedup();
+        outcome.orphan_dependencies_cleaned =
+            storage.delete_orphan_dependencies_for_issues_in_tx(&applied_ids)?;
+        if outcome.orphan_dependencies_cleaned > 0 {
+            tracing::info!(
+                count = outcome.orphan_dependencies_cleaned,
+                "Reconcile removed dangling dependency rows from applied issues"
+            );
+        }
+        outcome.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+        outcome.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    }
+
+    // Repair the import metadata inside the same transaction so the
+    // false-equal stored hash cannot survive a successful apply.
+    let observed = observed_jsonl_witness(input_path)?;
+    if observed.mtime_witness != plan.witness.jsonl_mtime_witness
+        || observed.size != plan.witness.jsonl_size
+    {
+        return Err(reconcile_config_error(format!(
+            "JSONL file {} changed during reconcile apply; transaction rolled back",
+            input_path.display()
+        )));
+    }
+    storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+    storage.set_metadata_in_tx(
+        METADATA_JSONL_CONTENT_HASH,
+        &plan.witness.jsonl_content_hash,
+    )?;
+    record_observed_jsonl_witness_in_tx(storage, &observed)?;
+    outcome.metadata_repaired = true;
+
+    if outcome.uncertified_local_wins > 0 || !plan.db_only_ids.is_empty() {
+        tracing::debug!(
+            uncertified_local_wins = outcome.uncertified_local_wins,
+            db_only = plan.db_only_ids.len(),
+            "Reconcile preserved local records that diverge from JSONL; marking database for flush"
+        );
+        storage.set_metadata_in_tx("needs_flush", "true")?;
+        outcome.needs_flush_set = true;
+    }
+
+    // Hard guarantee: reconcile never creates, mutates, or deletes events.
+    let (events_after, events_max_after) = storage.events_table_witness()?;
+    if events_after != events_before || events_max_after != events_max_before {
+        return Err(reconcile_config_error(
+            "reconcile apply would have changed audit events; transaction rolled back",
+        ));
+    }
+    outcome.events_after = events_after;
+
+    Ok(outcome)
+}
+
+// ============================================================================
 // 3-Way Merge Types and Functions
 // ============================================================================
 

@@ -27,6 +27,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "ReadyIssue",
     "StaleIssue",
     "Statistics",
+    "SyncReconcileReceipt",
     "TreeNode",
 ];
 

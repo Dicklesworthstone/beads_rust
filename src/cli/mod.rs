@@ -2814,6 +2814,23 @@ pub struct SyncArgs {
     #[arg(long)]
     pub merge: bool,
 
+    /// Additively reconcile JSONL into the database (JSONL → DB, lossless)
+    ///
+    /// Classifies every JSONL row against full issue state instead of the
+    /// cached content hash, then applies creates and timestamp-newer updates
+    /// in place. Never resets tables, never deletes issues, never writes
+    /// events or JSONL, and preserves all audit history. Combine with
+    /// --dry-run to preview the plan without any mutation.
+    #[arg(long)]
+    pub reconcile: bool,
+
+    /// Preview the reconcile plan without mutating anything
+    ///
+    /// Only valid with --reconcile. Opens no write transaction and performs
+    /// no metadata, cache, dirty-marker, JSONL, or base-snapshot writes.
+    #[arg(long, requires = "reconcile")]
+    pub dry_run: bool,
+
     /// Show sync status (read-only)
     ///
     /// Displays hash comparison and freshness info without modifications.

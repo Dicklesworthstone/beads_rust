@@ -33,16 +33,24 @@
 | `--flush-only` | Yes* | N/A | Export DB → JSONL | Explicit |
 | `--import-only` | Yes* | N/A | Import JSONL → DB | Explicit |
 | `--merge` | Yes* | N/A | Three-way merge base + DB + JSONL | Explicit |
+| `--reconcile` | Yes* | N/A | Additive JSONL → DB reconciliation (no deletes, no JSONL writes) | Explicit |
 | `--status` | No | N/A | Show sync status (read-only) | Implicit |
 | `--force` / `-f` | No | `false` | Override safety guards | Forced |
 | `--force-db` | No | `false` | Resolve `--merge` conflicts by keeping local SQLite rows | Forced |
 | `--force-jsonl` | No | `false` | Resolve `--merge` conflicts by keeping JSONL rows | Forced |
+| `--dry-run` | No | `false` | With `--reconcile`: read-only plan preview, zero mutation | Implicit |
 | `--manifest` | No | `false` | Write export manifest | Explicit |
 | `--error-policy` | No | `strict` | Error handling mode | Explicit |
 | `--orphans` | No | `strict` | Orphan handling mode | Explicit |
 | `--robot` / `--json` | No | `false` | Machine-readable output | Implicit |
 
-*One of `--flush-only`, `--import-only`, `--merge`, or `--status` is required.
+*One of `--flush-only`, `--import-only`, `--merge`, `--reconcile`, or `--status` is required.
+
+`--reconcile` deliberately has NO force tier: it rejects `--force`,
+`--rename-prefix`, and `--orphans`. Its guards (conflict markers, duplicate
+ids, plan/apply witness verification, event-table immutability) cannot be
+bypassed; the destructive alternatives remain `--import-only --force` and
+`--import-only --rebuild`.
 
 ### 2.2 Flag Dependencies
 
@@ -57,6 +65,10 @@ br sync --merge               → OK: Three-way merge; reports unresolved confli
 br sync --merge --force       → OK: Resolve merge conflicts by newer timestamp
 br sync --merge --force-db    → OK: Resolve merge conflicts by keeping SQLite
 br sync --merge --force-jsonl → OK: Resolve merge conflicts by keeping JSONL
+br sync --reconcile --dry-run → OK: Read-only additive plan preview
+br sync --reconcile           → OK: Additive apply (creates + newer updates only)
+br sync --reconcile --force   → ERROR: reconcile has no force tier
+br sync --dry-run             → ERROR: --dry-run requires --reconcile
 ```
 
 ---

@@ -12762,6 +12762,86 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Snapshot the events table shape as an immutability witness.
+    ///
+    /// Returns `(row_count, max_rowid)`. Additive reconciliation captures this
+    /// at plan time and re-verifies it inside (and at the end of) the apply
+    /// transaction: import-path upserts never write events, so any change is
+    /// evidence of a concurrent writer and must roll the apply back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn events_table_witness(&self) -> Result<(u64, Option<i64>)> {
+        let count = self
+            .conn
+            .query_row("SELECT count(*) FROM events")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        let max_id = self
+            .conn
+            .query_row("SELECT max(id) FROM events")?
+            .get(0)
+            .and_then(SqliteValue::as_integer);
+        Ok((u64::try_from(count).unwrap_or(0), max_id))
+    }
+
+    /// Get all non-ephemeral, non-wisp issue IDs (the exportable population).
+    ///
+    /// Uses the same filter as the doctor `counts.db_vs_jsonl` check so that
+    /// DB↔JSONL set comparisons agree on the same population.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_non_ephemeral_issue_ids(&self) -> Result<Vec<String>> {
+        let rows = self.conn.query(
+            "SELECT id FROM issues \
+             WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%' \
+             ORDER BY id",
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
+    /// Delete dependency rows owned by the given issues whose target issue is
+    /// missing, inside the current write transaction.
+    ///
+    /// This is the scoped counterpart of the import path's global orphan
+    /// cleanup: additive reconciliation may only introduce dangling
+    /// `depends_on_id` references through rows it just wrote, so it must not
+    /// touch orphan rows owned by any other issue. `external:` dependency
+    /// targets are never orphans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn delete_orphan_dependencies_for_issues_in_tx(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<usize> {
+        let mut deleted = 0usize;
+        for chunk in issue_ids.chunks(IMPORT_DEPENDENCY_CHUNK_SIZE) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM dependencies \
+                 WHERE issue_id IN ({}) \
+                   AND depends_on_id NOT LIKE 'external:%' \
+                   AND depends_on_id NOT IN (SELECT id FROM issues)",
+                placeholders.join(", ")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            deleted += self.conn.execute_with_params(&sql, &params)?;
+        }
+        Ok(deleted)
+    }
+
     /// Count active project issues using default user-facing visibility.
     ///
     /// Active issues are non-closed issues, including deferred issues, while

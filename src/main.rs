@@ -837,7 +837,7 @@ const fn should_preopen_storage(
 }
 
 const fn sync_mode_opens_storage(args: &beads_rust::cli::SyncArgs) -> bool {
-    args.flush_only || args.import_only || args.merge || args.status
+    args.flush_only || args.import_only || args.merge || args.reconcile || args.status
 }
 
 const fn should_acquire_startup_write_lock(
@@ -1013,7 +1013,9 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 
 const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     match cmd {
-        Commands::Sync(args) => args.status,
+        // `--reconcile --dry-run` is read-only by contract: it plans without
+        // opening a write transaction, so it may share the status fast path.
+        Commands::Sync(args) => args.status || (args.reconcile && args.dry_run),
         Commands::Stats(_)
         | Commands::Status(_)
         | Commands::Coordination { .. }

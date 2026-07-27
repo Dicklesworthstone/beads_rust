@@ -201,6 +201,10 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 "CoordinationClaimRow",
                 schema_for_output::<CoordinationClaimRow>(),
             );
+            schemas.insert(
+                "SyncReconcileReceipt",
+                schema_for_output::<crate::cli::commands::sync::SyncReconcileReceipt>(),
+            );
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Issue => {
