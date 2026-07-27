@@ -1657,8 +1657,12 @@ fn seed_dirty_issue_and_corrupt_db(root: &Path) -> String {
         .expect("dirty issue id")
         .to_string();
 
-    // Checkpoint the WAL into the main DB, then corrupt a user page the
-    // same way the vacuum test above does.
+    // Drop any WAL/SHM sidecars so the page corruption lands in the
+    // authoritative main DB file rather than being masked by an
+    // uncheckpointed overlay. (This does not checkpoint anything — br
+    // checkpoints on clean close, so the rows are already in the main
+    // file; removal just discards the empty sidecars.) Same pattern as
+    // the vacuum test above.
     let db_path = root.join(".beads").join("beads.db");
     let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
     let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
@@ -1698,6 +1702,12 @@ fn repair_rebuild_preserves_dirty_unflushed_issue() {
     assert_eq!(
         repair["preserved_dirty_issues"], 1,
         "repair payload: {repair}"
+    );
+    assert!(
+        repair["preserved_dirty_issue_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == dirty_id.as_str())),
+        "repair payload must name the preserved issue id {dirty_id}: {repair}"
     );
 
     // The preserved issue is alive in the rebuilt store...

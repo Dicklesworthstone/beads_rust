@@ -15,7 +15,12 @@
   warning.
 - **Cost note**: plants a ~105MB file in the fixture tempdir; written
   in one buffered pass and iterated as ~104 long lines, so the suite
-  stays fast.
+  stays fast. Because `run_all.sh` retains every workspace even on
+  pass, the fixture caps its steady-state footprint: the baseline tar
+  excludes the padded JSONL (recording its sha256 + size instead), and
+  the final `post_undo` stage truncates the padding back off. A run
+  that fails any earlier stage retains the full padded file for
+  forensics.
 - **Expected exit codes**:
     - detect: 1 (warn present)
     - repair: non-zero tolerated (warning persists by design)

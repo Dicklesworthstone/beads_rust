@@ -56,6 +56,25 @@ case "$stage" in
     ;;
   post_undo)
     [ -f .beads/issues.jsonl ] || { echo "ASSERT FAIL[$stage]: issues.jsonl gone after undo" >&2; exit 1; }
+    # Final stage of a fully-passed run: shrink the retained workspace.
+    # run_all.sh keeps every fixture tempdir even on pass, and the ~105MB
+    # padding has served its purpose by now. It was appended after the
+    # real content, so truncating to the recorded pre-padding size
+    # restores the original bytes exactly. A run that FAILED any earlier
+    # stage never reaches this line, so failures retain the full padded
+    # file for forensics.
+    if [ -f .fixture_prepad_size ]; then
+      truncate -s "$(cat .fixture_prepad_size)" .beads/issues.jsonl
+    fi
+    # The padding also propagates into repair/undo artifacts: the
+    # base_jsonl fixer regenerates beads.base.jsonl as a byte copy of the
+    # padded export, and `doctor undo` preserves that copy in the run's
+    # backup slot. Sweep any padding-sized file (nothing legitimate in
+    # this fixture approaches 100MB). This invalidates redo for the
+    # retained workspace, which has already served its purpose.
+    while IFS= read -r artifact; do
+      truncate -s 0 "$artifact"
+    done < <(find . -type f -size +100M 2>/dev/null)
     ;;
   *)
     echo "unknown stage: $stage" >&2
