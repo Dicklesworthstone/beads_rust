@@ -17211,6 +17211,119 @@ mod tests {
         }
     }
 
+    /// Drift gate (beads_rust-oow2): every `fm-` id the runtime fixer
+    /// gates consult via `FixerFilter::allows` must be advertised in the
+    /// capabilities envelope's `fixers[].filter_ids` — that field is the
+    /// documented vocabulary for `--only`/`--skip`, and an unadvertised
+    /// gate id is undiscoverable (its fixer is silently disabled by any
+    /// `--only` list with no way to name it back in; historically this
+    /// hid `fm-caches_indexes-partial-index-stale` entirely). And the
+    /// reverse: every advertised filter id must actually be consulted by
+    /// a gate, so the envelope cannot advertise vocabulary the runtime
+    /// ignores.
+    #[test]
+    fn every_fixer_filter_gate_id_is_advertised_in_capabilities() {
+        use std::collections::{HashMap, HashSet};
+
+        let caps =
+            crate::cli::commands::doctor_subsystems::capabilities_doctor::DoctorCapabilities::build(
+            );
+        let advertised: HashSet<&str> = caps
+            .fixers
+            .iter()
+            .flat_map(|fixer| fixer.filter_ids.iter().map(String::as_str))
+            .collect();
+
+        // Scan the runtime half of this file (everything before the test
+        // module) for the ids the gates actually consult.
+        let source = include_str!("doctor.rs");
+        let runtime = source
+            .split("#[cfg(all(test, unix))]")
+            .next()
+            .expect("split never yields zero items");
+
+        // Resolve `const FM_*` definitions to their string values.
+        let mut const_values: HashMap<String, &str> = HashMap::new();
+        for line in runtime.lines() {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix("const FM_") else {
+                continue;
+            };
+            let Some((name, value_rest)) = rest.split_once(':') else {
+                continue;
+            };
+            let mut quoted = value_rest.split('"');
+            let _ = quoted.next();
+            if let Some(value) = quoted.next() {
+                const_values.insert(format!("FM_{}", name.trim()), value);
+            }
+        }
+
+        let mut gate_ids: HashSet<String> = HashSet::new();
+        for line in runtime.lines() {
+            let mut rest = line;
+            while let Some(pos) = rest.find("allows(") {
+                let after = &rest[pos + "allows(".len()..];
+                let Some(end) = after.find(')') else { break };
+                let arg = after[..end].trim();
+                if let Some(literal) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+                    gate_ids.insert(literal.to_string());
+                } else if let Some(value) = const_values.get(arg) {
+                    gate_ids.insert((*value).to_string());
+                }
+                // Bare closure vars (the `.any(|fm| filter.allows(fm))`
+                // shape) carry no id here; the array scan below covers
+                // the constants such closures iterate.
+                rest = &after[end..];
+            }
+        }
+
+        // `filter_allows_jsonl_rebuild` consults an ARRAY of FM_
+        // constants via a closure; pull its idents from the function
+        // body (everything up to the `.iter()` that starts the closure).
+        let rebuild_body = runtime
+            .split("fn filter_allows_jsonl_rebuild")
+            .nth(1)
+            .expect("filter_allows_jsonl_rebuild present in runtime source");
+        let rebuild_array = rebuild_body
+            .split(".iter()")
+            .next()
+            .expect("split never yields zero items");
+        for token in rebuild_array.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if let Some(value) = const_values.get(token) {
+                gate_ids.insert((*value).to_string());
+            }
+        }
+
+        assert!(
+            gate_ids.len() >= 20,
+            "suspiciously few gate ids found by the source scan ({}); did the scan break?",
+            gate_ids.len()
+        );
+
+        let mut unadvertised: Vec<&String> = gate_ids
+            .iter()
+            .filter(|id| !advertised.contains(id.as_str()))
+            .collect();
+        unadvertised.sort();
+        assert!(
+            unadvertised.is_empty(),
+            "fixer gate id(s) consulted by FixerFilter::allows but missing from \
+             capabilities fixers[].filter_ids: {unadvertised:?}"
+        );
+
+        let mut unconsulted: Vec<&&str> = advertised
+            .iter()
+            .filter(|id| !gate_ids.contains(**id))
+            .collect();
+        unconsulted.sort();
+        assert!(
+            unconsulted.is_empty(),
+            "capabilities fixers[].filter_ids advertise id(s) no runtime gate \
+             consults: {unconsulted:?}"
+        );
+    }
+
     #[test]
     fn test_recoverable_db_state_filter_preserves_sidecar_fm() {
         let sidecar_only = FixerFilter::from_args(&[FM_WAL_SHM_SIDECAR_ORPHAN.to_string()], &[]);

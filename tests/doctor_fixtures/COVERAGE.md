@@ -29,7 +29,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-caches_indexes-dirty-bitmap-divergence | dirty_bitmap_orphans | detect |
 | fm-caches_indexes-export-hash-cache-divergence | export_hash_cache_divergence, duplicate_metadata_rows | detect |
 | fm-caches_indexes-labels-orphans | labels_orphans | detect |
-| fm-caches_indexes-partial-index-stale | — | exception: fixer-scope id only (gates the REINDEX repair path via the fixer filter); no check emits it as a finding and it is absent from the capabilities envelope's detectors/fixers lists |
+| fm-caches_indexes-partial-index-stale | — | exception: fixer-scope id only (gates the REINDEX repair path via the fixer filter); no check emits it as a finding, so no fixture can fire it. Advertised in the capabilities envelope via `fixers[].filter_ids` (beads_rust-oow2) |
 | fm-concurrency_primitives-orphaned-write-lock | orphaned_write_lock, mcp_serve_stale_write_lock | assert: the probe contract (GH #395) classifies a free stale-mtime lock as ok via a non-blocking flock probe under `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0`; the warn path (`stale_unprobed`) is unreachable on a workspace whose doctor startup succeeds, because an unopenable lock degrades startup first (see permissions_write_lock_unwritable) |
 | fm-configs-gitignore-leaking-beads | gitignore_leaking_beads, gitignore_bare_pattern, inner_gitignore_append | detect |
 | fm-configs-metadata-json-stale | metadata_json_drift, metadata_json_malformed | detect |

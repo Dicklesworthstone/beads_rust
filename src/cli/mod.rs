@@ -3133,12 +3133,13 @@ pub struct DoctorArgs {
     /// identifier matches one of the supplied values. Accepts
     /// comma-separated lists and repeated `--only` flags. Empty list
     /// means "run all fixers" (existing behavior). FM identifiers are
-    /// the `fm-<subsystem>-<slug>` form from the capabilities
-    /// envelope's `finding_id_map`. Currently respected by the
-    /// chokepointed fixers (gitignore_repair, merge_artifact_quarantine,
-    /// startup_cache_quarantine, recovery_artifacts_aged_quarantine,
-    /// export_hash_cache_repair); legacy `repair_*` paths run
-    /// unconditionally.
+    /// the `fm-<subsystem>-<slug>` form; the authoritative vocabulary
+    /// is the capabilities envelope's `fixers[].filter_ids` (each
+    /// fixer's gate ids — beware: an `--only` list disables every
+    /// fixer whose ids it omits, including the rebuild paths). All
+    /// repair paths respect the filter, including the legacy
+    /// `repair_*` ones (each gated on the ids its `filter_ids` row
+    /// advertises).
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub only: Vec<String>,
 
@@ -3147,7 +3148,8 @@ pub struct DoctorArgs {
     /// lists and repeated `--skip` flags. Useful when an operator
     /// wants the doctor to run everything except one known-flaky
     /// path. Applied after `--only` filtering (so `--only A --skip A`
-    /// effectively disables A).
+    /// effectively disables A). Ids come from the capabilities
+    /// envelope's `fixers[].filter_ids`.
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     pub skip: Vec<String>,
 
