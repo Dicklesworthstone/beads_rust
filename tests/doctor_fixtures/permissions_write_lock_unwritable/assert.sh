@@ -25,6 +25,28 @@ assert_lock_preserved() {
 
 case "$stage" in
   detect)
+    # Precondition re-check (beads_rust-ypwu): the fixture plants a regular
+    # 0444 `.write.lock` and needs the OS to actually refuse this uid write
+    # access to it. Environments where permission bits do not bind — root,
+    # CAP_DAC_OVERRIDE container sandboxes (some CI/remote build workers),
+    # or filesystems that drop mode bits — cannot hold the precondition, so
+    # the detector legitimately never fires there. Exit 3 is the suite's
+    # skip protocol; a precondition the environment cannot hold is not a
+    # product failure and must not read as one.
+    if [ ! -f .beads/.write.lock ] || [ -L .beads/.write.lock ]; then
+      echo "SKIP[$stage]: planted .beads/.write.lock is missing or not a regular file before doctor ran; the harness environment did not preserve the fixture state" >&2
+      exit 3
+    fi
+    mode=$(stat -c '%a' .beads/.write.lock)
+    if [ "$mode" != "444" ]; then
+      echo "SKIP[$stage]: planted .write.lock mode is $mode (expected 444) before doctor ran; the filesystem did not preserve the fixture's permission bits" >&2
+      exit 3
+    fi
+    if [ -w .beads/.write.lock ]; then
+      echo "SKIP[$stage]: uid $(id -u) can write a mode-444 file (root or CAP_DAC_OVERRIDE); this environment cannot hold the unwritable-lock precondition" >&2
+      exit 3
+    fi
+
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
     echo "$out" | jq -e '
       .ok == false
