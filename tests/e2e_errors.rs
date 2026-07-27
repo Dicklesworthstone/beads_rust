@@ -2019,6 +2019,121 @@ fn e2e_structured_error_not_initialized() {
 }
 
 #[test]
+fn e2e_partially_applied_close_batch_does_not_exit_zero() {
+    // The process-level half of the defect. `br close <blocked> <closeable>`
+    // exited 0 while printing "Warning: Skipped ..." and leaving the blocked
+    // issue untouched, because the terminal error was gated on
+    // `closed_count == 0`. docs/agent/ERRORS.md tells callers to parse stdout
+    // precisely when the exit code is 0, so the transcript — which shows an
+    // unqualified "✓ Closed" and nothing else — was certified authoritative.
+    //
+    // This asserts the real ExitStatus of the real binary, not a Result, and
+    // then reads the record back rather than trusting the output. Under the old
+    // predicate it fails at the exit-code assertion with `Some(0)`.
+    let _log = common::test_log("e2e_partially_applied_close_batch_does_not_exit_zero");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "partial_close_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(
+        &workspace,
+        ["create", "Blocker issue", "-p", "2"],
+        "partial_close_create_blocker",
+    );
+    assert!(
+        blocker.status.success(),
+        "blocker create failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(
+        &workspace,
+        ["create", "Blocked issue", "-p", "2"],
+        "partial_close_create_blocked",
+    );
+    assert!(
+        blocked.status.success(),
+        "blocked create failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let free = run_br(
+        &workspace,
+        ["create", "Independently closeable issue", "-p", "2"],
+        "partial_close_create_free",
+    );
+    assert!(free.status.success(), "free create failed: {}", free.stderr);
+    let free_id = parse_created_id(&free.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id],
+        "partial_close_dep_add",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    // One id is refused, the other closes. The batch is partially applied.
+    let close = run_br(
+        &workspace,
+        ["close", &blocked_id, &free_id, "--reason", "partial batch"],
+        "partial_close_batch",
+    );
+
+    assert!(
+        !close.status.success(),
+        "a partially applied batch must not report success; stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+    assert_eq!(
+        close.status.code(),
+        Some(3),
+        "partial close should exit 3, not 0; stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+
+    // The record is the authority, not the transcript: one closed, one refused.
+    let show_blocked = run_br(
+        &workspace,
+        ["show", &blocked_id, "--json"],
+        "partial_close_show_blocked",
+    );
+    assert!(
+        show_blocked.status.success(),
+        "show blocked failed: {}",
+        show_blocked.stderr
+    );
+    assert!(
+        show_blocked.stdout.contains("\"status\":\"open\""),
+        "the blocked issue must still be open, got: {}",
+        show_blocked.stdout
+    );
+
+    let show_free = run_br(
+        &workspace,
+        ["show", &free_id, "--json"],
+        "partial_close_show_free",
+    );
+    assert!(
+        show_free.status.success(),
+        "show free failed: {}",
+        show_free.stderr
+    );
+    assert!(
+        show_free.stdout.contains("\"status\":\"closed\""),
+        "the closeable issue should have closed, got: {}",
+        show_free.stdout
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_transition_required_fields_are_structured_fresh_and_atomic() {
     let _log = common::test_log("e2e_transition_required_fields_are_structured_fresh_and_atomic");

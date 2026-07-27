@@ -1231,14 +1231,38 @@ fn e2e_close_json_reports_closed_and_skipped_in_partial_batch() {
         ["close", &blocked_id, &independent_id, "--json"],
         "close_partial_batch",
     );
+    // EXPECTATION INVERTED DELIBERATELY [fgdb-h6kr]. This previously asserted
+    // `close.status.success()`, which froze the defect: a batch that refused one
+    // id and closed another exited 0, so callers branching on `$?` — and callers
+    // following docs/agent/ERRORS.md, which says to parse stdout precisely when
+    // the exit code is 0 — read the untouched issue as closed. A partially
+    // applied batch is now CLOSE_INCOMPLETE (exit 3).
+    //
+    // What this test is actually about is unchanged and still asserted below:
+    // the --json payload still reports BOTH the closed and the skipped issue,
+    // with the blocker detail preserved. Only the exit-status expectation moved.
     assert!(
-        close.status.success(),
-        "partial close should succeed: {}",
+        !close.status.success(),
+        "a partially applied batch must not exit 0: {}",
+        close.stderr
+    );
+    assert_eq!(
+        close.status.code(),
+        Some(3),
+        "partial close should exit 3: {}",
         close.stderr
     );
 
+    // Now that a partial batch is a failure, it follows the same #336 contract
+    // as the all-skipped case above: stdout carries TWO JSON documents, the
+    // close payload followed by the structured CLOSE_INCOMPLETE envelope. Parse
+    // just the first, exactly as `e2e_close_json_skips_blocked_issue` does.
     let payload = extract_json_payload(&close.stdout);
-    let close_json: Value = serde_json::from_str(&payload).expect("close json");
+    let close_json: Value = serde_json::Deserializer::from_str(&payload)
+        .into_iter::<Value>()
+        .next()
+        .expect("close payload document")
+        .expect("close json");
     let closed = close_json["closed"].as_array().cloned().unwrap_or_default();
     let skipped = close_json["skipped"]
         .as_array()
