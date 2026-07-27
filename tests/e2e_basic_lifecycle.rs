@@ -278,11 +278,14 @@ fn e2e_basic_lifecycle() {
         "show text missing title"
     );
 
+    // Terminal-state transitions must go through `br close` so close-policy
+    // (close-reason / AC / attribution) is enforced; `update --status closed`
+    // refuses by design (#301).
     let close_args = vec![
-        "update".to_string(),
+        "close".to_string(),
         id,
-        "--status".to_string(),
-        "closed".to_string(),
+        "--reason".to_string(),
+        "e2e lifecycle complete".to_string(),
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -360,7 +363,19 @@ fn e2e_update_description_file_preserves_exact_content() {
         "an empty file is an explicit empty-description update: {}",
         clear_to_empty.stdout
     );
-    assert_issue_description(&workspace, &issue_id, "");
+    // A cleared description reads back as null: the storage layer normalizes
+    // empty text to None on read (`get_non_empty_str`), so `Some("")` is
+    // unrepresentable after a round-trip. The contract under test is that the
+    // empty file CLEARS the previous description rather than being a no-op.
+    let show = run_br(&workspace, ["show", &issue_id, "--json"], "show_cleared");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
+    assert!(
+        issues[0]["description"].is_null(),
+        "description must be cleared to null, got: {}",
+        issues[0]["description"]
+    );
 }
 
 #[test]
