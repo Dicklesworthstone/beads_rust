@@ -28,14 +28,19 @@ br list --json --limit 5   # JSON always wins
 
 ## stderr vs stdout
 
-- Normal successful outputs go to stdout.
-- Diagnostics/logging go to stderr.
-- Some failures emit a structured JSON error object on stderr (see `docs/agent/ERRORS.md`).
+- In JSON/robot mode, the machine-readable result goes to stdout: success
+  data on exit `0`, the structured JSON error envelope on non-zero exits
+  (see `docs/agent/ERRORS.md`, including the two-document partial-batch
+  contract).
+- Diagnostics/logging (`RUST_LOG`) and non-fatal structured warnings
+  (e.g. `AUTO_FLUSH_FAILED`) go to stderr — never the error envelope.
 
 Practical pattern:
 
 ```bash
-br ready --format json 2>ready.stderr.json | jq .
+br ready --format json 2>/dev/null | jq .
+# On non-zero exit, the envelope is the last JSON document on stdout:
+br show br-NOTEXIST --json 2>/dev/null | jq -s '.[-1].error' || true
 ```
 
 ## Text wrapping (human output)
