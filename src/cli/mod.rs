@@ -761,6 +761,12 @@ pub enum Commands {
     /// Describe br's machine-readable contracts and safety guarantees
     Capabilities(CapabilitiesArgs),
 
+    /// Workflow capacity management: audited issue-specific exemptions (GitHub #384)
+    Capacity {
+        #[command(subcommand)]
+        command: CapacityCommands,
+    },
+
     /// Generate changelog from closed issues
     Changelog(ChangelogArgs),
 
@@ -821,7 +827,7 @@ pub enum Commands {
         command: GateCommands,
     },
 
-    /// Visualize dependency graph
+    /// Visualize the dependents graph: what an issue unblocks
     Graph(GraphArgs),
 
     /// Manage local history backups
@@ -1042,7 +1048,9 @@ pub struct CreateArgs {
     pub priority: Option<String>,
 
     /// Description
-    #[arg(long, short = 'd', visible_alias = "body")]
+    // Markdown bodies routinely begin with a list marker ("- item"), which
+    // clap otherwise parses as an unknown flag in the space-separated form.
+    #[arg(long, short = 'd', visible_alias = "body", allow_hyphen_values = true)]
     pub description: Option<String>,
 
     /// Read the issue description verbatim from a file (or `-` for stdin).
@@ -1146,7 +1154,9 @@ pub struct QuickArgs {
     pub labels: Vec<String>,
 
     /// Description
-    #[arg(long, short = 'd', visible_alias = "body")]
+    // Markdown bodies routinely begin with a list marker ("- item"), which
+    // clap otherwise parses as an unknown flag in the space-separated form.
+    #[arg(long, short = 'd', visible_alias = "body", allow_hyphen_values = true)]
     pub description: Option<String>,
 
     /// Parent issue ID (creates parent-child dep)
@@ -1170,7 +1180,9 @@ pub struct UpdateArgs {
     pub title: Option<String>,
 
     /// Update description
-    #[arg(long, short = 'd', visible_alias = "body")]
+    // Markdown bodies routinely begin with a list marker ("- item"), which
+    // clap otherwise parses as an unknown flag in the space-separated form.
+    #[arg(long, short = 'd', visible_alias = "body", allow_hyphen_values = true)]
     pub description: Option<String>,
 
     /// Set the issue description verbatim from a file (or `-` for stdin),
@@ -1182,20 +1194,20 @@ pub struct UpdateArgs {
     pub description_file: Option<PathBuf>,
 
     /// Update design notes
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub design: Option<String>,
 
     /// Update acceptance criteria
-    #[arg(long, visible_alias = "acceptance")]
+    #[arg(long, visible_alias = "acceptance", allow_hyphen_values = true)]
     pub acceptance_criteria: Option<String>,
 
     /// Update additional notes
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub notes: Option<String>,
 
     /// New comment bound atomically to the requested status transition.
     /// Required when policy lists `transition_comment` for the transition.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     /// Change status. Terminal states (`closed`, `tombstone`) are refused —
@@ -1594,6 +1606,12 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
             GateCommands::Report(args) => args.robot,
             GateCommands::List(args) => args.robot,
         },
+        Commands::Capacity { command } => match command {
+            CapacityCommands::Exempt(args) => args.robot,
+            CapacityCommands::Renew(args) => args.robot,
+            CapacityCommands::Revoke(args) => args.robot,
+            CapacityCommands::Exemptions(args) => args.robot,
+        },
         _ => false,
     }
 }
@@ -1673,7 +1691,7 @@ pub fn resolve_output_format_basic_with_outer_mode(
 #[derive(Args, Debug, Default, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ListArgs {
-    /// Filter by status (can be repeated)
+    /// Filter by status (can be repeated; 'all' matches every status)
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Vec<String>,
 
@@ -1863,7 +1881,7 @@ pub struct EpicCloseEligibleArgs {
     pub dry_run: bool,
 
     /// New comment committed atomically with every eligible epic close.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 }
 
@@ -1925,6 +1943,128 @@ pub struct GateListArgs {
     /// Issue ID whose gate results to show
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub id: String,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Subcommands for workflow capacity management (GitHub #384 phase 4).
+#[derive(Subcommand, Debug)]
+pub enum CapacityCommands {
+    /// Grant an audited issue-specific exemption from one named capacity
+    Exempt(CapacityExemptArgs),
+    /// Renew an active exemption's expiry
+    Renew(CapacityRenewArgs),
+    /// Revoke an active exemption
+    Revoke(CapacityRevokeArgs),
+    /// List exemption state (and optionally the append-only audit history)
+    Exemptions(CapacityExemptionsArgs),
+}
+
+/// Arguments for `br capacity exempt`.
+#[derive(Args, Debug, Clone)]
+pub struct CapacityExemptArgs {
+    /// Issue the exemption applies to (one issue, one named capacity)
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Named status capacity to exempt the issue from (e.g. blocked)
+    #[arg(long, value_name = "STATUS", conflicts_with = "group", add = ArgValueCompleter::new(status_completer))]
+    pub status: Option<String>,
+
+    /// Named capacity group to exempt the issue from
+    #[arg(long, value_name = "GROUP", conflicts_with = "status")]
+    pub group: Option<String>,
+
+    /// Approving provider; must be listed in workflow.capacity.exemptions.providers
+    #[arg(long)]
+    pub provider: String,
+
+    /// Mandatory rationale recorded with the grant
+    #[arg(long)]
+    pub reason: String,
+
+    /// Expiration: RFC3339, YYYY-MM-DD, or relative (+7d). Required when
+    /// policy sets workflow.capacity.exemptions.require_expiry
+    #[arg(long, value_name = "WHEN")]
+    pub expires: Option<String>,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br capacity renew`.
+#[derive(Args, Debug, Clone)]
+pub struct CapacityRenewArgs {
+    /// Issue whose exemption to renew
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Named status capacity of the exemption
+    #[arg(long, value_name = "STATUS", conflicts_with = "group", add = ArgValueCompleter::new(status_completer))]
+    pub status: Option<String>,
+
+    /// Named capacity group of the exemption
+    #[arg(long, value_name = "GROUP", conflicts_with = "status")]
+    pub group: Option<String>,
+
+    /// Approving provider; must be listed in workflow.capacity.exemptions.providers
+    #[arg(long)]
+    pub provider: String,
+
+    /// New expiration: RFC3339, YYYY-MM-DD, or relative (+7d)
+    #[arg(long, value_name = "WHEN")]
+    pub expires: Option<String>,
+
+    /// Optional note recorded with the renewal
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br capacity revoke`.
+#[derive(Args, Debug, Clone)]
+pub struct CapacityRevokeArgs {
+    /// Issue whose exemption to revoke
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: String,
+
+    /// Named status capacity of the exemption
+    #[arg(long, value_name = "STATUS", conflicts_with = "group", add = ArgValueCompleter::new(status_completer))]
+    pub status: Option<String>,
+
+    /// Named capacity group of the exemption
+    #[arg(long, value_name = "GROUP", conflicts_with = "status")]
+    pub group: Option<String>,
+
+    /// Revoking provider, recorded for audit (not required to be authorized)
+    #[arg(long)]
+    pub provider: String,
+
+    /// Optional note recorded with the revocation
+    #[arg(long)]
+    pub reason: Option<String>,
+
+    /// Emit machine-readable JSON
+    #[arg(long)]
+    pub robot: bool,
+}
+
+/// Arguments for `br capacity exemptions`.
+#[derive(Args, Debug, Clone)]
+pub struct CapacityExemptionsArgs {
+    /// Restrict to one issue (all exemptions when omitted)
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: Option<String>,
+
+    /// Include the append-only audit history
+    #[arg(long)]
+    pub history: bool,
 
     /// Emit machine-readable JSON
     #[arg(long)]
@@ -2126,7 +2266,12 @@ pub struct CommentAddArgs {
     pub author: Option<String>,
 
     /// Comment text (alternative flag)
-    #[arg(long = "message", short = 'm', visible_alias = "content")]
+    #[arg(
+        long = "message",
+        short = 'm',
+        visible_alias = "content",
+        allow_hyphen_values = true
+    )]
     pub message: Option<String>,
 }
 
@@ -2261,7 +2406,7 @@ pub struct CountArgs {
     #[arg(long)]
     pub by_label: bool,
 
-    /// Filter by status (repeatable or comma-separated)
+    /// Filter by status (repeatable or comma-separated; 'all' matches every status)
     #[arg(long, value_delimiter = ',', add = ArgValueCompleter::new(status_completer_delimited))]
     pub status: Vec<String>,
 
@@ -2345,7 +2490,7 @@ pub struct DeferArgs {
     pub robot: bool,
 
     /// New comment committed atomically with each defer transition.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
@@ -2375,7 +2520,7 @@ pub struct UndeferArgs {
     pub robot: bool,
 
     /// New comment committed atomically with each undefer transition.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     // Tier 1 attribution (issue #312, Layer 3 — capture-only). Recorded on the
@@ -2547,12 +2692,12 @@ pub struct CloseArgs {
     pub ids: Vec<String>,
 
     /// Close reason
-    #[arg(long, short = 'r')]
+    #[arg(long, short = 'r', allow_hyphen_values = true)]
     pub reason: Option<String>,
 
     /// New comment committed atomically with each close transition. This is
     /// distinct from close metadata in `--reason`.
-    #[arg(long, value_name = "COMMENT")]
+    #[arg(long, value_name = "COMMENT", allow_hyphen_values = true)]
     pub transition_comment: Option<String>,
 
     /// Close even if blocked by open dependencies
@@ -2608,7 +2753,7 @@ pub struct ReopenArgs {
     pub ids: Vec<String>,
 
     /// Reason for reopening (stored as a comment)
-    #[arg(long, short = 'r')]
+    #[arg(long, short = 'r', allow_hyphen_values = true)]
     pub reason: Option<String>,
 
     /// Machine-readable output (alias for --json)
@@ -2668,6 +2813,23 @@ pub struct SyncArgs {
     /// Uses `.beads/beads.base.jsonl` as the common ancestor.
     #[arg(long)]
     pub merge: bool,
+
+    /// Additively reconcile JSONL into the database (JSONL → DB, lossless)
+    ///
+    /// Classifies every JSONL row against full issue state instead of the
+    /// cached content hash, then applies creates and timestamp-newer updates
+    /// in place. Never resets tables, never deletes issues, never writes
+    /// events or JSONL, and preserves all audit history. Combine with
+    /// --dry-run to preview the plan without any mutation.
+    #[arg(long)]
+    pub reconcile: bool,
+
+    /// Preview the reconcile plan without mutating anything
+    ///
+    /// Only valid with --reconcile. Opens no write transaction and performs
+    /// no metadata, cache, dirty-marker, JSONL, or base-snapshot writes.
+    #[arg(long, requires = "reconcile")]
+    pub dry_run: bool,
 
     /// Show sync status (read-only)
     ///
@@ -3207,15 +3369,29 @@ pub struct QueryDeleteArgs {
 }
 
 /// Arguments for the graph command.
+///
+/// The traversal follows *dependents* by default — issues blocked by the root —
+/// so `br graph <id>` answers "what does closing this unblock?". An issue that
+/// is itself blocked and blocks nothing therefore reports no dependents. This
+/// is a deliberate divergence from classic `bd`, whose `graph` walks
+/// dependencies (`beads_rust-mf72`).
+///
+/// `--dependencies` walks the other way — "what is blocking this?" — so one
+/// command covers both directions. `br dep tree <id>` remains the
+/// dependency-shaped view for a single issue.
 #[derive(Args, Debug, Clone, Default)]
 pub struct GraphArgs {
-    /// Issue ID (root of graph). Required unless --all is specified.
+    /// Issue ID (root of the dependents graph). Required unless --all is specified.
     #[arg(add = ArgValueCompleter::new(open_issue_id_completer))]
     pub issue: Option<String>,
 
     /// Show graph for all `open`/`in_progress`/`blocked` issues (connected components)
     #[arg(long)]
     pub all: bool,
+
+    /// Walk dependencies instead of dependents: what is blocking this issue
+    #[arg(long, conflicts_with = "all")]
+    pub dependencies: bool,
 
     /// One line per issue (compact output)
     #[arg(long)]

@@ -211,14 +211,101 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 pub mod test_helpers {
+    use std::path::{Path, PathBuf};
     use std::sync::{LazyLock, Mutex};
+    use tempfile::TempDir;
     pub static TEST_DIR_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Whether `start` or any ancestor already contains a beads workspace or a
+    /// git checkout. Both matter: `br` resolves its workspace by walking
+    /// ancestors for `.beads/`, and the sync status helpers shell out to git,
+    /// so a temp directory inside either tree is not the isolated environment
+    /// these tests intend.
+    fn is_inside_beads_workspace(start: &Path) -> bool {
+        start.ancestors().any(|dir| {
+            dir.join(".beads").is_dir() || dir.join("_beads").is_dir() || dir.join(".git").exists()
+        })
+    }
+
+    /// A temp root guaranteed not to sit inside an existing beads workspace.
+    ///
+    /// [`crate::config::discover_beads_dir`] walks every ancestor to the
+    /// filesystem root with no `.git`-style boundary, so a `TMPDIR` inside a
+    /// checkout hands each "fresh" temp directory the enclosing repository's
+    /// `.beads/`. Tests that assert on an *uninitialized* workspace then
+    /// silently exercise the wrong one and fail.
+    ///
+    /// This is not hypothetical: rch points `TMPDIR` at `<repo>/.rch-tmp` for
+    /// remote builds, so these tests fail on every worker while passing
+    /// locally. `tests/common/cli.rs` carries the same helper for the
+    /// integration suite, which cannot be shared with `src/` unit tests.
+    ///
+    /// Prefer `TMPDIR`; fall back to a system temp root that is clean.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `TMPDIR` and every system fallback sit inside a beads
+    /// workspace or git checkout, since silently returning a polluted root
+    /// would make the calling test assert against the wrong workspace.
+    #[must_use]
+    pub fn isolated_temp_root() -> PathBuf {
+        let preferred = std::env::temp_dir();
+        if !is_inside_beads_workspace(&preferred) {
+            return preferred;
+        }
+
+        for fallback in ["/tmp", "/var/tmp"] {
+            let path = PathBuf::from(fallback);
+            if path.is_dir() && !is_inside_beads_workspace(&path) {
+                return path;
+            }
+        }
+
+        panic!(
+            "no beads-free temp root available: TMPDIR ({}) is inside a beads workspace \
+             and no system fallback is clean. Set TMPDIR to a directory outside any \
+             .beads/ tree before running the test suite.",
+            preferred.display()
+        );
+    }
+
+    /// A [`TempDir`] created outside any beads workspace.
+    ///
+    /// Use this instead of `TempDir::new()` in any test whose subject resolves
+    /// a beads workspace by walking ancestors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no clean temp root exists or the directory cannot be
+    /// created.
+    #[must_use]
+    pub fn isolated_temp_dir() -> TempDir {
+        TempDir::new_in(isolated_temp_root()).expect("isolated temp dir")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn isolated_temp_root_is_beads_free_and_usable() {
+        let root = test_helpers::isolated_temp_root();
+        assert!(
+            root.is_dir(),
+            "temp root {} is not a directory",
+            root.display()
+        );
+        // The whole point: nothing above a temp dir created here may supply a
+        // workspace to `discover_beads_dir`'s unbounded ancestor walk.
+        let temp = test_helpers::isolated_temp_dir();
+        assert!(
+            crate::config::discover_beads_dir(Some(temp.path())).is_err(),
+            "temp dir {} resolved a beads workspace; TMPDIR is inside one",
+            temp.path().display()
+        );
+    }
 
     #[test]
     fn test_set_get_clear_last_touched() {

@@ -4,7 +4,7 @@ Usage: br list [OPTIONS]
 
 Options:
   -s, --status <STATUS>
-          Filter by status (can be repeated)
+          Filter by status (can be repeated; 'all' matches every status)
 
   -t, --type <TYPE>
           Filter by issue type (can be repeated)

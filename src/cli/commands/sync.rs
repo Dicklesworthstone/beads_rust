@@ -18,9 +18,11 @@ use crate::sync::witness::{
 use crate::sync::{
     ConflictResolution, ExportConfig, ExportEntityType, ExportError, ExportErrorPolicy,
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_LAST_EXPORT_TIME,
-    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, analyze_jsonl, compute_jsonl_hash,
-    compute_staleness, export_temp_path, export_to_jsonl_with_policy, finalize_export,
-    get_issue_ids_from_jsonl, id_matches_expected_prefix, import_from_jsonl, load_base_snapshot,
+    METADATA_LAST_IMPORT_TIME, MergeContext, OrphanMode, ReconcileActionKind,
+    ReconcileApplyOutcome, ReconcilePlan, SYNC_RECONCILE_SCHEMA_VERSION, analyze_jsonl,
+    apply_additive_reconcile, compute_jsonl_hash, compute_staleness, export_temp_path,
+    export_to_jsonl_with_policy, finalize_export, get_issue_ids_from_jsonl,
+    id_matches_expected_prefix, import_from_jsonl, load_base_snapshot, plan_additive_reconcile,
     read_issues_from_jsonl, refresh_base_snapshot_from_flushed_jsonl,
     require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
     save_base_snapshot_from_jsonl, scan_jsonl_for_tombstone_filter, snapshot_tombstones,
@@ -61,6 +63,138 @@ pub struct ImportResultOutput {
     pub tombstone_skipped: usize,
     pub orphans_removed: usize,
     pub blocked_cache_rebuilt: bool,
+}
+
+/// Maximum ids serialized per preview list in a reconcile receipt.
+///
+/// Mirrors the doctor `IdDelta` preview cap: operators want the first few
+/// divergent ids to grep for; counts always reflect the true totals.
+const RECONCILE_PREVIEW_LIMIT: usize = 50;
+
+/// Versioned receipt for `br sync --reconcile` (`br.sync.reconcile.v1`).
+///
+/// Emitted by both `--dry-run` (plan only, `applied: false`) and apply
+/// (`applied: true`, with the `apply` block present). Deletion is impossible
+/// in this mode, so `plan.deleted` is a constant `0`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SyncReconcileReceipt {
+    /// Receipt schema identifier (`br.sync.reconcile.v1`).
+    pub schema_version: &'static str,
+    /// `"dry_run"` or `"apply"`.
+    pub mode: &'static str,
+    /// True when the plan was applied to the database.
+    pub applied: bool,
+    /// Resolved JSONL path the plan was computed against.
+    pub jsonl_path: String,
+    /// Source (JSONL) witness the plan is bound to.
+    pub source: ReconcileSourceWitness,
+    /// Target (database) witness the plan is bound to.
+    pub target: ReconcileTargetWitness,
+    /// Row classification counts.
+    pub plan: ReconcilePlanCounts,
+    /// Bounded id previews for the classified sets.
+    pub previews: ReconcileIdPreviews,
+    /// Relation rows carried by planned create/update rows.
+    pub relations: ReconcileRelationCounts,
+    /// Event rows before the operation.
+    pub events_before: u64,
+    /// Event rows after the operation (always equals `events_before`; the
+    /// apply transaction rolls back otherwise).
+    pub events_after: u64,
+    /// Apply-only details; absent in dry-run receipts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply: Option<ReconcileApplyReceipt>,
+}
+
+/// JSONL-side witness in a reconcile receipt.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReconcileSourceWitness {
+    /// Non-empty JSONL rows parsed (including ephemeral rows).
+    pub record_count: usize,
+    /// Ephemeral (`-wisp-`) rows excluded from planning.
+    pub ephemeral_skipped: usize,
+    /// Whitespace-normalized SHA-256 of the JSONL content.
+    pub content_hash: String,
+    /// RFC3339 mtime of the JSONL file at plan time.
+    pub mtime: String,
+    /// Byte size of the JSONL file at plan time.
+    pub size_bytes: u64,
+}
+
+/// Database-side witness in a reconcile receipt.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReconcileTargetWitness {
+    /// Total issue rows at plan time (including tombstones).
+    pub db_issue_count: usize,
+    /// Whether the stored `jsonl_content_hash` metadata already matched the
+    /// file at plan time. True alongside nonzero `created`/`updated` counts
+    /// is the false-equal state this mode repairs.
+    pub stored_hash_matches_jsonl: bool,
+}
+
+/// Row classification counts in a reconcile receipt.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReconcilePlanCounts {
+    /// JSONL rows with no DB counterpart (inserted on apply).
+    pub created: usize,
+    /// JSONL rows strictly newer than their DB counterpart (updated on apply).
+    pub updated: usize,
+    /// Rows skipped because timestamps are equal.
+    pub skipped_equal: usize,
+    /// Rows skipped because the DB copy is strictly newer.
+    pub skipped_older: usize,
+    /// Rows skipped by tombstone protection.
+    pub skipped_tombstone: usize,
+    /// Always 0: additive reconciliation cannot delete.
+    pub deleted: usize,
+    /// Exportable DB issues absent from the JSONL row set (never touched).
+    pub db_only: usize,
+}
+
+/// Bounded id previews in a reconcile receipt.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReconcileIdPreviews {
+    /// First ids (sorted) that would be / were created.
+    pub created_ids: Vec<String>,
+    /// First ids (sorted) that would be / were updated.
+    pub updated_ids: Vec<String>,
+    /// First exportable DB-only ids (sorted).
+    pub db_only_ids: Vec<String>,
+    /// Per-list truncation cap; counts in `plan` reflect true totals.
+    pub preview_limit: usize,
+}
+
+/// Relation rows carried by planned create/update rows.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReconcileRelationCounts {
+    /// Label rows.
+    pub labels: usize,
+    /// Dependency rows.
+    pub dependencies: usize,
+    /// Comment rows.
+    pub comments: usize,
+}
+
+/// Apply-only block of a reconcile receipt.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ReconcileApplyReceipt {
+    /// Export-hash rows recorded for rows whose DB copy now matches JSONL.
+    pub export_hashes_recorded: usize,
+    /// Skipped rows whose DB copy still differs from JSONL (local wins that
+    /// need a future flush).
+    pub uncertified_local_wins: usize,
+    /// Dangling dependency rows removed from just-written issues.
+    pub orphan_dependencies_cleaned: usize,
+    /// Blocked-cache rows after rebuild (0 when no row changed).
+    pub blocked_cache_entries: usize,
+    /// Child-counter rows after rebuild (0 when no row changed).
+    pub child_counter_entries: usize,
+    /// Whether `needs_flush` was set because local state still diverges from
+    /// JSONL (db-only rows or uncertified local wins).
+    pub needs_flush_set: bool,
+    /// Whether import metadata (content hash + stat witness + import time)
+    /// was repaired in the apply transaction.
+    pub metadata_repaired: bool,
 }
 
 /// Sync status information.
@@ -189,6 +323,7 @@ enum SyncOperation {
     Flush,
     Merge,
     Import,
+    Reconcile,
     Unspecified,
 }
 
@@ -312,12 +447,13 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         + u8::from(args.flush_only)
         + u8::from(args.import_only)
         + u8::from(args.merge)
+        + u8::from(args.reconcile)
         + u8::from(args.witness);
     if mode_count > 1 {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify exactly one of --flush-only, --import-only, --merge, --status, or --witness"
+                "Must specify exactly one of --flush-only, --import-only, --merge, --reconcile, --status, or --witness"
                     .to_string(),
         });
     }
@@ -325,9 +461,36 @@ fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
         return Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify one of --flush-only, --import-only, --merge, --status, or --witness"
+                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --status, or --witness"
                     .to_string(),
         });
+    }
+
+    if args.reconcile {
+        if args.force {
+            return Err(BeadsError::Validation {
+                field: "force".to_string(),
+                reason: "--force cannot be used with --reconcile; reconcile is always additive \
+                         and guarded (use --import-only --force for a destructive import)"
+                    .to_string(),
+            });
+        }
+        if args.rename_prefix {
+            return Err(BeadsError::Validation {
+                field: "rename_prefix".to_string(),
+                reason: "--rename-prefix cannot be used with --reconcile; reconcile never \
+                         rewrites issue ids"
+                    .to_string(),
+            });
+        }
+        if args.orphans.is_some() {
+            return Err(BeadsError::Validation {
+                field: "orphans".to_string(),
+                reason: "--orphans cannot be used with --reconcile; reconcile only removes \
+                         dangling dependency references from rows it just wrote"
+                    .to_string(),
+            });
+        }
     }
 
     if args.witness && args.witness_chunk_lines == 0 {
@@ -551,10 +714,17 @@ fn dispatch_sync_subcommand(
             &options.db_path,
             ctx,
         ),
+        SyncOperation::Reconcile => execute_reconcile(
+            &mut open_result.storage,
+            path_policy,
+            args,
+            options.use_json,
+            ctx,
+        ),
         SyncOperation::Unspecified => Err(BeadsError::Validation {
             field: "mode".to_string(),
             reason:
-                "Must specify one of --flush-only, --import-only, --merge, --status, or --witness"
+                "Must specify one of --flush-only, --import-only, --merge, --reconcile, --status, or --witness"
                     .to_string(),
         }),
     }
@@ -588,6 +758,8 @@ fn sync_operation(args: &SyncArgs) -> SyncOperation {
         SyncOperation::Merge
     } else if args.import_only {
         SyncOperation::Import
+    } else if args.reconcile {
+        SyncOperation::Reconcile
     } else {
         SyncOperation::Unspecified
     }
@@ -2648,6 +2820,195 @@ fn detect_prefix_from_jsonl(jsonl_path: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// Execute the --reconcile operation (additive JSONL→DB reconciliation).
+///
+/// Plans read-only, then either emits the plan receipt (`--dry-run`) or
+/// applies it through `apply_additive_reconcile`, which re-verifies the
+/// plan's witnesses inside a single write transaction and rolls back on any
+/// mismatch. Deletion is impossible in this mode and no JSONL, base
+/// snapshot, or event rows are ever written.
+fn execute_reconcile(
+    storage: &mut crate::storage::SqliteStorage,
+    path_policy: &SyncPathPolicy,
+    args: &SyncArgs,
+    use_json: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let jsonl_path = &path_policy.jsonl_path;
+    info!(
+        jsonl_path = %jsonl_path.display(),
+        dry_run = args.dry_run,
+        "Starting additive reconcile"
+    );
+
+    let import_config = ImportConfig {
+        // Mixed prefixes are supported and reconcile never rewrites ids.
+        skip_prefix_validation: true,
+        rename_on_import: false,
+        clear_duplicate_external_refs: false,
+        orphan_mode: OrphanMode::Strict,
+        force_upsert: false,
+        beads_dir: Some(path_policy.beads_dir.clone()),
+        allow_external_jsonl: path_policy.allow_external_jsonl,
+        show_progress: false,
+    };
+
+    let plan = plan_additive_reconcile(storage, jsonl_path, &import_config)?;
+    debug!(
+        records = plan.record_count,
+        creates = plan.count_kind(ReconcileActionKind::Create),
+        updates = plan.count_kind(ReconcileActionKind::Update),
+        db_only = plan.db_only_ids.len(),
+        stored_hash_matches_jsonl = plan.stored_hash_matches_jsonl,
+        "Reconcile plan computed"
+    );
+
+    let outcome = if args.dry_run {
+        None
+    } else {
+        Some(apply_additive_reconcile(
+            storage,
+            jsonl_path,
+            &import_config,
+            &plan,
+        )?)
+    };
+
+    let receipt = build_reconcile_receipt(jsonl_path, &plan, outcome.as_ref());
+
+    if use_json {
+        ctx.json_pretty(&receipt);
+    } else if should_render_human_sync_output(ctx, use_json) {
+        render_reconcile_receipt_text(&receipt);
+    }
+    Ok(())
+}
+
+fn build_reconcile_receipt(
+    jsonl_path: &Path,
+    plan: &ReconcilePlan,
+    outcome: Option<&ReconcileApplyOutcome>,
+) -> SyncReconcileReceipt {
+    let truncate = |mut ids: Vec<String>| {
+        ids.truncate(RECONCILE_PREVIEW_LIMIT);
+        ids
+    };
+    let mut db_only_preview = plan.db_only_ids.clone();
+    db_only_preview.truncate(RECONCILE_PREVIEW_LIMIT);
+
+    SyncReconcileReceipt {
+        schema_version: SYNC_RECONCILE_SCHEMA_VERSION,
+        mode: if outcome.is_some() {
+            "apply"
+        } else {
+            "dry_run"
+        },
+        applied: outcome.is_some(),
+        jsonl_path: jsonl_path.display().to_string(),
+        source: ReconcileSourceWitness {
+            record_count: plan.record_count,
+            ephemeral_skipped: plan.ephemeral_skipped,
+            content_hash: plan.witness.jsonl_content_hash.clone(),
+            mtime: plan.witness.jsonl_mtime_witness.clone(),
+            size_bytes: plan.witness.jsonl_size,
+        },
+        target: ReconcileTargetWitness {
+            db_issue_count: plan.witness.db_issue_count,
+            stored_hash_matches_jsonl: plan.stored_hash_matches_jsonl,
+        },
+        plan: ReconcilePlanCounts {
+            created: plan.count_kind(ReconcileActionKind::Create),
+            updated: plan.count_kind(ReconcileActionKind::Update),
+            skipped_equal: plan.count_kind(ReconcileActionKind::SkipEqual),
+            skipped_older: plan.count_kind(ReconcileActionKind::SkipOlder),
+            skipped_tombstone: plan.count_kind(ReconcileActionKind::SkipTombstone),
+            deleted: 0,
+            db_only: plan.db_only_ids.len(),
+        },
+        previews: ReconcileIdPreviews {
+            created_ids: truncate(plan.target_ids_for_kind(ReconcileActionKind::Create)),
+            updated_ids: truncate(plan.target_ids_for_kind(ReconcileActionKind::Update)),
+            db_only_ids: db_only_preview,
+            preview_limit: RECONCILE_PREVIEW_LIMIT,
+        },
+        relations: ReconcileRelationCounts {
+            labels: plan.labels_planned,
+            dependencies: plan.dependencies_planned,
+            comments: plan.comments_planned,
+        },
+        events_before: plan.witness.events_count,
+        events_after: outcome.map_or(plan.witness.events_count, |o| o.events_after),
+        apply: outcome.map(|o| ReconcileApplyReceipt {
+            export_hashes_recorded: o.export_hashes_recorded,
+            uncertified_local_wins: o.uncertified_local_wins,
+            orphan_dependencies_cleaned: o.orphan_dependencies_cleaned,
+            blocked_cache_entries: o.blocked_cache_entries,
+            child_counter_entries: o.child_counter_entries,
+            needs_flush_set: o.needs_flush_set,
+            metadata_repaired: o.metadata_repaired,
+        }),
+    }
+}
+
+fn render_reconcile_receipt_text(receipt: &SyncReconcileReceipt) {
+    if receipt.applied {
+        println!("Reconciled JSONL into database (additive):");
+    } else {
+        println!("Reconcile plan (dry run, nothing changed):");
+    }
+    println!(
+        "  JSONL records: {} ({} ephemeral skipped)",
+        receipt.source.record_count, receipt.source.ephemeral_skipped
+    );
+    println!(
+        "  Create: {}  Update: {}  Delete: {} (structurally impossible)",
+        receipt.plan.created, receipt.plan.updated, receipt.plan.deleted
+    );
+    println!(
+        "  Skipped: {} equal, {} older-in-JSONL, {} tombstone-protected",
+        receipt.plan.skipped_equal, receipt.plan.skipped_older, receipt.plan.skipped_tombstone
+    );
+    if receipt.plan.db_only > 0 {
+        println!(
+            "  DB-only issues (absent from JSONL, untouched): {}",
+            receipt.plan.db_only
+        );
+    }
+    println!(
+        "  Events: {} before, {} after (preserved)",
+        receipt.events_before, receipt.events_after
+    );
+    if receipt.target.stored_hash_matches_jsonl
+        && (receipt.plan.created > 0 || receipt.plan.updated > 0)
+    {
+        println!(
+            "  Note: stored content hash matched the JSONL while rows diverged (false-equal state)"
+        );
+    }
+    if let Some(apply) = &receipt.apply {
+        println!(
+            "  Relations written: {} labels, {} dependencies, {} comments",
+            receipt.relations.labels, receipt.relations.dependencies, receipt.relations.comments
+        );
+        if apply.orphan_dependencies_cleaned > 0 {
+            println!(
+                "  Dangling dependency rows removed: {}",
+                apply.orphan_dependencies_cleaned
+            );
+        }
+        if apply.metadata_repaired {
+            println!("  Sync metadata repaired (content hash + witness recorded)");
+        }
+        if apply.needs_flush_set {
+            println!(
+                "  Local state still diverges from JSONL; database marked for flush (run: br sync --flush-only)"
+            );
+        }
+    } else {
+        println!("  Run without --dry-run to apply.");
+    }
+}
+
 /// Execute the --merge operation.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn execute_merge(
@@ -3496,7 +3857,9 @@ mod tests {
 
     #[test]
     fn test_git_export_status_unavailable_outside_git_repo() {
-        let temp = TempDir::new().unwrap();
+        // Must sit outside any checkout: a TMPDIR inside one would make this
+        // temp dir part of a real git repo and the status would be available.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
         let jsonl_path = temp.path().join("issues.jsonl");
         fs::write(&jsonl_path, "{\"id\":\"bd-x\"}\n").unwrap();
 

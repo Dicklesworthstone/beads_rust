@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 15;
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 
 /// The complete SQL schema for the beads database.
@@ -309,6 +309,70 @@ pub const SCHEMA_SQL: &str = r"
         ON gate_result_history(issue_id, id);
     CREATE INDEX IF NOT EXISTS idx_gate_result_history_scope
         ON gate_result_history(issue_id, from_status, to_status, status_revision, id);
+
+    -- Audited issue-specific capacity exemptions (GitHub #384 phase 4).
+    -- One row per (issue, capacity): the latest exemption state. Like
+    -- gate_results, project-local auxiliary metadata — never synced to
+    -- JSONL. A re-grant replaces the state row; the append-only history
+    -- table below preserves every action.
+    CREATE TABLE IF NOT EXISTS capacity_exemptions (
+        issue_id TEXT NOT NULL,
+        capacity_kind TEXT NOT NULL,
+        capacity_name TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        granted_by TEXT NOT NULL,
+        granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        expires_at DATETIME,
+        ended_at DATETIME,
+        ended_action TEXT,
+        ended_by TEXT,
+        PRIMARY KEY (issue_id, capacity_kind, capacity_name),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_capacity_exemptions_capacity
+        ON capacity_exemptions(capacity_kind, capacity_name);
+
+    -- Append-only capacity-exemption audit history: grant, renew, revoke,
+    -- expire, and left_status actions with actor/provider attribution.
+    CREATE TABLE IF NOT EXISTS capacity_exemption_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        capacity_kind TEXT NOT NULL,
+        capacity_name TEXT NOT NULL,
+        action TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        reason TEXT,
+        actor TEXT NOT NULL,
+        expires_at DATETIME,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
+        ON capacity_exemption_history(issue_id, id);
+
+    -- Capacity occupancy attribution (GitHub #384 phase 5). One row per
+    -- issue recording who moved it into its CURRENT status (acting actor
+    -- plus self-reported agent/harness/session attribution). Written on
+    -- every committed status transition; scoped capacity limits count
+    -- against these keys. Project-local — never synced to JSONL, and
+    -- deliberately not written by JSONL import (import is state
+    -- replication, not admission).
+    CREATE TABLE IF NOT EXISTS capacity_occupancy (
+        issue_id TEXT PRIMARY KEY,
+        actor TEXT,
+        agent_name TEXT,
+        harness TEXT,
+        session TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_actor
+        ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_harness
+        ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
+        ON capacity_occupancy(session) WHERE session IS NOT NULL;
 ";
 
 /// Split a SQL script into individual statements, respecting string literals,
@@ -1702,6 +1766,83 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         )?;
     }
 
+    // v16 (GitHub #384 phase 4): audited issue-specific capacity exemptions.
+    // A state table holds the latest exemption per (issue, capacity); an
+    // append-only history table preserves every grant/renew/revoke/expire/
+    // left_status action. Pure additive — new tables only, no row rewrites.
+    if user_version < 16 {
+        tracing::info!(
+            "Migrating database to schema version 16 (capacity exemptions - GitHub #384 phase 4)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS capacity_exemptions (
+                issue_id TEXT NOT NULL,
+                capacity_kind TEXT NOT NULL,
+                capacity_name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                granted_by TEXT NOT NULL,
+                granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME,
+                ended_at DATETIME,
+                ended_action TEXT,
+                ended_by TEXT,
+                PRIMARY KEY (issue_id, capacity_kind, capacity_name),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capacity_exemptions_capacity
+                ON capacity_exemptions(capacity_kind, capacity_name);
+            CREATE TABLE IF NOT EXISTS capacity_exemption_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                capacity_kind TEXT NOT NULL,
+                capacity_name TEXT NOT NULL,
+                action TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                reason TEXT,
+                actor TEXT NOT NULL,
+                expires_at DATETIME,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
+                ON capacity_exemption_history(issue_id, id);
+        ",
+        )?;
+    }
+
+    // v17 (GitHub #384 phase 5): capacity occupancy attribution. One row per
+    // issue recording who moved it into its current status, so actor/
+    // harness/session capacity scopes can count occupancy inside the
+    // admission transaction. Pure additive — a new table only.
+    if user_version < 17 {
+        tracing::info!(
+            "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
+        );
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS capacity_occupancy (
+                issue_id TEXT PRIMARY KEY,
+                actor TEXT,
+                agent_name TEXT,
+                harness TEXT,
+                session TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_actor
+                ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_harness
+                ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
+                ON capacity_occupancy(session) WHERE session IS NOT NULL;
+        ",
+        )?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -1997,14 +2138,11 @@ mod tests {
 
     #[test]
     fn test_apply_schema() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("Failed to apply schema");
 
         // Verify a few tables exist
@@ -2296,6 +2434,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_v16_adds_capacity_exemption_tables() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP TABLE capacity_exemption_history")
+            .unwrap();
+        conn.execute("DROP TABLE capacity_exemptions").unwrap();
+        conn.execute("PRAGMA user_version = 15").unwrap();
+
+        run_migrations(&conn, false).expect("v16 migration should succeed");
+
+        assert!(table_exists(&conn, "capacity_exemptions"));
+        for column in [
+            "issue_id",
+            "capacity_kind",
+            "capacity_name",
+            "provider",
+            "reason",
+            "granted_by",
+            "granted_at",
+            "expires_at",
+            "ended_at",
+            "ended_action",
+            "ended_by",
+        ] {
+            assert!(
+                column_exists(&conn, "capacity_exemptions", column),
+                "v16 migration missing capacity_exemptions.{column}"
+            );
+        }
+        assert!(table_exists(&conn, "capacity_exemption_history"));
+        for column in [
+            "id",
+            "issue_id",
+            "capacity_kind",
+            "capacity_name",
+            "action",
+            "provider",
+            "reason",
+            "actor",
+            "expires_at",
+            "recorded_at",
+        ] {
+            assert!(
+                column_exists(&conn, "capacity_exemption_history", column),
+                "v16 migration missing capacity_exemption_history.{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_v17_adds_capacity_occupancy_table() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP TABLE capacity_occupancy").unwrap();
+        conn.execute("PRAGMA user_version = 16").unwrap();
+
+        run_migrations(&conn, false).expect("v17 migration should succeed");
+
+        assert!(table_exists(&conn, "capacity_occupancy"));
+        for column in [
+            "issue_id",
+            "actor",
+            "agent_name",
+            "harness",
+            "session",
+            "recorded_at",
+        ] {
+            assert!(
+                column_exists(&conn, "capacity_occupancy", column),
+                "v17 migration missing capacity_occupancy.{column}"
+            );
+        }
+    }
+
     /// Regression for beads_rust#290: legacy DBs that pre-date the
     /// `marked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP` definition
     /// kept `dirty_issues.marked_at` as a plain NOT NULL column with no
@@ -2547,14 +2766,11 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn test_schema_parity_conformance() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("Failed to apply schema");
 
         // === ISSUES TABLE ===
@@ -2840,14 +3056,11 @@ mod tests {
     /// Test that migrations correctly upgrade old schemas.
     #[test]
     fn test_migration_blocked_cache_upgrade() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
 
         // Create old-style blocked_issues_cache with blocked_by_json
         // Using a complete issues table schema so index migrations succeed
@@ -3000,14 +3213,11 @@ mod tests {
     /// Migration: drop old blocked_issues_cache missing issue_id column.
     #[test]
     fn test_migration_blocked_cache_missing_issue_id() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
 
         // Old-style cache table with 'id' column instead of 'issue_id'
         // Using a complete issues table schema so index migrations succeed
@@ -3093,14 +3303,11 @@ mod tests {
     /// Migration: add missing issue columns for older schemas.
     #[test]
     fn test_migration_adds_missing_issue_columns() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3151,14 +3358,11 @@ mod tests {
 
     #[test]
     fn test_rebuild_issues_table_errors_when_canonical_columns_are_missing() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3207,14 +3411,11 @@ mod tests {
     /// Migration: add missing dependency type column for older schemas.
     #[test]
     fn test_migration_adds_missing_dependency_type() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3246,14 +3447,11 @@ mod tests {
 
     #[test]
     fn test_migration_rebuilds_legacy_config_metadata_primary_keys() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
 
         execute_batch(
             &conn,
@@ -3350,14 +3548,11 @@ mod tests {
 
     #[test]
     fn test_active_list_query_plan_uses_composite_index() {
-        let conn = Connection::open(
-            tempfile::NamedTempFile::new()
-                .unwrap()
-                .path()
-                .to_string_lossy()
-                .into_owned(),
-        )
-        .unwrap();
+        // Bind the temp file: dropping it here would unlink the database
+        // before the connection ever writes to it, leaving `Connection::open`
+        // pointed at a dangling path.
+        let temp_db = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(temp_db.path().to_string_lossy().into_owned()).unwrap();
         apply_schema(&conn).expect("schema");
 
         let plan_rows = conn

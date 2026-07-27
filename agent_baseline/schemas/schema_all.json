@@ -741,6 +741,13 @@
           "items": {
             "$ref": "#/$defs/CoordinationClaimRow"
           }
+        },
+        "capacity": {
+          "description": "Workflow capacity occupancy (GitHub #384 phase 6). Absent when no\ncapacity is configured, preserving the pre-capacity\n`br.coordination.v1` payload shape.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapacityStat"
+          }
         }
       },
       "required": [
@@ -1453,6 +1460,103 @@
               "type": "string",
               "const": "claim_issue"
             }
+          ]
+        },
+        "CapacityStat": {
+          "description": "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included).",
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "The status or group name.",
+              "type": "string"
+            },
+            "kind": {
+              "description": "`status` or `group`.",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Scope partition dimension (`repository`, `actor`, ...).",
+              "type": "string"
+            },
+            "scope_key": {
+              "description": "Partition key within a non-repository scope.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "counted": {
+              "description": "Occupancy excluding exemptions (and hierarchy aggregates).",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "aggregate_parents_excluded": {
+              "description": "Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "exempt": {
+              "description": "Occupancy excluded by active, authorized exemptions.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "soft_limit": {
+              "description": "Advisory threshold, if configured.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "hard_limit": {
+              "description": "Enforced threshold, if configured.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "remaining": {
+              "description": "`hard_limit - counted`, clamped at zero; absent without a hard limit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "state": {
+              "description": "`healthy` | `soft-limit` | `at-hard` | `over-hard`.",
+              "type": "string"
+            },
+            "counting_mode": {
+              "description": "Counting mode the numbers were computed under.",
+              "type": "string"
+            },
+            "policy_path": {
+              "description": "Policy location of the limit.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "scope",
+            "counted",
+            "state",
+            "counting_mode",
+            "policy_path"
           ]
         }
       }
@@ -2219,6 +2323,17 @@
             "string",
             "null"
           ]
+        },
+        "rollup": {
+          "description": "Derived parent-child subtree rollup; present only when the issue has\nlocal parent-child children (GitHub #384 phase 3).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RollupSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -2480,6 +2595,29 @@
         },
         "EventType": {
           "type": "string"
+        },
+        "RollupSummary": {
+          "description": "Derived parent-child subtree rollup for a parent issue (GitHub #384\nphase 3: hierarchy observability).\n\nThe rollup reports what a parent's subtree is effectively doing without\nmutating the parent's explicit status: an epic can stay `open` while its\nrollup says `in_progress` because a descendant started.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "description": "Furthest-along non-terminal descendant status in workflow order, or\n`closed` when every descendant is terminal.",
+              "type": "string"
+            },
+            "descendants": {
+              "description": "Count of strict parent-child descendants by stored status.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "status",
+            "descendants"
+          ]
         }
       }
     },
@@ -3171,6 +3309,13 @@
               "type": "null"
             }
           ]
+        },
+        "capacity": {
+          "description": "Workflow capacity occupancy (GitHub #384). Absent when no capacity\nis configured, preserving the pre-capacity payload shape.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapacityStat"
+          }
         }
       },
       "required": [
@@ -3343,6 +3488,422 @@
             "issues_updated",
             "issues_reopened",
             "total_changes"
+          ]
+        },
+        "CapacityStat": {
+          "description": "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included).",
+          "type": "object",
+          "properties": {
+            "name": {
+              "description": "The status or group name.",
+              "type": "string"
+            },
+            "kind": {
+              "description": "`status` or `group`.",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Scope partition dimension (`repository`, `actor`, ...).",
+              "type": "string"
+            },
+            "scope_key": {
+              "description": "Partition key within a non-repository scope.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "counted": {
+              "description": "Occupancy excluding exemptions (and hierarchy aggregates).",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "aggregate_parents_excluded": {
+              "description": "Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "exempt": {
+              "description": "Occupancy excluded by active, authorized exemptions.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "soft_limit": {
+              "description": "Advisory threshold, if configured.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "hard_limit": {
+              "description": "Enforced threshold, if configured.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "remaining": {
+              "description": "`hard_limit - counted`, clamped at zero; absent without a hard limit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0
+            },
+            "state": {
+              "description": "`healthy` | `soft-limit` | `at-hard` | `over-hard`.",
+              "type": "string"
+            },
+            "counting_mode": {
+              "description": "Counting mode the numbers were computed under.",
+              "type": "string"
+            },
+            "policy_path": {
+              "description": "Policy location of the limit.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "scope",
+            "counted",
+            "state",
+            "counting_mode",
+            "policy_path"
+          ]
+        }
+      }
+    },
+    "SyncReconcileReceipt": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "title": "SyncReconcileReceipt",
+      "description": "Versioned receipt for `br sync --reconcile` (`br.sync.reconcile.v1`).\n\nEmitted by both `--dry-run` (plan only, `applied: false`) and apply\n(`applied: true`, with the `apply` block present). Deletion is impossible\nin this mode, so `plan.deleted` is a constant `0`.",
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "description": "Receipt schema identifier (`br.sync.reconcile.v1`).",
+          "type": "string"
+        },
+        "mode": {
+          "description": "`\"dry_run\"` or `\"apply\"`.",
+          "type": "string"
+        },
+        "applied": {
+          "description": "True when the plan was applied to the database.",
+          "type": "boolean"
+        },
+        "jsonl_path": {
+          "description": "Resolved JSONL path the plan was computed against.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Source (JSONL) witness the plan is bound to.",
+          "$ref": "#/$defs/ReconcileSourceWitness"
+        },
+        "target": {
+          "description": "Target (database) witness the plan is bound to.",
+          "$ref": "#/$defs/ReconcileTargetWitness"
+        },
+        "plan": {
+          "description": "Row classification counts.",
+          "$ref": "#/$defs/ReconcilePlanCounts"
+        },
+        "previews": {
+          "description": "Bounded id previews for the classified sets.",
+          "$ref": "#/$defs/ReconcileIdPreviews"
+        },
+        "relations": {
+          "description": "Relation rows carried by planned create/update rows.",
+          "$ref": "#/$defs/ReconcileRelationCounts"
+        },
+        "events_before": {
+          "description": "Event rows before the operation.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "events_after": {
+          "description": "Event rows after the operation (always equals `events_before`; the\napply transaction rolls back otherwise).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "apply": {
+          "description": "Apply-only details; absent in dry-run receipts.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReconcileApplyReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "schema_version",
+        "mode",
+        "applied",
+        "jsonl_path",
+        "source",
+        "target",
+        "plan",
+        "previews",
+        "relations",
+        "events_before",
+        "events_after"
+      ],
+      "$defs": {
+        "ReconcileSourceWitness": {
+          "description": "JSONL-side witness in a reconcile receipt.",
+          "type": "object",
+          "properties": {
+            "record_count": {
+              "description": "Non-empty JSONL rows parsed (including ephemeral rows).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "ephemeral_skipped": {
+              "description": "Ephemeral (`-wisp-`) rows excluded from planning.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "content_hash": {
+              "description": "Whitespace-normalized SHA-256 of the JSONL content.",
+              "type": "string"
+            },
+            "mtime": {
+              "description": "RFC3339 mtime of the JSONL file at plan time.",
+              "type": "string"
+            },
+            "size_bytes": {
+              "description": "Byte size of the JSONL file at plan time.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "record_count",
+            "ephemeral_skipped",
+            "content_hash",
+            "mtime",
+            "size_bytes"
+          ]
+        },
+        "ReconcileTargetWitness": {
+          "description": "Database-side witness in a reconcile receipt.",
+          "type": "object",
+          "properties": {
+            "db_issue_count": {
+              "description": "Total issue rows at plan time (including tombstones).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "stored_hash_matches_jsonl": {
+              "description": "Whether the stored `jsonl_content_hash` metadata already matched the\nfile at plan time. True alongside nonzero `created`/`updated` counts\nis the false-equal state this mode repairs.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "db_issue_count",
+            "stored_hash_matches_jsonl"
+          ]
+        },
+        "ReconcilePlanCounts": {
+          "description": "Row classification counts in a reconcile receipt.",
+          "type": "object",
+          "properties": {
+            "created": {
+              "description": "JSONL rows with no DB counterpart (inserted on apply).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "updated": {
+              "description": "JSONL rows strictly newer than their DB counterpart (updated on apply).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "skipped_equal": {
+              "description": "Rows skipped because timestamps are equal.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "skipped_older": {
+              "description": "Rows skipped because the DB copy is strictly newer.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "skipped_tombstone": {
+              "description": "Rows skipped by tombstone protection.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "deleted": {
+              "description": "Always 0: additive reconciliation cannot delete.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "db_only": {
+              "description": "Exportable DB issues absent from the JSONL row set (never touched).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "created",
+            "updated",
+            "skipped_equal",
+            "skipped_older",
+            "skipped_tombstone",
+            "deleted",
+            "db_only"
+          ]
+        },
+        "ReconcileIdPreviews": {
+          "description": "Bounded id previews in a reconcile receipt.",
+          "type": "object",
+          "properties": {
+            "created_ids": {
+              "description": "First ids (sorted) that would be / were created.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "updated_ids": {
+              "description": "First ids (sorted) that would be / were updated.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "db_only_ids": {
+              "description": "First exportable DB-only ids (sorted).",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "preview_limit": {
+              "description": "Per-list truncation cap; counts in `plan` reflect true totals.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "created_ids",
+            "updated_ids",
+            "db_only_ids",
+            "preview_limit"
+          ]
+        },
+        "ReconcileRelationCounts": {
+          "description": "Relation rows carried by planned create/update rows.",
+          "type": "object",
+          "properties": {
+            "labels": {
+              "description": "Label rows.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "dependencies": {
+              "description": "Dependency rows.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "comments": {
+              "description": "Comment rows.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "labels",
+            "dependencies",
+            "comments"
+          ]
+        },
+        "ReconcileApplyReceipt": {
+          "description": "Apply-only block of a reconcile receipt.",
+          "type": "object",
+          "properties": {
+            "export_hashes_recorded": {
+              "description": "Export-hash rows recorded for rows whose DB copy now matches JSONL.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "uncertified_local_wins": {
+              "description": "Skipped rows whose DB copy still differs from JSONL (local wins that\nneed a future flush).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "orphan_dependencies_cleaned": {
+              "description": "Dangling dependency rows removed from just-written issues.",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "blocked_cache_entries": {
+              "description": "Blocked-cache rows after rebuild (0 when no row changed).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "child_counter_entries": {
+              "description": "Child-counter rows after rebuild (0 when no row changed).",
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "needs_flush_set": {
+              "description": "Whether `needs_flush` was set because local state still diverges from\nJSONL (db-only rows or uncertified local wins).",
+              "type": "boolean"
+            },
+            "metadata_repaired": {
+              "description": "Whether import metadata (content hash + stat witness + import time)\nwas repaired in the apply transaction.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "export_hashes_recorded",
+            "uncertified_local_wins",
+            "orphan_dependencies_cleaned",
+            "blocked_cache_entries",
+            "child_counter_entries",
+            "needs_flush_set",
+            "metadata_repaired"
           ]
         }
       }

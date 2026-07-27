@@ -149,10 +149,13 @@ fn execute_inner(
         None
     };
 
+    let capacity = capacity_stats(storage)?;
+
     let output = Statistics {
         summary,
         breakdowns,
         recent_activity,
+        capacity,
     };
 
     if matches!(early_ctx.mode(), OutputMode::Quiet) {
@@ -1285,8 +1288,57 @@ fn print_text_output(output: &Statistics) {
         println!("  Issues Updated:         {}", activity.issues_updated);
     }
 
+    print_capacity_table(&output.capacity);
+
     // Match bd footer
     println!("\nFor more details, use 'br list' to see individual issues.");
+}
+
+/// Capacity occupancy for the stats payload (GitHub #384 phase 6), absent
+/// when no capacity is configured.
+fn capacity_stats(storage: &SqliteStorage) -> Result<Vec<crate::format::CapacityStat>> {
+    Ok(storage
+        .capacity_snapshot()?
+        .into_iter()
+        .map(crate::format::CapacityStat::from_snapshot)
+        .collect())
+}
+
+/// Print the GitHub #384 capacity occupancy table. Silent when no capacity
+/// is configured, keeping the pre-capacity stats text byte-stable.
+fn print_capacity_table(capacity: &[crate::format::CapacityStat]) {
+    if capacity.is_empty() {
+        return;
+    }
+    println!("\nCapacity:");
+    println!(
+        "  {:<24} {:>7} {:>10} {:>6} {:>5} {:>5} {:>9}  STATE",
+        "CAPACITY", "COUNTED", "AGGREGATES", "EXEMPT", "SOFT", "HARD", "REMAINING"
+    );
+    for stat in capacity {
+        let label = stat.scope_key.as_ref().map_or_else(
+            || {
+                if stat.scope == "repository" {
+                    stat.name.clone()
+                } else {
+                    format!("{} [{}]", stat.name, stat.scope)
+                }
+            },
+            |key| format!("{} [{}:{}]", stat.name, stat.scope, key),
+        );
+        let opt = |value: Option<u32>| value.map_or_else(|| "-".to_string(), |v| v.to_string());
+        println!(
+            "  {:<24} {:>7} {:>10} {:>6} {:>5} {:>5} {:>9}  {}",
+            sanitize_terminal_inline(&label),
+            stat.counted,
+            opt(stat.aggregate_parents_excluded),
+            opt(stat.exempt),
+            opt(stat.soft_limit),
+            opt(stat.hard_limit),
+            opt(stat.remaining),
+            stat.state,
+        );
+    }
 }
 
 /// Render stats with rich formatting.
@@ -1352,6 +1404,8 @@ fn render_stats_rich(output: &Statistics, ctx: &OutputContext) {
         content.append("\n\n");
     }
 
+    append_capacity_section_rich(&mut content, &output.capacity, theme);
+
     // === Health Warnings ===
     let mut warnings = Vec::new();
     if s.blocked_issues > 5 {
@@ -1387,6 +1441,49 @@ fn render_stats_rich(output: &Statistics, ctx: &OutputContext) {
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+}
+
+/// Append the GitHub #384 capacity section to the rich stats panel.
+/// Silent when no capacity is configured so pre-capacity panel goldens
+/// stay byte-stable.
+fn append_capacity_section_rich(
+    content: &mut Text,
+    capacity: &[crate::format::CapacityStat],
+    theme: &crate::output::Theme,
+) {
+    if capacity.is_empty() {
+        return;
+    }
+    content.append_styled("\u{1f6a6} Capacity\n", theme.section.clone());
+    for stat in capacity {
+        let label = stat.scope_key.as_ref().map_or_else(
+            || {
+                if stat.scope == "repository" {
+                    stat.name.clone()
+                } else {
+                    format!("{} [{}]", stat.name, stat.scope)
+                }
+            },
+            |key| format!("{} [{}:{}]", stat.name, stat.scope, key),
+        );
+        content.append_styled("   ", theme.dimmed.clone());
+        content.append(&sanitize_terminal_inline(&label));
+        content.append_styled(": ", theme.dimmed.clone());
+        content.append(&stat.counted.to_string());
+        if let Some(hard) = stat.hard_limit {
+            content.append(&format!("/{hard}"));
+        }
+        if let Some(exempt) = stat.exempt {
+            content.append_styled(&format!(" (+{exempt} exempt)"), theme.dimmed.clone());
+        }
+        let state_style = match stat.state.as_str() {
+            "healthy" => theme.success.clone(),
+            _ => theme.warning.clone(),
+        };
+        content.append_styled(&format!("  {}", stat.state), state_style);
+        content.append("\n");
+    }
+    content.append("\n");
 }
 
 /// Render status distribution as progress bars.

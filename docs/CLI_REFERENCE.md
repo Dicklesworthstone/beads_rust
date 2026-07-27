@@ -35,6 +35,7 @@ Comprehensive reference for all `br` (beads_rust) commands.
   - [orphans](#orphans)
   - [query (saved queries)](#query-saved-queries)
   - [gate](#gate)
+  - [capacity](#capacity)
 - [Sync & Config](#sync--config)
   - [sync](#sync)
   - [config](#config)
@@ -285,7 +286,7 @@ br list [OPTIONS]
 **Filter Options:**
 | Option | Description |
 |--------|-------------|
-| `-s, --status <STATUS>` | Filter by status (can repeat) |
+| `-s, --status <STATUS>` | Filter by status (can repeat; `all` matches every status) |
 | `-t, --type <TYPE>` | Filter by issue type (can repeat) |
 | `--assignee <NAME>` | Filter by assignee |
 | `--unassigned` | Show only unassigned issues |
@@ -605,8 +606,9 @@ workflow:
   warning; JSON and TOON add a structured `warnings` array only when warnings
   exist, preserving the legacy success shape below the threshold.
 - Each warning contains `issue_id`, `from_status`, `to_status`,
-  `capacity_kind`, `capacity_name`, `scope`, `counting_mode`, `current`,
-  `prospective`, `soft_limit`, optional `hard_limit`, and `policy_path`.
+  `capacity_kind`, `capacity_name`, `scope`, optional `scope_key`,
+  `counting_mode`, `current`, `prospective`, `soft_limit`, optional
+  `hard_limit`, and `policy_path`.
   `update` wraps its normal array as `{updated, warnings}` and `create` as
   `{created, warnings}`; commands that already return an object add `warnings`
   to that object. The wrapper is never introduced below the soft threshold.
@@ -620,10 +622,155 @@ workflow:
   be committed if a later route fails and cross-repository atomicity is
   intentionally not claimed.
 - Omitting `workflow.capacity` preserves existing behavior exactly.
-- The current enforcement layer has fixed `repository` scope and `all`
-  counting. Hierarchy-aware counting, audited exemptions, actor/assignee/
-  harness/session/subtree scopes, and capacity observability are later phases
-  tracked in GitHub issue #384.
+- Audited issue-specific exemptions (`br capacity exempt`, see
+  [capacity](#capacity)) let a named issue enter a named capacity without
+  consuming a slot; evidence then reports counted and exempt totals
+  separately.
+- Optional multi-agent admission scopes are configured under
+  `workflow.capacity.scopes` (see below).
+- Occupancy is observable without mutating anything: once any capacity is
+  configured, `br stats --json` and `br coordination status --json` carry a
+  `capacity` array (one row per repository capacity plus one per occupied
+  scope partition) with `counted`, `aggregate_parents_excluded`, `exempt`,
+  `soft_limit`, `hard_limit`, `remaining`, and a `state` of
+  `healthy`/`soft-limit`/`at-hard`/`over-hard`; human `br stats` prints the
+  matching CAPACITY/COUNTED/AGGREGATES/EXEMPT/SOFT/HARD/REMAINING/STATE
+  table. The block is absent when no capacity is configured, keeping the
+  legacy payload shapes byte-stable, and the snapshot never writes (lazy
+  exemption expiry stays pending for the next enforcement observation).
+  The complete GitHub #384 acceptance matrix lives in
+  [GH384_ACCEPTANCE_MATRIX.md](GH384_ACCEPTANCE_MATRIX.md).
+
+**Multi-agent admission scopes (`workflow.capacity.scopes`):**
+
+Beyond the repository totals, capacity limits can partition occupancy by who
+is doing the work:
+
+```yaml
+workflow:
+  statuses: [open, in_progress, in_review, rework, closed]
+  capacity:
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+      harness:
+        groups:
+          active_work:
+            statuses: [in_progress, in_review, rework]
+            hard: 6
+      subtree:
+        statuses:
+          in_progress:
+            soft: 2
+```
+
+- Recognized scopes: `repository`, `actor`, `assignee`, `harness`,
+  `session`, and `subtree`. Each scope carries its own `statuses`/`groups`
+  limit tables; every applicable scope composes with (never replaces) the
+  repository-level limits, and a transition must satisfy all of them inside
+  the same admission transaction.
+- Partition keys: `actor` uses the resolved CLI actor; `harness` uses the
+  self-reported `--harness`/`BR_HARNESS` attribution; `session` uses the
+  env-only `BR_SESSION` attribution; `assignee` uses the issue's prospective
+  assignee; `subtree` uses the issue's root ancestor over parent-child
+  edges. Every committed status transition records its admitting
+  actor/agent/harness/session in the project-local `capacity_occupancy`
+  table (never synced to JSONL, never written by import), and scoped counts
+  are measured against those records.
+- This is admission control for cooperating agent harnesses, not
+  authentication or process supervision: attribution is self-reported, and
+  a transition that carries no key for a scope is not subject to that
+  scope's limits (`actor` always has a key; `assignee` skips unassigned
+  transitions).
+- Only partitions whose count would increase are checked, so departures,
+  cross-partition handoffs, and same-key finish-and-claim swaps in one
+  batch remain admissible at the cap. Active exemptions free their issue's
+  slot in every scope measuring the same capacity.
+- Scoped counting is plain per-issue occupancy: `counting.hierarchy` modes
+  and `admission` rules remain repository-scope features. Scoped evidence
+  reports `counting_mode: "all"`, carries the partition key in `scope_key`,
+  and uses `workflow.capacity.scopes.<scope>...` policy paths; repository
+  evidence keeps its pre-scope shape byte-for-byte (no `scope_key` field).
+
+**Hierarchy-aware counting (`workflow.capacity.counting`):**
+
+By default every matching issue counts. `counting.hierarchy` changes how
+occupancy is measured so an aggregate parent and its executable child do not
+each consume a slot. Only `parent-child` dependency edges participate;
+`blocks` and `related` edges never affect counting.
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: leaf_work
+    groups:
+      active_work:
+        statuses: [in_progress, in_review]
+        hard: 8
+```
+
+| Mode | Behavior |
+|------|----------|
+| `all` | Every matching issue counts. The default; unchanged from earlier phases. |
+| `leaf_work` | An issue does not count while a descendant is already counted in the same capacity. Active leaves count one, aggregate parents count zero, and a parent begins counting when its last active descendant leaves. |
+| `roots` | Count active work streams by their highest matching ancestor: an issue counts only when no ancestor is active in the same capacity. |
+| `weighted` | Sum explicit `counting.weights` over matching issues. |
+
+For a group containing `in_progress` and `in_review`, an epic → parent →
+{child A `in_progress`, child B `in_review`} tree consumes two `leaf_work`
+slots, not four.
+
+Weights are resolved per issue as: `counting.weights.issues.<id>`, then
+`counting.weights.types.<type>` (case-insensitive), then
+`counting.weights.default`, then `1`. A weight of `0` is the explicit,
+visible way to declare that a parent represents no independent execution
+beyond its children. Configuring `counting.weights` without
+`hierarchy: weighted` is rejected while loading the policy rather than
+silently ignored.
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: weighted
+      weights:
+        default: 1
+        types:
+          epic: 0
+        issues:
+          br-migration: 3
+```
+
+- Hierarchy counting runs inside the same `BEGIN IMMEDIATE` transaction as
+  admission, so concurrent transitions cannot disagree about the tree.
+- Each issue is counted at most once per capacity. Parent-child cycles from
+  imported data are condensed into one component, so every active member of a
+  cycle stays counted rather than cancelling out.
+- Under `leaf_work` and `roots`, capacity evidence adds
+  `aggregate_parents_excluded`: the number of active issues that did not count
+  because a relative already covers their work stream. `counting_mode` reports
+  the active mode. Under `all` both the field and the message text are
+  unchanged from earlier phases.
+
+**Derived rollup status:**
+
+`br show --json` adds a `rollup` object to any issue that has local
+parent-child children, without mutating the issue's own status:
+
+```json
+{"id":"br-epic","status":"open",
+ "rollup":{"status":"in_progress","descendants":{"in_progress":1,"closed":2}}}
+```
+
+`rollup.status` is the furthest-along non-terminal descendant status —
+ranked by position in `workflow.statuses` when configured, otherwise by a
+built-in `draft < deferred < open < blocked < in_progress` ladder — or
+`closed` when every descendant is terminal. `rollup.descendants` counts the
+whole strict subtree by stored status. Issues without children omit the key
+entirely, and the JSONL fallback show paths do not emit it.
 
 ---
 
@@ -895,6 +1042,36 @@ br dep tree bd-123
 br dep cycles
 ```
 
+An issue reachable through more than one parent (a diamond) is listed under
+every parent, but only its first occurrence expands the subtree beneath it.
+Later occurrences are marked `(shown above)` in text output and carry
+`"repeat": true` in `--json`. This keeps the output bounded by the size of the
+dependency graph instead of by the number of distinct paths through it, which
+is what made deep traversals of shared-dependency graphs explode
+([#392](https://github.com/Dicklesworthstone/beads_rust/issues/392)).
+`truncated` is unrelated and still means "children exist but `--max-depth`
+stopped the walk".
+
+**Cycle semantics
+([#391](https://github.com/Dicklesworthstone/beads_rust/issues/391)):**
+
+- Only *blocking* dependency types are cycle-checked when an edge is added:
+  `blocks`, `conditional-blocks`, `waits-for`, and `parent-child`.
+  `related`, `discovered-from`, and custom types are never cycle-checked,
+  and `br dep cycles` uses the same blocking edge set, so an edge the add
+  path accepted can never fail a cycle health check afterwards
+  (`--blocking-only` is a compatible alias of the default).
+- **Epic containment participates in blocking cycles, reversed:** depending
+  on an epic means depending on its entire subtree, now and future, so the
+  traversal walks parent → child containment edges. A consequence: once any
+  issue's blocks-chain reaches an epic, no *descendant* of that epic may add
+  a `blocks` edge back into that chain — the add is rejected as a cycle even
+  though no `child → parent` edge exists. This is the intended
+  "depend-on-epic = depend-on-all-descendants" rule; the rejection's cycle
+  may traverse containment edges that the error path does not list. To
+  express a loose association that must never gate work or trip cycle
+  checks, use `-t related`.
+
 ---
 
 ### graph
@@ -1111,6 +1288,78 @@ repository-local batch. Supply comments with `update`, `close`, `defer`, and
 
 ---
 
+### capacity
+
+Audited issue-specific capacity exemptions (GitHub #384 phase 4). A
+long-lived external blocker may legitimately remain in a limited status;
+an exemption lets that one issue occupy one named capacity without
+consuming a slot, while staying visible in queue metrics. Exemption records
+are project-local metadata (like gate results) and are not synced through
+JSONL.
+
+```bash
+br capacity exempt <ID> --status <NAME>|--group <NAME> --provider <P> --reason <TEXT> [--expires <WHEN>]
+br capacity renew <ID> --status <NAME>|--group <NAME> --provider <P> [--expires <WHEN>] [--reason <TEXT>]
+br capacity revoke <ID> --status <NAME>|--group <NAME> --provider <P> [--reason <TEXT>]
+br capacity exemptions [<ID>] [--history]
+```
+
+**Subcommands:**
+| Command | Description |
+|---------|-------------|
+| `exempt <ID>` | Grant an exemption: one issue, one named capacity. Requires an authorized `--provider` and a non-empty `--reason`. |
+| `renew <ID>` | Extend an active exemption's expiry. Expired or ended exemptions cannot be renewed — grant a new one so the audit trail shows the gap. |
+| `revoke <ID>` | Withdraw an active exemption. Deliberately not provider-gated so cleanup stays possible after policy edits; provider and actor are still recorded. |
+| `exemptions [<ID>]` | List exemption state (`active`, `expired`, `revoked`, `left_status`) and, with `--history`, the append-only audit trail. |
+
+**Common options:**
+| Option | Description |
+|--------|-------------|
+| `--status <NAME>` | The named status capacity (a status with a configured limit, or one observed by an admission rule) |
+| `--group <NAME>` | The named capacity group from `workflow.capacity.groups` |
+| `--provider <NAME>` | Approving provider; grants/renewals require it to be listed in policy |
+| `--reason <TEXT>` | Rationale recorded with the action (mandatory for grants) |
+| `--expires <WHEN>` | Expiry: RFC3339, `YYYY-MM-DD`, or relative (`+7d`) |
+| `--robot` | Machine-readable JSON output |
+
+Authorization lives in `.beads/policy.yaml`:
+
+```yaml
+workflow:
+  statuses: [open, in_progress, blocked, closed]
+  capacity:
+    statuses:
+      blocked:
+        hard: 12
+    exemptions:
+      providers: [operator]     # empty/absent disables granting entirely
+      require_expiry: true      # optional: every grant must carry an expiry
+      max_ttl_seconds: 1209600  # optional: cap the expiry horizon
+```
+
+Semantics:
+
+- An active, authorized exemption removes its issue from the named
+  capacity's counted total everywhere that capacity is measured — its own
+  limit and any admission rule observing the same status or group. Evidence
+  and warnings then carry a separate `exempt` total alongside
+  `current`/`prospective` (and `aggregate_parents_excluded` under hierarchy
+  counting, where an exempted issue still suppresses its ancestors, so an
+  exemption can only lower a count, never raise one).
+- Leaving the applicable status set ends the exemption in the same
+  transaction, with an audited `left_status` record; re-entry needs a new
+  grant.
+- Expired exemptions count again immediately; the audited `expire` record
+  is written by the first committed observation.
+- Removing a provider from `exemptions.providers` withdraws the effect of
+  every exemption it granted without rewriting audit history; re-listing
+  the provider restores them.
+- Ordinary labels can never grant an exemption, and grant/renew/revoke/
+  expire actions all land in the append-only `capacity_exemption_history`
+  audit table.
+
+---
+
 ## Sync & Config
 
 ### sync
@@ -1133,6 +1382,7 @@ br sync [OPTIONS]
 | `--flush-only` | Export database to JSONL |
 | `--import-only` | Import JSONL into database |
 | `--merge` | Three-way merge `.beads/beads.base.jsonl`, SQLite, and JSONL |
+| `--reconcile` | Additively reconcile JSONL into the database (lossless, previewable) |
 | `--status` | Show sync status (read-only) |
 
 **Options:**
@@ -1147,6 +1397,7 @@ br sync [OPTIONS]
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
 | `--rename-prefix` | During import, rewrite mismatched issue IDs into the configured default prefix |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
+| `--dry-run` | With `--reconcile`, preview the plan without any mutation |
 | `--robot` | Machine-readable output |
 
 **Merge semantics:**
@@ -1154,6 +1405,17 @@ br sync [OPTIONS]
 - Without an explicit conflict policy, semantic conflicts stop the command. This covers both-modified, delete-vs-modify, and convergent same-ID creation conflicts.
 - `--force-db` keeps local SQLite changes for conflicts, `--force-jsonl` keeps JSONL changes for conflicts, and `--force` chooses the side with the newer timestamp.
 - `--force-db`, `--force-jsonl`, and `--force` are mutually exclusive for `--merge`.
+
+**Reconcile semantics:**
+- `--reconcile` classifies every JSONL row against full issue state — never the cached content hash — so it repairs the "false equal" state where `br sync --status` reports synchronized while the JSONL holds rows the database never imported.
+- Classification is timestamp-newer-wins with tombstone protection: JSONL-only rows are created, strictly newer JSONL rows update in place, and everything else is skipped. Deletion is structurally impossible in this mode.
+- Apply runs in one write transaction bound to plan-time witnesses (JSONL content hash + stat, event-table shape). Any divergence between plan and apply rolls the whole transaction back.
+- Audit events are never created, modified, or deleted; the apply transaction verifies the events table is byte-stable and aborts otherwise.
+- Existing dependencies, labels, comments, dirty markers, and tombstones survive unless superseded by an applied row. Database-only issues are never touched; they (and skipped rows whose local copy still diverges) mark the database for a future flush.
+- No JSONL, base snapshot, manifest, or history writes ever happen; the same transaction repairs the stored content hash and stat witness so the staleness short-circuit becomes truthful again.
+- `--dry-run` is read-only: no write transaction, no metadata/cache/dirty changes, no file writes of any kind.
+- Both modes emit a versioned receipt (`br.sync.reconcile.v1` — see `br schema all`, key `SyncReconcileReceipt`) with source/target witnesses, created/updated/skipped/deleted counts (deleted is always 0), bounded id previews, relation counts, and before/after event counts.
+- `--force`, `--rename-prefix`, and `--orphans` are rejected with `--reconcile`; dangling dependency references are cleaned only from rows the reconcile itself wrote.
 
 **Rebuild semantics:**
 - `--rebuild` is valid only with explicit import mode: `br sync --import-only --rebuild`.
@@ -1183,6 +1445,10 @@ br sync --import-only --rebuild
 
 # Rebuild while rewriting imported IDs to the configured prefix
 br sync --import-only --rebuild --rename-prefix
+
+# Preview an additive reconcile (read-only), then apply it
+br sync --reconcile --dry-run --json
+br sync --reconcile --json
 
 # Check sync status
 br sync --status

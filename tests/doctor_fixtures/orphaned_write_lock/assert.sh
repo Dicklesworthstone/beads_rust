@@ -6,36 +6,41 @@ stage="${2:?usage: assert.sh <target_dir> <stage>}"
 tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
-# Force the stale branch by overriding the staleness threshold to 0.
-# Any non-future mtime is then "older than threshold" → warn.
+# Force the stale-mtime branch by overriding the staleness threshold to 0.
+# Any non-future mtime is then "older than threshold" — which, since
+# GitHub #395, only selects the file for a non-blocking flock PROBE: the
+# planted lock is free, so the probe acquires it and the check must
+# classify Ok. Lock acquisition never updates mtime, so file age alone
+# is not evidence of an orphan.
 export BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0
 
 case "$stage" in
   detect)
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
+    # A free lock — however old the file — must be Ok via the probe.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | select(.status == "warn" or .status == "error")
+      | select(.status == "ok")
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: write_lock not flagged" >&2
+      echo "ASSERT FAIL[$stage]: free stale-mtime lock must be ok (GH #395)" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock")' >&2
       exit 1
     }
-    # reason must be stale_mtime.
+    # The classification must come from the probe, not the mtime heuristic.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | .details.reason == "stale_mtime"
+      | (.details.reason == "probe_acquired_free" or .details.reason == "probe_would_block_live_holder")
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: details.reason != stale_mtime" >&2
+      echo "ASSERT FAIL[$stage]: details.reason != probe_acquired_free" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock") | .details' >&2
       exit 1
     }
-    # recommended_fix must include the .stale-<ts> rename suffix.
+    # The old move-aside advice was the inode-split hazard; it must be gone.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | .details.recommended_fix | test("\\.stale-")
+      | ((.details.recommended_fix // "") | test("\\.stale-") | not)
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: recommended_fix missing .stale- rename suffix" >&2
+      echo "ASSERT FAIL[$stage]: move-aside advice must not be suggested" >&2
       exit 1
     }
     ;;

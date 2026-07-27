@@ -18,6 +18,8 @@
 //! | `.beads/*.db-wal` | `SQLite` WAL files |
 //! | `.beads/*.db-shm` | `SQLite` shared memory files |
 //! | `.beads/*.db-journal` | `SQLite` rollback journals |
+//! | `.beads/*.db-fsqlite-ns-gate` | fsqlite multi-process namespace gate |
+//! | `.beads/*.db-fsqlite-ns-use` | fsqlite multi-process namespace use-count |
 //! | `.beads/*.jsonl` | `JSONL` export files |
 //! | `.beads/*.jsonl.tmp` | Temp files for atomic writes |
 //! | `.beads/*.jsonl.<pid>.tmp` | PID-scoped temp files for atomic writes |
@@ -49,12 +51,14 @@ use tracing::{debug, warn};
 ///
 /// This list is exhaustive - any file not matching these patterns is rejected.
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
-    "db",         // SQLite database
-    "db-wal",     // SQLite WAL
-    "db-shm",     // SQLite shared memory
-    "db-journal", // SQLite rollback journal
-    "jsonl",      // JSONL export
-    "jsonl.tmp",  // Atomic write temp files (plus pid-scoped .jsonl.<pid>.tmp)
+    "db",                 // SQLite database
+    "db-wal",             // SQLite WAL
+    "db-shm",             // SQLite shared memory
+    "db-journal",         // SQLite rollback journal
+    "db-fsqlite-ns-gate", // fsqlite multi-process namespace gate
+    "db-fsqlite-ns-use",  // fsqlite multi-process namespace use-count
+    "jsonl",              // JSONL export
+    "jsonl.tmp",          // Atomic write temp files (plus pid-scoped .jsonl.<pid>.tmp)
 ];
 
 /// Files explicitly allowed by exact name within `.beads/`.

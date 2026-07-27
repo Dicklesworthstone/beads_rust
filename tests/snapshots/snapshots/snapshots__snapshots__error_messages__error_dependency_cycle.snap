@@ -2,13 +2,5 @@
 source: tests/snapshots/error_messages.rs
 expression: normalize_output(&output.stderr)
 ---
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-Error: Cycle detected in dependencies: ID-REDACTED -> ID-REDACTED
+Error: Cycle detected in dependencies: Adding dependency ID-REDACTED -> ID-REDACTED would create a cycle
 Hint: Remove one dependency to break the cycle

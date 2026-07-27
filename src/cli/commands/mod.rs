@@ -14,6 +14,7 @@ pub mod agents;
 pub mod audit;
 pub mod blocked;
 pub mod capabilities;
+pub mod capacity;
 pub mod changelog;
 pub mod close;
 pub mod comments;
@@ -275,6 +276,28 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
             })
         }
     }
+}
+
+/// Whether a CLI status filter contains the `all` meta-value
+/// (case-insensitive), meaning "every status" — the same convention
+/// `br lint --status all` uses. Without this, `all` would parse as the
+/// custom status literal `Custom("all")` and silently match nothing
+/// (beads_rust-6ilv).
+pub(super) fn status_filter_requests_all(statuses: &[String]) -> bool {
+    statuses
+        .iter()
+        .any(|status| status.trim().eq_ignore_ascii_case("all"))
+}
+
+/// Self-reported session identity for capacity occupancy and the `session`
+/// capacity scope (GitHub #384 phase 5). Env-only (`BR_SESSION`): a CLI flag
+/// would collide with `br close --session`, which records close metadata,
+/// and session identity is a harness-level property anyway.
+pub(super) fn session_attribution_from_env() -> Option<String> {
+    std::env::var("BR_SESSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub(super) fn update_issues_atomically_with_recovery(
@@ -837,6 +860,7 @@ mod tests {
                 Some("agent-recovered"),
                 None,
                 Some("opus-4"),
+                None,
             ));
 
         retry_mutation_with_jsonl_recovery(

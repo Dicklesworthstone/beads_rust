@@ -214,6 +214,158 @@ fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
     }
 }
 
+/// GitHub #391: `br dep cycles` must agree with the add-time gate — a
+/// `related` edge accepted without a cycle check can never fail the cycle
+/// health report (which exits nonzero on active cycles since #368).
+#[test]
+fn e2e_dep_cycles_agrees_with_add_time_related_semantics() {
+    let _log = common::test_log("e2e_dep_cycles_agrees_with_add_time_related_semantics");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "cyc_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let mut ids: Vec<String> = Vec::new();
+    for title in ["epic E", "sub S", "grandchild E2", "H", "R", "A", "M"] {
+        let create = run_br(&workspace, ["create", title], "cyc_create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        ids.push(parse_created_id(&create.stdout));
+    }
+    let (epic, sub, grandchild, blocker_h, blocker_r, blocker_a, blocker_m) = (
+        &ids[0], &ids[1], &ids[2], &ids[3], &ids[4], &ids[5], &ids[6],
+    );
+    for (from, to, dep_type) in [
+        (sub, epic, "parent-child"),
+        (grandchild, sub, "parent-child"),
+        (blocker_h, epic, "blocks"),
+        (blocker_r, blocker_h, "blocks"),
+        (blocker_a, epic, "blocks"),
+        (blocker_m, blocker_a, "blocks"),
+    ] {
+        let add = run_br(
+            &workspace,
+            ["dep", "add", from, to, "--type", dep_type],
+            "cyc_dep_add",
+        );
+        assert!(add.status.success(), "dep add failed: {}", add.stderr);
+    }
+
+    // Documented containment rule: the descendant's blocks-edge back into a
+    // chain reaching the epic is rejected, and the hint explains that epic
+    // containment participates.
+    let rejected = run_br(
+        &workspace,
+        ["dep", "add", grandchild, blocker_r],
+        "cyc_rejected",
+    );
+    assert!(
+        !rejected.status.success(),
+        "containment-induced cycle must still reject: {}",
+        rejected.stdout
+    );
+    let combined = format!("{}{}", rejected.stdout, rejected.stderr);
+    assert!(
+        combined.contains("epic containment"),
+        "rejection hint must explain containment participation: {combined}"
+    );
+
+    // A `related` edge is accepted unchecked and must not fail the report.
+    let related = run_br(
+        &workspace,
+        ["dep", "add", grandchild, blocker_m, "--type", "related"],
+        "cyc_related",
+    );
+    assert!(
+        related.status.success(),
+        "related add failed: {}",
+        related.stderr
+    );
+    for args in [
+        vec!["dep", "cycles"],
+        vec!["dep", "cycles", "--blocking-only"],
+    ] {
+        let cycles = run_br(&workspace, args.clone(), "cyc_report");
+        assert!(
+            cycles.status.success(),
+            "{args:?} must exit 0 when the only 'cycle' is a related edge \
+             the add path allowed: {}{}",
+            cycles.stdout,
+            cycles.stderr
+        );
+    }
+}
+
+#[test]
+fn e2e_list_and_count_status_all_matches_every_status() {
+    let _log = common::test_log("e2e_list_and_count_status_all_matches_every_status");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "status_all_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // One open, one in_progress, one closed issue.
+    let mut ids = Vec::new();
+    for title in ["Open one", "Working one", "Closed one"] {
+        let create = run_br(&workspace, ["create", title], "status_all_create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        ids.push(parse_created_id(&create.stdout));
+    }
+    let claim = run_br(
+        &workspace,
+        ["update", &ids[1], "--status", "in_progress"],
+        "status_all_claim",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    let close = run_br(
+        &workspace,
+        ["close", &ids[2], "--reason", "done"],
+        "status_all_close",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    // `--status all` must return every issue (beads_rust-6ilv: it used to
+    // parse as the literal custom status "all" and silently match nothing).
+    let list = run_br(
+        &workspace,
+        ["list", "--status", "all", "--json"],
+        "status_all_list",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let issues = parse_list_issues(&list.stdout);
+    assert_eq!(
+        issues.len(),
+        3,
+        "--status all must match every status: {issues:?}"
+    );
+
+    let count = run_br(
+        &workspace,
+        ["count", "--status", "all", "--json"],
+        "status_all_count",
+    );
+    assert!(count.status.success(), "count failed: {}", count.stderr);
+    let count_json: Value =
+        serde_json::from_str(common::cli::extract_json_payload(&count.stdout).as_str())
+            .expect("count JSON");
+    let total = count_json
+        .get("count")
+        .or_else(|| count_json.get("total"))
+        .and_then(Value::as_u64)
+        .expect("count total");
+    assert_eq!(total, 3, "count --status all must match every status");
+
+    let search = run_br(
+        &workspace,
+        ["search", "one", "--status", "all", "--json"],
+        "status_all_search",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+    assert!(
+        search.stdout.contains(&ids[2]),
+        "search --status all must include closed issues: {}",
+        search.stdout
+    );
+}
+
 #[test]
 fn e2e_basic_lifecycle() {
     let _log = common::test_log("e2e_basic_lifecycle");
@@ -278,11 +430,14 @@ fn e2e_basic_lifecycle() {
         "show text missing title"
     );
 
+    // Terminal-state transitions must go through `br close` so close-policy
+    // (close-reason / AC / attribution) is enforced; `update --status closed`
+    // refuses by design (#301).
     let close_args = vec![
-        "update".to_string(),
+        "close".to_string(),
         id,
-        "--status".to_string(),
-        "closed".to_string(),
+        "--reason".to_string(),
+        "e2e lifecycle complete".to_string(),
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -360,7 +515,19 @@ fn e2e_update_description_file_preserves_exact_content() {
         "an empty file is an explicit empty-description update: {}",
         clear_to_empty.stdout
     );
-    assert_issue_description(&workspace, &issue_id, "");
+    // A cleared description reads back as null: the storage layer normalizes
+    // empty text to None on read (`get_non_empty_str`), so `Some("")` is
+    // unrepresentable after a round-trip. The contract under test is that the
+    // empty file CLEARS the previous description rather than being a no-op.
+    let show = run_br(&workspace, ["show", &issue_id, "--json"], "show_cleared");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
+    assert!(
+        issues[0]["description"].is_null(),
+        "description must be cleared to null, got: {}",
+        issues[0]["description"]
+    );
 }
 
 #[test]
@@ -674,6 +841,79 @@ fn e2e_update_claim_multiple_ids_is_all_or_nothing() {
         serde_json::from_str(&extract_json_payload(&show_second.stdout)).expect("show second json");
     assert_eq!(second_after[0]["status"].as_str(), Some("in_progress"));
     assert_eq!(second_after[0]["assignee"].as_str(), Some("bob"));
+}
+
+/// GitHub issue #393: the `--claim --json` echo must carry the resulting
+/// assignee so an agent can confirm the claim landed without a follow-up
+/// `br show`. The field is emitted unconditionally (null when unassigned) so
+/// "not claimed" and "not reported" stay distinguishable.
+#[test]
+fn e2e_update_claim_json_echo_reports_assignee() {
+    let _log = common::test_log("e2e_update_claim_json_echo_reports_assignee");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_claim_echo_assignee");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Claim echo target", "--json"],
+        "create_claim_echo_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let claim = run_br(
+        &workspace,
+        ["--actor", "testagent", "update", &id, "--claim", "--json"],
+        "claim_echo_assignee",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+
+    let claimed: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&claim.stdout)).expect("claim echo json");
+    assert_eq!(claimed.len(), 1, "expected one updated issue in the echo");
+    assert_eq!(claimed[0]["id"].as_str(), Some(id.as_str()));
+    assert_eq!(claimed[0]["status"].as_str(), Some("in_progress"));
+    assert_eq!(
+        claimed[0]["assignee"].as_str(),
+        Some("testagent"),
+        "claim echo must report the resulting assignee: {}",
+        claim.stdout
+    );
+
+    // A non-claim update on an unassigned issue still carries the key, as
+    // an explicit null rather than an omitted field.
+    let create_plain = run_br(
+        &workspace,
+        ["create", "Unassigned target", "--json"],
+        "create_unassigned_target",
+    );
+    assert!(
+        create_plain.status.success(),
+        "create failed: {}",
+        create_plain.stderr
+    );
+    let plain: Value =
+        serde_json::from_str(&extract_json_payload(&create_plain.stdout)).expect("create json");
+    let plain_id = plain["id"].as_str().expect("issue id").to_string();
+
+    let bump = run_br(
+        &workspace,
+        ["update", &plain_id, "--priority", "1", "--json"],
+        "update_unassigned_priority",
+    );
+    assert!(bump.status.success(), "update failed: {}", bump.stderr);
+    let bumped: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&bump.stdout)).expect("update echo json");
+    assert!(
+        bumped[0].get("assignee").is_some(),
+        "assignee key must be present even when unassigned: {}",
+        bump.stdout
+    );
+    assert!(bumped[0]["assignee"].is_null());
 }
 
 #[test]

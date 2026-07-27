@@ -58,6 +58,9 @@ grep -A20 'fn is_allowed_sync_file' src/sync/path.rs
 Verify the allowlist only includes:
 - `.beads/*.db` (SQLite database)
 - `.beads/*.db-wal`, `.beads/*.db-shm`, `.beads/*.db-journal` (SQLite sidecar files)
+- `.beads/*.db-fsqlite-ns-gate`, `.beads/*.db-fsqlite-ns-use` (fsqlite multi-process
+  namespace admission sidecars; the engine creates and updates these for every
+  database path it opens, so sync observes them alongside the classic trio)
 - `.beads/*.jsonl` (JSONL export)
 - `.beads/*.jsonl.tmp` (atomic write temp files)
 - `.beads/.manifest.json` (optional manifest)
@@ -82,6 +85,10 @@ cargo test sync:: --release
 
 # Run sync safety e2e tests
 cargo test e2e_sync --release
+
+# Run the additive-reconcile suite (false-equal repair, event preservation,
+# dry-run zero-mutation, plan/apply witness rollback)
+cargo test --test e2e_sync_reconcile --release
 
 # Run with verbose output for debugging
 cargo test e2e_sync --release -- --nocapture
@@ -139,6 +146,15 @@ cargo test e2e_sync --release -- --nocapture
 [ ] Safety guarantees still accurate?
 [ ] New flags documented with safety implications?
 [ ] Test coverage section updated?
+```
+
+**Reconcile-specific invariants** (when touching `--reconcile` code paths):
+```
+[ ] Deletion still structurally impossible (no delete/reset/tombstone-write calls)
+[ ] Apply still verifies event-table witness and rolls back on any event change
+[ ] Dry-run still opens no write transaction and writes no file
+[ ] Apply still writes no JSONL/base/manifest/history file
+[ ] Receipt schema version bumped if the receipt shape changed
 ```
 
 ---

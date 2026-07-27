@@ -301,7 +301,13 @@ impl BeadsError {
             Self::AmbiguousId { .. } => Some("Provide more characters of the ID"),
             Self::HasDependents { .. } => Some("Use --force or --cascade to delete anyway"),
             Self::ImportCollision { .. } => Some("Use --force to overwrite or resolve manually"),
-            Self::DependencyCycle { .. } => Some("Remove one dependency to break the cycle"),
+            Self::DependencyCycle { .. } => Some(
+                "Remove one dependency to break the cycle. Note: epic containment \
+                 participates in blocking cycles — depending on an epic implies \
+                 depending on its entire subtree, so the cycle may traverse \
+                 parent-child edges that the message does not list (see \
+                 docs/CLI_REFERENCE.md, `dep add`)",
+            ),
             Self::SelfDependency { .. } => Some("An issue cannot depend on itself"),
             Self::AlreadyInitialized { .. } => Some("Use --force to reinitialize"),
             Self::InvalidPriority { .. } => {

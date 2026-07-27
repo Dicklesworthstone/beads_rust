@@ -779,6 +779,9 @@ fn build_issue_details_from_exact_jsonl_index(
             .rev()
             .find(|dep| dep.dep_type.as_str() == "parent-child")
             .map(|dep| dep.depends_on_id.clone()),
+        // Rollup derives from the local database; JSONL fallback paths
+        // deliberately omit it.
+        rollup: None,
     })
 }
 
@@ -848,6 +851,9 @@ fn build_issue_details_from_jsonl(
             .rev()
             .find(|dep| dep.dep_type.as_str() == "parent-child")
             .map(|dep| dep.depends_on_id.clone()),
+        // Rollup derives from the local database; JSONL fallback paths
+        // deliberately omit it.
+        rollup: None,
     })
 }
 
@@ -1195,6 +1201,20 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
         );
     }
 
+    if let Some(rollup) = &details.rollup {
+        let breakdown = rollup
+            .descendants
+            .iter()
+            .map(|(status, count)| format!("{count} {}", sanitize_terminal_inline(status)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            output,
+            "Rollup: {} ({breakdown})",
+            sanitize_terminal_inline(&rollup.status)
+        );
+    }
+
     if let Some(desc) = &issue.description {
         output.push('\n');
         let _ = writeln!(
@@ -1503,6 +1523,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let json = serde_json::to_string_pretty(&vec![details]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1539,6 +1560,7 @@ mod tests {
             }],
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
@@ -1574,6 +1596,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
 
         let output = format_issue_details(&details, false, false);
@@ -1776,6 +1799,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let local_last = IssueDetails {
             issue: make_test_issue("bd-local-2", "Local last"),
@@ -1785,6 +1809,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let external_middle = IssueDetails {
             issue: make_test_issue("ext-middle", "External middle"),
@@ -1794,6 +1819,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
 
         let ordered = reorder_details_by_requested_inputs(

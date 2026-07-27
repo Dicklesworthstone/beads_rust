@@ -49,7 +49,6 @@ Commands:
   sync          Sync database with JSONL file (export or import)
   undefer       Undefer issues (make ready again)
   update        Update an issue
-  serve         Start an MCP (Model Context Protocol) server on stdio
   upgrade       Upgrade br to the latest version
   version       Show version information
   where         Show the active .beads directory

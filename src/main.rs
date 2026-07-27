@@ -391,6 +391,9 @@ fn main() {
             }
         }
         Commands::Gate { command } => commands::gate::execute(&command, &overrides, &output_ctx),
+        Commands::Capacity { command } => {
+            commands::capacity::execute(&command, &overrides, &output_ctx)
+        }
         Commands::Label { command } => {
             if let Some(res) = storage_result.as_ref() {
                 match commands::label::execute_with_storage(
@@ -834,7 +837,7 @@ const fn should_preopen_storage(
 }
 
 const fn sync_mode_opens_storage(args: &beads_rust::cli::SyncArgs) -> bool {
-    args.flush_only || args.import_only || args.merge || args.status
+    args.flush_only || args.import_only || args.merge || args.reconcile || args.status
 }
 
 const fn should_acquire_startup_write_lock(
@@ -981,6 +984,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Label { .. }
         | Commands::Epic { .. }
         | Commands::Gate { .. }
+        | Commands::Capacity { .. }
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }
@@ -1009,7 +1013,9 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 
 const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     match cmd {
-        Commands::Sync(args) => args.status,
+        // `--reconcile --dry-run` is read-only by contract: it plans without
+        // opening a write transaction, so it may share the status fast path.
+        Commands::Sync(args) => args.status || (args.reconcile && args.dry_run),
         Commands::Stats(_)
         | Commands::Status(_)
         | Commands::Coordination { .. }
@@ -1281,8 +1287,14 @@ fn lock_mode_octal(_lock_path: &Path) -> Option<String> {
 }
 
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
+    // `--lock-timeout` deliberately does NOT disable the fast path. The
+    // timeout governs how long to wait *when a lock is required*, and a
+    // read-only fast open acquires none; on a fast-open miss the fallback
+    // still takes the write lock and honors the timeout. Gating on it meant
+    // any scripted caller that passed `--lock-timeout` silently lost lock-free
+    // reads and serialized every read command behind an exclusive flock,
+    // which shows up as spurious lock-timeout failures under parallel reads.
     let read_only_fast_open = !cli.no_db
-        && cli.lock_timeout.is_none()
         && !read_only_fast_open_disabled_for_cli()
         && supports_read_only_fast_open(&cli.command)
         && cli.no_auto_import

@@ -2,18 +2,5 @@
 source: tests/snapshots/error_messages.rs
 expression: normalize_output(&output.stderr)
 ---
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: Import path validated input_path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads allow_external=false
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::storage::sqlite: Rebuilt blocked issues cache blocked_count=0
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: ID-REDACTED completed imported_count=0 jsonl_path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
 Error: Issue not found: ID-REDACTED
 Hint: Run 'br list' to see available issues.

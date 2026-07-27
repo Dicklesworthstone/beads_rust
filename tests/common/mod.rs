@@ -24,7 +24,10 @@ pub use baseline::{
     BaselineStore, RegressionConfig, RegressionResult, RegressionStatus, RegressionSummary,
     should_update_baseline, update_baselines_from_results,
 };
-pub use binary_discovery::{BinaryVersion, DiscoveredBinaries, discover_binaries};
+pub use binary_discovery::{
+    BinaryVersion, DiscoveredBinaries, bd_available, bd_binary_name, bd_skip_reason,
+    discover_binaries,
+};
 pub use dataset_registry::{
     DatasetIntegrityGuard, DatasetMetadata, DatasetOverride, DatasetProvenance, DatasetRegistry,
     IntegrityCheckResult, IsolatedDataset, IsolatedWorkspaceFailureFixture, KnownDataset,

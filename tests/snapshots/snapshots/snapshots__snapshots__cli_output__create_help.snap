@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/cli_output.rs
+assertion_line: 65
 expression: normalize_output(&output.stdout)
 ---
 Create a new issue
@@ -7,38 +8,124 @@ Create a new issue
 Usage: br create [OPTIONS] [TITLE]
 
 Arguments:
-  [TITLE]  Issue title
+  [TITLE]
+          Issue title
 
 Options:
-      --title <TITLE_FLAG>           Issue title (alternative to positional argument)
-  -t, --type <TYPE>                  Issue type (task, bug, feature, etc.)
-      --slug <SLUG>                  ID-REDACTED slug embedded in the generated ID. Example: `--slug ID-REDACTED` produces an ID of the form `ID-REDACTED-<hash>`, keeping the configured prefix and the uniquifying hash suffix. The slug is normalized to lowercase ASCII alphanumeric + single hyphens (runs of other characters collapse to one hyphen, leading/trailing hyphens are stripped, length is capped at 48 characters after normalization)
-  -p, --priority <PRIORITY>          Priority (0-4 or P0-P4)
-  -d, --description <DESCRIPTION>    Description [aliases: --body]
-  -a, --assignee <ASSIGNEE>          Assign to person
-      --owner <OWNER>                Set owner email
-  -l, --labels <LABELS>              Labels (ID-REDACTED)
-      --parent <PARENT>              Parent issue ID (creates ID-REDACTED dep)
-      --deps <DEPS>                  Dependencies (format: type:id,type:id)
-  -e, --estimate <ESTIMATE>          Time estimate in minutes
-      --due <DUE>                    Due date (RFC3339 or relative)
-      --defer <DEFER>                Defer until date (RFC3339 or relative)
-      --ID-REDACTED <EXTERNAL_REF>  External reference
-      --ephemeral                    Mark as ephemeral (not exported to JSONL)
-  -s, --status <STATUS>              Initial status (open, deferred, in_progress, closed)
-      --ID-REDACTED                      Preview without creating
-      --silent                       Output only issue ID
-  -f, --file <FILE>                  Create issues from a markdown file (bulk import)
-      --db <DB>                      Database path (ID-REDACTED .beads/*.db if not set)
-      --actor <ACTOR>                Actor name for audit trail
-      --json                         Output as JSON
-      --ID-REDACTED                    Force direct mode (no daemon) - effectively no-op in br v1
-      --ID-REDACTED                Skip auto JSONL export
-      --ID-REDACTED               Skip auto import check
-      --ID-REDACTED                  Allow stale DB (bypass freshness check warning)
-      --ID-REDACTED <LOCK_TIMEOUT>  `SQLite` busy/ID-REDACTED timeout in ms
-      --no-db                        ID-REDACTED mode (no DB connection)
-  -v, --verbose...                   Increase logging verbosity (-v, -vv)
-  -q, --quiet                        Quiet mode (no output except errors)
-      --ID-REDACTED                     Disable colored output
-  -h, --help                         Print help
+      --title <TITLE_FLAG>
+          Issue title (alternative to positional argument)
+
+  -t, --type <TYPE>
+          Issue type (task, bug, feature, etc.)
+
+      --slug <SLUG>
+          ID-REDACTED slug embedded in the generated ID. Example: `--slug ID-REDACTED` produces an ID of the form `ID-REDACTED-<hash>`, keeping the configured prefix and the uniquifying hash suffix. The slug is normalized to lowercase ASCII alphanumeric + single hyphens (runs of other characters collapse to one hyphen, leading/trailing hyphens are stripped, length is capped at 48 characters after normalization)
+
+  -p, --priority <PRIORITY>
+          Priority (0-4 or P0-P4)
+
+  -d, --description <DESCRIPTION>
+          Description
+
+          [alias: --body]
+
+      --ID-REDACTED <PATH>
+          Read the issue description verbatim from a file (or `-` for stdin).
+
+          The entire file content is used as the description, unchanged from disk — unlike the bulk `-f/--file` markdown import, which only captures the first paragraph after each `## Title` heading. Use this for ID-REDACTED / markdown descriptions (lists, fenced code) that are fragile to pass through shell quoting on `-d/--description`. Mutually exclusive with `-d/--description`.
+
+  -a, --assignee <ASSIGNEE>
+          Assign to person
+
+      --owner <OWNER>
+          Set owner email
+
+  -l, --labels <LABELS>
+          Labels (ID-REDACTED)
+
+      --parent <PARENT>
+          Parent issue ID (creates ID-REDACTED dep)
+
+      --deps <DEPS>
+          Dependencies (format: type:id,type:id)
+
+  -e, --estimate <ESTIMATE>
+          Time estimate in minutes
+
+      --due <DUE>
+          Due date (RFC3339 or relative)
+
+      --defer <DEFER>
+          Defer until date (RFC3339 or relative)
+
+      --ID-REDACTED <EXTERNAL_REF>
+          External reference
+
+      --ephemeral
+          Mark as ephemeral (not exported to JSONL)
+
+  -s, --status <STATUS>
+          Initial status (open, deferred, in_progress, closed)
+
+      --ID-REDACTED
+          Preview without creating
+
+      --silent
+          Output only issue ID
+
+  -f, --file <FILE>
+          Create issues from a markdown file (bulk import)
+
+      --ID-REDACTED <NAME>
+          Tier 1 attribution: agent name (env: BR_AGENT_NAME). Recorded only
+
+          [env: BR_AGENT_NAME=]
+
+      --harness <HARNESS>
+          Tier 1 attribution: harness identifier (env: BR_HARNESS). Recorded only
+
+          [env: BR_HARNESS=]
+
+      --model <MODEL>
+          Tier 1 attribution: model identifier (env: BR_MODEL). Recorded only
+
+          [env: BR_MODEL=]
+
+      --db <DB>
+          Database path (ID-REDACTED .beads/*.db if not set)
+
+      --actor <ACTOR>
+          Actor name for audit trail
+
+      --json
+          Output as JSON
+
+      --ID-REDACTED
+          Force direct mode (no daemon) - effectively no-op in br v1
+
+      --ID-REDACTED
+          Skip auto JSONL export
+
+      --ID-REDACTED
+          Skip auto import check
+
+      --ID-REDACTED
+          Allow stale DB (bypass freshness check warning)
+
+      --ID-REDACTED <LOCK_TIMEOUT>
+          `SQLite` busy/ID-REDACTED timeout in ms
+
+      --no-db
+          ID-REDACTED mode (no DB connection)
+
+  -v, --verbose...
+          Increase logging verbosity (-v, -vv)
+
+  -q, --quiet
+          Quiet mode (no output except errors)
+
+      --ID-REDACTED
+          Disable colored output
+
+  -h, --help
+          Print help (see a summary with '-h')

@@ -441,7 +441,7 @@ fn coordination_status_invalid_snapshot_fails_structured() {
 
     assert!(!result.status.success(), "invalid snapshot should fail");
     assert_eq!(result.status.code(), Some(4));
-    let json = parse_error_json(&result.stderr).expect("structured error json");
+    let json = parse_error_json(&result.stdout).expect("structured error json");
     assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
     assert!(
         json["error"]["message"]

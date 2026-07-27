@@ -2,13 +2,5 @@
 source: tests/snapshots/error_messages.rs
 expression: normalize_output(&output.stderr)
 ---
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Validating sync path path=/TMP/.beads/issues.jsonl beads_dir=/TMP/.beads
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: Path validated for sync I/O path=/TMP/.beads/issues.jsonl
 Error: Issue cannot depend on itself: ID-REDACTED
 Hint: An issue cannot depend on itself

@@ -1139,7 +1139,10 @@ mod tests {
                 capacity_kind: "status".to_string(),
                 capacity_name: "in_progress".to_string(),
                 scope: "repository".to_string(),
+                scope_key: None,
                 counting_mode: "all".to_string(),
+                aggregate_parents_excluded: None,
+                exempt: None,
                 current: 2,
                 prospective: 3,
                 soft_limit: Some(1),
@@ -1160,6 +1163,46 @@ mod tests {
         assert_eq!(
             context["policy_path"],
             "workflow.capacity.statuses.in_progress"
+        );
+        // `all` counting omits the hierarchy field entirely, so phase-1/2
+        // consumers see the exact evidence shape they saw before phase 3.
+        assert!(context.get("aggregate_parents_excluded").is_none());
+        // Likewise, no active exemption means no `exempt` field: phase-4
+        // evidence stays byte-identical for repos without exemptions.
+        assert!(context.get("exempt").is_none());
+    }
+
+    #[test]
+    fn workflow_capacity_error_reports_hierarchy_counting_evidence() {
+        let err = BeadsError::WorkflowCapacityExceeded {
+            violation: Box::new(crate::close_policy::WorkflowCapacityViolation {
+                issue_id: "bd-next".to_string(),
+                from_status: Some("open".to_string()),
+                to_status: "in_progress".to_string(),
+                capacity_kind: "group".to_string(),
+                capacity_name: "active_work".to_string(),
+                scope: "repository".to_string(),
+                scope_key: None,
+                counting_mode: "leaf_work".to_string(),
+                aggregate_parents_excluded: Some(2),
+                exempt: Some(1),
+                current: 2,
+                prospective: 3,
+                soft_limit: None,
+                hard_limit: 2,
+                policy_path: "workflow.capacity.groups.active_work".to_string(),
+            }),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("capacity evidence");
+        assert_eq!(context["counting_mode"], "leaf_work");
+        assert_eq!(context["aggregate_parents_excluded"], 2);
+        assert_eq!(context["exempt"], 1);
+        assert!(
+            err.to_string()
+                .contains("counting: leaf_work, aggregate-excluded: 2, exempt: 1"),
+            "hierarchy and exemption evidence missing from message: {err}"
         );
     }
 
