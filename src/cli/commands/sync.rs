@@ -619,7 +619,7 @@ fn maybe_delegate_rebuild(
     // Snapshot tombstones before the delegation wipes the DB. The
     // in-place rebuild path inside `execute_import` preserves deletion-
     // retention state across `reset_data_tables` via
-    // `snapshot_tombstones` + `restore_tombstones`; the auto-recovery
+    // `snapshot_tombstones` + `restore_preserved_issues`; the auto-recovery
     // path opens a fresh DB and only imports what's in the JSONL, so
     // any tombstones that were in the old DB but not yet flushed would
     // be silently lost. Grab them here, restore them after the
@@ -3329,9 +3329,9 @@ mod tests {
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
     use crate::sync::{
-        ConflictResolution, PreservedTombstone, restore_tombstones,
-        scan_jsonl_for_tombstone_filter, snapshot_tombstones,
-        tombstones_missing_from_jsonl_tombstones,
+        ConflictResolution, PreservedIssue, dirty_issues_missing_from_jsonl,
+        restore_preserved_issues, scan_jsonl_for_tombstone_filter, snapshot_dirty_live_issues,
+        snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
     };
     use chrono::Utc;
     use std::collections::HashSet;
@@ -3989,7 +3989,7 @@ mod tests {
 
         storage.reset_data_tables().unwrap();
         storage.upsert_issue_for_import(&keep).unwrap();
-        restore_tombstones(&mut storage, &tombstones).unwrap();
+        restore_preserved_issues(&mut storage, &tombstones).unwrap();
 
         let restored = storage.get_issue("bd-delete").unwrap().unwrap();
         assert_eq!(restored.status, Status::Tombstone);
@@ -4031,7 +4031,7 @@ mod tests {
         storage.upsert_issue_for_import(&keep).unwrap();
         storage.execute_raw("DROP TABLE comments").unwrap();
 
-        let err = restore_tombstones(&mut storage, &tombstones).unwrap_err();
+        let err = restore_preserved_issues(&mut storage, &tombstones).unwrap_err();
         assert!(
             err.to_string().contains("comments"),
             "unexpected restore failure: {err}"
@@ -4068,7 +4068,7 @@ mod tests {
         let tombstones = snapshot_tombstones(&storage);
 
         storage.reset_data_tables().unwrap();
-        restore_tombstones(&mut storage, &tombstones).unwrap();
+        restore_preserved_issues(&mut storage, &tombstones).unwrap();
 
         let dependencies = storage.get_dependencies_full("bd-first").unwrap();
         assert_eq!(dependencies.len(), 1);
@@ -4083,13 +4083,13 @@ mod tests {
 
     #[test]
     fn test_tombstones_missing_from_jsonl_tombstones_only_skips_already_flushed_deletions() {
-        let in_jsonl = PreservedTombstone {
+        let in_jsonl = PreservedIssue {
             issue: make_test_issue("bd-in-jsonl", "in jsonl"),
             labels: Some(vec!["jsonl".to_string()]),
             dependencies: Some(Vec::new()),
             comments: Some(Vec::new()),
         };
-        let missing = PreservedTombstone {
+        let missing = PreservedIssue {
             issue: make_test_issue("bd-missing", "missing"),
             labels: Some(vec!["local".to_string()]),
             dependencies: Some(Vec::new()),
@@ -4123,7 +4123,7 @@ mod tests {
         let mut old_local_tombstone = make_test_issue("bd-contested-older", "older local delete");
         old_local_tombstone.status = Status::Tombstone;
         old_local_tombstone.deleted_at = Some(jsonl_updated_at - Duration::hours(1));
-        let old_local_preserved = PreservedTombstone {
+        let old_local_preserved = PreservedIssue {
             issue: old_local_tombstone,
             labels: None,
             dependencies: None,
@@ -4133,7 +4133,7 @@ mod tests {
         let mut new_local_tombstone = make_test_issue("bd-contested-newer", "newer local delete");
         new_local_tombstone.status = Status::Tombstone;
         new_local_tombstone.deleted_at = Some(jsonl_updated_at + Duration::hours(1));
-        let new_local_preserved = PreservedTombstone {
+        let new_local_preserved = PreservedIssue {
             issue: new_local_tombstone,
             labels: None,
             dependencies: None,
@@ -4161,6 +4161,133 @@ mod tests {
             .collect();
         assert!(filtered_ids.contains("bd-contested-older"));
         assert!(filtered_ids.contains("bd-contested-newer"));
+    }
+
+    #[test]
+    fn test_dirty_issues_missing_from_jsonl_keeps_only_unreproducible_rows() {
+        // GitHub #394: dirty live issues survive a rebuild only when the
+        // JSONL cannot reproduce them — absent entirely, or strictly older.
+        use chrono::{Duration, Utc};
+
+        let jsonl_updated_at = Utc::now();
+
+        // Never flushed anywhere: must be preserved.
+        let never_flushed = PreservedIssue {
+            issue: make_test_issue("bd-never-flushed", "db only"),
+            labels: Some(vec!["local".to_string()]),
+            dependencies: Some(Vec::new()),
+            comments: Some(Vec::new()),
+        };
+
+        // JSONL copy is as new as the local row: rebuild's import restores
+        // an identical row, no preservation needed.
+        let mut jsonl_current = make_test_issue("bd-jsonl-current", "flushed");
+        jsonl_current.updated_at = jsonl_updated_at;
+        let jsonl_current_preserved = PreservedIssue {
+            issue: jsonl_current,
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        // Local edit newer than the JSONL copy: must be preserved.
+        let mut locally_edited = make_test_issue("bd-locally-edited", "edited");
+        locally_edited.updated_at = jsonl_updated_at + Duration::hours(1);
+        let locally_edited_preserved = PreservedIssue {
+            issue: locally_edited,
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        // JSONL has the ID as a flushed tombstone: the deletion wins over
+        // the unflushed local edit (mirrors the import tombstone guard).
+        let flushed_delete = PreservedIssue {
+            issue: make_test_issue("bd-flushed-delete", "deleted upstream"),
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        let mut non_tombstone_map = std::collections::HashMap::new();
+        non_tombstone_map.insert("bd-jsonl-current".to_string(), jsonl_updated_at);
+        non_tombstone_map.insert("bd-locally-edited".to_string(), jsonl_updated_at);
+        let filter = crate::sync::JsonlTombstoneFilter {
+            tombstone_ids: HashSet::from(["bd-flushed-delete".to_string()]),
+            non_tombstone_updated_at: non_tombstone_map,
+        };
+
+        let filtered = dirty_issues_missing_from_jsonl(
+            vec![
+                never_flushed,
+                jsonl_current_preserved,
+                locally_edited_preserved,
+                flushed_delete,
+            ],
+            &filter,
+        );
+
+        let filtered_ids: HashSet<_> = filtered
+            .iter()
+            .map(|preserved| preserved.issue.id.as_str())
+            .collect();
+        assert_eq!(
+            filtered_ids,
+            HashSet::from(["bd-never-flushed", "bd-locally-edited"])
+        );
+    }
+
+    #[test]
+    fn test_snapshot_dirty_live_issues_skips_tombstones_and_captures_relations() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let live = make_test_issue("bd-live", "Live dirty issue");
+        let deleted = make_test_issue("bd-deleted", "Deleted issue");
+        storage.create_issue(&live, "test").unwrap();
+        storage.create_issue(&deleted, "test").unwrap();
+        storage.add_label("bd-live", "urgent", "test").unwrap();
+        storage
+            .add_comment("bd-live", "test", "unflushed comment")
+            .unwrap();
+        storage
+            .add_dependency("bd-live", "bd-deleted", "related", "test")
+            .unwrap();
+        storage
+            .delete_issue("bd-deleted", "test", "gone", None)
+            .unwrap();
+
+        // Both rows are dirty (nothing has been flushed), but the tombstone
+        // belongs to the `snapshot_tombstones` pass, not this one.
+        let dirty = snapshot_dirty_live_issues(&storage);
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].issue.id, "bd-live");
+        assert_eq!(
+            dirty[0].labels.as_ref().unwrap(),
+            &vec!["urgent".to_string()]
+        );
+        assert_eq!(dirty[0].comments.as_ref().unwrap().len(), 1);
+        assert_eq!(dirty[0].dependencies.as_ref().unwrap().len(), 1);
+
+        // Round-trip: after a wipe (stand-in for the rebuild), restoring
+        // the tombstone pass then the dirty pass — the order the rebuild
+        // wiring uses — brings the live issue back and re-marks it dirty.
+        let tombstones = snapshot_tombstones(&storage);
+        storage.reset_data_tables().unwrap();
+        restore_preserved_issues(&mut storage, &tombstones).unwrap();
+        restore_preserved_issues(&mut storage, &dirty).unwrap();
+        let restored = storage.get_issue("bd-live").unwrap().unwrap();
+        assert_eq!(restored.title, "Live dirty issue");
+        assert_eq!(
+            storage.get_dependencies_full("bd-live").unwrap().len(),
+            1,
+            "dependency to the restored tombstone must survive"
+        );
+        assert!(
+            storage
+                .get_dirty_issue_ids()
+                .unwrap()
+                .contains(&"bd-live".to_string())
+        );
     }
 
     #[test]

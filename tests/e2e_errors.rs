@@ -885,7 +885,7 @@ fn e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation() {
     // Regression: `br sync --import-only --rebuild` on an existing DB used
     // to lose tombstones that had not yet been flushed to JSONL. The
     // in-place path preserves them via `snapshot_tombstones` +
-    // `restore_tombstones` across `reset_data_tables`, but the new
+    // `restore_preserved_issues` across `reset_data_tables`, but the new
     // delegation path to `recover_database_from_jsonl` opens a fresh DB and
     // imports only what's in the JSONL. Unflushed tombstones therefore
     // vanished silently, taking their deletion-retention state with them.

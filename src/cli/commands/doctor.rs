@@ -14,10 +14,12 @@ use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassificatio
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness,
+    JsonlTombstoneFilter, PathValidation, PreservedIssue, compute_staleness,
+    dirty_issues_missing_from_jsonl, restore_dirty_issues_after_rebuild,
     restore_tombstones_after_rebuild, scan_conflict_markers, scan_jsonl_for_tombstone_filter,
-    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
-    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
+    snapshot_dirty_live_issues, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    validate_jsonl_issue_records, validate_no_git_path, validate_sync_path,
+    validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
 use fsqlite::{Connection, Row};
@@ -66,6 +68,17 @@ struct DoctorRepairResult {
     imported: usize,
     skipped: usize,
     fk_violations_cleaned: usize,
+    /// Unflushed tombstones restored across the rebuild (deletion-retention
+    /// state absent from the JSONL).
+    preserved_tombstones: usize,
+    /// Dirty live issues restored across the rebuild — local creations or
+    /// edits that had not yet been flushed to the JSONL (GitHub #394).
+    preserved_dirty_issues: usize,
+    /// IDs of the restored dirty issues. Post-repair verification uses
+    /// this set to accept the intentional DB-ahead-of-JSONL divergence
+    /// those rows create until the next flush.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preserved_dirty_issue_ids: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     verified_backups: Vec<config::RecoveryBackupVerification>,
 }
@@ -1558,11 +1571,79 @@ fn is_benign_post_rebuild_finding(check: &CheckResult) -> bool {
 /// `repair_report_verified` returned false even when the rebuilt database was
 /// fully healthy, forcing `doctor --repair` to exit 7 on the `corrupt_db_text`
 /// fixture (issue #375).
-fn jsonl_rebuild_repair_verified(report: &DoctorReport) -> bool {
+///
+/// `preserved_dirty_issue_ids` are the dirty unflushed issues this repair
+/// run restored across the rebuild (GitHub #394). Those rows intentionally
+/// leave the DB ahead of the JSONL until the next flush, so the
+/// `counts.db_vs_jsonl` divergence they cause is accepted — but only in
+/// exactly that shape (see [`is_preserved_dirty_count_divergence`]).
+fn jsonl_rebuild_repair_verified(
+    report: &DoctorReport,
+    preserved_dirty_issue_ids: &[String],
+) -> bool {
     report.ok
         && report.checks.iter().all(|check| {
-            matches!(check.status, CheckStatus::Ok) || is_benign_post_rebuild_finding(check)
+            matches!(check.status, CheckStatus::Ok)
+                || is_benign_post_rebuild_finding(check)
+                || is_preserved_dirty_count_divergence(check, preserved_dirty_issue_ids)
         })
+}
+
+/// GitHub #394: a rebuild that preserved dirty unflushed issues leaves the
+/// DB intentionally ahead of the JSONL until the next `sync --flush-only`,
+/// so the post-repair `counts.db_vs_jsonl` warning is expected. Accept it
+/// only in exactly that shape:
+///
+/// - nothing is missing from the DB (`only_jsonl_count == 0` — a row
+///   missing from the DB is record loss, never benign), and
+/// - the id delta's DB-only preview is complete (not clipped by the
+///   preview limit), and
+/// - every DB-only id is one this repair run just restored.
+///
+/// Any other divergence — extra unexplained DB rows, missing rows, a
+/// clipped preview we cannot fully attribute — still fails verification.
+fn is_preserved_dirty_count_divergence(
+    check: &CheckResult,
+    preserved_dirty_issue_ids: &[String],
+) -> bool {
+    if preserved_dirty_issue_ids.is_empty()
+        || check.name != "counts.db_vs_jsonl"
+        || !matches!(check.status, CheckStatus::Warn)
+    {
+        return false;
+    }
+    let Some(delta) = check
+        .details
+        .as_ref()
+        .and_then(|details| details.get("id_delta"))
+    else {
+        return false;
+    };
+    if delta
+        .get("only_jsonl_count")
+        .and_then(serde_json::Value::as_u64)
+        != Some(0)
+    {
+        return false;
+    }
+    let Some(only_db_count) = delta
+        .get("only_db_count")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+    else {
+        return false;
+    };
+    let Some(only_db) = delta.get("only_db").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    if only_db.len() != only_db_count {
+        // Preview clipped: we cannot attribute every divergent row.
+        return false;
+    }
+    only_db.iter().all(|id| {
+        id.as_str()
+            .is_some_and(|id| preserved_dirty_issue_ids.iter().any(|kept| kept == id))
+    })
 }
 
 /// Return true if any integrity check reported partial-index row mismatches
@@ -2509,17 +2590,20 @@ fn repair_database_from_jsonl_after_preflight(
         cli.as_layer(),
     ]);
 
-    // Snapshot any local tombstones before the JSONL rebuild. `doctor
-    // --repair` reaches this branch only after light repairs failed (or
-    // never applied) and the on-disk DB reports errors, so the storage
-    // handle here might be limping — but `snapshot_tombstones` is already
-    // fault-tolerant (warn+empty on enumeration failure, warn+partial on
-    // per-tombstone failure) and the cost of trying is a few selects.
-    // Without this, repair would silently wipe any tombstone the user
-    // deleted but had not yet flushed to JSONL (same hazard that
-    // `br sync --import-only --rebuild` preserves via snapshot/restore), since the
+    // Snapshot any local tombstones and dirty live issues before the
+    // JSONL rebuild. `doctor --repair` reaches this branch only after
+    // light repairs failed (or never applied) and the on-disk DB reports
+    // errors, so the storage handle here might be limping — but the
+    // snapshot helpers are already fault-tolerant (warn+empty on
+    // enumeration failure, warn+partial on per-issue failure) and the
+    // cost of trying is a few selects. Without this, repair would
+    // silently wipe any tombstone the user deleted but had not yet
+    // flushed to JSONL (same hazard that `br sync --import-only
+    // --rebuild` preserves via snapshot/restore) and any creation or
+    // edit that had not yet been flushed (GitHub #394), since the
     // rebuild only replays what's in the JSONL.
-    let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
+    let (preserved_tombstones, preserved_dirty_issues) =
+        preserved_state_for_doctor_rebuild(db_path, jsonl_path);
 
     let (mut storage, import_result, verified_backups) = config::repair_database_from_jsonl(
         beads_dir,
@@ -2532,6 +2616,7 @@ fn repair_database_from_jsonl_after_preflight(
     )?;
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
+    restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
 
     let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
 
@@ -2539,6 +2624,12 @@ fn repair_database_from_jsonl_after_preflight(
         imported: import_result.imported_count,
         skipped: import_result.skipped_count,
         fk_violations_cleaned,
+        preserved_tombstones: preserved_tombstones.len(),
+        preserved_dirty_issues: preserved_dirty_issues.len(),
+        preserved_dirty_issue_ids: preserved_dirty_issues
+            .iter()
+            .map(|preserved| preserved.issue.id.clone())
+            .collect(),
         verified_backups,
     })
 }
@@ -2777,6 +2868,8 @@ fn write_jsonl_rebuild_verification_failed_marker(
         "imported": repair_result.imported,
         "skipped": repair_result.skipped,
         "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+        "preserved_tombstones": repair_result.preserved_tombstones,
+        "preserved_dirty_issues": repair_result.preserved_dirty_issues,
         "verified_backups": &repair_result.verified_backups,
         "workspace_health": post_repair.report.workspace_health.as_deref(),
         "failed_checks": failed_checks,
@@ -2794,22 +2887,23 @@ fn write_jsonl_rebuild_verification_failed_marker(
     Ok(marker_path)
 }
 
-/// Best-effort snapshot of unflushed local tombstones, guarded on every
-/// failure mode the doctor-repair path may encounter (DB missing, DB can't
-/// be opened, JSONL unreadable).
+/// Best-effort snapshot of unflushed local tombstones and dirty live
+/// issues, guarded on every failure mode the doctor-repair path may
+/// encounter (DB missing, DB can't be opened, JSONL unreadable).
 ///
-/// This mirrors the helper at the config layer (`preserved_unflushed_tombstones`)
-/// but has to live here because the doctor-repair entry point is where we have
-/// the storage-open attempt — the config helper receives an already-open
-/// storage handle. Returns an empty vector if no tombstones survive filtering
-/// or if any step fails; the rebuild itself always proceeds either way, and
-/// `snapshot_tombstones` logs its own best-effort warnings.
-fn preserved_tombstones_for_doctor_rebuild(
+/// This mirrors the helper at the config layer (`preserved_unflushed_state`)
+/// but has to live here because the doctor-repair entry point is where we
+/// have the storage-open attempt — the config helper receives an
+/// already-open storage handle. Returns `(tombstones, dirty_live_issues)`;
+/// each vector is empty if nothing survives filtering or if any step
+/// fails. The rebuild itself always proceeds either way, and the snapshot
+/// helpers log their own best-effort warnings.
+fn preserved_state_for_doctor_rebuild(
     db_path: &Path,
     jsonl_path: &Path,
-) -> Vec<PreservedTombstone> {
+) -> (Vec<PreservedIssue>, Vec<PreservedIssue>) {
     if !db_path.is_file() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let storage = match SqliteStorage::open(db_path) {
         Ok(storage) => storage,
@@ -2817,15 +2911,16 @@ fn preserved_tombstones_for_doctor_rebuild(
             tracing::debug!(
                 db_path = %db_path.display(),
                 error = %err,
-                "Could not open DB for pre-repair tombstone snapshot; proceeding without preservation"
+                "Could not open DB for pre-repair preservation snapshot; proceeding without preservation"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
-    let snapshot = snapshot_tombstones(&storage);
+    let tombstone_snapshot = snapshot_tombstones(&storage);
+    let dirty_snapshot = snapshot_dirty_live_issues(&storage);
     drop(storage);
-    if snapshot.is_empty() {
-        return snapshot;
+    if tombstone_snapshot.is_empty() && dirty_snapshot.is_empty() {
+        return (tombstone_snapshot, dirty_snapshot);
     }
     let jsonl_filter = if jsonl_path.is_file() {
         match scan_jsonl_for_tombstone_filter(jsonl_path) {
@@ -2834,7 +2929,7 @@ fn preserved_tombstones_for_doctor_rebuild(
                 tracing::debug!(
                     jsonl_path = %jsonl_path.display(),
                     error = %err,
-                    "Could not scan JSONL for tombstone filter during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
+                    "Could not scan JSONL for tombstone filter during doctor --repair; preserving every snapshotted issue and letting the rebuild surface the JSONL error"
                 );
                 JsonlTombstoneFilter::default()
             }
@@ -2842,7 +2937,10 @@ fn preserved_tombstones_for_doctor_rebuild(
     } else {
         JsonlTombstoneFilter::default()
     };
-    tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
+    (
+        tombstones_missing_from_jsonl_tombstones(tombstone_snapshot, &jsonl_filter),
+        dirty_issues_missing_from_jsonl(dirty_snapshot, &jsonl_filter),
+    )
 }
 
 fn repair_recoverable_db_state(
@@ -12344,7 +12442,10 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     };
 
     let post_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-    let post_repair_verified = jsonl_rebuild_repair_verified(&post_repair.report);
+    let post_repair_verified = jsonl_rebuild_repair_verified(
+        &post_repair.report,
+        &repair_result.preserved_dirty_issue_ids,
+    );
     let verification_failure_marker = if post_repair_verified {
         None
     } else {
@@ -12389,6 +12490,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "imported": repair_result.imported,
             "skipped": repair_result.skipped,
             "fk_violations_cleaned": repair_result.fk_violations_cleaned,
+            "preserved_tombstones": repair_result.preserved_tombstones,
+            "preserved_dirty_issues": repair_result.preserved_dirty_issues,
             "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
             "verified": post_repair_verified,
@@ -12401,6 +12504,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "Repair complete: imported {}, skipped {}",
             repair_result.imported, repair_result.skipped
         ));
+        if repair_result.preserved_dirty_issues > 0 {
+            ctx.info(&format!(
+                "Preserved {} unflushed local issue(s) across the rebuild; run `br sync --flush-only` to export them",
+                repair_result.preserved_dirty_issues
+            ));
+        }
         if let Some(reason) = verification_failure_reason.as_deref() {
             ctx.warning(reason);
         }
@@ -13369,6 +13478,9 @@ mod tests {
             imported: 3,
             skipped: 1,
             fk_violations_cleaned: 2,
+            preserved_tombstones: 0,
+            preserved_dirty_issues: 0,
+            preserved_dirty_issue_ids: Vec::new(),
             verified_backups: Vec::new(),
         };
 
@@ -13440,6 +13552,9 @@ mod tests {
             imported: 1,
             skipped: 0,
             fk_violations_cleaned: 0,
+            preserved_tombstones: 0,
+            preserved_dirty_issues: 0,
+            preserved_dirty_issue_ids: Vec::new(),
             verified_backups: Vec::new(),
         };
         let mut session =
@@ -20207,7 +20322,7 @@ mod tests {
         // Strict verifier (used by the light-repair path) rejects these...
         assert!(!repair_report_verified(&report));
         // ...but the rebuild path's verifier tolerates them.
-        assert!(jsonl_rebuild_repair_verified(&report));
+        assert!(jsonl_rebuild_repair_verified(&report, &[]));
     }
 
     #[test]
@@ -20225,7 +20340,7 @@ mod tests {
                 details: None,
             }],
         };
-        assert!(!jsonl_rebuild_repair_verified(&error_report));
+        assert!(!jsonl_rebuild_repair_verified(&error_report, &[]));
 
         // A non-benign WARN (page anomaly) is NOT tolerated even though
         // report.ok is true: it signals residual corruption after rebuild.
@@ -20240,7 +20355,7 @@ mod tests {
                 details: None,
             }],
         };
-        assert!(!jsonl_rebuild_repair_verified(&page_warn_report));
+        assert!(!jsonl_rebuild_repair_verified(&page_warn_report, &[]));
 
         // A db.sidecars ERROR (dangling non-file sidecar) is not tolerated
         // even though the check name is on the benign list.
@@ -20255,7 +20370,7 @@ mod tests {
                 details: None,
             }],
         };
-        assert!(!jsonl_rebuild_repair_verified(&sidecar_error_report));
+        assert!(!jsonl_rebuild_repair_verified(&sidecar_error_report, &[]));
     }
 
     /// Build a `sync.metadata` WARN carrying the drift flags `check_sync_metadata`
@@ -20293,7 +20408,7 @@ mod tests {
         // preserving local state, not a defect, and it must not make a
         // successful repair exit 7.
         let report = report_with(vec![sync_metadata_warn(false, true)]);
-        assert!(jsonl_rebuild_repair_verified(&report));
+        assert!(jsonl_rebuild_repair_verified(&report, &[]));
         // The strict verifier used by the light-repair path is unchanged.
         assert!(!repair_report_verified(&report));
     }
@@ -20303,13 +20418,15 @@ mod tests {
         // The other drift direction stays fatal: we just rebuilt the database
         // *from* the JSONL, so a JSONL that still reads newer means the rebuild
         // did not land what it read.
-        assert!(!jsonl_rebuild_repair_verified(&report_with(vec![
-            sync_metadata_warn(true, false)
-        ])));
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![sync_metadata_warn(true, false)]),
+            &[]
+        ));
         // Divergence (both directions) is likewise not benign.
-        assert!(!jsonl_rebuild_repair_verified(&report_with(vec![
-            sync_metadata_warn(true, true)
-        ])));
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![sync_metadata_warn(true, true)]),
+            &[]
+        ));
     }
 
     #[test]
@@ -20322,9 +20439,10 @@ mod tests {
             details: None,
         };
         assert!(!is_pending_export_only_sync_metadata(&no_details));
-        assert!(!jsonl_rebuild_repair_verified(&report_with(vec![
-            no_details
-        ])));
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![no_details]),
+            &[]
+        ));
 
         // So must details that carry only one half of the pair.
         let half_details = CheckResult {
@@ -20334,6 +20452,83 @@ mod tests {
             details: Some(serde_json::json!({ "pending_export": true })),
         };
         assert!(!is_pending_export_only_sync_metadata(&half_details));
+    }
+
+    /// Build the `counts.db_vs_jsonl` WARN shape `check_available_db_count`
+    /// emits, so the preserved-dirty predicate is exercised against the real
+    /// detail layout.
+    fn count_divergence_warn(only_db: &[&str], only_jsonl: &[&str]) -> CheckResult {
+        CheckResult {
+            name: "counts.db_vs_jsonl".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("DB and JSONL counts differ".to_string()),
+            details: Some(serde_json::json!({
+                "db": 1 + only_db.len(),
+                "jsonl": 1 + only_jsonl.len(),
+                "id_delta": {
+                    "only_db_count": only_db.len(),
+                    "only_jsonl_count": only_jsonl.len(),
+                    "both_count": 1,
+                    "only_db": only_db,
+                    "only_jsonl": only_jsonl,
+                    "preview_limit": 50,
+                },
+            })),
+        }
+    }
+
+    #[test]
+    fn jsonl_rebuild_verification_tolerates_preserved_dirty_count_divergence() {
+        // GitHub #394: restoring a dirty unflushed issue across the rebuild
+        // leaves the DB one row ahead of the JSONL until the next flush.
+        // That exact divergence — and only that one — must not fail
+        // verification.
+        let preserved = vec!["bd-kept".to_string()];
+        let report = report_with(vec![count_divergence_warn(&["bd-kept"], &[])]);
+        assert!(jsonl_rebuild_repair_verified(&report, &preserved));
+
+        // Without a preserved set, the same divergence stays fatal.
+        assert!(!jsonl_rebuild_repair_verified(&report, &[]));
+    }
+
+    #[test]
+    fn preserved_dirty_count_divergence_fails_closed() {
+        let preserved = vec!["bd-kept".to_string()];
+
+        // A DB-only id we did NOT restore is unexplained drift.
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![count_divergence_warn(&["bd-kept", "bd-mystery"], &[])]),
+            &preserved
+        ));
+
+        // A row missing from the DB is record loss, never benign.
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![count_divergence_warn(&["bd-kept"], &["bd-lost"])]),
+            &preserved
+        ));
+
+        // A warn without the id_delta details cannot be attributed.
+        let bare_warn = CheckResult {
+            name: "counts.db_vs_jsonl".to_string(),
+            status: CheckStatus::Warn,
+            message: Some("DB and JSONL counts differ".to_string()),
+            details: Some(serde_json::json!({ "db": 2, "jsonl": 1 })),
+        };
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![bare_warn]),
+            &preserved
+        ));
+
+        // A clipped preview (only_db shorter than only_db_count) cannot
+        // attribute every divergent row.
+        let mut clipped = count_divergence_warn(&["bd-kept"], &[]);
+        if let Some(details) = clipped.details.as_mut() {
+            details["id_delta"]["only_db_count"] = serde_json::json!(2);
+        }
+        assert!(!jsonl_rebuild_repair_verified(
+            &report_with(vec![clipped]),
+            &preserved
+        ));
     }
 
     #[test]
