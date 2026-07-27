@@ -1052,6 +1052,26 @@ is what made deep traversals of shared-dependency graphs explode
 `truncated` is unrelated and still means "children exist but `--max-depth`
 stopped the walk".
 
+**Cycle semantics
+([#391](https://github.com/Dicklesworthstone/beads_rust/issues/391)):**
+
+- Only *blocking* dependency types are cycle-checked when an edge is added:
+  `blocks`, `conditional-blocks`, `waits-for`, and `parent-child`.
+  `related`, `discovered-from`, and custom types are never cycle-checked,
+  and `br dep cycles` uses the same blocking edge set, so an edge the add
+  path accepted can never fail a cycle health check afterwards
+  (`--blocking-only` is a compatible alias of the default).
+- **Epic containment participates in blocking cycles, reversed:** depending
+  on an epic means depending on its entire subtree, now and future, so the
+  traversal walks parent → child containment edges. A consequence: once any
+  issue's blocks-chain reaches an epic, no *descendant* of that epic may add
+  a `blocks` edge back into that chain — the add is rejected as a cycle even
+  though no `child → parent` edge exists. This is the intended
+  "depend-on-epic = depend-on-all-descendants" rule; the rejection's cycle
+  may traverse containment edges that the error path does not list. To
+  express a loose association that must never gate work or trip cycle
+  checks, use `-t related`.
+
 ---
 
 ### graph

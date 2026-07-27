@@ -10967,7 +10967,7 @@ impl SqliteStorage {
                 }
             }
 
-            let mut graph = Self::load_dependency_cycle_graph_from_conn(conn, true)?;
+            let mut graph = Self::load_dependency_cycle_graph_from_conn(conn)?;
             for (dep, dep_type) in &unique_dependencies {
                 let Ok(parsed_type) = dep_type.parse::<DependencyType>() else {
                     continue;
@@ -15868,6 +15868,12 @@ impl SqliteStorage {
 
     /// Detect all cycles in the dependency graph.
     ///
+    /// Since GitHub #391 the graph contains only *blocking* edges (`blocks`,
+    /// `conditional-blocks`, `waits-for`, plus reversed `parent-child`
+    /// containment), matching the add-time gate — `related` and other
+    /// non-blocking types are never cycle-checked on insertion, so they must
+    /// not fail the report either.
+    ///
     /// Returns deterministic cycle witnesses, where each cycle is a vector of
     /// issue IDs ending with its starting ID. The implementation finds strongly
     /// connected components first, then emits one witness per cyclic component.
@@ -15892,8 +15898,8 @@ impl SqliteStorage {
         self.detect_cycles(true)
     }
 
-    fn detect_cycles(&self, blocking_only: bool) -> Result<Vec<Vec<String>>> {
-        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+    fn detect_cycles(&self, _blocking_only: bool) -> Result<Vec<Vec<String>>> {
+        let graph = self.load_dependency_cycle_graph()?;
         Ok(Self::cycle_witnesses_from_graph(&graph))
     }
 
@@ -15905,11 +15911,14 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
+    /// Since GitHub #391, the cycle graph always uses the blocking edge set
+    /// (matching the add-time gate), so `blocking_only` is a compatible
+    /// no-op alias retained for the `--blocking-only` CLI flag.
     pub fn detect_dependency_cycle_report(
         &self,
-        blocking_only: bool,
+        _blocking_only: bool,
     ) -> Result<DependencyCycleReport> {
-        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+        let graph = self.load_dependency_cycle_graph()?;
         let statuses = self.load_dependency_cycle_issue_statuses()?;
         let witnesses = Self::cycle_witnesses_with_components_from_graph(&graph);
         let mut active_cycles = Vec::new();
@@ -15931,24 +15940,25 @@ impl SqliteStorage {
         })
     }
 
-    fn load_dependency_cycle_graph(
-        &self,
-        blocking_only: bool,
-    ) -> Result<BTreeMap<String, Vec<String>>> {
-        Self::load_dependency_cycle_graph_from_conn(&self.conn, blocking_only)
+    fn load_dependency_cycle_graph(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        Self::load_dependency_cycle_graph_from_conn(&self.conn)
     }
 
     fn load_dependency_cycle_graph_from_conn(
         conn: &Connection,
-        blocking_only: bool,
     ) -> Result<BTreeMap<String, Vec<String>>> {
         let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let standard_edge_sql = if blocking_only {
-            "SELECT issue_id, depends_on_id FROM dependencies \
-             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
-        } else {
-            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'"
-        };
+        // Cycle health is a *blocking* question, and it must agree with the
+        // add-time gate: `br dep add -t related` (and custom non-blocking
+        // types) are never cycle-checked on insertion, so counting those
+        // edges here made `br dep cycles` fail (nonzero since #368) on
+        // graphs the add path deliberately allowed (GitHub #391). Both modes
+        // therefore use the blocking edge set; `--blocking-only` remains a
+        // compatible alias now that the default matches add-time semantics.
+        // The reversed parent-child containment edges below participate in
+        // both modes, exactly like the add-time traversal.
+        let standard_edge_sql = "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')";
         let rows1 = conn.query(standard_edge_sql)?;
         for row in &rows1 {
             let from = cycle_endpoint(row.get(0));
@@ -19236,6 +19246,106 @@ mod tests {
         assert_eq!(text(1).as_deref(), Some("agent-7"));
         assert_eq!(text(2).as_deref(), Some("swarm-h1"));
         assert_eq!(text(3).as_deref(), Some("sess-1"));
+    }
+
+    /// GitHub #391: the cycle report must agree with the add-time gate.
+    /// A `related` edge is never cycle-checked on insertion, so it must not
+    /// be counted by `br dep cycles` either; the containment-induced
+    /// rejection of a descendant's blocks-edge stays (documented design).
+    #[test]
+    fn dependency_cycles_agree_with_add_time_blocking_semantics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in [
+            "bd-391-e",
+            "bd-391-s",
+            "bd-391-e2",
+            "bd-391-h",
+            "bd-391-r",
+            "bd-391-a",
+            "bd-391-m",
+        ] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        // Containment: E ── S ── E2 (parent-child rows are child -> parent).
+        storage
+            .add_dependency("bd-391-s", "bd-391-e", "parent-child", "seed")
+            .unwrap();
+        storage
+            .add_dependency("bd-391-e2", "bd-391-s", "parent-child", "seed")
+            .unwrap();
+        // Blocks chains reaching the epic: H -> E, R -> H, A -> E, M -> A.
+        for (from, to) in [
+            ("bd-391-h", "bd-391-e"),
+            ("bd-391-r", "bd-391-h"),
+            ("bd-391-a", "bd-391-e"),
+            ("bd-391-m", "bd-391-a"),
+        ] {
+            storage.add_dependency(from, to, "blocks", "seed").unwrap();
+        }
+
+        // Documented containment rule: a descendant's blocks-edge back into
+        // a chain that reaches the epic is rejected as a cycle.
+        let error = storage
+            .add_dependency("bd-391-e2", "bd-391-r", "blocks", "seed")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::DependencyCycle { .. }));
+
+        // A `related` edge is accepted unchecked...
+        storage
+            .add_dependency("bd-391-e2", "bd-391-m", "related", "seed")
+            .unwrap();
+        // ...and must NOT surface as a cycle in any report mode.
+        assert!(
+            storage.detect_blocking_cycles().unwrap().is_empty(),
+            "blocking cycle report must ignore related edges"
+        );
+        for blocking_only in [false, true] {
+            let report = storage
+                .detect_dependency_cycle_report(blocking_only)
+                .unwrap();
+            assert!(
+                report.active_cycles.is_empty(),
+                "related edges the add path allowed must not fail the cycle \
+                 report (blocking_only={blocking_only}): {:?}",
+                report.active_cycles
+            );
+        }
+
+        // Positive control: a genuine blocking cycle is still detected.
+        // (Insert via the import-relation path, which does not cycle-check.)
+        for id in ["bd-391-p", "bd-391-q"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        let cyclic_dep = |issue: &str, on: &str| crate::model::Dependency {
+            issue_id: issue.to_string(),
+            depends_on_id: on.to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: now,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        };
+        storage
+            .sync_dependencies_for_import("bd-391-p", &[cyclic_dep("bd-391-p", "bd-391-q")])
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("bd-391-q", &[cyclic_dep("bd-391-q", "bd-391-p")])
+            .unwrap();
+        assert!(
+            !storage.detect_blocking_cycles().unwrap().is_empty(),
+            "a genuine blocking cycle must still be reported"
+        );
     }
 
     #[test]
@@ -22946,7 +23056,10 @@ mod tests {
         storage.add_dependency("bd-rel-cy1", "bd-rel-cy2", "related", "tester")?;
         storage.add_dependency("bd-rel-cy2", "bd-rel-cy1", "related", "tester")?;
 
-        assert!(!storage.detect_all_cycles()?.is_empty());
+        // GitHub #391: `related` edges are never cycle-checked when added,
+        // so no report mode may count them — the default previously did,
+        // making `br dep cycles` fail on graphs the add path allowed.
+        assert!(storage.detect_all_cycles()?.is_empty());
         assert!(storage.detect_blocking_cycles()?.is_empty());
         Ok(())
     }

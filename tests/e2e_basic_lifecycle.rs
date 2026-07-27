@@ -214,6 +214,86 @@ fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
     }
 }
 
+/// GitHub #391: `br dep cycles` must agree with the add-time gate — a
+/// `related` edge accepted without a cycle check can never fail the cycle
+/// health report (which exits nonzero on active cycles since #368).
+#[test]
+fn e2e_dep_cycles_agrees_with_add_time_related_semantics() {
+    let _log = common::test_log("e2e_dep_cycles_agrees_with_add_time_related_semantics");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "cyc_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let mut ids: Vec<String> = Vec::new();
+    for title in ["epic E", "sub S", "grandchild E2", "H", "R", "A", "M"] {
+        let create = run_br(&workspace, ["create", title], "cyc_create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        ids.push(parse_created_id(&create.stdout));
+    }
+    let (epic, sub, grandchild, blocker_h, blocker_r, blocker_a, blocker_m) = (
+        &ids[0], &ids[1], &ids[2], &ids[3], &ids[4], &ids[5], &ids[6],
+    );
+    for (from, to, dep_type) in [
+        (sub, epic, "parent-child"),
+        (grandchild, sub, "parent-child"),
+        (blocker_h, epic, "blocks"),
+        (blocker_r, blocker_h, "blocks"),
+        (blocker_a, epic, "blocks"),
+        (blocker_m, blocker_a, "blocks"),
+    ] {
+        let add = run_br(
+            &workspace,
+            ["dep", "add", from, to, "--type", dep_type],
+            "cyc_dep_add",
+        );
+        assert!(add.status.success(), "dep add failed: {}", add.stderr);
+    }
+
+    // Documented containment rule: the descendant's blocks-edge back into a
+    // chain reaching the epic is rejected, and the hint explains that epic
+    // containment participates.
+    let rejected = run_br(
+        &workspace,
+        ["dep", "add", grandchild, blocker_r],
+        "cyc_rejected",
+    );
+    assert!(
+        !rejected.status.success(),
+        "containment-induced cycle must still reject: {}",
+        rejected.stdout
+    );
+    let combined = format!("{}{}", rejected.stdout, rejected.stderr);
+    assert!(
+        combined.contains("epic containment"),
+        "rejection hint must explain containment participation: {combined}"
+    );
+
+    // A `related` edge is accepted unchecked and must not fail the report.
+    let related = run_br(
+        &workspace,
+        ["dep", "add", grandchild, blocker_m, "--type", "related"],
+        "cyc_related",
+    );
+    assert!(
+        related.status.success(),
+        "related add failed: {}",
+        related.stderr
+    );
+    for args in [
+        vec!["dep", "cycles"],
+        vec!["dep", "cycles", "--blocking-only"],
+    ] {
+        let cycles = run_br(&workspace, args.clone(), "cyc_report");
+        assert!(
+            cycles.status.success(),
+            "{args:?} must exit 0 when the only 'cycle' is a related edge \
+             the add path allowed: {}{}",
+            cycles.stdout,
+            cycles.stderr
+        );
+    }
+}
+
 #[test]
 fn e2e_list_and_count_status_all_matches_every_status() {
     let _log = common::test_log("e2e_list_and_count_status_all_matches_every_status");
