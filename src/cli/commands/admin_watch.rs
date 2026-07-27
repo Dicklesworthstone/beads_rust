@@ -25,7 +25,7 @@ use crate::storage::messages::{MessageFilter, generate_message_id};
 /// — Drop guards don't run on signal-kill, so we'd otherwise lock the
 /// operator out for 60s after every untidy exit.
 const SINGLE_INSTANCE_TTL_SECS: i64 = 10;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::thread;
@@ -255,8 +255,13 @@ fn handle_message<R: BufRead, W: Write>(
     msg: &Message,
 ) -> Result<Action> {
     let age = format_age_compact(seconds_since(msg.sent_at));
+    let local = msg.sent_at.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S");
     writeln!(out)?;
-    writeln!(out, "  ── {} from {} ({age} ago)", msg.id, msg.from_prefix)?;
+    writeln!(
+        out,
+        "  ── {} from {} ({local}, {age} ago)",
+        msg.id, msg.from_prefix
+    )?;
     for line in msg.body.lines() {
         writeln!(out, "  │ {line}")?;
     }
