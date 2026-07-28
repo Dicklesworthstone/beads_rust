@@ -926,6 +926,8 @@ MODES (one required):
   --merge         Three-way merge .beads/beads.base.jsonl + DB + JSONL
   --status        Show sync status (read-only)
   --witness       Emit deterministic JSONL chunk witness (read-only)
+  --reconcile-additive
+                   Plan/apply exact-ID additive reconciliation
 
 SAFETY GUARDS:
   Export guards (bypassed with --force):
@@ -959,7 +961,8 @@ EXAMPLES:
   br sync --merge --force-jsonl  Keep JSONL conflicts
   br sync --import-only --rebuild Import + remove DB entries not in JSONL
   br sync --status               Show current sync status
-  br sync --witness --json       Emit JSONL chunk witness")]
+  br sync --witness --json       Emit JSONL chunk witness
+  br vcs-status --json           Explicitly inspect JSONL Git visibility")]
     Sync(SyncArgs),
 
     /// Undefer issues (make ready again)
@@ -967,6 +970,14 @@ EXAMPLES:
 
     /// Update an issue
     Update(UpdateArgs),
+
+    /// Explicitly inspect Git visibility for the configured JSONL export
+    ///
+    /// This diagnostic is intentionally separate from `br sync`: sync never
+    /// executes Git. The command applies a shared probe budget, bounded output,
+    /// literal path handling, and no-prompt/no-optional-lock safeguards.
+    #[command(name = "vcs-status")]
+    VcsStatus(VcsStatusArgs),
 
     /// Start an MCP (Model Context Protocol) server on stdio
     ///
@@ -1352,6 +1363,41 @@ pub struct InfoArgs {
     pub thanks: bool,
 }
 
+/// Arguments for the explicit VCS export-status diagnostic.
+#[derive(Args, Debug, Clone)]
+pub struct VcsStatusArgs {
+    /// Inspect this JSONL instead of the configured workspace export
+    #[arg(long, value_name = "PATH")]
+    pub jsonl: Option<PathBuf>,
+
+    /// Permit an explicitly selected JSONL outside the workspace metadata directory
+    #[arg(long)]
+    pub allow_external_jsonl: bool,
+
+    /// Shared execution budget for source capture, Git probes, and raw hashing
+    ///
+    /// Direct-child termination/reaping is cleanup and may extend past this
+    /// budget. Capture and hashing check the deadline between bounded reads;
+    /// an individual filesystem read cannot itself be preempted.
+    #[arg(long, default_value_t = 2_000, value_name = "MILLISECONDS")]
+    pub timeout_ms: u64,
+
+    /// Machine-readable output (alias for --json)
+    #[arg(long)]
+    pub robot: bool,
+}
+
+impl Default for VcsStatusArgs {
+    fn default() -> Self {
+        Self {
+            jsonl: None,
+            allow_external_jsonl: false,
+            timeout_ms: 2_000,
+            robot: false,
+        }
+    }
+}
+
 /// Arguments for the schema command.
 #[derive(Args, Debug, Default, Clone)]
 pub struct SchemaArgs {
@@ -1443,6 +1489,10 @@ pub enum SchemaTarget {
     Statistics,
     /// Coordination status output
     CoordinationStatus,
+    /// Additive reconciliation plan/apply receipt
+    AdditiveReconciliation,
+    /// Explicit VCS export-status diagnostic
+    VcsStatus,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)
@@ -1582,6 +1632,7 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.robot,
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
+        Commands::VcsStatus(args) => args.robot,
         Commands::Dep { command } => match command {
             DepCommands::Import(args) => args.robot,
             DepCommands::Add(_)
@@ -2674,9 +2725,9 @@ pub struct SyncArgs {
     /// Displays hash comparison and freshness info without modifications.
     /// With --json the payload also carries `workspace_health` plus a
     /// `reliability_audit` anomaly record (same write-gate vocabulary as
-    /// `br doctor --json`) and a read-only `git_export` block reporting
-    /// whether the tracked JSONL is clean in the surrounding git repo
-    /// ({"available": false} when git or a repo is absent).
+    /// `br doctor --json`). Its compatibility `git_export` block is always
+    /// `{available:false, reason:"not_probed"}` and points to the explicit
+    /// `br vcs-status --json` diagnostic; sync never probes VCS.
     #[arg(long)]
     pub status: bool,
 
@@ -2686,6 +2737,40 @@ pub struct SyncArgs {
     /// without opening or mutating the SQLite database.
     #[arg(long)]
     pub witness: bool,
+
+    /// Plan a lossless additive JSONL-to-database reconciliation
+    ///
+    /// This mode is read-only by default. It compares exact issue IDs, keeps
+    /// every database-only row and audit event, and emits a hash-bound receipt.
+    /// It never performs content-hash identity merges, physical deletes, base
+    /// snapshot writes, or JSONL writes.
+    #[arg(long = "reconcile-additive")]
+    pub reconcile_additive: bool,
+
+    /// Apply a conflict-free additive reconciliation plan transactionally
+    ///
+    /// Without this flag, --reconcile-additive only prints the dry-run plan.
+    #[arg(long, requires = "reconcile_additive")]
+    pub apply: bool,
+
+    /// SHA-256 from the reviewed additive-reconciliation dry-run receipt
+    ///
+    /// Required with --apply. The command refuses mutation if the exact source,
+    /// database, resolution set, or expected post-state now produces another
+    /// plan token.
+    #[arg(long = "expect-plan-sha256", value_name = "SHA256", requires = "apply")]
+    pub expect_plan_sha256: Option<String>,
+
+    /// Resolve one reviewed shared scalar-row conflict in favor of JSONL
+    ///
+    /// Repeat for multiple exact issue IDs. Relations are never replaced by
+    /// this resolution; they must already be semantically identical.
+    #[arg(
+        long = "resolve-source-id",
+        value_name = "ISSUE_ID",
+        requires = "reconcile_additive"
+    )]
+    pub resolve_source_ids: Vec<String>,
 
     /// Lines per JSONL witness chunk
     ///
@@ -3030,6 +3115,9 @@ pub enum DoctorSubcommand {
     Ls(DoctorLsArgs),
     /// Restore from `.doctor/runs/<run-id>/backups/` (or `latest`).
     Undo(DoctorUndoArgs),
+    /// Plan, apply, or undo an explicitly reviewed database schema migration.
+    #[command(name = "migrate-schema")]
+    MigrateSchema(DoctorMigrateSchemaArgs),
     /// Expand a single finding (stub in WP6; full evidence later).
     Explain(DoctorExplainArgs),
 }
@@ -3086,6 +3174,60 @@ pub struct DoctorUndoArgs {
     pub dry_run: bool,
 
     /// Emit a JSON envelope describing the restore.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor migrate-schema`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorMigrateSchemaArgs {
+    /// Reviewed migration operation.
+    #[command(subcommand)]
+    pub command: DoctorMigrateSchemaCommand,
+}
+
+/// Explicit schema-migration lifecycle.
+#[derive(Subcommand, Debug, Clone)]
+pub enum DoctorMigrateSchemaCommand {
+    /// Inspect the live database and emit a token bound to its exact file-family state.
+    Plan(DoctorMigrateSchemaPlanArgs),
+    /// Apply the reviewed migration only when the live state still matches a plan token.
+    Apply(DoctorMigrateSchemaApplyArgs),
+    /// Restore the exact pre-migration database family from a completed run.
+    Undo(DoctorMigrateSchemaUndoArgs),
+}
+
+/// Arguments for `br doctor migrate-schema plan`.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorMigrateSchemaPlanArgs {
+    /// Emit the machine-readable receipt.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor migrate-schema apply`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorMigrateSchemaApplyArgs {
+    /// Exact token emitted by `migrate-schema plan`.
+    #[arg(long)]
+    pub plan_token: String,
+
+    /// Emit the machine-readable completion receipt.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Arguments for `br doctor migrate-schema undo`.
+#[derive(Args, Debug, Clone)]
+pub struct DoctorMigrateSchemaUndoArgs {
+    /// Migration run identifier emitted by `migrate-schema apply`.
+    pub run_id: String,
+
+    /// Verify and print the restore plan without touching the database family.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit the machine-readable restore receipt.
     #[arg(long)]
     pub json: bool,
 }
@@ -3258,7 +3400,9 @@ pub struct AgentsArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic, issue_type_completer,
+        Cli, Commands, DoctorMigrateSchemaArgs, DoctorMigrateSchemaCommand,
+        DoctorMigrateSchemaPlanArgs, DoctorMigrateSchemaUndoArgs, DoctorSubcommand,
+        InheritedOutputMode, OutputFormat, OutputFormatBasic, issue_type_completer,
         issue_type_completer_delimited, resolve_output_format_basic_with_outer_mode,
         resolve_output_format_with_outer_mode,
     };
@@ -3338,6 +3482,64 @@ mod tests {
         let err = Cli::try_parse_from(["br", "doctor", "--fix", "--repair-indexes"])
             .expect_err("--fix must share --repair's repair-index conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_doctor_migrate_schema_lifecycle_parses() {
+        let plan = Cli::parse_from(["br", "doctor", "migrate-schema", "plan", "--json"]);
+        let Commands::Doctor(plan_args) = plan.command else {
+            panic!("expected doctor command");
+        };
+        assert!(matches!(
+            plan_args.subcommand,
+            Some(DoctorSubcommand::MigrateSchema(DoctorMigrateSchemaArgs {
+                command: DoctorMigrateSchemaCommand::Plan(DoctorMigrateSchemaPlanArgs {
+                    json: true
+                })
+            }))
+        ));
+
+        let apply = Cli::parse_from([
+            "br",
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            "receipt-token",
+        ]);
+        let Commands::Doctor(apply_args) = apply.command else {
+            panic!("expected doctor command");
+        };
+        let Some(DoctorSubcommand::MigrateSchema(DoctorMigrateSchemaArgs {
+            command: DoctorMigrateSchemaCommand::Apply(apply),
+        })) = apply_args.subcommand
+        else {
+            panic!("expected migrate-schema apply");
+        };
+        assert_eq!(apply.plan_token, "receipt-token");
+        assert!(!apply.json);
+
+        let undo = Cli::parse_from([
+            "br",
+            "doctor",
+            "migrate-schema",
+            "undo",
+            "run-id",
+            "--dry-run",
+        ]);
+        let Commands::Doctor(undo_args) = undo.command else {
+            panic!("expected doctor command");
+        };
+        assert!(matches!(
+            undo_args.subcommand,
+            Some(DoctorSubcommand::MigrateSchema(DoctorMigrateSchemaArgs {
+                command: DoctorMigrateSchemaCommand::Undo(DoctorMigrateSchemaUndoArgs {
+                    ref run_id,
+                    dry_run: true,
+                    json: false,
+                })
+            })) if run_id == "run-id"
+        ));
     }
 
     #[test]

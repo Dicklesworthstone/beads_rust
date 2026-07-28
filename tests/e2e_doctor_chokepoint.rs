@@ -184,6 +184,18 @@ fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
     let _ = conn.close();
 }
 
+fn db_user_version(db_path: &Path) -> i64 {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open database");
+    let version = conn
+        .query_row("PRAGMA user_version")
+        .expect("read user_version")
+        .get(0)
+        .and_then(fsqlite_types::SqliteValue::as_integer)
+        .expect("integer user_version");
+    let _ = conn.close();
+    version
+}
+
 fn db_exec_context(root: &Path, run_id: &str) -> (PathBuf, MutateContext) {
     let run_dir = root.join(".doctor").join("runs").join(run_id);
     fs::create_dir_all(run_dir.join("backups")).unwrap();
@@ -1457,13 +1469,16 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
     // Overwrite a non-header page so `PRAGMA integrity_check` reports
     // page-level corruption (the trigger for `repair_via_vacuum`).
     {
-        use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new()
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open(&db_path)
             .expect("open db rw");
         let junk = vec![0xffu8; 200];
-        f.write_at(&junk, 4096).expect("corrupt page-2");
+        f.seek(SeekFrom::Start(4096))
+            .expect("seek to page-2 corruption offset");
+        f.write_all(&junk).expect("corrupt page-2");
     }
 
     // Capture the pre-VACUUM SHA-256 so we can compare to the backup.
@@ -1585,5 +1600,168 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         "br doctor undo failed: stdout={} stderr={}",
         String::from_utf8_lossy(&undo.stdout),
         String::from_utf8_lossy(&undo.stderr)
+    );
+}
+
+#[test]
+fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    br_init(&root);
+    let db_path = root.join(".beads/beads.db");
+
+    {
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open initialized db");
+        conn.execute(
+            "INSERT INTO issues (
+                id, title, status, priority, issue_type, created_at, updated_at
+             ) VALUES (
+                'bd-e2e-schema', 'Schema migration e2e', 'open', 2, 'task',
+                '2026-07-27T12:00:00Z', '2026-07-27T12:00:00Z'
+             )",
+        )
+        .expect("seed issue");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("restore v14 table shape");
+        conn.execute("PRAGMA user_version = 14").expect("stamp v14");
+        conn.close().expect("close v14 fixture");
+    }
+
+    let refused = br_cmd(&root)
+        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
+        .output()
+        .expect("ordinary command spawned");
+    assert!(
+        !refused.status.success(),
+        "ordinary storage open must refuse an implicit schema migration"
+    );
+    assert_eq!(db_user_version(&db_path), 14);
+    let refusal_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        refusal_text.contains("br doctor migrate-schema plan"),
+        "refusal must route the operator to the reviewed workflow: {refusal_text}"
+    );
+
+    let plan = br_cmd(&root)
+        .args(["doctor", "migrate-schema", "plan", "--json"])
+        .output()
+        .expect("migration plan spawned");
+    assert!(
+        plan.status.success(),
+        "migration plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan_json = parse_trailing_json(&String::from_utf8_lossy(&plan.stdout));
+    assert_eq!(
+        plan_json["schema_version"],
+        "br.doctor.schema_migration.plan.v1"
+    );
+    assert_eq!(plan_json["eligible"], true);
+    assert_eq!(plan_json["from_version"], 14);
+    assert_eq!(plan_json["to_version"], 15);
+    let token = plan_json["plan_token"]
+        .as_str()
+        .expect("plan token")
+        .to_string();
+    assert_eq!(
+        db_user_version(&db_path),
+        14,
+        "planning must not migrate the live database"
+    );
+
+    let apply = br_cmd(&root)
+        .args([
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            &token,
+            "--json",
+        ])
+        .output()
+        .expect("migration apply spawned");
+    assert!(
+        apply.status.success(),
+        "migration apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply_json = parse_trailing_json(&String::from_utf8_lossy(&apply.stdout));
+    assert_eq!(
+        apply_json["schema_version"],
+        "br.doctor.schema_migration.applied.v1"
+    );
+    let run_id = apply_json["run_id"]
+        .as_str()
+        .expect("migration run id")
+        .to_string();
+    assert_eq!(db_user_version(&db_path), 15);
+    let run_dir = root
+        .join(".beads/.br_recovery/schema-migrations")
+        .join(&run_id);
+    assert!(run_dir.join("prepared.json").is_file());
+    assert!(run_dir.join("applied.json").is_file());
+    assert!(run_dir.join("before/beads.db").is_file());
+
+    let list_after = br_cmd(&root)
+        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
+        .output()
+        .expect("post-migration list spawned");
+    assert!(
+        list_after.status.success(),
+        "current canonical schema should open normally: stdout={} stderr={}",
+        String::from_utf8_lossy(&list_after.stdout),
+        String::from_utf8_lossy(&list_after.stderr)
+    );
+
+    let undo_plan = br_cmd(&root)
+        .args([
+            "doctor",
+            "migrate-schema",
+            "undo",
+            &run_id,
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("migration undo dry-run spawned");
+    assert!(
+        undo_plan.status.success(),
+        "undo dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&undo_plan.stdout),
+        String::from_utf8_lossy(&undo_plan.stderr)
+    );
+    assert_eq!(db_user_version(&db_path), 15);
+
+    let undo = br_cmd(&root)
+        .args(["doctor", "migrate-schema", "undo", &run_id, "--json"])
+        .output()
+        .expect("migration undo spawned");
+    assert!(
+        undo.status.success(),
+        "migration undo failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&undo.stdout),
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    let undo_json = parse_trailing_json(&String::from_utf8_lossy(&undo.stdout));
+    assert_eq!(
+        undo_json["schema_version"],
+        "br.doctor.schema_migration.undo.v1"
+    );
+    assert_eq!(undo_json["dry_run"], false);
+    assert_eq!(db_user_version(&db_path), 14);
+    assert!(run_dir.join("undone.json").is_file());
+    let quarantine_entries = fs::read_dir(run_dir.join("undo-quarantine"))
+        .expect("read undo quarantine")
+        .count();
+    assert_eq!(
+        quarantine_entries, 1,
+        "undo must retain exactly one displaced applied-state directory"
     );
 }

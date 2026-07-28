@@ -10,6 +10,189 @@ use crate::util::content_hash_from_parts;
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 15;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
+const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
+    CREATE TABLE IF NOT EXISTS gate_result_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        from_status TEXT NOT NULL,
+        to_status TEXT NOT NULL,
+        status_revision INTEGER NOT NULL,
+        gate TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        recorded_by TEXT,
+        recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_gate_result_history_issue
+        ON gate_result_history(issue_id, id);
+    CREATE INDEX IF NOT EXISTS idx_gate_result_history_scope
+        ON gate_result_history(issue_id, from_status, to_status, status_revision, id);
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedSchemaColumn {
+    name: &'static str,
+    data_type: &'static str,
+    not_null: bool,
+    default_value: Option<&'static str>,
+    primary_key_position: i64,
+}
+
+const GATE_RESULT_HISTORY_COLUMNS: &[ExpectedSchemaColumn] = &[
+    ExpectedSchemaColumn {
+        name: "id",
+        data_type: "INTEGER",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    ExpectedSchemaColumn {
+        name: "issue_id",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "from_status",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "to_status",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "status_revision",
+        data_type: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "gate",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "provider",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "passed",
+        data_type: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "note",
+        data_type: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "recorded_by",
+        data_type: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ExpectedSchemaColumn {
+        name: "recorded_at",
+        data_type: "DATETIME",
+        not_null: true,
+        default_value: Some("CURRENT_TIMESTAMP"),
+        primary_key_position: 0,
+    },
+];
+
+const GATE_RESULT_HISTORY_INDEXES: &[(&str, &[&str])] = &[
+    ("idx_gate_result_history_issue", &["issue_id", "id"]),
+    (
+        "idx_gate_result_history_scope",
+        &[
+            "issue_id",
+            "from_status",
+            "to_status",
+            "status_revision",
+            "id",
+        ],
+    ),
+];
+
+const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
+    "idx_blocked_cache_blocked_at",
+    "idx_close_metadata_bypassed",
+    "idx_close_metadata_recorded_at",
+    "idx_comments_created_at",
+    "idx_comments_issue",
+    "idx_config_key",
+    "idx_dependencies_blocking",
+    "idx_dependencies_depends_on",
+    "idx_dependencies_depends_on_type",
+    "idx_dependencies_issue",
+    "idx_dependencies_thread",
+    "idx_dependencies_type",
+    "idx_dirty_issues_marked_at",
+    "idx_events_actor",
+    "idx_events_created_at",
+    "idx_events_issue",
+    "idx_events_type",
+    "idx_gate_result_history_issue",
+    "idx_gate_result_history_scope",
+    "idx_gate_results_issue",
+    "idx_issues_assignee",
+    "idx_issues_content_hash",
+    "idx_issues_created_at",
+    "idx_issues_defer_until",
+    "idx_issues_due_at",
+    "idx_issues_ephemeral",
+    "idx_issues_external_ref_unique",
+    "idx_issues_issue_type",
+    "idx_issues_list_active_order",
+    "idx_issues_pinned",
+    "idx_issues_priority",
+    "idx_issues_ready",
+    "idx_issues_status",
+    "idx_issues_status_priority_created",
+    "idx_issues_tombstone",
+    "idx_issues_updated_at",
+    "idx_labels_issue",
+    "idx_labels_label",
+    "idx_metadata_key",
+];
+
+/// Effects produced by one explicit reviewed schema migration.
+///
+/// The reviewed migration surface is intentionally narrow: this binary only
+/// accepts schema 13 or 14 as input and always migrates to
+/// [`CURRENT_SCHEMA_VERSION`]. Callers use these counts to compare the
+/// transaction result with their reviewed plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewedSchemaMigrationEffects {
+    /// Effective `PRAGMA user_version` observed before any migration write.
+    pub from_version: u32,
+    /// Effective `PRAGMA user_version` stamped by the migration.
+    pub to_version: u32,
+    /// Issue rows whose content hash and dirty marker were rewritten by v14.
+    pub content_hash_rows_rebuilt: usize,
+    /// Whether v15 created `gate_result_history` rather than finding it present.
+    pub gate_result_history_created: bool,
+}
 
 /// The complete SQL schema for the beads database.
 /// Schema matches classic bd (Go) for interoperability.
@@ -544,84 +727,143 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Run schema migrations to bring the connected database from
-/// `PRAGMA user_version == from` up to `target_version`.
-///
-/// This is the **public hook** for `doctor_subsystems::mutate::Op::DbMigrate`
-/// (`beads_rust-folg`). The chokepoint already verifies the
-/// precondition (`PRAGMA user_version == from`) and snapshots the DB
-/// file verbatim before calling here; this function does the actual
-/// DDL.
-///
-/// The inner `run_migrations` was previously private and contained
-/// its own per-step transactions. This wrapper:
-///
-/// 1. Re-verifies the `PRAGMA user_version == from` precondition on the
-///    connection that will run the migration.
-/// 2. Calls `run_migrations` with `issues_rebuilt: false` — the
-///    chokepoint path is always invoked against an existing DB whose
-///    `issues` table is already in place; the issues-rebuild signaling
-///    is a property of fresh `apply_schema` paths, not chokepoint-driven
-///    migrations.
-/// 3. Stamps `PRAGMA user_version = target_version` so subsequent
-///    `apply_schema` opens short-circuit.
-///
-/// # Errors
-///
-/// Returns [`BeadsError::Database`] if any underlying SQL fails, or
-/// [`BeadsError::internal`] if the post-migration `user_version` does
-/// not match `target_version`.
-pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) -> Result<()> {
-    // Re-verify the precondition on this connection (the chokepoint
-    // already did one read against a separate connection; doing it
-    // again here closes the TOCTOU window between the chokepoint's read
-    // and this call's migration connection).
+fn connection_user_version(conn: &Connection) -> Result<u32> {
     let row = conn.query_row("PRAGMA user_version")?;
-    let current = row
+    Ok(row
         .get(0)
         .and_then(|v| match v {
             fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
             _ => None,
         })
-        .unwrap_or(0);
+        .unwrap_or(0))
+}
+
+fn current_schema_version_u32() -> Result<u32> {
+    u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
+        BeadsError::internal(format!(
+            "current schema version {CURRENT_SCHEMA_VERSION} cannot be represented as u32"
+        ))
+    })
+}
+
+fn validate_reviewed_schema_migration(
+    conn: &Connection,
+    from: u32,
+    target_version: u32,
+    marked_at: &str,
+) -> Result<()> {
+    let supported_target = current_schema_version_u32()?;
+    if target_version != supported_target {
+        return Err(BeadsError::internal(format!(
+            "schema migrate refused — target must be CURRENT_SCHEMA_VERSION \
+             ({supported_target}), got {target_version}"
+        )));
+    }
+    if !matches!(from, 13 | 14) {
+        return Err(BeadsError::internal(format!(
+            "schema migrate refused — only reviewed migrations 13->{supported_target} and \
+             14->{supported_target} are supported (got {from}->{target_version})"
+        )));
+    }
+    if marked_at.is_empty() {
+        return Err(BeadsError::internal(
+            "schema migrate refused — marked_at must be non-empty",
+        ));
+    }
+
+    let current = connection_user_version(conn)?;
     if current != from {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — user_version mismatch (expected {from}, got {current})"
         )));
     }
+    Ok(())
+}
 
-    // No outer transaction here. The inner `run_migrations` already
-    // opens `BEGIN IMMEDIATE` / `COMMIT` around the migration step
-    // bundles that need atomicity (e.g., the `blocked_issues_cache`
-    // pre-schema rebuild), and fsqlite does not support nested
-    // BEGINs ("cannot start a transaction within a transaction"). The
-    // chokepoint's pre-migrate snapshot
-    // (`backups/db/beads.db.pre-migrate`) is the full-rollback safety
-    // net: on any error here, the caller restores the DB file from
-    // the snapshot before returning.
-    run_migrations(conn, false)?;
+/// Apply the reviewed v14/v15 migration steps inside the caller's transaction.
+///
+/// This function never starts, commits, or rolls back a transaction. The caller
+/// must hold the database-family write authority and an active
+/// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
+/// before the first migration write.
+///
+/// Only `13 -> CURRENT_SCHEMA_VERSION` and
+/// `14 -> CURRENT_SCHEMA_VERSION` are accepted. `marked_at` is written
+/// verbatim to every v14 `dirty_issues` row, making the bookkeeping timestamp
+/// explicit and reviewable.
+///
+/// # Errors
+///
+/// Returns an error without stamping `user_version` when the source/target pair
+/// is unsupported, the effective source version does not match `from`,
+/// `marked_at` is empty, or any migration statement or postcondition fails.
+pub fn run_reviewed_schema_migration_steps_in_transaction(
+    conn: &Connection,
+    from: u32,
+    target_version: u32,
+    marked_at: &str,
+) -> Result<ReviewedSchemaMigrationEffects> {
+    validate_reviewed_schema_migration(conn, from, target_version, marked_at)?;
+
+    let content_hash_rows_rebuilt = if from == 13 {
+        tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
+        rebuild_content_hashes_for_current_format_in_transaction(conn, marked_at)?
+    } else {
+        0
+    };
+
+    let gate_result_history_created = !table_exists(conn, "gate_result_history");
+    tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
+    apply_gate_result_history_migration_in_transaction(conn)?;
+
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
 
-    // Post-state verification: `user_version` must reflect the target.
-    // If fsqlite raced its own PRAGMA cache and didn't persist the
-    // stamp, the chokepoint will see the mismatch and restore from
-    // the pre-migrate snapshot.
-    let post = conn
-        .query_row("PRAGMA user_version")?
-        .get(0)
-        .and_then(|v| match v {
-            fsqlite_types::value::SqliteValue::Integer(n) => u32::try_from(*n).ok(),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let post = connection_user_version(conn)?;
     if post != target_version {
         return Err(BeadsError::internal(format!(
             "schema migrate post-check failed — expected user_version={target_version}, observed {post}"
         )));
     }
 
-    Ok(())
+    Ok(ReviewedSchemaMigrationEffects {
+        from_version: from,
+        to_version: target_version,
+        content_hash_rows_rebuilt,
+        gate_result_history_created,
+    })
+}
+
+/// Compatibility wrapper for the existing doctor migration hook.
+///
+/// Unlike the previous implementation, this wrapper is genuinely atomic and
+/// cannot stamp an arbitrary target after running newer migrations. It accepts
+/// only the two reviewed paths supported by
+/// [`run_reviewed_schema_migration_steps_in_transaction`].
+///
+/// # Errors
+///
+/// Returns an error and rolls back the transaction when validation, migration,
+/// commit, or postcondition checks fail.
+pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) -> Result<()> {
+    let marked_at = Utc::now().to_rfc3339();
+    validate_reviewed_schema_migration(conn, from, target_version, &marked_at)?;
+
+    conn.execute("BEGIN IMMEDIATE")?;
+    match run_reviewed_schema_migration_steps_in_transaction(conn, from, target_version, &marked_at)
+    {
+        Ok(_) => {
+            if let Err(error) = conn.execute("COMMIT") {
+                let _ = conn.execute("ROLLBACK");
+                return Err(BeadsError::Database(error));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
@@ -1314,15 +1556,8 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
 }
 
 pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
-    if current_schema_version_declared(conn)
-        && core_runtime_tables_exist(conn)
-        && blocked_cache_table_canonical(conn)
-        && !kv_table_uses_primary_key(conn, "config")
-        && !kv_table_uses_primary_key(conn, "metadata")
-    {
-        return true;
-    }
-
+    let version_ok = current_schema_version_declared(conn);
+    let core_tables_ok = core_runtime_tables_exist(conn);
     let issues_ok = issues_column_order_matches(conn);
     let dependencies_ok = table_has_columns(conn, "dependencies", &["issue_id", "depends_on_id"])
         && DEPENDENCY_COLUMNS
@@ -1351,8 +1586,14 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     );
     let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
+    let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
+    let indexes_ok = REQUIRED_RUNTIME_INDEXES
+        .iter()
+        .all(|index| index_exists(conn, index));
 
-    let compatible = issues_ok
+    let compatible = version_ok
+        && core_tables_ok
+        && issues_ok
         && dependencies_ok
         && labels_ok
         && comments_ok
@@ -1362,10 +1603,14 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && dirty_issues_ok
         && export_hashes_ok
         && blocked_cache_ok
-        && child_counters_ok;
+        && child_counters_ok
+        && gate_history_ok
+        && indexes_ok;
 
     if !compatible {
         tracing::debug!(
+            version_ok,
+            core_tables_ok,
             issues_ok,
             dependencies_ok,
             labels_ok,
@@ -1377,6 +1622,8 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             export_hashes_ok,
             blocked_cache_ok,
             child_counters_ok,
+            gate_history_ok,
+            indexes_ok,
             "runtime schema compatibility check failed"
         );
     }
@@ -1677,29 +1924,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // historical, unscoped evidence; its rows never satisfy a v15 transition.
     if user_version < 15 {
         tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
-        execute_batch(
-            conn,
-            r"
-            CREATE TABLE IF NOT EXISTS gate_result_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_id TEXT NOT NULL,
-                from_status TEXT NOT NULL,
-                to_status TEXT NOT NULL,
-                status_revision INTEGER NOT NULL,
-                gate TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                passed INTEGER NOT NULL DEFAULT 0,
-                note TEXT,
-                recorded_by TEXT,
-                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_gate_result_history_issue
-                ON gate_result_history(issue_id, id);
-            CREATE INDEX IF NOT EXISTS idx_gate_result_history_scope
-                ON gate_result_history(issue_id, from_status, to_status, status_revision, id);
-        ",
-        )?;
+        apply_gate_result_history_migration_in_transaction(conn)?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -1859,7 +2084,178 @@ fn repair_legacy_status_values(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize> {
+fn schema_migration_shape_error(detail: impl std::fmt::Display) -> BeadsError {
+    BeadsError::internal(format!("schema migrate v15 post-check failed — {detail}"))
+}
+
+fn sql_default_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) => actual.trim().eq_ignore_ascii_case(expected),
+        _ => false,
+    }
+}
+
+fn attest_gate_result_history_columns(conn: &Connection) -> Result<()> {
+    let rows = conn.query("PRAGMA table_info('gate_result_history')")?;
+    if rows.len() != GATE_RESULT_HISTORY_COLUMNS.len() {
+        return Err(schema_migration_shape_error(format!(
+            "gate_result_history has {} columns, expected {}",
+            rows.len(),
+            GATE_RESULT_HISTORY_COLUMNS.len()
+        )));
+    }
+
+    for (position, (row, expected)) in rows.iter().zip(GATE_RESULT_HISTORY_COLUMNS).enumerate() {
+        let name = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+            schema_migration_shape_error(format!(
+                "gate_result_history column {position} has no text name"
+            ))
+        })?;
+        let data_type = row.get(2).and_then(SqliteValue::as_text).ok_or_else(|| {
+            schema_migration_shape_error(format!("gate_result_history.{name} has no declared type"))
+        })?;
+        let not_null = row
+            .get(3)
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| {
+                schema_migration_shape_error(format!(
+                    "gate_result_history.{name} has no NOT NULL flag"
+                ))
+            })?
+            != 0;
+        let default_value = row.get(4).and_then(SqliteValue::as_text);
+        let primary_key_position =
+            row.get(5)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    schema_migration_shape_error(format!(
+                        "gate_result_history.{name} has no primary-key position"
+                    ))
+                })?;
+
+        if name != expected.name
+            || !data_type.eq_ignore_ascii_case(expected.data_type)
+            || not_null != expected.not_null
+            || !sql_default_matches(default_value, expected.default_value)
+            || primary_key_position != expected.primary_key_position
+        {
+            return Err(schema_migration_shape_error(format!(
+                "gate_result_history column {position} is not canonical \
+                 (observed name={name:?}, type={data_type:?}, not_null={not_null}, \
+                 default={default_value:?}, pk={primary_key_position}; expected \
+                 name={:?}, type={:?}, not_null={}, default={:?}, pk={})",
+                expected.name,
+                expected.data_type,
+                expected.not_null,
+                expected.default_value,
+                expected.primary_key_position
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn attest_gate_result_history_foreign_key(conn: &Connection) -> Result<()> {
+    let rows = conn.query("PRAGMA foreign_key_list('gate_result_history')")?;
+    if rows.len() != 1 {
+        return Err(schema_migration_shape_error(format!(
+            "gate_result_history has {} foreign keys, expected 1",
+            rows.len()
+        )));
+    }
+    let row = &rows[0];
+    let table = row.get(2).and_then(SqliteValue::as_text);
+    let from = row.get(3).and_then(SqliteValue::as_text);
+    let to = row.get(4).and_then(SqliteValue::as_text);
+    let on_update = row.get(5).and_then(SqliteValue::as_text);
+    let on_delete = row.get(6).and_then(SqliteValue::as_text);
+    let sequence = row.get(1).and_then(SqliteValue::as_integer);
+    if sequence != Some(0)
+        || table != Some("issues")
+        || from != Some("issue_id")
+        || to != Some("id")
+        || !on_update.is_some_and(|value| value.eq_ignore_ascii_case("NO ACTION"))
+        || !on_delete.is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+    {
+        return Err(schema_migration_shape_error(format!(
+            "gate_result_history foreign key is not canonical \
+             (seq={sequence:?}, table={table:?}, from={from:?}, to={to:?}, \
+             on_update={on_update:?}, on_delete={on_delete:?})"
+        )));
+    }
+    Ok(())
+}
+
+fn attest_gate_result_history_indexes(conn: &Connection) -> Result<()> {
+    let index_rows = conn.query("PRAGMA index_list('gate_result_history')")?;
+    for (index_name, expected_columns) in GATE_RESULT_HISTORY_INDEXES {
+        let index_row = index_rows
+            .iter()
+            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(*index_name))
+            .ok_or_else(|| schema_migration_shape_error(format!("missing index {index_name}")))?;
+        let unique = index_row
+            .get(2)
+            .and_then(SqliteValue::as_integer)
+            .ok_or_else(|| {
+                schema_migration_shape_error(format!("index {index_name} has no uniqueness flag"))
+            })?;
+        let origin = index_row.get(3).and_then(SqliteValue::as_text);
+        let partial = index_row.get(4).and_then(SqliteValue::as_integer);
+        if unique != 0
+            || !origin.is_some_and(|value| value.eq_ignore_ascii_case("c"))
+            || partial != Some(0)
+        {
+            return Err(schema_migration_shape_error(format!(
+                "index {index_name} is not a canonical non-unique, non-partial created index \
+                 (unique={unique}, origin={origin:?}, partial={partial:?})"
+            )));
+        }
+
+        let escaped_index = index_name.replace('\'', "''");
+        let columns = conn.query(&format!("PRAGMA index_info('{escaped_index}')"))?;
+        if columns.len() != expected_columns.len() {
+            return Err(schema_migration_shape_error(format!(
+                "index {index_name} has {} columns, expected {}",
+                columns.len(),
+                expected_columns.len()
+            )));
+        }
+        for (position, (row, expected_name)) in columns.iter().zip(*expected_columns).enumerate() {
+            let sequence = row.get(0).and_then(SqliteValue::as_integer);
+            let name = row.get(2).and_then(SqliteValue::as_text);
+            let expected_sequence = i64::try_from(position).map_err(|_| {
+                schema_migration_shape_error(format!(
+                    "index {index_name} position does not fit i64"
+                ))
+            })?;
+            if sequence != Some(expected_sequence) || name != Some(*expected_name) {
+                return Err(schema_migration_shape_error(format!(
+                    "index {index_name} column {position} is not canonical \
+                     (seq={sequence:?}, name={name:?}, expected={expected_name:?})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
+    attest_gate_result_history_columns(conn)?;
+    attest_gate_result_history_foreign_key(conn)?;
+    attest_gate_result_history_indexes(conn)
+}
+
+fn apply_gate_result_history_migration_in_transaction(conn: &Connection) -> Result<()> {
+    execute_batch(conn, GATE_RESULT_HISTORY_MIGRATION_SQL)?;
+    attest_gate_result_history_schema(conn)
+}
+
+fn rebuild_content_hashes_for_current_format_in_transaction(
+    conn: &Connection,
+    marked_at: &str,
+) -> Result<usize> {
     let rows = conn.query(
         "SELECT id, title, description, design, acceptance_criteria, notes, \
                 status, priority, issue_type, assignee, owner, created_by, \
@@ -1867,98 +2263,94 @@ fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize>
          FROM issues ORDER BY id",
     )?;
 
-    if rows.is_empty() {
-        return Ok(0);
+    let mut updated = 0;
+    for row in &rows {
+        let id = row_text(row, 0).ok_or_else(|| BeadsError::Internal {
+            message: "content hash migration found issue row without id".to_string(),
+        })?;
+        let title = row_text(row, 1).unwrap_or_default();
+        let description = row_optional_text(row, 2);
+        let design = row_optional_text(row, 3);
+        let acceptance_criteria = row_optional_text(row, 4);
+        let notes = row_optional_text(row, 5);
+        let status_raw = row_text(row, 6).unwrap_or_else(|| Status::default().as_str().into());
+        let priority = Priority(
+            row.get(7)
+                .and_then(SqliteValue::as_integer)
+                .and_then(|value| i32::try_from(value).ok())
+                .unwrap_or_else(|| Priority::default().0),
+        );
+        let issue_type_raw =
+            row_text(row, 8).unwrap_or_else(|| IssueType::default().as_str().into());
+        let assignee = row_optional_text(row, 9);
+        let owner = row_optional_text(row, 10);
+        let created_by = row_optional_text(row, 11);
+        let external_ref = row_optional_text(row, 12);
+        let source_system = row_optional_text(row, 13);
+        let pinned = row_bool(row, 14);
+        let is_template = row_bool(row, 15);
+
+        let status = status_raw
+            .parse::<Status>()
+            .unwrap_or_else(|_| Status::Custom(status_raw.clone()));
+        let issue_type = issue_type_raw
+            .parse::<IssueType>()
+            .unwrap_or_else(|_| IssueType::Custom(issue_type_raw.clone()));
+        let content_hash = content_hash_from_parts(
+            &title,
+            description.as_deref(),
+            design.as_deref(),
+            acceptance_criteria.as_deref(),
+            notes.as_deref(),
+            &status,
+            &priority,
+            &issue_type,
+            assignee.as_deref(),
+            owner.as_deref(),
+            created_by.as_deref(),
+            external_ref.as_deref(),
+            source_system.as_deref(),
+            pinned,
+            is_template,
+        );
+
+        conn.execute_with_params(
+            "UPDATE issues SET content_hash = ? WHERE id = ?",
+            &[
+                SqliteValue::from(content_hash.as_str()),
+                SqliteValue::from(id.as_str()),
+            ],
+        )?;
+        conn.execute_with_params(
+            "DELETE FROM dirty_issues WHERE issue_id = ?",
+            &[SqliteValue::from(id.as_str())],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
+            &[SqliteValue::from(id.as_str()), SqliteValue::from(marked_at)],
+        )?;
+        updated += 1;
     }
 
+    if table_exists(conn, "export_hashes") {
+        conn.execute("DELETE FROM export_hashes")?;
+    }
+
+    Ok(updated)
+}
+
+fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize> {
+    // Pre-compute once and pass explicitly: legacy DBs created before the
+    // `DEFAULT CURRENT_TIMESTAMP` was added to `dirty_issues.marked_at`
+    // reject INSERTs that omit the column.
+    let marked_at = Utc::now().to_rfc3339();
     conn.execute("BEGIN IMMEDIATE")?;
-    let result = (|| -> Result<usize> {
-        let mut updated = 0;
-        // Pre-compute once outside the loop and pass explicitly: legacy DBs
-        // created before the `DEFAULT CURRENT_TIMESTAMP` was added to
-        // `dirty_issues.marked_at` reject INSERTs that omit the column.
-        let now_str = Utc::now().to_rfc3339();
-        for row in &rows {
-            let id = row_text(row, 0).ok_or_else(|| BeadsError::Internal {
-                message: "content hash migration found issue row without id".to_string(),
-            })?;
-            let title = row_text(row, 1).unwrap_or_default();
-            let description = row_optional_text(row, 2);
-            let design = row_optional_text(row, 3);
-            let acceptance_criteria = row_optional_text(row, 4);
-            let notes = row_optional_text(row, 5);
-            let status_raw = row_text(row, 6).unwrap_or_else(|| Status::default().as_str().into());
-            let priority = Priority(
-                row.get(7)
-                    .and_then(SqliteValue::as_integer)
-                    .and_then(|value| i32::try_from(value).ok())
-                    .unwrap_or_else(|| Priority::default().0),
-            );
-            let issue_type_raw =
-                row_text(row, 8).unwrap_or_else(|| IssueType::default().as_str().into());
-            let assignee = row_optional_text(row, 9);
-            let owner = row_optional_text(row, 10);
-            let created_by = row_optional_text(row, 11);
-            let external_ref = row_optional_text(row, 12);
-            let source_system = row_optional_text(row, 13);
-            let pinned = row_bool(row, 14);
-            let is_template = row_bool(row, 15);
-
-            let status = status_raw
-                .parse::<Status>()
-                .unwrap_or_else(|_| Status::Custom(status_raw.clone()));
-            let issue_type = issue_type_raw
-                .parse::<IssueType>()
-                .unwrap_or_else(|_| IssueType::Custom(issue_type_raw.clone()));
-            let content_hash = content_hash_from_parts(
-                &title,
-                description.as_deref(),
-                design.as_deref(),
-                acceptance_criteria.as_deref(),
-                notes.as_deref(),
-                &status,
-                &priority,
-                &issue_type,
-                assignee.as_deref(),
-                owner.as_deref(),
-                created_by.as_deref(),
-                external_ref.as_deref(),
-                source_system.as_deref(),
-                pinned,
-                is_template,
-            );
-
-            conn.execute_with_params(
-                "UPDATE issues SET content_hash = ? WHERE id = ?",
-                &[
-                    SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(id.as_str()),
-                ],
-            )?;
-            conn.execute_with_params(
-                "DELETE FROM dirty_issues WHERE issue_id = ?",
-                &[SqliteValue::from(id.as_str())],
-            )?;
-            conn.execute_with_params(
-                "INSERT INTO dirty_issues (issue_id, marked_at) VALUES (?, ?)",
-                &[
-                    SqliteValue::from(id.as_str()),
-                    SqliteValue::from(now_str.as_str()),
-                ],
-            )?;
-            updated += 1;
-        }
-
-        if table_exists(conn, "export_hashes") {
-            conn.execute("DELETE FROM export_hashes")?;
-        }
-
-        Ok(updated)
-    })();
-
-    match result {
+    match rebuild_content_hashes_for_current_format_in_transaction(conn, &marked_at) {
         Ok(updated) => {
-            conn.execute("COMMIT")?;
+            if let Err(error) = conn.execute("COMMIT") {
+                let _ = conn.execute("ROLLBACK");
+                return Err(BeadsError::Database(error));
+            }
             Ok(updated)
         }
         Err(error) => {
@@ -1994,6 +2386,19 @@ mod tests {
     use fsqlite::Connection;
     use std::collections::HashSet;
     use tempfile::TempDir;
+
+    fn reviewed_v14_with_gate_history_schema(schema_sql: &str) -> (TempDir, Connection) {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("reviewed-v14-shape.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("remove canonical v15 table");
+        execute_batch(&conn, schema_sql).expect("install requested gate-history fixture");
+        conn.execute("PRAGMA user_version = 14")
+            .expect("stamp reviewed v14 source");
+        (temp, conn)
+    }
 
     #[test]
     fn test_apply_schema() {
@@ -2241,6 +2646,419 @@ mod tests {
     }
 
     #[test]
+    fn test_reviewed_v13_to_v15_steps_use_explicit_timestamp_and_preserve_legacy_gates() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("reviewed-v13.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-reviewed-v13', 'pre-v14-hash', 'Test', 'open', 2, 'task', \
+                     '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed issue");
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-reviewed-v13', 'pre-v14-hash', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed export hash");
+        conn.execute(
+            "INSERT INTO gate_results (issue_id, gate, provider, passed, recorded_by) \
+             VALUES ('bd-reviewed-v13', 'ci_green', 'ci', 1, 'legacy-bot')",
+        )
+        .expect("seed legacy gate result");
+        conn.execute("DELETE FROM dirty_issues")
+            .expect("clear trigger-created dirty marker");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("restore pre-v15 shape");
+        conn.execute("PRAGMA user_version = 13")
+            .expect("stamp reviewed source");
+
+        let marked_at = "2026-07-27T12:34:56Z";
+        conn.execute("BEGIN IMMEDIATE")
+            .expect("caller owns migration transaction");
+        let effects = run_reviewed_schema_migration_steps_in_transaction(
+            &conn,
+            13,
+            current_schema_version_u32().expect("current version"),
+            marked_at,
+        )
+        .expect("reviewed 13->15 steps");
+        conn.execute("COMMIT")
+            .expect("caller commits migration transaction");
+
+        assert_eq!(
+            effects,
+            ReviewedSchemaMigrationEffects {
+                from_version: 13,
+                to_version: 15,
+                content_hash_rows_rebuilt: 1,
+                gate_result_history_created: true,
+            }
+        );
+        let hash = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-reviewed-v13'")
+            .expect("read rebuilt hash");
+        assert_eq!(
+            hash.get(0).and_then(SqliteValue::as_text),
+            Some("c42bf13dfd6447e08d119f8b0ad0a503d23ccaa92b211348fb6dfbc55a4e0779")
+        );
+        let dirty = conn
+            .query_row("SELECT marked_at FROM dirty_issues WHERE issue_id = 'bd-reviewed-v13'")
+            .expect("read explicit dirty marker");
+        assert_eq!(
+            dirty.get(0).and_then(SqliteValue::as_text),
+            Some(marked_at),
+            "reviewed migration must write the caller-provided timestamp verbatim"
+        );
+        let export_count = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .expect("count export hashes");
+        assert_eq!(
+            export_count.get(0).and_then(SqliteValue::as_integer),
+            Some(0)
+        );
+        let legacy_count = conn
+            .query_row("SELECT COUNT(*) FROM gate_results")
+            .expect("count legacy gate results");
+        assert_eq!(
+            legacy_count.get(0).and_then(SqliteValue::as_integer),
+            Some(1),
+            "v15 must preserve legacy unscoped evidence"
+        );
+        let history_count = conn
+            .query_row("SELECT COUNT(*) FROM gate_result_history")
+            .expect("count scoped history");
+        assert_eq!(
+            history_count.get(0).and_then(SqliteValue::as_integer),
+            Some(0),
+            "legacy rows must not be promoted into a transition scope"
+        );
+        assert_eq!(
+            connection_user_version(&conn).expect("read migrated version"),
+            15
+        );
+    }
+
+    #[test]
+    fn test_reviewed_v14_to_v15_steps_do_not_reapply_v14() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("reviewed-v14.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-reviewed-v14', 'already-v14-hash', 'Keep me', 'open', 2, 'task', \
+                     '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed issue");
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-reviewed-v14', 'already-v14-hash', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed export hash");
+        conn.execute("DELETE FROM dirty_issues")
+            .expect("clear trigger-created dirty marker");
+        conn.execute(
+            "INSERT INTO dirty_issues (issue_id, marked_at) \
+             VALUES ('bd-reviewed-v14', 'existing-marker')",
+        )
+        .expect("seed existing dirty marker");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("restore pre-v15 shape");
+        conn.execute("PRAGMA user_version = 14")
+            .expect("stamp reviewed source");
+
+        conn.execute("BEGIN IMMEDIATE")
+            .expect("caller owns migration transaction");
+        let effects = run_reviewed_schema_migration_steps_in_transaction(
+            &conn,
+            14,
+            current_schema_version_u32().expect("current version"),
+            "unused-v14-timestamp",
+        )
+        .expect("reviewed 14->15 steps");
+        conn.execute("COMMIT")
+            .expect("caller commits migration transaction");
+
+        assert_eq!(
+            effects,
+            ReviewedSchemaMigrationEffects {
+                from_version: 14,
+                to_version: 15,
+                content_hash_rows_rebuilt: 0,
+                gate_result_history_created: true,
+            }
+        );
+        let issue = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-reviewed-v14'")
+            .expect("read preserved hash");
+        assert_eq!(
+            issue.get(0).and_then(SqliteValue::as_text),
+            Some("already-v14-hash")
+        );
+        let dirty = conn
+            .query_row("SELECT marked_at FROM dirty_issues WHERE issue_id = 'bd-reviewed-v14'")
+            .expect("read preserved dirty marker");
+        assert_eq!(
+            dirty.get(0).and_then(SqliteValue::as_text),
+            Some("existing-marker")
+        );
+        let export_count = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .expect("count preserved export hashes");
+        assert_eq!(
+            export_count.get(0).and_then(SqliteValue::as_integer),
+            Some(1)
+        );
+        assert!(table_exists(&conn, "gate_result_history"));
+        assert_eq!(
+            connection_user_version(&conn).expect("read migrated version"),
+            15
+        );
+    }
+
+    #[test]
+    fn test_reviewed_v15_attestation_rejects_same_name_malformed_schema() {
+        let malformed_type =
+            GATE_RESULT_HISTORY_MIGRATION_SQL.replace("passed INTEGER", "passed TEXT");
+        let malformed_foreign_key =
+            GATE_RESULT_HISTORY_MIGRATION_SQL.replace("ON DELETE CASCADE", "ON DELETE SET NULL");
+        let malformed_index = GATE_RESULT_HISTORY_MIGRATION_SQL.replace(
+            "ON gate_result_history(issue_id, id)",
+            "ON gate_result_history(id, issue_id)",
+        );
+
+        for (label, schema_sql) in [
+            ("column_type", malformed_type),
+            ("foreign_key", malformed_foreign_key),
+            ("index_order", malformed_index),
+        ] {
+            let (_temp, conn) = reviewed_v14_with_gate_history_schema(&schema_sql);
+            let error = run_migrations_atomic(
+                &conn,
+                14,
+                current_schema_version_u32().expect("current version"),
+            )
+            .expect_err("same-name malformed v15 schema must be refused");
+            assert!(
+                error.to_string().contains("v15 post-check failed"),
+                "{label} mismatch should report failed v15 attestation: {error}"
+            );
+            assert_eq!(
+                connection_user_version(&conn).expect("read refused version"),
+                14,
+                "{label} mismatch must not stamp the target version"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reviewed_v14_clears_export_hashes_when_issues_are_empty() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("reviewed-empty-v13.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute("DROP TABLE export_hashes")
+            .expect("replace export hashes with legacy FK-free fixture");
+        conn.execute(
+            "CREATE TABLE export_hashes (
+                issue_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                exported_at DATETIME NOT NULL
+            )",
+        )
+        .expect("create legacy export hashes");
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at)
+             VALUES ('orphan-export', 'stale-hash', '2026-07-27T12:00:00Z')",
+        )
+        .expect("seed stale orphan export hash");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("restore pre-v15 shape");
+        conn.execute("PRAGMA user_version = 13")
+            .expect("stamp reviewed source");
+
+        run_migrations_atomic(
+            &conn,
+            13,
+            current_schema_version_u32().expect("current version"),
+        )
+        .expect("empty v13 migration");
+
+        let issue_count = conn
+            .query_row("SELECT COUNT(*) FROM issues")
+            .expect("count empty issues");
+        assert_eq!(
+            issue_count.get(0).and_then(SqliteValue::as_integer),
+            Some(0)
+        );
+        let export_count = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .expect("count cleared export hashes");
+        assert_eq!(
+            export_count.get(0).and_then(SqliteValue::as_integer),
+            Some(0),
+            "v14 must clear export hashes even when there are no issue rows"
+        );
+        assert_eq!(
+            connection_user_version(&conn).expect("read migrated version"),
+            15
+        );
+    }
+
+    #[test]
+    fn test_reviewed_migration_rolls_back_v14_when_v15_ddl_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("reviewed-rollback.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-reviewed-rollback', 'pre-v14-hash', 'Test', 'open', 2, 'task', \
+                     '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed issue");
+        conn.execute(
+            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+             VALUES ('bd-reviewed-rollback', 'pre-v14-hash', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed export hash");
+        conn.execute("DELETE FROM dirty_issues")
+            .expect("clear trigger-created dirty marker");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("remove canonical v15 table");
+        conn.execute("CREATE TABLE gate_result_history (id INTEGER PRIMARY KEY)")
+            .expect("seed incompatible v15 table");
+        conn.execute("PRAGMA user_version = 13")
+            .expect("stamp reviewed source");
+
+        let error = run_migrations_atomic(
+            &conn,
+            13,
+            current_schema_version_u32().expect("current version"),
+        )
+        .expect_err("incompatible v15 DDL must fail the migration");
+        assert!(
+            !error.to_string().is_empty(),
+            "migration failure should retain a diagnostic"
+        );
+
+        let issue = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-reviewed-rollback'")
+            .expect("read rolled-back hash");
+        assert_eq!(
+            issue.get(0).and_then(SqliteValue::as_text),
+            Some("pre-v14-hash"),
+            "v14 hash rewrite must roll back when v15 fails"
+        );
+        let dirty_count = conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-reviewed-rollback'")
+            .expect("count rolled-back dirty markers");
+        assert_eq!(
+            dirty_count.get(0).and_then(SqliteValue::as_integer),
+            Some(0),
+            "v14 dirty marker must roll back when v15 fails"
+        );
+        let export_count = conn
+            .query_row("SELECT COUNT(*) FROM export_hashes")
+            .expect("count rolled-back export hashes");
+        assert_eq!(
+            export_count.get(0).and_then(SqliteValue::as_integer),
+            Some(1),
+            "v14 export-hash clearing must roll back when v15 fails"
+        );
+        assert_eq!(
+            connection_user_version(&conn).expect("read rolled-back version"),
+            13,
+            "failed migration must not stamp the target"
+        );
+        assert!(table_exists(&conn, "gate_result_history"));
+        assert!(!column_exists(&conn, "gate_result_history", "issue_id"));
+        assert!(!index_exists(&conn, "idx_gate_result_history_issue"));
+        assert!(!index_exists(&conn, "idx_gate_result_history_scope"));
+    }
+
+    #[test]
+    fn test_reviewed_migration_refuses_unreviewed_edges_before_writes() {
+        let current = current_schema_version_u32().expect("current version");
+        for (from, target) in [(13, 14), (14, 14), (12, current), (15, 15), (13, 16)] {
+            let temp = TempDir::new().expect("tempdir");
+            let db_path = temp.path().join(format!("refuse-{from}-{target}.db"));
+            let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+            apply_schema(&conn).expect("apply current schema");
+            conn.execute(
+                "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+                 VALUES ('bd-refuse', 'sentinel-hash', 'Unchanged', 'open', 2, 'task', \
+                         '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+            )
+            .expect("seed sentinel issue");
+            conn.execute("DELETE FROM dirty_issues")
+                .expect("clear trigger-created dirty marker");
+            conn.execute("DROP TABLE gate_result_history")
+                .expect("make v15 creation observable");
+            conn.execute(&format!("PRAGMA user_version = {from}"))
+                .expect("stamp requested source");
+
+            let error = run_migrations_atomic(&conn, from, target)
+                .expect_err("unreviewed migration edge must be refused");
+            assert!(
+                error.to_string().contains("schema migrate refused"),
+                "refusal should explain the rejected edge {from}->{target}: {error}"
+            );
+            assert_eq!(
+                connection_user_version(&conn).expect("read unchanged version"),
+                from,
+                "refused edge {from}->{target} must not stamp user_version"
+            );
+            let issue = conn
+                .query_row("SELECT content_hash FROM issues WHERE id = 'bd-refuse'")
+                .expect("read unchanged issue");
+            assert_eq!(
+                issue.get(0).and_then(SqliteValue::as_text),
+                Some("sentinel-hash"),
+                "refused edge {from}->{target} must not rebuild hashes"
+            );
+            assert!(
+                !table_exists(&conn, "gate_result_history"),
+                "refused edge {from}->{target} must not apply v15 DDL"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reviewed_migration_refuses_effective_source_mismatch_before_writes() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("refuse-source-mismatch.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("make v15 creation observable");
+        conn.execute("PRAGMA user_version = 14")
+            .expect("stamp effective source");
+
+        let error = run_migrations_atomic(
+            &conn,
+            13,
+            current_schema_version_u32().expect("current version"),
+        )
+        .expect_err("declared source mismatch must be refused");
+        assert!(
+            error.to_string().contains("user_version mismatch"),
+            "mismatch should be explicit: {error}"
+        );
+        assert_eq!(
+            connection_user_version(&conn).expect("read unchanged version"),
+            14
+        );
+        assert!(!table_exists(&conn, "gate_result_history"));
+    }
+
+    #[test]
     fn test_v15_adds_scoped_gate_history_without_reusing_legacy_results() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("beads.db");
@@ -2272,6 +3090,7 @@ mod tests {
             "gate",
             "provider",
             "passed",
+            "note",
             "recorded_by",
             "recorded_at",
         ] {
@@ -2411,16 +3230,12 @@ mod tests {
     }
 
     #[test]
-    fn test_v10_migration_adds_source_repo_path_when_missing() {
-        // Regression for beads_rust#289: a v9 database stamped with
-        // user_version=9 (no source_repo_path column yet) MUST get the column
-        // back when migrated by a v10+ binary. Without an explicit v10
-        // migration, direct migration callers can stamp the DB current while
-        // leaving every subsequent INSERT to hit "no such column".
-        //
-        // This test simulates a v9 layout by creating the issues table
-        // without source_repo_path and stamping user_version=9, then asserts
-        // that the direct migration hook heals the column.
+    fn test_reviewed_migration_refuses_9_to_10_without_applying_later_steps() {
+        // The explicit reviewed migration hook is deliberately not the
+        // automatic open-time migration ladder. A request for the old 9->10
+        // edge must be rejected before either its v10 ALTER or any newer v11-
+        // v15 step runs; otherwise a caller-controlled target could stamp a
+        // partially or over-migrated database.
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("legacy_v9.db");
         let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
@@ -2469,9 +3284,25 @@ mod tests {
                 pinned INTEGER NOT NULL DEFAULT 0,
                 is_template INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT '',
+                old_value TEXT,
+                new_value TEXT,
+                comment TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             ",
         )
-        .expect("seed v9 issues table");
+        .expect("seed v9 schema objects");
+        conn.execute(
+            "INSERT INTO issues (id, content_hash, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-v9-refusal', 'pre-v14-hash', 'Do not migrate', 'open', 2, 'task', \
+                     '2026-04-02T20:00:00Z', '2026-04-03T01:00:00Z')",
+        )
+        .expect("seed v14 sentinel");
 
         // Stamp the legacy version so the open-path would otherwise
         // short-circuit and skip migrations.
@@ -2483,25 +3314,52 @@ mod tests {
             "precondition: legacy v9 table must not have source_repo_path"
         );
 
-        run_migrations_atomic(&conn, 9, 10).expect("v10 migration must succeed on v9 layout");
-
+        let error =
+            run_migrations_atomic(&conn, 9, 10).expect_err("unreviewed 9->10 edge must be refused");
         assert!(
-            column_exists(&conn, "issues", "source_repo_path"),
-            "source_repo_path column should be present after schema upgrade"
+            error.to_string().contains("schema migrate refused"),
+            "refusal should be explicit: {error}"
         );
 
-        // The user_version stamp must advance to the migration's target so
-        // future opens take the fast path safely. This test pins the v9→v10
-        // step specifically (run_migrations_atomic above used target=10), so
-        // the assertion stays at 10 even as CURRENT_SCHEMA_VERSION advances.
+        assert!(
+            !column_exists(&conn, "issues", "source_repo_path"),
+            "refused 9->10 edge must not apply the v10 column"
+        );
+        assert!(
+            !column_exists(&conn, "issues", "agent_context"),
+            "refused 9->10 edge must not apply the v11 column"
+        );
+        assert!(
+            !table_exists(&conn, "gate_results"),
+            "refused 9->10 edge must not create the v12 table"
+        );
+        for column in ["agent_name", "harness", "model"] {
+            assert!(
+                !column_exists(&conn, "events", column),
+                "refused 9->10 edge must not apply the v13 events.{column} column"
+            );
+        }
+        let hash = conn
+            .query_row("SELECT content_hash FROM issues WHERE id = 'bd-v9-refusal'")
+            .expect("read v14 sentinel");
+        assert_eq!(
+            hash.get(0).and_then(SqliteValue::as_text),
+            Some("pre-v14-hash"),
+            "refused 9->10 edge must not apply the v14 hash rebuild"
+        );
+        assert!(
+            !table_exists(&conn, "gate_result_history"),
+            "refused 9->10 edge must not create the v15 table"
+        );
+
         let stamped = conn
             .query_row("PRAGMA user_version")
             .ok()
             .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
             .unwrap_or(-1);
         assert_eq!(
-            stamped, 10,
-            "user_version should reflect the v10 migration target after run_migrations_atomic(9, 10)"
+            stamped, 9,
+            "refused migration must leave the effective source version unchanged"
         );
     }
 

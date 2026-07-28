@@ -1,7 +1,7 @@
-//! E2E coverage for the `br sync --status --json` additions:
+//! E2E coverage for `br sync --status --json`:
 //!
-//! - beads_rust#338: read-only `git_export` block (tracked/dirty JSONL
-//!   visibility; `{available:false}` outside a git repo).
+//! - beads_rust-0v1.2.4: stable `git_export` compatibility slot that never
+//!   probes VCS and points to the explicit `br vcs-status` command.
 //! - beads_rust#334: `workspace_health` + `reliability_audit` fields in
 //!   the same write-gate vocabulary as `br doctor --json`.
 
@@ -9,36 +9,6 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
-use std::path::Path;
-use std::process::Command;
-
-fn git(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .args([
-            "-c",
-            "user.name=br-e2e",
-            "-c",
-            "user.email=br-e2e@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(root)
-        .env("HOME", root)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("run git")
-}
-
-fn git_ok(root: &Path, args: &[&str]) {
-    let out = git(root, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 
 fn sync_status_json(workspace: &BrWorkspace, label: &str) -> Value {
     let status = run_br(workspace, ["sync", "--status", "--json"], label);
@@ -67,137 +37,53 @@ fn sync_status_json_no_auto_import(workspace: &BrWorkspace, label: &str) -> Valu
     serde_json::from_str(&extract_json_payload(&status.stdout)).expect("sync status json")
 }
 
-#[test]
-fn e2e_sync_status_git_export_committed_vs_dirty_jsonl() {
-    let _log = common::test_log("e2e_sync_status_git_export_committed_vs_dirty_jsonl");
-    let workspace = BrWorkspace::new();
-
-    git_ok(&workspace.root, &["init", "--initial-branch=main"]);
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    let create = run_br(&workspace, ["create", "Git status issue"], "create");
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-
-    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
-    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
-
-    // Untracked JSONL: available, but not tracked and not worktree-clean.
-    let untracked = sync_status_json(&workspace, "status_untracked");
-    let git_export = &untracked["git_export"];
-    assert_eq!(git_export["available"], true, "{untracked}");
-    assert_eq!(git_export["tracked"], false, "{untracked}");
-    assert_eq!(git_export["worktree_clean"], false, "{untracked}");
-    assert_eq!(git_export["index_clean"], true, "{untracked}");
-    assert!(git_export["head_hash"].is_null(), "{untracked}");
-    assert!(git_export["worktree_hash"].is_string(), "{untracked}");
-
-    // Commit the JSONL exactly as it sits on disk. We avoid asserting
-    // byte-for-byte hash equality with a later status call because a
-    // `br sync --status` open may auto-export the JSONL with refreshed
-    // timestamps; instead we assert the structural git facts (tracked,
-    // and the reported HEAD blob hash agrees with git's own view).
-    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
-    git_ok(&workspace.root, &["add", ".beads/issues.jsonl"]);
-    git_ok(&workspace.root, &["commit", "-m", "track issues.jsonl"]);
-    let committed_head =
-        git_committed_blob_hash(&workspace.root, ".beads/issues.jsonl").expect("head blob hash");
-
-    let committed = sync_status_json(&workspace, "status_committed");
-    let git_export = &committed["git_export"];
-    assert_eq!(git_export["available"], true, "{committed}");
-    assert_eq!(git_export["tracked"], true, "{committed}");
-    // The reported HEAD blob hash must agree with what git records for
-    // the committed copy (independent of any worktree re-export jitter).
+fn assert_vcs_not_probed(status: &Value) {
+    let git_export = status["git_export"]
+        .as_object()
+        .expect("git_export compatibility object");
     assert_eq!(
-        git_export["head_hash"].as_str().expect("head hash"),
-        committed_head,
-        "{committed}"
+        git_export
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["available", "diagnostic_command", "reason"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "sync must not leak or fabricate VCS observations: {status}"
     );
-    assert_eq!(committed_head.len(), 40, "{committed}");
-
-    // Dirty the tracked JSONL with a git-level edit that br will NOT undo
-    // on a read-only status call. This is the regression target: a dirty
-    // tracked issues.jsonl that DB-vs-JSONL drift alone cannot see.
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&jsonl_path)
-            .expect("open jsonl for append");
-        writeln!(f, "{{\"id\":\"bd-extra-untracked-edit\"}}").expect("append to jsonl");
-    }
-
-    // Use --no-auto-import so the status open does not absorb the edit
-    // back into the DB before we read the worktree's git state.
-    let dirty = sync_status_json_no_auto_import(&workspace, "status_dirty");
-    let git_export = &dirty["git_export"];
-    assert_eq!(git_export["available"], true, "{dirty}");
-    assert_eq!(git_export["tracked"], true, "{dirty}");
-    // The committed copy must now differ from the on-disk copy — the
-    // core #338 signal: a dirty tracked issues.jsonl that DB-vs-JSONL
-    // drift alone cannot see. We assert via the hashes (git's own
-    // content view) rather than a specific porcelain column, because
-    // git's racy-clean stat handling can attribute a same-second
-    // commit-then-edit to either the index or worktree column.
-    assert_ne!(
-        git_export["head_hash"].as_str().expect("head hash"),
-        git_export["worktree_hash"].as_str().expect("worktree hash"),
-        "dirty worktree must hash differently from HEAD: {dirty}"
+    assert_eq!(git_export["available"], false, "{status}");
+    assert_eq!(git_export["reason"], "not_probed", "{status}");
+    assert_eq!(
+        git_export["diagnostic_command"], "br vcs-status --json",
+        "{status}"
     );
-    let worktree_clean = git_export["worktree_clean"]
-        .as_bool()
-        .expect("worktree_clean");
-    let index_clean = git_export["index_clean"].as_bool().expect("index_clean");
-    assert!(
-        !worktree_clean || !index_clean,
-        "an edited tracked JSONL must be reported dirty in the index or worktree: {dirty}"
-    );
-}
-
-/// Resolve the committed blob hash for `relpath` via git, returning
-/// `None` when the path is absent from HEAD.
-fn git_committed_blob_hash(root: &Path, relpath: &str) -> Option<String> {
-    let out = git(
-        root,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("HEAD:{relpath}"),
-        ],
-    );
-    if !out.status.success() {
-        return None;
-    }
-    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if hash.is_empty() { None } else { Some(hash) }
 }
 
 #[test]
-fn e2e_sync_status_git_export_unavailable_outside_repo() {
-    let _log = common::test_log("e2e_sync_status_git_export_unavailable_outside_repo");
+fn e2e_sync_status_vcs_slot_is_not_probed_inside_git_repo() {
+    let _log = common::test_log("e2e_sync_status_vcs_slot_is_not_probed_inside_git_repo");
+    let workspace = BrWorkspace::new();
+    let git = std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(&workspace.root)
+        .output()
+        .expect("git init");
+    assert!(git.status.success(), "git init failed");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    assert_vcs_not_probed(&sync_status_json(&workspace, "status_in_git"));
+}
+
+#[test]
+fn e2e_sync_status_vcs_slot_is_not_probed_outside_git_repo() {
+    let _log = common::test_log("e2e_sync_status_vcs_slot_is_not_probed_outside_git_repo");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    let status = sync_status_json(&workspace, "status_no_git");
-    let git_export = &status["git_export"];
-    assert_eq!(git_export["available"], false, "{status}");
-    for absent in [
-        "tracked",
-        "worktree_clean",
-        "index_clean",
-        "head_hash",
-        "worktree_hash",
-    ] {
-        assert!(
-            git_export.get(absent).is_none(),
-            "{absent} must be omitted when git is unavailable: {status}"
-        );
-    }
+    assert_vcs_not_probed(&sync_status_json(&workspace, "status_no_git"));
 }
 
 #[test]

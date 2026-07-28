@@ -541,6 +541,17 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "External JSONL paths require both `BEADS_JSONL` and `--allow-external-jsonl`.",
             "Use `--status --json` or `--witness` for read-only diagnostics.",
         ],
+        "vcs-status" => &[
+            "Runs only when explicitly requested; sync and implicit startup paths never invoke it.",
+            "Uses bounded, read-only Git plumbing with prompts, hooks, filters, lazy fetch, and optional locks disabled.",
+            "The Git executable selected from PATH is trusted; this is not a process sandbox.",
+            "External JSONL paths require `--allow-external-jsonl` and are redacted in output.",
+        ],
+        "doctor" => &[
+            "Ordinary commands never cross a schema-version boundary implicitly.",
+            "Use `doctor migrate-schema plan --json` before apply; apply requires the exact state-bound plan token.",
+            "Migration undo refuses changed post-migration data, quarantines the displaced family without deletion, and is resumable.",
+        ],
         "search" => &[
             "Search is read-only; prefer `--format json` or `--format toon` for parsing.",
             "Use list-style filters after the query to narrow result sets.",
@@ -970,11 +981,25 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["json", "text"],
             examples: &["br sync --status --json", "br sync --flush-only"],
         },
+        "vcs-status" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "toon", "text"],
+            examples: &[
+                "br vcs-status --json",
+                "br vcs-status --timeout-ms 5000 --robot",
+            ],
+        },
         "doctor" => CommandContract {
             operation: "mixed",
             workspace: "optional",
             machine_output: &["json", "text"],
-            examples: &["br doctor --json"],
+            examples: &[
+                "br doctor --json",
+                "br doctor migrate-schema plan --json",
+                "br doctor migrate-schema apply --plan-token <TOKEN> --json",
+                "br doctor migrate-schema undo <RUN_ID> --dry-run --json",
+            ],
         },
         "config" => CommandContract {
             operation: "mixed",
@@ -1012,6 +1037,54 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["text"],
             examples: &[],
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_contract, command_detail_for_path};
+
+    #[test]
+    fn vcs_status_capability_is_explicit_read_only_and_machine_discoverable() {
+        let contract = command_contract("vcs-status");
+        assert_eq!(contract.operation, "read");
+        assert_eq!(contract.workspace, "required");
+        assert_eq!(contract.machine_output, ["json", "toon", "text"]);
+        assert!(
+            contract
+                .examples
+                .iter()
+                .any(|example| example.contains("br vcs-status --json"))
+        );
+
+        let detail = command_detail_for_path("vcs-status").expect("vcs-status detail");
+        assert_eq!(detail.operation, "read");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("selected from PATH is trusted"))
+        );
+    }
+
+    #[test]
+    fn doctor_capability_exposes_the_reviewed_schema_migration_workflow() {
+        let contract = command_contract("doctor");
+        assert_eq!(contract.operation, "mixed");
+        assert!(
+            contract
+                .examples
+                .iter()
+                .any(|example| example.contains("migrate-schema plan --json"))
+        );
+
+        let detail = command_detail_for_path("doctor").expect("doctor detail");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("never cross a schema-version boundary"))
+        );
     }
 }
 

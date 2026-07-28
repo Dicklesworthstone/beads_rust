@@ -162,6 +162,27 @@ where
     )
 }
 
+fn configure_test_command_environment<E, K, V>(cmd: &mut Command, root: &Path, env_vars: E)
+where
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    // Default e2e runs un-throttled so history-mechanics tests (backup
+    // chronology, prune, restore) observe one `.br_history` snapshot per
+    // mutation. Set before caller `env_vars` so a test can override this to
+    // exercise the #313 snapshot throttle.
+    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
+    // Keep each fixture's Git configuration hermetic by default, while still
+    // allowing tests of effective global configuration to supply another
+    // HOME explicitly.
+    cmd.env("HOME", root);
+    cmd.envs(env_vars);
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "beads_rust=debug");
+    cmd.env("RUST_BACKTRACE", "1");
+}
+
 fn run_br_full_in_root<I, S, E, K, V>(
     root: &Path,
     log_dir: &Path,
@@ -188,16 +209,7 @@ where
     } else {
         clear_inherited_br_env(&mut cmd);
     }
-    // Default e2e runs un-throttled so history-mechanics tests (backup
-    // chronology, prune, restore) observe one `.br_history` snapshot per
-    // mutation. Set before caller `env_vars` so a test can override this to
-    // exercise the #313 snapshot throttle.
-    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
-    cmd.envs(env_vars);
-    cmd.env("NO_COLOR", "1");
-    cmd.env("RUST_LOG", "beads_rust=debug");
-    cmd.env("RUST_BACKTRACE", "1");
-    cmd.env("HOME", root);
+    configure_test_command_environment(&mut cmd, root, env_vars);
 
     if let Some(input) = stdin_input {
         cmd.write_stdin(input);
@@ -303,8 +315,29 @@ pub fn parse_list_issues(stdout: &str) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{should_clear_inherited_br_env, should_preserve_smoke_env};
+    use super::{
+        configure_test_command_environment, should_clear_inherited_br_env,
+        should_preserve_smoke_env,
+    };
+    use assert_cmd::Command;
     use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn caller_home_overrides_the_hermetic_default() {
+        let mut command = Command::new("br");
+        configure_test_command_environment(
+            &mut command,
+            Path::new("/fixture-default-home"),
+            [("HOME", "/caller-selected-home")],
+        );
+
+        let home = command
+            .get_envs()
+            .find_map(|(key, value)| (key == OsStr::new("HOME")).then_some(value))
+            .flatten();
+        assert_eq!(home, Some(OsStr::new("/caller-selected-home")));
+    }
 
     #[test]
     fn inherited_beads_and_toon_env_are_cleared() {

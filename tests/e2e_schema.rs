@@ -19,6 +19,51 @@ use toon_rust::{EncodeOptions, JsonValue};
 const UPDATE_AGENT_BASELINE_ENV: &str = "UPDATE_AGENT_BASELINE";
 
 #[test]
+fn e2e_schema_vcs_shape_matches_live_success_and_error_streams() {
+    let _log = common::test_log("e2e_schema_vcs_shape_matches_live_success_and_error_streams");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "schema_vcs_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let schemas = run_br(
+        &workspace,
+        ["schema", "commands", "--format", "json"],
+        "schema_vcs_commands",
+    );
+    assert!(schemas.status.success(), "{}", schemas.stderr);
+    let schemas: Value =
+        serde_json::from_str(&extract_json_payload(&schemas.stdout)).expect("schema commands JSON");
+    let shape = &schemas["commands"]["vcs-status"];
+    assert_eq!(shape["shape"], "object", "{shape}");
+    assert_eq!(shape["jq_filter"], ".", "{shape}");
+    assert_eq!(shape["item_schema"], "VcsExportStatus", "{shape}");
+    assert_eq!(
+        shape["error_envelope_on_stderr"], false,
+        "shape must describe the top-level CLI error stream: {shape}"
+    );
+
+    let success = run_br(
+        &workspace,
+        ["vcs-status", "--json"],
+        "schema_vcs_live_success",
+    );
+    assert!(success.status.success(), "{}", success.stderr);
+    let success: Value =
+        serde_json::from_str(&extract_json_payload(&success.stdout)).expect("VCS success JSON");
+    assert_eq!(success["schema"], "br.vcs-export-status.v2", "{success}");
+
+    let error = run_br(
+        &workspace,
+        ["vcs-status", "--timeout-ms", "1", "--json"],
+        "schema_vcs_live_error",
+    );
+    assert!(!error.status.success(), "invalid timeout must fail");
+    let error: Value = serde_json::from_str(&extract_json_payload(&error.stdout))
+        .expect("VCS error JSON on stdout");
+    assert!(error.get("error").is_some(), "{error}");
+}
+
+#[test]
 fn e2e_schema_json_issue() {
     let _log = common::test_log("e2e_schema_json_issue");
     let workspace = BrWorkspace::new();

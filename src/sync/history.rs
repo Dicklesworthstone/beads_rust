@@ -7,6 +7,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::sync::path::validate_sync_path_with_external;
+use crate::sync::{JsonlSourceSnapshot, capture_optional_jsonl_source};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -483,12 +484,22 @@ pub fn backup_before_export(
     if !config.enabled {
         return Ok(());
     }
+    let Some(source) = capture_optional_jsonl_source(target_path)? else {
+        return Ok(());
+    };
+    backup_before_export_snapshot(beads_dir, config, target_path, &source)
+}
 
-    let history_dir = beads_dir.join(".br_history");
-
-    if history_artifact_metadata(target_path, "backup source")?.is_none() {
+pub(crate) fn backup_before_export_snapshot(
+    beads_dir: &Path,
+    config: &HistoryConfig,
+    target_path: &Path,
+    source: &JsonlSourceSnapshot,
+) -> Result<()> {
+    if !config.enabled {
         return Ok(());
     }
+    let history_dir = beads_dir.join(".br_history");
 
     ensure_history_dir_path(&history_dir)?;
 
@@ -504,7 +515,7 @@ pub fn backup_before_export(
     // We match by full target identity so similarly named exports do not
     // collapse each other's history.
     if let Some(latest) = get_latest_backup(&history_dir, &target_key)? {
-        if files_are_identical(target_path, &latest.path)? {
+        if snapshot_and_file_are_identical(source, &latest.path)? {
             tracing::debug!(
                 "Skipping backup: identical to latest {}",
                 latest.path.display()
@@ -542,8 +553,7 @@ pub fn backup_before_export(
     // overwrite race so pre-existing symlinks or files are never clobbered.
     let (backup_path, mut backup_file) = create_backup_file(&history_dir, file_stem)?;
     let mut backup_guard = BackupFileGuard::new(backup_path.clone());
-    let mut source = File::open(target_path).map_err(BeadsError::Io)?;
-    io::copy(&mut source, &mut backup_file).map_err(BeadsError::Io)?;
+    io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
     crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
     write_backup_metadata(beads_dir, target_path, &backup_path)?;
@@ -677,38 +687,32 @@ fn get_latest_backup(history_dir: &Path, target_key: &str) -> Result<Option<Back
         .find(|entry| entry.target_key == target_key))
 }
 
-/// Compare two files by content hash.
-fn files_are_identical(p1: &Path, p2: &Path) -> Result<bool> {
-    let f1 = File::open(p1).map_err(BeadsError::Io)?;
-    let f2 = File::open(p2).map_err(BeadsError::Io)?;
-
-    let len1 = f1.metadata().map_err(BeadsError::Io)?.len();
-    let len2 = f2.metadata().map_err(BeadsError::Io)?.len();
-
-    if len1 != len2 {
+fn snapshot_and_file_are_identical(source: &JsonlSourceSnapshot, path: &Path) -> Result<bool> {
+    let file = File::open(path).map_err(BeadsError::Io)?;
+    if source.size() != file.metadata().map_err(BeadsError::Io)?.len() {
         return Ok(false);
     }
 
-    let mut reader1 = BufReader::new(f1);
-    let mut reader2 = BufReader::new(f2);
+    readers_are_identical(source.reader(), BufReader::new(file))
+}
 
+fn readers_are_identical(mut reader1: impl Read, mut reader2: impl Read) -> Result<bool> {
     let mut buf1 = [0u8; 8192];
     let mut buf2 = [0u8; 8192];
 
     loop {
         let n1 = reader1.read(&mut buf1).map_err(BeadsError::Io)?;
         if n1 == 0 {
-            break;
+            return Ok(reader2.read(&mut buf2[..1]).map_err(BeadsError::Io)? == 0);
         }
 
-        // Fill buffer 2 to match n1
         let mut n2_total = 0;
         while n2_total < n1 {
             let n2 = reader2
                 .read(&mut buf2[n2_total..n1])
                 .map_err(BeadsError::Io)?;
             if n2 == 0 {
-                return Ok(false); // Unexpected EOF
+                return Ok(false);
             }
             n2_total += n2;
         }
@@ -717,8 +721,6 @@ fn files_are_identical(p1: &Path, p2: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
-
-    Ok(true)
 }
 
 /// Prune old backups based on count and age.

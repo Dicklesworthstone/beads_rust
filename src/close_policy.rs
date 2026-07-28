@@ -266,6 +266,12 @@ impl CapacityPolicy {
     pub fn is_active(&self) -> bool {
         !self.statuses.is_empty() || !self.groups.is_empty() || !self.admission.is_empty()
     }
+
+    /// Whether this policy has no capacity behavior to bind or enforce.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.is_active()
+    }
 }
 
 /// Soft and hard occupancy thresholds for one capacity.

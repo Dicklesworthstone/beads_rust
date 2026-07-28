@@ -13,11 +13,18 @@ use crate::error::{BeadsError, Result};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
+use crate::storage::sqlite::PendingSyncMergeInspection;
+#[cfg(test)]
+use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
 use crate::sync::{
-    JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness,
-    restore_tombstones_after_rebuild, scan_conflict_markers, scan_jsonl_for_tombstone_filter,
-    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
-    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
+    JsonlSourceSnapshot, JsonlTombstoneFilter, PathValidation, PreservedTombstone,
+    SyncMergePendingPhase, SyncMergePendingReceipt, blocking_jsonl_family_write_lock_with_timeout,
+    capture_jsonl_source_snapshot, compute_staleness, restore_tombstones_after_rebuild,
+    scan_conflict_markers, scan_conflict_markers_snapshot,
+    scan_jsonl_snapshot_for_tombstone_filter, snapshot_tombstones,
+    tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
+    validate_jsonl_snapshot_issue_records, validate_no_git_path, validate_sync_path,
+    validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
 use fsqlite::{Connection, Row};
@@ -30,7 +37,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Check result status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -74,6 +81,117 @@ struct DoctorRepairResult {
 struct DoctorRun {
     report: DoctorReport,
     jsonl_path: Option<PathBuf>,
+}
+
+/// Classification of durable sync-merge state found in database metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingSyncMergeCondition {
+    /// A current v2 receipt passed its schema and intent-hash validation.
+    Valid,
+    /// An older receipt exists and requires an explicit compatible recovery path.
+    Legacy,
+    /// Current metadata is ambiguous, empty, malformed, or failed validation.
+    Malformed,
+}
+
+/// Redacted, machine-readable pending sync-merge state for startup guards and
+/// doctor diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingSyncMergeState {
+    /// Whether the receipt is valid, legacy, or malformed.
+    pub condition: PendingSyncMergeCondition,
+    /// Metadata key that caused the pending-state classification.
+    pub metadata_key: String,
+    /// Stable receipt identity when a valid v2 receipt supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
+    /// Durable saga phase when a valid v2 receipt supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Merge conflict-resolution policy when a valid v2 receipt supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<String>,
+    /// Receipt creation time when a valid v2 receipt supplied one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// Expected post-merge JSONL record count when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_jsonl_issue_count: Option<usize>,
+    /// Actionable explanation. Receipt payload bodies are never exposed.
+    pub diagnostic: String,
+}
+
+impl PendingSyncMergeState {
+    /// Return a stable lowercase condition name for logs and robot envelopes.
+    #[must_use]
+    pub const fn condition_name(&self) -> &'static str {
+        match self.condition {
+            PendingSyncMergeCondition::Valid => "valid",
+            PendingSyncMergeCondition::Legacy => "legacy",
+            PendingSyncMergeCondition::Malformed => "malformed",
+        }
+    }
+
+    fn valid(receipt: &SyncMergePendingReceipt) -> Self {
+        let phase = match receipt.phase {
+            SyncMergePendingPhase::DatabaseCommitted => "database_committed",
+            SyncMergePendingPhase::ExportFinalized => "export_finalized",
+        };
+        Self {
+            condition: PendingSyncMergeCondition::Valid,
+            metadata_key: crate::sync::METADATA_SYNC_MERGE_PENDING.to_string(),
+            receipt_id: Some(receipt.receipt_id.clone()),
+            phase: Some(phase.to_string()),
+            resolution: Some(receipt.intent.resolution.clone()),
+            created_at: Some(receipt.created_at.clone()),
+            expected_jsonl_issue_count: Some(receipt.jsonl_after_issue_count),
+            diagnostic: "A committed sync merge still requires JSONL/base artifact reconciliation"
+                .to_string(),
+        }
+    }
+
+    fn legacy(metadata_key: String, row_count: usize, diagnostic: String) -> Self {
+        Self {
+            condition: PendingSyncMergeCondition::Legacy,
+            metadata_key,
+            receipt_id: None,
+            phase: None,
+            resolution: None,
+            created_at: None,
+            expected_jsonl_issue_count: None,
+            diagnostic: format!("{diagnostic} ({row_count} metadata row(s))"),
+        }
+    }
+
+    fn malformed(metadata_key: impl Into<String>, diagnostic: String) -> Self {
+        Self {
+            condition: PendingSyncMergeCondition::Malformed,
+            metadata_key: metadata_key.into(),
+            receipt_id: None,
+            phase: None,
+            resolution: None,
+            created_at: None,
+            expected_jsonl_issue_count: None,
+            diagnostic,
+        }
+    }
+
+    fn from_inspection(inspection: PendingSyncMergeInspection) -> Option<Self> {
+        match inspection {
+            PendingSyncMergeInspection::Absent => None,
+            PendingSyncMergeInspection::Valid(receipt) => Some(Self::valid(&receipt)),
+            PendingSyncMergeInspection::Legacy {
+                metadata_key,
+                row_count,
+                diagnostic,
+            } => Some(Self::legacy(metadata_key, row_count, diagnostic)),
+            PendingSyncMergeInspection::Malformed {
+                metadata_key,
+                diagnostic,
+            } => Some(Self::malformed(metadata_key, diagnostic)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -549,6 +667,48 @@ fn emit_refused_unsafe(
     }
 }
 
+fn refuse_doctor_mutation_if_merge_pending(
+    operation: &str,
+    db_path: &Path,
+    authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ctx: &OutputContext,
+) {
+    let refusal = match inspect_pending_sync_merge_under_authority(db_path, authority) {
+        Ok(None) => return,
+        Ok(Some(state)) => {
+            let reason = format!(
+                "{}; only `br sync --merge` may reconcile this state before generic doctor mutation",
+                state.diagnostic
+            );
+            let evidence = serde_json::json!({
+                "gate": "sync.merge_pending",
+                "finding": "sync.merge_pending",
+                "pending": true,
+                "state": state,
+                "database_path": db_path.display().to_string(),
+                "remediation": "Run `br sync --merge`, verify that it clears the pending receipt, then rerun the requested doctor operation."
+            });
+            (reason, evidence)
+        }
+        Err(error) => {
+            let reason = format!(
+                "could not prove that no sync merge is pending ({error}); doctor mutation fails closed"
+            );
+            let evidence = serde_json::json!({
+                "gate": "sync.merge_pending",
+                "finding": "sync.merge_pending",
+                "pending": "unknown",
+                "database_path": db_path.display().to_string(),
+                "inspection_error": error.to_string(),
+                "remediation": "Restore read-only access to the database family and rerun `br doctor` before attempting repair."
+            });
+            (reason, evidence)
+        }
+    };
+    emit_refused_unsafe(operation, &refusal.0, &refusal.1, ctx);
+    std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+}
+
 impl FilesystemPathKind {
     fn exists(self) -> bool {
         !matches!(self, Self::Missing)
@@ -643,6 +803,7 @@ fn inject_finding_id(details: Option<serde_json::Value>, fm: &'static str) -> se
 pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     // state_files (pass-1 archaeology + pass-1 / pass-2 detectors)
     ("jsonl.parse", "fm-state_files-jsonl-malformed-utf8"),
+    ("sync.merge_pending", "fm-state_files-sync-merge-pending"),
     (
         "jsonl.merge_artifacts",
         "fm-state_files-merge-artifact-stuck",
@@ -816,6 +977,136 @@ fn has_non_ok(checks: &[CheckResult]) -> bool {
     checks
         .iter()
         .any(|check| !matches!(check.status, CheckStatus::Ok))
+}
+
+/// Inspect pending sync-merge metadata through a current-schema read-only
+/// connection and one coherent read transaction.
+///
+/// This is an advisory inspection for doctor reporting and startup warnings.
+/// Mutation gates must use [`inspect_pending_sync_merge_under_authority`].
+/// Missing databases, stale/future schemas, open failures, and query failures
+/// are errors rather than being mistaken for the safe absent state.
+///
+/// # Errors
+///
+/// Returns an error if the database family cannot be inspected from a stable
+/// snapshot.
+pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<PendingSyncMergeState>> {
+    match fs::symlink_metadata(db_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Cannot inspect pending sync-merge state because database path '{}' is a symlink",
+                    db_path.display()
+                ),
+            });
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Cannot inspect pending sync-merge state because database path '{}' is not a regular file",
+                    db_path.display()
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending sync-merge state is unknown because database '{}' is missing",
+                    db_path.display()
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Failed to inspect database path '{}' before checking pending sync-merge state",
+                    db_path.display()
+                ),
+                source: Box::new(error),
+            });
+        }
+    }
+
+    let storage = SqliteStorage::open_current_read_only(db_path)?.ok_or_else(|| {
+        BeadsError::SyncConflict {
+            message: format!(
+                "Pending sync-merge state is unknown because database '{}' does not have the current supported schema",
+                db_path.display()
+            ),
+        }
+    })?;
+    Ok(PendingSyncMergeState::from_inspection(
+        storage.inspect_pending_sync_merge()?,
+    ))
+}
+
+/// Inspect pending sync-merge metadata while the caller holds inode-bound
+/// authority over the database family.
+///
+/// This is the definitive mutation gate. Authority is verified before and
+/// after opening the current-schema read-only connection and around its
+/// coherent read transaction. Only an exact absence of both metadata keys
+/// returns `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns an error for authority drift or any missing, stale, unsupported,
+/// unreadable, or unclassifiable database state.
+pub fn inspect_pending_sync_merge_under_authority(
+    db_path: &Path,
+    authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> Result<Option<PendingSyncMergeState>> {
+    Ok(PendingSyncMergeState::from_inspection(
+        SqliteStorage::inspect_pending_sync_merge_under_authority(db_path, authority)?,
+    ))
+}
+
+fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
+    match inspect_pending_sync_merge_at_path(db_path) {
+        Ok(None) => push_check(
+            checks,
+            "sync.merge_pending",
+            CheckStatus::Ok,
+            Some("No pending sync merge requires artifact reconciliation".to_string()),
+            None,
+        ),
+        Ok(Some(state)) => {
+            let status = if state.condition == PendingSyncMergeCondition::Valid {
+                CheckStatus::Warn
+            } else {
+                CheckStatus::Error
+            };
+            let condition = state.condition_name();
+            push_check(
+                checks,
+                "sync.merge_pending",
+                status,
+                Some(format!(
+                    "Pending sync merge state is {condition}; generic repair and non-merge mutations are disabled"
+                )),
+                Some(serde_json::json!({
+                    "pending": true,
+                    "state": state,
+                    "remediation": "Run `br sync --merge` to validate and resume the exact pending merge. Do not run generic repair, import, flush, or tracker mutation commands first."
+                })),
+            );
+        }
+        Err(error) => push_check(
+            checks,
+            "sync.merge_pending",
+            CheckStatus::Error,
+            Some(format!(
+                "Could not prove that no sync merge is pending: {error}"
+            )),
+            Some(serde_json::json!({
+                "pending": "unknown",
+                "database_path": db_path.display().to_string(),
+                "remediation": "Restore read-only access to the database family, then rerun `br doctor`. Mutating commands must remain disabled until pending merge state can be inspected."
+            })),
+        ),
+    }
 }
 
 fn push_anomaly(anomalies: &mut Vec<AnomalyClass>, anomaly: AnomalyClass) {
@@ -1280,10 +1571,39 @@ fn report_has_page_corruption(report: &DoctorReport) -> bool {
 /// Run in-place VACUUM first, then try to install a compacted copy via VACUUM
 /// INTO. If upstream sqlite3 still reports `Page N: never used` afterward,
 /// the caller escalates to a JSONL rebuild.
+fn acquire_doctor_database_write_authority(
+    beads_dir: &Path,
+    db_path: &Path,
+    lock_timeout: Option<u64>,
+) -> Result<Arc<crate::sync::DatabaseFamilyWriteLock>> {
+    let write_authority = Arc::new(
+        crate::sync::blocking_database_family_write_lock_with_timeout(
+            beads_dir,
+            db_path,
+            lock_timeout,
+        )?,
+    );
+    write_authority.bind_database_inode_for_mutation()?;
+    write_authority.verify_database_authority()?;
+    Ok(write_authority)
+}
+
+fn open_doctor_storage_under_write_authority(
+    db_path: &Path,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> Result<SqliteStorage> {
+    write_authority.verify_database_authority()?;
+    let mut storage = SqliteStorage::open(db_path)?;
+    write_authority.verify_database_authority()?;
+    storage.attach_write_authority(Arc::clone(write_authority));
+    Ok(storage)
+}
+
 fn repair_via_vacuum(
     db_path: &Path,
     repair: &mut LocalRepairResult,
     session: Option<&mut DoctorRepairSession>,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) {
     if !db_path.is_file() {
         tracing::debug!(
@@ -1292,36 +1612,46 @@ fn repair_via_vacuum(
         );
         return;
     }
-    let do_vacuum = |repair: &mut LocalRepairResult| match SqliteStorage::open(db_path) {
-        Ok(storage) => {
-            if let Err(err) = storage.execute_raw("VACUUM") {
-                tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
-                return;
-            }
-
-            repair.vacuumed = true;
-            match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
-                Ok(_storage) => {
-                    tracing::info!(
-                        path = %db_path.display(),
-                        "VACUUM plus VACUUM INTO compaction completed successfully"
-                    );
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %db_path.display(),
-                        error = %err,
-                        "VACUUM INTO compaction failed after VACUUM"
-                    );
-                }
-            }
-        }
-        Err(err) => {
+    let do_vacuum = |repair: &mut LocalRepairResult| {
+        if let Err(err) = write_authority.verify_database_authority() {
             tracing::warn!(
                 path = %db_path.display(),
                 error = %err,
-                "Skipping VACUUM because the database could not be opened"
+                "Skipping VACUUM because database-family authority was lost"
             );
+            return;
+        }
+        match open_doctor_storage_under_write_authority(db_path, write_authority) {
+            Ok(storage) => {
+                if let Err(err) = storage.execute_raw("VACUUM") {
+                    tracing::warn!(path = %db_path.display(), error = %err, "VACUUM failed");
+                    return;
+                }
+
+                repair.vacuumed = true;
+                match config::compact_database_via_vacuum_into_in_place(storage, db_path, None) {
+                    Ok(_storage) => {
+                        tracing::info!(
+                            path = %db_path.display(),
+                            "VACUUM plus VACUUM INTO compaction completed successfully"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %db_path.display(),
+                            error = %err,
+                            "VACUUM INTO compaction failed after VACUUM"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "Skipping VACUUM because the database could not be opened"
+                );
+            }
         }
     };
     if let Some(session) = session {
@@ -1351,7 +1681,13 @@ fn repair_via_vacuum(
 /// reads it back, then ROLLS BACK the entire transaction so no data is
 /// persisted.  The insert-then-read pattern catches read-after-write
 /// divergence that a simple no-op UPDATE would miss.
-fn write_probe_after_repair(db_path: &Path) -> bool {
+fn write_probe_after_repair(
+    db_path: &Path,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> bool {
+    if write_authority.verify_database_authority().is_err() {
+        return false;
+    }
     let Ok(conn) = Connection::open(db_path.to_string_lossy().into_owned()) else {
         return false;
     };
@@ -1362,6 +1698,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
     let now = chrono::Utc::now().to_rfc3339();
 
     let probe = (|| -> std::result::Result<(), Box<dyn std::error::Error>> {
+        write_authority.verify_database_authority()?;
         conn.execute("BEGIN IMMEDIATE")?;
 
         conn.execute_with_params(
@@ -1387,6 +1724,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         )?;
         if rows.is_empty() {
             conn.execute("ROLLBACK")?;
+            write_authority.verify_database_authority()?;
             tracing::warn!("Write probe: INSERT succeeded but SELECT returned no rows");
             return Err("read-after-write divergence".into());
         }
@@ -1394,6 +1732,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         // Always ROLLBACK — the probe is non-destructive.  No data is
         // persisted, so JSONL export state stays clean.
         conn.execute("ROLLBACK")?;
+        write_authority.verify_database_authority()?;
         Ok(())
     })();
 
@@ -1415,7 +1754,7 @@ fn write_probe_after_repair(db_path: &Path) -> bool {
         return false;
     }
 
-    probe_ok
+    probe_ok && write_authority.verify_database_authority().is_ok()
 }
 
 /// Return true if any integrity check reported WARN-level page anomalies
@@ -2225,7 +2564,11 @@ fn repair_database_from_jsonl(
     show_progress: bool,
     session: Option<&mut DoctorRepairSession>,
 ) -> Result<DoctorRepairResult> {
-    preflight_jsonl_rebuild_authority(jsonl_path)?;
+    let jsonl_authority =
+        blocking_jsonl_family_write_lock_with_timeout(jsonl_path, cli.lock_timeout)?;
+    jsonl_authority.verify_jsonl_authority()?;
+    let source = capture_jsonl_source_snapshot(jsonl_path)?;
+    preflight_jsonl_rebuild_authority(&source)?;
 
     if let Some(session) = session {
         let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
@@ -2237,9 +2580,10 @@ fn repair_database_from_jsonl(
                 repair_database_from_jsonl_after_preflight(
                     beads_dir,
                     db_path,
-                    jsonl_path,
                     cli,
                     show_progress,
+                    &source,
+                    &jsonl_authority,
                 )
             },
         )? {
@@ -2251,15 +2595,23 @@ fn repair_database_from_jsonl(
         };
     }
 
-    repair_database_from_jsonl_after_preflight(beads_dir, db_path, jsonl_path, cli, show_progress)
+    repair_database_from_jsonl_after_preflight(
+        beads_dir,
+        db_path,
+        cli,
+        show_progress,
+        &source,
+        &jsonl_authority,
+    )
 }
 
 fn repair_database_from_jsonl_after_preflight(
     beads_dir: &Path,
     db_path: &Path,
-    jsonl_path: &Path,
     cli: &config::CliOverrides,
     show_progress: bool,
+    source: &JsonlSourceSnapshot,
+    jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
 ) -> Result<DoctorRepairResult> {
     let bootstrap_layer = config::ConfigLayer::merge_layers(&[
         config::load_startup_config(beads_dir)?,
@@ -2276,17 +2628,34 @@ fn repair_database_from_jsonl_after_preflight(
     // deleted but had not yet flushed to JSONL (same hazard that
     // `br sync --import-only --rebuild` preserves via snapshot/restore), since the
     // rebuild only replays what's in the JSONL.
-    let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
+    let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, source);
 
-    let (mut storage, import_result, verified_backups) = config::repair_database_from_jsonl(
-        beads_dir,
-        db_path,
-        jsonl_path,
-        cli.lock_timeout,
-        &bootstrap_layer,
-        show_progress,
-        false,
-    )?;
+    let recovery =
+        if let Some(authority) = cli.database_family_write_authority_for(beads_dir, db_path) {
+            config::repair_database_from_jsonl_snapshot_under_write_authority(
+                beads_dir,
+                db_path,
+                cli.lock_timeout,
+                &bootstrap_layer,
+                show_progress,
+                false,
+                source,
+                jsonl_authority,
+                authority,
+            )
+        } else {
+            config::repair_database_from_jsonl_snapshot(
+                beads_dir,
+                db_path,
+                cli.lock_timeout,
+                &bootstrap_layer,
+                show_progress,
+                false,
+                source,
+                jsonl_authority,
+            )
+        };
+    let (mut storage, import_result, verified_backups) = recovery?;
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
 
@@ -2359,8 +2728,8 @@ fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Resul
     Ok(cleaned)
 }
 
-fn preflight_jsonl_rebuild_authority(jsonl_path: &Path) -> Result<()> {
-    let conflict_markers = scan_conflict_markers(jsonl_path)?;
+fn preflight_jsonl_rebuild_authority(source: &JsonlSourceSnapshot) -> Result<()> {
+    let conflict_markers = scan_conflict_markers_snapshot(source)?;
     if !conflict_markers.is_empty() {
         let preview = conflict_markers
             .iter()
@@ -2385,7 +2754,7 @@ fn preflight_jsonl_rebuild_authority(jsonl_path: &Path) -> Result<()> {
         )));
     }
 
-    let validation = validate_jsonl_issue_records(jsonl_path)?;
+    let validation = validate_jsonl_snapshot_issue_records(source)?;
     if validation.invalid_count > 0 {
         let preview = validation.preview_messages().join("; ");
         let suffix = if validation.invalid_count > validation.failures.len() {
@@ -2470,7 +2839,7 @@ fn write_jsonl_rebuild_verification_failed_marker(
 /// `snapshot_tombstones` logs its own best-effort warnings.
 fn preserved_tombstones_for_doctor_rebuild(
     db_path: &Path,
-    jsonl_path: &Path,
+    source: &JsonlSourceSnapshot,
 ) -> Vec<PreservedTombstone> {
     if !db_path.is_file() {
         return Vec::new();
@@ -2491,37 +2860,81 @@ fn preserved_tombstones_for_doctor_rebuild(
     if snapshot.is_empty() {
         return snapshot;
     }
-    let jsonl_filter = if jsonl_path.is_file() {
-        match scan_jsonl_for_tombstone_filter(jsonl_path) {
-            Ok(filter) => filter,
-            Err(err) => {
-                tracing::debug!(
-                    jsonl_path = %jsonl_path.display(),
-                    error = %err,
-                    "Could not scan JSONL for tombstone filter during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
-                );
-                JsonlTombstoneFilter::default()
-            }
+    let jsonl_filter = match scan_jsonl_snapshot_for_tombstone_filter(source) {
+        Ok(filter) => filter,
+        Err(err) => {
+            tracing::debug!(
+                jsonl_path = %source.display_path().display(),
+                error = %err,
+                "Could not scan immutable JSONL snapshot for tombstone filter during doctor --repair; preserving every snapshotted tombstone and letting the rebuild surface the JSONL error"
+            );
+            JsonlTombstoneFilter::default()
         }
-    } else {
-        JsonlTombstoneFilter::default()
     };
     tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
 }
 
+#[cfg(test)]
 fn repair_recoverable_db_state(
-    _beads_dir: &Path,
+    beads_dir: &Path,
+    db_path: &Path,
+    report: &DoctorReport,
+    session: Option<&mut DoctorRepairSession>,
+    fixer_filter: &FixerFilter,
+) -> LocalRepairResult {
+    let write_authority = match acquire_doctor_database_write_authority(
+        beads_dir,
+        db_path,
+        Some(crate::sync::default_write_lock_timeout_ms()),
+    ) {
+        Ok(authority) => authority,
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping recoverable database repair because authority could not be acquired"
+            );
+            return LocalRepairResult::default();
+        }
+    };
+    repair_recoverable_db_state_under_write_authority(
+        db_path,
+        report,
+        session,
+        fixer_filter,
+        &write_authority,
+    )
+}
+
+fn repair_recoverable_db_state_under_write_authority(
     db_path: &Path,
     report: &DoctorReport,
     mut session: Option<&mut DoctorRepairSession>,
     fixer_filter: &FixerFilter,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> LocalRepairResult {
     let mut repair = LocalRepairResult::default();
 
     if report_has_sidecar_anomaly(report)
         && fixer_filter.allows("fm-state_files-wal-shm-sidecar-orphan")
     {
+        if let Err(err) = write_authority.verify_database_authority() {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping sidecar repair because database authority was lost"
+            );
+            return repair;
+        }
         repair_database_sidecars(db_path, &mut repair, session.as_deref_mut());
+        if let Err(err) = write_authority.verify_database_authority() {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Database authority changed during sidecar repair"
+            );
+            return repair;
+        }
     }
 
     if !db_path.is_file() {
@@ -2532,36 +2945,40 @@ fn repair_recoverable_db_state(
         return repair;
     }
 
-    let do_rebuild = |repair: &mut LocalRepairResult| match SqliteStorage::open(db_path) {
-        Ok(mut storage) => {
-            let force_rebuild = report_has_projection_content_mismatch_finding(report);
-            let rebuild_result = if force_rebuild {
-                storage.rebuild_blocked_cache(true).map(|_| true)
-            } else {
-                storage.ensure_blocked_cache_fresh()
-            };
+    let do_rebuild =
+        |repair: &mut LocalRepairResult| match open_doctor_storage_under_write_authority(
+            db_path,
+            write_authority,
+        ) {
+            Ok(mut storage) => {
+                let force_rebuild = report_has_projection_content_mismatch_finding(report);
+                let rebuild_result = if force_rebuild {
+                    storage.rebuild_blocked_cache(true).map(|_| true)
+                } else {
+                    storage.ensure_blocked_cache_fresh()
+                };
 
-            match rebuild_result {
-                Ok(blocked_cache_rebuilt) => {
-                    repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %db_path.display(),
-                        error = %err,
-                        "Skipping blocked-cache repair; falling back to JSONL rebuild"
-                    );
+                match rebuild_result {
+                    Ok(blocked_cache_rebuilt) => {
+                        repair.blocked_cache_rebuilt = blocked_cache_rebuilt;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %db_path.display(),
+                            error = %err,
+                            "Skipping blocked-cache repair; falling back to JSONL rebuild"
+                        );
+                    }
                 }
             }
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %db_path.display(),
-                error = %err,
-                "Skipping blocked-cache repair because the database could not be opened"
-            );
-        }
-    };
+            Err(err) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "Skipping blocked-cache repair because the database could not be opened"
+                );
+            }
+        };
     if let Some(session) = session {
         let family_paths = existing_sqlite_family_paths_for_legacy_op(db_path);
         let family_refs: Vec<&Path> = family_paths.iter().map(PathBuf::as_path).collect();
@@ -2587,10 +3004,39 @@ fn repair_recoverable_db_state(
 ///
 /// This is safe — `REINDEX` only rebuilds existing indexes from the underlying
 /// table data.  It does not modify any row data.
+#[cfg(test)]
 fn repair_partial_indexes(
     db_path: &Path,
     repair: &mut LocalRepairResult,
     session: Option<&mut DoctorRepairSession>,
+) {
+    let Some(beads_dir) = db_path.parent() else {
+        tracing::warn!(path = %db_path.display(), "Skipping REINDEX for parentless database path");
+        return;
+    };
+    let write_authority = match acquire_doctor_database_write_authority(
+        beads_dir,
+        db_path,
+        Some(crate::sync::default_write_lock_timeout_ms()),
+    ) {
+        Ok(authority) => authority,
+        Err(err) => {
+            tracing::warn!(
+                path = %db_path.display(),
+                error = %err,
+                "Skipping REINDEX because database authority could not be acquired"
+            );
+            return;
+        }
+    };
+    repair_partial_indexes_under_write_authority(db_path, repair, session, &write_authority);
+}
+
+fn repair_partial_indexes_under_write_authority(
+    db_path: &Path,
+    repair: &mut LocalRepairResult,
+    session: Option<&mut DoctorRepairSession>,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) {
     if !db_path.is_file() {
         tracing::debug!(
@@ -2600,41 +3046,57 @@ fn repair_partial_indexes(
         return;
     }
 
-    let do_reindex = |repair: &mut LocalRepairResult| match Connection::open(
-        db_path.to_string_lossy().into_owned(),
-    ) {
-        Ok(conn) => {
-            let _ = conn.execute("PRAGMA busy_timeout=30000");
-            match conn.execute("REINDEX") {
-                Ok(_) => {
-                    tracing::info!(
-                        path = %db_path.display(),
-                        "REINDEX completed successfully"
-                    );
-                    repair.indexes_reindexed = true;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %db_path.display(),
-                        error = %err,
-                        "REINDEX failed; partial-index warnings may persist"
-                    );
-                }
-            }
-            if let Err(err) = conn.close() {
-                tracing::warn!(
-                    path = %db_path.display(),
-                    error = %err,
-                    "REINDEX connection close failed"
-                );
-            }
-        }
-        Err(err) => {
+    let do_reindex = |repair: &mut LocalRepairResult| {
+        if let Err(err) = write_authority.verify_database_authority() {
             tracing::warn!(
                 path = %db_path.display(),
                 error = %err,
-                "Skipping REINDEX because the database could not be opened"
+                "Skipping REINDEX because database authority was lost"
             );
+            return;
+        }
+        match Connection::open(db_path.to_string_lossy().into_owned()) {
+            Ok(conn) => {
+                let _ = conn.execute("PRAGMA busy_timeout=30000");
+                match conn.execute("REINDEX") {
+                    Ok(_) => {
+                        tracing::info!(
+                            path = %db_path.display(),
+                            "REINDEX completed successfully"
+                        );
+                        repair.indexes_reindexed = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %db_path.display(),
+                            error = %err,
+                            "REINDEX failed; partial-index warnings may persist"
+                        );
+                    }
+                }
+                if let Err(err) = conn.close() {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "REINDEX connection close failed"
+                    );
+                }
+                if let Err(err) = write_authority.verify_database_authority() {
+                    tracing::warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "Database authority changed during REINDEX"
+                    );
+                    repair.indexes_reindexed = false;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "Skipping REINDEX because the database could not be opened"
+                );
+            }
         }
     };
     if let Some(session) = session {
@@ -3359,11 +3821,46 @@ fn check_wal_oversized(db_path: &Path, checks: &mut Vec<CheckResult>) {
 /// TRUNCATE was chosen over PASSIVE/RESTART because the FM is "WAL
 /// grew unboundedly" — a no-op opportunistic checkpoint wouldn't
 /// resolve it.
+#[cfg(test)]
 fn fix_wal_oversized_if_warned(
     db_path: &Path,
     report: &DoctorReport,
     ctx: &OutputContext,
     session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let Some(beads_dir) = db_path.parent() else {
+        return false;
+    };
+    let write_authority = match acquire_doctor_database_write_authority(
+        beads_dir,
+        db_path,
+        Some(crate::sync::default_write_lock_timeout_ms()),
+    ) {
+        Ok(authority) => authority,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Skipping wal_checkpoint: database authority unavailable ({err})"
+                ));
+            }
+            return false;
+        }
+    };
+    fix_wal_oversized_if_warned_under_write_authority(
+        db_path,
+        report,
+        ctx,
+        session,
+        &write_authority,
+    )
+}
+
+fn fix_wal_oversized_if_warned_under_write_authority(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> bool {
     let has_warning = report
         .checks
@@ -3385,7 +3882,7 @@ fn fix_wal_oversized_if_warned(
     match session.record_legacy_mutation(
         "doctor.wal_checkpoint_truncate",
         &[db_path, &wal_path, &shm_path],
-        || checkpoint_wal_truncate(db_path),
+        || checkpoint_wal_truncate(db_path, write_authority),
     ) {
         Ok(()) => {
             if !ctx.is_json() {
@@ -3408,7 +3905,11 @@ fn sqlite_shm_sidecar_path(db_path: &Path) -> PathBuf {
     PathBuf::from(sidecar)
 }
 
-fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
+fn checkpoint_wal_truncate(
+    db_path: &Path,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> Result<()> {
+    write_authority.verify_database_authority()?;
     let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
     let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
         Ok(complete) => complete,
@@ -3418,6 +3919,7 @@ fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
         }
     };
     conn.close()?;
+    write_authority.verify_database_authority()?;
     if !checkpoint_complete {
         return Err(BeadsError::internal(
             "doctor: WAL checkpoint did not complete; a reader may still hold a snapshot",
@@ -3426,6 +3928,7 @@ fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
 
     let wal_path = sqlite_wal_sidecar_path(db_path);
     truncate_oversized_regular_wal_if_needed(&wal_path)?;
+    write_authority.verify_database_authority()?;
 
     Ok(())
 }
@@ -3459,11 +3962,47 @@ fn truncate_oversized_regular_wal_if_needed(wal_path: &Path) -> Result<()> {
 ///
 /// Like `fix_wal_oversized_if_warned`, this uses `record_legacy_mutation`
 /// (NOT `Op::DbExec`) because `VACUUM` cannot run inside a transaction.
+#[cfg(test)]
+#[allow(dead_code)] // Retains the standalone harness entry point for future bloat fixtures.
 fn fix_db_bloat_via_vacuum_if_warned(
     db_path: &Path,
     report: &DoctorReport,
     ctx: &OutputContext,
     session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let Some(beads_dir) = db_path.parent() else {
+        return false;
+    };
+    let write_authority = match acquire_doctor_database_write_authority(
+        beads_dir,
+        db_path,
+        Some(crate::sync::default_write_lock_timeout_ms()),
+    ) {
+        Ok(authority) => authority,
+        Err(err) => {
+            if !ctx.is_json() {
+                ctx.warning(&format!(
+                    "Skipping db-bloat VACUUM: database authority unavailable ({err})"
+                ));
+            }
+            return false;
+        }
+    };
+    fix_db_bloat_via_vacuum_if_warned_under_write_authority(
+        db_path,
+        report,
+        ctx,
+        session,
+        &write_authority,
+    )
+}
+
+fn fix_db_bloat_via_vacuum_if_warned_under_write_authority(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> bool {
     let has_warning = report
         .checks
@@ -3485,7 +4024,7 @@ fn fix_db_bloat_via_vacuum_if_warned(
     match session.record_legacy_mutation(
         "doctor.db_bloat_vacuum",
         &[db_path, &wal_path, &shm_path],
-        || vacuum_database(db_path),
+        || vacuum_database(db_path, write_authority),
     ) {
         Ok(()) => {
             if !ctx.is_json() {
@@ -3507,9 +4046,13 @@ fn fix_db_bloat_via_vacuum_if_warned(
 /// Open the database, run `VACUUM`, close. Used by
 /// [`fix_db_bloat_via_vacuum_if_warned`] under the chokepoint's
 /// legacy-mutation wrapper so the DB family is snapshotted for undo.
-fn vacuum_database(db_path: &Path) -> Result<()> {
-    let storage = SqliteStorage::open(db_path)?;
+fn vacuum_database(
+    db_path: &Path,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> Result<()> {
+    let storage = open_doctor_storage_under_write_authority(db_path, write_authority)?;
     storage.execute_raw("VACUUM")?;
+    write_authority.verify_database_authority()?;
     Ok(())
 }
 
@@ -9866,17 +10409,32 @@ fn execute_repair_indexes(
     // Acquire the workspace write lock the same way --repair does.
     // A REINDEX inside a transaction is a write, and concurrency with
     // another writer is operator error.
-    let _write_lock_guard = if cli.holds_write_lock_for(beads_dir) {
-        None
+    let write_authority = if let Some(authority) =
+        cli.database_family_write_authority_for(beads_dir, &paths.db_path)
+    {
+        if let Err(err) = authority.verify_database_authority() {
+            emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
+            std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+        }
+        Arc::clone(authority)
     } else {
-        match crate::sync::blocking_write_lock_with_timeout(beads_dir, Some(0)) {
-            Ok(file) => Some(file),
+        match acquire_doctor_database_write_authority(beads_dir, &paths.db_path, Some(0)) {
+            Ok(authority) => authority,
             Err(err) => {
                 emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
                 std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
             }
         }
     };
+
+    if !args.dry_run {
+        refuse_doctor_mutation_if_merge_pending(
+            "--repair-indexes",
+            &paths.db_path,
+            &write_authority,
+            ctx,
+        );
+    }
 
     match refuse_gates::run_all(beads_dir, &paths.db_path) {
         GateOutcome::Allow => {}
@@ -9907,12 +10465,14 @@ fn execute_repair_indexes(
         return Ok(());
     }
 
-    checkpoint_and_snapshot_repair_indexes(&paths.db_path, &snapshot_path)?;
+    checkpoint_and_snapshot_repair_indexes(&paths.db_path, &snapshot_path, &write_authority)?;
 
     // Open the DB and enumerate every user-defined index so we don't
     // reindex sqlite_autoindex_* or any internal index — those are
     // managed by SQLite and not the partial-index class we're after.
+    write_authority.verify_database_authority()?;
     let conn = Connection::open(paths.db_path.to_string_lossy().into_owned())?;
+    write_authority.verify_database_authority()?;
     let rows = match conn.query(
         "SELECT name FROM sqlite_master \
          WHERE type = 'index' \
@@ -9936,6 +10496,7 @@ fn execute_repair_indexes(
         // place so the operator has a recoverable pre-state regardless.
         ctx.info("doctor --repair-indexes: no user indexes found; nothing to do");
         conn.close()?;
+        write_authority.verify_database_authority()?;
         return Ok(());
     }
 
@@ -9949,18 +10510,22 @@ fn execute_repair_indexes(
         return Err(err.into());
     }
     let reindex_result: Result<usize> = (|| {
+        write_authority.verify_database_authority()?;
         let mut reindexed_count = 0;
         for name in &index_names {
             conn.execute(&format!("REINDEX {}", quote_sql_identifier(name)))?;
             reindexed_count += 1;
         }
+        write_authority.verify_database_authority()?;
         conn.execute("COMMIT")?;
+        write_authority.verify_database_authority()?;
         Ok(reindexed_count)
     })();
 
     match reindex_result {
         Ok(reindexed_count) => {
             conn.close()?;
+            write_authority.verify_database_authority()?;
             ctx.success(&format!(
                 "doctor --repair-indexes: REINDEX completed on {reindexed_count} user indexes (pre-snapshot retained at {})",
                 snapshot_path.display(),
@@ -9981,13 +10546,23 @@ fn execute_repair_indexes(
             // Close the connection before the file copy so we don't
             // race the SQLite WAL machinery on the live DB.
             close_repair_indexes_connection(conn, "before restoring pre-snapshot");
-            restore_repair_indexes_snapshot(paths, &snapshot_path, [&wal_path, &shm_path], &err)?;
+            restore_repair_indexes_snapshot(
+                paths,
+                &snapshot_path,
+                [&wal_path, &shm_path],
+                &err,
+                &write_authority,
+            )?;
             Err(err)
         }
     }
 }
 
-fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) -> Result<()> {
+fn checkpoint_and_snapshot_repair_indexes(
+    db_path: &Path,
+    snapshot_path: &Path,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> Result<()> {
     // WAL-safety contract: checkpoint before snapshot so the `.db`
     // file alone is a complete pre-state for restore-via-copy. When
     // checkpoint fails (concurrent reader holding a snapshot,
@@ -9996,6 +10571,7 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
     // pre-state — otherwise a restore would overwrite the live DB
     // with a snapshot that's missing whatever data the WAL still
     // held, silently destroying committed-but-uncheckpointed work.
+    write_authority.verify_database_authority()?;
     let conn = Connection::open(db_path.to_string_lossy().into_owned())?;
     let checkpoint_complete = match wal_checkpoint_truncate_complete(&conn) {
         Ok(complete) => complete,
@@ -10008,6 +10584,7 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
         }
     };
     close_repair_indexes_connection(conn, "after pre-snapshot WAL checkpoint");
+    write_authority.verify_database_authority()?;
 
     // Clear sidecar snapshots from any previous `--repair-indexes`
     // invocation BEFORE writing the new ones. Without this cleanup,
@@ -10046,6 +10623,7 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
             snapshot_path.display(),
         ),
     })?;
+    write_authority.verify_database_authority()?;
 
     // When checkpoint failed, also snapshot the WAL/SHM sidecars
     // alongside the `.db` so the restore path can restore the full
@@ -10071,6 +10649,7 @@ fn checkpoint_and_snapshot_repair_indexes(db_path: &Path, snapshot_path: &Path) 
             }
         }
     }
+    write_authority.verify_database_authority()?;
     Ok(())
 }
 
@@ -10140,12 +10719,15 @@ fn restore_repair_indexes_snapshot(
     snapshot_path: &Path,
     sidecars: [&PathBuf; 2],
     original_err: &BeadsError,
+    write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> Result<()> {
+    write_authority.verify_database_authority()?;
     std::fs::copy(snapshot_path, &paths.db_path).map_err(|copy_err| BeadsError::Internal {
         message: format!(
             "doctor --repair-indexes: REINDEX failed and pre-snapshot restore also failed: original={original_err}, restore={copy_err}",
         ),
     })?;
+    write_authority.verify_database_authority()?;
 
     // WAL/SHM restore handling. Two paths:
     //
@@ -10204,6 +10786,7 @@ fn restore_repair_indexes_snapshot(
             }
         }
     }
+    write_authority.verify_database_authority()?;
     Ok(())
 }
 
@@ -10343,6 +10926,12 @@ fn collect_doctor_report_with_mode_and_db_override(
     check_orphaned_write_lock(beads_dir, &mut checks);
     check_routes_targets_resolve(beads_dir, &mut checks);
     check_startup_cache(beads_dir, db_override, &mut checks);
+    // A committed merge is a durable saga, not a generic corruption class.
+    // Surface it before any ordinary DB/JSONL consistency findings so
+    // operators know that only `br sync --merge` may advance the state.
+    // This check still runs in `--no-db` mode because a JSONL-only rewrite
+    // could otherwise overwrite the pending merge's expected artifact.
+    check_pending_sync_merge(&paths.db_path, &mut checks);
 
     // The JSONL-side audit always runs — it is the source of truth under the
     // `--no-db` (JSONL-only) contract.
@@ -10810,9 +11399,46 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // WP6: dispatch to the agent-ergonomics surface when a subcommand is
     // present. The flat handler below stays untouched.
     if let Some(sub) = &args.subcommand {
-        return crate::cli::commands::doctor_subsystems::surface::dispatch_subcommand(
-            sub, cli, ctx,
-        );
+        let undo_write_authority = if let crate::cli::DoctorSubcommand::Undo(undo) = sub
+            && !undo.dry_run
+            && let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)?
+        {
+            let paths = config::resolve_paths(&beads_dir, cli.db.as_ref())?;
+            let write_authority = if let Some(authority) =
+                cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
+            {
+                if let Err(err) = authority.verify_database_authority() {
+                    emit_concurrency_lost(&beads_dir, &err, ctx, "doctor undo");
+                    std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                }
+                Arc::clone(authority)
+            } else {
+                match acquire_doctor_database_write_authority(
+                    &beads_dir,
+                    &paths.db_path,
+                    cli.lock_timeout,
+                ) {
+                    Ok(authority) => authority,
+                    Err(err) => {
+                        emit_concurrency_lost(&beads_dir, &err, ctx, "doctor undo");
+                        std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                    }
+                }
+            };
+            refuse_doctor_mutation_if_merge_pending(
+                "doctor undo",
+                &paths.db_path,
+                &write_authority,
+                ctx,
+            );
+            Some(write_authority)
+        } else {
+            None
+        };
+        let result =
+            crate::cli::commands::doctor_subsystems::surface::dispatch_subcommand(sub, cli, ctx);
+        drop(undo_write_authority);
+        return result;
     }
     let Some(beads_dir) = config::discover_optional_beads_dir_with_cli(cli)? else {
         let mut checks = Vec::new();
@@ -10906,12 +11532,19 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // early-return below. Releasing the lock implicitly on panic is
     // load-bearing: a panicking fixer must not strand the `.write.lock`
     // file held against subsequent runs.
-    let _repair_lock_guard: Option<std::fs::File> = if args.repair && !args.robot_triage {
-        if cli.holds_write_lock_for(&beads_dir) {
+    let repair_write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>> = if args.repair
+        && !args.robot_triage
+    {
+        if let Some(authority) = cli.database_family_write_authority_for(&beads_dir, &paths.db_path)
+        {
             // main.rs already serialized us against concurrent writers.
-            // Don't open a second flock handle — same process, different
-            // open-file-descriptions would deadlock on Linux flock(2).
-            None
+            // Reuse that exact inode-bound capability; a fresh flock
+            // handle in the same process would deadlock on Linux.
+            if let Err(err) = authority.verify_database_authority() {
+                emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
+                std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+            }
+            Some(Arc::clone(authority))
         } else {
             // Phase 10 cold-prober finding (`beads_rust-mbpq` P0):
             // the documented contract is "try-lock or refuse with
@@ -10923,8 +11556,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // to wait can pass `--lock-timeout 30000` explicitly;
             // the default doctor path tries once and refuses fast.
             let timeout_ms = cli.lock_timeout.unwrap_or(0);
-            match crate::sync::blocking_write_lock_with_timeout(&beads_dir, Some(timeout_ms)) {
-                Ok(file) => Some(file),
+            match crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(timeout_ms),
+            ) {
+                Ok(authority) => {
+                    let authority = Arc::new(authority);
+                    if let Err(err) = authority
+                        .bind_database_inode_for_mutation()
+                        .and_then(|_| authority.verify_database_authority())
+                    {
+                        emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
+                        std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                    }
+                    Some(authority)
+                }
                 Err(err) => {
                     emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
                     std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
@@ -10934,6 +11581,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     } else {
         None
     };
+
+    if args.repair && !args.dry_run && !args.robot_triage {
+        let write_authority = repair_write_authority
+            .as_ref()
+            .expect("repair write authority acquired before pending-merge gate");
+        refuse_doctor_mutation_if_merge_pending("--repair", &paths.db_path, write_authority, ctx);
+    }
 
     // Round-5 fresh-eyes follow-through (`beads_rust-73ux`): the WP1
     // refuse-unsafe gates (schema-version-downgrade,
@@ -11328,8 +11982,20 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // Pass-5 cycle 37: PRAGMA wal_checkpoint(TRUNCATE) when the WAL is oversized.
     let wal_checkpoint_repaired =
         if args.repair && fixer_filter.allows("fm-state_files-wal-oversized") {
-            let repaired =
-                fix_wal_oversized_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
+            let write_authority =
+                repair_write_authority
+                    .as_ref()
+                    .ok_or_else(|| BeadsError::SyncConflict {
+                        message: "WAL repair reached mutation without database-family authority"
+                            .to_string(),
+                    })?;
+            let repaired = fix_wal_oversized_if_warned_under_write_authority(
+                &paths.db_path,
+                &initial.report,
+                ctx,
+                session.as_mut(),
+                write_authority,
+            );
             if repaired {
                 initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
             }
@@ -11362,11 +12028,19 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         && args.unsafe_auto_fix
         && fixer_filter.allows("fm-caches_indexes-db-bloat-vs-jsonl")
     {
-        let repaired = fix_db_bloat_via_vacuum_if_warned(
+        let write_authority =
+            repair_write_authority
+                .as_ref()
+                .ok_or_else(|| BeadsError::SyncConflict {
+                    message: "VACUUM repair reached mutation without database-family authority"
+                        .to_string(),
+                })?;
+        let repaired = fix_db_bloat_via_vacuum_if_warned_under_write_authority(
             &paths.db_path,
             &initial.report,
             ctx,
             session.as_mut(),
+            write_authority,
         );
         if repaired {
             initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
@@ -11478,6 +12152,16 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         return Ok(());
     }
 
+    let repair_write_authority =
+        repair_write_authority
+            .as_ref()
+            .ok_or_else(|| {
+                BeadsError::SyncConflict {
+            message:
+                "doctor --repair reached mutation planning without database-family write authority"
+                    .to_string(),
+        }
+            })?;
     let mut local_repair = LocalRepairResult::default();
 
     if initial.report.ok {
@@ -11498,23 +12182,33 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // --repair is passed and the warnings are present.
         if has_blocked_cache_rebuild || has_partial_index_warnings || has_warn_page_anomalies {
             local_repair = if has_blocked_cache_rebuild {
-                repair_recoverable_db_state(
-                    &beads_dir,
+                repair_recoverable_db_state_under_write_authority(
                     &paths.db_path,
                     &initial.report,
                     session.as_mut(),
                     &fixer_filter,
+                    repair_write_authority,
                 )
             } else {
                 LocalRepairResult::default()
             };
 
             if has_partial_index_warnings {
-                repair_partial_indexes(&paths.db_path, &mut local_repair, session.as_mut());
+                repair_partial_indexes_under_write_authority(
+                    &paths.db_path,
+                    &mut local_repair,
+                    session.as_mut(),
+                    repair_write_authority,
+                );
             }
 
             if has_warn_page_anomalies {
-                repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
+                repair_via_vacuum(
+                    &paths.db_path,
+                    &mut local_repair,
+                    session.as_mut(),
+                    repair_write_authority,
+                );
             }
 
             let post_warning_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
@@ -11623,12 +12317,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             has_sidecar_anomaly,
         )
     {
-        local_repair = repair_recoverable_db_state(
-            &beads_dir,
+        local_repair = repair_recoverable_db_state_under_write_authority(
             &paths.db_path,
             &initial.report,
             session.as_mut(),
             &fixer_filter,
+            repair_write_authority,
         );
     }
 
@@ -11637,7 +12331,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         && fixer_filter.allows(FM_PARTIAL_INDEX_STALE)
         && report_has_partial_index_warnings(&initial.report)
     {
-        repair_partial_indexes(&paths.db_path, &mut local_repair, session.as_mut());
+        repair_partial_indexes_under_write_authority(
+            &paths.db_path,
+            &mut local_repair,
+            session.as_mut(),
+            repair_write_authority,
+        );
     }
 
     // VACUUM to fix page-level anomalies (free space corruption, malformed
@@ -11646,7 +12345,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // it fixes both index and table corruption.
     if fixer_filter.allows(FM_SQLITE_PAGE_MALFORMED) && report_has_page_corruption(&initial.report)
     {
-        repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
+        repair_via_vacuum(
+            &paths.db_path,
+            &mut local_repair,
+            session.as_mut(),
+            repair_write_authority,
+        );
     }
 
     let mut after_local_repair = if local_repair.applied() {
@@ -11671,7 +12375,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             path = %paths.db_path.display(),
             "Post-repair report has WARN-level page anomalies; running VACUUM to clean up orphaned pages"
         );
-        repair_via_vacuum(&paths.db_path, &mut local_repair, session.as_mut());
+        repair_via_vacuum(
+            &paths.db_path,
+            &mut local_repair,
+            session.as_mut(),
+            repair_write_authority,
+        );
         if local_repair.vacuumed {
             after_local_repair = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
         }
@@ -11683,7 +12392,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // writes to fail (reads work, writes get ISSUE_NOT_FOUND).  Run a
         // write probe to confirm that the DB is truly healthy before
         // declaring success.
-        let write_probe_ok = write_probe_after_repair(&paths.db_path);
+        let write_probe_ok = write_probe_after_repair(&paths.db_path, repair_write_authority);
         if !write_probe_ok {
             let recovery_audit = early_repair.prepend_actions_to_audit(local_repair_audit_record(
                 "doctor.local_repair",
@@ -11954,8 +12663,10 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use assert_cmd::Command as AssertCommand;
     use chrono::Utc;
     use fsqlite::Connection;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::{NamedTempFile, TempDir};
@@ -12022,6 +12733,577 @@ mod tests {
         storage
             .create_issue(&sample_issue(id, title), "tester")
             .unwrap();
+    }
+
+    fn install_valid_pending_merge_receipt(db_path: &Path) -> SyncMergePendingReceipt {
+        let mut storage = SqliteStorage::open(db_path).expect("open pending-receipt fixture");
+        let database_before =
+            crate::sync::capture_sync_database_witness(&storage).expect("capture database before");
+        let intent = crate::sync::SyncMergeIntent {
+            schema_version: 2,
+            database_authority_sha256: "1".repeat(64),
+            jsonl_authority_sha256: "2".repeat(64),
+            jsonl_path_sha256: "3".repeat(64),
+            jsonl_before: crate::sync::JsonlSourceStateWitness::Missing,
+            jsonl_before_content_sha256: None,
+            base_authority_sha256: "4".repeat(64),
+            base_before: crate::sync::JsonlSourceStateWitness::Missing,
+            base_before_content_sha256: None,
+            resolution: "manual".to_string(),
+            actor: "doctor-test".to_string(),
+            event_attribution: crate::storage::EventAttribution::default(),
+            capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            retention_days: None,
+            export_as_of: chrono::DateTime::parse_from_rfc3339("2026-07-27T00:00:00Z")
+                .expect("fixed export timestamp")
+                .with_timezone(&Utc),
+            changed_kept_issue_ids: Vec::new(),
+            kept_issue_witnesses: Vec::new(),
+            deleted_issue_ids: Vec::new(),
+            note_witnesses: Vec::new(),
+            database_before,
+        };
+        let database_after =
+            crate::sync::capture_sync_merge_core_witness(&storage).expect("capture database after");
+        let receipt = SyncMergePendingReceipt::new(
+            intent,
+            "2026-07-27T00:00:00Z".to_string(),
+            database_after,
+            "5".repeat(64),
+            0,
+            &[],
+            Vec::new(),
+        )
+        .expect("construct receipt");
+        receipt.validate().expect("fixture receipt must validate");
+        storage
+            .set_metadata(
+                crate::sync::METADATA_SYNC_MERGE_PENDING,
+                &serde_json::to_string(&receipt).expect("serialize receipt"),
+            )
+            .expect("persist pending receipt");
+        receipt
+    }
+
+    fn pending_merge_workspace_with_newer_jsonl() -> (TempDir, PathBuf) {
+        let temp = TempDir::new().expect("pending merge workspace");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create .beads");
+        let db_path = beads_dir.join("beads.db");
+        install_valid_pending_merge_receipt(&db_path);
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let issue = sample_issue("bd-auto-import-sentinel", "must remain outside pending DB");
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&issue).expect("serialize JSONL sentinel")
+            ),
+        )
+        .expect("write newer JSONL sentinel");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&jsonl_path)
+            .expect("open JSONL sentinel");
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+        )
+        .expect("make JSONL newer than database");
+
+        (temp, db_path)
+    }
+
+    fn database_family_bytes(db_path: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let path = if suffix.is_empty() {
+                    db_path.to_path_buf()
+                } else {
+                    PathBuf::from(format!("{}{suffix}", db_path.to_string_lossy()))
+                };
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        assert_eq!(
+                            error.kind(),
+                            io::ErrorKind::NotFound,
+                            "read database-family artifact {}: {error}",
+                            path.display()
+                        );
+                        None
+                    }
+                };
+                (suffix.to_string(), bytes)
+            })
+            .collect()
+    }
+
+    fn run_br(cwd: &Path, args: &[&str]) -> std::process::Output {
+        let mut command = AssertCommand::cargo_bin("br").expect("locate br binary");
+        command.current_dir(cwd);
+        command.env("NO_COLOR", "1");
+        command.env("RUST_LOG", "warn");
+        command.env("HOME", cwd);
+        command.env_remove("BR_DISABLE_READ_ONLY_FAST_OPEN");
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("BD_")
+                || name.starts_with("BEADS_")
+                || matches!(
+                    name.as_ref(),
+                    "BR_OUTPUT_FORMAT" | "TOON_DEFAULT_FORMAT" | "TOON_STATS"
+                )
+            {
+                command.env_remove(&key);
+            }
+        }
+        command.args(args).output().expect("run br child")
+    }
+
+    #[test]
+    fn pending_sync_merge_read_only_inspector_accepts_valid_v2_receipt() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let receipt = install_valid_pending_merge_receipt(&db_path);
+
+        let state = inspect_pending_sync_merge_at_path(&db_path)
+            .expect("inspect pending receipt")
+            .expect("pending receipt must be visible");
+
+        assert_eq!(state.condition, PendingSyncMergeCondition::Valid);
+        assert_eq!(
+            state.receipt_id.as_deref(),
+            Some(receipt.receipt_id.as_str())
+        );
+        assert_eq!(state.phase.as_deref(), Some("database_committed"));
+        assert_eq!(state.resolution.as_deref(), Some("manual"));
+        assert_eq!(state.expected_jsonl_issue_count, Some(0));
+    }
+
+    #[test]
+    fn pending_sync_merge_authority_inspector_is_coherent_and_byte_identical() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let receipt = install_valid_pending_merge_receipt(&db_path);
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        authority.bind_database_inode_for_mutation().unwrap();
+        let before = database_family_bytes(&db_path);
+
+        let state = inspect_pending_sync_merge_under_authority(&db_path, &authority)
+            .expect("inspect under authority")
+            .expect("pending receipt must remain visible");
+
+        assert_eq!(
+            state.receipt_id.as_deref(),
+            Some(receipt.receipt_id.as_str())
+        );
+        assert_eq!(
+            database_family_bytes(&db_path),
+            before,
+            "read-only authority inspection must not change DB/WAL/SHM/journal bytes"
+        );
+    }
+
+    #[test]
+    fn pending_sync_merge_authority_inspector_treats_missing_database_as_unknown() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("missing.db");
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        let err = inspect_pending_sync_merge_under_authority(&db_path, &authority).unwrap_err();
+
+        assert!(
+            err.to_string().contains("unknown") && err.to_string().contains("missing"),
+            "missing database must not be classified absent: {err}"
+        );
+        assert!(
+            !db_path.exists(),
+            "read-only pending-state inspection must not initialize a missing database"
+        );
+    }
+
+    #[test]
+    fn pending_sync_merge_read_only_inspector_distinguishes_legacy_and_malformed() {
+        let legacy = TempDir::new().unwrap();
+        let legacy_db = legacy.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&legacy_db).unwrap();
+        storage
+            .set_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY, "legacy-receipt")
+            .unwrap();
+        drop(storage);
+        let legacy_state = inspect_pending_sync_merge_at_path(&legacy_db)
+            .unwrap()
+            .expect("legacy state");
+        assert_eq!(legacy_state.condition, PendingSyncMergeCondition::Legacy);
+        assert_eq!(
+            legacy_state.metadata_key,
+            METADATA_SYNC_MERGE_PENDING_LEGACY
+        );
+
+        let malformed = TempDir::new().unwrap();
+        let malformed_db = malformed.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&malformed_db).unwrap();
+        storage
+            .set_metadata(crate::sync::METADATA_SYNC_MERGE_PENDING, "{")
+            .unwrap();
+        drop(storage);
+        let malformed_state = inspect_pending_sync_merge_at_path(&malformed_db)
+            .unwrap()
+            .expect("malformed state");
+        assert_eq!(
+            malformed_state.condition,
+            PendingSyncMergeCondition::Malformed
+        );
+        assert!(
+            malformed_state.diagnostic.contains("not valid JSON"),
+            "{malformed_state:?}"
+        );
+    }
+
+    #[test]
+    fn pending_sync_merge_read_only_inspector_rejects_dual_legacy_and_current_keys() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage
+            .set_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY, "legacy-receipt")
+            .unwrap();
+        storage
+            .set_metadata(crate::sync::METADATA_SYNC_MERGE_PENDING, "{}")
+            .unwrap();
+        drop(storage);
+
+        let state = inspect_pending_sync_merge_at_path(&db_path)
+            .unwrap()
+            .expect("dual-key state");
+
+        assert_eq!(state.condition, PendingSyncMergeCondition::Malformed);
+        assert!(
+            state
+                .metadata_key
+                .contains(METADATA_SYNC_MERGE_PENDING_LEGACY),
+            "{state:?}"
+        );
+        assert!(
+            state
+                .metadata_key
+                .contains(crate::sync::METADATA_SYNC_MERGE_PENDING),
+            "{state:?}"
+        );
+        assert!(
+            state.diagnostic.contains("both legacy (1) and current (1)"),
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn pending_sync_merge_read_only_inspector_rejects_duplicate_and_empty_rows() {
+        let duplicate = TempDir::new().unwrap();
+        let duplicate_db = duplicate.path().join("beads.db");
+        drop(SqliteStorage::open(&duplicate_db).unwrap());
+        let conn = Connection::open(duplicate_db.to_string_lossy().into_owned()).unwrap();
+        for value in ["{}", "{}"] {
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(crate::sync::METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(value),
+                ],
+            )
+            .unwrap();
+        }
+        conn.close().unwrap();
+        let duplicate_state = inspect_pending_sync_merge_at_path(&duplicate_db)
+            .unwrap()
+            .expect("duplicate state");
+        assert_eq!(
+            duplicate_state.condition,
+            PendingSyncMergeCondition::Malformed
+        );
+        assert!(
+            duplicate_state.diagnostic.contains("duplicate receipts"),
+            "{duplicate_state:?}"
+        );
+
+        let duplicate_legacy = TempDir::new().unwrap();
+        let duplicate_legacy_db = duplicate_legacy.path().join("beads.db");
+        drop(SqliteStorage::open(&duplicate_legacy_db).unwrap());
+        let conn = Connection::open(duplicate_legacy_db.to_string_lossy().into_owned()).unwrap();
+        for value in ["legacy-a", "legacy-b"] {
+            conn.execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING_LEGACY),
+                    SqliteValue::from(value),
+                ],
+            )
+            .unwrap();
+        }
+        conn.close().unwrap();
+        let duplicate_legacy_state = inspect_pending_sync_merge_at_path(&duplicate_legacy_db)
+            .unwrap()
+            .expect("duplicate legacy state");
+        assert_eq!(
+            duplicate_legacy_state.condition,
+            PendingSyncMergeCondition::Malformed
+        );
+        assert_eq!(
+            duplicate_legacy_state.metadata_key,
+            METADATA_SYNC_MERGE_PENDING_LEGACY
+        );
+        assert!(
+            duplicate_legacy_state
+                .diagnostic
+                .contains("duplicate receipts"),
+            "{duplicate_legacy_state:?}"
+        );
+
+        let empty = TempDir::new().unwrap();
+        let empty_db = empty.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&empty_db).unwrap();
+        storage
+            .set_metadata(crate::sync::METADATA_SYNC_MERGE_PENDING, " ")
+            .unwrap();
+        drop(storage);
+        let empty_state = inspect_pending_sync_merge_at_path(&empty_db)
+            .unwrap()
+            .expect("empty state");
+        assert_eq!(empty_state.condition, PendingSyncMergeCondition::Malformed);
+        assert!(
+            empty_state.diagnostic.contains("NULL or empty"),
+            "{empty_state:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_pending_merge_check_is_dedicated_and_never_repairs() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        install_valid_pending_merge_receipt(&db_path);
+        let mut checks = Vec::new();
+
+        check_pending_sync_merge(&db_path, &mut checks);
+
+        let check = find_check(&checks, "sync.merge_pending").expect("dedicated pending check");
+        assert_eq!(check.status, CheckStatus::Warn);
+        let details = check.details.as_ref().expect("structured pending details");
+        assert_eq!(details["pending"], true);
+        assert_eq!(details["state"]["condition"], "valid");
+        assert!(
+            details["remediation"]
+                .as_str()
+                .is_some_and(|text| text.contains("br sync --merge")),
+            "{details}"
+        );
+    }
+
+    #[test]
+    fn pending_merge_read_only_cli_is_byte_identical_and_skips_newer_jsonl() {
+        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
+        let before_bytes = database_family_bytes(&db_path);
+        let before_state = inspect_pending_sync_merge_at_path(&db_path)
+            .expect("inspect before list")
+            .expect("pending before list");
+
+        let output = run_br(temp.path(), &["--json", "list"]);
+
+        assert!(
+            output.status.success(),
+            "read-only list failed:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("sync_merge_pending"),
+            "pending warning missing:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("bd-auto-import-sentinel"),
+            "newer JSONL was imported despite the pending gate:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            database_family_bytes(&db_path),
+            before_bytes,
+            "read-only command changed database-family bytes"
+        );
+        assert_eq!(
+            inspect_pending_sync_merge_at_path(&db_path)
+                .expect("inspect after list")
+                .expect("pending after list"),
+            before_state,
+            "read-only command changed pending metadata"
+        );
+    }
+
+    #[test]
+    fn pending_merge_mutation_refuses_before_auto_import_or_storage_write() {
+        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
+        let before_bytes = database_family_bytes(&db_path);
+        let jsonl_path = temp.path().join(".beads/issues.jsonl");
+        let before_jsonl = fs::read(&jsonl_path).expect("read JSONL before mutation");
+
+        let output = run_br(
+            temp.path(),
+            &["--json", "create", "must-not-cross-pending-gate"],
+        );
+        let rendered = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(!output.status.success(), "mutation unexpectedly succeeded");
+        assert!(
+            rendered.contains("Refusing non-merge mutation") && rendered.contains("sync-merge"),
+            "wrong refusal:\n{rendered}"
+        );
+        assert_eq!(
+            database_family_bytes(&db_path),
+            before_bytes,
+            "refused mutation changed database-family bytes"
+        );
+        assert_eq!(
+            fs::read(&jsonl_path).expect("read JSONL after mutation"),
+            before_jsonl,
+            "refused mutation changed JSONL"
+        );
+    }
+
+    #[test]
+    fn pending_merge_refuses_no_db_jsonl_writer_without_changing_either_artifact() {
+        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
+        let before_bytes = database_family_bytes(&db_path);
+        let before_state = inspect_pending_sync_merge_at_path(&db_path)
+            .expect("inspect before no-DB mutation")
+            .expect("pending before no-DB mutation");
+        let jsonl_path = temp.path().join(".beads/issues.jsonl");
+        let before_jsonl = fs::read(&jsonl_path).expect("read JSONL before no-DB mutation");
+
+        let output = run_br(
+            temp.path(),
+            &[
+                "--no-db",
+                "--json",
+                "create",
+                "must-not-clobber-pending-generation",
+            ],
+        );
+        let rendered = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !output.status.success(),
+            "no-DB mutation unexpectedly crossed pending gate"
+        );
+        assert!(
+            rendered.contains("no-DB JSONL mutation")
+                && rendered.contains("without `--no-db`")
+                && rendered.contains("sync --merge"),
+            "wrong no-DB refusal:\n{rendered}"
+        );
+        assert_eq!(
+            database_family_bytes(&db_path),
+            before_bytes,
+            "refused no-DB mutation changed database-family bytes"
+        );
+        assert_eq!(
+            fs::read(&jsonl_path).expect("read JSONL after no-DB mutation"),
+            before_jsonl,
+            "refused no-DB mutation changed JSONL bytes"
+        );
+        assert_eq!(
+            inspect_pending_sync_merge_at_path(&db_path)
+                .expect("inspect after no-DB mutation")
+                .expect("pending after no-DB mutation"),
+            before_state,
+            "refused no-DB mutation changed pending receipt"
+        );
+    }
+
+    #[test]
+    fn pending_merge_doctor_reports_read_only_and_refuses_all_mutation_surfaces() {
+        let (temp, db_path) = pending_merge_workspace_with_newer_jsonl();
+        let before_bytes = database_family_bytes(&db_path);
+        let before_state = inspect_pending_sync_merge_at_path(&db_path)
+            .expect("inspect before doctor")
+            .expect("pending before doctor");
+
+        let report = run_br(temp.path(), &["--json", "doctor"]);
+        let report_rendered = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&report.stdout),
+            String::from_utf8_lossy(&report.stderr)
+        );
+        assert!(
+            report_rendered.contains("sync.merge_pending"),
+            "doctor omitted the dedicated pending finding:\n{report_rendered}"
+        );
+        assert_eq!(
+            database_family_bytes(&db_path),
+            before_bytes,
+            "read-only doctor changed database-family bytes"
+        );
+
+        let cases: &[(&str, &[&str])] = &[
+            ("--repair", &["--json", "doctor", "--repair"]),
+            (
+                "--repair-indexes",
+                &["--json", "doctor", "--repair-indexes"],
+            ),
+            ("doctor undo", &["--json", "doctor", "undo", "latest"]),
+        ];
+        for (name, args) in cases {
+            let output = run_br(temp.path(), args);
+            let rendered = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(DoctorExitCode::RefusedUnsafe.as_i32()),
+                "{name} returned the wrong status:\n{rendered}"
+            );
+            assert!(
+                rendered.contains("sync.merge_pending"),
+                "{name} omitted structured gate evidence:\n{rendered}"
+            );
+            assert_eq!(
+                database_family_bytes(&db_path),
+                before_bytes,
+                "{name} changed database-family bytes"
+            );
+        }
+
+        assert_eq!(
+            inspect_pending_sync_merge_at_path(&db_path)
+                .expect("inspect after doctor")
+                .expect("pending after doctor"),
+            before_state,
+            "doctor surfaces changed pending metadata"
+        );
     }
 
     fn insert_dependency_row(conn: &Connection, issue_id: &str, depends_on_id: &str) {
@@ -18978,9 +20260,18 @@ mod tests {
         fs::write(&wal_path, b"wal-before-vacuum").unwrap();
         fs::write(&journal_path, b"journal-before-vacuum").unwrap();
 
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        write_authority.bind_database_inode_for_mutation().unwrap();
         let mut session = DoctorRepairSession::new(temp.path(), false).unwrap();
         let mut repair = LocalRepairResult::default();
-        repair_via_vacuum(&db_path, &mut repair, Some(&mut session));
+        repair_via_vacuum(&db_path, &mut repair, Some(&mut session), &write_authority);
 
         let actions = fs::read_to_string(&session.run.actions_file).unwrap();
         let action_paths: BTreeSet<String> = actions
@@ -21242,9 +22533,12 @@ version = "2026-05-11-abc123"
         let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
         let stale_wal = PathBuf::from(format!("{}-wal", snapshot_path.to_string_lossy()));
         fs::create_dir(&stale_wal).unwrap();
+        let write_authority =
+            acquire_doctor_database_write_authority(&beads_dir, &db_path, Some(1_000)).unwrap();
 
-        let err = checkpoint_and_snapshot_repair_indexes(&db_path, &snapshot_path)
-            .expect_err("unremovable stale sidecar snapshot must fail closed");
+        let err =
+            checkpoint_and_snapshot_repair_indexes(&db_path, &snapshot_path, &write_authority)
+                .expect_err("unremovable stale sidecar snapshot must fail closed");
         let message = err.to_string();
         assert!(
             message.contains("failed to remove stale sidecar snapshot")
@@ -21280,9 +22574,12 @@ version = "2026-05-11-abc123"
 
         let snapshot_path = db_path.with_extension("db.pre-repair-indexes");
         symlink(&outside_target, &snapshot_path).unwrap();
+        let write_authority =
+            acquire_doctor_database_write_authority(&beads_dir, &db_path, Some(1_000)).unwrap();
 
-        let err = checkpoint_and_snapshot_repair_indexes(&db_path, &snapshot_path)
-            .expect_err("symlinked pre-snapshot target must fail closed");
+        let err =
+            checkpoint_and_snapshot_repair_indexes(&db_path, &snapshot_path, &write_authority)
+                .expect_err("symlinked pre-snapshot target must fail closed");
         let message = err.to_string();
         assert!(
             message.contains("refusing to write pre-snapshot backup through symlink"),
@@ -21457,12 +22754,16 @@ version = "2026-05-11-abc123"
             .unwrap();
         drop(storage);
 
-        let _startup_lock =
-            crate::sync::blocking_write_lock_with_timeout(&beads_dir, Some(0)).unwrap();
-        let cli = CliOverrides {
-            held_write_lock_beads_dir: Some(beads_dir.clone()),
-            ..CliOverrides::default()
-        };
+        let startup_lock = std::sync::Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(0),
+            )
+            .unwrap(),
+        );
+        let mut cli = CliOverrides::default();
+        cli.mark_database_family_lock_held(&beads_dir, &startup_lock);
         let paths = ConfigPaths {
             beads_dir: beads_dir.clone(),
             db_path: db_path.clone(),
