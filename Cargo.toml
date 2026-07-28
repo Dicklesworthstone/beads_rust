@@ -68,6 +68,7 @@ schemars = { version = "1.2", features = ["derive", "chrono04"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 
 # Hashing
+sha1 = "0.11.0"
 sha2 = "0.11.0"
 
 # Error handling
@@ -114,7 +115,14 @@ self-replace = { version = "1.5.0", optional = true }
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
 [target.'cfg(unix)'.dependencies]
+libc = "0.2.185"
+rustix = { version = "1.1.4", features = ["fs"] }
 signal-hook = "0.4.4"
+
+[target.'cfg(windows)'.dependencies]
+# Capability-relative Windows filesystem access. Pin exactly because the
+# no-follow/open-at implementation is part of sync's hostile-path boundary.
+cap-primitives = "=4.0.2"
 
 [target.'cfg(not(windows))'.dependencies]
 mimalloc = "0.1.52"
@@ -130,6 +138,7 @@ walkdir = "2.5"
 insta = { version = "1.48", features = ["json", "yaml"] }
 proptest = "1.11"
 rand = "0.10"
+toml = "=1.1.2"
 
 [[bench]]
 name = "storage_perf"

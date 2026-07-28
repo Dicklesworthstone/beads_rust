@@ -812,6 +812,21 @@ impl Issue {
     /// Check if this issue is a tombstone that has exceeded its TTL.
     #[must_use]
     pub fn is_expired_tombstone(&self, retention_days: Option<u64>) -> bool {
+        self.is_expired_tombstone_at(retention_days, Utc::now())
+    }
+
+    /// Check if this issue is a tombstone that has exceeded its TTL at a
+    /// caller-supplied cutoff.
+    ///
+    /// Supplying the cutoff lets one logical export apply a single retention
+    /// decision to every issue, even when serial and parallel preparation take
+    /// different amounts of time.
+    #[must_use]
+    pub fn is_expired_tombstone_at(
+        &self,
+        retention_days: Option<u64>,
+        as_of: DateTime<Utc>,
+    ) -> bool {
         if self.status != Status::Tombstone {
             return false;
         }
@@ -833,8 +848,14 @@ impl Issue {
         // something extremely safe for an issue tracker (e.g., 1000 years).
         let max_safe_days = 365_u64 * 1000;
         let days_i64 = i64::try_from(days.min(max_safe_days)).unwrap_or(365_000);
-        let expiration_time = deleted_at + chrono::Duration::days(days_i64);
-        Utc::now() > expiration_time
+        let Some(expiration_time) = deleted_at.checked_add_signed(chrono::Duration::days(days_i64))
+        else {
+            // A positive retention period that extends beyond chrono's maximum
+            // representable timestamp has not expired at any representable
+            // cutoff, so retain the tombstone.
+            return false;
+        };
+        as_of > expiration_time
     }
 }
 
@@ -1726,6 +1747,60 @@ mod tests {
         issue.status = Status::Tombstone;
         issue.deleted_at = Some(Utc::now() - chrono::Duration::days(40));
         assert!(issue.is_expired_tombstone(Some(30)));
+    }
+
+    #[test]
+    fn test_is_expired_tombstone_at_uses_strict_ttl_boundary() {
+        let as_of = DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(as_of - chrono::Duration::days(30));
+
+        assert!(
+            !issue.is_expired_tombstone_at(Some(30), as_of),
+            "a tombstone is retained at the exact TTL boundary"
+        );
+        assert!(
+            issue.is_expired_tombstone_at(Some(30), as_of + chrono::Duration::nanoseconds(1)),
+            "a tombstone expires immediately after the strict TTL boundary"
+        );
+    }
+
+    #[test]
+    fn test_is_expired_tombstone_at_retains_unrepresentable_expiration() {
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(DateTime::<Utc>::MAX_UTC);
+
+        assert!(
+            !issue.is_expired_tombstone_at(Some(1), DateTime::<Utc>::MAX_UTC),
+            "an expiration beyond chrono's maximum timestamp must retain the tombstone"
+        );
+    }
+
+    #[test]
+    fn test_is_expired_tombstone_at_clamps_maximum_retention() {
+        let deleted_at = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let clamped_expiration = deleted_at + chrono::Duration::days(365_000);
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(deleted_at);
+
+        assert!(
+            !issue.is_expired_tombstone_at(Some(u64::MAX), clamped_expiration),
+            "maximum retention is clamped and remains live at the strict boundary"
+        );
+        assert!(
+            issue.is_expired_tombstone_at(
+                Some(u64::MAX),
+                clamped_expiration + chrono::Duration::nanoseconds(1),
+            ),
+            "maximum retention expires immediately after the clamped boundary"
+        );
     }
 
     // ========================================================================

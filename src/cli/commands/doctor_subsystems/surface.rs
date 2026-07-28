@@ -93,6 +93,7 @@ pub fn dispatch_subcommand(
         }
         DoctorSubcommand::Ls(a) => execute_ls(a, &repo_root),
         DoctorSubcommand::Undo(a) => execute_undo(a, &repo_root),
+        DoctorSubcommand::MigrateSchema(a) => super::schema_migration::execute(a, cli, ctx),
         DoctorSubcommand::Explain(a) => execute_explain(a, &repo_root),
     }
 }

@@ -15,6 +15,7 @@
 use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, DependencyType, Issue, Priority, Status};
 use crate::util::id::MAX_ID_LENGTH;
+use std::fs;
 use std::path::Path;
 
 const TITLE_MAX_CHARS: usize = 500;
@@ -465,10 +466,47 @@ pub fn is_valid_id_format(id: &str) -> bool {
 /// 4. **No auto-commit**: All git operations are user-initiated
 /// 5. **No hook execution**: No git hooks are installed or triggered
 ///
-/// These are enforced by design (no git dependencies) and by runtime validation.
+/// These are defended by a fail-closed source-boundary scan, a direct
+/// normal/target-runtime manifest guard, a separately reviewed
+/// `cargo tree -e normal`, and the runtime PATH/.git snapshot matrix.
 pub struct SyncSafetyValidator;
 
 impl SyncSafetyValidator {
+    const FORBIDDEN_AUTHORITY_PATTERNS: [(&'static str, &'static str); 17] = [
+        (
+            "std::process::Command",
+            "direct subprocess command construction",
+        ),
+        ("process::Command", "subprocess command construction"),
+        ("std::process::{", "aliased subprocess command import"),
+        ("process::{", "aliased subprocess command import"),
+        ("usestd::processas", "aliased subprocess module import"),
+        ("usestd::{processas", "aliased subprocess module import"),
+        ("Command::new", "subprocess command construction"),
+        (
+            "crate::cli::commands::",
+            "delegation to a process-capable CLI adapter namespace",
+        ),
+        (
+            "include!(",
+            "source inclusion that can evade the inspected boundary",
+        ),
+        (
+            "include_bytes!(",
+            "byte inclusion that can hide authority-bearing source",
+        ),
+        (
+            "#[path",
+            "out-of-bound module path inclusion that can evade inspection",
+        ),
+        ("run_git", "Git subprocess wrapper"),
+        ("spawn_git", "Git subprocess wrapper"),
+        ("git_capture", "Git subprocess wrapper"),
+        ("git2::", "Git library authority"),
+        ("gix::", "Git library authority"),
+        ("gitoxide", "Git library authority"),
+    ];
+
     /// Validates that a path does not target git internals.
     ///
     /// Returns an error if the path contains `.git` components.
@@ -550,23 +588,230 @@ impl SyncSafetyValidator {
         Ok(())
     }
 
-    /// Asserts that sync code paths don't execute git commands.
+    /// Validate that every Rust source in the sync authority boundary is free
+    /// of subprocess, Git-library, and VCS-adapter authority.
     ///
-    /// This is a compile-time design assertion documented here for clarity:
-    /// - No `std::process::Command::new("git")` in sync module
-    /// - No git library dependencies (gitoxide, git2, etc.)
-    /// - Verified by static analysis: `grep -r "Command::new.*git" src/sync/`
+    /// The boundary deliberately includes both the reusable sync engine
+    /// (`src/sync/**/*.rs`) and the CLI sync adapter
+    /// (`src/cli/commands/sync.rs`). The walk is fail-closed: a missing path,
+    /// unreadable or special entry, symlink, non-UTF-8 source, or forbidden
+    /// construct is an error rather than a skipped check. Whitespace is
+    /// normalized before matching so split-token formatting cannot evade the
+    /// guard. The scan is intentionally conservative over comments and string
+    /// literals: a false positive requires moving or rewording documentation,
+    /// whereas ignoring source regions would create an authority-evasion
+    /// surface.
     ///
-    /// At runtime, this function serves as documentation and can be used
-    /// in tests to validate the invariant holds.
-    #[inline]
-    pub const fn assert_no_git_in_sync() {
-        // This is a compile-time design assertion.
-        // The actual enforcement is:
-        // 1. No git dependencies in Cargo.toml for sync
-        // 2. No Command::new("git") calls in src/sync/
-        // 3. This is verified by tests and grep/audit
+    /// # Errors
+    ///
+    /// Returns `ValidationError` when the source boundary cannot be inspected
+    /// completely or when authority-bearing code is found.
+    pub fn validate_no_git_authority_in_sync_sources(
+        repo_root: &Path,
+    ) -> Result<(), ValidationError> {
+        let sync_dir = repo_root.join("src/sync");
+        let cli_sync = repo_root.join("src/cli/commands/sync.rs");
+
+        Self::validate_sync_source_tree(repo_root, &sync_dir)?;
+        Self::validate_sync_source_file(repo_root, &cli_sync)
     }
+
+    fn validate_sync_source_tree(
+        repo_root: &Path,
+        directory: &Path,
+    ) -> Result<(), ValidationError> {
+        let metadata = fs::symlink_metadata(directory).map_err(|error| {
+            Self::sync_source_error(
+                repo_root,
+                directory,
+                format!("cannot inspect required directory: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(Self::sync_source_error(
+                repo_root,
+                directory,
+                "required directory is a symlink",
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(Self::sync_source_error(
+                repo_root,
+                directory,
+                "required sync source directory is not a directory",
+            ));
+        }
+
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| {
+                Self::sync_source_error(
+                    repo_root,
+                    directory,
+                    format!("cannot read required directory: {error}"),
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                Self::sync_source_error(
+                    repo_root,
+                    directory,
+                    format!("cannot enumerate required directory: {error}"),
+                )
+            })?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                Self::sync_source_error(
+                    repo_root,
+                    &path,
+                    format!("cannot inspect source entry: {error}"),
+                )
+            })?;
+            if file_type.is_symlink() {
+                return Err(Self::sync_source_error(
+                    repo_root,
+                    &path,
+                    "sync source entry is a symlink",
+                ));
+            }
+            if file_type.is_dir() {
+                Self::validate_sync_source_tree(repo_root, &path)?;
+            } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                Self::validate_sync_source_file(repo_root, &path)?;
+            } else if !file_type.is_file() {
+                return Err(Self::sync_source_error(
+                    repo_root,
+                    &path,
+                    "sync source tree contains an unsupported special entry",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_sync_source_file(repo_root: &Path, path: &Path) -> Result<(), ValidationError> {
+        let metadata = fs::symlink_metadata(path).map_err(|error| {
+            Self::sync_source_error(
+                repo_root,
+                path,
+                format!("cannot inspect required source: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(Self::sync_source_error(
+                repo_root,
+                path,
+                "required sync source is a symlink",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(Self::sync_source_error(
+                repo_root,
+                path,
+                "required sync source is not a regular file",
+            ));
+        }
+
+        let source = fs::read_to_string(path).map_err(|error| {
+            Self::sync_source_error(
+                repo_root,
+                path,
+                format!("cannot read required UTF-8 source: {error}"),
+            )
+        })?;
+        Self::validate_sync_source_text(
+            path.strip_prefix(repo_root).unwrap_or(path),
+            source.as_str(),
+        )
+    }
+
+    fn validate_sync_source_text(
+        relative_path: &Path,
+        source: &str,
+    ) -> Result<(), ValidationError> {
+        let normalized = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        for (pattern, authority) in Self::FORBIDDEN_AUTHORITY_PATTERNS {
+            if normalized.contains(pattern) {
+                return Err(ValidationError::new(
+                    "sync_source",
+                    format!(
+                        "{} contains forbidden {authority} marker {pattern:?}",
+                        relative_path.display()
+                    ),
+                ));
+            }
+        }
+        if relative_path == Path::new("src/cli/commands/sync.rs")
+            && Self::references_process_capable_sibling(&normalized)
+        {
+            return Err(ValidationError::new(
+                "sync_source",
+                format!(
+                    "{} contains a forbidden process-capable CLI sibling reference",
+                    relative_path.display()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn references_process_capable_sibling(normalized: &str) -> bool {
+        const ADAPTERS: [&str; 8] = [
+            "changelog",
+            "config",
+            "doctor",
+            "orphans",
+            "stats",
+            "upgrade",
+            "vcs",
+            "version",
+        ];
+
+        ADAPTERS.iter().any(|adapter| {
+            normalized.contains(&format!("super::{adapter}::"))
+                || normalized.contains(&format!("super::{adapter};"))
+                || normalized.contains(&format!("super::{adapter}as"))
+                || grouped_super_import_contains(normalized, adapter)
+        })
+    }
+
+    fn sync_source_error(
+        repo_root: &Path,
+        path: &Path,
+        reason: impl std::fmt::Display,
+    ) -> ValidationError {
+        ValidationError::new(
+            "sync_source",
+            format!(
+                "{}: {reason}",
+                path.strip_prefix(repo_root).unwrap_or(path).display()
+            ),
+        )
+    }
+}
+
+fn grouped_super_import_contains(normalized: &str, adapter: &str) -> bool {
+    let mut remaining = normalized;
+    while let Some(start) = remaining.find("usesuper::{") {
+        remaining = &remaining[start + "usesuper::{".len()..];
+        let Some(end) = remaining.find('}') else {
+            return true;
+        };
+        if remaining[..end].split(',').any(|import| {
+            import == adapter
+                || import.starts_with(&format!("{adapter}as"))
+                || import.starts_with(&format!("{adapter}::"))
+        }) {
+            return true;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1132,63 +1377,398 @@ mod tests {
         assert!(result.unwrap_err().message.contains(".git"));
     }
 
-    /// This test verifies the core safety invariant: no git commands in sync code.
-    ///
-    /// It uses static analysis (grep) to prove that `Command::new("git")` does
-    /// not appear in the sync module.
     #[test]
-    fn sync_safety_no_git_commands_in_sync_module() {
-        use std::process::Command;
+    fn sync_safety_source_scan_accepts_complete_real_tree() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        SyncSafetyValidator::validate_no_git_authority_in_sync_sources(repo_root)
+            .expect("the complete sync source boundary must be authority-free");
+    }
 
-        // Search for git command invocations in sync module
-        let output = Command::new("grep")
-            .args(["-r", "Command::new.*git", "src/sync/"])
-            .output();
+    #[test]
+    fn sync_safety_source_scan_rejects_missing_boundary() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let error = SyncSafetyValidator::validate_no_git_authority_in_sync_sources(temp.path())
+            .expect_err("a missing source boundary must fail closed");
+        assert_eq!(error.field, "sync_source");
+        assert!(error.message.contains("cannot inspect required directory"));
+    }
 
-        match output {
-            Ok(result) => {
-                // grep returns exit code 1 when no matches found (which is what we want)
-                // grep returns exit code 0 when matches found (which is a failure)
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                assert!(
-                    result.status.code() == Some(1) || stdout.is_empty(),
-                    "SAFETY VIOLATION: Found git commands in sync module:\n{stdout}"
-                );
-            }
-            Err(_) => {
-                // If grep isn't available, skip this test with a warning
-                // This can happen in some CI environments
-                eprintln!("Warning: grep not available, skipping static analysis test");
-            }
+    #[test]
+    fn sync_safety_source_scan_rejects_direct_command_construction() {
+        let source = r#"fn probe(tool: &str) {
+            let _child = std
+                :: process
+                :: Command
+                :: new(tool)
+                .spawn();
+        }"#;
+        let error =
+            SyncSafetyValidator::validate_sync_source_text(Path::new("src/sync/probe.rs"), source)
+                .expect_err("indirect program selection still grants process authority");
+        assert!(error.message.contains("subprocess command construction"));
+        assert!(error.message.contains("src/sync/probe.rs"));
+    }
+
+    #[test]
+    fn sync_safety_source_scan_rejects_vcs_wrapper_delegation() {
+        let source = r#"fn status() {
+            crate::cli::commands::vcs::execute_for_sync();
+        }"#;
+        let error = SyncSafetyValidator::validate_sync_source_text(
+            Path::new("src/cli/commands/sync.rs"),
+            source,
+        )
+        .expect_err("sync must not regain authority through a VCS wrapper");
+        assert!(error.message.contains("process-capable CLI adapter"));
+        assert!(error.message.contains("src/cli/commands/sync.rs"));
+    }
+
+    #[test]
+    fn sync_safety_source_scan_rejects_inclusion_escape_hatches() {
+        for (source, marker) in [
+            (
+                r#"include!("../../../outside/authority.rs");"#,
+                "source inclusion",
+            ),
+            (
+                r#"const HIDDEN: &[u8] = include_bytes!("authority.rs");"#,
+                "byte inclusion",
+            ),
+            (
+                r#"#[path = "../../../outside/authority.rs"] mod hidden;"#,
+                "module path inclusion",
+            ),
+        ] {
+            let error = SyncSafetyValidator::validate_sync_source_text(
+                Path::new("src/sync/escape.rs"),
+                source,
+            )
+            .expect_err("inclusion escape hatch must fail closed");
+            assert!(error.message.contains(marker), "{error:?}");
         }
     }
 
-    /// Verify no runtime git dependencies exist in Cargo.toml [dependencies] section.
-    ///
-    /// Note: Build-time dependencies (like vergen-gix) are allowed since they
-    /// don't affect sync runtime behavior.
     #[test]
-    fn sync_safety_no_git_library_dependencies() {
-        let cargo_toml = std::fs::read_to_string("Cargo.toml").unwrap_or_default();
-
-        // Extract only the [dependencies] section (not [build-dependencies] or [dev-dependencies])
-        let deps_section = cargo_toml
-            .lines()
-            .skip_while(|line| !line.starts_with("[dependencies]"))
-            .skip(1) // Skip the [dependencies] header
-            .take_while(|line| !line.starts_with('[')) // Stop at next section
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Check for common git library crates in runtime dependencies only
-        let git_crates = ["git2 ", "gitoxide ", "gix ", "libgit2 "];
-
-        for crate_name in git_crates {
-            let crate_name = crate_name.trim();
+    fn sync_safety_source_scan_rejects_every_process_capable_cli_sibling() {
+        for adapter in [
+            "changelog",
+            "config",
+            "doctor",
+            "orphans",
+            "stats",
+            "upgrade",
+            "vcs",
+            "version",
+        ] {
+            let source = format!("use super::{{safe_helper, {adapter}}};");
+            let error = SyncSafetyValidator::validate_sync_source_text(
+                Path::new("src/cli/commands/sync.rs"),
+                &source,
+            )
+            .expect_err("process-capable sibling import must fail closed");
             assert!(
-                !deps_section.contains(crate_name),
-                "SAFETY VIOLATION: Found git library dependency '{crate_name}' in runtime [dependencies]"
+                error.message.contains("process-capable CLI sibling"),
+                "{adapter}: {error:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_safety_source_scan_rejects_symlinked_entries() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let sync_dir = temp.path().join("src/sync");
+        let cli_dir = temp.path().join("src/cli/commands");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(cli_dir.join("sync.rs"), "").unwrap();
+        std::fs::write(temp.path().join("outside.rs"), "").unwrap();
+        symlink(temp.path().join("outside.rs"), sync_dir.join("hidden.rs")).unwrap();
+
+        let error = SyncSafetyValidator::validate_no_git_authority_in_sync_sources(temp.path())
+            .expect_err("symlinked source entries must fail closed");
+        assert!(error.message.contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_safety_source_scan_rejects_fifo_entries() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sync_dir = temp.path().join("src/sync");
+        let cli_dir = temp.path().join("src/cli/commands");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(sync_dir.join("mod.rs"), "").unwrap();
+        std::fs::write(cli_dir.join("sync.rs"), "").unwrap();
+
+        let fifo = sync_dir.join("authority.rs");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available for this Unix regression");
+        assert!(status.success(), "mkfifo fixture setup failed: {status}");
+
+        let error = SyncSafetyValidator::validate_no_git_authority_in_sync_sources(temp.path())
+            .expect_err("special source entries must fail closed");
+        assert_eq!(error.field, "sync_source");
+        assert!(error.message.contains("unsupported special entry"));
+        assert!(error.message.contains("authority.rs"));
+    }
+
+    #[test]
+    fn sync_safety_source_scan_rejects_non_utf8_rust_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let sync_dir = temp.path().join("src/sync");
+        let cli_dir = temp.path().join("src/cli/commands");
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(sync_dir.join("mod.rs"), b"pub fn safe() {}\n").unwrap();
+        std::fs::write(sync_dir.join("invalid.rs"), b"pub fn invalid() {\xff}\n").unwrap();
+        std::fs::write(cli_dir.join("sync.rs"), "").unwrap();
+
+        let error = SyncSafetyValidator::validate_no_git_authority_in_sync_sources(temp.path())
+            .expect_err("non-UTF-8 Rust source must fail closed");
+        assert_eq!(error.field, "sync_source");
+        assert!(error.message.contains("required UTF-8 source"));
+        assert!(error.message.contains("invalid.rs"));
+    }
+
+    fn validate_manifest_has_no_direct_runtime_git_dependencies(path: &Path) -> Result<(), String> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let manifest = toml::from_str::<toml::Value>(&source)
+            .map_err(|error| format!("cannot parse {} as TOML: {error}", path.display()))?;
+        let root = manifest
+            .as_table()
+            .ok_or_else(|| "root must be a TOML table".to_string())?;
+        let workspace_dependencies = root
+            .get("workspace")
+            .and_then(toml::Value::as_table)
+            .and_then(|workspace| workspace.get("dependencies"))
+            .map(|dependencies| {
+                dependencies
+                    .as_table()
+                    .ok_or_else(|| "root.workspace.dependencies must be a TOML table".to_string())
+            })
+            .transpose()?;
+
+        if let Some(dependencies) = root.get("dependencies") {
+            inspect_runtime_dependency_table(
+                dependencies,
+                "root.dependencies",
+                workspace_dependencies,
+            )?;
+        }
+        if let Some(targets) = root.get("target") {
+            let targets = targets
+                .as_table()
+                .ok_or_else(|| "root.target must be a TOML table".to_string())?;
+            for (selector, target) in targets {
+                let target = target
+                    .as_table()
+                    .ok_or_else(|| format!("root.target.{selector} must be a TOML table"))?;
+                if let Some(dependencies) = target.get("dependencies") {
+                    inspect_runtime_dependency_table(
+                        dependencies,
+                        &format!("root.target.{selector}.dependencies"),
+                        workspace_dependencies,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inspect_runtime_dependency_table(
+        value: &toml::Value,
+        location: &str,
+        workspace_dependencies: Option<&toml::Table>,
+    ) -> Result<(), String> {
+        let dependencies = value
+            .as_table()
+            .ok_or_else(|| format!("{location} must be a TOML table"))?;
+        for (alias, specification) in dependencies {
+            let package =
+                runtime_dependency_package(alias, specification, location, workspace_dependencies)?;
+            if is_forbidden_git_library(alias) || is_forbidden_git_library(&package) {
+                return Err(format!(
+                    "{location}.{alias} grants forbidden Git library authority via package {package:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn runtime_dependency_package(
+        alias: &str,
+        specification: &toml::Value,
+        location: &str,
+        workspace_dependencies: Option<&toml::Table>,
+    ) -> Result<String, String> {
+        match specification {
+            toml::Value::String(_) => Ok(alias.to_string()),
+            toml::Value::Table(table) => {
+                let inherits_workspace = table
+                    .get("workspace")
+                    .map(|value| {
+                        value.as_bool().ok_or_else(|| {
+                            format!("{location}.{alias}.workspace must be a boolean")
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if inherits_workspace {
+                    let inherited = workspace_dependencies
+                        .and_then(|dependencies| dependencies.get(alias))
+                        .ok_or_else(|| {
+                            format!("{location}.{alias} inherits a missing workspace dependency")
+                        })?;
+                    return runtime_dependency_package(
+                        alias,
+                        inherited,
+                        "root.workspace.dependencies",
+                        None,
+                    );
+                }
+                table
+                    .get("package")
+                    .map(|package| {
+                        package
+                            .as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| format!("{location}.{alias}.package must be a string"))
+                    })
+                    .transpose()
+                    .map(|package| package.unwrap_or_else(|| alias.to_string()))
+            }
+            _ => Err(format!(
+                "{location}.{alias} must be a version string or dependency table"
+            )),
+        }
+    }
+
+    fn is_forbidden_git_library(package: &str) -> bool {
+        let normalized = package.to_ascii_lowercase().replace('_', "-");
+        matches!(
+            normalized.as_str(),
+            "git2" | "gitoxide" | "gix" | "libgit2" | "git-repository"
+        ) || ["git2-", "gitoxide-", "gix-", "libgit2-", "git-repository-"]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+    }
+
+    #[test]
+    fn sync_safety_no_direct_runtime_git_library_dependencies() {
+        // Anchor to the crate root: sibling tests may change the process CWD,
+        // and a relative path would then resolve against their directory.
+        validate_manifest_has_no_direct_runtime_git_dependencies(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
+        )
+        .expect("direct normal and target runtime dependencies must be Git-authority-free");
+
+        for (name, manifest) in [
+            ("root", "[dependencies]\ngix = \"1\"\n"),
+            (
+                "alias",
+                "[dependencies]\nsafe_name = { package = \"git2\", version = \"1\" }\n",
+            ),
+            (
+                "target",
+                "[target.'cfg(unix)'.dependencies]\ngitoxide = \"1\"\n",
+            ),
+            (
+                "workspace-inherited",
+                "[dependencies]\ngit_backend = { workspace = true }\n\
+                 [workspace.dependencies]\ngit_backend = { package = \"libgit2\", version = \"1\" }\n",
+            ),
+            (
+                "native-sys",
+                "[dependencies]\nlibgit2-sys = { version = \"1\" }\n",
+            ),
+            (
+                "git2-adapter",
+                "[dependencies]\ngit2_curl = { package = \"git2-curl\", version = \"1\" }\n",
+            ),
+            (
+                "gix-family",
+                "[dependencies]\nsafe_alias = { package = \"gix-worktree\", version = \"1\" }\n",
+            ),
+            (
+                "legacy-gitoxide",
+                "[dependencies]\ngit-repository = \"1\"\n",
+            ),
+        ] {
+            let temp = tempfile::TempDir::new().expect("temp dir");
+            let path = temp.path().join("Cargo.toml");
+            std::fs::write(&path, manifest).expect("write manifest");
+            let error = validate_manifest_has_no_direct_runtime_git_dependencies(&path)
+                .expect_err("forbidden dependency must fail closed");
+            assert!(error.contains("forbidden Git library"), "{name}: {error}");
+        }
+
+        let tooling_only = "\
+            [build-dependencies]\n\
+            vergen-gix = \"1\"\n\
+            [dev-dependencies]\n\
+            git2 = \"1\"\n\
+            [workspace.dependencies]\n\
+            gix = \"1\"\n";
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let path = temp.path().join("Cargo.toml");
+        std::fs::write(&path, tooling_only).expect("write tooling-only manifest");
+        validate_manifest_has_no_direct_runtime_git_dependencies(&path)
+            .expect("build/dev declarations and unused workspace entries are not runtime edges");
+
+        for allowed in [
+            "git-version",
+            "git-cliff-core",
+            "github-actions",
+            "digit2",
+            "legit2",
+        ] {
+            assert!(
+                !is_forbidden_git_library(allowed),
+                "non-authority package {allowed:?} must not be rejected by family matching"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_safety_dependency_guard_fails_closed_on_unreadable_or_malformed_manifest() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let missing = temp.path().join("missing.toml");
+        assert!(
+            validate_manifest_has_no_direct_runtime_git_dependencies(&missing)
+                .expect_err("missing manifest must fail closed")
+                .contains("cannot read")
+        );
+
+        let directory = temp.path().join("directory.toml");
+        std::fs::create_dir(&directory).expect("create directory fixture");
+        assert!(
+            validate_manifest_has_no_direct_runtime_git_dependencies(&directory)
+                .expect_err("non-file manifest must fail closed")
+                .contains("cannot read")
+        );
+
+        let malformed = temp.path().join("malformed.toml");
+        std::fs::write(&malformed, "[dependencies\nbroken = true")
+            .expect("write malformed manifest");
+        assert!(
+            validate_manifest_has_no_direct_runtime_git_dependencies(&malformed)
+                .expect_err("malformed manifest must fail closed")
+                .contains("cannot parse")
+        );
+
+        let invalid_form = temp.path().join("invalid-form.toml");
+        std::fs::write(&invalid_form, "[dependencies]\ngix = [\"1\"]\n")
+            .expect("write invalid dependency form");
+        assert!(
+            validate_manifest_has_no_direct_runtime_git_dependencies(&invalid_form)
+                .expect_err("non-string dependency form must fail closed")
+                .contains("must be a version string or dependency table")
+        );
     }
 }

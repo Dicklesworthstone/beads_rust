@@ -28,8 +28,7 @@ use std::path::{Path, PathBuf};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
     ImportConfig, METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
-    METADATA_LAST_IMPORT_TIME, apply_additive_reconcile, compute_jsonl_hash,
-    plan_additive_reconcile,
+    METADATA_LAST_IMPORT_TIME, apply_sync_reconcile, compute_jsonl_hash, plan_sync_reconcile,
 };
 
 // ============================================================================
@@ -1147,7 +1146,7 @@ fn lib_apply_rolls_back_when_db_changed_after_planning() {
 
     let plan = {
         let storage = SqliteStorage::open(&db_path(&ws)).expect("open");
-        plan_additive_reconcile(&storage, &jsonl_path(&ws), &config).expect("plan")
+        plan_sync_reconcile(&storage, &jsonl_path(&ws), &config).expect("plan")
     };
     assert_eq!(plan.actions.len(), 5);
 
@@ -1184,7 +1183,7 @@ fn lib_apply_rolls_back_when_db_changed_after_planning() {
     let events_before = events_witness(&ws);
 
     let mut storage = SqliteStorage::open(&db_path(&ws)).expect("open");
-    let err = apply_additive_reconcile(&mut storage, &jsonl_path(&ws), &config, &plan)
+    let err = apply_sync_reconcile(&mut storage, &jsonl_path(&ws), &config, &plan)
         .expect_err("apply must refuse a stale plan");
     let msg = err.to_string();
     assert!(
@@ -1209,7 +1208,7 @@ fn lib_apply_rolls_back_when_jsonl_changed_after_planning() {
 
     let plan = {
         let storage = SqliteStorage::open(&db_path(&ws)).expect("open");
-        plan_additive_reconcile(&storage, &jsonl_path(&ws), &config).expect("plan")
+        plan_sync_reconcile(&storage, &jsonl_path(&ws), &config).expect("plan")
     };
 
     // Concurrent JSONL change after planning.
@@ -1226,7 +1225,7 @@ fn lib_apply_rolls_back_when_jsonl_changed_after_planning() {
 
     let issues_before = issue_count(&ws, "racejsonl_before");
     let mut storage = SqliteStorage::open(&db_path(&ws)).expect("open");
-    let err = apply_additive_reconcile(&mut storage, &jsonl_path(&ws), &config, &plan)
+    let err = apply_sync_reconcile(&mut storage, &jsonl_path(&ws), &config, &plan)
         .expect_err("apply must refuse a changed JSONL");
     assert!(
         err.to_string().contains("changed since the reconcile plan"),

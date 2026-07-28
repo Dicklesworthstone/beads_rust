@@ -132,7 +132,8 @@ Some explicit commands intentionally step outside that default storage boundary:
 the project `.gitignore`, `br config edit/set` updates config files,
 `br completions -o` writes shell completion files, `br upgrade` updates the
 installed binary, and git-reporting commands such as `br changelog`, `br
-orphans`, and commit-activity `br stats` inspect git history.
+orphans`, commit-activity `br stats`, and the explicitly requested bounded
+`br vcs-status` diagnostic inspect git state/history.
 
 ```bash
 # Normal issue state lives under .beads/
@@ -178,6 +179,12 @@ br sync --merge
 # Additively pull JSONL rows the database is missing (previewable, lossless)
 br sync --reconcile --dry-run
 br sync --reconcile
+# Recover JSONL-only rows without deleting SQLite-only rows.
+# Review the dry-run receipt, then bind apply to that exact plan.
+plan="$(br sync --reconcile-additive --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+br sync --reconcile-additive --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
 
 # Rebuild SQLite from authoritative JSONL after recovery/corruption
 br sync --import-only --rebuild
@@ -515,14 +522,18 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `info` | Show workspace diagnostics | `br info` |
 | `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
 | `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
+| `vcs-status` | Explicit bounded JSONL Git visibility | `br vcs-status --json` |
 | `where` | Show active `.beads` directory | `br where` |
 
 ### Sync & System
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `sync` | Sync DB ↔ JSONL | `br sync --flush-only` |
+| `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
+| `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
+| `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
+| `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
 | `stats` | Project statistics | `br stats` |
 | `config` | Manage config | `br config list` |
 | `upgrade` | Self-update | `br upgrade` |
@@ -808,7 +819,7 @@ This keeps successful commands readable by suppressing low-level dependency logg
 │  ┌─────────────────┐              ┌─────────────────────┐    │
 │  │  SqliteStorage  │◄────────────►│  JSONL Export/Import │    │
 │  │                 │   sync       │                     │    │
-│  │  - WAL mode     │              │  - Atomic writes    │    │
+│  │  - WAL mode     │              │  - Atomic publish   │    │
 │  │  - Dirty track  │              │  - Content hashing  │    │
 │  │  - Blocked cache│              │  - Merge support    │    │
 │  └────────┬────────┘              └──────────┬──────────┘    │
@@ -841,8 +852,10 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 ```
 
 Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
-`--merge`, `--reconcile`, `--status`, or `--witness` so the data direction is
-explicit.
+`--merge`, `--reconcile`, `--reconcile-additive`, `--status`, or `--witness`
+so the data direction and authority are explicit. `br sync --status` never
+probes Git; run `br vcs-status --json` only when Git visibility is explicitly
+wanted.
 
 ### Safety Model
 
@@ -852,7 +865,7 @@ explicit.
 |-----------|----------------|
 | Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
 | Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
-| Atomic writes | Write to temp file, then rename |
+| Checked publication and transactions | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback |
 | No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
 
 ---

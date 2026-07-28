@@ -78,11 +78,11 @@ The incident could have occurred through several mechanisms:
 - **Current Mitigation**: Safety guard blocks without --force ✓
 
 #### Scenario 4: Git Operations Side Effects
-- **Vector**: br invokes git commands that modify working tree
+- **Vector**: an implicit or sync path invokes Git commands that modify the working tree
 - **Risk**: Unintended file deletion or modification
-- **Likelihood**: N/A - br performs NO git operations ✓
+- **Likelihood**: N/A for sync - `br sync` performs no Git operations ✓
 - **Impact**: N/A
-- **Current Mitigation**: Complete prevention by design ✓
+- **Current Mitigation**: Static source/dependency guards plus a no-Git process sentinel and exact `.git` snapshot E2E matrix ✓
 
 #### Scenario 5: Atomic Write Failure
 - **Vector**: System crash during temp file → rename
@@ -117,7 +117,7 @@ The incident could have occurred through several mechanisms:
 
 | Forbidden Operation | Rationale |
 |--------------------|-----------|
-| Execute `git` commands | Prevents working tree side effects |
+| Execute `git` commands implicitly or from sync | Prevents working tree side effects; only explicit `br vcs-status` runs bounded read-only probes |
 | Write outside `.beads/` | Prevents file system damage |
 | Auto-commit changes | Prevents unintended commits |
 | Install git hooks | Non-invasive by design |
@@ -129,7 +129,7 @@ The incident could have occurred through several mechanisms:
 1. **Empty DB Guard**: Refuses export of 0 issues over non-empty JSONL without `--force`
 2. **Stale DB Guard**: Refuses export that would lose JSONL issues without `--force`
 3. **Conflict Marker Scan**: Aborts import if merge markers detected
-4. **Atomic Writes**: Temp file → rename pattern prevents partial writes
+4. **Atomic JSONL Export**: Temp file → rename protects the published JSONL generation
 5. **Tombstone Protection**: Never resurrects deleted issues during import
 6. **Path Confinement**: All I/O within `.beads/` directory (with env override escape hatch)
 
@@ -142,7 +142,7 @@ The incident could have occurred through several mechanisms:
 | Export deletes JSONL issues | Stale DB guard | ✅ Implemented |
 | Empty DB overwrites JSONL | Empty DB guard | ✅ Implemented |
 | Corrupt JSONL import | Conflict marker scan, JSON validation | ✅ Implemented |
-| Git side effects | No git operations | ✅ By design |
+| Git side effects from sync | No Git authority in sync | ✅ Guarded and tested |
 | Path traversal | Confined to .beads/ (except env var) | ⚠️ ENV can escape |
 | Partial writes | Atomic rename | ✅ Implemented |
 | Tombstone resurrection | Tombstone protection | ✅ Implemented |
@@ -176,10 +176,10 @@ The incident could have occurred through several mechanisms:
 ## 7. Conclusion
 
 The current br implementation is fundamentally safe because:
-1. **It performs NO git operations** - eliminating the primary attack vector
+1. **Sync performs no Git operations** - eliminating the primary implicit attack vector; `br vcs-status` is a separate, explicit bounded diagnostic
 2. **All file I/O is confined** - to `.beads/` directory by default
 3. **Safety guards exist** - for common data loss scenarios
-4. **Atomic operations** - prevent partial/corrupt states
+4. **Atomic JSONL publication** - protects export replacement; SQLite transactions and operation-specific receipts cover other mutations
 
 The remaining risk is the `BEADS_JSONL` environment variable escape hatch, which should be hardened with additional validation or require explicit opt-in.
 

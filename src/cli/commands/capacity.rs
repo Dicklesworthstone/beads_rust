@@ -472,6 +472,12 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 2, "grant + revoke, append-only");
         assert_eq!(history[1].action, "revoke");
+        // Release the held workspace/database authority before invoking the
+        // next command: since the retained write-authority model landed, a
+        // caller-held OpenStorageResult blocks a nested same-process open
+        // (real CLI runs are one command per process, so sequential commands
+        // never contend like this).
+        drop(storage_ctx);
 
         let renew = CapacityRenewArgs {
             id: "bd-1".to_string(),
@@ -484,6 +490,6 @@ mod tests {
         };
         let error = execute_renew(&renew, &CliOverrides::default(), &ctx, &beads_dir)
             .expect_err("a revoked exemption cannot be renewed");
-        assert!(error.to_string().contains("revoked"));
+        assert!(error.to_string().contains("revoked"), "{error}");
     }
 }

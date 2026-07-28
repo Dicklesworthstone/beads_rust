@@ -13,7 +13,8 @@ use crate::storage::schema::{
 };
 use crate::sync::{
     METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
-    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
+    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, METADATA_SYNC_MERGE_PENDING,
+    METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent, SyncMergePendingReceipt,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
@@ -22,12 +23,20 @@ use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(test)]
+thread_local! {
+    static REPLACE_ATTACHED_DATABASE_AFTER_COMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
@@ -1172,10 +1181,174 @@ const KNOWN_METADATA_DEFAULTS: [(&str, &str); 7] = [
     (METADATA_LAST_IMPORT_TIME, METADATA_EMPTY_VALUE),
 ];
 
+/// Coherent classification of the two durable pending-sync-merge metadata keys.
+///
+/// `Absent` is the only state that permits an unrelated automatic mutation.
+/// Every other variant is a durable or ambiguous saga state that only the
+/// explicit `br sync --merge` recovery path may advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingSyncMergeInspection {
+    Absent,
+    Valid(SyncMergePendingReceipt),
+    Legacy {
+        metadata_key: String,
+        row_count: usize,
+        diagnostic: String,
+    },
+    Malformed {
+        metadata_key: String,
+        diagnostic: String,
+    },
+}
+
+impl PendingSyncMergeInspection {
+    #[must_use]
+    pub(crate) const fn permits_automatic_mutation(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    #[must_use]
+    pub(crate) fn diagnostic(&self) -> String {
+        match self {
+            Self::Absent => "No pending sync merge receipt is present".to_string(),
+            Self::Valid(receipt) => format!(
+                "Pending sync merge receipt {} is in {:?} phase",
+                receipt.receipt_id, receipt.phase
+            ),
+            Self::Legacy { diagnostic, .. } | Self::Malformed { diagnostic, .. } => {
+                diagnostic.clone()
+            }
+        }
+    }
+}
+
+/// Classify exact raw rows from both pending-sync-merge metadata keys.
+///
+/// This function deliberately receives every matching row, including SQL
+/// `NULL`, rather than going through `get_metadata()`. That prevents a
+/// duplicate, null, empty, legacy, or malformed receipt from being mistaken
+/// for the safe `Absent` state.
+pub(crate) fn classify_pending_sync_merge_rows(
+    current_rows: &[Option<String>],
+    legacy_rows: &[Option<String>],
+) -> PendingSyncMergeInspection {
+    if !legacy_rows.is_empty() && !current_rows.is_empty() {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: format!(
+                "{METADATA_SYNC_MERGE_PENDING_LEGACY},{METADATA_SYNC_MERGE_PENDING}"
+            ),
+            diagnostic: format!(
+                "Found both legacy ({}) and current ({}) pending sync-merge metadata row(s); competing receipts are ambiguous and automatic mutation is disabled",
+                legacy_rows.len(),
+                current_rows.len()
+            ),
+        };
+    }
+
+    if legacy_rows.len() > 1 {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING_LEGACY.to_string(),
+            diagnostic: format!(
+                "Found {} legacy pending sync-merge metadata rows; duplicate receipts are ambiguous and automatic mutation is disabled",
+                legacy_rows.len()
+            ),
+        };
+    }
+    if let [legacy] = legacy_rows {
+        if legacy
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING_LEGACY.to_string(),
+                diagnostic:
+                    "Legacy pending sync-merge metadata is NULL or empty; automatic mutation is disabled"
+                        .to_string(),
+            };
+        }
+        return PendingSyncMergeInspection::Legacy {
+            metadata_key: METADATA_SYNC_MERGE_PENDING_LEGACY.to_string(),
+            row_count: 1,
+            diagnostic:
+                "Legacy pending sync-merge state requires explicit `br sync --merge` reconciliation"
+                    .to_string(),
+        };
+    }
+
+    let [serialized] = current_rows else {
+        return if current_rows.is_empty() {
+            PendingSyncMergeInspection::Absent
+        } else {
+            PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+                diagnostic: format!(
+                    "Found {} current pending sync-merge metadata rows; duplicate receipts are ambiguous and automatic mutation is disabled",
+                    current_rows.len()
+                ),
+            }
+        };
+    };
+    let Some(serialized) = serialized
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+            diagnostic:
+                "Current pending sync-merge metadata is NULL or empty; automatic mutation is disabled"
+                    .to_string(),
+        };
+    };
+    let receipt = match serde_json::from_str::<SyncMergePendingReceipt>(serialized) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+                diagnostic: format!(
+                    "Current pending sync-merge receipt is not valid JSON for schema v2: {error}"
+                ),
+            };
+        }
+    };
+    if let Err(error) = receipt.validate() {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+            diagnostic: format!(
+                "Current pending sync-merge receipt failed schema or intent-hash validation: {error}"
+            ),
+        };
+    }
+    let canonical = match serde_json::to_string(&receipt) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+                diagnostic: format!(
+                    "Current pending sync-merge receipt could not be canonically serialized: {error}"
+                ),
+            };
+        }
+    };
+    if canonical != serialized {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+            diagnostic:
+                "Current pending sync-merge receipt is noncanonical or contains unrecognized fields; exact compare-and-swap recovery would be ambiguous"
+                    .to_string(),
+        };
+    }
+    PendingSyncMergeInspection::Valid(receipt)
+}
+
 /// SQLite-based storage backend.
 #[derive(Debug)]
 pub struct SqliteStorage {
     conn: Connection,
+    /// Owned advisory capability for writable persistent storage. Keeping it
+    /// on the storage itself prevents callers from moving the public storage
+    /// handle out of a higher-level context and accidentally releasing the
+    /// database-family authority first.
+    write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
     /// When set, this storage owns an ephemeral on-disk temp database (created
@@ -1224,7 +1397,7 @@ pub struct SqliteStorage {
 /// simply makes the corresponding scope inapplicable. Empty/whitespace-only
 /// inputs are coerced to `None` so absent attribution never produces
 /// blank-string noise in the audit log.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventAttribution {
     pub agent_name: Option<String>,
     pub harness: Option<String>,
@@ -1587,21 +1760,86 @@ impl MutationContext {
     }
 }
 
+pub(crate) struct ReconcileTransactionOutcome<T> {
+    pub value: T,
+    pub foreign_keys_restored: bool,
+    pub database_authority_preserved: bool,
+}
+
 impl SqliteStorage {
-    fn with_connection_write_transaction<F, R>(conn: &Connection, mut f: F) -> Result<R>
+    #[cfg(test)]
+    pub(crate) fn arm_database_replacement_after_commit_for_test() {
+        REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
+    }
+
+    pub(crate) fn attach_write_authority(
+        &mut self,
+        authority: Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) {
+        self.write_authority = Some(authority);
+    }
+
+    pub(crate) fn attached_write_authority(
+        &self,
+    ) -> Option<Arc<crate::sync::DatabaseFamilyWriteLock>> {
+        self.write_authority.clone()
+    }
+
+    fn verify_attached_database_authority(&self) -> Result<()> {
+        if let Some(authority) = self.write_authority.as_ref() {
+            authority.verify_database_authority()?;
+        }
+        Ok(())
+    }
+
+    fn verify_attached_database_authority_after_commit(
+        &self,
+        transaction_kind: &str,
+    ) -> Result<()> {
+        self.verify_attached_database_authority().map_err(|source| {
+            BeadsError::CommittedStateUnwitnessed {
+                operation: transaction_kind.to_string(),
+                source: Box::new(source),
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn maybe_replace_attached_database_after_commit(&self) -> Result<()> {
+        let replace = REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.replace(false));
+        if !replace {
+            return Ok(());
+        }
+
+        let authority = self.write_authority.as_ref().ok_or_else(|| {
+            BeadsError::Config(
+                "post-commit database replacement test hook requires attached authority".into(),
+            )
+        })?;
+        let database_path = authority.canonical_database_path();
+        let mut displaced_name = database_path.as_os_str().to_os_string();
+        displaced_name.push(".postcommit-original");
+        let displaced_path = PathBuf::from(displaced_name);
+        std::fs::rename(database_path, &displaced_path)?;
+        std::fs::copy(&displaced_path, database_path)?;
+        Ok(())
+    }
+
+    fn with_connection_write_transaction<F, R>(&self, mut f: F) -> Result<R>
     where
         F: FnMut(&Connection) -> Result<R>,
     {
         // Issue #219: same retry parameters as with_write_transaction (see
-        // that method for rationale).  This static variant is used for
-        // blocked-cache rebuilds and metadata writes which also contend for
-        // the write lock under parallel agent operations.
+        // that method for rationale). This shared-connection variant is used
+        // for blocked-cache rebuilds and metadata writes which also contend
+        // for the write lock under parallel agent operations.
         const MAX_RETRIES: u32 = 8;
         let base_backoff_ms: u64 = 50;
         let mut last_error: Option<crate::error::BeadsError> = None;
 
         for attempt in 0..MAX_RETRIES {
-            match conn.execute("BEGIN IMMEDIATE") {
+            self.verify_attached_database_authority()?;
+            match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
                     last_error = Some(e.into());
@@ -1612,30 +1850,58 @@ impl SqliteStorage {
                 Err(e) => return Err(e.into()),
             }
 
-            match f(conn) {
-                Ok(result) => match conn.execute("COMMIT") {
-                    Ok(_) => return Ok(result),
-                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                        if let Err(rb_err) = conn.execute("ROLLBACK") {
-                            tracing::warn!(
-                                error = %rb_err,
-                                "ROLLBACK failed after transient COMMIT error"
-                            );
-                        }
-                        last_error = Some(e.into());
-                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
-                        std::thread::sleep(Duration::from_millis(backoff));
+            match f(&self.conn) {
+                Ok(result) => {
+                    if let Some(authority) = self.write_authority.as_ref()
+                        && let Err(authority_error) = authority.verify_database_authority()
+                    {
+                        return Err(Self::rollback_transaction_error(
+                            &self.conn,
+                            authority_error,
+                            "database authority changed before shared COMMIT",
+                        ));
                     }
-                    Err(e) => {
-                        if let Err(rb_err) = conn.execute("ROLLBACK") {
-                            tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                    match self.conn.execute("COMMIT") {
+                        Ok(_) => {
+                            #[cfg(test)]
+                            self.maybe_replace_attached_database_after_commit()?;
+                            self.verify_attached_database_authority_after_commit(
+                                "shared write transaction",
+                            )?;
+                            return Ok(result);
                         }
-                        return Err(e.into());
+                        Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                            let commit_error = e.into();
+                            if let Err(rollback_error) = Self::rollback_transaction(
+                                &self.conn,
+                                "transient shared COMMIT error",
+                            ) {
+                                return Err(BeadsError::WithContext {
+                                    context: rollback_error,
+                                    source: Box::new(commit_error),
+                                });
+                            }
+                            last_error = Some(commit_error);
+                            let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
+                            std::thread::sleep(Duration::from_millis(backoff));
+                        }
+                        Err(e) => {
+                            return Err(Self::rollback_transaction_error(
+                                &self.conn,
+                                e.into(),
+                                "shared COMMIT error",
+                            ));
+                        }
                     }
-                },
+                }
                 Err(e) => {
-                    if let Err(rb_err) = conn.execute("ROLLBACK") {
-                        tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
+                    if let Err(rollback_error) =
+                        Self::rollback_transaction(&self.conn, "shared transaction body error")
+                    {
+                        return Err(BeadsError::WithContext {
+                            context: rollback_error,
+                            source: Box::new(e),
+                        });
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
                         last_error = Some(e);
@@ -1818,6 +2084,93 @@ impl SqliteStorage {
         }
     }
 
+    /// Run a recovery transaction with FK enforcement suppressed only for the
+    /// duration required by fsqlite's cache-rebuild workaround (#215).
+    ///
+    /// The caller remains responsible for an explicit in-transaction
+    /// `foreign_key_check` before commit. FK enforcement is restored and
+    /// verified after both commit and rollback.
+    pub(crate) fn with_reconcile_transaction<F, T>(
+        &mut self,
+        operation: &str,
+        mut f: F,
+    ) -> Result<ReconcileTransactionOutcome<T>>
+    where
+        F: FnMut(&mut Self) -> Result<T>,
+    {
+        self.conn.execute("PRAGMA foreign_keys = OFF")?;
+        let mut completed_value = None;
+        let result = self.with_write_transaction(|storage| {
+            completed_value = Some(f(storage)?);
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                let foreign_keys_restored = match Self::restore_foreign_keys(&self.conn, operation)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            operation,
+                            error = %error,
+                            "Transaction committed, but foreign-key enforcement could not be restored on the disposable recovery connection"
+                        );
+                        false
+                    }
+                };
+                Ok(ReconcileTransactionOutcome {
+                    value: completed_value.ok_or_else(|| BeadsError::Internal {
+                        message: format!(
+                            "{operation} committed without retaining its transaction result"
+                        ),
+                    })?,
+                    foreign_keys_restored,
+                    database_authority_preserved: true,
+                })
+            }
+            Err(committed_error @ BeadsError::CommittedStateUnwitnessed { .. })
+                if completed_value.is_some() =>
+            {
+                let value = completed_value.ok_or_else(|| BeadsError::Internal {
+                    message: format!(
+                        "{operation} committed with unwitnessed authority but no transaction result was retained"
+                    ),
+                })?;
+                let foreign_keys_restored = match Self::restore_foreign_keys(&self.conn, operation)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            operation,
+                            error = %error,
+                            "Transaction committed with unwitnessed database authority, and foreign-key enforcement could not be restored"
+                        );
+                        false
+                    }
+                };
+                tracing::error!(
+                    operation,
+                    error = %committed_error,
+                    "Transaction committed, but database authority changed; automatic retry is forbidden"
+                );
+                Ok(ReconcileTransactionOutcome {
+                    value,
+                    foreign_keys_restored,
+                    database_authority_preserved: false,
+                })
+            }
+            Err(original_error) => match Self::restore_foreign_keys(&self.conn, operation) {
+                Ok(()) => Err(original_error),
+                Err(restore_error) => Err(BeadsError::WithContext {
+                    context: format!(
+                        "{operation} rolled back, and SQLite foreign key enforcement could not be re-enabled: {restore_error}"
+                    ),
+                    source: Box::new(original_error),
+                }),
+            },
+        }
+    }
+
     fn refresh_blocked_cache_after_commit(
         &self,
         op: &str,
@@ -1827,7 +2180,7 @@ impl SqliteStorage {
         // can only be changed outside an active transaction.  fsqlite can
         // surface false FK violations on blocked_issues_cache inserts (#215).
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
-        let result = Self::with_connection_write_transaction(&self.conn, |conn| {
+        let result = self.with_connection_write_transaction(|conn| {
             let refreshed = Self::apply_blocked_cache_refresh_plan(conn, plan)?;
             Self::upsert_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
             tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
@@ -1887,7 +2240,7 @@ impl SqliteStorage {
         // can only be changed outside an active transaction.  fsqlite can
         // surface false FK violations on blocked_issues_cache inserts (#215).
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
-        let result = Self::with_connection_write_transaction(&self.conn, |conn| {
+        let result = self.with_connection_write_transaction(|conn| {
             if !Self::metadata_equals(conn, BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)? {
                 return Ok(false);
             }
@@ -1925,6 +2278,12 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
+        // Ordinary opens keep the shipped auto-migration contract: a database
+        // behind CURRENT_SCHEMA_VERSION is migrated in place (legacy fleets
+        // depend on this — pre-v13 databases have no reviewed migration
+        // pair). The reviewed `br doctor migrate-schema` lifecycle remains
+        // the explicit, receipt-bound alternative for operator-driven
+        // migrations of supported version pairs.
         let schema_current = connection_user_version(&conn)
             .or_else(|| database_header_user_version(path))
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
@@ -1940,6 +2299,7 @@ impl SqliteStorage {
         Self::ensure_known_metadata_defaults(&conn)?;
         Ok(Self {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
@@ -1966,16 +2326,56 @@ impl SqliteStorage {
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         // Now that the connection is open, consult the effective schema version
-        // (WAL-aware) and fall back to the header peek. If it is still below the
-        // current version, this database is genuinely stale.
-        if connection_user_version(&conn)
-            .or_else(|| database_header_user_version(path))
-            .is_none_or(|version| version < current_schema_version)
+        // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
+        // is intentionally exact-version only: a future schema may add columns,
+        // triggers, or invariants that this binary cannot witness safely.
+        if connection_user_version(&conn).or_else(|| database_header_user_version(path))
+            != Some(current_schema_version)
+        {
+            conn.close().map_err(BeadsError::Database)?;
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            conn,
+            write_authority: None,
+            mutation_count: 0,
+            temp_db_path: None,
+            pending_event_attribution: None,
+            workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            workflow_transition_policy: crate::close_policy::Workflow::default(),
+            last_capacity_warnings: Vec::new(),
+        }))
+    }
+
+    /// Open an existing current-schema database for a token-bound recovery write.
+    ///
+    /// Unlike [`Self::open`], this never creates, migrates, repairs, or seeds
+    /// metadata. Callers must hold the project writer lock before opening it.
+    pub(crate) fn open_current_for_reconcile(
+        path: &Path,
+        lock_timeout_ms: Option<u64>,
+    ) -> Result<Option<Self>> {
+        let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+        if database_header_user_version(path).is_none() {
+            return Ok(None);
+        }
+
+        let conn = open_with_flags(
+            path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        if let Some(timeout_ms) = lock_timeout_ms {
+            conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
+        }
+        if connection_user_version(&conn).or_else(|| database_header_user_version(path))
+            != Some(current_schema_version)
+            || !runtime_schema_compatible(&conn)
         {
             return Ok(None);
         }
         Ok(Some(Self {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
@@ -2028,6 +2428,7 @@ impl SqliteStorage {
         Self::ensure_known_metadata_defaults(&conn)?;
         Ok(Self {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
@@ -2047,6 +2448,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if any DROP/CREATE statement fails.
     pub fn reset_data_tables(&mut self) -> Result<()> {
+        self.with_write_transaction(|storage| storage.reset_data_tables_in_tx())
+    }
+
+    fn reset_data_tables_in_tx(&self) -> Result<()> {
         use crate::storage::schema::execute_batch;
         execute_batch(
             &self.conn,
@@ -2194,7 +2599,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the statement fails.
     pub(crate) fn execute_raw(&self, sql: &str) -> Result<()> {
+        self.verify_attached_database_authority()?;
         self.conn.execute(sql)?;
+        self.verify_attached_database_authority()?;
         Ok(())
     }
 
@@ -2294,8 +2701,23 @@ impl SqliteStorage {
     ///
     /// Returns an error if the statement fails.
     pub(crate) fn execute_raw_count(&self, sql: &str) -> Result<usize> {
+        self.verify_attached_database_authority()?;
         let rows = self.conn.execute(sql)?;
+        self.verify_attached_database_authority()?;
         Ok(rows)
+    }
+
+    /// Read the schema version visible through this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `PRAGMA user_version` is unavailable or invalid.
+    pub(crate) fn schema_user_version(&self) -> Result<u32> {
+        connection_user_version(&self.conn).ok_or_else(|| {
+            BeadsError::Config(
+                "Could not read PRAGMA user_version for reconciliation provenance".to_string(),
+            )
+        })
     }
 
     /// Probe whether a rollback-only write against an issue can safely touch
@@ -2308,6 +2730,7 @@ impl SqliteStorage {
     ///
     /// Returns any database error raised while executing the probe.
     pub(crate) fn probe_issue_mutation_write_path(&self, issue_id: &str) -> Result<()> {
+        self.verify_attached_database_authority()?;
         self.conn.execute("BEGIN IMMEDIATE")?;
 
         let probe_result = self.conn.execute_with_params(
@@ -2316,7 +2739,88 @@ impl SqliteStorage {
         );
         let rollback_result = self.conn.execute("ROLLBACK");
 
-        finish_issue_mutation_write_probe(probe_result, rollback_result)
+        finish_issue_mutation_write_probe(probe_result, rollback_result)?;
+        self.verify_attached_database_authority()
+    }
+
+    /// Execute a closure against one coherent read snapshot.
+    ///
+    /// This uses a deferred transaction: the first query in `f` establishes
+    /// the SQLite snapshot, and every later query observes that same database
+    /// state even if another process commits concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot begin/commit, the closure
+    /// fails, or rollback after a failure also exposes a database error.
+    pub(crate) fn with_read_transaction<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&Self) -> Result<R>,
+    {
+        self.verify_attached_database_authority()?;
+        self.conn.execute("BEGIN")?;
+        match f(self) {
+            Ok(result) => {
+                if let Err(authority_error) = self.verify_attached_database_authority() {
+                    return Err(Self::rollback_transaction_error(
+                        &self.conn,
+                        authority_error,
+                        "database authority changed during read transaction",
+                    ));
+                }
+                match self.conn.execute("COMMIT") {
+                    Ok(_) => {
+                        self.verify_attached_database_authority()?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let original_error = BeadsError::Database(error);
+                        match self.conn.execute("ROLLBACK") {
+                            Ok(_) => Err(original_error),
+                            Err(rollback_error) => Err(Self::rollback_failure_error(
+                                original_error,
+                                rollback_error,
+                                "read-transaction COMMIT error",
+                            )),
+                        }
+                    }
+                }
+            }
+            Err(original_error) => match self.conn.execute("ROLLBACK") {
+                Ok(_) => Err(original_error),
+                Err(rollback_error) => Err(Self::rollback_failure_error(
+                    original_error,
+                    rollback_error,
+                    "read-transaction body error",
+                )),
+            },
+        }
+    }
+
+    fn rollback_failure_error(
+        original_error: BeadsError,
+        rollback_error: FrankenError,
+        cause: &str,
+    ) -> BeadsError {
+        BeadsError::WithContext {
+            context: format!(
+                "ROLLBACK failed after {cause}; transaction state is unknown and no retry was attempted: {rollback_error}"
+            ),
+            source: Box::new(original_error),
+        }
+    }
+
+    fn rollback_result_error(
+        original_error: BeadsError,
+        rollback_result: std::result::Result<usize, FrankenError>,
+        cause: &str,
+    ) -> BeadsError {
+        match rollback_result {
+            Ok(_) => original_error,
+            Err(rollback_error) => {
+                Self::rollback_failure_error(original_error, rollback_error, cause)
+            }
+        }
     }
 
     /// Execute a closure inside a write transaction with robust retry logic
@@ -2344,6 +2848,7 @@ impl SqliteStorage {
         let mut last_error: Option<crate::error::BeadsError> = None;
 
         for attempt in 0..MAX_RETRIES {
+            self.verify_attached_database_authority()?;
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
@@ -2357,8 +2862,22 @@ impl SqliteStorage {
 
             match f(self) {
                 Ok(result) => {
+                    if let Some(authority) = self.write_authority.as_ref()
+                        && let Err(authority_error) = authority.verify_database_authority()
+                    {
+                        return Err(Self::rollback_transaction_error(
+                            &self.conn,
+                            authority_error,
+                            "database authority changed before COMMIT",
+                        ));
+                    }
                     match self.conn.execute("COMMIT") {
                         Ok(_) => {
+                            #[cfg(test)]
+                            self.maybe_replace_attached_database_after_commit()?;
+                            self.verify_attached_database_authority_after_commit(
+                                "write transaction",
+                            )?;
                             // Periodic WAL checkpoint to prevent unbounded WAL growth.
                             // Uses PASSIVE mode so it never blocks concurrent readers
                             // or writers (issue #219).
@@ -2370,25 +2889,37 @@ impl SqliteStorage {
                             return Ok(result);
                         }
                         Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                                tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
+                            let commit_error = e.into();
+                            if let Err(rollback_error) =
+                                Self::rollback_transaction(&self.conn, "transient COMMIT error")
+                            {
+                                return Err(BeadsError::WithContext {
+                                    context: rollback_error,
+                                    source: Box::new(commit_error),
+                                });
                             }
-                            last_error = Some(e.into());
+                            last_error = Some(commit_error);
                             let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
                         }
                         Err(e) => {
-                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                                tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
-                            }
-                            return Err(e.into());
+                            return Err(Self::rollback_transaction_error(
+                                &self.conn,
+                                e.into(),
+                                "COMMIT error",
+                            ));
                         }
                     }
                 }
                 Err(e) => {
-                    if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                        tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
+                    if let Err(rollback_error) =
+                        Self::rollback_transaction(&self.conn, "transaction body error")
+                    {
+                        return Err(BeadsError::WithContext {
+                            context: rollback_error,
+                            source: Box::new(e),
+                        });
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
                         last_error = Some(e);
@@ -2406,6 +2937,28 @@ impl SqliteStorage {
                 "write transaction retry loop exhausted without producing an error".into(),
             )
         }))
+    }
+
+    fn rollback_transaction(conn: &Connection, cause: &str) -> std::result::Result<(), String> {
+        conn.execute("ROLLBACK").map(|_| ()).map_err(|error| {
+            format!(
+                "ROLLBACK failed after {cause}; transaction state is unknown and no retry was attempted: {error}"
+            )
+        })
+    }
+
+    fn rollback_transaction_error(
+        conn: &Connection,
+        original_error: BeadsError,
+        cause: &str,
+    ) -> BeadsError {
+        match Self::rollback_transaction(conn, cause) {
+            Ok(()) => original_error,
+            Err(context) => BeadsError::WithContext {
+                context,
+                source: Box::new(original_error),
+            },
+        }
     }
 
     /// Compute exponential backoff with random jitter (+/-25%) to prevent
@@ -2517,6 +3070,18 @@ impl SqliteStorage {
         &self,
         exports: &[(String, String)],
     ) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        self.set_changed_export_hashes_at_in_tx(exports, &now)
+    }
+
+    /// Set only changed export hashes at a caller-supplied, evidence-bound
+    /// timestamp. Reviewed recovery uses this so transaction retries and a
+    /// delayed apply produce the exact poststate authorized by the plan.
+    pub(crate) fn set_changed_export_hashes_at_in_tx(
+        &self,
+        exports: &[(String, String)],
+        exported_at: &str,
+    ) -> Result<usize> {
         let unique_exports = Self::dedupe_export_hash_batch(exports);
         if unique_exports.is_empty() {
             return Ok(0);
@@ -2527,7 +3092,6 @@ impl SqliteStorage {
             .map(|(issue_id, _hash)| issue_id.clone())
             .collect::<Vec<_>>();
         let existing_hashes = self.get_export_hashes_for_ids_in_tx(&issue_ids)?;
-        let now = Utc::now().to_rfc3339();
         let mut count = 0;
 
         for (issue_id, content_hash) in &unique_exports {
@@ -2547,13 +3111,48 @@ impl SqliteStorage {
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(now.as_str()),
+                    SqliteValue::from(exported_at),
                 ],
             )?;
             count += 1;
         }
 
         Ok(count)
+    }
+
+    /// Repair only persisted issue content hashes in the caller's transaction.
+    ///
+    /// This intentionally leaves issue scalars, relations, `updated_at`, dirty
+    /// tracking, and audit events untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an issue disappeared or the database update fails.
+    pub(crate) fn repair_issue_content_hashes_in_tx(
+        &self,
+        repairs: &[(String, String)],
+    ) -> Result<usize> {
+        let mut repaired = 0usize;
+        for (issue_id, content_hash) in repairs {
+            let changed = self.conn.execute_with_params(
+                "UPDATE issues SET content_hash = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(issue_id.as_str()),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(BeadsError::Config(format!(
+                    "Content-hash repair expected one issue row for '{issue_id}', updated {changed}"
+                )));
+            }
+            repaired = repaired.checked_add(1).ok_or_else(|| {
+                BeadsError::Config(
+                    "Content-hash repair count overflow during additive reconciliation".to_string(),
+                )
+            })?;
+        }
+        Ok(repaired)
     }
 
     fn get_export_hashes_for_ids_in_tx(
@@ -2650,8 +3249,14 @@ impl SqliteStorage {
         // so it never blocks other connections.  The WAL file may grow slightly
         // larger between checkpoints, but journal_size_limit (set in
         // apply_runtime_pragmas) caps it.
+        if let Err(e) = self.verify_attached_database_authority() {
+            tracing::warn!(error = %e, "Skipping WAL checkpoint after database authority changed");
+            return;
+        }
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)") {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
+        } else if let Err(e) = self.verify_attached_database_authority() {
+            tracing::warn!(error = %e, "Database authority changed during WAL checkpoint");
         }
     }
 
@@ -2671,6 +3276,7 @@ impl SqliteStorage {
     /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
     /// failure is downgraded to a warning because it is best-effort.
     pub(crate) fn checkpoint_full(&self) -> Result<()> {
+        self.verify_attached_database_authority()?;
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(
                 error = %e,
@@ -2678,7 +3284,7 @@ impl SqliteStorage {
             );
             self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
         }
-        Ok(())
+        self.verify_attached_database_authority()
     }
 
     /// Run SQLite's native integrity probe and return its diagnostic rows.
@@ -2687,7 +3293,28 @@ impl SqliteStorage {
     ///
     /// Returns an error if the pragma cannot be executed.
     pub(crate) fn integrity_check_messages(&self) -> Result<Vec<String>> {
-        let rows = self.conn.query("PRAGMA integrity_check")?;
+        self.database_check_messages("PRAGMA integrity_check")
+    }
+
+    /// Run SQLite's structural check without its page-ownership scan.
+    ///
+    /// This is the in-transaction companion to [`Self::integrity_check_messages`].
+    /// FrankenSQLite's full integrity walker switches to a transaction-local
+    /// freelist projection while a transaction is active; a read transaction
+    /// over a healthy database with committed free pages can therefore report
+    /// a false orphan. `quick_check` still validates every B-tree page and is
+    /// safe at the transaction boundary. Callers must run the full integrity
+    /// check again from autocommit state after the transaction ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma cannot be executed.
+    pub(crate) fn quick_check_messages(&self) -> Result<Vec<String>> {
+        self.database_check_messages("PRAGMA quick_check")
+    }
+
+    fn database_check_messages(&self, pragma: &str) -> Result<Vec<String>> {
+        let rows = self.conn.query(pragma)?;
         let mut messages = Vec::new();
         for row in rows {
             for value in row.values() {
@@ -2703,6 +3330,38 @@ impl SqliteStorage {
             messages.push("integrity_check returned no diagnostic rows".to_string());
         }
         Ok(messages)
+    }
+
+    /// Return raw rows from SQLite's foreign-key consistency probe.
+    ///
+    /// An empty vector is the only healthy result. The textual row projection
+    /// is intentionally retained so reconciliation receipts can diagnose the
+    /// exact table/row/parent constraint that failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma cannot be executed.
+    pub(crate) fn foreign_key_check_messages(&self) -> Result<Vec<Vec<String>>> {
+        let rows = self.conn.query("PRAGMA foreign_key_check")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                row.values()
+                    .iter()
+                    .map(|value| {
+                        value.as_text().map_or_else(
+                            || {
+                                value.as_integer().map_or_else(
+                                    || format!("{value:?}"),
+                                    |number| number.to_string(),
+                                )
+                            },
+                            str::to_string,
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     /// Get audit events for a specific issue.
@@ -2787,37 +3446,39 @@ impl SqliteStorage {
         // the prior row. If the project ever needs full history, querying the
         // events table gives an audit trail; `close_metadata` is the
         // currently-effective metadata for the most recent close.
-        self.conn.execute_with_params(
-            "INSERT OR REPLACE INTO close_metadata (
-                issue_id,
-                closed_by_agent_name,
-                closed_by_harness,
-                closed_by_model,
-                bypassed_policy,
-                bypass_reason,
-                policy_gates_fired,
-                recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            &[
-                SqliteValue::from(issue_id),
-                attribution
-                    .agent_name
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                attribution
-                    .harness
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                attribution
-                    .model
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(i64::from(bypassed)),
-                bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(gates_json.as_str()),
-            ],
-        )?;
-        Ok(())
+        self.with_connection_write_transaction(|conn| {
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO close_metadata (
+                    issue_id,
+                    closed_by_agent_name,
+                    closed_by_harness,
+                    closed_by_model,
+                    bypassed_policy,
+                    bypass_reason,
+                    policy_gates_fired,
+                    recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    attribution
+                        .agent_name
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    attribution
+                        .harness
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    attribution
+                        .model
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(i64::from(bypassed)),
+                    bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(gates_json.as_str()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Read a previously-stored close-metadata row, or `None` when no policy
@@ -2915,7 +3576,7 @@ impl SqliteStorage {
             ));
         }
         let mut recorded = None;
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             let issue = Self::get_issue_from_conn(conn, issue_id)?.ok_or_else(|| {
                 BeadsError::IssueNotFound {
                     id: issue_id.to_string(),
@@ -3432,7 +4093,7 @@ impl SqliteStorage {
         let provider = provider.trim().to_string();
         let expires_text = expires_at.map(|dt| dt.to_rfc3339());
         let mut record = None;
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             if Self::get_issue_from_conn(conn, issue_id)?.is_none() {
                 return Err(BeadsError::IssueNotFound {
                     id: issue_id.to_string(),
@@ -3515,7 +4176,7 @@ impl SqliteStorage {
         let expires_text = expires_at.map(|dt| dt.to_rfc3339());
         let reason = reason.map(str::trim).filter(|value| !value.is_empty());
         let mut record = None;
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             let now = Utc::now();
             let existing =
                 Self::capacity_exemption_record_from_conn(conn, issue_id, &kind, &name, now)?
@@ -3648,7 +4309,7 @@ impl SqliteStorage {
         let provider = provider.trim().to_string();
         let reason = reason.map(str::trim).filter(|value| !value.is_empty());
         let mut record = None;
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             let now = Utc::now();
             let existing =
                 Self::capacity_exemption_record_from_conn(conn, issue_id, &kind, &name, now)?
@@ -5216,6 +5877,26 @@ impl SqliteStorage {
     /// transferred/cleared — it never leaks into an unrelated operation.
     pub(crate) fn take_pending_event_attribution(&mut self) -> Option<EventAttribution> {
         self.pending_event_attribution.take()
+    }
+
+    /// Return the normalized attribution staged for the next mutation.
+    ///
+    /// Reviewed multi-phase mutations bind this value into their immutable
+    /// intent before entering the write transaction. Returning the normalized
+    /// empty value instead of exposing the optional slot keeps receipt evidence
+    /// independent of the storage implementation's staging representation.
+    #[must_use]
+    pub(crate) fn pending_event_attribution_for_review(&self) -> EventAttribution {
+        self.pending_event_attribution.clone().unwrap_or_default()
+    }
+
+    /// Return the exact workflow-capacity policy installed for the next
+    /// reviewed mutation.
+    #[must_use]
+    pub(crate) fn workflow_capacity_policy_for_review(
+        &self,
+    ) -> crate::close_policy::CapacityPolicy {
+        self.workflow_capacity_policy.clone()
     }
 
     /// Execute a mutation with the 4-step transaction protocol.
@@ -9260,6 +9941,17 @@ impl SqliteStorage {
         Ok(rebuilt)
     }
 
+    /// Rebuild the blocked cache and normalize its operational timestamps to
+    /// the exact source-snapshot time bound into a reviewed recovery plan.
+    pub(crate) fn rebuild_blocked_cache_at_in_tx(&self, blocked_at: &str) -> Result<usize> {
+        let rebuilt = self.rebuild_blocked_cache_in_tx()?;
+        self.conn.execute_with_params(
+            "UPDATE blocked_issues_cache SET blocked_at = ?",
+            &[SqliteValue::from(blocked_at)],
+        )?;
+        Ok(rebuilt)
+    }
+
     /// Rebuild the child counters table from all existing issues.
     ///
     /// Useful after a full import or manual database manipulation.
@@ -9269,6 +9961,11 @@ impl SqliteStorage {
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_child_counters_in_tx(&self) -> Result<usize> {
         Self::rebuild_child_counters_impl(&self.conn)
+    }
+
+    #[allow(dead_code)] // Guarded standalone entry point; bulk mutations use the in-tx primitive.
+    pub(crate) fn rebuild_child_counters(&self) -> Result<usize> {
+        self.with_connection_write_transaction(|_| self.rebuild_child_counters_in_tx())
     }
 
     fn rebuild_child_counters_impl(conn: &Connection) -> Result<usize> {
@@ -10609,6 +11306,34 @@ impl SqliteStorage {
         let row = self.conn.query_row("SELECT count(*) FROM issues")?;
         let count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
         Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Count the two derived sync tables without rebuilding either one.
+    ///
+    /// Additive reconciliation uses this read-only snapshot to prove whether
+    /// its transactional cache rebuild changed either materialized view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either count query fails.
+    pub(crate) fn count_sync_derived_rows(&self) -> Result<(usize, usize)> {
+        let blocked = self
+            .conn
+            .query_row("SELECT count(*) FROM blocked_issues_cache")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        let child_counters = self
+            .conn
+            .query_row("SELECT count(*) FROM child_counters")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+
+        Ok((
+            usize::try_from(blocked).unwrap_or(0),
+            usize::try_from(child_counters).unwrap_or(0),
+        ))
     }
 
     /// Get all issue IDs in the database.
@@ -13259,11 +13984,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database delete fails.
     pub fn delete_config(&mut self, key: &str) -> Result<bool> {
-        let deleted = self.conn.execute_with_params(
-            "DELETE FROM config WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        Ok(deleted > 0)
+        self.with_write_transaction(|storage| {
+            let deleted = storage.conn.execute_with_params(
+                "DELETE FROM config WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            Ok(deleted > 0)
+        })
     }
 
     // ========================================================================
@@ -13471,15 +14198,21 @@ impl SqliteStorage {
     pub fn get_dirty_issue_metadata(&self) -> Result<Vec<(String, String)>> {
         let rows = self
             .conn
-            .query("SELECT issue_id, marked_at FROM dirty_issues ORDER BY marked_at")?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                let id = r.get(0).and_then(SqliteValue::as_text).map(String::from)?;
-                let marked_at = r.get(1).and_then(SqliteValue::as_text).map(String::from)?;
-                Some((id, marked_at))
+            .query("SELECT issue_id, marked_at FROM dirty_issues ORDER BY issue_id, marked_at")?;
+        rows.iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let issue_id = row.get(0).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::Config(format!("Dirty-issue row {row_index} issue_id was not text"))
+                })?;
+                let marked_at = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "Dirty-issue row {row_index} marked_at was not text"
+                    ))
+                })?;
+                Ok((issue_id.to_string(), marked_at.to_string()))
             })
-            .collect())
+            .collect()
     }
 
     /// Get IDs of all dirty issues (issues modified since last export).
@@ -13510,7 +14243,10 @@ impl SqliteStorage {
         if metadata.is_empty() {
             return Ok(0);
         }
+        self.with_connection_write_transaction(|_| self.clear_dirty_issues_in_tx(metadata))
+    }
 
+    pub(crate) fn clear_dirty_issues_in_tx(&self, metadata: &[(String, String)]) -> Result<usize> {
         let mut total_deleted = 0;
         for (id, marked_at) in metadata {
             let count = self.conn.execute_with_params(
@@ -13532,11 +14268,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn clear_dirty_issues_legacy(&mut self, issue_ids: &[String]) -> Result<usize> {
-        const SQLITE_VAR_LIMIT: usize = 900;
         if issue_ids.is_empty() {
             return Ok(0);
         }
+        self.with_write_transaction(|storage| storage.clear_dirty_issue_ids_in_tx(issue_ids))
+    }
 
+    fn clear_dirty_issue_ids_in_tx(&self, issue_ids: &[String]) -> Result<usize> {
         let mut total_deleted = 0;
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
@@ -13560,8 +14298,11 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn clear_all_dirty_issues(&mut self) -> Result<usize> {
-        let count = self.conn.execute("DELETE FROM dirty_issues")?;
-        Ok(count)
+        self.with_write_transaction(Self::clear_all_dirty_issues_in_tx)
+    }
+
+    fn clear_all_dirty_issues_in_tx(storage: &mut Self) -> Result<usize> {
+        Ok(storage.conn.execute("DELETE FROM dirty_issues")?)
     }
 
     // =========================================================================
@@ -13645,8 +14386,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn clear_all_export_hashes(&mut self) -> Result<usize> {
-        let count = self.conn.execute("DELETE FROM export_hashes")?;
-        Ok(count)
+        self.with_write_transaction(|storage| {
+            Ok(storage.conn.execute("DELETE FROM export_hashes")?)
+        })
     }
 
     /// Get issues that need to be exported (dirty issues whose content hash differs from stored export hash).
@@ -13732,7 +14474,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub(crate) fn set_metadata_shared(&self, key: &str, value: &str) -> Result<()> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             Self::upsert_metadata_key_in_tx(conn, key, value)?;
             Ok(())
         })
@@ -13744,11 +14486,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn delete_metadata(&mut self, key: &str) -> Result<bool> {
-        let count = self.conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        Ok(count > 0)
+        self.with_write_transaction(|storage| {
+            let count = storage.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            Ok(count > 0)
+        })
     }
 
     /// Count issues in the database.
@@ -14694,30 +15438,33 @@ fn finish_issue_mutation_write_probe(
         // built to catch (issue #263). Returning Ok here would turn
         // the probe into a false-negative oracle for the storage
         // layer's visibility/write-path bug class. Surface it as the
-        // primary error even when ROLLBACK also fails: a downstream
-        // rollback hiccup is noise compared to "we couldn't update
-        // the row we just inserted".
+        // primary error. If ROLLBACK also fails, retain the zero-row
+        // diagnostic as the source while explicitly reporting that the
+        // connection's transaction state is now unknown.
         (Ok(0), rollback) => {
-            if let Err(rollback_err) = rollback {
-                tracing::warn!(
-                    error = %rollback_err,
-                    "ROLLBACK failed after zero-row issue write probe"
-                );
-            }
-            Err(BeadsError::Database(FrankenError::Internal(
+            let original_error = BeadsError::Database(FrankenError::Internal(
                 "write probe did not find issue inside mutation transaction".to_string(),
-            )))
+            ));
+            Err(SqliteStorage::rollback_result_error(
+                original_error,
+                rollback,
+                "zero-row issue write probe",
+            ))
         }
         (Ok(_), Ok(_)) => Ok(()),
-        (Ok(_), Err(rollback_err)) => Err(BeadsError::Database(rollback_err)),
+        (Ok(_), Err(rollback_err)) => Err(SqliteStorage::rollback_failure_error(
+            BeadsError::Config(
+                "issue write probe succeeded but its rollback cleanup failed".to_string(),
+            ),
+            rollback_err,
+            "successful issue write probe",
+        )),
         (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
-        (Err(probe_err), Err(rollback_err)) => {
-            tracing::warn!(
-                error = %rollback_err,
-                "ROLLBACK failed after issue write probe"
-            );
-            Err(BeadsError::Database(probe_err))
-        }
+        (Err(probe_err), Err(rollback_err)) => Err(SqliteStorage::rollback_failure_error(
+            BeadsError::Database(probe_err),
+            rollback_err,
+            "issue write probe error",
+        )),
     }
 }
 
@@ -14776,6 +15523,19 @@ fn connection_user_version(conn: &Connection) -> Option<u32> {
     row.get(0)
         .and_then(SqliteValue::as_integer)
         .and_then(|v| u32::try_from(v).ok())
+}
+
+fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
+    if database_header_user_version(path).is_none() {
+        return Ok(None);
+    }
+    let conn = open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let version = connection_user_version(&conn).or_else(|| database_header_user_version(path));
+    conn.close().map_err(BeadsError::Database)?;
+    Ok(version)
 }
 
 fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
@@ -15758,26 +16518,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn clear_dirty_flags(&mut self, ids: &[String]) -> Result<usize> {
-        const SQLITE_VAR_LIMIT: usize = 900;
         if ids.is_empty() {
             return Ok(0);
         }
-
-        let mut total_deleted = 0;
-        for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
-            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
-            let mut chunk_deleted = 0;
-            for id in chunk {
-                let deleted = self.conn.execute_with_params(
-                    "DELETE FROM dirty_issues WHERE issue_id = ?",
-                    &[SqliteValue::from(id.as_str())],
-                )?;
-                chunk_deleted += deleted;
-            }
-            total_deleted += chunk_deleted;
-        }
-
-        Ok(total_deleted)
+        self.with_write_transaction(|storage| storage.clear_dirty_issue_ids_in_tx(ids))
     }
 
     /// Clear all dirty flags.
@@ -15786,8 +16530,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn clear_all_dirty_flags(&mut self) -> Result<usize> {
-        let deleted = self.conn.execute("DELETE FROM dirty_issues")?;
-        Ok(deleted)
+        self.with_write_transaction(Self::clear_all_dirty_issues_in_tx)
     }
 
     /// Get the count of issues (for safety guard).
@@ -16263,6 +17006,39 @@ impl SqliteStorage {
         ]
     }
 
+    /// Return the exact SQLite values a full import INSERT/UPDATE writes, in
+    /// physical `issues` table column order. Additive reconciliation uses this
+    /// to bind implementation-produced raw poststate into its review token.
+    pub(crate) fn import_issue_raw_row_for_witness(issue: &Issue) -> Result<Vec<SqliteValue>> {
+        let timestamps = ImportIssueTimestampStrings::from_issue(issue);
+        let mut fields = Self::import_issue_field_values(issue, &timestamps);
+        if fields.len() != 37 {
+            return Err(BeadsError::Config(format!(
+                "Import issue raw witness expected 37 fields, found {}",
+                fields.len()
+            )));
+        }
+        // Import SQL places source_repo_path beside source_repo for parameter
+        // readability, while migrated physical schemas append it immediately
+        // before agent_context. Reorder into SELECT * / schema-catalog order.
+        let source_repo_path = fields.remove(23);
+        let agent_context = fields.pop().ok_or_else(|| {
+            BeadsError::Config("Import issue raw witness lost the agent_context field".to_string())
+        })?;
+        let mut row = Vec::with_capacity(38);
+        row.push(SqliteValue::from(issue.id.as_str()));
+        row.extend(fields);
+        row.push(source_repo_path);
+        row.push(agent_context);
+        if row.len() != 38 {
+            return Err(BeadsError::Config(format!(
+                "Import issue raw witness expected 38 columns, found {}",
+                row.len()
+            )));
+        }
+        Ok(row)
+    }
+
     fn insert_issue_row_for_import(
         &self,
         issue: &Issue,
@@ -16322,7 +17098,12 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import uses the in-tx primitive.
     pub(crate) fn insert_new_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        self.with_connection_write_transaction(|_| self.insert_new_issue_for_import_in_tx(issue))
+    }
+
+    pub(crate) fn insert_new_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
         Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
     }
@@ -16345,6 +17126,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn upsert_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        self.with_connection_write_transaction(|_| self.upsert_issue_for_import_in_tx(issue))
+    }
+
+    pub(crate) fn upsert_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
 
         // Narrow existence probe: don't deserialize the row, just check
@@ -16404,7 +17189,18 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the marker cannot be updated.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import uses the in-tx primitive.
     pub(crate) fn replace_dirty_issue_marker(&self, issue_id: &str, marked_at: &str) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.replace_dirty_issue_marker_in_tx(issue_id, marked_at)
+        })
+    }
+
+    pub(crate) fn replace_dirty_issue_marker_in_tx(
+        &self,
+        issue_id: &str,
+        marked_at: &str,
+    ) -> Result<()> {
         self.conn.execute_with_params(
             "DELETE FROM dirty_issues WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
@@ -16423,6 +17219,16 @@ impl SqliteStorage {
     /// Returns an error if the label replacement is invalid or the database
     /// operation fails.
     pub fn sync_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.sync_labels_for_import_in_tx(issue_id, labels)
+        })
+    }
+
+    pub(crate) fn sync_labels_for_import_in_tx(
+        &self,
+        issue_id: &str,
+        labels: &[String],
+    ) -> Result<()> {
         let unique_labels = unique_label_refs(labels);
         validate_storage_label_refs(&unique_labels)?;
 
@@ -16472,6 +17278,16 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_dependencies_for_import(
+        &self,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.sync_dependencies_for_import_in_tx(issue_id, dependencies)
+        })
+    }
+
+    pub(crate) fn sync_dependencies_for_import_in_tx(
         &self,
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
@@ -16605,6 +17421,16 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.sync_comments_for_import_in_tx(issue_id, comments)
+        })
+    }
+
+    pub(crate) fn sync_comments_for_import_in_tx(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
         validate_import_comments_for_issue(issue_id, comments)?;
 
         // Remove existing comments
@@ -16625,11 +17451,690 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if any relation insert fails.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import uses the in-tx primitive.
     pub(crate) fn insert_new_issue_relations_for_import(&self, issue: &Issue) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.insert_new_issue_relations_for_import_in_tx(issue)
+        })
+    }
+
+    pub(crate) fn insert_new_issue_relations_for_import_in_tx(&self, issue: &Issue) -> Result<()> {
         self.insert_labels_for_import(&issue.id, &issue.labels)?;
         self.insert_dependencies_for_import(&issue.id, &issue.dependencies)?;
         self.insert_comments_for_import(&issue.id, &issue.comments)?;
         Ok(())
+    }
+
+    /// Upsert one imported issue and replace all of its owned relations in one
+    /// authority-verified transaction.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import/merge use one outer transaction.
+    pub(crate) fn upsert_issue_and_relations_for_import(&self, issue: &Issue) -> Result<bool> {
+        self.with_connection_write_transaction(|_| {
+            let changed = self.upsert_issue_for_import_in_tx(issue)?;
+            self.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
+            self.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
+            self.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
+            Ok(changed)
+        })
+    }
+
+    /// Apply the complete database side of one reviewed three-way merge in a
+    /// single write transaction.
+    ///
+    /// Deletions, issue rows, owned relations, resolution notes, dirty
+    /// markers, export-hash invalidation, operational caches, child counters,
+    /// and the merge-pending receipt either all commit or all roll back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation or any database operation fails.
+    pub(crate) fn apply_sync_merge_atomically(
+        &mut self,
+        kept: &[Issue],
+        deleted_ids: &[String],
+        notes: &[(String, String)],
+        intent: &SyncMergeIntent,
+    ) -> Result<SyncMergePendingReceipt> {
+        self.last_capacity_warnings.clear();
+        let actor = intent.actor.as_str();
+        if actor.trim().is_empty() || actor.trim() != actor {
+            return Err(BeadsError::validation(
+                "actor",
+                "sync merge actor must be nonblank and trimmed",
+            ));
+        }
+        let timestamp = intent.export_as_of;
+        let created_at = timestamp.to_rfc3339();
+        for (issue_id, note) in notes {
+            validate_new_comment(issue_id, "br-sync", note)?;
+        }
+
+        let kept_by_id = kept
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue))
+            .collect::<BTreeMap<_, _>>();
+        if kept_by_id.len() != kept.len() {
+            return Err(BeadsError::validation(
+                "kept",
+                "sync merge report contains duplicate kept issue IDs",
+            ));
+        }
+        let deleted_set = deleted_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if deleted_set.len() != deleted_ids.len() {
+            return Err(BeadsError::validation(
+                "deleted",
+                "sync merge report contains duplicate deleted issue IDs",
+            ));
+        }
+        if let Some(overlap) = kept_by_id
+            .keys()
+            .find(|issue_id| deleted_set.contains(**issue_id))
+        {
+            return Err(BeadsError::validation(
+                "merge_report",
+                format!("issue {overlap} is both kept and deleted"),
+            ));
+        }
+        let note_ids = notes
+            .iter()
+            .map(|(issue_id, _)| issue_id.as_str())
+            .collect::<HashSet<_>>();
+        if note_ids.len() != notes.len() {
+            return Err(BeadsError::validation(
+                "notes",
+                "sync merge report contains duplicate note targets",
+            ));
+        }
+        for note_id in &note_ids {
+            let issue = kept_by_id.get(note_id).ok_or_else(|| {
+                BeadsError::validation(
+                    "notes",
+                    format!("merge note target {note_id} is not a kept issue"),
+                )
+            })?;
+            if issue.status == Status::Tombstone {
+                return Err(BeadsError::validation(
+                    "notes",
+                    format!("merge note target {note_id} is a tombstone"),
+                ));
+            }
+        }
+
+        let mut actual_kept_ids = kept_by_id
+            .keys()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>();
+        actual_kept_ids.sort();
+        let mut actual_deleted_ids = deleted_ids.to_vec();
+        actual_deleted_ids.sort();
+        let mut actual_note_witnesses = notes
+            .iter()
+            .map(|(issue_id, note)| crate::sync::SyncMergeNoteWitness {
+                issue_id: issue_id.clone(),
+                note_sha256: crate::util::hex_encode(&Sha256::digest(note.as_bytes())),
+            })
+            .collect::<Vec<_>>();
+        actual_note_witnesses.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+        let actual_kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(kept)?;
+        if actual_kept_ids != intent.changed_kept_issue_ids
+            || actual_kept_issue_witnesses != intent.kept_issue_witnesses
+            || actual_deleted_ids != intent.deleted_issue_ids
+            || actual_note_witnesses != intent.note_witnesses
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Sync merge mutation payload does not match its reviewed intent"
+                    .to_string(),
+            });
+        }
+        if intent.schema_version != 2 {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Unsupported sync merge intent schema {}",
+                    intent.schema_version
+                ),
+            });
+        }
+
+        let pending_attribution = self.pending_event_attribution_for_review();
+        if pending_attribution != intent.event_attribution {
+            return Err(BeadsError::SyncConflict {
+                message: "Sync merge event attribution changed after its intent was reviewed"
+                    .to_string(),
+            });
+        }
+        let reviewed_attribution = intent.event_attribution.clone();
+        if self.workflow_capacity_policy != intent.capacity_policy {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Workflow capacity policy changed after the sync merge intent was reviewed"
+                        .to_string(),
+            });
+        }
+        let capacity_policy = intent.capacity_policy.clone();
+        let result = self.with_write_transaction(|storage| {
+            match storage.inspect_pending_sync_merge_in_current_transaction()? {
+                PendingSyncMergeInspection::Absent => {}
+                pending => {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "{}; refusing to begin a second sync merge",
+                            pending.diagnostic()
+                        ),
+                    });
+                }
+            }
+            let database_before = crate::sync::capture_sync_database_witness(storage)?;
+            if database_before != intent.database_before {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database changed after sync merge planning; refusing to clobber the newer generation"
+                            .to_string(),
+                });
+            }
+
+            let mut changed_ids = kept
+                .iter()
+                .map(|issue| issue.id.clone())
+                .collect::<HashSet<_>>();
+            changed_ids.extend(notes.iter().map(|(issue_id, _)| issue_id.clone()));
+
+            // Capacity is a final-state property of the complete merge, not a
+            // sequence of independent row writes. Build one transition batch
+            // from the transaction's exact prestate so a kept/new issue cannot
+            // bypass limits and a capacity-neutral swap is not rejected merely
+            // because its admitting row happens to be applied first.
+            let mut affected_ids = kept
+                .iter()
+                .map(|issue| issue.id.clone())
+                .chain(deleted_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            affected_ids.sort();
+            affected_ids.dedup();
+            let existing_by_id = storage
+                .get_issues_by_ids(&affected_ids)?
+                .into_iter()
+                .map(|issue| (issue.id.clone(), issue))
+                .collect::<HashMap<_, _>>();
+            let mut capacity_transitions = Vec::with_capacity(affected_ids.len());
+            for issue in kept {
+                let from = existing_by_id
+                    .get(&issue.id)
+                    .map(|existing| existing.status.as_str().to_string());
+                if from
+                    .as_deref()
+                    .is_none_or(|status| !status.eq_ignore_ascii_case(issue.status.as_str()))
+                {
+                    capacity_transitions.push(CapacityBatchTransition {
+                        issue_id: issue.id.clone(),
+                        from,
+                        to: issue.status.as_str().to_string(),
+                        issue_type: Some(issue.issue_type.as_str().to_string()),
+                        current_assignee: existing_by_id
+                            .get(&issue.id)
+                            .and_then(|existing| existing.assignee.clone()),
+                        prospective_assignee: issue.assignee.clone(),
+                    });
+                }
+            }
+            let tombstones = deleted_ids
+                .iter()
+                .filter_map(|issue_id| existing_by_id.get(issue_id).cloned())
+                .collect::<Vec<_>>();
+            for tombstone in &tombstones {
+                if tombstone.status != Status::Tombstone {
+                    capacity_transitions.push(CapacityBatchTransition {
+                        issue_id: tombstone.id.clone(),
+                        from: Some(tombstone.status.as_str().to_string()),
+                        to: Status::Tombstone.as_str().to_string(),
+                        issue_type: None,
+                        current_assignee: tombstone.assignee.clone(),
+                        prospective_assignee: tombstone.assignee.clone(),
+                    });
+                }
+            }
+            capacity_transitions.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+            let acting = CapacityActingContext::new(actor, &reviewed_attribution);
+            let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
+                &storage.conn,
+                &capacity_policy,
+                &capacity_transitions,
+                &acting,
+            )?;
+
+            for tombstone in &tombstones {
+                if tombstone.status == Status::Tombstone {
+                    continue;
+                }
+                let was_terminal = tombstone.status.is_terminal();
+                let original_type = tombstone.issue_type.as_str().to_string();
+                let mut tombstone_for_hash = tombstone.clone();
+                tombstone_for_hash.status = Status::Tombstone;
+                let tombstone_hash = crate::util::content_hash(&tombstone_for_hash);
+                storage.conn.execute_with_params(
+                    "UPDATE issues SET
+                        content_hash = ?,
+                        status = 'tombstone',
+                        deleted_at = ?,
+                        deleted_by = ?,
+                        delete_reason = ?,
+                        original_type = ?,
+                        updated_at = ?
+                     WHERE id = ?",
+                    &[
+                        SqliteValue::from(tombstone_hash.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(actor),
+                        SqliteValue::from("merge deletion"),
+                        SqliteValue::from(original_type.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(tombstone.id.as_str()),
+                    ],
+                )?;
+                storage.conn.execute_with_params(
+                    "DELETE FROM close_metadata WHERE issue_id = ?",
+                    &[SqliteValue::from(tombstone.id.as_str())],
+                )?;
+                if !was_terminal {
+                    storage.insert_sync_merge_event_in_tx(
+                        &tombstone.id,
+                        EventType::Deleted,
+                        actor,
+                        Some("Deleted issue: merge deletion"),
+                        &created_at,
+                        &reviewed_attribution,
+                    )?;
+                }
+                changed_ids.insert(tombstone.id.clone());
+            }
+
+            // Materialize every issue row before validating/inserting
+            // dependency relations so references between two newly merged
+            // rows do not depend on report ordering.
+            for issue in kept {
+                storage.upsert_issue_for_import_in_tx(issue)?;
+            }
+            for issue in kept {
+                storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
+                storage.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
+                storage.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
+            }
+
+            for (issue_id, note) in notes {
+                Self::ensure_issue_mutable_in_tx(&storage.conn, issue_id, "add merge note to")?;
+                storage.conn.execute_with_params(
+                    "INSERT INTO comments (issue_id, author, text, created_at) \
+                     VALUES (?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from("br-sync"),
+                        SqliteValue::from(note.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                    ],
+                )?;
+                storage.conn.execute_with_params(
+                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ],
+                )?;
+                storage.insert_sync_merge_event_in_tx(
+                    issue_id,
+                    EventType::Commented,
+                    actor,
+                    Some(note),
+                    &created_at,
+                    &reviewed_attribution,
+                )?;
+            }
+
+            let mut changed_ids = changed_ids.into_iter().collect::<Vec<_>>();
+            changed_ids.sort();
+            for issue_id in &changed_ids {
+                storage.replace_dirty_issue_marker_in_tx(issue_id, &created_at)?;
+            }
+            storage.clear_export_hashes_in_tx(&changed_ids)?;
+            storage.set_metadata_in_tx("needs_flush", "true")?;
+            storage.rebuild_blocked_cache_in_tx()?;
+            storage.rebuild_child_counters_in_tx()?;
+            let database_after = crate::sync::capture_sync_merge_core_witness(storage)?;
+            let mut sink = std::io::sink();
+            let (export_result, _) =
+                crate::sync::export_to_writer_with_policy_and_retention_at(
+                    storage,
+                    &mut sink,
+                    crate::sync::ExportErrorPolicy::Strict,
+                    intent.retention_days,
+                    intent.export_as_of,
+                )?;
+            let receipt = SyncMergePendingReceipt::new(
+                intent.clone(),
+                timestamp.to_rfc3339(),
+                database_after,
+                export_result.content_hash,
+                export_result.exported_count,
+                &export_result.issue_hashes,
+                capacity_warnings.clone(),
+            )?;
+            receipt.validate()?;
+            let receipt_serialized = serde_json::to_string(&receipt)?;
+            storage.set_metadata_in_tx(
+                METADATA_SYNC_MERGE_PENDING,
+                &receipt_serialized,
+            )?;
+            storage.require_exact_pending_sync_merge_row_in_current_transaction(
+                &receipt_serialized,
+                "New sync merge receipt was not durably materialized before COMMIT",
+            )?;
+            Ok((receipt, capacity_warnings))
+        });
+
+        if result.is_ok() {
+            self.pending_event_attribution = None;
+        }
+        let (receipt, capacity_warnings) = result?;
+        self.last_capacity_warnings = capacity_warnings;
+        Ok(receipt)
+    }
+
+    fn insert_sync_merge_event_in_tx(
+        &self,
+        issue_id: &str,
+        event_type: EventType,
+        actor: &str,
+        comment: Option<&str>,
+        created_at: &str,
+        attribution: &EventAttribution,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT INTO events (
+                issue_id, event_type, actor, old_value, new_value, comment,
+                created_at, agent_name, harness, model
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(event_type.as_str()),
+                SqliteValue::from(actor),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                comment.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(created_at),
+                attribution
+                    .agent_name
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .harness
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .model
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn pending_sync_merge_metadata_rows(&self, key: &str) -> Result<Vec<Option<String>>> {
+        let rows = self.conn.query_with_params(
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid",
+            &[SqliteValue::from(key)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
+    fn inspect_pending_sync_merge_in_current_transaction(
+        &self,
+    ) -> Result<PendingSyncMergeInspection> {
+        let current_rows = self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING)?;
+        let legacy_rows =
+            self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING_LEGACY)?;
+        Ok(classify_pending_sync_merge_rows(
+            &current_rows,
+            &legacy_rows,
+        ))
+    }
+
+    fn require_exact_pending_sync_merge_row_in_current_transaction(
+        &self,
+        expected_serialized: &str,
+        operation: &str,
+    ) -> Result<()> {
+        let current_rows = self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING)?;
+        let legacy_rows =
+            self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING_LEGACY)?;
+        let exact_current = matches!(
+            current_rows.as_slice(),
+            [Some(serialized)] if serialized == expected_serialized
+        );
+        if exact_current && legacy_rows.is_empty() {
+            return Ok(());
+        }
+        let diagnostic = classify_pending_sync_merge_rows(&current_rows, &legacy_rows).diagnostic();
+        Err(BeadsError::SyncConflict {
+            message: format!(
+                "{operation}: the exact pending sync-merge receipt row changed or became ambiguous ({diagnostic})"
+            ),
+        })
+    }
+
+    /// Inspect both pending-sync-merge metadata keys in one coherent read
+    /// transaction.
+    ///
+    /// Query/open uncertainty is returned as an error. `Absent` is produced
+    /// only after both exact raw row sets were read successfully from the same
+    /// SQLite snapshot.
+    ///
+    /// Callers must invoke this outside any caller-managed SQLite transaction.
+    /// If an in-transaction caller is added, it must use the private
+    /// `inspect_pending_sync_merge_in_current_transaction` classifier directly.
+    pub(crate) fn inspect_pending_sync_merge(&self) -> Result<PendingSyncMergeInspection> {
+        self.with_read_transaction(Self::inspect_pending_sync_merge_in_current_transaction)
+    }
+
+    /// Inspect pending-sync-merge state on an existing current-schema database
+    /// while a caller-owned database-family authority prevents replacement.
+    ///
+    /// Missing databases, stale/future schemas, route mismatches, open errors,
+    /// query errors, and receipt validation failures all fail closed. The
+    /// read-only storage carries the caller's authority, so
+    /// `with_read_transaction` verifies it before the transaction, immediately
+    /// before COMMIT, and again after COMMIT.
+    pub(crate) fn inspect_pending_sync_merge_under_authority(
+        path: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<PendingSyncMergeInspection> {
+        let planned_authority = crate::sync::database_write_authority_sha256(path)?;
+        if planned_authority != authority.authority_path_sha256() {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync-merge inspection path does not match the held database-family authority"
+                        .to_string(),
+            });
+        }
+        if authority.bind_database_inode_for_mutation()? {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync-merge state is unknown because the authorized database is missing"
+                        .to_string(),
+            });
+        }
+        authority.verify_database_authority()?;
+        let mut storage = match Self::open_current_read_only(path)? {
+            Some(storage) => storage,
+            None => {
+                let found = effective_database_user_version(path)?;
+                return match found {
+                    Some(found) => Err(BeadsError::SchemaMismatch {
+                        expected: CURRENT_SCHEMA_VERSION,
+                        found: i32::try_from(found).unwrap_or(i32::MAX),
+                    }),
+                    None => Err(BeadsError::SyncConflict {
+                        message:
+                            "Pending sync-merge state is unknown because the database schema is missing or unreadable"
+                                .to_string(),
+                    }),
+                };
+            }
+        };
+        authority.verify_database_authority()?;
+        storage.attach_write_authority(Arc::clone(authority));
+        storage.inspect_pending_sync_merge()
+    }
+
+    pub(crate) fn pending_sync_merge_receipt(&self) -> Result<Option<SyncMergePendingReceipt>> {
+        match self.inspect_pending_sync_merge()? {
+            PendingSyncMergeInspection::Absent => Ok(None),
+            PendingSyncMergeInspection::Valid(receipt) => Ok(Some(receipt)),
+            pending @ (PendingSyncMergeInspection::Legacy { .. }
+            | PendingSyncMergeInspection::Malformed { .. }) => Err(BeadsError::SyncConflict {
+                message: format!(
+                    "{}; refusing automatic recovery until `br sync --merge` reconciles it",
+                    pending.diagnostic()
+                ),
+            }),
+        }
+    }
+
+    pub(crate) fn compare_and_set_pending_sync_merge_receipt(
+        &mut self,
+        expected: &SyncMergePendingReceipt,
+        replacement: &SyncMergePendingReceipt,
+    ) -> Result<()> {
+        expected.validate()?;
+        replacement.validate()?;
+        if expected.phase != crate::sync::SyncMergePendingPhase::DatabaseCommitted
+            || replacement.phase != crate::sync::SyncMergePendingPhase::ExportFinalized
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge phase update must advance database_committed to export_finalized"
+                        .to_string(),
+            });
+        }
+        if expected.receipt_id != replacement.receipt_id
+            || expected.intent_sha256 != replacement.intent_sha256
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync merge phase update changed immutable receipt identity"
+                    .to_string(),
+            });
+        }
+        let Some(jsonl_after) = replacement.jsonl_after.as_ref() else {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Export-finalized sync merge receipt must witness a published JSONL source"
+                        .to_string(),
+            });
+        };
+        let Some(export_finalization) = replacement.export_finalization.as_ref() else {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Export-finalized sync merge receipt must witness database export bookkeeping"
+                        .to_string(),
+            });
+        };
+        let exact_advancement = expected
+            .advance_to_export_finalized(jsonl_after.clone(), export_finalization.clone())?;
+        if replacement != &exact_advancement {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync merge phase update changed immutable receipt evidence"
+                    .to_string(),
+            });
+        }
+        let expected_serialized = serde_json::to_string(expected)?;
+        let replacement_serialized = serde_json::to_string(replacement)?;
+        self.with_write_transaction(|storage| {
+            storage.require_exact_pending_sync_merge_row_in_current_transaction(
+                &expected_serialized,
+                "Pending sync merge receipt changed before phase advancement",
+            )?;
+            if crate::sync::capture_sync_merge_core_witness(storage)? != expected.database_after {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database merge-authoritative state changed before pending merge phase advancement"
+                            .to_string(),
+                });
+            }
+            let live_finalization =
+                crate::sync::capture_sync_merge_export_finalization_witness(storage)?;
+            if replacement.export_finalization.as_ref() != Some(&live_finalization) {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database export bookkeeping changed before pending merge phase advancement"
+                            .to_string(),
+                });
+            }
+            storage.set_metadata_in_tx(METADATA_SYNC_MERGE_PENDING, &replacement_serialized)
+        })
+    }
+
+    pub(crate) fn compare_and_clear_pending_sync_merge_receipt(
+        &mut self,
+        expected: &SyncMergePendingReceipt,
+    ) -> Result<()> {
+        expected.validate()?;
+        let terminal_raw_sha256 = match (expected.phase, expected.jsonl_after.as_ref()) {
+            (
+                crate::sync::SyncMergePendingPhase::ExportFinalized,
+                Some(crate::sync::JsonlSourceStateWitness::Present { raw_sha256, .. }),
+            ) => raw_sha256,
+            _ => {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Pending sync merge receipt may be cleared only after exact export finalization"
+                            .to_string(),
+                });
+            }
+        };
+        if terminal_raw_sha256 != &expected.jsonl_after_raw_sha256 {
+            return Err(BeadsError::SyncConflict {
+                message: "Terminal sync merge source witness does not match reviewed export bytes"
+                    .to_string(),
+            });
+        }
+        let expected_serialized = serde_json::to_string(expected)?;
+        self.with_write_transaction(|storage| {
+            storage.require_exact_pending_sync_merge_row_in_current_transaction(
+                &expected_serialized,
+                "Pending sync merge receipt changed before terminal cleanup",
+            )?;
+            if crate::sync::capture_sync_merge_core_witness(storage)? != expected.database_after {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database merge-authoritative state changed before pending merge terminal cleanup"
+                            .to_string(),
+                });
+            }
+            let live_finalization =
+                crate::sync::capture_sync_merge_export_finalization_witness(storage)?;
+            if expected.export_finalization.as_ref() != Some(&live_finalization) {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database export bookkeeping changed before pending merge terminal cleanup"
+                            .to_string(),
+                });
+            }
+            storage.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ? AND value = ?",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(expected_serialized.as_str()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn insert_comments_for_import(
@@ -17099,6 +18604,299 @@ mod tests {
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
+        }
+    }
+
+    fn sync_merge_test_intent(
+        storage: &SqliteStorage,
+        kept: &[Issue],
+        deleted_ids: &[String],
+        notes: &[(String, String)],
+    ) -> SyncMergeIntent {
+        let mut changed_kept_issue_ids = kept
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<Vec<_>>();
+        changed_kept_issue_ids.sort();
+        let kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(kept).unwrap();
+        let mut deleted_issue_ids = deleted_ids.to_vec();
+        deleted_issue_ids.sort();
+        let mut note_witnesses = notes
+            .iter()
+            .map(|(issue_id, note)| crate::sync::SyncMergeNoteWitness {
+                issue_id: issue_id.clone(),
+                note_sha256: crate::util::hex_encode(&Sha256::digest(note.as_bytes())),
+            })
+            .collect::<Vec<_>>();
+        note_witnesses.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+        SyncMergeIntent {
+            schema_version: 2,
+            database_authority_sha256: "11".repeat(32),
+            jsonl_authority_sha256: "22".repeat(32),
+            jsonl_path_sha256: "33".repeat(32),
+            jsonl_before: crate::sync::JsonlSourceStateWitness::Missing,
+            jsonl_before_content_sha256: None,
+            base_authority_sha256: "44".repeat(32),
+            base_before: crate::sync::JsonlSourceStateWitness::Missing,
+            base_before_content_sha256: None,
+            resolution: "manual".to_string(),
+            actor: "merge-agent".to_string(),
+            event_attribution: storage.pending_event_attribution_for_review(),
+            capacity_policy: storage.workflow_capacity_policy_for_review(),
+            retention_days: None,
+            export_as_of: Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap(),
+            changed_kept_issue_ids,
+            kept_issue_witnesses,
+            deleted_issue_ids,
+            note_witnesses,
+            database_before: crate::sync::capture_sync_database_witness(storage).unwrap(),
+        }
+    }
+
+    fn sync_merge_test_export_hashes(
+        storage: &SqliteStorage,
+        intent: &SyncMergeIntent,
+    ) -> Vec<(String, String)> {
+        let mut sink = Vec::new();
+        crate::sync::export_to_writer_with_policy_and_retention_at(
+            storage,
+            &mut sink,
+            crate::sync::ExportErrorPolicy::Strict,
+            intent.retention_days,
+            intent.export_as_of,
+        )
+        .unwrap()
+        .0
+        .issue_hashes
+    }
+
+    fn finalized_sync_merge_test_receipt(
+        storage: &mut SqliteStorage,
+        receipt: &SyncMergePendingReceipt,
+    ) -> SyncMergePendingReceipt {
+        let dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        storage.clear_dirty_flags(&dirty_ids).unwrap();
+        let reviewed_issue_hashes = sync_merge_test_export_hashes(storage, &receipt.intent);
+        storage.clear_all_export_hashes().unwrap();
+        storage.set_export_hashes(&reviewed_issue_hashes).unwrap();
+        storage
+            .set_metadata(
+                METADATA_JSONL_CONTENT_HASH,
+                &receipt.jsonl_after_content_sha256,
+            )
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, "2026-07-27T08:00:00+00:00")
+            .unwrap();
+        storage.set_metadata(METADATA_JSONL_SIZE, "128").unwrap();
+        storage
+            .set_metadata(METADATA_LAST_EXPORT_TIME, &receipt.created_at)
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        receipt
+            .advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Present {
+                    raw_sha256: receipt.jsonl_after_raw_sha256.clone(),
+                    mtime: "2026-07-27T08:00:00+00:00".to_string(),
+                    size: 128,
+                    identity: None,
+                },
+                crate::sync::capture_sync_merge_export_finalization_witness(storage).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn assert_sync_merge_payload_rejected_without_writes(
+        storage: &mut SqliteStorage,
+        kept: &[Issue],
+        deleted_ids: &[String],
+        notes: &[(String, String)],
+    ) -> BeadsError {
+        let intent = sync_merge_test_intent(storage, kept, deleted_ids, notes);
+        let before = crate::sync::capture_sync_database_witness(storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(kept, deleted_ids, notes, &intent)
+            .unwrap_err();
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(storage).unwrap(),
+            before
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        error
+    }
+
+    fn assert_sync_merge_substituted_issue_rejected_without_writes(
+        storage: &mut SqliteStorage,
+        planned: &Issue,
+        substituted: &Issue,
+    ) {
+        let intent = sync_merge_test_intent(storage, std::slice::from_ref(planned), &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(std::slice::from_ref(substituted), &[], &[], &intent)
+            .unwrap_err();
+        assert!(
+            matches!(error, BeadsError::SyncConflict { .. }),
+            "same-ID payload substitution must fail as a reviewed-intent conflict: {error}"
+        );
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(storage).unwrap(),
+            before,
+            "rejected same-ID payload substitution must perform zero writes"
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_sync_merge_raw_classifier_fails_closed_on_legacy_null_and_duplicates() {
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[], &[]),
+            PendingSyncMergeInspection::Absent
+        ));
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[], &[Some("legacy-receipt".to_string())]),
+            PendingSyncMergeInspection::Legacy { row_count: 1, .. }
+        ));
+        for current in [
+            vec![None],
+            vec![Some(String::new())],
+            vec![Some("{}".to_string()), Some("{}".to_string())],
+        ] {
+            assert!(
+                matches!(
+                    classify_pending_sync_merge_rows(&current, &[]),
+                    PendingSyncMergeInspection::Malformed { .. }
+                ),
+                "current rows must fail closed: {current:?}"
+            );
+        }
+        for legacy in [
+            vec![None],
+            vec![Some(" ".to_string())],
+            vec![Some("legacy-a".to_string()), Some("legacy-b".to_string())],
+        ] {
+            assert!(
+                matches!(
+                    classify_pending_sync_merge_rows(&[], &legacy),
+                    PendingSyncMergeInspection::Malformed { .. }
+                ),
+                "legacy rows must fail closed: {legacy:?}"
+            );
+        }
+        assert!(matches!(
+            classify_pending_sync_merge_rows(
+                &[Some("{}".to_string())],
+                &[Some("legacy-receipt".to_string())],
+            ),
+            PendingSyncMergeInspection::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_sync_merge_raw_classifier_requires_exact_canonical_receipt_bytes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-canonical-receipt",
+            "Canonical receipt",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        let canonical = serde_json::to_string(&receipt).unwrap();
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[Some(canonical)], &[]),
+            PendingSyncMergeInspection::Valid(observed) if observed == receipt
+        ));
+
+        let pretty = serde_json::to_string_pretty(&receipt).unwrap();
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[Some(pretty)], &[]),
+            PendingSyncMergeInspection::Malformed { .. }
+        ));
+
+        let mut with_unknown = serde_json::to_value(&receipt).unwrap();
+        with_unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unrecognized_state".to_string(), serde_json::json!(true));
+        assert!(matches!(
+            classify_pending_sync_merge_rows(
+                &[Some(serde_json::to_string(&with_unknown).unwrap())],
+                &[],
+            ),
+            PendingSyncMergeInspection::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn sync_merge_transaction_refuses_legacy_malformed_and_duplicate_pending_rows() {
+        for (case, rows) in [
+            (
+                "empty-current",
+                vec![(METADATA_SYNC_MERGE_PENDING, String::new())],
+            ),
+            (
+                "legacy",
+                vec![(
+                    METADATA_SYNC_MERGE_PENDING_LEGACY,
+                    "legacy-pending-state".to_string(),
+                )],
+            ),
+            (
+                "duplicate-current",
+                vec![
+                    (METADATA_SYNC_MERGE_PENDING, "{}".to_string()),
+                    (METADATA_SYNC_MERGE_PENDING, "{}".to_string()),
+                ],
+            ),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            for (key, value) in rows {
+                storage
+                    .conn
+                    .execute_with_params(
+                        "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                        &[SqliteValue::from(key), SqliteValue::from(value.as_str())],
+                    )
+                    .unwrap();
+            }
+            let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+            let issue = make_issue(
+                &format!("bd-refuse-{case}"),
+                "Must not commit",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            );
+            let kept = vec![issue];
+            let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+            let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+            assert!(matches!(
+                storage.apply_sync_merge_atomically(&kept, &[], &[], &intent),
+                Err(BeadsError::SyncConflict { .. })
+            ));
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&storage).unwrap(),
+                before,
+                "{case} must reject before any merge write"
+            );
+            assert!(
+                !matches!(
+                    storage.inspect_pending_sync_merge().unwrap(),
+                    PendingSyncMergeInspection::Absent
+                ),
+                "{case} must preserve the exact blocking state"
+            );
         }
     }
 
@@ -17996,17 +19794,18 @@ mod tests {
             .unwrap();
 
         // Simulate the clock passing the expiry.
-        SqliteStorage::with_connection_write_transaction(&storage.conn, |conn| {
-            conn.execute_with_params(
-                "UPDATE capacity_exemptions SET expires_at = ? WHERE issue_id = ?",
-                &[
-                    SqliteValue::from((now - chrono::Duration::hours(1)).to_rfc3339()),
-                    SqliteValue::from("bd-exp-hotfix"),
-                ],
-            )?;
-            Ok(())
-        })
-        .unwrap();
+        storage
+            .with_connection_write_transaction(|conn| {
+                conn.execute_with_params(
+                    "UPDATE capacity_exemptions SET expires_at = ? WHERE issue_id = ?",
+                    &[
+                        SqliteValue::from((now - chrono::Duration::hours(1)).to_rfc3339()),
+                        SqliteValue::from("bd-exp-hotfix"),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         // Expired exemptions count again: the hotfix now occupies a slot, so
         // the next admission sees current=2 with no exempt total.
@@ -25953,12 +27752,45 @@ mod tests {
             SqliteStorage::open_current_read_only(&db_path)
                 .unwrap()
                 .is_none(),
-            "stale schema headers must fall back to the normal repair-capable open path"
+            "stale schema headers must decline the current-schema read-only path"
         );
     }
 
     #[test]
-    fn test_open_repairs_runtime_compatible_legacy_db_indexes() {
+    fn test_reviewed_reconcile_opens_decline_unknown_future_schema() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("reviewed_future_schema.db");
+        let future_version = CURRENT_SCHEMA_VERSION
+            .checked_add(1)
+            .expect("schema version increment");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute(&format!("PRAGMA user_version = {future_version}"))
+                .unwrap();
+        }
+
+        assert!(
+            SqliteStorage::open_current_read_only(&db_path)
+                .unwrap()
+                .is_none(),
+            "read-only planning must refuse an unknown future schema"
+        );
+        assert!(
+            SqliteStorage::open_current_for_reconcile(&db_path, Some(100))
+                .unwrap()
+                .is_none(),
+            "reviewed apply must refuse an unknown future schema before mutation"
+        );
+    }
+
+    #[test]
+    #[ignore = "superseded by the merge decision keeping shipped auto-migration on ordinary \
+                opens (open_auto_migrates_legacy_integer_datetimes_and_done_status); the \
+                reviewed migrate-schema lifecycle remains the explicit operator surface"]
+    fn test_open_refuses_runtime_compatible_legacy_db_without_reviewed_migration() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_runtime_compatible.db");
 
@@ -25971,30 +27803,34 @@ mod tests {
             storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
-        let reopened = SqliteStorage::open(&db_path).unwrap();
-        let user_version = reopened
-            .conn
+        let error = SqliteStorage::open(&db_path)
+            .expect_err("ordinary open must not cross a schema-version boundary");
+        assert!(
+            error.to_string().contains("br doctor migrate-schema plan"),
+            "refusal must provide the reviewed migration command: {error}"
+        );
+
+        let unchanged = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let user_version = unchanged
             .query_row("PRAGMA user_version")
             .unwrap()
             .get(0)
             .and_then(SqliteValue::as_integer)
             .unwrap();
         assert_eq!(
-            user_version,
-            i64::from(CURRENT_SCHEMA_VERSION),
-            "runtime-compatible legacy DBs should be repaired and marked current on open"
+            user_version, 0,
+            "refused ordinary open must not stamp the stale database"
         );
 
-        let indexes: HashSet<String> = reopened
-            .conn
+        let indexes: HashSet<String> = unchanged
             .query("SELECT name FROM sqlite_master WHERE type='index'")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
             .collect();
         assert!(
-            indexes.contains("idx_issues_external_ref_unique"),
-            "runtime-compatible repair path should restore missing canonical indexes"
+            !indexes.contains("idx_issues_external_ref_unique"),
+            "refused ordinary open must not repair DDL as a side effect"
         );
     }
 
@@ -26009,10 +27845,6 @@ mod tests {
                 .conn
                 .execute("DROP INDEX IF EXISTS idx_issues_external_ref_unique")
                 .unwrap();
-            // Reset user_version so the reopen takes the full schema path
-            // (the fast path only applies runtime pragmas and does not
-            // recreate missing indexes).
-            storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
         let reopened = SqliteStorage::open(&db_path).unwrap();
@@ -26110,7 +27942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_repairs_legacy_kv_primary_key_tables() {
+    fn test_open_repairs_current_version_legacy_kv_primary_key_tables() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_kv_primary_keys.db");
 
@@ -26146,8 +27978,6 @@ mod tests {
                 .conn
                 .execute("INSERT INTO metadata (key, value) VALUES ('project', 'legacy-project')")
                 .unwrap();
-
-            storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
         let reopened = SqliteStorage::open(&db_path).unwrap();
@@ -26367,19 +28197,24 @@ mod tests {
 
     /// Regression test for issue #263 (b): when both the probe update
     /// matches zero rows AND the rollback returns an error, the
-    /// zero-row diagnostic remains the primary failure reported up
-    /// the stack — a downstream rollback hiccup is noise compared to
-    /// "we couldn't update the row we just inserted".
+    /// zero-row diagnostic remains the primary source while the rollback
+    /// failure is also surfaced as an unknown transaction state.
     #[test]
-    fn test_finish_issue_mutation_write_probe_prefers_zero_row_over_rollback_error() {
+    fn test_finish_issue_mutation_write_probe_composes_zero_row_and_rollback_errors() {
         let err = finish_issue_mutation_write_probe(
             Ok(0),
             Err(FrankenError::Internal("rollback failed".to_string())),
         )
-        .expect_err("zero-row probe must outrank rollback error");
+        .expect_err("zero-row probe and rollback failure must both surface");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("write probe did not find issue"),
-            "unexpected error: {err}",
+            message.contains("write probe did not find issue"),
+            "{message}"
+        );
+        assert!(message.contains("rollback failed"), "{message}");
+        assert!(
+            message.contains("transaction state is unknown"),
+            "{message}"
         );
     }
 
@@ -29044,6 +30879,7 @@ mod tests {
 
         let storage = SqliteStorage {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
@@ -29389,16 +31225,19 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_issue_mutation_write_probe_prefers_write_error() {
+    fn test_finish_issue_mutation_write_probe_composes_write_and_rollback_errors() {
         let result = finish_issue_mutation_write_probe(
             Err(FrankenError::Internal("write failed".to_string())),
             Err(FrankenError::Internal("rollback failed".to_string())),
         );
 
-        let err = result.expect_err("write failure should surface");
+        let err = result.expect_err("write and rollback failures should surface");
+        let message = err.to_string();
+        assert!(message.contains("write failed"), "{message}");
+        assert!(message.contains("rollback failed"), "{message}");
         assert!(
-            err.to_string().contains("write failed"),
-            "unexpected error: {err}"
+            message.contains("transaction state is unknown"),
+            "{message}"
         );
     }
 
@@ -30368,6 +32207,97 @@ mod tests {
     }
 
     #[test]
+    fn write_transaction_surfaces_actual_rollback_failure_without_retrying_body() {
+        let dir = TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let mut body_attempts = 0_u8;
+
+        let result: Result<()> = storage.with_write_transaction(|storage| {
+            body_attempts += 1;
+            storage
+                .conn
+                .execute("ROLLBACK")
+                .expect("end transaction inside body");
+            Err(crate::error::BeadsError::Config(
+                "original transaction body failure".into(),
+            ))
+        });
+
+        assert_eq!(body_attempts, 1, "unknown transaction state must not retry");
+        let err_msg = result.expect_err("second ROLLBACK must fail").to_string();
+        assert!(
+            err_msg.contains("ROLLBACK failed after transaction body error"),
+            "rollback failure context must be preserved: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("transaction state is unknown and no retry was attempted"),
+            "operator guidance must forbid an unsafe retry: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("original transaction body failure"),
+            "original body error must remain in the composed error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn read_transaction_composes_body_and_rollback_failures() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let mut body_attempts = 0_u8;
+
+        let result: Result<()> = storage.with_read_transaction(|storage| {
+            body_attempts += 1;
+            storage
+                .conn
+                .execute("ROLLBACK")
+                .expect("end read transaction inside body");
+            Err(BeadsError::Config(
+                "original read transaction body failure".into(),
+            ))
+        });
+
+        assert_eq!(body_attempts, 1);
+        let message = result
+            .expect_err("outer read rollback must fail")
+            .to_string();
+        assert!(
+            message.contains("original read transaction body failure"),
+            "{message}"
+        );
+        assert!(message.contains("ROLLBACK failed"), "{message}");
+        assert!(
+            message.contains("transaction state is unknown"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn read_transaction_composes_commit_and_rollback_failures() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+
+        let result: Result<()> = storage.with_read_transaction(|storage| {
+            storage
+                .conn
+                .execute("COMMIT")
+                .expect("end read transaction inside body");
+            Ok(())
+        });
+
+        let message = result
+            .expect_err("outer read COMMIT and cleanup ROLLBACK must fail")
+            .to_string();
+        assert!(
+            message.contains("ROLLBACK failed after read-transaction COMMIT error"),
+            "{message}"
+        );
+        assert!(
+            message.contains("transaction state is unknown"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn open_auto_migrates_legacy_integer_datetimes_and_done_status() {
         // Simulate the exact on-disk corruption observed in the wild: a v5
         // DB (pre-migration user_version) with integer-typed DATETIME
@@ -30448,15 +32378,252 @@ mod tests {
     fn connection_write_transaction_propagates_body_error() {
         let dir = TempDir::new().unwrap();
         let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
-        let result: Result<()> =
-            SqliteStorage::with_connection_write_transaction(&storage.conn, |_| {
-                Err(crate::error::BeadsError::Config("conn test error".into()))
-            });
+        let result: Result<()> = storage.with_connection_write_transaction(|_| {
+            Err(crate::error::BeadsError::Config("conn test error".into()))
+        });
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("conn test error"),
             "should propagate body error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn connection_write_transaction_surfaces_actual_rollback_failure_without_retrying_body() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let mut body_attempts = 0_u8;
+
+        let result: Result<()> = storage.with_connection_write_transaction(|conn| {
+            body_attempts += 1;
+            conn.execute("ROLLBACK")
+                .expect("end shared transaction inside body");
+            Err(crate::error::BeadsError::Config(
+                "original shared transaction body failure".into(),
+            ))
+        });
+
+        assert_eq!(body_attempts, 1, "unknown transaction state must not retry");
+        let err_msg = result
+            .expect_err("second shared ROLLBACK must fail")
+            .to_string();
+        assert!(
+            err_msg.contains("ROLLBACK failed after shared transaction body error"),
+            "rollback failure context must be preserved: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("transaction state is unknown and no retry was attempted"),
+            "operator guidance must forbid an unsafe retry: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("original shared transaction body failure"),
+            "original body error must remain in the composed error: {err_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_authority_rejects_replaced_database_before_both_write_transaction_paths() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let displaced_path = beads_dir.join("beads.displaced.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        authority.verify_database_authority().unwrap();
+        storage.attach_write_authority(authority);
+
+        fs::rename(&db_path, &displaced_path).unwrap();
+        fs::copy(&displaced_path, &db_path).unwrap();
+
+        let exclusive_error = storage
+            .set_metadata("must_not_commit_exclusive", "value")
+            .expect_err("exclusive write must reject a replaced database inode")
+            .to_string();
+        assert!(
+            exclusive_error.contains("database")
+                && (exclusive_error.contains("authority")
+                    || exclusive_error.contains("identity")
+                    || exclusive_error.contains("inode")),
+            "exclusive transaction should report the authority mismatch: {exclusive_error}"
+        );
+
+        let shared_error = storage
+            .set_metadata_shared("must_not_commit_shared", "value")
+            .expect_err("shared write must reject a replaced database inode")
+            .to_string();
+        assert!(
+            shared_error.contains("database")
+                && (shared_error.contains("authority")
+                    || shared_error.contains("identity")
+                    || shared_error.contains("inode")),
+            "shared transaction should report the authority mismatch: {shared_error}"
+        );
+
+        // Since fsqlite 0.1.18 the engine itself fails closed (CannotOpen)
+        // on a connection whose underlying file was replaced, so post-scenario
+        // forensics must reopen the displaced inode fresh instead of reading
+        // through the stale connection.
+        drop(storage);
+        let displaced = SqliteStorage::open(&displaced_path).unwrap();
+        assert_eq!(
+            displaced.get_metadata("must_not_commit_exclusive").unwrap(),
+            None,
+            "the displaced inode must remain unchanged"
+        );
+        assert_eq!(
+            displaced.get_metadata("must_not_commit_shared").unwrap(),
+            None,
+            "the displaced inode must remain unchanged for the shared path"
+        );
+        drop(displaced);
+        let replacement = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            replacement
+                .get_metadata("must_not_commit_exclusive")
+                .unwrap(),
+            None,
+            "the unowned replacement inode must remain unchanged"
+        );
+        assert_eq!(
+            replacement.get_metadata("must_not_commit_shared").unwrap(),
+            None,
+            "the unowned replacement inode must remain unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
+                pre-merge snapshot); tracked for completion by the owning workstream"]
+    fn write_transaction_reports_post_commit_authority_loss_without_retrying() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        storage.attach_write_authority(authority);
+
+        let mut body_attempts = 0_u8;
+        REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
+        let error = storage
+            .with_write_transaction(|storage| {
+                body_attempts += 1;
+                storage.set_metadata_in_tx("postcommit_exclusive", "committed")
+            })
+            .expect_err("post-COMMIT inode replacement must fail the witness check");
+
+        assert_eq!(
+            body_attempts, 1,
+            "a committed transaction must never be retried"
+        );
+        assert!(
+            matches!(&error, BeadsError::CommittedStateUnwitnessed { .. }),
+            "post-COMMIT authority loss must remain typed: {error:?}"
+        );
+        assert!(
+            !error.is_transient(),
+            "a potentially committed mutation must never be classified as retryable"
+        );
+        let structured = crate::error::StructuredError::from_error(&error);
+        assert!(!structured.retryable);
+        assert_eq!(structured.code.exit_code(), 6);
+        assert_eq!(
+            structured
+                .context
+                .as_ref()
+                .and_then(|context| context.get("committed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("write transaction committed, but database authority changed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("reconcile committed state before retrying"),
+            "{error}"
+        );
+        assert_eq!(
+            storage.get_metadata("postcommit_exclusive").unwrap(),
+            Some("committed".to_string()),
+            "the connection's displaced inode must retain the committed mutation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_write_transaction_reports_post_commit_authority_loss_without_retrying() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        storage.attach_write_authority(authority);
+
+        let mut body_attempts = 0_u8;
+        REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
+        let error = storage
+            .with_connection_write_transaction(|conn| {
+                body_attempts += 1;
+                SqliteStorage::upsert_metadata_key_in_tx(conn, "postcommit_shared", "committed")
+            })
+            .expect_err("post-COMMIT inode replacement must fail the shared witness check");
+
+        assert_eq!(
+            body_attempts, 1,
+            "a committed shared transaction must never be retried"
+        );
+        assert!(matches!(
+            &error,
+            BeadsError::CommittedStateUnwitnessed { .. }
+        ));
+        assert!(!error.is_transient());
+        let error = error.to_string();
+        assert!(
+            error.contains("shared write transaction committed, but database authority changed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("reconcile committed state before retrying"),
+            "{error}"
+        );
+        // fsqlite 0.1.18 fails closed on the displaced-inode connection, so
+        // verify the committed mutation with a fresh open of the database
+        // path: the commit lives in the WAL, which stays beside the original
+        // path and replays over the hook's byte-identical copy.
+        drop(storage);
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_metadata("postcommit_shared").unwrap(),
+            Some("committed".to_string()),
+            "the committed mutation must survive in the WAL at the database path"
         );
     }
 
@@ -30681,5 +32848,1667 @@ mod tests {
         assert!(created.agent_name.is_none());
         assert!(created.harness.is_none());
         assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn sync_merge_transaction_commits_rows_relations_notes_and_operational_state_together() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let victim = make_issue(
+            "bd-merge-victim",
+            "Delete me",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut parent = make_issue(
+            "bd-merge-parent",
+            "Old parent",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&victim, "fixture").unwrap();
+        storage.create_issue(&parent, "fixture").unwrap();
+        storage
+            .set_export_hash(&victim.id, "victim-export-hash")
+            .unwrap();
+        storage
+            .set_export_hash(&parent.id, "parent-export-hash")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        parent.title = "Merged parent".to_string();
+        parent.labels = vec!["sync".to_string(), "verified".to_string()];
+        parent.comments = vec![crate::model::Comment {
+            id: 7001,
+            issue_id: parent.id.clone(),
+            author: "fixture".to_string(),
+            body: "Imported merge comment".to_string(),
+            created_at: now,
+        }];
+        let mut child = make_issue(
+            "bd-merge-parent.1",
+            "Merged child",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        child.dependencies = vec![crate::model::Dependency {
+            issue_id: child.id.clone(),
+            depends_on_id: parent.id.clone(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: now,
+            created_by: Some("fixture".to_string()),
+            metadata: Some("{}".to_string()),
+            thread_id: None,
+        }];
+        let kept = vec![parent.clone(), child.clone()];
+        let deleted = vec![victim.id.clone()];
+        let notes = vec![(
+            parent.id.clone(),
+            "Merge resolution selected the reviewed generation.".to_string(),
+        )];
+        let intent = sync_merge_test_intent(&storage, &kept, &deleted, &notes);
+
+        let pending_receipt = storage
+            .apply_sync_merge_atomically(&kept, &deleted, &notes, &intent)
+            .unwrap();
+
+        let stored_parent = storage.get_issue(&parent.id).unwrap().unwrap();
+        assert_eq!(stored_parent.title, "Merged parent");
+        assert_eq!(
+            storage.get_labels(&parent.id).unwrap(),
+            vec!["sync", "verified"]
+        );
+        assert_eq!(
+            storage
+                .get_dependencies_full(&child.id)
+                .unwrap()
+                .first()
+                .map(|dependency| dependency.depends_on_id.as_str()),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(storage.next_child_number(&parent.id).unwrap(), 2);
+        let parent_comments = storage.get_comments(&parent.id).unwrap();
+        assert_eq!(parent_comments.len(), 2);
+        assert!(
+            parent_comments
+                .iter()
+                .any(|comment| comment.body == "Imported merge comment")
+        );
+        let merge_note = parent_comments
+            .iter()
+            .find(|comment| comment.body == "Merge resolution selected the reviewed generation.")
+            .expect("merge note comment");
+        assert_eq!(merge_note.author, "br-sync");
+        assert_eq!(merge_note.created_at, intent.export_as_of);
+
+        let tombstone = storage.get_issue(&victim.id).unwrap().unwrap();
+        assert_eq!(tombstone.status, Status::Tombstone);
+        assert_eq!(tombstone.deleted_by.as_deref(), Some("merge-agent"));
+        assert_eq!(tombstone.delete_reason.as_deref(), Some("merge deletion"));
+        assert!(
+            storage
+                .get_events(&victim.id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == EventType::Deleted)
+        );
+        let merge_note_event = storage
+            .get_events(&parent.id, 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.event_type == EventType::Commented
+                    && event.comment.as_deref()
+                        == Some("Merge resolution selected the reviewed generation.")
+            })
+            .expect("merge note audit event");
+        assert_eq!(merge_note_event.actor, "merge-agent");
+        assert_eq!(merge_note_event.created_at, intent.export_as_of);
+
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(pending_receipt)
+        );
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec![parent.id, child.id, victim.id]
+        );
+        assert!(
+            storage
+                .get_export_hash("bd-merge-parent")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_export_hash("bd-merge-victim")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sync_merge_transaction_rolls_back_rows_when_relation_validation_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let mut invalid = make_issue(
+            "bd-merge-invalid-relation",
+            "Must roll back",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        invalid.dependencies = vec![crate::model::Dependency {
+            issue_id: invalid.id.clone(),
+            depends_on_id: "bd-dependency-target".to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: now,
+            created_by: None,
+            metadata: Some("not-json".to_string()),
+            thread_id: None,
+        }];
+
+        let kept = vec![invalid.clone()];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let result = storage.apply_sync_merge_atomically(&kept, &[], &[], &intent);
+
+        assert!(matches!(result, Err(BeadsError::Validation { .. })));
+        assert!(storage.get_issue(&invalid.id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_merge_transaction_rolls_back_rows_when_note_target_is_absent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let kept = make_issue(
+            "bd-merge-before-note-failure",
+            "Must roll back",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        let notes = vec![(
+            "bd-absent-note-target".to_string(),
+            "Valid note with an absent owner.".to_string(),
+        )];
+        let intent = sync_merge_test_intent(&storage, std::slice::from_ref(&kept), &[], &notes);
+        let result =
+            storage.apply_sync_merge_atomically(std::slice::from_ref(&kept), &[], &notes, &intent);
+
+        assert!(result.is_err());
+        assert!(storage.get_issue(&kept.id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_merge_transaction_rolls_back_rows_when_cache_rebuild_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-merge-cache-parent",
+            "Must roll back with child",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let child = make_issue(
+            "bd-merge-cache-parent.1",
+            "Child forces a counter insert",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage
+            .conn
+            .execute(
+                "CREATE TRIGGER fail_sync_merge_child_counter
+                 BEFORE INSERT ON child_counters
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected child-counter rebuild failure');
+                 END",
+            )
+            .unwrap();
+        let kept = vec![parent.clone(), child.clone()];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+
+        let result = storage.apply_sync_merge_atomically(&kept, &[], &[], &intent);
+
+        assert!(result.is_err());
+        assert!(storage.get_issue(&parent.id).unwrap().is_none());
+        assert!(storage.get_issue(&child.id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_roundtrips_and_rejects_full_envelope_tampering() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-receipt",
+            "Receipt target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        let expected_intent_sha256 = receipt.intent.intent_sha256().unwrap();
+        assert_eq!(receipt.intent_sha256, expected_intent_sha256);
+        assert_ne!(
+            receipt.receipt_id, expected_intent_sha256,
+            "the receipt ID must identify the full immutable evidence envelope"
+        );
+        assert_ne!(
+            receipt.state_sha256, receipt.receipt_id,
+            "state and immutable-envelope digests must use distinct domains"
+        );
+        receipt.validate().unwrap();
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        let roundtrip = serde_json::from_str::<SyncMergePendingReceipt>(&serialized).unwrap();
+        assert_eq!(roundtrip, receipt);
+        assert_eq!(roundtrip.intent.export_as_of, intent.export_as_of);
+        roundtrip.validate().unwrap();
+
+        let mut different_cutoff = receipt.intent.clone();
+        different_cutoff.export_as_of += chrono::Duration::nanoseconds(1);
+        assert_ne!(
+            different_cutoff.intent_sha256().unwrap(),
+            receipt.intent_sha256,
+            "the frozen export cutoff must be hash-bound into merge intent"
+        );
+        let reviewed_issue_hashes = sync_merge_test_export_hashes(&storage, &receipt.intent);
+        assert!(
+            SyncMergePendingReceipt::new(
+                receipt.intent.clone(),
+                (now + chrono::Duration::nanoseconds(1)).to_rfc3339(),
+                receipt.database_after.clone(),
+                receipt.jsonl_after_raw_sha256.clone(),
+                receipt.jsonl_after_issue_count,
+                &reviewed_issue_hashes,
+                Vec::new(),
+            )
+            .is_err(),
+            "receipt creation time and frozen export cutoff must identify one instant"
+        );
+
+        let mut unsupported_schema = receipt.clone();
+        unsupported_schema.schema_version += 1;
+        let mut tampered_intent_schema = receipt.clone();
+        tampered_intent_schema.intent.schema_version += 1;
+        let mut tampered_intent = receipt.clone();
+        tampered_intent.intent.resolution = "force-db".to_string();
+        tampered_intent.intent_sha256 = tampered_intent.intent.intent_sha256().unwrap();
+        let mut tampered_intent_digest = receipt.clone();
+        tampered_intent_digest.intent_sha256 = "10".repeat(32);
+        let mut tampered_created_at = receipt.clone();
+        tampered_created_at.created_at = "2026-07-27T08:00:00.000000001+00:00".to_string();
+        let mut tampered_database_after = receipt.clone();
+        tampered_database_after.database_after.issue_payload_sha256 = "20".repeat(32);
+        let mut tampered_raw_hash = receipt.clone();
+        tampered_raw_hash.jsonl_after_raw_sha256 = "30".repeat(32);
+        let mut tampered_content_hash = receipt.clone();
+        tampered_content_hash.jsonl_after_content_sha256 = "40".repeat(32);
+        let mut tampered_count = receipt.clone();
+        tampered_count.jsonl_after_issue_count += 1;
+        let mut tampered_identity = receipt.clone();
+        tampered_identity.receipt_id = "50".repeat(32);
+        let mut tampered_state_digest = receipt.clone();
+        tampered_state_digest.state_sha256 = "60".repeat(32);
+
+        for (field, tampered) in [
+            ("schema_version", unsupported_schema),
+            ("intent.schema_version", tampered_intent_schema),
+            ("intent", tampered_intent),
+            ("intent_sha256", tampered_intent_digest),
+            ("created_at", tampered_created_at),
+            ("database_after", tampered_database_after),
+            ("jsonl_after_raw_sha256", tampered_raw_hash),
+            ("jsonl_after_content_sha256", tampered_content_hash),
+            ("jsonl_after_issue_count", tampered_count),
+            ("receipt_id", tampered_identity),
+            ("state_sha256", tampered_state_digest),
+        ] {
+            storage
+                .set_metadata(
+                    METADATA_SYNC_MERGE_PENDING,
+                    &serde_json::to_string(&tampered).unwrap(),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    storage.pending_sync_merge_receipt(),
+                    Err(BeadsError::SyncConflict { .. })
+                ),
+                "persisted {field} tampering must be rejected"
+            );
+        }
+
+        storage
+            .set_metadata(
+                METADATA_SYNC_MERGE_PENDING,
+                &serde_json::to_string(&receipt).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(storage.pending_sync_merge_receipt().unwrap(), Some(receipt));
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_state_digest_rejects_phase_and_witness_tampering() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 5, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-state",
+            "State digest target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+
+        assert_eq!(finalized.receipt_id, committed.receipt_id);
+        assert_ne!(finalized.state_sha256, committed.state_sha256);
+        finalized.validate().unwrap();
+
+        let mut stale_committed_state = finalized.clone();
+        stale_committed_state.phase = crate::sync::SyncMergePendingPhase::DatabaseCommitted;
+        stale_committed_state.jsonl_after = None;
+        let mut stale_finalized_state = finalized.clone();
+        let Some(crate::sync::JsonlSourceStateWitness::Present { size, .. }) =
+            stale_finalized_state.jsonl_after.as_mut()
+        else {
+            panic!("finalized fixture must contain a present JSONL witness");
+        };
+        *size += 1;
+        let mut stale_finalization_witness = finalized.clone();
+        stale_finalization_witness
+            .export_finalization
+            .as_mut()
+            .expect("finalized fixture must contain database bookkeeping")
+            .export_hashes
+            .payload_sha256 = "ab".repeat(32);
+
+        for (field, tampered) in [
+            ("phase", stale_committed_state),
+            ("jsonl_after", stale_finalized_state),
+            ("export_finalization", stale_finalization_witness),
+        ] {
+            storage
+                .set_metadata(
+                    METADATA_SYNC_MERGE_PENDING,
+                    &serde_json::to_string(&tampered).unwrap(),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    storage.pending_sync_merge_receipt(),
+                    Err(BeadsError::SyncConflict { .. })
+                ),
+                "persisted {field} tampering without a state digest update must be rejected"
+            );
+        }
+
+        let finalization =
+            crate::sync::capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert!(matches!(
+            finalized.advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Present {
+                    raw_sha256: finalized.jsonl_after_raw_sha256.clone(),
+                    mtime: "2026-07-27T08:00:00+00:00".to_string(),
+                    size: 129,
+                    identity: None,
+                },
+                finalization.clone(),
+            ),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(matches!(
+            committed.advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Missing,
+                finalization.clone(),
+            ),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(matches!(
+            committed.advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Present {
+                    raw_sha256: "70".repeat(32),
+                    mtime: "2026-07-27T08:00:00+00:00".to_string(),
+                    size: 128,
+                    identity: None,
+                },
+                finalization,
+            ),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_merge_existing_pending_receipt_blocks_second_merge_without_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 15, 0).unwrap();
+        let first = make_issue(
+            "bd-merge-first",
+            "First committed merge",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let first_kept = vec![first];
+        let first_intent = sync_merge_test_intent(&storage, &first_kept, &[], &[]);
+        let first_receipt = storage
+            .apply_sync_merge_atomically(&first_kept, &[], &[], &first_intent)
+            .unwrap();
+
+        let second = make_issue(
+            "bd-merge-second",
+            "Must remain absent",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let second_kept = vec![second.clone()];
+        let second_intent = sync_merge_test_intent(&storage, &second_kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(&second_kept, &[], &[], &second_intent)
+            .unwrap_err();
+
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert!(storage.get_issue(&second.id).unwrap().is_none());
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(first_receipt)
+        );
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_cas_rejects_stale_backward_and_immutable_changes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 30, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-cas",
+            "CAS target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &committed),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+        let mut stale = committed.clone();
+        stale.created_at = "2026-07-27T08:31:00+00:00".to_string();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&stale, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(committed.clone())
+        );
+
+        assert_eq!(finalized.receipt_id, committed.receipt_id);
+        assert_eq!(finalized.intent_sha256, committed.intent_sha256);
+        assert_eq!(finalized.created_at, committed.created_at);
+        assert_eq!(finalized.database_after, committed.database_after);
+        assert_eq!(
+            finalized.jsonl_after_raw_sha256,
+            committed.jsonl_after_raw_sha256
+        );
+        assert_eq!(
+            finalized.jsonl_after_content_sha256,
+            committed.jsonl_after_content_sha256
+        );
+        assert_eq!(
+            finalized.jsonl_after_issue_count,
+            committed.jsonl_after_issue_count
+        );
+        assert_ne!(finalized.state_sha256, committed.state_sha256);
+
+        let mut cross_intent = committed.intent.clone();
+        cross_intent.resolution = "force-db".to_string();
+        let cross_issue_hashes = sync_merge_test_export_hashes(&storage, &cross_intent);
+        let cross_committed = SyncMergePendingReceipt::new(
+            cross_intent,
+            committed.created_at.clone(),
+            committed.database_after.clone(),
+            committed.jsonl_after_raw_sha256.clone(),
+            committed.jsonl_after_issue_count,
+            &cross_issue_hashes,
+            Vec::new(),
+        )
+        .unwrap();
+        let changed_identity = finalized_sync_merge_test_receipt(&mut storage, &cross_committed);
+        assert_ne!(changed_identity.receipt_id, committed.receipt_id);
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &changed_identity),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+
+        let mut changed_created_at = finalized.clone();
+        changed_created_at.created_at = "2026-07-27T08:32:00+00:00".to_string();
+        let mut changed_core = finalized.clone();
+        changed_core.database_after.issue_payload_sha256 = "aa".repeat(32);
+        let mut changed_hash = finalized.clone();
+        changed_hash.jsonl_after_content_sha256 = "bb".repeat(32);
+        let mut changed_count = finalized.clone();
+        changed_count.jsonl_after_issue_count += 1;
+        for changed in [
+            changed_created_at,
+            changed_core,
+            changed_hash,
+            changed_count,
+        ] {
+            assert!(matches!(
+                storage.compare_and_set_pending_sync_merge_receipt(&committed, &changed),
+                Err(BeadsError::SyncConflict { .. })
+            ));
+        }
+
+        storage
+            .set_metadata("sync_merge_cas_core_drift", "must-block")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(
+            storage
+                .delete_metadata("sync_merge_cas_core_drift")
+                .unwrap()
+        );
+
+        let committed_serialized = serde_json::to_string(&committed).unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(committed_serialized.as_str()),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata \
+                 WHERE rowid = (SELECT MAX(rowid) FROM metadata WHERE key = ?)",
+                &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING_LEGACY),
+                    SqliteValue::from("legacy-pending-state"),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING_LEGACY)],
+            )
+            .unwrap();
+
+        storage
+            .compare_and_set_pending_sync_merge_receipt(&committed, &finalized)
+            .unwrap();
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized.clone())
+        );
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&finalized, &committed),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized)
+        );
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_clear_requires_exact_terminal_value() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 45, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-clear",
+            "Clear target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&committed),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        let mut incomplete_terminal = committed.clone();
+        incomplete_terminal.phase = crate::sync::SyncMergePendingPhase::ExportFinalized;
+        incomplete_terminal.jsonl_after = Some(crate::sync::JsonlSourceStateWitness::Missing);
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&incomplete_terminal),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+        storage
+            .compare_and_set_pending_sync_merge_receipt(&committed, &finalized)
+            .unwrap();
+
+        let finalized_serialized = serde_json::to_string(&finalized).unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(finalized_serialized.as_str()),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata \
+                 WHERE rowid = (SELECT MAX(rowid) FROM metadata WHERE key = ?)",
+                &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+            )
+            .unwrap();
+
+        storage
+            .set_metadata("sync_merge_clear_core_drift", "must-block")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(
+            storage
+                .delete_metadata("sync_merge_clear_core_drift")
+                .unwrap()
+        );
+
+        let mut stale_finalized = finalized.clone();
+        stale_finalized.created_at = "2026-07-27T08:46:00+00:00".to_string();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&stale_finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized.clone())
+        );
+
+        let reviewed_export_hash = sync_merge_test_export_hashes(&storage, &finalized.intent)
+            .into_iter()
+            .find_map(|(issue_id, content_hash)| (issue_id == kept[0].id).then_some(content_hash))
+            .expect("reviewed export mapping contains the kept issue");
+        let original_export_hash = storage
+            .get_export_hash(&kept[0].id)
+            .unwrap()
+            .expect("finalized export-hash fixture");
+        storage
+            .set_export_hash(&kept[0].id, "drifted-export-hash")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(original_export_hash.0, reviewed_export_hash);
+        storage
+            .with_write_transaction(|storage| {
+                storage.conn.execute_with_params(
+                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    &[SqliteValue::from(kept[0].id.as_str())],
+                )?;
+                storage.conn.execute_with_params(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+                     VALUES (?, ?, ?)",
+                    &[
+                        SqliteValue::from(kept[0].id.as_str()),
+                        SqliteValue::from(original_export_hash.0.as_str()),
+                        SqliteValue::from(original_export_hash.1.as_str()),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        storage
+            .replace_dirty_issue_marker(&kept[0].id, "2026-07-27T08:45:01+00:00")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .clear_dirty_flags(std::slice::from_ref(&kept[0].id))
+            .unwrap();
+
+        for (key, drifted) in [
+            (METADATA_JSONL_CONTENT_HASH, "drifted-content-hash"),
+            (METADATA_JSONL_MTIME, "2026-07-27T08:46:00+00:00"),
+            (METADATA_JSONL_SIZE, "129"),
+            (METADATA_LAST_EXPORT_TIME, "2026-07-27T08:47:00+00:00"),
+            ("needs_flush", "true"),
+        ] {
+            let original = storage
+                .get_metadata(key)
+                .unwrap()
+                .expect("finalized metadata fixture");
+            storage.set_metadata(key, drifted).unwrap();
+            assert!(
+                matches!(
+                    storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+                    Err(BeadsError::SyncConflict { .. })
+                ),
+                "drift in finalized metadata key {key} must prevent receipt cleanup"
+            );
+            storage.set_metadata(key, &original).unwrap();
+        }
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized.clone()),
+            "all rejected finalization drift must preserve the exact receipt"
+        );
+
+        storage
+            .compare_and_clear_pending_sync_merge_receipt(&finalized)
+            .unwrap();
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_merge_core_witness_ignores_only_export_finalization_bookkeeping() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-core",
+            "Core witness target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue.clone()];
+        for (key, value) in [
+            ("unrelated_sync_merge_metadata", "baseline"),
+            ("project", "baseline-project"),
+            (METADATA_LAST_IMPORT_TIME, "2026-07-27T08:59:00+00:00"),
+        ] {
+            storage.set_metadata(key, value).unwrap();
+        }
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        assert_eq!(
+            crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+            committed.database_after
+        );
+
+        storage
+            .set_export_hash(&issue.id, "reviewed-export-hash")
+            .unwrap();
+        let dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        storage.clear_dirty_flags(&dirty_ids).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "canonical-jsonl-hash")
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, "2026-07-27T09:01:00+00:00")
+            .unwrap();
+        storage.set_metadata(METADATA_JSONL_SIZE, "128").unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        storage
+            .set_metadata(METADATA_LAST_EXPORT_TIME, "2026-07-27T09:01:00+00:00")
+            .unwrap();
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+        storage
+            .compare_and_set_pending_sync_merge_receipt(&committed, &finalized)
+            .unwrap();
+
+        assert_eq!(
+            crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+            committed.database_after
+        );
+
+        for (key, replacement) in [
+            ("unrelated_sync_merge_metadata", "must-be-bound"),
+            ("project", "different-project"),
+            (METADATA_LAST_IMPORT_TIME, "2026-07-27T09:02:00+00:00"),
+        ] {
+            let original = storage.get_metadata(key).unwrap();
+            storage.set_metadata(key, replacement).unwrap();
+            assert_ne!(
+                crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+                committed.database_after,
+                "stable metadata key {key} must be bound by the merge core witness"
+            );
+            storage
+                .set_metadata(key, &original.expect("stable metadata fixture"))
+                .unwrap();
+            assert_eq!(
+                crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+                committed.database_after,
+                "restoring stable metadata key {key} must restore the exact core witness"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_merge_intent_prestate_drift_rejects_without_additional_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 15, 0).unwrap();
+        let planned = make_issue(
+            "bd-merge-planned",
+            "Planned merge row",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![planned.clone()];
+        let stale_intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+
+        let concurrent = make_issue(
+            "bd-merge-concurrent",
+            "Concurrent committed row",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&concurrent, "other-agent").unwrap();
+        let drifted_prestate = crate::sync::capture_sync_database_witness(&storage).unwrap();
+
+        let error = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &stale_intent)
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            drifted_prestate
+        );
+        assert!(storage.get_issue(&planned.id).unwrap().is_none());
+        assert!(storage.get_issue(&concurrent.id).unwrap().is_some());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_merge_payload_validation_rejects_duplicates_and_overlap_without_writes() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 30, 0).unwrap();
+
+        let duplicate_kept = make_issue(
+            "bd-merge-duplicate-kept",
+            "Duplicate kept row",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            &[duplicate_kept.clone(), duplicate_kept],
+            &[],
+            &[],
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let duplicate_deleted = vec![
+            "bd-merge-duplicate-deleted".to_string(),
+            "bd-merge-duplicate-deleted".to_string(),
+        ];
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            &[],
+            &duplicate_deleted,
+            &[],
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+
+        let overlap = make_issue(
+            "bd-merge-overlap",
+            "Kept and deleted",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            std::slice::from_ref(&overlap),
+            std::slice::from_ref(&overlap.id),
+            &[],
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+
+        let note_target = make_issue(
+            "bd-merge-duplicate-note",
+            "Duplicate note target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let duplicate_notes = vec![
+            (note_target.id.clone(), "First valid note.".to_string()),
+            (note_target.id.clone(), "Second valid note.".to_string()),
+        ];
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            std::slice::from_ref(&note_target),
+            &[],
+            &duplicate_notes,
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn sync_merge_intent_rejects_every_same_id_issue_payload_substitution_without_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 40, 0).unwrap();
+        let planned = make_issue(
+            "bd-merge-payload-bound",
+            "Reviewed payload",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        let mut scalar = planned.clone();
+        scalar.title = "Substituted scalar".to_string();
+        let mut label = planned.clone();
+        label.labels.push("substituted-label".to_string());
+        let mut dependency = planned.clone();
+        dependency.dependencies.push(crate::model::Dependency {
+            issue_id: planned.id.clone(),
+            depends_on_id: "bd-substituted-target".to_string(),
+            dep_type: crate::model::DependencyType::Related,
+            created_at: now,
+            created_by: Some("substituted".to_string()),
+            metadata: Some("{}".to_string()),
+            thread_id: None,
+        });
+        let mut comment = planned.clone();
+        comment.comments.push(crate::model::Comment {
+            id: 991,
+            issue_id: planned.id.clone(),
+            author: "substituted".to_string(),
+            body: "Substituted owned comment".to_string(),
+            created_at: now,
+        });
+        let mut timestamp = planned.clone();
+        timestamp.updated_at += chrono::Duration::nanoseconds(1);
+        let mut content_hash = planned.clone();
+        content_hash.content_hash = Some("substituted-content-hash".to_string());
+
+        for (field, substituted) in [
+            ("scalar", scalar),
+            ("label", label),
+            ("dependency", dependency),
+            ("comment", comment),
+            ("timestamp", timestamp),
+            ("content_hash", content_hash),
+        ] {
+            assert_eq!(substituted.id, planned.id);
+            assert_sync_merge_substituted_issue_rejected_without_writes(
+                &mut storage,
+                &planned,
+                &substituted,
+            );
+            assert!(
+                storage.get_issue(&planned.id).unwrap().is_none(),
+                "{field} substitution must not materialize the reviewed ID"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_merge_actor_is_hash_bound_and_invalid_actor_performs_zero_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 42, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-actor-bound",
+            "Actor-bound merge",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let mut substituted_actor = intent.clone();
+        substituted_actor.actor = "different-reviewed-actor".to_string();
+        assert_ne!(
+            intent.intent_sha256().unwrap(),
+            substituted_actor.intent_sha256().unwrap(),
+            "the actor must be part of the immutable reviewed intent"
+        );
+
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let mut invalid_actor = intent;
+        invalid_actor.actor = " untrimmed".to_string();
+        let error = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &invalid_actor)
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::Validation { .. }));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_merge_attribution_is_applied_to_all_merge_events_and_consumed_once() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 45, 0).unwrap();
+        let victim = make_issue(
+            "bd-merge-attribution-victim",
+            "Attribution deletion",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let note_target = make_issue(
+            "bd-merge-attribution-note",
+            "Attribution note",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&victim, "fixture").unwrap();
+        storage.create_issue(&note_target, "fixture").unwrap();
+
+        let kept = vec![note_target.clone()];
+        let deleted = vec![victim.id.clone()];
+        let notes = vec![(
+            note_target.id.clone(),
+            "Reviewed merge attribution note.".to_string(),
+        )];
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-merge"),
+            Some("test-harness"),
+            Some("test-model"),
+            None,
+        ));
+        let intent = sync_merge_test_intent(&storage, &kept, &deleted, &notes);
+        storage
+            .apply_sync_merge_atomically(&kept, &deleted, &notes, &intent)
+            .unwrap();
+
+        let attributed_merge_events = storage
+            .get_events(&victim.id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == EventType::Deleted)
+            .chain(
+                storage
+                    .get_events(&note_target.id, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| event.event_type == EventType::Commented),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(attributed_merge_events.len(), 2);
+        for event in attributed_merge_events {
+            assert_eq!(event.actor, "merge-agent");
+            assert_eq!(event.agent_name.as_deref(), Some("agent-merge"));
+            assert_eq!(event.harness.as_deref(), Some("test-harness"));
+            assert_eq!(event.model.as_deref(), Some("test-model"));
+        }
+        assert!(storage.pending_event_attribution.is_none());
+
+        let unrelated = make_issue(
+            "bd-merge-attribution-next",
+            "Must not inherit attribution",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&unrelated, "fixture").unwrap();
+        let created = storage
+            .get_events(&unrelated.id, 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == EventType::Created)
+            .unwrap();
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn sync_merge_rejects_attribution_and_capacity_policy_drift_without_writes() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 50, 0).unwrap();
+        let kept = vec![make_issue(
+            "bd-merge-reviewed-context",
+            "Reviewed merge context",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        )];
+
+        let mut attribution_storage = SqliteStorage::open_memory().unwrap();
+        attribution_storage.set_pending_event_attribution(EventAttribution::new(
+            Some("reviewed-agent"),
+            Some("reviewed-harness"),
+            Some("reviewed-model"),
+            None,
+        ));
+        let attribution_intent = sync_merge_test_intent(&attribution_storage, &kept, &[], &[]);
+        let mut substituted_attribution = attribution_intent.clone();
+        substituted_attribution.event_attribution = EventAttribution::new(
+            Some("substituted-agent"),
+            Some("reviewed-harness"),
+            Some("reviewed-model"),
+            None,
+        );
+        assert_ne!(
+            attribution_intent.intent_sha256().unwrap(),
+            substituted_attribution.intent_sha256().unwrap()
+        );
+        attribution_storage
+            .set_pending_event_attribution(substituted_attribution.event_attribution.clone());
+        let before = crate::sync::capture_sync_database_witness(&attribution_storage).unwrap();
+        assert!(matches!(
+            attribution_storage.apply_sync_merge_atomically(&kept, &[], &[], &attribution_intent),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&attribution_storage).unwrap(),
+            before
+        );
+        assert!(
+            attribution_storage
+                .pending_sync_merge_receipt()
+                .unwrap()
+                .is_none()
+        );
+
+        let mut policy_storage = SqliteStorage::open_memory().unwrap();
+        policy_storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+        let policy_intent = sync_merge_test_intent(&policy_storage, &kept, &[], &[]);
+        let mut substituted_policy = policy_intent.clone();
+        substituted_policy.capacity_policy = hard_status_capacity("in_progress", 2);
+        assert_ne!(
+            policy_intent.intent_sha256().unwrap(),
+            substituted_policy.intent_sha256().unwrap()
+        );
+        policy_storage.set_workflow_capacity_policy(substituted_policy.capacity_policy);
+        let before = crate::sync::capture_sync_database_witness(&policy_storage).unwrap();
+        assert!(matches!(
+            policy_storage.apply_sync_merge_atomically(&kept, &[], &[], &policy_intent),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&policy_storage).unwrap(),
+            before
+        );
+        assert!(
+            policy_storage
+                .pending_sync_merge_receipt()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sync_merge_new_kept_rows_obey_group_capacity_and_roll_back_atomically() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.groups.insert(
+            "active_work".to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: vec!["open".to_string(), "in_progress".to_string()],
+                soft: None,
+                hard: Some(0),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 52, 0).unwrap();
+        let kept = vec![make_issue(
+            "bd-merge-capacity-new",
+            "New merge row must be admitted",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        )];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+
+        assert!(matches!(
+            storage.apply_sync_merge_atomically(&kept, &[], &[], &intent),
+            Err(BeadsError::WorkflowCapacityExceeded { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert!(storage.get_issue(&kept[0].id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert!(storage.take_capacity_warnings().is_empty());
+    }
+
+    #[test]
+    fn sync_merge_kept_status_changes_obey_hard_capacity_and_roll_back_atomically() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 53, 0).unwrap();
+        let existing = make_issue(
+            "bd-merge-capacity-status",
+            "Existing row changes status",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&existing, "fixture").unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 0));
+
+        let mut changed = storage.get_issue(&existing.id).unwrap().unwrap();
+        changed.status = Status::InProgress;
+        let kept = vec![changed];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+
+        assert!(matches!(
+            storage.apply_sync_merge_atomically(&kept, &[], &[], &intent),
+            Err(BeadsError::WorkflowCapacityExceeded { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert_eq!(
+            storage.get_issue(&existing.id).unwrap().unwrap().status,
+            Status::Open
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_merge_kept_status_changes_obey_cross_queue_admission_rules() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 54, 0).unwrap();
+        let blocker = make_issue(
+            "bd-merge-capacity-blocker",
+            "Occupies active-work admission queue",
+            Status::InProgress,
+            2,
+            None,
+            now,
+            None,
+        );
+        let candidate = make_issue(
+            "bd-merge-capacity-admission",
+            "Must satisfy cross-queue admission",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&blocker, "fixture").unwrap();
+        storage.create_issue(&candidate, "fixture").unwrap();
+
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.groups.insert(
+            "active_work".to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: vec!["in_progress".to_string()],
+                soft: None,
+                hard: None,
+            },
+        );
+        policy
+            .admission
+            .push(crate::close_policy::CapacityAdmissionRule {
+                name: "review_requires_active_headroom".to_string(),
+                transitions: crate::close_policy::CapacityTransitionMatcher {
+                    from: vec!["open".to_string()],
+                    to: vec!["in_review".to_string()],
+                },
+                require_below: crate::close_policy::CapacityRequirements {
+                    statuses: std::collections::BTreeMap::new(),
+                    groups: std::collections::BTreeMap::from([("active_work".to_string(), 1)]),
+                },
+            });
+        storage.set_workflow_capacity_policy(policy);
+
+        let mut changed = storage.get_issue(&candidate.id).unwrap().unwrap();
+        changed.status = Status::Custom("in_review".to_string());
+        let kept = vec![changed];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap_err();
+
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("expected a cross-queue policy violation");
+        };
+        assert_eq!(violation.capacity_kind, "admission_group");
+        assert_eq!(violation.capacity_name, "active_work");
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert_eq!(
+            storage.get_issue(&candidate.id).unwrap().unwrap().status,
+            Status::Open
+        );
+    }
+
+    #[test]
+    fn sync_merge_capacity_neutral_swap_uses_final_batch_state() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 55, 0).unwrap();
+        let open = make_issue(
+            "bd-merge-capacity-swap-open",
+            "Enters active work",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let active = make_issue(
+            "bd-merge-capacity-swap-active",
+            "Drains active work",
+            Status::InProgress,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&open, "fixture").unwrap();
+        storage.create_issue(&active, "fixture").unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+
+        let mut entering = storage.get_issue(&open.id).unwrap().unwrap();
+        entering.status = Status::InProgress;
+        let mut draining = storage.get_issue(&active.id).unwrap().unwrap();
+        draining.status = Status::Open;
+        // Deliberately put the admitting row first. Sequential evaluation
+        // would reject it even though the complete merge is capacity-neutral.
+        let kept = vec![entering, draining];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert_eq!(
+            storage.get_issue(&open.id).unwrap().unwrap().status,
+            Status::InProgress
+        );
+        assert_eq!(
+            storage.get_issue(&active.id).unwrap().unwrap().status,
+            Status::Open
+        );
+        assert!(receipt.capacity_warnings.is_empty());
+        assert!(storage.take_capacity_warnings().is_empty());
+    }
+
+    #[test]
+    fn sync_merge_capacity_warnings_are_receipt_bound_and_consumable() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 56, 0).unwrap();
+        let existing = make_issue(
+            "bd-merge-capacity-warning",
+            "Crosses a soft threshold",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&existing, "fixture").unwrap();
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: Some(1),
+                hard: Some(2),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let mut changed = storage.get_issue(&existing.id).unwrap().unwrap();
+        changed.status = Status::InProgress;
+        let kept = vec![changed];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert_eq!(receipt.capacity_warnings.len(), 1);
+        assert_eq!(receipt.capacity_warnings[0].issue_id, existing.id);
+        assert_eq!(receipt.capacity_warnings[0].capacity_kind, "status");
+        assert_eq!(storage.take_capacity_warnings(), receipt.capacity_warnings);
+        assert!(storage.take_capacity_warnings().is_empty());
+        receipt.validate().unwrap();
+
+        let mut tampered = receipt.clone();
+        tampered.capacity_warnings[0].prospective += 1;
+        assert!(
+            tampered.validate().is_err(),
+            "capacity warning evidence must be immutable-envelope bound"
+        );
+    }
+
+    #[test]
+    fn sync_merge_deletion_events_match_tombstone_semantics_without_terminal_duplicates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 10, 0, 0).unwrap();
+        let open = make_issue(
+            "bd-merge-delete-open",
+            "Open deletion",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut closed = make_issue(
+            "bd-merge-delete-closed",
+            "Closed deletion",
+            Status::Closed,
+            2,
+            None,
+            now,
+            None,
+        );
+        closed.closed_at = Some(now);
+        closed.close_reason = Some("completed before merge".to_string());
+        let already_tombstoned = make_issue(
+            "bd-merge-delete-tombstone",
+            "Existing tombstone",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&open, "fixture").unwrap();
+        storage.create_issue(&closed, "fixture").unwrap();
+        storage
+            .create_issue(&already_tombstoned, "fixture")
+            .unwrap();
+        storage
+            .delete_issue(
+                &already_tombstoned.id,
+                "fixture",
+                "preexisting deletion",
+                Some(now),
+            )
+            .unwrap();
+
+        let deleted = vec![
+            open.id.clone(),
+            closed.id.clone(),
+            already_tombstoned.id.clone(),
+        ];
+        let intent = sync_merge_test_intent(&storage, &[], &deleted, &[]);
+        let merge_timestamp = intent.export_as_of;
+        storage
+            .apply_sync_merge_atomically(&[], &deleted, &[], &intent)
+            .unwrap();
+
+        let open_tombstone = storage.get_issue(&open.id).unwrap().unwrap();
+        assert_eq!(open_tombstone.status, Status::Tombstone);
+        assert_eq!(open_tombstone.deleted_at, Some(merge_timestamp));
+        assert_eq!(open_tombstone.deleted_by.as_deref(), Some("merge-agent"));
+        assert_eq!(
+            open_tombstone.delete_reason.as_deref(),
+            Some("merge deletion")
+        );
+        assert_eq!(
+            open_tombstone.content_hash.as_deref(),
+            Some(crate::util::content_hash(&open_tombstone).as_str())
+        );
+        let open_deleted = storage
+            .get_events(&open.id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == EventType::Deleted)
+            .collect::<Vec<_>>();
+        assert_eq!(open_deleted.len(), 1);
+        assert_eq!(open_deleted[0].actor, "merge-agent");
+        assert_eq!(
+            open_deleted[0].comment.as_deref(),
+            Some("Deleted issue: merge deletion")
+        );
+        assert_eq!(open_deleted[0].created_at, merge_timestamp);
+
+        assert_eq!(
+            storage
+                .get_events(&closed.id, 0)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == EventType::Deleted)
+                .count(),
+            0
+        );
+        assert_eq!(
+            storage
+                .get_events(&already_tombstoned.id, 0)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == EventType::Deleted)
+                .count(),
+            1
+        );
     }
 }

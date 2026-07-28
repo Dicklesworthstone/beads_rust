@@ -100,6 +100,11 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 - `reliability_audit`: the matching anomaly evidence record
   (`source: "sync.status"`, `anomalies[].code/severity/message`), in the
   same shape as `report.reliability_audit` from doctor.
+- `git_export`: a compatibility slot, not a health probe. Sync always emits
+  `{available:false, reason:"not_probed", diagnostic_command:"br vcs-status --json"}`
+  and omits the former optional observation fields. Consumers that need
+  tracked/worktree/index/hash visibility must explicitly run the isolated,
+  bounded `br vcs-status --json` diagnostic.
 
 The same records are emitted through `tracing` with target `br::reliability` so field logs can be correlated with doctor JSON, quarantined artifacts, and replay fixtures.
 

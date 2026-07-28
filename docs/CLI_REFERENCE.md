@@ -1373,10 +1373,14 @@ br sync [OPTIONS]
 **SAFETY GUARANTEES:**
 - NEVER executes git commands or auto-commits
 - NEVER modifies files outside the selected workspace's `.beads/` (unless `--allow-external-jsonl`)
-- Uses atomic temp-file-then-rename pattern
+- Publishes JSONL/base/manifest files with checked temporary-file replacement;
+  database mutations use transactions and operation-specific rollback guards
 - Safety guards prevent accidental data loss
+- `--status` does not probe Git; its stable `git_export` compatibility object
+  reports `available: false`, `reason: "not_probed"`, and
+  `diagnostic_command: "br vcs-status --json"`
 
-**Modes (one required unless --status):**
+**Modes (exactly one required):**
 | Option | Description |
 |--------|-------------|
 | `--flush-only` | Export database to JSONL |
@@ -1384,6 +1388,8 @@ br sync [OPTIONS]
 | `--merge` | Three-way merge `.beads/beads.base.jsonl`, SQLite, and JSONL |
 | `--reconcile` | Additively reconcile JSONL into the database (lossless, previewable) |
 | `--status` | Show sync status (read-only) |
+| `--witness` | Compute a deterministic read-only JSONL integrity witness |
+| `--reconcile-additive` | Plan a lossless exact-ID JSONL-to-SQLite reconciliation (read-only by default) |
 
 **Options:**
 | Option | Description |
@@ -1398,6 +1404,9 @@ br sync [OPTIONS]
 | `--rename-prefix` | During import, rewrite mismatched issue IDs into the configured default prefix |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--dry-run` | With `--reconcile`, preview the plan without any mutation |
+| `--apply` | Apply a conflict-free `--reconcile-additive` plan transactionally |
+| `--expect-plan-sha256 <SHA256>` | Required with additive `--apply`; must equal the exact reviewed dry-run token |
+| `--resolve-source-id <ISSUE_ID>` | Explicitly choose the allowed non-lifecycle JSONL scalar fields for one reviewed shared-ID conflict when JSONL is not older; repeat per ID |
 | `--robot` | Machine-readable output |
 
 **Merge semantics:**
@@ -1424,6 +1433,16 @@ br sync [OPTIONS]
 - Recovery artifacts are preserved under `.beads/.br_recovery/` when br has to move aside a damaged SQLite family before rebuilding.
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
+**Additive reconciliation semantics:**
+- `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.
+- The planner preserves SQLite-only issues, audit events, close metadata, gate-result history, runtime config, and every unmodified relation row. It never performs content-hash identity merges, physical deletes, JSONL writes, base-snapshot writes, or merge-note writes.
+- JSONL-only IDs are created. For a shared ID, only an `open`/`in_progress` to `closed` transition whose scalar diff is limited to `status`, `updated_at`, `closed_at`, and `close_reason` is accepted automatically. Other drift is a conflict. Exact-ID `--resolve-source-id` is limited to the documented non-lifecycle scalar whitelist and is rejected when JSONL is older than SQLite.
+- Explicit resolution never authorizes relation drift, tombstone resurrection, live-to-tombstone conversion, external-reference collision, orphan dependencies, or a newly introduced blocking cycle. Superfluous, duplicate, blank, and unknown resolution IDs are rejected.
+- Comment IDs are storage-local surrogates. Every comment on a newly created issue is deterministically allocated from the next contiguous database-owned range and witnessed without changing issue ownership, author, text, or timestamp.
+- `--apply` requires `--expect-plan-sha256`, re-resolves the terminal workspace and configured database, acquires that workspace's writer lock, re-plans, and compares the complete plan to the reviewed token before mutation. Source drift, database or raw-storage drift, resolution-set drift, event drift, child-table drift, count drift, schema/sequence drift, health-gate failure, or cache-projection mismatch rolls the transaction back.
+- Stale or missing `issues.content_hash` values are explicit token-bound repairs. They never alter issue timestamps, relations, dirty tracking, or audit events, and a second plan must be a true no-op.
+- The receipt distinguishes distinct conflicted issues from total conflict observations; includes complete ID/diff/remap manifests and their SHA-256 digests; and reports pre-existing, projected, and newly introduced blocking-cycle components.
+
 **Examples:**
 ```bash
 # Export to JSONL explicitly; useful as a final check before committing .beads/
@@ -1449,12 +1468,102 @@ br sync --import-only --rebuild --rename-prefix
 # Preview an additive reconcile (read-only), then apply it
 br sync --reconcile --dry-run --json
 br sync --reconcile --json
+# Inspect a lossless additive recovery plan
+br sync --reconcile-additive --robot > /tmp/additive-plan.json
+
+# If a scalar conflict is intentionally source-authoritative, re-plan with the
+# exact ID. Repeat the flag for each independently reviewed conflict.
+br sync --reconcile-additive \
+  --resolve-source-id bd-example \
+  --robot > /tmp/additive-plan.json
+
+# Apply only the exact conflict-free plan that was reviewed.
+br sync --reconcile-additive \
+  --resolve-source-id bd-example \
+  --apply \
+  --expect-plan-sha256 "$(jq -r .plan_sha256 /tmp/additive-plan.json)" \
+  --robot
 
 # Check sync status
 br sync --status
 
+# Explicitly inspect the JSONL export's Git visibility
+br vcs-status --json
+
 # Export with verbose logging
 br sync --flush-only -v
+```
+
+---
+
+### vcs-status
+
+Explicitly inspect Git visibility for the configured JSONL export. This is a
+separate, user-requested diagnostic capability; no `br sync` mode delegates to
+it or executes Git.
+
+```bash
+br vcs-status [--jsonl PATH] [--allow-external-jsonl] [--timeout-ms MILLISECONDS] [--json|--robot]
+```
+
+The machine-readable `br.vcs-export-status.v2` record reports:
+
+- `observation_atomic: false`, because its exact evidence is collected by
+  sequential probes rather than a transactional Git snapshot;
+- repository `object_format` (`sha1` or `sha256`);
+- exact HEAD and stage-zero index identities (`mode`, `object_type`, and
+  `object_id`), plus explicit unmerged stages;
+- `index_clean`, computed from exact HEAD/index mode and object identity;
+- `worktree_state`: `clean`, `modified`, `deleted`, `untracked`, `ignored`,
+  `unmerged`, `comparison_unavailable`, or `absent`;
+- optional `worktree_clean`, which is omitted rather than guessed when an
+  exact comparison is unavailable;
+- a stable `worktree_comparison_reason` for unsupported index flags/modes,
+  configured content transforms, unmerged indexes, or changed file identity;
+- filter-free `worktree_raw_git_blob_hash` and `worktree_raw_sha256`, computed
+  in-process from one securely opened immutable JSONL snapshot.
+
+Repository and index evidence remains available when only the worktree
+comparison is unavailable. Top-level unavailable results are reserved for
+repository/probe failures and carry stable reasons such as `git_unavailable`,
+`not_git_repository`, `path_unavailable`, `probe_timed_out`,
+`probe_output_limit`, or `probe_failed`.
+
+The command uses one shared execution budget across observation phases. It redirects stdout and
+stderr to separate anonymous temporary files and polls each file against a
+fixed limit. The probe clock starts before secure source capture. Capture,
+Git subprocesses, capture reads, and in-process blob hashing check the shared
+deadline between bounded operations; an individual filesystem read cannot
+itself be preempted. On timeout or runner failure, br terminates and reaps the
+direct child before returning; mandatory cleanup may extend past the probe
+budget. This preserves distinct `probe_timed_out` and `probe_output_limit`
+results without waiting for pipe EOF from a descendant that only inherited an
+output descriptor.
+
+Prompts, optional locks, hooks, fsmonitor, untracked-cache writes, paging, lazy
+object fetches, and inherited Git redirections are disabled, and pathspecs are
+literal. Fixed-key config probes intentionally observe effective
+system/global/common/worktree settings; any configured content transform makes
+the comparison unavailable without exposing its path. The command also
+inspects repository-local attributes before comparing raw worktree bytes and
+never executes clean/process filters or text conversions. Its sequential
+HEAD/index/config/worktree observations are explicitly non-atomic. The selected
+Git executable is nevertheless trusted: this diagnostic is not a process
+sandbox and does not promise to terminate arbitrary daemonized descendants. External
+paths require `--allow-external-jsonl` before the leaf is opened and are
+reported only as a SHA-256 descriptor; raw external paths and Git stderr are
+not emitted.
+
+```bash
+# Inspect the configured .beads/issues.jsonl
+br vcs-status
+br vcs-status --json
+
+# Inspect an explicitly authorized external JSONL without exposing its path
+br vcs-status \
+  --jsonl /private/export/issues.jsonl \
+  --allow-external-jsonl \
+  --json
 ```
 
 ---
@@ -1686,6 +1795,60 @@ Checks database integrity, schema compatibility, and configuration.
 | `--repair` | Attempt to repair detected issues by rebuilding DB from JSONL |
 | `--allow-repeated-repair` | Allow another JSONL rebuild after prior failed recovery evidence |
 
+#### Reviewed schema migration
+
+Ordinary commands never upgrade an existing database across a schema-version
+boundary. If the database is on a supported older version, use the explicit
+receipt-bound lifecycle:
+
+```bash
+# Read-only inspection. Save and review the complete JSON receipt.
+br doctor migrate-schema plan --json > migration-plan.json
+
+# Apply only if the database still matches the exact reviewed plan.
+br doctor migrate-schema apply \
+  --plan-token "$(jq -r .plan_token migration-plan.json)" \
+  --json > migration-applied.json
+
+# Verify that undo is still safe without changing the database.
+br doctor migrate-schema undo \
+  "$(jq -r .run_id migration-applied.json)" \
+  --dry-run --json
+
+# Restore the exact pre-migration SQLite family if necessary.
+br doctor migrate-schema undo \
+  "$(jq -r .run_id migration-applied.json)" \
+  --json
+```
+
+`plan` currently accepts only the explicitly reviewed 13→current and
+14→current transitions. Its deterministic token binds the absolute database
+path, a complete logical row/schema witness, and the exact migration forecast.
+The receipt reports every raw SQLite family member, but raw page/WAL/SHM/journal
+layout is deliberately not token-bound: process close and checkpoint may
+rewrite or retire those files without changing database semantics. `apply`
+captures and verifies a fresh byte-exact family backup after logical-token
+validation and before migration.
+
+`apply` re-plans under database-family write authority and rejects stale tokens
+before allocating a run. It writes a verified, private recovery bundle and a
+prepared receipt before running the reviewed steps in one `BEGIN IMMEDIATE`
+transaction. The applied receipt records the complete before/after witnesses,
+actual effects, post-commit attestation, and an undo command. A committed
+migration that fails post-commit attestation still receives an undo-capable
+receipt and is reported as an error.
+
+`undo` hash-validates the prepared/applied receipt chain and recovery bundle,
+then refuses if the complete post-migration logical state changed. Raw-family
+equality is the fail-closed fallback only when post-commit logical attestation
+could not be captured; ordinary SQLite checkpoint churn is not mistaken for
+user data. Undo moves the applied SQLite family into a retained quarantine
+before restoring the byte-exact pre-state; it never deletes the displaced
+state. An interrupted undo resumes component by component, and a completed
+undo is idempotent. Recovery directories are mode `0700` and receipt/backup
+files are mode `0600` on Unix. Runs are retained under
+`.beads/.br_recovery/schema-migrations/`.
+
 ---
 
 ### info
@@ -1718,7 +1881,8 @@ br schema [TARGET] [OPTIONS]
 
 **Targets:** `all`, `issue`, `issue-with-counts`, `issue-details`,
 `ready-issue`, `stale-issue`, `blocked-issue`, `tree-node`, `statistics`,
-`error`.
+`coordination-status`, `additive-reconciliation`, `vcs-status`, `error`, and
+`commands`.
 
 **Options:**
 | Option | Description |

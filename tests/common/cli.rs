@@ -239,6 +239,35 @@ where
     )
 }
 
+fn configure_test_command_environment<E, K, V>(cmd: &mut Command, root: &Path, env_vars: E)
+where
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    // Default e2e runs un-throttled so history-mechanics tests (backup
+    // chronology, prune, restore) observe one `.br_history` snapshot per
+    // mutation. Set before caller `env_vars` so a test can override this to
+    // exercise the #313 snapshot throttle.
+    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
+    // Keep each fixture's Git configuration hermetic by default, while still
+    // allowing tests of effective global configuration to supply another
+    // HOME explicitly.
+    cmd.env("HOME", root);
+    // `error`, not `beads_rust=debug`. Debug tracing goes to stderr, which
+    // (a) `br doctor`'s own `rust_log` check flags as an agent-hostile
+    // setting — so every "healthy workspace" doctor assertion failed purely
+    // because the harness set it — and (b) drowns the assertions that match
+    // on stderr contents. Tests that specifically want verbose tracing pass
+    // RUST_LOG through the caller `env_vars`, which are applied after these
+    // defaults and so still win.
+    cmd.env("RUST_LOG", "error");
+    cmd.envs(env_vars);
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("PATH", deduplicated_br_path());
+}
+
 fn run_br_full_in_root<I, S, E, K, V>(
     root: &Path,
     log_dir: &Path,
@@ -265,24 +294,7 @@ where
     } else {
         clear_inherited_br_env(&mut cmd);
     }
-    // Default e2e runs un-throttled so history-mechanics tests (backup
-    // chronology, prune, restore) observe one `.br_history` snapshot per
-    // mutation. Set before caller `env_vars` so a test can override this to
-    // exercise the #313 snapshot throttle.
-    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
-    cmd.envs(env_vars);
-    cmd.env("NO_COLOR", "1");
-    // `error`, not `beads_rust=debug`. Debug tracing goes to stderr, which
-    // (a) `br doctor`'s own `rust_log` check flags as an agent-hostile
-    // setting — so every "healthy workspace" doctor assertion failed purely
-    // because the harness set it — and (b) drowns the assertions that match
-    // on stderr contents. Tests that specifically want verbose tracing pass
-    // RUST_LOG through `run_br_with_env`, which is applied above and so still
-    // wins over this default.
-    cmd.env("RUST_LOG", "error");
-    cmd.env("RUST_BACKTRACE", "1");
-    cmd.env("PATH", deduplicated_br_path());
-    cmd.env("HOME", root);
+    configure_test_command_environment(&mut cmd, root, env_vars);
 
     if let Some(input) = stdin_input {
         cmd.write_stdin(input);
@@ -389,12 +401,30 @@ pub fn parse_list_issues(stdout: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrWorkspace, is_inside_beads_workspace, isolated_temp_root, should_clear_inherited_br_env,
-        should_preserve_smoke_env,
+        BrWorkspace, configure_test_command_environment, is_inside_beads_workspace,
+        isolated_temp_root, should_clear_inherited_br_env, should_preserve_smoke_env,
     };
+    use assert_cmd::Command;
     use std::ffi::OsStr;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn caller_home_overrides_the_hermetic_default() {
+        let mut command = Command::new("br");
+        configure_test_command_environment(
+            &mut command,
+            Path::new("/fixture-default-home"),
+            [("HOME", "/caller-selected-home")],
+        );
+
+        let home = command
+            .get_envs()
+            .find_map(|(key, value)| (key == OsStr::new("HOME")).then_some(value))
+            .flatten();
+        assert_eq!(home, Some(OsStr::new("/caller-selected-home")));
+    }
 
     #[test]
     fn inherited_beads_and_toon_env_are_cleared() {

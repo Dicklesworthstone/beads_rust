@@ -282,6 +282,13 @@ impl CapacityPolicy {
             || !self.admission.is_empty()
             || !self.scopes.is_empty()
     }
+
+    /// Whether this policy has no capacity behavior to bind or enforce.
+    /// Serde `skip_serializing_if` hook for receipt fields.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.is_active()
+    }
 }
 
 /// Status/group limits for one admission scope (GitHub #384 phase 5).
@@ -402,6 +409,12 @@ impl CapacityExemptionPolicy {
                 .providers
                 .iter()
                 .any(|candidate| candidate.trim().eq_ignore_ascii_case(target))
+    }
+
+    /// Whether this policy has no capacity behavior to bind or enforce.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.is_enabled()
     }
 }
 
