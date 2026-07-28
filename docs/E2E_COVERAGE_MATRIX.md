@@ -127,7 +127,8 @@
 
 | Command | Key Flags | Mutating | Test File(s) | Status |
 |---------|-----------|----------|--------------|--------|
-| `sync` | `--flush-only`, `--import-only`, `--merge`, `--status`, `--force`, `--allow-external-jsonl`, `--manifest`, `--error-policy`, `--orphans`, `--robot` | ✏️ | `e2e_sync_artifacts.rs`, `e2e_sync_failure_injection.rs`, `e2e_sync_fuzz_edge_cases.rs`, `e2e_sync_git_safety.rs`, `e2e_sync_preflight_integration.rs`, `jsonl_import_export.rs` | ✅ |
+| `sync` | `--flush-only`, `--import-only`, `--merge`, `--status`, `--witness`, `--reconcile-additive`, `--apply`, `--expect-plan-sha256`, `--force`, `--force-db`, `--force-jsonl`, `--rename-prefix`, `--rebuild`, `--allow-external-jsonl`, `--manifest`, `--error-policy`, `--orphans`, `--robot` | ✏️ | `e2e_sync_artifacts.rs`, `e2e_sync_failure_injection.rs`, `e2e_sync_fuzz_edge_cases.rs`, `e2e_sync_git_safety.rs`, `e2e_sync_status_health.rs`, `e2e_sync_preflight_integration.rs`, `e2e_basic_lifecycle.rs`, `jsonl_import_export.rs` | ✅ |
+| `vcs-status` | `--jsonl`, `--allow-external-jsonl`, `--timeout-ms`, `--robot`, global JSON/TOON | 📖 | `e2e_vcs_status.rs`, VCS runner unit tests | ✅ |
 
 **Safety-critical test files:**
 - `e2e_sync_git_safety.rs` - verifies no git operations
@@ -155,7 +156,7 @@
 
 | Command | Key Flags | Mutating | Test File(s) | Status |
 |---------|-----------|----------|--------------|--------|
-| `doctor` | - | 📖 | `e2e_basic_lifecycle.rs`, `conformance.rs` | ✅ |
+| `doctor` | diagnostics, `--repair`, `migrate-schema plan/apply/undo`, migration `--dry-run` | ✏️ | `e2e_basic_lifecycle.rs`, `e2e_doctor_chokepoint.rs`, `conformance.rs`, focused schema-migration unit tests | ✅ |
 | `info` | `--schema`, `--whats-new`, `--thanks` | 📖 | `e2e_workspace_scenarios.rs`, `e2e_env_overrides.rs`, `e2e_global_flags.rs`, `conformance.rs` | 🔶 |
 | `where` | - | 📖 | `e2e_basic_lifecycle.rs` | ✅ |
 | `version` | - | 📖 | `e2e_basic_lifecycle.rs` | ✅ |

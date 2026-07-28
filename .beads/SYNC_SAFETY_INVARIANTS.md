@@ -11,10 +11,10 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 
 | ID | Non-Goal | Rationale |
 |----|----------|-----------|
-| NG-1 | **Execute git commands** | Prevents working tree side effects; users control git workflow |
+| NG-1 | **Execute Git commands from sync** | Prevents implicit working tree side effects; users explicitly request any VCS diagnostic |
 | NG-2 | **Install or invoke git hooks** | Non-invasive design; users add hooks manually if desired |
 | NG-3 | **Run as daemon or background process** | Simple CLI only; no persistent state outside .beads/ |
-| NG-4 | **Auto-commit changes** | Every git operation requires explicit user action |
+| NG-4 | **Auto-commit changes** | Every Git operation remains user-controlled; `br vcs-status` is read-only |
 | NG-5 | **Delete files outside .beads/** | Minimal filesystem footprint; data safety by confinement |
 | NG-6 | **Create files outside .beads/** (without explicit opt-in) | Path confinement by default |
 | NG-7 | **Modify files outside .beads/** | All mutations confined to project metadata |
@@ -68,9 +68,25 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 
 | ID | Risk | Invariant | Test Strategy |
 |----|------|-----------|---------------|
-| NGI-1 | CRITICAL | br sync NEVER executes `git` subprocess commands | Static analysis: grep for `Command::new("git")` returns zero results |
-| NGI-2 | CRITICAL | br sync NEVER calls libgit2 or gitoxide | Dependency audit: verify no git libraries in Cargo.toml |
-| NGI-3 | CRITICAL | br sync NEVER modifies `.git/` directory | Unit test: mock filesystem, assert no .git/ access |
+| NGI-1 | CRITICAL | Neither sync source boundary has subprocess, Git-library, or VCS-adapter authority | Fail-closed recursive source validation over `src/sync/**/*.rs` and `src/cli/commands/sync.rs`; reject missing/unreadable/non-UTF-8/symlinked/special entries, direct/aliased process construction, and indirect VCS delegation |
+| NGI-2 | CRITICAL | br sync has no embedded runtime Git-library authority | Parsed manifest audit rejects direct normal/target-runtime git2/libgit2, gitoxide/gix, legacy git-repository family edges and aliases; strict `cargo tree -e normal` separately proves the resolved transitive runtime closure while allowing build/dev tooling such as vergen-gix |
+| NGI-3 | CRITICAL | Every exercised sync branch leaves the complete `.git/` tree unchanged | E2E: fake `git` first on PATH detects ordinary executable-name dispatch, plus before/after equality of every path, file byte, symlink target, and Unix mode, including root/index/logs/refs/objects/config/HEAD with zero exclusions; static source/runtime-dependency guards cover absolute-path, shell, linked, and adapter authority surfaces |
+| NGI-4 | HIGH | `sync --status` never probes VCS and emits a stable compatibility pointer | E2E inside/outside a Git repository: exact `{available:false, reason:"not_probed", diagnostic_command:"br vcs-status --json"}` object |
+| NGI-5 | HIGH | VCS observation is available only through the explicit budgeted `br vcs-status` command | E2E tracked/dirty/missing-Git/non-repo semantics, deadline-aware secure capture/hash, direct-child termination/reap before return, anonymous-file output bounds, inherited-descriptor return, non-UTF-8 path, and external-path redaction; an individual filesystem read and cleanup may extend the probe budget, the selected executable remains trusted, and arbitrary descendants are not claimed sandboxed |
+
+### 2.6 Additive Reconciliation Invariants
+
+| ID | Risk | Invariant | Test Strategy |
+|----|------|-----------|---------------|
+| AR-1 | CRITICAL | Planning is read-only and emits a deterministic v2 plan token | Snapshot the complete DB family and JSONL bytes before/after repeated plans |
+| AR-2 | CRITICAL | Apply requires the exact token from an identically configured reviewed plan | Reject missing, malformed, mismatched, stale-source, stale-DB, and resolution-set-drift tokens |
+| AR-3 | CRITICAL | No authoritative issue, relation, child-evidence, config, event, JSONL, base, or merge-note row is deleted; only token-bound export/dirty/metadata bookkeeping and independently projected derived caches may be replaced | Seed every table; compare complete typed-row SHA-256 witnesses before/after and require exact projected bookkeeping/cache state |
+| AR-4 | CRITICAL | Shared scalar drift fails closed except a field-bounded monotonic closure or exact-ID source resolution | Unit-test newer/equal/older drift, closure field boundaries, redundant/unknown resolution IDs |
+| AR-5 | CRITICAL | Relation drift, tombstone resurrection, live-to-tombstone, or new blocking cycles cannot be overridden | Adversarial plan/apply rollback tests |
+| AR-6 | HIGH | Comment surrogate collisions are deterministically remapped without changing logical comment payload | Five-collision fixture, remap witness digest, apply, and true second no-op |
+| AR-7 | HIGH | Derived blocked cache and child counters equal an independent issue-graph projection | Seed stale/corrupt caches; plan, rebuild, compare exact maps and digests |
+| AR-8 | HIGH | Strict source parsing rejects unknown or silently normalized fields | Unknown-field, enum-alias, blank optional, ignored content-hash, and omitted-option round-trip tests |
+| AR-9 | HIGH | Receipt JSON Schema and command envelope are discoverable through `br schema` | Schema catalog and enum-domain tests |
 
 ---
 
@@ -103,6 +119,9 @@ These events should be logged at DEBUG level for forensic analysis:
 | Issue import (update) | `"Updating existing issue {id} (old_hash -> new_hash)"` |
 | Issue skip (tombstone) | `"Skipping tombstoned issue {id}"` |
 | Collision detected | `"Collision detected for {id}: {collision_type}"` |
+| Additive plan | `"Planned additive reconciliation"` with token prefix, counts, and status |
+| Additive apply | `"Applying reviewed additive reconciliation transaction"` |
+| Additive rollback | `"Rolled back additive reconciliation transaction"` with reason |
 
 ### 3.3 Structured Logging Format
 
@@ -139,7 +158,7 @@ All safety-critical logs MUST include:
 | Atomic Write | ✓ Required | ○ Recommended | ○ Optional |
 | Data Loss Prevention | ✓ Required | ✓ Required | ○ Recommended |
 | Input Validation | ✓ Required | ✓ Required | ✓ Required |
-| No Git Operations | ✓ Required (static) | ○ Optional | N/A |
+| No Git Operations | ✓ Required (fail-closed) | ✓ Required (all modes) | N/A |
 | Logging | ✓ Required | ○ Optional | N/A |
 
 ---

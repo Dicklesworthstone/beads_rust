@@ -553,7 +553,7 @@ HARNESS_ARTIFACTS=1 cargo test --test e2e_sync_git_safety -- --nocapture
 
 ```bash
 # Run with explicit timeout
-timeout 120 cargo test e2e_sync --release
+timeout 120 cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status
 
 # Check for lock contention
 lsof +D /tmp/tmp.* 2>/dev/null | grep -E '\.db'
@@ -583,7 +583,7 @@ BD_BINARY=/path/to/bd scripts/conformance.sh
 
 ```bash
 # Run serially to avoid race conditions
-cargo test e2e_sync --release -- --test-threads=1
+cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status -- --test-threads=1
 ```
 
 ### Cleanup Stale State
