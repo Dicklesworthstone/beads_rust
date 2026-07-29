@@ -7,19 +7,21 @@ use super::{
     report_auto_flush_failure, resolve_issue_id, retry_mutation_with_jsonl_recovery,
 };
 use crate::cli::{
-    DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepListArgs, DepRemoveArgs, DepTreeArgs,
-    OutputFormat, resolve_output_format_basic_with_outer_mode,
+    DepAddArgs, DepCommands, DepCyclesArgs, DepDirection, DepImportArgs, DepListArgs,
+    DepRemoveArgs, DepTreeArgs, OutputFormat, resolve_output_format_basic_with_outer_mode,
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, truncate_title};
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode, Theme};
-use crate::storage::SqliteStorage;
+use crate::storage::{BulkDependencyInsert, SqliteStorage};
 use crate::util::id::{IdResolver, ResolverConfig};
 use rich_rust::prelude::*;
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// Execute the dep command.
@@ -36,6 +38,7 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     match command {
         DepCommands::Add(args) => execute_dep_add(args, json, cli, ctx, &beads_dir),
+        DepCommands::Import(args) => execute_dep_import(args, json, cli, ctx, &beads_dir),
         DepCommands::Remove(args) => execute_dep_remove(args, json, cli, ctx, &beads_dir),
         DepCommands::List(args) => execute_dep_list(args, cli, ctx, &beads_dir),
         DepCommands::Tree(args) => execute_dep_tree(args, json, cli, ctx, &beads_dir),
@@ -72,7 +75,7 @@ pub fn execute_with_storage_ctx(
             dep_cycles(args, &storage_ctx.storage, json, ctx)?;
             Ok(true)
         }
-        DepCommands::Add(_) | DepCommands::Remove(_) => Ok(false),
+        DepCommands::Add(_) | DepCommands::Import(_) | DepCommands::Remove(_) => Ok(false),
     }
 }
 
@@ -124,6 +127,21 @@ fn execute_dep_remove(
         local_beads_dir,
         auto_flush_external,
     )
+}
+
+fn execute_dep_import(
+    args: &DepImportArgs,
+    _json: bool,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    local_beads_dir: &Path,
+) -> Result<()> {
+    let mut storage_ctx = config::open_storage_with_cli(local_beads_dir, cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    let config_layer = storage_ctx.load_config(cli)?;
+    let actor = config::resolve_actor(&config_layer);
+    let dependencies = read_dependency_imports(&args.path)?;
+    dep_import(args, &dependencies, &mut storage_ctx, &actor, ctx)
 }
 
 fn execute_dep_list(
@@ -311,6 +329,157 @@ struct DepActionResult {
     action: String,
 }
 
+/// JSON output for dep import operations.
+#[derive(Serialize)]
+struct DepImportResult {
+    status: String,
+    input_path: String,
+    imported: usize,
+    skipped: usize,
+    total_edges: usize,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepImportLine {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    issue_id: Option<String>,
+    #[serde(default)]
+    depends_on_id: Option<String>,
+    #[serde(default, rename = "type", alias = "dep_type")]
+    dep_type: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<DepImportNestedDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepImportNestedDependency {
+    #[serde(default)]
+    issue_id: Option<String>,
+    depends_on_id: String,
+    #[serde(default, rename = "type", alias = "dep_type")]
+    dep_type: Option<String>,
+}
+
+fn read_dependency_imports(path: &Path) -> Result<Vec<BulkDependencyInsert>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut dependencies = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index + 1;
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        dependencies.extend(parse_dependency_import_line(&line, line_number)?);
+    }
+
+    if dependencies.is_empty() {
+        return Err(BeadsError::validation(
+            "path",
+            format!(
+                "dependency import file '{}' did not contain any dependency edges",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+fn parse_dependency_import_line(
+    line: &str,
+    line_number: usize,
+) -> Result<Vec<BulkDependencyInsert>> {
+    let record: DepImportLine = serde_json::from_str(line).map_err(|err| {
+        BeadsError::validation(
+            "jsonl",
+            format!("invalid dependency JSONL at line {line_number}: {err}"),
+        )
+    })?;
+
+    let mut dependencies = Vec::new();
+
+    if let (Some(issue_id), Some(depends_on_id)) = (&record.issue_id, &record.depends_on_id) {
+        dependencies.push(build_bulk_dependency_insert(
+            issue_id,
+            depends_on_id,
+            record.dep_type.as_deref(),
+            line_number,
+        )?);
+    }
+
+    if !record.dependencies.is_empty() {
+        let parent_issue_id = record.id.as_deref().or(record.issue_id.as_deref()).ok_or_else(|| {
+            BeadsError::validation(
+                "issue_id",
+                format!(
+                    "dependency JSONL line {line_number} has a dependencies array but no id or issue_id"
+                ),
+            )
+        })?;
+
+        for dep in &record.dependencies {
+            let issue_id = dep.issue_id.as_deref().unwrap_or(parent_issue_id);
+            dependencies.push(build_bulk_dependency_insert(
+                issue_id,
+                &dep.depends_on_id,
+                dep.dep_type.as_deref(),
+                line_number,
+            )?);
+        }
+    }
+
+    if dependencies.is_empty() {
+        if record.id.is_some() {
+            return Ok(dependencies);
+        }
+
+        return Err(BeadsError::validation(
+            "jsonl",
+            format!(
+                "dependency JSONL line {line_number} must contain either issue_id + depends_on_id or an issue record with dependencies"
+            ),
+        ));
+    }
+
+    Ok(dependencies)
+}
+
+fn build_bulk_dependency_insert(
+    issue_id: &str,
+    depends_on_id: &str,
+    dep_type: Option<&str>,
+    line_number: usize,
+) -> Result<BulkDependencyInsert> {
+    let issue_id = issue_id.trim();
+    let depends_on_id = depends_on_id.trim();
+    if issue_id.is_empty() || depends_on_id.is_empty() {
+        return Err(BeadsError::validation(
+            "jsonl",
+            format!("dependency JSONL line {line_number} contains an empty issue id"),
+        ));
+    }
+
+    let dep_type = dep_type.unwrap_or("blocks").trim();
+    let dep_type = parse_dependency_type(dep_type)
+        .map_err(|err| BeadsError::WithContext {
+            context: format!("dependency JSONL line {line_number} has an invalid type"),
+            source: Box::new(err),
+        })?
+        .as_str()
+        .to_string();
+
+    Ok(BulkDependencyInsert {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type,
+    })
+}
+
 fn finalize_dep_mutation(
     storage_ctx: &mut config::OpenStorageResult,
     cache_dirty: bool,
@@ -346,6 +515,14 @@ struct TreeNode {
     priority: i32,
     status: String,
     truncated: bool,
+    /// This occurrence's subtree was elided because the same issue was already
+    /// expanded elsewhere in the tree (GitHub #392).
+    ///
+    /// Distinct from `truncated`, which means "children exist but `--max-depth`
+    /// stopped us". A `repeat` node is reachable through more than one parent
+    /// (a diamond); it is still listed under every parent, but only its first
+    /// occurrence carries the expanded subtree.
+    repeat: bool,
 }
 
 /// JSON output for dep cycles
@@ -353,6 +530,16 @@ struct TreeNode {
 struct CyclesResult {
     cycles: Vec<Vec<String>>,
     count: usize,
+    active_count: usize,
+    archived_closed_count: usize,
+    total_count: usize,
+    blocking_only: bool,
+    include_closed: bool,
+    scope: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    active_cycles: Vec<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    archived_closed_cycles: Vec<Vec<String>>,
 }
 
 fn dep_add(
@@ -378,18 +565,6 @@ fn dep_add(
     // Self-dependency check
     if issue_id == depends_on_id {
         return Err(BeadsError::SelfDependency { id: issue_id });
-    }
-
-    // Cycle check for blocking types only
-    if dep_type.is_blocking()
-        && !depends_on_id.starts_with("external:")
-        && storage_ctx
-            .storage
-            .would_create_cycle(&issue_id, &depends_on_id, true)?
-    {
-        return Err(BeadsError::DependencyCycle {
-            path: format!("{issue_id} -> {depends_on_id}"),
-        });
     }
 
     let added = retry_mutation_with_jsonl_recovery(
@@ -472,6 +647,61 @@ fn dep_add(
         let depends_on_id_display = dep_display_text(&depends_on_id);
         ctx.info(&format!(
             "Dependency already exists: {issue_id_display} → {depends_on_id_display}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn dep_import(
+    args: &DepImportArgs,
+    dependencies: &[BulkDependencyInsert],
+    storage_ctx: &mut config::OpenStorageResult,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let total_edges = dependencies.len();
+    let probe_issue_id = dependencies.first().map(|dep| dep.issue_id.as_str());
+    let imported = retry_mutation_with_jsonl_recovery(
+        storage_ctx,
+        true,
+        "dep import",
+        probe_issue_id,
+        |storage| storage.add_dependencies_bulk_for_import(dependencies, actor),
+    )?;
+
+    finalize_dep_mutation(storage_ctx, imported > 0, "dep import")?;
+    if let Err(error) = storage_ctx.auto_flush_if_enabled() {
+        report_auto_flush_failure(
+            ctx,
+            &storage_ctx.paths.beads_dir,
+            &storage_ctx.paths.jsonl_path,
+            &error,
+        );
+    }
+
+    if ctx.is_json() || ctx.is_toon() {
+        let result = DepImportResult {
+            status: "ok".to_string(),
+            input_path: args.path.display().to_string(),
+            imported,
+            skipped: total_edges.saturating_sub(imported),
+            total_edges,
+            action: "imported".to_string(),
+        };
+        if ctx.is_toon() {
+            ctx.toon(&result);
+        } else {
+            ctx.json_pretty(&result);
+        }
+    } else if matches!(ctx.mode(), OutputMode::Quiet) {
+        return Ok(());
+    } else {
+        ctx.success(&format!(
+            "Imported {} dependencies from {} ({} skipped)",
+            imported,
+            dep_display_text(&args.path.display().to_string()),
+            total_edges.saturating_sub(imported)
         ));
     }
 
@@ -1127,6 +1357,7 @@ fn build_dep_tree_nodes_global(
     let (dependencies_by_issue, dependents_by_issue) = load_dep_tree_adjacency(storage)?;
 
     let mut nodes = Vec::new();
+    let mut expanded: HashSet<String> = HashSet::new();
 
     let mut queue = vec![DepTreeQueueItem {
         id: root_id.to_string(),
@@ -1168,6 +1399,31 @@ fn build_dep_tree_nodes_global(
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 
+        // Expand each issue at most once for the whole traversal. A node that
+        // is reachable through several parents still gets its own `TreeNode`
+        // under every parent, so diamonds stay visible, but only the first
+        // occurrence expands the subtree beneath it.
+        //
+        // Without this the traversal enumerates every distinct simple path
+        // from the root, so a graph with shared dependencies produces a node
+        // count that grows exponentially with `--max-depth` (GitHub #392: a
+        // 121-issue graph emitted 4.19M nodes at depth 40, and a real
+        // 1,850-issue graph exhausted 64 GiB of RAM). The correct bound is
+        // O(V + E).
+        //
+        // Claim the "already expanded" slot ONLY when this occurrence really
+        // expands. DFS can reach a node at a deeper position first; if a copy
+        // that is itself too deep to expand consumed the slot, a later
+        // shallower copy would be demoted to a childless repeat and its whole
+        // subtree would vanish from the tree.
+        let can_expand_here = item.depth < args.max_depth && !item.id.starts_with("external:");
+        let already_expanded = expanded.contains(&item.id);
+        let expand_now = can_expand_here && !already_expanded;
+        if expand_now {
+            expanded.insert(item.id.clone());
+        }
+        let repeat = already_expanded && !dependencies.is_empty();
+
         nodes.push(TreeNode {
             node_key: node_key.clone(),
             id: item.id.clone(),
@@ -1178,10 +1434,11 @@ fn build_dep_tree_nodes_global(
             priority,
             status,
             truncated,
+            repeat,
         });
 
-        // Don't expand if at max depth
-        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+        // Don't expand if at max depth, or if this subtree is already shown.
+        if expand_now {
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
@@ -1196,7 +1453,6 @@ fn build_dep_tree_nodes_global(
             sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
             // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
-                // No global visited check here
                 queue.push(DepTreeQueueItem {
                     id: dep_id,
                     depth: item.depth + 1,
@@ -1223,6 +1479,7 @@ fn try_build_dep_tree_nodes_local(
     metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
 
     let mut nodes = Vec::new();
+    let mut expanded: HashSet<String> = HashSet::new();
     let mut queue = vec![DepTreeQueueItem {
         id: root_id.to_string(),
         depth: 0,
@@ -1261,6 +1518,20 @@ fn try_build_dep_tree_nodes_local(
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
         };
 
+        // Mirrors `build_dep_tree_nodes_global`: expand each issue once, but
+        // still emit an occurrence under every parent (GitHub #392), and only
+        // claim the expansion slot when this occurrence actually expands. The
+        // two builders must stay byte-identical — `dep_tree_local_traversal
+        // _matches_global_nodes` compares their projections including
+        // `node_key`.
+        let can_expand_here = item.depth < args.max_depth && !item.id.starts_with("external:");
+        let already_expanded = expanded.contains(&item.id);
+        let expand_now = can_expand_here && !already_expanded;
+        if expand_now {
+            expanded.insert(item.id.clone());
+        }
+        let repeat = already_expanded && !dependencies.is_empty();
+
         nodes.push(TreeNode {
             node_key: node_key.clone(),
             id: item.id.clone(),
@@ -1271,9 +1542,10 @@ fn try_build_dep_tree_nodes_local(
             priority,
             status,
             truncated,
+            repeat,
         });
 
-        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+        if expand_now {
             if nodes.len().saturating_add(dependencies.len()) > LOCAL_DEP_TREE_NODE_LIMIT {
                 return Ok(None);
             }
@@ -1373,6 +1645,8 @@ fn dep_tree(
                 ""
             } else if node.truncated {
                 "├── (truncated) "
+            } else if node.repeat {
+                "├── (shown above) "
             } else {
                 "├── "
             };
@@ -1529,6 +1803,9 @@ fn build_tree_node_label(node: &TreeNode, theme: &Theme) -> Text {
     if node.truncated {
         label.append_styled(" (truncated)", theme.dimmed.clone());
     }
+    if node.repeat {
+        label.append_styled(" (shown above)", theme.dimmed.clone());
+    }
     label
 }
 
@@ -1566,16 +1843,56 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
 }
 
 fn dep_cycles(
-    _args: &DepCyclesArgs,
+    args: &DepCyclesArgs,
     storage: &SqliteStorage,
     _json: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let cycles = storage.detect_all_cycles()?;
+    let report = storage.detect_dependency_cycle_report(args.blocking_only)?;
+    let active_count = report.active_cycles.len();
+    let archived_closed_count = report.archived_closed_cycles.len();
+    let total_count = active_count + archived_closed_count;
+
+    // #368: An active dependency cycle is a machine-actionable condition, so a
+    // scripted/robot caller gating on the exit code must be able to see it. We
+    // still emit the full, data-carrying output on every surface below (text,
+    // rich, JSON `count`, TOON) — the exit code is recorded here and applied by
+    // `main` after output completes, so the JSON/TOON stream stays a single
+    // clean object. Archived-closed-only cycles are historical and never flip
+    // the exit code, even under `--include-closed`.
+    if active_count > 0 {
+        crate::output::record_pending_exit_code(crate::error::ErrorCode::CycleDetected.exit_code());
+    }
+    let mut cycles = report.active_cycles.clone();
+    let mut active_cycles = Vec::new();
+    let mut archived_closed_cycles = Vec::new();
+
+    if args.include_closed {
+        active_cycles.clone_from(&report.active_cycles);
+        archived_closed_cycles.clone_from(&report.archived_closed_cycles);
+        cycles.extend(report.archived_closed_cycles.clone());
+        cycles.sort();
+    }
     let count = cycles.len();
+    let scope = if args.include_closed {
+        "active_and_archived"
+    } else {
+        "active"
+    };
 
     if ctx.is_json() || ctx.is_toon() {
-        let result = CyclesResult { cycles, count };
+        let result = CyclesResult {
+            cycles,
+            count,
+            active_count,
+            archived_closed_count,
+            total_count,
+            blocking_only: args.blocking_only,
+            include_closed: args.include_closed,
+            scope,
+            active_cycles,
+            archived_closed_cycles,
+        };
         if ctx.is_toon() {
             ctx.toon(&result);
         } else {
@@ -1588,14 +1905,21 @@ fn dep_cycles(
         return Ok(());
     }
 
+    let cycle_scope = cycle_scope_label(args.blocking_only);
     if count == 0 {
-        ctx.success("No dependency cycles detected.");
+        if archived_closed_count > 0 && !args.include_closed {
+            ctx.success(&format!(
+                "No active {cycle_scope} cycles detected. {archived_closed_count} archived closed-only cycle(s) hidden; rerun with --include-closed to inspect them."
+            ));
+        } else {
+            ctx.success(&format!("No {cycle_scope} cycles detected."));
+        }
     } else if ctx.is_rich() {
         // Rich mode: Show cycles with red highlighting in a panel
-        render_cycles_rich(ctx, &cycles, count);
+        render_cycles_rich(ctx, &cycles, count, args.blocking_only);
     } else {
         // Plain mode: Simple text output
-        ctx.warning(&format!("Found {count} dependency cycle(s):"));
+        ctx.warning(&format!("Found {count} {cycle_scope} cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
             ctx.print_line(&format!("  {}. {}", i + 1, format_cycle_plain(cycle)));
         }
@@ -1605,20 +1929,44 @@ fn dep_cycles(
 }
 
 /// Render cycles in rich mode with red highlighting
-fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize) {
+fn render_cycles_rich(
+    ctx: &OutputContext,
+    cycles: &[Vec<String>],
+    count: usize,
+    blocking_only: bool,
+) {
     let theme = ctx.theme();
-    let content = build_cycles_rich_text(cycles, count, theme);
+    let content = build_cycles_rich_text(cycles, count, theme, blocking_only);
+    let title = if blocking_only {
+        "Blocking Dependency Cycles"
+    } else {
+        "Dependency Cycles"
+    };
     let panel = Panel::from_rich_text(&content, ctx.width())
-        .title(Text::new("Dependency Cycles"))
+        .title(Text::new(title))
         .border_style(theme.error.clone());
 
     ctx.render(&panel);
 }
 
-fn build_cycles_rich_text(cycles: &[Vec<String>], count: usize, theme: &Theme) -> Text {
+fn cycle_scope_label(blocking_only: bool) -> &'static str {
+    if blocking_only {
+        "blocking dependency"
+    } else {
+        "dependency"
+    }
+}
+
+fn build_cycles_rich_text(
+    cycles: &[Vec<String>],
+    count: usize,
+    theme: &Theme,
+    blocking_only: bool,
+) -> Text {
     let mut content = Text::new("");
+    let cycle_scope = cycle_scope_label(blocking_only);
     content.append_styled(
-        &format!("⚠ {count} dependency cycle(s) detected:\n\n"),
+        &format!("⚠ {count} {cycle_scope} cycle(s) detected:\n\n"),
         theme.error.clone().bold(),
     );
 
@@ -1701,6 +2049,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -1777,6 +2127,163 @@ mod tests {
     fn test_normalize_dep_type_filter_rejects_unknown_types() {
         let err = normalize_dep_type_filter("parent_child").unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "type"));
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_accepts_edge_jsonl() {
+        let deps = parse_dependency_import_line(
+            r#"{"issue_id":"bd-a","depends_on_id":"bd-b","type":"parent-child"}"#,
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deps,
+            vec![BulkDependencyInsert {
+                issue_id: "bd-a".to_string(),
+                depends_on_id: "bd-b".to_string(),
+                dep_type: "parent-child".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_accepts_issue_jsonl_dependencies() {
+        let deps = parse_dependency_import_line(
+            r#"{"id":"bd-a","dependencies":[{"depends_on_id":"bd-b","type":"blocks"},{"issue_id":"bd-c","depends_on_id":"bd-d","dep_type":"waits-for"}]}"#,
+            11,
+        )
+        .unwrap();
+
+        assert_eq!(
+            deps,
+            vec![
+                BulkDependencyInsert {
+                    issue_id: "bd-a".to_string(),
+                    depends_on_id: "bd-b".to_string(),
+                    dep_type: "blocks".to_string(),
+                },
+                BulkDependencyInsert {
+                    issue_id: "bd-c".to_string(),
+                    depends_on_id: "bd-d".to_string(),
+                    dep_type: "waits-for".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_skips_issue_record_without_dependencies() {
+        let deps = parse_dependency_import_line(
+            r#"{"id":"bd-no-deps","title":"plain issue record","status":"open"}"#,
+            13,
+        )
+        .unwrap();
+
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_rejects_dependency_array_without_owner() {
+        let error = parse_dependency_import_line(
+            r#"{"dependencies":[{"depends_on_id":"bd-target","type":"blocks"}]}"#,
+            17,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "issue_id"),
+            "unexpected missing-owner error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_import_line_rejects_empty_edge_ids() {
+        let error = parse_dependency_import_line(
+            r#"{"issue_id":"  ","depends_on_id":"bd-target","type":"blocks"}"#,
+            19,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, BeadsError::Validation { field, .. } if field == "jsonl"),
+            "unexpected empty-id error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_dep_import_bulk_storage_path_inserts_parent_child_batch() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-parent", "bd-child-a", "bd-child-b"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-child-a".to_string(),
+                        depends_on_id: "bd-parent".to_string(),
+                        dep_type: "parent-child".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-child-b".to_string(),
+                        depends_on_id: "bd-parent".to_string(),
+                        dep_type: "parent-child".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            storage.get_dependencies("bd-child-a").unwrap(),
+            vec!["bd-parent".to_string()]
+        );
+        assert_eq!(
+            storage.get_dependencies("bd-child-b").unwrap(),
+            vec!["bd-parent".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_dep_import_bulk_storage_path_skips_type_distinct_duplicate_pairs() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-source", "bd-target"] {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+
+        let inserted = storage
+            .add_dependencies_bulk_for_import(
+                &[
+                    BulkDependencyInsert {
+                        issue_id: "bd-source".to_string(),
+                        depends_on_id: "bd-target".to_string(),
+                        dep_type: "blocks".to_string(),
+                    },
+                    BulkDependencyInsert {
+                        issue_id: "bd-source".to_string(),
+                        depends_on_id: "bd-target".to_string(),
+                        dep_type: "related".to_string(),
+                    },
+                ],
+                "tester",
+            )
+            .unwrap();
+
+        assert_eq!(inserted, 1);
+        let dep_types: Vec<String> = storage
+            .get_dependencies_full("bd-source")
+            .unwrap()
+            .into_iter()
+            .map(|dep| dep.dep_type.as_str().to_string())
+            .collect();
+        assert_eq!(dep_types, vec!["blocks".to_string()]);
     }
 
     #[test]
@@ -1972,6 +2479,7 @@ mod tests {
         i32,
         String,
         bool,
+        bool,
     );
 
     fn tree_node_projection(nodes: &[TreeNode]) -> Vec<TreeNodeProjection> {
@@ -1988,6 +2496,7 @@ mod tests {
                     node.priority,
                     node.status.clone(),
                     node.truncated,
+                    node.repeat,
                 )
             })
             .collect()
@@ -2045,6 +2554,163 @@ mod tests {
 
         assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
         info!("test_dep_tree_local_traversal_matches_global_nodes: assertions passed");
+    }
+
+    /// GitHub #392: a "diamond ladder" (`A_i` depends on `B_i` and `C_i`; both
+    /// depend on `A_{i+1}`) used to emit one node per distinct simple path, so
+    /// the node count doubled with every rung and grew without bound as
+    /// `--max-depth` rose. The output is now bounded by the graph size no
+    /// matter how deep the traversal is allowed to go.
+    #[test]
+    fn test_dep_tree_diamond_ladder_is_bounded_by_graph_size() {
+        const RUNGS: usize = 12;
+
+        init_test_logging();
+        info!("test_dep_tree_diamond_ladder_is_bounded_by_graph_size: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        let a_id = |i: usize| format!("bd-a{i:03}");
+        let b_id = |i: usize| format!("bd-b{i:03}");
+        let c_id = |i: usize| format!("bd-c{i:03}");
+
+        for index in 0..=RUNGS {
+            let issue = make_test_issue(&a_id(index), &format!("A{index}"));
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        for index in 0..RUNGS {
+            for id in [b_id(index), c_id(index)] {
+                let issue = make_test_issue(&id, &format!("Rung {index}"));
+                storage.create_issue(&issue, "tester").unwrap();
+            }
+        }
+        for index in 0..RUNGS {
+            for id in [b_id(index), c_id(index)] {
+                storage
+                    .add_dependency(&a_id(index), &id, "blocks", "tester")
+                    .unwrap();
+                storage
+                    .add_dependency(&id, &a_id(index + 1), "blocks", "tester")
+                    .unwrap();
+            }
+        }
+
+        let total_issues = 3 * RUNGS + 1;
+        // Each rung contributes A->B, A->C, B->A', C->A'.
+        let total_edges = 4 * RUNGS;
+        let root_issue = storage.get_issue(&a_id(0)).unwrap().unwrap();
+        let external_statuses = HashMap::new();
+
+        let node_count_at = |max_depth: usize| {
+            let args = dep_tree_test_args(&a_id(0), DepDirection::Down, max_depth);
+            build_dep_tree_nodes_global(&args, &storage, &a_id(0), &root_issue, &external_statuses)
+                .unwrap()
+        };
+
+        // Depth far beyond the ladder length: the pre-fix traversal emitted
+        // 2^RUNGS-scale node counts here.
+        let global = node_count_at(500);
+
+        // Every issue is expanded once, so the emitted occurrences are the root
+        // plus one per edge walked out of an expanded node — O(V + E), not one
+        // node per distinct simple path.
+        assert_eq!(
+            global.len(),
+            total_edges + 1,
+            "expected O(V+E) nodes for a {total_issues}-issue / {total_edges}-edge graph"
+        );
+
+        // The real regression signature: node count must not grow with depth
+        // once the traversal has covered the graph.
+        assert_eq!(
+            node_count_at(40).len(),
+            global.len(),
+            "node count must not grow with --max-depth"
+        );
+
+        // Every issue in the ladder is still reachable in the rendered tree.
+        let rendered: HashSet<&str> = global.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(rendered.len(), total_issues);
+
+        // The shared `A_{i+1}` rungs are reached through both B and C, so
+        // exactly one occurrence of each expands and the traversal is finite.
+        let repeats = global.iter().filter(|node| node.repeat).count();
+        assert!(
+            repeats > 0,
+            "diamond joins should be marked as repeat occurrences"
+        );
+
+        info!("test_dep_tree_diamond_ladder_is_bounded_by_graph_size: assertions passed");
+    }
+
+    /// A node reachable at two different depths must still expand at the
+    /// shallow one even if the deep occurrence was visited first.
+    ///
+    /// DFS reaches the deeper copy first here. If the traversal claimed the
+    /// "already expanded" slot for an occurrence that was itself too deep to
+    /// expand, the shallow copy would render as a childless repeat and the
+    /// subtree under it would disappear from the tree entirely.
+    #[test]
+    fn test_dep_tree_expands_shallow_occurrence_reached_after_deep_one() {
+        init_test_logging();
+        info!("test_dep_tree_expands_shallow_occurrence_reached_after_deep_one: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        for (id, title) in [
+            ("bd-root", "Root"),
+            ("bd-a-mid", "A mid"),
+            ("bd-x-shared", "X shared"),
+            ("bd-y-leaf", "Y leaf"),
+        ] {
+            let issue = make_test_issue(id, title);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // Root -> A (sorts first) and Root -> X directly; A -> X makes X
+        // reachable at depth 1 and depth 2. X -> Y is the subtree at risk.
+        storage
+            .add_dependency("bd-root", "bd-a-mid", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-root", "bd-x-shared", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-a-mid", "bd-x-shared", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-x-shared", "bd-y-leaf", "blocks", "tester")
+            .unwrap();
+
+        // Y sits at depth 2 via the shallow X, exactly at the depth limit.
+        let args = dep_tree_test_args("bd-root", DepDirection::Down, 2);
+        let root_issue = storage.get_issue("bd-root").unwrap().unwrap();
+        let external_statuses = HashMap::new();
+
+        let global = build_dep_tree_nodes_global(
+            &args,
+            &storage,
+            "bd-root",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap();
+        assert!(
+            global.iter().any(|node| node.id == "bd-y-leaf"),
+            "the subtree under the shallow occurrence must still be rendered: {:?}",
+            global.iter().map(|n| (&n.id, n.depth)).collect::<Vec<_>>()
+        );
+
+        let local = try_build_dep_tree_nodes_local(
+            &args,
+            &storage,
+            "bd-root",
+            &root_issue,
+            &external_statuses,
+        )
+        .unwrap()
+        .expect("small tree should use local traversal");
+        assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
+
+        info!("test_dep_tree_expands_shallow_occurrence_reached_after_deep_one: assertions passed");
     }
 
     #[test]
@@ -2257,6 +2923,14 @@ mod tests {
                 ],
             ],
             count: 2,
+            active_count: 2,
+            archived_closed_count: 0,
+            total_count: 2,
+            blocking_only: false,
+            include_closed: false,
+            scope: "active",
+            active_cycles: Vec::new(),
+            archived_closed_cycles: Vec::new(),
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -2275,7 +2949,7 @@ mod tests {
         assert!(plain.contains("bd-a\\u{1b}[2J -> bd-b\\u{7}bell"));
 
         let theme = Theme::default();
-        let rich_text = build_cycles_rich_text(&cycles, 1, &theme);
+        let rich_text = build_cycles_rich_text(&cycles, 1, &theme, false);
         let rendered = Panel::from_rich_text(&rich_text, 100).render_plain(100);
 
         assert!(!rendered.contains("[bold"));
@@ -2286,6 +2960,11 @@ mod tests {
         assert!(rendered.contains("bd-a\\u{1b}[2J"));
         assert!(rendered.contains("bd-b\\u{7}bell"));
         assert!(rich_text.spans().len() > 1, "rich text should carry styles");
+
+        let blocking_rich_text = build_cycles_rich_text(&cycles, 1, &theme, true);
+        let blocking_rendered = Panel::from_rich_text(&blocking_rich_text, 100).render_plain(100);
+
+        assert!(blocking_rendered.contains("blocking dependency cycle(s)"));
     }
 
     #[test]
@@ -2340,6 +3019,7 @@ mod tests {
             priority: 1,
             status: "blocked".to_string(),
             truncated: true,
+            repeat: false,
         };
         let theme = Theme::default();
         let label = build_tree_node_label(&node, &theme);

@@ -1,2 +1,2 @@
-[1]{id,title,status,priority,issue_type,created_at,created_by,updated_at,source_repo,compaction_level,original_size}:
-  bd-azy,Two,open,0,bug,"2026-04-25T00:17:56.149697780Z",ubuntu,"2026-04-25T00:17:56.149697780Z",.,0,0
+[1]{id,title,status,priority,issue_type,created_at,created_by,updated_at,source_repo,source_repo_path,compaction_level,original_size}:
+  <ISSUE_ID>,Two,open,0,bug,<TIMESTAMP>,<ACTOR>,<TIMESTAMP>,<SOURCE_REPO>,<SOURCE_REPO>,0,0

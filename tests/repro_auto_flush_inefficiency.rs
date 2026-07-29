@@ -259,7 +259,14 @@ fn assert_bounded_jsonl_diff(
     let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
     let after = read_jsonl_lines(&jsonl_path);
     let observed_changed_ids = changed_issue_ids(before, &after);
+<<<<<<< HEAD
     let expected_changed_ids = expected_changed_ids.iter().cloned().collect::<BTreeSet<_>>();
+=======
+    let expected_changed_ids = expected_changed_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+>>>>>>> origin/main
     let line_churn = positional_line_churn(before, &after);
     let line_count = after.len();
     let content_hash = compute_jsonl_hash(&jsonl_path).unwrap();
@@ -276,9 +283,17 @@ fn assert_bounded_jsonl_diff(
 }
 
 #[test]
+<<<<<<< HEAD
 fn e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import() {
     let _log =
         common::test_log("e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import");
+=======
+#[allow(clippy::too_many_lines)]
+fn e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import() {
+    let _log = common::test_log(
+        "e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import",
+    );
+>>>>>>> origin/main
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "bounded_diff_init");
@@ -373,7 +388,13 @@ fn e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import() {
     let before_dep = read_jsonl_lines(&jsonl_path);
     let dep = run_br(
         &workspace,
+<<<<<<< HEAD
         ["dep", "add", &alpha_id, &beta_id, "--type", "related", "--json"],
+=======
+        [
+            "dep", "add", &alpha_id, &beta_id, "--type", "related", "--json",
+        ],
+>>>>>>> origin/main
         "bounded_diff_dep",
     );
     assert!(

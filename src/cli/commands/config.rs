@@ -17,6 +17,7 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::util::id::normalize_configured_prefix;
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -708,6 +709,30 @@ const ALLOWED_EDITORS: &[&str] = &[
     "zed",
 ];
 
+/// Resolve the effective DB path `br` would use at runtime for the current
+/// workspace, independent of any explicit `db` config override.
+///
+/// Uses the same path-resolution logic (`config::resolve_paths`, honoring the
+/// `--db` / `BEADS_DB` override and `.beads/metadata.json`) that the storage
+/// layer uses to locate the database. Returns the canonical path (when a
+/// `.beads` directory was discovered) and whether that file exists on disk.
+/// Returns `(None, false)` when no workspace is discovered. #339
+fn resolve_effective_db_path(
+    beads_dir: Option<&PathBuf>,
+    overrides: &CliOverrides,
+) -> (Option<PathBuf>, bool) {
+    let Some(dir) = beads_dir else {
+        return (None, false);
+    };
+    match config::resolve_paths(dir, overrides.db.as_ref()) {
+        Ok(paths) => {
+            let exists = paths.db_path.exists();
+            (Some(paths.db_path), exists)
+        }
+        Err(_) => (None, false),
+    }
+}
+
 /// Get a specific config value.
 fn get_config_value(
     key: &str,
@@ -724,10 +749,27 @@ fn get_config_value(
     let value = layer.get(&canonical_key).map(str::to_owned);
 
     if ctx.is_json() {
-        let output = json!({
+        let mut output = json!({
             "key": key,
             "value": value,
         });
+        // For the `db` key, surface the RESOLVED canonical DB path that `br`
+        // actually uses at runtime (the discovered `.beads/beads.db`), even
+        // when there is no explicit override (`value` is null). Robot callers
+        // querying `config get db --json` need the effective path, not just
+        // the raw override, plus whether that file currently exists. #339
+        if canonical_key == "db" {
+            let (effective_path, exists) = resolve_effective_db_path(beads_dir, overrides);
+            if let Some(obj) = output.as_object_mut() {
+                obj.insert(
+                    "effective_path".to_string(),
+                    effective_path
+                        .as_ref()
+                        .map_or(serde_json::Value::Null, |p| json!(p.display().to_string())),
+                );
+                obj.insert("exists".to_string(), json!(exists));
+            }
+        }
         ctx.json_pretty(&output);
     } else if let Some(v) = value {
         if ctx.is_quiet() {
@@ -779,6 +821,10 @@ fn set_config_value(
             });
         }
     };
+
+    if canonical_config_key(key) == "issue_prefix" {
+        normalize_configured_prefix(value)?;
+    }
 
     // Determine target config file
     let (config_path, is_project) =
@@ -1631,6 +1677,39 @@ mod tests {
             "config read paths must not create a database as a side effect"
         );
         assert!(!layers.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_effective_db_path_reports_discovered_path_and_existence() {
+        // #339: `config get db --json` must expose the RESOLVED canonical DB
+        // path even with no explicit override, plus whether it exists.
+        let dir = tempfile::TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        // No override, no DB file yet: effective path points at the discovered
+        // `.beads` DB location, and `exists` is false.
+        let (path, exists) = resolve_effective_db_path(Some(&beads_dir), &CliOverrides::default());
+        let path = path.expect("effective DB path resolved for discovered workspace");
+        assert!(
+            path.starts_with(crate::util::resolve_cache_dir(&beads_dir))
+                || path.starts_with(&beads_dir),
+            "effective path must resolve under the discovered .beads workspace: {}",
+            path.display()
+        );
+        assert!(!exists, "DB does not exist yet");
+
+        // Create the DB at the resolved path; `exists` flips to true.
+        crate::storage::SqliteStorage::open(&path).unwrap();
+        let (path2, exists2) =
+            resolve_effective_db_path(Some(&beads_dir), &CliOverrides::default());
+        assert_eq!(path2.as_ref(), Some(&path));
+        assert!(exists2, "DB now exists at the resolved effective path");
+
+        // No discovered workspace: returns (None, false).
+        let (none_path, none_exists) = resolve_effective_db_path(None, &CliOverrides::default());
+        assert!(none_path.is_none());
+        assert!(!none_exists);
     }
 
     #[test]

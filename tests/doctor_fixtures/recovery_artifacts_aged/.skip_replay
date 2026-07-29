@@ -1,0 +1,9 @@
+Pass-4 cycle 3: same post_undo interaction as cycles 1, 2, and the
+gitignore fixtures (per HANDOFF_pass_3.md). The post_undo stage
+asserts that `undo latest` restores the FIRST repair; under
+REPLAY_IDEMPOTENCE=1 the second no-op --repair creates a newer
+(empty) run-dir that becomes the new "latest", breaking post_undo.
+
+The idempotence contract is still indirectly enforced: a second
+--repair against a clean (post-quarantine) workspace finds no aged
+artifacts and emits zero actions.

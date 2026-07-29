@@ -2,7 +2,7 @@
   "name": "orphaned_lock_file",
   "family": "external_interference",
   "description": "The workspace includes an orphaned .beads.lock file left behind by a killed process or external sync tool.",
-  "expected_classification": "usable",
+  "expected_classification": "degraded",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
@@ -14,7 +14,7 @@
     },
     {
       "surface": "doctor",
-      "outcome": "doctor_clean"
+      "outcome": "reports_errors"
     },
     {
       "surface": "sync --status",
@@ -24,6 +24,6 @@
   "source_hint": "Covers the cloud-drive/editor interference class from beads_rust-rsei.3.3.",
   "notes": [
     "The lock file is intentionally stale metadata, not an active lock held by this test process.",
-    "Current posture is tolerated as command-clean while doctor reports workspace_health=degraded in its JSON payload."
+    "Per the post-#292 contract any non-OK doctor check causes `ok=false` and a non-zero exit; the stale lock plus db-newer drift trip WARN-level checks so doctor reports workspace_health=degraded and exits 1."
   ]
 }

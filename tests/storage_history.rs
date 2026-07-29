@@ -54,6 +54,7 @@ fn disabled_config_skips_backup() {
         enabled: false,
         max_count: 100,
         max_age_days: 30,
+        min_interval_secs: 0,
     };
 
     backup_before_export(&beads_dir, &config, &target).unwrap();
@@ -94,7 +95,12 @@ fn changed_content_creates_new_backup() {
     let beads_dir = setup_beads_dir(&temp);
     let target = beads_dir.join("issues.jsonl");
 
-    let config = HistoryConfig::default();
+    // Disable the snapshot throttle: this test validates that *changed* content
+    // produces a new (non-deduped) backup, independent of the #313 throttle.
+    let config = HistoryConfig {
+        min_interval_secs: 0,
+        ..HistoryConfig::default()
+    };
 
     // First backup
     write_file(&target, b"version 1");
@@ -157,6 +163,7 @@ fn rotation_by_count_keeps_newest() {
         enabled: true,
         max_count: 2,
         max_age_days: 365, // Don't trigger age-based rotation
+        min_interval_secs: 0,
     };
 
     // Create 4 backups with distinct content
@@ -222,6 +229,7 @@ fn mixed_stems_rotate_independently() {
         enabled: true,
         max_count: 1,
         max_age_days: 365,
+        min_interval_secs: 0,
     };
 
     // Create backups for "issues" stem

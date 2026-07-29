@@ -684,6 +684,22 @@ resolve_version() {
     VERSION=""
 }
 
+release_download_tag() {
+    local raw="$1"
+    if [ -z "$raw" ]; then
+        printf '%s\n' ""
+    elif [[ "$raw" == v* ]]; then
+        printf '%s\n' "$raw"
+    else
+        printf 'v%s\n' "$raw"
+    fi
+}
+
+release_asset_version() {
+    local raw="$1"
+    printf '%s\n' "${raw#v}"
+}
+
 # ============================================================================
 # Cross-platform locking using mkdir (atomic on all POSIX systems)
 # ============================================================================
@@ -744,6 +760,7 @@ TMP=""
 cleanup() {
     [ -n "$TMP" ] && rm -rf "$TMP"
     [ "$LOCKED" -eq 1 ] && rm -rf "$LOCK_DIR"
+    return 0
 }
 trap cleanup EXIT
 
@@ -1385,12 +1402,15 @@ download_release() {
         url="$ARTIFACT_URL"
         archive_name="$(basename "$ARTIFACT_URL")"
     else
+        local release_tag asset_version
+        release_tag="$(release_download_tag "$VERSION")"
+        asset_version="$(release_asset_version "$VERSION")"
         local archive_ext="tar.gz"
         case "$platform" in
             windows_*) archive_ext="zip" ;;
         esac
-        archive_name="br-${VERSION}-${platform}.${archive_ext}"
-        url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
+        archive_name="br-${asset_version}-${platform}.${archive_ext}"
+        url="https://github.com/${OWNER}/${REPO}/releases/download/${release_tag}/${archive_name}"
     fi
 
     run_with_spinner "Downloading $archive_name..." \
@@ -1409,7 +1429,7 @@ download_release() {
         if [ -n "$CHECKSUM_URL" ]; then
             checksum_url="$CHECKSUM_URL"
         else
-            checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}.sha256"
+            checksum_url="https://github.com/${OWNER}/${REPO}/releases/download/$(release_download_tag "$VERSION")/${archive_name}.sha256"
         fi
 
         if download_file "$checksum_url" "$TMP/checksum.sha256"; then
@@ -1417,7 +1437,7 @@ download_release() {
         fi
     fi
 
-    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 1
+    verify_archive_checksum "$TMP/$archive_name" "$archive_name" "$expected" || return 2
 
     # Extract
     log_step "Extracting..."
@@ -1615,6 +1635,11 @@ main() {
             if [ "$downloaded" -eq 0 ]; then
                 if download_release "$platform"; then
                     downloaded=1
+                else
+                    local download_status=$?
+                    if [ "$download_status" -eq 2 ]; then
+                        die "Release artifact verification failed"
+                    fi
                 fi
             fi
             if [ "$downloaded" -eq 0 ]; then

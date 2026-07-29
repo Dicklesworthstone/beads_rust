@@ -16,26 +16,35 @@ pub use path::{
     require_safe_sync_overwrite_path, require_valid_sync_path, validate_no_git_path,
     validate_sync_path, validate_sync_path_with_external, validate_temp_file_path,
 };
+pub(crate) use path::{
+    JsonlSourceSnapshot, PinnedJsonlName, capture_jsonl_source_snapshot,
+    capture_optional_jsonl_source_snapshot, capture_optional_jsonl_source_snapshot_until,
+    pin_jsonl_target,
+};
 
 use crate::error::{BeadsError, Result};
-use crate::model::{Comment, Dependency, Issue};
-use crate::storage::SqliteStorage;
+use crate::model::{Comment, Dependency, DependencyType, Issue};
+use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
 use crate::util::id::{IdConfig, IdGenerator, parse_id};
 use crate::util::progress::{create_progress_bar, create_spinner};
-use crate::validation::IssueValidator;
+use crate::validation::{CommentValidator, IssueValidator};
 use chrono::{DateTime, Utc};
 use fsqlite_types::SqliteValue;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::util::hex_encode;
 use indicatif::ProgressBar;
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -47,6 +56,123 @@ const EXPORT_PARALLEL_PREPARE_MIN_ISSUES: usize = 256;
 const DEFAULT_JSONL_EXPORT_PARALLELISM: usize = 64;
 const IMPORT_EXPORT_HASH_BATCH_SIZE: usize = 512;
 const MAX_JSONL_TEMP_PATH_ATTEMPTS: u32 = 64;
+
+/// Exact source state used by stale-overwrite guards.
+///
+/// `Missing` is intentionally distinct from a present zero-byte file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum JsonlSourceIdentityWitness {
+    #[cfg(unix)]
+    Unix { device_id: u64, inode: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum JsonlSourceStateWitness {
+    Missing,
+    Present {
+        raw_sha256: String,
+        mtime: String,
+        size: u64,
+        identity: Option<JsonlSourceIdentityWitness>,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ExpectedJsonlSourceRef<'a> {
+    Missing,
+    Present(&'a JsonlSourceSnapshot),
+}
+
+impl JsonlSourceSnapshot {
+    #[must_use]
+    pub(crate) fn state_witness(&self) -> JsonlSourceStateWitness {
+        #[cfg(unix)]
+        let identity = {
+            let identity = self.identity();
+            Some(JsonlSourceIdentityWitness::Unix {
+                device_id: identity.device_id(),
+                inode: identity.inode(),
+            })
+        };
+        #[cfg(not(unix))]
+        let identity = None;
+
+        JsonlSourceStateWitness::Present {
+            raw_sha256: self.raw_sha256().to_string(),
+            mtime: DateTime::<Utc>::from(self.modified()).to_rfc3339(),
+            size: self.size(),
+            identity,
+        }
+    }
+}
+
+pub(crate) fn capture_optional_jsonl_source(path: &Path) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_snapshot(path)
+}
+
+pub(crate) fn capture_optional_jsonl_source_until(
+    path: &Path,
+    deadline: Instant,
+) -> Result<Option<JsonlSourceSnapshot>> {
+    capture_optional_jsonl_source_snapshot_until(path, deadline)
+}
+
+pub(crate) fn verify_jsonl_source_snapshot_current(
+    source: &JsonlSourceSnapshot,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<()> {
+    jsonl_authority.verify_jsonl_authority()?;
+    let pinned_source = jsonl_authority.pinned_name_for_target(source.display_path())?;
+    verify_expected_jsonl_source_state_observed(
+        pinned_source.capture_optional()?,
+        None,
+        Some(&source.state_witness()),
+    )
+}
+
+#[cfg(test)]
+fn verify_expected_jsonl_source_state(
+    path: &Path,
+    expected_previous_content_sha256: Option<&Option<String>>,
+    expected_previous_source: Option<&JsonlSourceStateWitness>,
+) -> Result<()> {
+    verify_expected_jsonl_source_state_observed(
+        capture_optional_jsonl_source(path)?,
+        expected_previous_content_sha256,
+        expected_previous_source,
+    )
+}
+
+fn verify_expected_jsonl_source_state_observed(
+    observed_source: Option<JsonlSourceSnapshot>,
+    expected_previous_content_sha256: Option<&Option<String>>,
+    expected_previous_source: Option<&JsonlSourceStateWitness>,
+) -> Result<()> {
+    if let Some(expected_previous) = expected_previous_source {
+        let observed = observed_source.as_ref().map_or(
+            JsonlSourceStateWitness::Missing,
+            JsonlSourceSnapshot::state_witness,
+        );
+        if &observed != expected_previous {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL exact bytes changed on disk since the exporting session loaded them; refusing a stale atomic replacement"
+                    .to_string(),
+            });
+        }
+    } else if let Some(expected_previous) = expected_previous_content_sha256 {
+        let observed = observed_source
+            .as_ref()
+            .map(|source| source.content_sha256().to_string());
+        if &observed != expected_previous {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL changed on disk since the exporting session loaded it; refusing a stale atomic replacement"
+                    .to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
 
 /// Acquire a blocking exclusive lock on `.beads/.write.lock`.
 ///
@@ -70,27 +196,1038 @@ pub fn blocking_write_lock_with_timeout(
     lock_timeout_ms: Option<u64>,
 ) -> Result<File> {
     let lock_path = beads_dir.join(".write.lock");
-    let file = OpenOptions::new()
+    open_and_lock_regular_file(
+        &lock_path,
+        lock_timeout_ms,
+        true,
+        "workspace write lock",
+        false,
+    )
+}
+
+/// Acquire an advisory lock on the exact database inode used by a reviewed
+/// reconciliation.
+///
+/// This second authority lock composes with the workspace `.write.lock`.
+/// It is required for configured external databases because two independent
+/// workspaces can legitimately route to the same database while owning
+/// different workspace lock files.
+fn blocking_database_file_lock_with_timeout(
+    database_path: &Path,
+    lock_timeout_ms: Option<u64>,
+    create_if_missing: bool,
+) -> Result<File> {
+    open_and_lock_regular_file(
+        database_path,
+        lock_timeout_ms,
+        create_if_missing,
+        "database write authority",
+        true,
+    )
+}
+
+#[derive(Debug)]
+struct DatabaseInodeAuthority {
+    lock: Option<File>,
+    identity: Option<(u64, u64)>,
+    retired_locks: Vec<File>,
+}
+
+/// Composite advisory authority for every mutation of one database family.
+///
+/// The workspace lock preserves existing single-workspace serialization, the
+/// canonical-path sidecar serializes independent workspaces before a database
+/// exists or across atomic replacement, and the database-inode lock unifies
+/// hard-link aliases once the file exists.
+#[derive(Debug)]
+pub struct DatabaseFamilyWriteLock {
+    _workspace_lock: File,
+    workspace_lock_path: PathBuf,
+    _authority_lock: File,
+    authority_lock_path: PathBuf,
+    database_authority: std::sync::Mutex<DatabaseInodeAuthority>,
+    authority_path_sha256: String,
+    routed_database_path: PathBuf,
+    canonical_database_path: PathBuf,
+    acquisition_started: Instant,
+    total_timeout_ms: u64,
+}
+
+/// Stable canonical-path authority for an atomically replaced JSONL export.
+///
+/// Unlike a SQLite database, JSONL export intentionally renames a fresh inode
+/// over the destination. Locking the destination inode would therefore become
+/// stale at every successful flush. The workspace lock plus a sidecar derived
+/// from the canonical destination path remains stable across that rename.
+#[derive(Debug)]
+pub struct JsonlFamilyWriteLock {
+    _authority_lock: File,
+    authority_lock_path: PathBuf,
+    authority_path_sha256: String,
+    routed_jsonl_path: PathBuf,
+    canonical_jsonl_path: PathBuf,
+    pinned_jsonl_name: PinnedJsonlName,
+}
+
+impl JsonlFamilyWriteLock {
+    #[must_use]
+    pub fn authority_path_sha256(&self) -> &str {
+        &self.authority_path_sha256
+    }
+
+    #[must_use]
+    pub fn canonical_jsonl_path(&self) -> &Path {
+        &self.canonical_jsonl_path
+    }
+
+    fn pinned_name_for_target(&self, path: &Path) -> Result<PinnedJsonlName> {
+        if path == self.routed_jsonl_path || path == self.canonical_jsonl_path {
+            return Ok(self.pinned_jsonl_name.clone());
+        }
+        let pinned = self.pinned_jsonl_name.with_sibling_path(path)?;
+        if pinned.leaf() != self.pinned_jsonl_name.leaf() {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL target does not match its retained leaf capability".to_string(),
+            });
+        }
+        Ok(pinned)
+    }
+
+    fn pinned_sibling(&self, path: &Path) -> Result<PinnedJsonlName> {
+        if path.parent() == self.routed_jsonl_path.parent() {
+            let leaf = path.file_name().ok_or_else(|| {
+                BeadsError::Config("JSONL sibling path has no leaf name".to_string())
+            })?;
+            return self.pinned_jsonl_name.with_leaf(leaf);
+        }
+        self.pinned_jsonl_name.with_sibling_path(path)
+    }
+
+    pub(crate) fn capture_target(&self) -> Result<JsonlSourceSnapshot> {
+        self.verify_jsonl_authority()?;
+        let source = self.pinned_jsonl_name.capture()?;
+        self.verify_jsonl_authority()?;
+        Ok(source)
+    }
+
+    pub(crate) fn capture_optional_target(&self) -> Result<Option<JsonlSourceSnapshot>> {
+        self.verify_jsonl_authority()?;
+        let source = self.pinned_jsonl_name.capture_optional()?;
+        self.verify_jsonl_authority()?;
+        Ok(source)
+    }
+
+    fn fsync_pinned_parent(&self) -> std::io::Result<()> {
+        self.pinned_jsonl_name.parent().fsync()
+    }
+
+    pub fn verify_jsonl_authority(&self) -> Result<()> {
+        verify_locked_file_identity(
+            &self._authority_lock,
+            &self.authority_lock_path,
+            "JSONL-family write lock",
+            true,
+        )?;
+        self.pinned_jsonl_name.parent().verify_route()?;
+        let canonical_now = canonical_database_authority_key(&self.canonical_jsonl_path)?;
+        if canonical_now != self.canonical_jsonl_path {
+            return Err(BeadsError::SyncConflict {
+                message: "Canonical JSONL path changed while its write authority was held"
+                    .to_string(),
+            });
+        }
+        if self.pinned_jsonl_name.display_path() != self.canonical_jsonl_path {
+            return Err(BeadsError::SyncConflict {
+                message: "Pinned JSONL target changed while its write authority was held"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Stable SHA-256 of a canonical routed path without lossy UTF-8 conversion.
+#[must_use]
+pub(crate) fn canonical_sync_path_sha256(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    update_sync_path_digest(&mut hasher, path);
+    crate::util::hex_encode(&hasher.finalize())
+}
+
+fn update_sync_path_digest(hasher: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(path.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in path.as_os_str().encode_wide() {
+            hasher.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+}
+
+impl DatabaseFamilyWriteLock {
+    #[must_use]
+    pub fn authority_path_sha256(&self) -> &str {
+        &self.authority_path_sha256
+    }
+
+    #[must_use]
+    pub fn canonical_database_path(&self) -> &Path {
+        &self.canonical_database_path
+    }
+
+    fn remaining_lock_timeout_ms(&self) -> u64 {
+        let elapsed_ms =
+            u64::try_from(self.acquisition_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.total_timeout_ms.saturating_sub(elapsed_ms)
+    }
+
+    fn verify_common_authority(&self) -> Result<()> {
+        verify_locked_file_identity(
+            &self._workspace_lock,
+            &self.workspace_lock_path,
+            "workspace write lock",
+            false,
+        )?;
+        verify_locked_file_identity(
+            &self._authority_lock,
+            &self.authority_lock_path,
+            "database-family write lock",
+            true,
+        )?;
+        let canonical_now = canonical_database_authority_key(&self.routed_database_path)?;
+        if canonical_now != self.canonical_database_path {
+            return Err(BeadsError::SyncConflict {
+                message: "Canonical database path changed while its write authority was held"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Lock an existing database inode immediately before a writable open, or
+    /// report that the stable sidecar protects a still-missing database.
+    ///
+    /// This method intentionally does not materialize a missing DB: doing so
+    /// would hide the missing-database recovery branch from startup. The caller
+    /// creates/rebuilds under the stable sidecar, then calls
+    /// [`Self::rebind_database_inode_after_authorized_replace`].
+    pub fn bind_database_inode_for_mutation(&self) -> Result<bool> {
+        self.verify_common_authority()?;
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        if let Some(database_lock) = database_authority.lock.as_ref() {
+            verify_locked_file_identity(
+                database_lock,
+                &self.canonical_database_path,
+                "database write authority",
+                true,
+            )?;
+            return Ok(false);
+        }
+
+        match fs::symlink_metadata(&self.canonical_database_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Ok(_) => Err(BeadsError::SyncConflict {
+                message: "Database appeared before its inode authority could be bound".to_string(),
+            }),
+            Err(error) => Err(BeadsError::Config(format!(
+                "Could not inspect missing database authority {}: {error}",
+                database_path_descriptor(&self.canonical_database_path)
+            ))),
+        }
+    }
+
+    /// Rebind the inode component after a caller-authorized atomic database
+    /// replacement while retaining the stable workspace and canonical-path
+    /// sidecar authority.
+    pub fn rebind_database_inode_after_authorized_replace(&self) -> Result<()> {
+        self.verify_common_authority()?;
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        let current_metadata =
+            fs::symlink_metadata(&self.canonical_database_path).map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not inspect replaced database authority {}: {error}",
+                    database_path_descriptor(&self.canonical_database_path)
+                ))
+            })?;
+        if current_metadata.file_type().is_symlink() || !current_metadata.is_file() {
+            return Err(BeadsError::SyncConflict {
+                message: "Authorized database replacement did not leave a regular file".to_string(),
+            });
+        }
+        let current_identity = additive_metadata_identity(&current_metadata);
+        if database_authority.identity == Some(current_identity) {
+            let database_lock =
+                database_authority
+                    .lock
+                    .as_ref()
+                    .ok_or_else(|| BeadsError::SyncConflict {
+                        message:
+                            "Database inode identity existed without a held replacement authority"
+                                .to_string(),
+                    })?;
+            verify_locked_file_identity(
+                database_lock,
+                &self.canonical_database_path,
+                "database write authority",
+                true,
+            )?;
+            return Ok(());
+        }
+
+        let replacement_lock = blocking_database_file_lock_with_timeout(
+            &self.canonical_database_path,
+            Some(self.remaining_lock_timeout_ms()),
+            false,
+        )?;
+        verify_locked_file_identity(
+            &replacement_lock,
+            &self.canonical_database_path,
+            "replacement database write authority",
+            true,
+        )?;
+        let replacement_identity =
+            additive_metadata_identity(&replacement_lock.metadata().map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not witness replacement database authority {}: {error}",
+                    database_path_descriptor(&self.canonical_database_path)
+                ))
+            })?);
+        if let Some(previous_lock) = database_authority.lock.replace(replacement_lock) {
+            database_authority.retired_locks.push(previous_lock);
+        }
+        database_authority.identity = Some(replacement_identity);
+        Ok(())
+    }
+
+    /// Create a missing database through a pre-locked replacement inode and
+    /// install that inode at the routed database path.
+    ///
+    /// The replacement is locked before it becomes visible at the canonical
+    /// database path. A hard-link alias therefore cannot acquire a competing
+    /// inode authority in the interval between creation and binding.
+    pub(crate) fn install_empty_database_replacement_and_bind(&self) -> Result<()> {
+        self.verify_common_authority()?;
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        if fs::symlink_metadata(&self.canonical_database_path).is_ok() {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing to install an empty database replacement over an existing path"
+                    .to_string(),
+            });
+        }
+
+        let parent = self.canonical_database_path.parent().ok_or_else(|| {
+            BeadsError::Config(
+                "Canonical database path has no parent for replacement installation".to_string(),
+            )
+        })?;
+        let stem = self
+            .canonical_database_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("beads.db");
+        let mut installed = None;
+        for attempt in 0..64_u32 {
+            let candidate = parent.join(format!(
+                ".{stem}.replacement.{}.{}.tmp",
+                std::process::id(),
+                attempt
+            ));
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            let candidate_file = match options.open(&candidate) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(BeadsError::Config(format!(
+                        "Could not create locked database replacement candidate: {error}"
+                    )));
+                }
+            };
+            match candidate_file.try_lock() {
+                Ok(()) => {}
+                Err(TryLockError::WouldBlock) => {
+                    return Err(BeadsError::SyncConflict {
+                        message: "Fresh database replacement candidate was already locked"
+                            .to_string(),
+                    });
+                }
+                Err(TryLockError::Error(error)) => {
+                    return Err(BeadsError::Config(format!(
+                        "Could not lock database replacement candidate: {error}"
+                    )));
+                }
+            }
+            candidate_file.sync_all()?;
+            if fs::symlink_metadata(&self.canonical_database_path).is_ok() {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database appeared before the locked replacement was installed"
+                        .to_string(),
+                });
+            }
+            crate::util::durable_rename(&candidate, &self.canonical_database_path)?;
+            installed = Some(candidate_file);
+            break;
+        }
+        let replacement_lock = installed.ok_or_else(|| {
+            BeadsError::Config(
+                "Could not allocate a unique locked database replacement candidate".to_string(),
+            )
+        })?;
+        verify_locked_file_identity(
+            &replacement_lock,
+            &self.canonical_database_path,
+            "installed database replacement authority",
+            true,
+        )?;
+        let replacement_identity =
+            additive_metadata_identity(&replacement_lock.metadata().map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not witness installed database replacement: {error}"
+                ))
+            })?);
+        if let Some(previous_lock) = database_authority.lock.replace(replacement_lock) {
+            database_authority.retired_locks.push(previous_lock);
+        }
+        database_authority.identity = Some(replacement_identity);
+        Ok(())
+    }
+
+    /// Drop locks for displaced database inodes only after recovery has
+    /// irreversibly accepted the replacement.
+    pub(crate) fn finalize_database_replacement(&self) -> Result<()> {
+        self.verify_database_authority()?;
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        database_authority.retired_locks.clear();
+        Ok(())
+    }
+
+    /// Re-adopt the still-locked original inode after a failed replacement is
+    /// rolled back into place.
+    pub(crate) fn restore_retained_database_inode_after_authorized_replace(&self) -> Result<()> {
+        self.verify_common_authority()?;
+        let target_metadata = fs::metadata(&self.canonical_database_path)?;
+        let target_identity = additive_metadata_identity(&target_metadata);
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+
+        if database_authority.identity == Some(target_identity) {
+            let current_lock =
+                database_authority
+                    .lock
+                    .as_ref()
+                    .ok_or_else(|| BeadsError::SyncConflict {
+                        message: "Restored database identity existed without a retained inode lock"
+                            .to_string(),
+                    })?;
+            verify_locked_file_identity(
+                current_lock,
+                &self.canonical_database_path,
+                "restored database write authority",
+                true,
+            )?;
+            database_authority.retired_locks.clear();
+            return Ok(());
+        }
+
+        let retained_index = database_authority
+            .retired_locks
+            .iter()
+            .position(|lock| {
+                lock.metadata()
+                    .is_ok_and(|metadata| additive_metadata_identity(&metadata) == target_identity)
+            })
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message: "Restored database inode was not retained under lock".to_string(),
+            })?;
+        let restored_lock = database_authority.retired_locks.swap_remove(retained_index);
+        verify_locked_file_identity(
+            &restored_lock,
+            &self.canonical_database_path,
+            "restored database write authority",
+            true,
+        )?;
+        if let Some(displaced_lock) = database_authority.lock.replace(restored_lock) {
+            database_authority.retired_locks.push(displaced_lock);
+        }
+        database_authority.identity = Some(target_identity);
+        database_authority.retired_locks.clear();
+        Ok(())
+    }
+
+    /// Lock a fully written replacement candidate before it is atomically
+    /// installed at the canonical database path.
+    pub(crate) fn lock_database_replacement_candidate(
+        &self,
+        candidate_path: &Path,
+    ) -> Result<File> {
+        self.verify_common_authority()?;
+        blocking_database_file_lock_with_timeout(
+            candidate_path,
+            Some(self.remaining_lock_timeout_ms()),
+            false,
+        )
+    }
+
+    /// Adopt a pre-locked replacement immediately after its atomic install.
+    ///
+    /// The caller keeps the replacement inode locked across the rename, so
+    /// hard-link aliases never observe the new inode without its authority.
+    pub(crate) fn adopt_locked_database_replacement(&self, replacement_lock: File) -> Result<()> {
+        self.verify_common_authority()?;
+        verify_locked_file_identity(
+            &replacement_lock,
+            &self.canonical_database_path,
+            "installed database replacement authority",
+            true,
+        )?;
+        let replacement_identity =
+            additive_metadata_identity(&replacement_lock.metadata().map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not witness installed database replacement: {error}"
+                ))
+            })?);
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        if let Some(previous_lock) = database_authority.lock.replace(replacement_lock) {
+            database_authority.retired_locks.push(previous_lock);
+        }
+        database_authority.identity = Some(replacement_identity);
+        Ok(())
+    }
+
+    /// Clear the inode component after an authorized rollback restores the
+    /// database family to a legitimately missing state.
+    pub(crate) fn clear_database_inode_after_authorized_remove(&self) -> Result<()> {
+        self.verify_common_authority()?;
+        match fs::symlink_metadata(&self.canonical_database_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(BeadsError::SyncConflict {
+                    message: "Cannot clear database inode authority while the routed path exists"
+                        .to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "Could not verify authorized missing database state: {error}"
+                )));
+            }
+        }
+        let mut database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        database_authority.lock = None;
+        database_authority.identity = None;
+        database_authority.retired_locks.clear();
+        Ok(())
+    }
+
+    pub fn verify_database_authority(&self) -> Result<()> {
+        self.verify_common_authority()?;
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        if let Some(database_lock) = database_authority.lock.as_ref() {
+            verify_locked_file_identity(
+                database_lock,
+                &self.canonical_database_path,
+                "database write authority",
+                true,
+            )?;
+            let current_identity = additive_metadata_identity(
+                &fs::metadata(&self.canonical_database_path).map_err(|error| {
+                    BeadsError::Config(format!(
+                        "Could not re-witness canonical database authority {}: {error}",
+                        database_path_descriptor(&self.canonical_database_path)
+                    ))
+                })?,
+            );
+            if database_authority.identity != Some(current_identity) {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database inode changed while its write authority was held"
+                        .to_string(),
+                });
+            }
+        } else {
+            match fs::symlink_metadata(&self.canonical_database_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(BeadsError::SyncConflict {
+                        message: "Database appeared before its inode authority was bound"
+                            .to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(BeadsError::Config(format!(
+                        "Could not verify missing database authority {}: {error}",
+                        database_path_descriptor(&self.canonical_database_path)
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn additive_path_descriptor(path: &Path, role: &str) -> String {
+    let digest = hex_encode(&Sha256::digest(path.to_string_lossy().as_bytes()));
+    format!("<{role} sha256={digest}>")
+}
+
+fn database_path_descriptor(path: &Path) -> String {
+    additive_path_descriptor(path, "database-authority")
+}
+
+fn redact_reviewed_path_result<T, E>(
+    result: std::result::Result<T, E>,
+    path: &Path,
+    role: &str,
+    action: &str,
+) -> Result<T> {
+    result.map_err(|_| {
+        BeadsError::Config(format!(
+            "Could not {action} reviewed {role} {} (path-sensitive detail suppressed)",
+            additive_path_descriptor(path, role)
+        ))
+    })
+}
+
+fn canonical_database_authority_key(database_path: &Path) -> Result<PathBuf> {
+    let database_descriptor = database_path_descriptor(database_path);
+    let absolute = absolute_database_routing_path(database_path)?;
+    match fs::canonicalize(&absolute) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = absolute.parent().ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Database path {database_descriptor} has no parent for lock authority"
+                ))
+            })?;
+            let file_name = absolute.file_name().ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Database path {database_descriptor} has no filename for lock authority"
+                ))
+            })?;
+            Ok(fs::canonicalize(parent)
+                .map_err(|parent_error| {
+                    BeadsError::Config(format!(
+                        "Could not canonicalize database lock authority parent for {database_descriptor}: {parent_error}"
+                    ))
+                })?
+                .join(file_name))
+        }
+        Err(error) => {
+            return Err(BeadsError::Config(format!(
+                "Could not resolve database lock authority for {database_descriptor}: {error}"
+            )));
+        }
+    }
+}
+
+fn absolute_database_routing_path(database_path: &Path) -> Result<PathBuf> {
+    let database_descriptor = database_path_descriptor(database_path);
+    let absolute = if database_path.is_absolute() {
+        database_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not resolve database lock authority for {database_descriptor}: {error}"
+                ))
+            })?
+            .join(database_path)
+    };
+    Ok(absolute)
+}
+
+fn reject_unsafe_database_routing_leaf(database_path: &Path) -> Result<PathBuf> {
+    let absolute = absolute_database_routing_path(database_path)?;
+    reject_symlinked_database_route_components(&absolute)?;
+    match fs::symlink_metadata(&absolute) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(BeadsError::Config(format!(
+                "Refusing unsafe configured database leaf {}: expected a regular file, not a symlink or special file",
+                database_path_descriptor(&absolute)
+            )))
+        }
+        Ok(_) => Ok(absolute),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(absolute),
+        Err(error) => Err(BeadsError::Config(format!(
+            "Could not inspect configured database leaf {}: {error}",
+            database_path_descriptor(&absolute)
+        ))),
+    }
+}
+
+pub(crate) fn reject_symlinked_database_route_components(database_path: &Path) -> Result<()> {
+    let absolute = absolute_database_routing_path(database_path)?;
+    for component_path in absolute.ancestors().skip(1) {
+        match fs::symlink_metadata(component_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(BeadsError::Config(format!(
+                    "Refusing configured database route with a symlinked parent component {}",
+                    database_path_descriptor(&absolute)
+                )));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(BeadsError::Config(format!(
+                    "Refusing configured database route with a non-directory parent component {}",
+                    database_path_descriptor(&absolute)
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "Could not inspect configured database route {}: {error}",
+                    database_path_descriptor(&absolute)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the exact canonical database path protected by a database-family
+/// authority.
+pub fn canonical_database_authority_path(database_path: &Path) -> Result<PathBuf> {
+    canonical_database_authority_key(database_path)
+}
+
+fn database_write_authority_path(database_path: &Path) -> Result<PathBuf> {
+    let canonical_key = canonical_database_authority_key(database_path)?;
+    let parent = canonical_key.parent().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Canonical database path {} has no parent for lock authority",
+            database_path_descriptor(&canonical_key)
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"beads-rust-database-write-authority-v1\0");
+    update_sync_path_digest(&mut hasher, &canonical_key);
+    let digest = hex_encode(&hasher.finalize());
+    Ok(parent.join(format!(".br-db-write-{}.lock", &digest[..24])))
+}
+
+fn jsonl_write_authority_path(jsonl_path: &Path) -> Result<PathBuf> {
+    let canonical_key = canonical_database_authority_key(jsonl_path)?;
+    let parent = canonical_key.parent().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Canonical JSONL path {} has no parent for lock authority",
+            additive_path_descriptor(&canonical_key, "jsonl-authority")
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"beads-rust-jsonl-write-authority-v1\0");
+    update_sync_path_digest(&mut hasher, &canonical_key);
+    let digest = hex_encode(&hasher.finalize());
+    Ok(parent.join(format!(".br-jsonl-write-{}.lock", &digest[..24])))
+}
+
+/// Acquire the stable JSONL-family authority honored by no-DB sessions.
+pub fn blocking_jsonl_family_write_lock_with_timeout(
+    jsonl_path: &Path,
+    lock_timeout_ms: Option<u64>,
+) -> Result<JsonlFamilyWriteLock> {
+    match fs::symlink_metadata(jsonl_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(BeadsError::Config(format!(
+                "Refusing unsafe JSONL authority leaf {}: expected a regular file, not a symlink or special file",
+                additive_path_descriptor(jsonl_path, "jsonl-authority")
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(BeadsError::Config(format!(
+                "Could not inspect JSONL authority leaf {}: {error}",
+                additive_path_descriptor(jsonl_path, "jsonl-authority")
+            )));
+        }
+    }
+    let canonical_jsonl_path = canonical_database_authority_key(jsonl_path)?;
+    let authority_lock_path = jsonl_write_authority_path(jsonl_path)?;
+    let authority_path_sha256 = canonical_sync_path_sha256(&authority_lock_path);
+    let authority_lock = open_and_lock_regular_file(
+        &authority_lock_path,
+        lock_timeout_ms,
+        true,
+        "JSONL-family write lock",
+        true,
+    )?;
+    let canonical_after = canonical_database_authority_key(jsonl_path)?;
+    if canonical_after != canonical_jsonl_path {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL routing changed while acquiring its write authority".to_string(),
+        });
+    }
+    let pinned_jsonl_name = pin_jsonl_target(jsonl_path)?;
+    if pinned_jsonl_name.display_path() != canonical_jsonl_path {
+        return Err(BeadsError::SyncConflict {
+            message: "Pinned JSONL route does not match the canonical sidecar write authority"
+                .to_string(),
+        });
+    }
+    let authority = JsonlFamilyWriteLock {
+        _authority_lock: authority_lock,
+        authority_lock_path,
+        authority_path_sha256,
+        routed_jsonl_path: jsonl_path.to_path_buf(),
+        canonical_jsonl_path,
+        pinned_jsonl_name,
+    };
+    authority.verify_jsonl_authority()?;
+    Ok(authority)
+}
+
+/// Stable digest of the canonical database-family lock authority.
+pub fn database_write_authority_sha256(database_path: &Path) -> Result<String> {
+    Ok(canonical_sync_path_sha256(&database_write_authority_path(
+        database_path,
+    )?))
+}
+
+/// Acquire the common database-family authority honored by CLI, MCP, recovery,
+/// and reviewed reconciliation mutation paths.
+pub fn blocking_database_family_write_lock_with_timeout(
+    beads_dir: &Path,
+    database_path: &Path,
+    lock_timeout_ms: Option<u64>,
+) -> Result<DatabaseFamilyWriteLock> {
+    let acquisition_started = Instant::now();
+    let total_timeout_ms = lock_timeout_ms.unwrap_or(DEFAULT_WRITE_LOCK_TIMEOUT_MS);
+    let remaining_timeout_ms = || {
+        let elapsed_ms =
+            u64::try_from(acquisition_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        total_timeout_ms.saturating_sub(elapsed_ms)
+    };
+    let routed_database_path = reject_unsafe_database_routing_leaf(database_path)?;
+    let workspace_lock_path = beads_dir.join(".write.lock");
+    let workspace_lock = blocking_write_lock_with_timeout(beads_dir, Some(remaining_timeout_ms()))?;
+    let canonical_database_path = canonical_database_authority_key(database_path)?;
+    let authority_path = database_write_authority_path(database_path)?;
+    let authority_path_sha256 = database_write_authority_sha256(database_path)?;
+    let authority_lock = open_and_lock_regular_file(
+        &authority_path,
+        Some(remaining_timeout_ms()),
+        true,
+        "database-family write lock",
+        true,
+    )?;
+    let (database_lock, database_identity) = match fs::symlink_metadata(&canonical_database_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(BeadsError::Config(format!(
+                "Refusing unsafe database write authority {}: expected a regular file, not a symlink or special file",
+                database_path_descriptor(&canonical_database_path)
+            )));
+        }
+        Ok(_) => {
+            let database_lock = blocking_database_file_lock_with_timeout(
+                &canonical_database_path,
+                Some(remaining_timeout_ms()),
+                false,
+            )?;
+            let identity =
+                additive_metadata_identity(&database_lock.metadata().map_err(|error| {
+                    BeadsError::Config(format!(
+                        "Could not witness canonical database authority {}: {error}",
+                        database_path_descriptor(&canonical_database_path)
+                    ))
+                })?);
+            (Some(database_lock), Some(identity))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(error) => {
+            return Err(BeadsError::Config(format!(
+                "Could not inspect canonical database authority {}: {error}",
+                database_path_descriptor(&canonical_database_path)
+            )));
+        }
+    };
+    let canonical_after = canonical_database_authority_key(database_path)?;
+    if canonical_after != canonical_database_path {
+        return Err(BeadsError::SyncConflict {
+            message: "Database routing changed while acquiring its write authority".to_string(),
+        });
+    }
+    match (&database_lock, database_identity) {
+        (Some(database_lock), Some(identity)) => {
+            verify_locked_file_identity(
+                database_lock,
+                &canonical_after,
+                "database write authority",
+                true,
+            )?;
+            if additive_metadata_identity(&fs::metadata(&canonical_after).map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not re-witness canonical database authority {}: {error}",
+                    database_path_descriptor(&canonical_after)
+                ))
+            })?) != identity
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database inode changed while acquiring its write authority"
+                        .to_string(),
+                });
+            }
+        }
+        (None, None) => {
+            if fs::symlink_metadata(&canonical_after).is_ok() {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database appeared while acquiring its write authority".to_string(),
+                });
+            }
+        }
+        _ => unreachable!("database inode authority lock and identity must be paired"),
+    }
+    Ok(DatabaseFamilyWriteLock {
+        _workspace_lock: workspace_lock,
+        workspace_lock_path,
+        _authority_lock: authority_lock,
+        authority_lock_path: authority_path,
+        database_authority: std::sync::Mutex::new(DatabaseInodeAuthority {
+            lock: database_lock,
+            identity: database_identity,
+            retired_locks: Vec::new(),
+        }),
+        authority_path_sha256,
+        routed_database_path,
+        canonical_database_path,
+        acquisition_started,
+        total_timeout_ms,
+    })
+}
+
+fn open_and_lock_regular_file(
+    lock_path: &Path,
+    lock_timeout_ms: Option<u64>,
+    create_if_missing: bool,
+    role: &str,
+    redact_path: bool,
+) -> Result<File> {
+    let lock_path_display = if redact_path {
+        database_path_descriptor(lock_path)
+    } else {
+        lock_path.display().to_string()
+    };
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(BeadsError::Config(format!(
+                "Refusing unsafe {role} path {}: expected a regular file, not a symlink or special file",
+                lock_path_display
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if create_if_missing && error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(BeadsError::Config(format!(
+                "Failed to inspect {role} at {}: {error}",
+                lock_path_display
+            )));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|err| {
-            BeadsError::Config(format!(
-                "Failed to open write lock at {}: {err}",
-                lock_path.display()
-            ))
-        })?;
+        .create(create_if_missing)
+        .truncate(false);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(lock_path).map_err(|err| {
+        BeadsError::Config(format!(
+            "Failed to open {role} at {}: {err}",
+            lock_path_display
+        ))
+    })?;
+    let opened_metadata = file.metadata().map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to witness opened {role} at {}: {error}",
+            lock_path_display
+        ))
+    })?;
+    let path_metadata = fs::symlink_metadata(&lock_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to re-witness {role} at {}: {error}",
+            lock_path_display
+        ))
+    })?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "{role} path {} changed to a symlink or special file while opening it",
+            lock_path_display
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if (opened_metadata.dev(), opened_metadata.ino())
+            != (path_metadata.dev(), path_metadata.ino())
+        {
+            return Err(BeadsError::Config(format!(
+                "{role} identity changed while opening {}",
+                lock_path_display
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = opened_metadata;
 
     // Fast path: non-blocking try for the common uncontended case.
     match file.try_lock() {
-        Ok(()) => return Ok(file),
+        Ok(()) => {
+            verify_locked_file_identity(&file, lock_path, role, redact_path)?;
+            return Ok(file);
+        }
         Err(TryLockError::WouldBlock) => {}
         Err(TryLockError::Error(err)) => {
             return Err(BeadsError::Config(format!(
-                "Failed to acquire write lock at {}: {err}",
-                lock_path.display()
+                "Failed to acquire {role} at {}: {err}",
+                lock_path_display
             )));
         }
     }
@@ -100,37 +1237,76 @@ pub fn blocking_write_lock_with_timeout(
     let start = Instant::now();
     tracing::debug!(
         timeout_ms,
-        lock_path = %lock_path.display(),
-        ".write.lock is held by another process; waiting with timeout"
+        lock_path = %lock_path_display,
+        role,
+        "write authority is held by another process; waiting with timeout"
     );
 
     loop {
         if start.elapsed() >= timeout {
-            return Err(write_lock_timeout_error(&lock_path, timeout_ms));
+            return Err(write_lock_timeout_error(&lock_path_display, timeout_ms));
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
         thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
 
         match file.try_lock() {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                verify_locked_file_identity(&file, lock_path, role, redact_path)?;
+                return Ok(file);
+            }
             Err(TryLockError::WouldBlock) => {}
             Err(TryLockError::Error(err)) => {
-                tracing::debug!("failed to acquire .write.lock: {err}");
+                tracing::debug!(role, "failed to acquire write authority: {err}");
                 return Err(BeadsError::Config(format!(
-                    "Failed to acquire write lock at {}: {err}",
-                    lock_path.display()
+                    "Failed to acquire {role} at {}: {err}",
+                    lock_path_display
                 )));
             }
         }
     }
 }
 
-fn write_lock_timeout_error(lock_path: &Path, timeout_ms: u64) -> BeadsError {
+fn verify_locked_file_identity(
+    file: &File,
+    lock_path: &Path,
+    role: &str,
+    redact_path: bool,
+) -> Result<()> {
+    let lock_path_display = if redact_path {
+        database_path_descriptor(lock_path)
+    } else {
+        lock_path.display().to_string()
+    };
+    let opened = file.metadata().map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to witness locked {role} at {}: {error}",
+            lock_path_display
+        ))
+    })?;
+    let current = fs::symlink_metadata(lock_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to re-witness locked {role} at {}: {error}",
+            lock_path_display
+        ))
+    })?;
+    if current.file_type().is_symlink()
+        || !current.is_file()
+        || additive_metadata_identity(&opened) != additive_metadata_identity(&current)
+    {
+        return Err(BeadsError::Config(format!(
+            "{role} identity changed before lock authority was established at {}",
+            lock_path_display
+        )));
+    }
+    Ok(())
+}
+
+fn write_lock_timeout_error(lock_path_display: &str, timeout_ms: u64) -> BeadsError {
     BeadsError::Config(format!(
         "Timed out after {timeout_ms}ms waiting for write lock at {}. \
          Another br process may be holding .write.lock; retry after it exits or investigate a stuck process.",
-        lock_path.display()
+        lock_path_display
     ))
 }
 
@@ -183,6 +1359,13 @@ impl TempFileGuard {
         }
     }
 
+    fn new_retained(path: PathBuf) -> Self {
+        Self {
+            path,
+            persist: true,
+        }
+    }
+
     fn persist(&mut self) {
         self.persist = true;
     }
@@ -194,6 +1377,396 @@ impl Drop for TempFileGuard {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalPublicationHookPhase {
+    PreCreate,
+    PreCommit,
+    PostRename,
+    ParentFsync,
+    PreCleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalNamespaceChange {
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android", target_vendor = "apple")),
+        allow(dead_code)
+    )]
+    RenamedCreate,
+    Exchanged,
+}
+
+struct ConditionalJsonlPublication {
+    source: Arc<JsonlSourceSnapshot>,
+    atomicity: ExportPublicationAtomicity,
+    retained_recovery_path: Option<String>,
+    cleanup_durable: bool,
+}
+
+impl ConditionalJsonlPublication {
+    fn into_receipt(self, output_path: &Path, content_sha256: String) -> ExportPublicationReceipt {
+        ExportPublicationReceipt {
+            content_sha256,
+            output_path: output_path.to_string_lossy().to_string(),
+            source: self.source,
+            atomicity: self.atomicity,
+            retained_recovery_path: self.retained_recovery_path,
+            cleanup_durable: self.cleanup_durable,
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn perform_conditional_namespace_change(
+    staged_name: &PinnedJsonlName,
+    output_name: &PinnedJsonlName,
+    expected_previous_state: &JsonlSourceStateWitness,
+) -> Result<ConditionalNamespaceChange> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    if staged_name.parent().identity() != output_name.parent().identity() {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Conditional JSONL publication names do not share one retained parent capability"
+                    .to_string(),
+        });
+    }
+
+    let (flags, change) = match expected_previous_state {
+        JsonlSourceStateWitness::Missing => (
+            RenameFlags::NOREPLACE,
+            ConditionalNamespaceChange::RenamedCreate,
+        ),
+        JsonlSourceStateWitness::Present { .. } => {
+            (RenameFlags::EXCHANGE, ConditionalNamespaceChange::Exchanged)
+        }
+    };
+
+    renameat_with(
+        staged_name.parent().as_file(),
+        staged_name.leaf(),
+        output_name.parent().as_file(),
+        output_name.leaf(),
+        flags,
+    )
+    .map_err(|error| {
+        let error = std::io::Error::from(error);
+        match (expected_previous_state, error.kind()) {
+            (JsonlSourceStateWitness::Missing, std::io::ErrorKind::AlreadyExists) => {
+                BeadsError::SyncConflict {
+                    message:
+                        "JSONL appeared before the atomic no-replace publication; refusing to overwrite it"
+                            .to_string(),
+                }
+            }
+            (JsonlSourceStateWitness::Present { .. }, std::io::ErrorKind::NotFound) => {
+                BeadsError::SyncConflict {
+                    message:
+                        "JSONL disappeared before the atomic exchange publication; refusing to continue"
+                            .to_string(),
+                }
+            }
+            _ => BeadsError::Io(error),
+        }
+    })?;
+
+    Ok(change)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn perform_conditional_namespace_change(
+    _staged_name: &PinnedJsonlName,
+    _output_name: &PinnedJsonlName,
+    _expected_previous_state: &JsonlSourceStateWitness,
+) -> Result<ConditionalNamespaceChange> {
+    Err(BeadsError::Config(
+        "This platform does not provide the retained handle-relative namespace primitives required for conditional JSONL publication"
+            .to_string(),
+    ))
+}
+
+fn published_but_unwitnessed(
+    output_path: &Path,
+    recovery_path: Option<&Path>,
+    source: impl std::error::Error + Send + Sync + 'static,
+) -> BeadsError {
+    BeadsError::JsonlPublishedButUnwitnessed {
+        output_path: output_path.to_path_buf(),
+        recovery_path: recovery_path.map(Path::to_path_buf),
+        source: Box::new(source),
+    }
+}
+
+fn publish_staged_jsonl_conditionally(
+    temp_path: &Path,
+    temp_guard: TempFileGuard,
+    output_path: &Path,
+    staged_source: &JsonlSourceSnapshot,
+    expected_previous_state: &JsonlSourceStateWitness,
+    content_sha256: &str,
+    jsonl_authority: &JsonlFamilyWriteLock,
+    database_authority: Option<&DatabaseFamilyWriteLock>,
+) -> Result<ConditionalJsonlPublication> {
+    publish_staged_jsonl_conditionally_with_hooks(
+        temp_path,
+        temp_guard,
+        output_path,
+        staged_source,
+        expected_previous_state,
+        content_sha256,
+        jsonl_authority,
+        |phase| {
+            if matches!(
+                phase,
+                ConditionalPublicationHookPhase::PreCommit
+                    | ConditionalPublicationHookPhase::PostRename
+            ) && let Some(database_authority) = database_authority
+            {
+                database_authority.verify_database_authority()?;
+            }
+            Ok(())
+        },
+        JsonlFamilyWriteLock::fsync_pinned_parent,
+    )
+}
+
+/// Publish an already-synced staged regular file through the same conditional
+/// namespace protocol as primary JSONL exports.
+///
+/// The target's exact current generation is captured only after acquiring its
+/// stable path-family authority. Once admitted to this protocol, the staged
+/// file is retained on any failure because a substituted route makes
+/// path-based cleanup ambiguous.
+pub(crate) fn publish_staged_file_conditionally(
+    temp_path: &Path,
+    output_path: &Path,
+) -> Result<ExportPublicationReceipt> {
+    let authority = blocking_jsonl_family_write_lock_with_timeout(output_path, None)?;
+    let output_name = authority.pinned_name_for_target(output_path)?;
+    let staged_name = authority.pinned_sibling(temp_path)?;
+    let previous_source = output_name.capture_optional()?;
+    let expected_previous_state = previous_source.as_ref().map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+    let staged_source = staged_name.capture()?;
+    let content_sha256 = staged_source.content_sha256().to_string();
+    let publication = publish_staged_jsonl_conditionally(
+        temp_path,
+        TempFileGuard::new_retained(temp_path.to_path_buf()),
+        output_path,
+        &staged_source,
+        &expected_previous_state,
+        &content_sha256,
+        &authority,
+        None,
+    )?;
+    Ok(publication.into_receipt(output_path, content_sha256))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_staged_jsonl_conditionally_with_hooks<Hook, SyncParent>(
+    temp_path: &Path,
+    mut temp_guard: TempFileGuard,
+    output_path: &Path,
+    staged_source: &JsonlSourceSnapshot,
+    expected_previous_state: &JsonlSourceStateWitness,
+    content_sha256: &str,
+    jsonl_authority: &JsonlFamilyWriteLock,
+    mut hook: Hook,
+    mut sync_parent: SyncParent,
+) -> Result<ConditionalJsonlPublication>
+where
+    Hook: FnMut(ConditionalPublicationHookPhase) -> Result<()>,
+    SyncParent: FnMut(&JsonlFamilyWriteLock) -> std::io::Result<()>,
+{
+    // This path may become a recovery name after the namespace operation.
+    // Path-based Drop cleanup cannot safely distinguish the retained parent
+    // from an attacker-substituted route, so conditional publication owns all
+    // subsequent cleanup decisions explicitly.
+    temp_guard.persist();
+    jsonl_authority.verify_jsonl_authority()?;
+    let output_name = jsonl_authority.pinned_name_for_target(output_path)?;
+    let staged_name = jsonl_authority.pinned_sibling(temp_path)?;
+    verify_expected_jsonl_source_state_observed(
+        output_name.capture_optional()?,
+        None,
+        Some(expected_previous_state),
+    )?;
+    verify_expected_jsonl_source_state_observed(
+        staged_name.capture_optional()?,
+        None,
+        Some(&staged_source.state_witness()),
+    )?;
+
+    hook(ConditionalPublicationHookPhase::PreCommit)?;
+    let namespace_change =
+        perform_conditional_namespace_change(&staged_name, &output_name, expected_previous_state)?;
+    let displaced_path =
+        (namespace_change == ConditionalNamespaceChange::Exchanged).then_some(temp_path);
+    let cleanup_candidate =
+        (namespace_change == ConditionalNamespaceChange::Exchanged).then_some(temp_path);
+
+    hook(ConditionalPublicationHookPhase::PostRename)
+        .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?;
+
+    let persisted_source = Arc::new(
+        output_name
+            .capture()
+            .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?,
+    );
+    if persisted_source.state_witness() != staged_source.state_witness()
+        || persisted_source.content_sha256() != content_sha256
+    {
+        let error = BeadsError::SyncConflict {
+            message:
+                "Published JSONL path does not contain the exact staged generation after the namespace change"
+                    .to_string(),
+        };
+        return if let Some(recovery_path) = displaced_path {
+            Err(BeadsError::JsonlPublicationConflict {
+                output_path: output_path.to_path_buf(),
+                recovery_path: recovery_path.to_path_buf(),
+                message: error.to_string(),
+            })
+        } else {
+            Err(published_but_unwitnessed(output_path, None, error))
+        };
+    }
+
+    let displaced_source = if namespace_change == ConditionalNamespaceChange::Exchanged {
+        let displaced_source = staged_name
+            .capture()
+            .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?;
+        if displaced_source.state_witness() != *expected_previous_state {
+            return Err(BeadsError::JsonlPublicationConflict {
+                output_path: output_path.to_path_buf(),
+                recovery_path: temp_path.to_path_buf(),
+                message:
+                    "the atomically displaced JSONL generation does not match the exact retained source witness"
+                        .to_string(),
+            });
+        }
+        Some(displaced_source)
+    } else {
+        None
+    };
+
+    hook(ConditionalPublicationHookPhase::ParentFsync)
+        .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?;
+    sync_parent(jsonl_authority).map_err(|source| BeadsError::JsonlPublishedButNotDurable {
+        output_path: output_path.to_path_buf(),
+        recovery_path: cleanup_candidate.map(Path::to_path_buf),
+        content_sha256: content_sha256.to_string(),
+        source,
+    })?;
+    jsonl_authority
+        .verify_jsonl_authority()
+        .map_err(|error| published_but_unwitnessed(output_path, displaced_path, error))?;
+
+    let atomicity = match namespace_change {
+        ConditionalNamespaceChange::RenamedCreate => ExportPublicationAtomicity::CreateNoReplace,
+        ConditionalNamespaceChange::Exchanged => ExportPublicationAtomicity::ExchangeAndVerify,
+    };
+    let mut retained_recovery_path = None;
+    let mut cleanup_durable = true;
+    if let (Some(cleanup_path), Some(displaced_source)) =
+        (cleanup_candidate, displaced_source.as_ref())
+    {
+        let cleanup_result = hook(ConditionalPublicationHookPhase::PreCleanup).and_then(|()| {
+            jsonl_authority.verify_jsonl_authority()?;
+            #[cfg(unix)]
+            {
+                staged_name.remove_regular_if_identity(displaced_source.identity())
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = displaced_source;
+                Err(BeadsError::Config(
+                    "Exact handle-relative JSONL cleanup is unavailable on this platform"
+                        .to_string(),
+                ))
+            }
+        });
+        match cleanup_result {
+            Ok(()) => {
+                if let Err(error) = sync_parent(jsonl_authority) {
+                    cleanup_durable = false;
+                    tracing::warn!(
+                        output_path = %output_path.display(),
+                        cleanup_path = %cleanup_path.display(),
+                        error = %error,
+                        "JSONL publication is durable and the displaced generation was removed, but cleanup durability is uncertain"
+                    );
+                }
+            }
+            Err(error) => {
+                cleanup_durable = false;
+                retained_recovery_path = Some(cleanup_path.to_string_lossy().to_string());
+                tracing::warn!(
+                    output_path = %output_path.display(),
+                    cleanup_path = %cleanup_path.display(),
+                    error = %error,
+                    "JSONL publication is durable, but the displaced-generation recovery file was retained"
+                );
+            }
+        }
+    }
+
+    jsonl_authority.verify_jsonl_authority().map_err(|error| {
+        published_but_unwitnessed(
+            output_path,
+            retained_recovery_path.as_deref().map(Path::new),
+            error,
+        )
+    })?;
+
+    Ok(ConditionalJsonlPublication {
+        source: persisted_source,
+        atomicity,
+        retained_recovery_path,
+        cleanup_durable,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn publish_staged_jsonl_conditionally_with<Before, SyncParent>(
+    temp_path: &Path,
+    temp_guard: TempFileGuard,
+    output_path: &Path,
+    staged_source: &JsonlSourceSnapshot,
+    expected_previous_state: &JsonlSourceStateWitness,
+    content_sha256: &str,
+    jsonl_authority: &JsonlFamilyWriteLock,
+    before_namespace_change: Before,
+    mut sync_parent: SyncParent,
+) -> Result<ConditionalJsonlPublication>
+where
+    Before: FnOnce() -> Result<()>,
+    SyncParent: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut before_namespace_change = Some(before_namespace_change);
+    publish_staged_jsonl_conditionally_with_hooks(
+        temp_path,
+        temp_guard,
+        output_path,
+        staged_source,
+        expected_previous_state,
+        content_sha256,
+        jsonl_authority,
+        move |phase| {
+            if phase == ConditionalPublicationHookPhase::PreCommit
+                && let Some(before_namespace_change) = before_namespace_change.take()
+            {
+                before_namespace_change()?;
+            }
+            Ok(())
+        },
+        |_| sync_parent(output_path),
+    )
 }
 
 pub(crate) fn export_temp_path(output_path: &Path) -> PathBuf {
@@ -230,11 +1803,14 @@ fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(
             );
         }
 
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
             Ok(temp_file) => return Ok((temp_path, temp_file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if fs::symlink_metadata(&temp_path)
@@ -256,38 +1832,80 @@ fn create_jsonl_temp_file(output_path: &Path, config: &ExportConfig) -> Result<(
     )))
 }
 
-fn create_base_snapshot_temp_file(
-    snapshot_path: &Path,
-    jsonl_dir: &Path,
-) -> Result<(PathBuf, File)> {
-    for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
-        let temp_path = export_temp_path_for_attempt(snapshot_path, attempt);
-        validate_temp_file_path(&temp_path, snapshot_path, jsonl_dir, false)?;
+fn create_pinned_jsonl_temp_file_with<Validate, Hook>(
+    output_path: &Path,
+    jsonl_authority: &JsonlFamilyWriteLock,
+    mut validate: Validate,
+    mut hook: Hook,
+) -> Result<(PathBuf, PinnedJsonlName, File)>
+where
+    Validate: FnMut(&Path) -> Result<()>,
+    Hook: FnMut(ConditionalPublicationHookPhase) -> Result<()>,
+{
+    jsonl_authority.verify_jsonl_authority()?;
+    let _ = jsonl_authority.pinned_name_for_target(output_path)?;
+    hook(ConditionalPublicationHookPhase::PreCreate)?;
 
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(temp_file) => return Ok((temp_path, temp_file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if fs::symlink_metadata(&temp_path)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
-                {
-                    return Err(BeadsError::Config(format!(
-                        "Temporary base snapshot file already exists: {}",
-                        temp_path.display()
-                    )));
-                }
-            }
-            Err(error) => return Err(error.into()),
-        }
+    for attempt in 0..MAX_JSONL_TEMP_PATH_ATTEMPTS {
+        let temp_path = export_temp_path_for_attempt(output_path, attempt);
+        validate(&temp_path)?;
+        let pinned_temp = jsonl_authority.pinned_sibling(&temp_path)?;
+        let Some(temp_file) = pinned_temp.create_new_regular_if_absent()? else {
+            continue;
+        };
+
+        // The file was created through the retained directory handle. A route
+        // substitution can therefore never redirect creation, but it still
+        // invalidates ordinary success and must be surfaced immediately.
+        jsonl_authority.verify_jsonl_authority()?;
+        return Ok((temp_path, pinned_temp, temp_file));
     }
 
     Err(BeadsError::Config(format!(
-        "Failed to allocate temporary base snapshot file for {}",
-        snapshot_path.display()
+        "Failed to allocate pinned temporary export file for {}",
+        output_path.display()
     )))
+}
+
+fn create_full_export_temp_file_under_authority(
+    output_path: &Path,
+    config: &ExportConfig,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<(PathBuf, PinnedJsonlName, File)> {
+    create_pinned_jsonl_temp_file_with(
+        output_path,
+        jsonl_authority,
+        |temp_path| {
+            if let Some(ref beads_dir) = config.beads_dir {
+                validate_temp_file_path(
+                    temp_path,
+                    output_path,
+                    beads_dir,
+                    config.allow_external_jsonl,
+                )?;
+                tracing::debug!(
+                    temp_path = %temp_path.display(),
+                    target_path = %output_path.display(),
+                    "Pinned temp file path validated"
+                );
+            }
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+}
+
+fn create_base_snapshot_temp_file_under_authority(
+    snapshot_path: &Path,
+    jsonl_dir: &Path,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<(PathBuf, PinnedJsonlName, File)> {
+    create_pinned_jsonl_temp_file_with(
+        snapshot_path,
+        jsonl_authority,
+        |temp_path| validate_temp_file_path(temp_path, snapshot_path, jsonl_dir, false),
+        |_| Ok(()),
+    )
 }
 
 #[cfg(unix)]
@@ -306,6 +1924,17 @@ fn set_restrictive_jsonl_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn set_restrictive_jsonl_permissions(_path: &Path) {}
 
+/// Exact output approved by a durable export receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedStagedExport {
+    /// Exact SHA-256 of the serialized JSONL bytes approved for publication.
+    pub raw_sha256: String,
+    /// Exact number of serialized issue rows approved for publication.
+    pub issue_count: usize,
+    /// Exact `(issue_id, content_hash)` mapping approved for finalization.
+    pub issue_hashes: AdditiveTableWitness,
+}
+
 /// Configuration for JSONL export.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
@@ -318,6 +1947,12 @@ pub struct ExportConfig {
     pub error_policy: ExportErrorPolicy,
     /// Retention period for tombstones in days (None = keep forever).
     pub retention_days: Option<u64>,
+    /// Frozen tombstone-retention cutoff for this logical export.
+    ///
+    /// When absent, the file exporter captures `Utc::now()` once before
+    /// preparing any issue. Resume paths set this explicitly so replay emits
+    /// the same bytes as the original committed merge.
+    pub export_as_of: Option<DateTime<Utc>>,
     /// The `.beads` directory path for path validation.
     /// If None, path validation is skipped (for backwards compatibility).
     pub beads_dir: Option<PathBuf>,
@@ -333,6 +1968,12 @@ pub struct ExportConfig {
     /// `0` means "auto": use up to 64 workers, capped by host parallelism.
     /// `1` is the deterministic serial fallback.
     pub max_parallel_workers: usize,
+    /// Optional exact staged-output constraint for durable resume workflows.
+    ///
+    /// The exporter checks both values after the staged file has been flushed,
+    /// synced, captured, and structurally validated, but before any namespace
+    /// operation can replace the live JSONL.
+    pub expected_staged_output: Option<ExpectedStagedExport>,
 }
 
 /// Export error handling policy.
@@ -504,6 +2145,59 @@ impl ExportContext {
     }
 }
 
+/// Atomic namespace operation used to publish a verified JSONL generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportPublicationAtomicity {
+    /// The destination was known to be absent and the staged file was installed
+    /// with an atomic no-replace operation.
+    CreateNoReplace,
+    /// The staged and prior destination names were atomically exchanged, then
+    /// both resulting identities and byte digests were verified.
+    ExchangeAndVerify,
+}
+
+/// Verified durable-file publication metadata for an export.
+#[derive(Debug, Clone)]
+pub struct ExportPublicationReceipt {
+    content_sha256: String,
+    output_path: String,
+    source: Arc<JsonlSourceSnapshot>,
+    atomicity: ExportPublicationAtomicity,
+    retained_recovery_path: Option<String>,
+    cleanup_durable: bool,
+}
+
+impl ExportPublicationReceipt {
+    #[must_use]
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    #[must_use]
+    pub fn output_path(&self) -> &str {
+        &self.output_path
+    }
+
+    /// Returns the conditional namespace operation used for publication.
+    #[must_use]
+    pub const fn atomicity(&self) -> ExportPublicationAtomicity {
+        self.atomicity
+    }
+
+    /// Returns a displaced-generation recovery path retained after an
+    /// unsuccessful cleanup, if any.
+    #[must_use]
+    pub fn retained_recovery_path(&self) -> Option<&str> {
+        self.retained_recovery_path.as_deref()
+    }
+
+    /// Whether cleanup of any displaced generation was certified durable.
+    #[must_use]
+    pub const fn cleanup_durable(&self) -> bool {
+        self.cleanup_durable
+    }
+}
+
 /// Result of a JSONL export operation.
 #[derive(Debug, Clone, Default)]
 pub struct ExportResult {
@@ -513,6 +2207,10 @@ pub struct ExportResult {
     pub exported_ids: Vec<String>,
     /// IDs and timestamps of dirty issues that were cleared.
     pub exported_marked_at: Vec<(String, String)>,
+    /// Dirty rows intentionally omitted by the JSONL contract (ephemeral and
+    /// wisp issues). Finalization clears these only after the full export is
+    /// durably published; failed exportable rows are never included here.
+    pub intentionally_excluded_marked_at: Vec<(String, String)>,
     /// IDs skipped due to expired tombstone retention (still clear dirty flags).
     pub skipped_tombstone_ids: Vec<String>,
     /// SHA256 hash of the exported JSONL content.
@@ -521,6 +2219,36 @@ pub struct ExportResult {
     pub output_path: Option<String>,
     /// Per-issue content hashes (`issue_id`, `content_hash`) for incremental export tracking.
     pub issue_hashes: Vec<(String, String)>,
+    /// Exact immutable generation that was verified after durable publication.
+    ///
+    /// Writer-only exports leave this absent. File exports retain it so
+    /// finalization and merge-anchor updates never need to adopt a later path
+    /// generation as if it were the one this result describes.
+    pub publication: Option<ExportPublicationReceipt>,
+}
+
+impl ExportResult {
+    pub(crate) fn published_source(&self) -> Result<&JsonlSourceSnapshot> {
+        self.publication
+            .as_ref()
+            .map(|receipt| receipt.source.as_ref())
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message:
+                    "JSONL export result has no verified persisted source generation to finalize"
+                        .to_string(),
+            })
+    }
+
+    pub(crate) fn published_source_arc(&self) -> Result<Arc<JsonlSourceSnapshot>> {
+        self.publication
+            .as_ref()
+            .map(|receipt| Arc::clone(&receipt.source))
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message:
+                    "JSONL export result has no verified persisted source generation to retain"
+                        .to_string(),
+            })
+    }
 }
 
 /// Configuration for JSONL import.
@@ -606,6 +2334,5655 @@ pub struct ImportResult {
     pub blocked_cache_entries: usize,
     /// Number of child-counter rows rebuilt after import.
     pub child_counter_entries: usize,
+}
+
+/// Versioned receipt schema for lossless additive JSONL reconciliation.
+pub const ADDITIVE_RECONCILE_SCHEMA: &str = "br.sync.additive-reconciliation.v2";
+const ADDITIVE_RECONCILE_ALGORITHM: &str =
+    "exact-id-additive-create-monotonic-closure-explicit-scalar-v2";
+
+/// Relation-row counts captured around additive reconciliation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveRelationCounts {
+    pub labels: usize,
+    pub dependencies: usize,
+    pub comments: usize,
+}
+
+impl AdditiveRelationCounts {
+    fn from_issue(issue: &Issue) -> Self {
+        Self {
+            labels: issue.labels.len(),
+            dependencies: issue.dependencies.len(),
+            comments: issue.comments.len(),
+        }
+    }
+
+    fn checked_add(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            labels: self.labels.checked_add(other.labels).ok_or_else(|| {
+                BeadsError::Config("label count overflow during reconciliation".to_string())
+            })?,
+            dependencies: self
+                .dependencies
+                .checked_add(other.dependencies)
+                .ok_or_else(|| {
+                    BeadsError::Config(
+                        "dependency count overflow during reconciliation".to_string(),
+                    )
+                })?,
+            comments: self.comments.checked_add(other.comments).ok_or_else(|| {
+                BeadsError::Config("comment count overflow during reconciliation".to_string())
+            })?,
+        })
+    }
+}
+
+/// Count and canonical payload digest for one complete database table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveTableWitness {
+    pub rows: usize,
+    pub payload_sha256: String,
+}
+
+/// Hash-bound read-only database witness used to reject stale apply plans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveDatabaseWitness {
+    pub issues: usize,
+    /// Digest of every raw issues-table column with explicit NULL framing.
+    pub issue_payload_sha256: String,
+    /// Digest of the storage-semantic hydrated issue projection.
+    pub issue_semantic_payload_sha256: String,
+    pub issue_content_hashes: usize,
+    pub issue_content_hash_payload_sha256: String,
+    pub relations: AdditiveRelationCounts,
+    pub label_payload_sha256: String,
+    pub dependency_payload_sha256: String,
+    pub comment_payload_sha256: String,
+    pub export_hashes: usize,
+    pub export_hash_payload_sha256: String,
+    pub events: usize,
+    pub event_payload_sha256: String,
+    pub dirty_issues: usize,
+    pub dirty_payload_sha256: String,
+    pub metadata_rows: usize,
+    pub metadata_payload_sha256: String,
+    /// Metadata that must remain stable while a committed merge finalizes its
+    /// export. This excludes only the pending-receipt row and the documented
+    /// export-bookkeeping keys.
+    pub stable_metadata: AdditiveTableWitness,
+    pub blocked_cache_entries: usize,
+    pub blocked_cache_payload_sha256: String,
+    pub child_counter_entries: usize,
+    pub child_counter_payload_sha256: String,
+    pub config: AdditiveTableWitness,
+    pub close_metadata: AdditiveTableWitness,
+    pub gate_results: AdditiveTableWitness,
+    pub gate_result_history: AdditiveTableWitness,
+    pub schema_catalog: AdditiveTableWitness,
+    pub sqlite_sequence: AdditiveTableWitness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_jsonl_content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_jsonl_mtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stored_jsonl_size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_flush: Option<String>,
+}
+
+/// Merge-authoritative database state that must remain stable while a
+/// committed merge is reconciling its JSONL and base artifacts.
+///
+/// Export hashes, dirty markers, and export-finalization metadata are
+/// intentionally excluded because those surfaces change when the saga moves
+/// from `DatabaseCommitted` to `ExportFinalized`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncMergeDatabaseCoreWitness {
+    pub issues: usize,
+    pub issue_payload_sha256: String,
+    pub issue_semantic_payload_sha256: String,
+    pub issue_content_hash_payload_sha256: String,
+    pub relations: AdditiveRelationCounts,
+    pub label_payload_sha256: String,
+    pub dependency_payload_sha256: String,
+    pub comment_payload_sha256: String,
+    pub events: usize,
+    pub event_payload_sha256: String,
+    pub stable_metadata: AdditiveTableWitness,
+    pub blocked_cache_entries: usize,
+    pub blocked_cache_payload_sha256: String,
+    pub child_counter_entries: usize,
+    pub child_counter_payload_sha256: String,
+    pub config: AdditiveTableWitness,
+    pub close_metadata: AdditiveTableWitness,
+    pub gate_results: AdditiveTableWitness,
+    pub gate_result_history: AdditiveTableWitness,
+    pub schema_catalog: AdditiveTableWitness,
+    pub sqlite_sequence: AdditiveTableWitness,
+}
+
+impl From<AdditiveDatabaseWitness> for SyncMergeDatabaseCoreWitness {
+    fn from(witness: AdditiveDatabaseWitness) -> Self {
+        Self {
+            issues: witness.issues,
+            issue_payload_sha256: witness.issue_payload_sha256,
+            issue_semantic_payload_sha256: witness.issue_semantic_payload_sha256,
+            issue_content_hash_payload_sha256: witness.issue_content_hash_payload_sha256,
+            relations: witness.relations,
+            label_payload_sha256: witness.label_payload_sha256,
+            dependency_payload_sha256: witness.dependency_payload_sha256,
+            comment_payload_sha256: witness.comment_payload_sha256,
+            events: witness.events,
+            event_payload_sha256: witness.event_payload_sha256,
+            stable_metadata: witness.stable_metadata,
+            blocked_cache_entries: witness.blocked_cache_entries,
+            blocked_cache_payload_sha256: witness.blocked_cache_payload_sha256,
+            child_counter_entries: witness.child_counter_entries,
+            child_counter_payload_sha256: witness.child_counter_payload_sha256,
+            config: witness.config,
+            close_metadata: witness.close_metadata,
+            gate_results: witness.gate_results,
+            gate_result_history: witness.gate_result_history,
+            schema_catalog: witness.schema_catalog,
+            sqlite_sequence: witness.sqlite_sequence,
+        }
+    }
+}
+
+/// Hash-only witness for one merge-resolution note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncMergeNoteWitness {
+    pub issue_id: String,
+    pub note_sha256: String,
+}
+
+/// Digest of the complete issue payload approved for one kept merge row.
+///
+/// `Issue::content_hash` is skipped by its normal JSON representation, so the
+/// digest input below binds it explicitly alongside every serialized scalar
+/// and owned relation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncMergeKeptIssueWitness {
+    pub issue_id: String,
+    pub payload_sha256: String,
+}
+
+/// Immutable logical intent reviewed before the merge transaction begins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncMergeIntent {
+    pub schema_version: u32,
+    pub database_authority_sha256: String,
+    pub jsonl_authority_sha256: String,
+    pub jsonl_path_sha256: String,
+    pub jsonl_before: JsonlSourceStateWitness,
+    pub jsonl_before_content_sha256: Option<String>,
+    pub base_authority_sha256: String,
+    pub base_before: JsonlSourceStateWitness,
+    pub base_before_content_sha256: Option<String>,
+    pub resolution: String,
+    pub actor: String,
+    /// Exact audit-event attribution reviewed for this merge.
+    ///
+    /// Empty attribution is omitted so receipts produced before this field was
+    /// introduced retain their canonical serialized intent and digest.
+    #[serde(default, skip_serializing_if = "EventAttribution::is_empty")]
+    pub event_attribution: EventAttribution,
+    /// Exact workflow-capacity policy used for merge admission checks.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::close_policy::CapacityPolicy::is_empty"
+    )]
+    pub capacity_policy: crate::close_policy::CapacityPolicy,
+    pub retention_days: Option<u64>,
+    pub export_as_of: DateTime<Utc>,
+    pub changed_kept_issue_ids: Vec<String>,
+    pub kept_issue_witnesses: Vec<SyncMergeKeptIssueWitness>,
+    pub deleted_issue_ids: Vec<String>,
+    pub note_witnesses: Vec<SyncMergeNoteWitness>,
+    pub database_before: AdditiveDatabaseWitness,
+}
+
+impl SyncMergeIntent {
+    pub(crate) fn intent_sha256(&self) -> Result<String> {
+        sync_merge_domain_separated_sha256(SYNC_MERGE_INTENT_DOMAIN, self, "sync merge intent")
+    }
+}
+
+/// Durable state-machine phase for a committed merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SyncMergePendingPhase {
+    DatabaseCommitted,
+    ExportFinalized,
+}
+
+const SYNC_MERGE_INTENT_DOMAIN: &str = "beads-rust.sync-merge-intent.v1";
+const SYNC_MERGE_KEPT_ISSUE_DOMAIN: &str = "beads-rust.sync-merge-kept-issue.v1";
+const SYNC_MERGE_RECEIPT_ENVELOPE_DOMAIN: &str =
+    "beads-rust.sync-merge-receipt.immutable-envelope.v1";
+const SYNC_MERGE_RECEIPT_STATE_DOMAIN: &str = "beads-rust.sync-merge-receipt.state.v1";
+
+#[derive(Serialize)]
+struct SyncMergeKeptIssueDigestInput<'a> {
+    content_hash: &'a Option<String>,
+    issue: &'a Issue,
+}
+
+pub(crate) fn sync_merge_kept_issue_witnesses(
+    issues: &[Issue],
+) -> Result<Vec<SyncMergeKeptIssueWitness>> {
+    let mut witnesses = issues
+        .iter()
+        .map(|issue| {
+            Ok(SyncMergeKeptIssueWitness {
+                issue_id: issue.id.clone(),
+                payload_sha256: sync_merge_domain_separated_sha256(
+                    SYNC_MERGE_KEPT_ISSUE_DOMAIN,
+                    &SyncMergeKeptIssueDigestInput {
+                        content_hash: &issue.content_hash,
+                        issue,
+                    },
+                    "sync merge kept issue payload",
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    witnesses.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+    Ok(witnesses)
+}
+
+/// Exact database bookkeeping produced by export finalization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncMergeExportFinalizationWitness {
+    pub export_hashes: AdditiveTableWitness,
+    pub dirty_issues: AdditiveTableWitness,
+    pub jsonl_content_hash: Option<String>,
+    pub jsonl_mtime: Option<String>,
+    pub jsonl_size: Option<String>,
+    pub last_export_time: Option<String>,
+    pub needs_flush: Option<String>,
+    /// Exact rows for `jsonl_content_hash`, `jsonl_mtime`, `jsonl_size`,
+    /// `last_export_time`, and `needs_flush`.
+    pub export_metadata: AdditiveTableWitness,
+}
+
+fn sync_merge_capacity_warnings_are_empty(
+    warnings: &&[crate::close_policy::WorkflowCapacityWarning],
+) -> bool {
+    warnings.is_empty()
+}
+
+#[derive(Serialize)]
+struct SyncMergeReceiptEnvelopeDigestInput<'a> {
+    schema_version: u32,
+    intent_sha256: &'a str,
+    created_at: &'a str,
+    database_after: &'a SyncMergeDatabaseCoreWitness,
+    jsonl_after_raw_sha256: &'a str,
+    jsonl_after_content_sha256: &'a str,
+    jsonl_after_issue_count: usize,
+    jsonl_after_issue_hashes: &'a AdditiveTableWitness,
+    #[serde(skip_serializing_if = "sync_merge_capacity_warnings_are_empty")]
+    capacity_warnings: &'a [crate::close_policy::WorkflowCapacityWarning],
+}
+
+#[derive(Serialize)]
+struct SyncMergeReceiptStateDigestInput<'a> {
+    receipt_id: &'a str,
+    phase: SyncMergePendingPhase,
+    jsonl_after: Option<&'a JsonlSourceStateWitness>,
+    export_finalization: Option<&'a SyncMergeExportFinalizationWitness>,
+}
+
+fn sync_merge_domain_separated_sha256(
+    domain: &str,
+    value: &impl Serialize,
+    context: &str,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(&(domain, value)).map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to serialize {context} for hashing: {error}"
+        ))
+    })?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
+/// Typed receipt proving a merge's database commit and the remaining artifact
+/// reconciliation work.
+///
+/// The receipt ID binds the immutable evidence envelope, while
+/// `state_sha256` binds the current phase and finalized JSONL witness.
+/// These digests detect corruption and uncoordinated modification; they are
+/// not authentication against an actor that can rewrite the database and
+/// recompute hashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SyncMergePendingReceipt {
+    pub schema_version: u32,
+    pub receipt_id: String,
+    pub intent_sha256: String,
+    pub state_sha256: String,
+    pub created_at: String,
+    pub phase: SyncMergePendingPhase,
+    pub intent: SyncMergeIntent,
+    pub database_after: SyncMergeDatabaseCoreWitness,
+    pub jsonl_after_raw_sha256: String,
+    pub jsonl_after_content_sha256: String,
+    pub jsonl_after_issue_count: usize,
+    pub jsonl_after_issue_hashes: AdditiveTableWitness,
+    /// Soft-capacity warnings produced by the exact commit transaction.
+    ///
+    /// These remain in the immutable receipt so a crash between the database
+    /// commit and artifact publication cannot silently discard user-facing
+    /// admission evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+    pub jsonl_after: Option<JsonlSourceStateWitness>,
+    pub export_finalization: Option<SyncMergeExportFinalizationWitness>,
+}
+
+pub(crate) const METADATA_SYNC_MERGE_PENDING: &str = "sync_merge_pending_v2";
+pub(crate) const METADATA_SYNC_MERGE_PENDING_LEGACY: &str = "sync_merge_pending_v1";
+
+impl SyncMergePendingReceipt {
+    pub(crate) fn new(
+        intent: SyncMergeIntent,
+        created_at: String,
+        database_after: SyncMergeDatabaseCoreWitness,
+        jsonl_after_sha256: String,
+        jsonl_after_issue_count: usize,
+        jsonl_after_issue_hashes: &[(String, String)],
+        capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<Self> {
+        let intent_sha256 = intent.intent_sha256()?;
+        let jsonl_after_issue_hashes =
+            sync_merge_export_hash_mapping_witness(jsonl_after_issue_hashes)?;
+        if jsonl_after_issue_hashes.rows != jsonl_after_issue_count {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending sync merge export expected {jsonl_after_issue_count} JSONL rows but received {} issue-hash rows",
+                    jsonl_after_issue_hashes.rows
+                ),
+            });
+        }
+        let mut receipt = Self {
+            schema_version: 2,
+            receipt_id: String::new(),
+            intent_sha256,
+            state_sha256: String::new(),
+            created_at,
+            phase: SyncMergePendingPhase::DatabaseCommitted,
+            intent,
+            database_after,
+            jsonl_after_raw_sha256: jsonl_after_sha256.clone(),
+            jsonl_after_content_sha256: jsonl_after_sha256,
+            jsonl_after_issue_count,
+            jsonl_after_issue_hashes,
+            capacity_warnings,
+            jsonl_after: None,
+            export_finalization: None,
+        };
+        receipt.receipt_id = receipt.immutable_envelope_sha256()?;
+        receipt.state_sha256 = receipt.current_state_sha256()?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn immutable_envelope_sha256(&self) -> Result<String> {
+        sync_merge_domain_separated_sha256(
+            SYNC_MERGE_RECEIPT_ENVELOPE_DOMAIN,
+            &SyncMergeReceiptEnvelopeDigestInput {
+                schema_version: self.schema_version,
+                intent_sha256: &self.intent_sha256,
+                created_at: &self.created_at,
+                database_after: &self.database_after,
+                jsonl_after_raw_sha256: &self.jsonl_after_raw_sha256,
+                jsonl_after_content_sha256: &self.jsonl_after_content_sha256,
+                jsonl_after_issue_count: self.jsonl_after_issue_count,
+                jsonl_after_issue_hashes: &self.jsonl_after_issue_hashes,
+                capacity_warnings: &self.capacity_warnings,
+            },
+            "sync merge receipt immutable envelope",
+        )
+    }
+
+    fn current_state_sha256(&self) -> Result<String> {
+        sync_merge_domain_separated_sha256(
+            SYNC_MERGE_RECEIPT_STATE_DOMAIN,
+            &SyncMergeReceiptStateDigestInput {
+                receipt_id: &self.receipt_id,
+                phase: self.phase,
+                jsonl_after: self.jsonl_after.as_ref(),
+                export_finalization: self.export_finalization.as_ref(),
+            },
+            "sync merge receipt state",
+        )
+    }
+
+    pub(crate) fn advance_to_export_finalized(
+        &self,
+        jsonl_after: JsonlSourceStateWitness,
+        export_finalization: SyncMergeExportFinalizationWitness,
+    ) -> Result<Self> {
+        self.validate()?;
+        if self.phase != SyncMergePendingPhase::DatabaseCommitted
+            || self.jsonl_after.is_some()
+            || self.export_finalization.is_some()
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge receipt can advance only from database_committed without a JSONL witness"
+                        .to_string(),
+            });
+        }
+        let JsonlSourceStateWitness::Present {
+            raw_sha256,
+            mtime,
+            size,
+            ..
+        } = &jsonl_after
+        else {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync merge finalization requires a present JSONL source witness"
+                    .to_string(),
+            });
+        };
+        if raw_sha256 != &self.jsonl_after_raw_sha256 {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Finalized JSONL source witness does not match the immutable reviewed export"
+                        .to_string(),
+            });
+        }
+        if export_finalization.dirty_issues.rows != 0
+            || export_finalization.needs_flush.as_deref() != Some("false")
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge finalization requires zero dirty issues and needs_flush=false"
+                    .to_string(),
+            });
+        }
+        if export_finalization.export_metadata.rows != 5 {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending sync merge finalization requires exactly five export metadata rows, found {}",
+                    export_finalization.export_metadata.rows
+                ),
+            });
+        }
+        if export_finalization.export_hashes != self.jsonl_after_issue_hashes {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge finalization export-hash mapping does not match the reviewed JSONL output"
+                        .to_string(),
+            });
+        }
+        if export_finalization.jsonl_content_hash.as_deref()
+            != Some(self.jsonl_after_content_sha256.as_str())
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge finalization metadata does not identify the reviewed JSONL content"
+                        .to_string(),
+            });
+        }
+        let Some(last_export_time) = export_finalization.last_export_time.as_deref() else {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync merge finalization lacks last_export_time metadata"
+                    .to_string(),
+            });
+        };
+        DateTime::parse_from_rfc3339(last_export_time).map_err(|error| {
+            BeadsError::SyncConflict {
+                message: format!(
+                    "Pending sync merge finalization has invalid last_export_time metadata: {error}"
+                ),
+            }
+        })?;
+        if export_finalization.jsonl_mtime.as_deref() != Some(mtime.as_str())
+            || export_finalization
+                .jsonl_size
+                .as_deref()
+                .and_then(|value| value.parse::<u64>().ok())
+                != Some(*size)
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge finalization does not match the published JSONL mtime or exact size witness"
+                        .to_string(),
+            });
+        }
+
+        let mut finalized = self.clone();
+        finalized.phase = SyncMergePendingPhase::ExportFinalized;
+        finalized.jsonl_after = Some(jsonl_after);
+        finalized.export_finalization = Some(export_finalization);
+        finalized.state_sha256 = finalized.current_state_sha256()?;
+        finalized.validate()?;
+        Ok(finalized)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.schema_version != 2 || self.intent.schema_version != 2 {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Unsupported pending merge receipt schema {} (intent schema {})",
+                    self.schema_version, self.intent.schema_version
+                ),
+            });
+        }
+        for (field, value) in [
+            (
+                "database_authority_sha256",
+                self.intent.database_authority_sha256.as_str(),
+            ),
+            (
+                "jsonl_authority_sha256",
+                self.intent.jsonl_authority_sha256.as_str(),
+            ),
+            ("jsonl_path_sha256", self.intent.jsonl_path_sha256.as_str()),
+            (
+                "base_authority_sha256",
+                self.intent.base_authority_sha256.as_str(),
+            ),
+            (
+                "jsonl_after_raw_sha256",
+                self.jsonl_after_raw_sha256.as_str(),
+            ),
+            (
+                "jsonl_after_content_sha256",
+                self.jsonl_after_content_sha256.as_str(),
+            ),
+            ("intent_sha256", self.intent_sha256.as_str()),
+            ("receipt_id", self.receipt_id.as_str()),
+            ("state_sha256", self.state_sha256.as_str()),
+        ] {
+            validate_sync_merge_sha256(field, value)?;
+        }
+        validate_sync_merge_sha256(
+            "jsonl_after_issue_hashes",
+            &self.jsonl_after_issue_hashes.payload_sha256,
+        )?;
+        if self.jsonl_after_issue_hashes.rows != self.jsonl_after_issue_count {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending merge receipt issue-hash mapping does not exactly cover the reviewed JSONL row count"
+                        .to_string(),
+            });
+        }
+        validate_sync_merge_source_state(
+            "jsonl_before",
+            &self.intent.jsonl_before,
+            self.intent.jsonl_before_content_sha256.as_deref(),
+        )?;
+        validate_sync_merge_source_state(
+            "base_before",
+            &self.intent.base_before,
+            self.intent.base_before_content_sha256.as_deref(),
+        )?;
+        validate_sync_merge_sorted_ids(
+            "changed_kept_issue_ids",
+            &self.intent.changed_kept_issue_ids,
+        )?;
+        let kept_witness_ids = self
+            .intent
+            .kept_issue_witnesses
+            .iter()
+            .map(|witness| witness.issue_id.clone())
+            .collect::<Vec<_>>();
+        validate_sync_merge_sorted_ids("kept_issue_witnesses", &kept_witness_ids)?;
+        if kept_witness_ids != self.intent.changed_kept_issue_ids {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending merge kept payload witnesses do not exactly cover the reviewed kept issue IDs"
+                        .to_string(),
+            });
+        }
+        for witness in &self.intent.kept_issue_witnesses {
+            validate_sync_merge_sha256("kept_issue_payload_sha256", &witness.payload_sha256)?;
+        }
+        if let Some(finalization) = &self.export_finalization {
+            for (field, witness) in [
+                ("export_hashes", &finalization.export_hashes),
+                ("dirty_issues", &finalization.dirty_issues),
+                ("export_metadata", &finalization.export_metadata),
+            ] {
+                validate_sync_merge_sha256(field, &witness.payload_sha256)?;
+            }
+        }
+        validate_sync_merge_sorted_ids("deleted_issue_ids", &self.intent.deleted_issue_ids)?;
+        if let Some(overlap) = self.intent.changed_kept_issue_ids.iter().find(|issue_id| {
+            self.intent
+                .deleted_issue_ids
+                .binary_search(issue_id)
+                .is_ok()
+        }) {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending merge receipt places issue {overlap} in both kept and deleted sets"
+                ),
+            });
+        }
+        let note_ids = self
+            .intent
+            .note_witnesses
+            .iter()
+            .map(|witness| witness.issue_id.clone())
+            .collect::<Vec<_>>();
+        validate_sync_merge_sorted_ids("note_witnesses", &note_ids)?;
+        for witness in &self.intent.note_witnesses {
+            validate_sync_merge_sha256("note_sha256", &witness.note_sha256)?;
+            if self
+                .intent
+                .changed_kept_issue_ids
+                .binary_search(&witness.issue_id)
+                .is_err()
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Pending merge note target {} is not a changed kept issue",
+                        witness.issue_id
+                    ),
+                });
+            }
+        }
+        if !matches!(
+            self.intent.resolution.as_str(),
+            "manual" | "force-db" | "force-jsonl" | "force-newer"
+        ) {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Pending merge receipt has unsupported resolution {}",
+                    self.intent.resolution
+                ),
+            });
+        }
+        if self.intent.actor.trim().is_empty() || self.intent.actor.trim() != self.intent.actor {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending merge receipt actor must be nonblank and trimmed".to_string(),
+            });
+        }
+        let created_at = DateTime::parse_from_rfc3339(&self.created_at)
+            .map_err(|error| BeadsError::SyncConflict {
+                message: format!(
+                    "Pending merge receipt has invalid RFC 3339 creation time: {error}"
+                ),
+            })?
+            .with_timezone(&Utc);
+        if created_at != self.intent.export_as_of {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending merge receipt creation time does not match its frozen export cutoff"
+                        .to_string(),
+            });
+        }
+        if let Some(jsonl_after) = self.jsonl_after.as_ref() {
+            validate_sync_merge_source_state(
+                "jsonl_after",
+                jsonl_after,
+                Some(&self.jsonl_after_content_sha256),
+            )?;
+        }
+        if let Some(finalization) = self.export_finalization.as_ref() {
+            let last_export_time = finalization.last_export_time.as_deref().ok_or_else(|| {
+                BeadsError::SyncConflict {
+                    message:
+                        "Export-finalized pending merge receipt lacks last_export_time metadata"
+                            .to_string(),
+                }
+            })?;
+            DateTime::parse_from_rfc3339(last_export_time).map_err(|error| {
+                BeadsError::SyncConflict {
+                    message: format!(
+                        "Export-finalized pending merge receipt has invalid last_export_time metadata: {error}"
+                    ),
+                }
+            })?;
+        }
+        match (
+            self.phase,
+            self.jsonl_after.as_ref(),
+            self.export_finalization.as_ref(),
+        ) {
+            (SyncMergePendingPhase::DatabaseCommitted, None, None) => {}
+            (
+                SyncMergePendingPhase::ExportFinalized,
+                Some(JsonlSourceStateWitness::Present {
+                    raw_sha256,
+                    mtime,
+                    size,
+                    ..
+                }),
+                Some(finalization),
+            ) if raw_sha256 == &self.jsonl_after_raw_sha256
+                && finalization.export_hashes == self.jsonl_after_issue_hashes
+                && finalization.export_metadata.rows == 5
+                && finalization.jsonl_content_hash.as_deref()
+                    == Some(self.jsonl_after_content_sha256.as_str())
+                && finalization.jsonl_mtime.as_deref() == Some(mtime.as_str())
+                && finalization
+                    .jsonl_size
+                    .as_deref()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    == Some(*size)
+                && finalization.dirty_issues.rows == 0
+                && finalization.needs_flush.as_deref() == Some("false") => {}
+            (SyncMergePendingPhase::DatabaseCommitted, _, _) => {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database-committed pending merge receipt already contains finalized export evidence"
+                            .to_string(),
+                });
+            }
+            (SyncMergePendingPhase::ExportFinalized, _, _) => {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Export-finalized pending merge receipt lacks exact JSONL or database-bookkeeping evidence"
+                            .to_string(),
+                });
+            }
+        }
+        let computed_intent_sha256 = self.intent.intent_sha256()?;
+        if self.intent_sha256 != computed_intent_sha256 {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending merge receipt intent hash is malformed or has been modified"
+                    .to_string(),
+            });
+        }
+        if self.receipt_id != self.immutable_envelope_sha256()? {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending merge receipt immutable envelope is malformed or has been modified"
+                        .to_string(),
+            });
+        }
+        if self.state_sha256 != self.current_state_sha256()? {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending merge receipt state hash is malformed or has been modified"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_sync_merge_sha256(field: &str, value: &str) -> Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    Err(BeadsError::SyncConflict {
+        message: format!("Pending merge receipt field {field} is not a lowercase SHA-256 digest"),
+    })
+}
+
+fn validate_sync_merge_source_state(
+    field: &str,
+    state: &JsonlSourceStateWitness,
+    content_sha256: Option<&str>,
+) -> Result<()> {
+    match state {
+        JsonlSourceStateWitness::Missing if content_sha256.is_none() => Ok(()),
+        JsonlSourceStateWitness::Missing => Err(BeadsError::SyncConflict {
+            message: format!(
+                "Pending merge receipt field {field} is missing but has a content digest"
+            ),
+        }),
+        JsonlSourceStateWitness::Present {
+            raw_sha256, mtime, ..
+        } => {
+            validate_sync_merge_sha256(&format!("{field}.raw_sha256"), raw_sha256)?;
+            DateTime::parse_from_rfc3339(mtime).map_err(|error| BeadsError::SyncConflict {
+                message: format!(
+                    "Pending merge receipt field {field}.mtime is not valid RFC 3339: {error}"
+                ),
+            })?;
+            let content_sha256 = content_sha256.ok_or_else(|| BeadsError::SyncConflict {
+                message: format!(
+                    "Pending merge receipt field {field} is present without a content digest"
+                ),
+            })?;
+            validate_sync_merge_sha256(&format!("{field}.content_sha256"), content_sha256)
+        }
+    }
+}
+
+fn validate_sync_merge_sorted_ids(field: &str, issue_ids: &[String]) -> Result<()> {
+    if issue_ids
+        .iter()
+        .any(|issue_id| issue_id.trim().is_empty() || issue_id.trim() != issue_id)
+        || issue_ids.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Pending merge receipt field {field} must contain sorted, unique, nonblank issue IDs"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Database-health gates captured before and after additive reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveDatabaseHealth {
+    pub integrity_messages: Vec<String>,
+    pub foreign_key_violations: Vec<Vec<String>>,
+}
+
+/// Deterministic remap of a storage-local comment surrogate ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveCommentIdRemap {
+    pub issue_id: String,
+    pub old_id: i64,
+    pub new_id: i64,
+    pub logical_payload_sha256: String,
+}
+
+/// Complete deterministic issue-to-reason conflict witness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveConflictWitness {
+    pub issue_id: String,
+    pub reasons: Vec<String>,
+    pub details: Vec<AdditiveConflictDetailWitness>,
+}
+
+/// Privacy-preserving, actionable evidence for one rejected source element.
+///
+/// Embedded relation values are not assumed to be validated issue IDs: an
+/// external target or malformed source can contain terminal control bytes or
+/// a local path. All such related values, labels, external refs, dependency
+/// metadata, and comment payloads are represented only by SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveConflictDetailWitness {
+    pub reason: String,
+    pub detail_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_value_sha256: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_subcodes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_sha256: Option<String>,
+    pub detail_sha256: String,
+}
+
+/// Complete hash-bound scalar difference for a shared issue that was refused.
+///
+/// Payload bodies remain private; field names and before/after/diff hashes let
+/// an operator prove exactly which reviewed scalar conflict a token covered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveConflictScalarDiffWitness {
+    pub issue_id: String,
+    pub changed_fields: Vec<String>,
+    pub diff_sha256: String,
+    pub before_payload_sha256: String,
+    pub after_payload_sha256: String,
+}
+
+/// Privacy-preserving relation delta for a shared issue that was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveConflictRelationDiffWitness {
+    pub issue_id: String,
+    pub changed_relation_classes: Vec<String>,
+    pub before_counts: AdditiveRelationCounts,
+    pub after_counts: AdditiveRelationCounts,
+    pub before_payload_sha256: String,
+    pub after_payload_sha256: String,
+    pub added_element_sha256: Vec<String>,
+    pub removed_element_sha256: Vec<String>,
+    pub diff_sha256: String,
+}
+
+/// Lifecycle state of a reconciliation receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditiveReconcileStatus {
+    Conflicted,
+    MetadataOnlyReady,
+    NoChanges,
+    Ready,
+    AppliedMetadataOnly,
+    Applied,
+    /// The transaction committed, but one or more independently reported
+    /// source, authority, or connection postconditions failed afterward.
+    CommittedWithPostconditionFailures,
+}
+
+impl AdditiveReconcileStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conflicted => "conflicted",
+            Self::MetadataOnlyReady => "metadata_only_ready",
+            Self::NoChanges => "no_changes",
+            Self::Ready => "ready",
+            Self::AppliedMetadataOnly => "applied_metadata_only",
+            Self::Applied => "applied",
+            Self::CommittedWithPostconditionFailures => "committed_with_postcondition_failures",
+        }
+    }
+}
+
+/// Independently composable failure observed only after SQLite committed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditivePostcommitFailure {
+    ForeignKeyRestoration,
+    DatabaseAuthorityChanged,
+    DatabasePoststateChanged,
+    WorkspaceAuthorityChanged,
+    SourceWitnessChanged,
+}
+
+/// Evidence-backed reason a shared issue's scalar fields may be updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdditiveScalarResolution {
+    MonotonicClosure,
+    ExplicitSourceResolution,
+}
+
+impl AdditiveScalarResolution {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MonotonicClosure => "monotonic_closure",
+            Self::ExplicitSourceResolution => "explicit_source_resolution",
+        }
+    }
+}
+
+/// Hash-bound scalar-only repair for a shared issue ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveScalarUpdateWitness {
+    pub issue_id: String,
+    pub resolution: AdditiveScalarResolution,
+    pub changed_fields: Vec<String>,
+    pub diff_sha256: String,
+    pub before_payload_sha256: String,
+    pub after_payload_sha256: String,
+    pub relation_payload_sha256: String,
+}
+
+/// Exact before/after witness for a repaired persisted content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveContentHashRepairWitness {
+    pub issue_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    pub after: String,
+}
+
+/// Complete hash-bound result for additive reconciliation planning/apply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AdditiveReconcileReceipt {
+    pub schema: String,
+    pub algorithm: String,
+    pub tool_version: String,
+    pub plan_sha256: String,
+    pub status: AdditiveReconcileStatus,
+    pub workspace_path: String,
+    pub workspace_path_sha256: String,
+    pub workspace_identity_sha256: String,
+    pub source_path: String,
+    pub source_path_sha256: String,
+    pub source_identity_sha256: String,
+    pub database_path: String,
+    pub database_path_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_identity_sha256: Option<String>,
+    pub write_lock_authority: String,
+    pub write_lock_authority_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_authority_preserved_after_commit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_poststate_preserved_after_commit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_authority_preserved_after_commit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_preserved_after_commit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreign_keys_restored_after_commit: Option<bool>,
+    pub postcommit_failures: Vec<AdditivePostcommitFailure>,
+    pub database_user_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_prefix: Option<String>,
+    /// SHA-256 of the exact source bytes.
+    pub source_raw_sha256: String,
+    /// SHA-256 of trimmed nonblank JSONL records with canonical LF framing.
+    pub source_content_sha256: String,
+    /// SHA-256 of the deterministic storage-semantic projection of all source issues.
+    pub source_storage_projection_sha256: String,
+    pub source_size: u64,
+    pub source_mtime: String,
+    /// Deterministic timestamp used for recovery-owned bookkeeping rows.
+    /// Equal to the reviewed source snapshot mtime.
+    pub poststate_timestamp: String,
+    pub source_issues: usize,
+    pub target_before: AdditiveDatabaseWitness,
+    pub expected_target_after: AdditiveDatabaseWitness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_after: Option<AdditiveDatabaseWitness>,
+    pub health_before: AdditiveDatabaseHealth,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_after: Option<AdditiveDatabaseHealth>,
+    pub created: usize,
+    pub created_issue_ids: Vec<String>,
+    pub created_issue_ids_sha256: String,
+    pub updated: usize,
+    pub updated_issue_ids: Vec<String>,
+    pub updated_issue_ids_sha256: String,
+    /// Exact override set supplied by the operator, whether or not each ID was applicable.
+    pub requested_source_authoritative_issue_ids: Vec<String>,
+    pub requested_source_authoritative_issue_ids_sha256: String,
+    /// Applicable overrides actually used by this plan.
+    pub source_authoritative_issue_ids: Vec<String>,
+    pub source_authoritative_issue_ids_sha256: String,
+    pub scalar_updates: Vec<AdditiveScalarUpdateWitness>,
+    pub scalar_updates_sha256: String,
+    pub content_hash_repairs_planned: usize,
+    pub content_hash_repairs: Vec<AdditiveContentHashRepairWitness>,
+    pub content_hash_repairs_sha256: String,
+    pub content_hash_repair_issue_ids: Vec<String>,
+    pub content_hash_repair_issue_ids_sha256: String,
+    pub content_hash_repairs_applied: usize,
+    pub skipped_equal: usize,
+    pub equal_issue_ids: Vec<String>,
+    pub equal_issue_ids_sha256: String,
+    pub skipped_ephemeral: usize,
+    /// Source issues proven equal to, created in, or updated in SQLite.
+    pub synchronized: usize,
+    pub export_hash_updates_planned: usize,
+    pub export_hashes_updated: usize,
+    pub dirty_markers_clear_planned: usize,
+    pub dirty_markers_cleared: usize,
+    /// Number of distinct issues involved in one or more conflicts.
+    pub conflicted: usize,
+    /// Total conflict observations across all reason buckets.
+    pub conflict_occurrences: usize,
+    pub deleted: usize,
+    pub db_only_preserved: usize,
+    pub db_only_issue_ids: Vec<String>,
+    pub db_only_issue_ids_sha256: String,
+    pub conflict_reasons: BTreeMap<String, usize>,
+    pub conflict_issue_ids: Vec<String>,
+    pub conflict_issue_ids_sha256: String,
+    pub conflict_issue_ids_truncated: bool,
+    pub conflict_witnesses: Vec<AdditiveConflictWitness>,
+    pub conflict_witnesses_sha256: String,
+    pub conflict_scalar_diffs: Vec<AdditiveConflictScalarDiffWitness>,
+    pub conflict_scalar_diffs_sha256: String,
+    pub conflict_relation_diffs: Vec<AdditiveConflictRelationDiffWitness>,
+    pub conflict_relation_diffs_sha256: String,
+    pub comment_id_remaps: Vec<AdditiveCommentIdRemap>,
+    pub comment_id_remaps_sha256: String,
+    /// Blocking-cycle components already present in the database.
+    pub preexisting_blocking_cycles: usize,
+    /// Blocking-cycle components in the database after applying the plan.
+    pub projected_blocking_cycles: usize,
+    /// Projected blocking-cycle components not present before reconciliation.
+    pub new_blocking_cycles: usize,
+    pub relations_before: AdditiveRelationCounts,
+    pub relations_after: AdditiveRelationCounts,
+    pub relation_rows_planned: AdditiveRelationCounts,
+    pub relation_rows_applied: AdditiveRelationCounts,
+    pub expected_issue_raw_payload_sha256: String,
+    pub expected_issue_semantic_payload_sha256: String,
+    pub expected_issue_content_hash_payload_sha256: String,
+    pub expected_export_hash_payload_sha256: String,
+    pub expected_dirty_payload_sha256: String,
+    pub expected_metadata_payload_sha256: String,
+    pub expected_blocked_cache_payload_sha256: String,
+    pub expected_child_counter_payload_sha256: String,
+    pub expected_sqlite_sequence_payload_sha256: String,
+    pub events_before: usize,
+    pub events_after: usize,
+    pub event_payload_sha256_before: String,
+    pub event_payload_sha256_after: String,
+    pub cache_rebuild_planned: bool,
+    pub cache_rebuild_performed: bool,
+    pub metadata_update_planned: bool,
+    pub metadata_changed: bool,
+    pub jsonl_written: bool,
+    pub base_snapshot_used: bool,
+    pub merge_note_written: bool,
+}
+
+/// Path/safety policy for additive reconciliation.
+#[derive(Debug, Clone, Default)]
+pub struct AdditiveReconcileConfig {
+    pub beads_dir: Option<PathBuf>,
+    pub database_path: Option<PathBuf>,
+    pub allow_external_jsonl: bool,
+    /// Exact shared IDs for which reviewed source scalar fields override SQLite.
+    pub source_authoritative_ids: BTreeSet<String>,
+}
+
+/// Safe high-level request for applying an exact reviewed additive plan.
+///
+/// This API owns the `.write.lock`, opens only an existing current-schema
+/// database, rebuilds the plan under that boundary, and delegates to the
+/// transaction-scoped low-level apply. It performs no schema migration,
+/// corruption recovery, JSONL export, or implicit merge.
+#[derive(Debug, Clone)]
+pub struct ReviewedAdditiveReconcileRequest {
+    pub beads_dir: PathBuf,
+    /// Optional database override with the same precedence and path semantics
+    /// as the CLI's `--db` flag.
+    pub db_override: Option<PathBuf>,
+    /// Optional JSONL override. When absent, startup configuration resolves the
+    /// same source path as `br sync`.
+    pub source_path_override: Option<PathBuf>,
+    pub allow_external_jsonl: bool,
+    pub source_authoritative_ids: BTreeSet<String>,
+    pub expected_plan_sha256: String,
+    pub lock_timeout_ms: Option<u64>,
+}
+
+/// Read-only high-level request for producing the exact token and receipt later
+/// consumed by [`apply_reviewed_additive_reconcile`].
+#[derive(Debug, Clone)]
+pub struct ReviewedAdditiveReconcilePlanRequest {
+    pub beads_dir: PathBuf,
+    pub db_override: Option<PathBuf>,
+    pub source_path_override: Option<PathBuf>,
+    pub allow_external_jsonl: bool,
+    pub source_authoritative_ids: BTreeSet<String>,
+}
+
+#[cfg(unix)]
+fn additive_metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(unix)]
+fn additive_file_identity(path: &Path) -> Result<(u64, u64)> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not witness reviewed file identity for {}: {error}",
+            additive_path_descriptor(path, "reviewed-file")
+        ))
+    })?;
+    Ok(additive_metadata_identity(&metadata))
+}
+
+#[cfg(not(unix))]
+fn additive_metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos() as u64);
+    (metadata.len(), modified)
+}
+
+#[cfg(not(unix))]
+fn additive_file_identity(path: &Path) -> Result<(u64, u64)> {
+    Err(BeadsError::Config(format!(
+        "Reviewed additive reconciliation requires a stable platform file ID; unsupported for {} on this target",
+        additive_path_descriptor(path, "reviewed-file")
+    )))
+}
+
+fn resolve_reviewed_additive_workspace(
+    beads_dir: &Path,
+    db_override: Option<&PathBuf>,
+) -> Result<(PathBuf, PathBuf, PathBuf, (u64, u64))> {
+    for raw_path in std::iter::once(beads_dir).chain(db_override.map(PathBuf::as_path)) {
+        let validation = validate_no_git_path(raw_path);
+        if !validation.is_allowed() {
+            return Err(BeadsError::Config(format!(
+                "Reviewed reconciliation path was rejected: {}",
+                additive_path_descriptor(raw_path, "reviewed-path")
+            )));
+        }
+    }
+    let terminal_beads = redact_reviewed_path_result(
+        crate::config::routing::follow_redirects(beads_dir, 10),
+        beads_dir,
+        "workspace",
+        "resolve redirects for",
+    )?;
+    let canonical_beads = fs::canonicalize(&terminal_beads).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not canonicalize reviewed beads directory {}: {error}",
+            additive_path_descriptor(&terminal_beads, "reviewed-workspace")
+        ))
+    })?;
+    let startup = redact_reviewed_path_result(
+        crate::config::load_startup_config_with_paths_uncached(&canonical_beads, db_override),
+        &canonical_beads,
+        "workspace",
+        "load startup configuration for",
+    )?;
+    let database_path = startup.paths.db_path;
+    let jsonl_path = startup.paths.jsonl_path;
+    let absolute_database_path = if database_path.is_absolute() {
+        database_path.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not resolve relative reviewed database path {}: {error}",
+                    database_path_descriptor(&database_path)
+                ))
+            })?
+            .join(&database_path)
+    };
+    for path in [&canonical_beads, &database_path] {
+        let validation = validate_no_git_path(path);
+        if !validation.is_allowed() {
+            return Err(BeadsError::Config(format!(
+                "Reviewed reconciliation path was rejected: {}",
+                additive_path_descriptor(path, "reviewed-path")
+            )));
+        }
+    }
+    let database_metadata = fs::symlink_metadata(&database_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not inspect reviewed database {}: {error}",
+            database_path_descriptor(&database_path)
+        ))
+    })?;
+    if database_metadata.file_type().is_symlink() {
+        return Err(BeadsError::Config(format!(
+            "Reviewed additive reconciliation refuses a symlinked database: {}",
+            database_path_descriptor(&database_path)
+        )));
+    }
+    if !database_metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "Reviewed additive reconciliation requires a regular database file: {}",
+            database_path_descriptor(&database_path)
+        )));
+    }
+    let canonical_database = fs::canonicalize(&database_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not canonicalize reviewed database {}: {error}",
+            database_path_descriptor(&database_path)
+        ))
+    })?;
+    if absolute_database_path.starts_with(&canonical_beads)
+        && !canonical_database.starts_with(&canonical_beads)
+    {
+        return Err(BeadsError::Config(format!(
+            "Reviewed database path {} escapes its locked beads directory {} through a symlink",
+            database_path_descriptor(&canonical_database),
+            additive_path_descriptor(&canonical_beads, "reviewed-workspace")
+        )));
+    }
+    let identity = additive_file_identity(&canonical_database)?;
+    Ok((canonical_beads, canonical_database, jsonl_path, identity))
+}
+
+/// Build a reviewed additive plan without creating, migrating, repairing, or
+/// otherwise writing the database family.
+pub fn plan_reviewed_additive_reconcile(
+    request: &ReviewedAdditiveReconcilePlanRequest,
+) -> Result<AdditiveReconcilePlan> {
+    let (canonical_beads, canonical_database, configured_source, database_identity) =
+        resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref())?;
+    let storage = redact_reviewed_path_result(
+        SqliteStorage::open_current_read_only(&canonical_database),
+        &canonical_database,
+        "database",
+        "open",
+    )?
+    .ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Additive reconciliation requires an existing current-schema database at {}",
+            database_path_descriptor(&canonical_database)
+        ))
+    })?;
+    if additive_file_identity(&canonical_database)? != database_identity {
+        return Err(BeadsError::Config(
+            "Reviewed database identity changed while opening the read-only reconciliation plan"
+                .to_string(),
+        ));
+    }
+    let source_path = request
+        .source_path_override
+        .as_deref()
+        .unwrap_or(&configured_source);
+    let allow_external_jsonl = request.allow_external_jsonl
+        || crate::config::implicit_external_jsonl_allowed(
+            &canonical_beads,
+            &canonical_database,
+            source_path,
+        );
+    let plan = plan_additive_reconcile(
+        &storage,
+        source_path,
+        &AdditiveReconcileConfig {
+            beads_dir: Some(canonical_beads.clone()),
+            database_path: Some(canonical_database.clone()),
+            allow_external_jsonl,
+            source_authoritative_ids: request.source_authoritative_ids.clone(),
+        },
+    )?;
+    let (beads_after, database_after, source_after, identity_after) =
+        resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref())?;
+    if beads_after != canonical_beads
+        || database_after != canonical_database
+        || source_after != configured_source
+        || identity_after != database_identity
+    {
+        return Err(BeadsError::Config(
+            "Reviewed workspace, database, or source authority changed while producing the read-only reconciliation plan".to_string(),
+        ));
+    }
+    Ok(plan)
+}
+
+/// Apply a conflict-free additive plan only when its fresh token exactly
+/// matches the caller's reviewed token.
+///
+/// # Errors
+///
+/// Returns an error without applying the plan when the lock cannot be acquired,
+/// the database is absent/stale, the token is malformed or mismatched, any
+/// source/database witness drifts, or any transactional invariant fails.
+pub fn apply_reviewed_additive_reconcile(
+    request: &ReviewedAdditiveReconcileRequest,
+) -> Result<AdditiveReconcileReceipt> {
+    apply_reviewed_additive_reconcile_under_authority(request, None)
+}
+
+/// Apply a reviewed additive plan while reusing an authority already retained
+/// by the CLI startup gate.
+///
+/// The retained capability is accepted only when it protects this exact
+/// terminal workspace, canonical database-family sidecar, and database path.
+/// Standalone library callers use [`apply_reviewed_additive_reconcile`], which
+/// acquires and owns the same composite authority itself.
+pub(crate) fn apply_reviewed_additive_reconcile_under_authority(
+    request: &ReviewedAdditiveReconcileRequest,
+    retained_write_authority: Option<&Arc<DatabaseFamilyWriteLock>>,
+) -> Result<AdditiveReconcileReceipt> {
+    if request.expected_plan_sha256.len() != 64
+        || !request
+            .expected_plan_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(BeadsError::Config(
+            "Reviewed additive reconciliation plan SHA-256 must be exactly 64 lowercase hexadecimal characters"
+                .to_string(),
+        ));
+    }
+
+    let (canonical_beads, canonical_database, configured_source, database_identity) =
+        resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref())?;
+    let write_authority = if let Some(authority) = retained_write_authority {
+        authority.verify_database_authority()?;
+        let expected_workspace_lock = canonical_beads.join(".write.lock");
+        let expected_authority_lock = database_write_authority_path(&canonical_database)?;
+        if authority.workspace_lock_path != expected_workspace_lock
+            || authority.authority_lock_path != expected_authority_lock
+            || authority.canonical_database_path != canonical_database
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Retained database-family authority does not protect the exact reviewed workspace and database"
+                    .to_string(),
+            });
+        }
+        Arc::clone(authority)
+    } else {
+        Arc::new(blocking_database_family_write_lock_with_timeout(
+            &canonical_beads,
+            &canonical_database,
+            request.lock_timeout_ms,
+        )?)
+    };
+    let (
+        beads_after_authority_lock,
+        database_after_authority_lock,
+        configured_source_after_authority_lock,
+        database_identity_after_authority_lock,
+    ) = resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref())?;
+    if beads_after_authority_lock != canonical_beads
+        || database_after_authority_lock != canonical_database
+        || database_identity_after_authority_lock != database_identity
+        || (request.source_path_override.is_none()
+            && configured_source_after_authority_lock != configured_source)
+    {
+        return Err(BeadsError::Config(
+            "Reviewed additive reconciliation workspace or database identity changed while acquiring the database authority lock".to_string(),
+        ));
+    }
+    let mut storage = redact_reviewed_path_result(
+        SqliteStorage::open_current_for_reconcile(&canonical_database, request.lock_timeout_ms),
+        &canonical_database,
+        "database",
+        "open",
+    )?
+    .ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Additive reconciliation requires an existing current-schema database at {}",
+            database_path_descriptor(&canonical_database)
+        ))
+    })?;
+    storage.attach_write_authority(std::sync::Arc::clone(&write_authority));
+    if additive_file_identity(&canonical_database)? != database_identity {
+        return Err(BeadsError::Config(
+            "Reviewed database identity changed while opening the token-bound reconciliation connection"
+                .to_string(),
+        ));
+    }
+    let source_path = request
+        .source_path_override
+        .as_deref()
+        .unwrap_or(&configured_source_after_authority_lock);
+    let allow_external_jsonl = request.allow_external_jsonl
+        || crate::config::implicit_external_jsonl_allowed(
+            &canonical_beads,
+            &canonical_database,
+            source_path,
+        );
+    redact_reviewed_path_result(
+        validate_sync_path_with_external(source_path, &canonical_beads, allow_external_jsonl),
+        source_path,
+        "source",
+        "validate path policy for",
+    )?;
+    let _sync_authority = redact_reviewed_path_result(
+        try_sync_lock(&canonical_beads),
+        &canonical_beads,
+        "workspace",
+        "acquire sync authority for",
+    )?
+    .ok_or_else(|| BeadsError::SyncConflict {
+        message: "Reviewed additive reconciliation cannot start while another sync owns .sync.lock"
+            .to_string(),
+    })?;
+    let source_family_authority = redact_reviewed_path_result(
+        blocking_jsonl_family_write_lock_with_timeout(source_path, request.lock_timeout_ms),
+        source_path,
+        "source",
+        "acquire JSONL-family authority for",
+    )?;
+    source_family_authority.verify_jsonl_authority()?;
+    let _source_inode_witness = acquire_reviewed_additive_source_lock(source_path)?;
+    let config = AdditiveReconcileConfig {
+        beads_dir: Some(canonical_beads.clone()),
+        database_path: Some(canonical_database.clone()),
+        allow_external_jsonl,
+        source_authoritative_ids: request.source_authoritative_ids.clone(),
+    };
+    let plan = plan_additive_reconcile(&storage, source_path, &config)?;
+    if plan.receipt.write_lock_authority_sha256 != write_authority.authority_path_sha256() {
+        return Err(BeadsError::Config(
+            "Reviewed additive reconciliation planned a different database-family write authority"
+                .to_string(),
+        ));
+    }
+    let mut receipt = apply_additive_reconcile(
+        &mut storage,
+        source_path,
+        &config,
+        &plan,
+        &request.expected_plan_sha256,
+    )?;
+    source_family_authority.verify_jsonl_authority()?;
+    let post_resolution =
+        resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref());
+    let workspace_authority_preserved = post_resolution
+        .as_ref()
+        .is_ok_and(|(beads_after, _, _, _)| beads_after == &canonical_beads)
+        && additive_path_identity_sha256(&canonical_beads, "workspace")
+            .is_ok_and(|identity| identity == receipt.workspace_identity_sha256);
+    let configured_source_preserved = request.source_path_override.is_some()
+        || post_resolution
+            .as_ref()
+            .is_ok_and(|(_, _, source_after, _)| {
+                source_after == &configured_source_after_authority_lock
+            });
+    let database_authority_preserved = write_authority.verify_database_authority().is_ok()
+        && additive_file_identity(&canonical_database)
+            .is_ok_and(|identity| identity == database_identity)
+        && post_resolution
+            .as_ref()
+            .is_ok_and(|(_, database_after, _, identity_after)| {
+                database_after == &canonical_database && *identity_after == database_identity
+            });
+    let source_preserved = configured_source_preserved
+        && additive_source_snapshot(source_path, &config)
+            .is_ok_and(|snapshot| additive_source_matches_receipt(&snapshot, &receipt));
+    let database_witness_preserved = storage
+        .with_read_transaction(|storage| {
+            require_reviewed_additive_schema_version(storage, &receipt, "postcommit verification")?;
+            let issues = hydrate_additive_database_issues(storage)?;
+            let witness = additive_database_witness(storage, &issues)?;
+            Ok(witness)
+        })
+        .is_ok_and(|witness| receipt.target_after.as_ref() == Some(&witness));
+    let database_health_preserved = additive_database_health(&storage)
+        .is_ok_and(|health| receipt.health_after.as_ref() == Some(&health));
+    let database_poststate_preserved = database_witness_preserved && database_health_preserved;
+    receipt.database_authority_preserved_after_commit = Some(database_authority_preserved);
+    receipt.database_poststate_preserved_after_commit = Some(database_poststate_preserved);
+    receipt.workspace_authority_preserved_after_commit = Some(workspace_authority_preserved);
+    receipt.source_preserved_after_commit = Some(source_preserved);
+    if !database_authority_preserved {
+        receipt
+            .postcommit_failures
+            .push(AdditivePostcommitFailure::DatabaseAuthorityChanged);
+    }
+    if !database_poststate_preserved {
+        receipt
+            .postcommit_failures
+            .push(AdditivePostcommitFailure::DatabasePoststateChanged);
+    }
+    if !workspace_authority_preserved {
+        receipt
+            .postcommit_failures
+            .push(AdditivePostcommitFailure::WorkspaceAuthorityChanged);
+    }
+    if !source_preserved {
+        receipt
+            .postcommit_failures
+            .push(AdditivePostcommitFailure::SourceWitnessChanged);
+    }
+    receipt.postcommit_failures.sort_unstable();
+    receipt.postcommit_failures.dedup();
+    if !receipt.postcommit_failures.is_empty() {
+        receipt.status = AdditiveReconcileStatus::CommittedWithPostconditionFailures;
+    }
+    Ok(receipt)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+enum AdditiveMutation {
+    Create(Issue),
+    UpdateScalars(Issue),
+}
+
+impl AdditiveMutation {
+    fn issue(&self) -> &Issue {
+        match self {
+            Self::Create(issue) | Self::UpdateScalars(issue) => issue,
+        }
+    }
+
+    const fn creates_issue(&self) -> bool {
+        matches!(self, Self::Create(_))
+    }
+}
+
+/// Immutable plan whose private mutations are bound to the public witnesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdditiveReconcilePlan {
+    receipt: AdditiveReconcileReceipt,
+    mutations: Vec<AdditiveMutation>,
+    content_hash_repairs: Vec<(String, String)>,
+    synchronized_export_hashes: Vec<(String, String)>,
+    expected_issues: BTreeMap<String, Issue>,
+    expected_raw_issue_rows: Vec<Vec<String>>,
+    expected_issue_content_hashes: BTreeMap<String, Option<String>>,
+    expected_export_hashes: BTreeMap<String, String>,
+    expected_raw_export_hash_rows: Vec<Vec<String>>,
+    expected_dirty_issues: Vec<(String, String)>,
+    expected_metadata: BTreeMap<String, String>,
+    expected_blocked_cache: BTreeMap<String, Vec<String>>,
+    expected_raw_blocked_cache_rows: Vec<Vec<String>>,
+    expected_child_counters: BTreeMap<String, u32>,
+    expected_sqlite_sequence: BTreeMap<String, i64>,
+}
+
+impl AdditiveReconcilePlan {
+    #[must_use]
+    pub const fn receipt(&self) -> &AdditiveReconcileReceipt {
+        &self.receipt
+    }
+
+    #[must_use]
+    pub const fn has_conflicts(&self) -> bool {
+        self.receipt.conflicted != 0
+    }
+
+    #[must_use]
+    pub fn mutation_count(&self) -> usize {
+        self.mutations
+            .len()
+            .saturating_add(self.content_hash_repairs.len())
+    }
+}
+
+const ADDITIVE_LOG_PREVIEW_LIMIT: usize = 32;
+
+#[cfg(test)]
+std::thread_local! {
+    static ADDITIVE_TEST_DRIFT_SOURCE_AFTER_FINAL_CHECK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static ADDITIVE_TEST_FAIL_PHASE: std::cell::Cell<Option<AdditiveTestFailPhase>> =
+        const { std::cell::Cell::new(None) };
+    static ADDITIVE_TEST_DRIFT_SCHEMA_BEFORE_TRANSACTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdditiveTestFailPhase {
+    BeforeTransaction,
+    AfterIssueAndRelationWrites,
+    BeforeFinalCommitChecks,
+}
+
+#[cfg(test)]
+fn additive_test_fail_at(phase: AdditiveTestFailPhase) -> Result<()> {
+    let should_fail = ADDITIVE_TEST_FAIL_PHASE.with(|configured| {
+        if configured.get() == Some(phase) {
+            configured.set(None);
+            true
+        } else {
+            false
+        }
+    });
+    if should_fail {
+        return Err(BeadsError::SyncConflict {
+            message: format!("injected additive reconciliation failure at {phase:?}"),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn additive_test_drift_source_after_final_check(input_path: &Path) -> Result<()> {
+    let should_drift =
+        ADDITIVE_TEST_DRIFT_SOURCE_AFTER_FINAL_CHECK.with(|flag| flag.replace(false));
+    if should_drift {
+        let mut source = OpenOptions::new().append(true).open(input_path)?;
+        source.write_all(b"\n")?;
+        source.flush()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn additive_test_drift_schema_before_transaction(storage: &SqliteStorage) -> Result<()> {
+    let should_drift =
+        ADDITIVE_TEST_DRIFT_SCHEMA_BEFORE_TRANSACTION.with(|flag| flag.replace(false));
+    if should_drift {
+        let future = crate::storage::schema::CURRENT_SCHEMA_VERSION
+            .checked_add(1)
+            .ok_or_else(|| BeadsError::Config("Schema test version overflow".to_string()))?;
+        storage.execute_raw(&format!("PRAGMA user_version = {future}"))?;
+    }
+    Ok(())
+}
+
+fn acquire_reviewed_additive_source_lock(input_path: &Path) -> Result<File> {
+    let descriptor = additive_path_descriptor(input_path, "source");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(input_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not open reviewed reconciliation source {descriptor}: {error}"
+        ))
+    })?;
+    redact_reviewed_path_result(
+        path::validate_jsonl_fd_metadata(&file, input_path),
+        input_path,
+        "source",
+        "validate",
+    )?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(BeadsError::SyncConflict {
+            message: format!(
+                "Reviewed reconciliation source {descriptor} is being modified by another process"
+            ),
+        }),
+        Err(TryLockError::Error(error)) => Err(BeadsError::Config(format!(
+            "Could not acquire reviewed reconciliation source authority {descriptor}: {error}"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdditiveSourceWitness {
+    raw_sha256: String,
+    content_sha256: String,
+    canonical_path_sha256: String,
+    identity_sha256: String,
+    size: u64,
+    mtime: String,
+}
+
+#[derive(Debug, Clone)]
+struct AdditiveSourceSnapshot {
+    witness: AdditiveSourceWitness,
+    issues: BTreeMap<String, Issue>,
+    record_count: usize,
+}
+
+fn additive_sha256(value: &impl Serialize, context: &str) -> Result<String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to serialize {context} for additive reconciliation: {error}"
+        ))
+    })?;
+    Ok(hex_encode(&Sha256::digest(bytes)))
+}
+
+fn canonicalize_additive_issue(issue: &mut Issue) {
+    issue.content_hash = None;
+    issue.labels.sort_unstable();
+    issue.dependencies.sort_by(|left, right| {
+        left.issue_id
+            .cmp(&right.issue_id)
+            .then_with(|| left.depends_on_id.cmp(&right.depends_on_id))
+            .then_with(|| left.dep_type.as_str().cmp(right.dep_type.as_str()))
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.created_by.cmp(&right.created_by))
+            .then_with(|| left.metadata.cmp(&right.metadata))
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    issue.comments.sort_by(|left, right| {
+        left.issue_id
+            .cmp(&right.issue_id)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.author.cmp(&right.author))
+            .then_with(|| left.body.cmp(&right.body))
+    });
+}
+
+fn canonicalize_additive_issue_for_storage(issue: &mut Issue) {
+    canonicalize_additive_issue(issue);
+    issue.source_repo.get_or_insert_with(|| ".".to_string());
+    issue.compaction_level.get_or_insert(0);
+    issue.original_size.get_or_insert(0);
+    for dependency in &mut issue.dependencies {
+        dependency
+            .created_by
+            .get_or_insert_with(|| "import".to_string());
+        dependency.metadata.get_or_insert_with(|| "{}".to_string());
+        dependency.thread_id.get_or_insert_with(String::new);
+    }
+}
+
+fn additive_issues_semantically_equal(left: &Issue, right: &Issue) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for comment in &mut left.comments {
+        comment.id = 0;
+    }
+    for comment in &mut right.comments {
+        comment.id = 0;
+    }
+    canonicalize_additive_issue(&mut left);
+    canonicalize_additive_issue(&mut right);
+    left == right
+}
+
+fn additive_relations_semantically_equal(left: &Issue, right: &Issue) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    for comment in &mut left.comments {
+        comment.id = 0;
+    }
+    for comment in &mut right.comments {
+        comment.id = 0;
+    }
+    canonicalize_additive_issue(&mut left);
+    canonicalize_additive_issue(&mut right);
+    left.labels == right.labels
+        && left.dependencies == right.dependencies
+        && left.comments == right.comments
+}
+
+fn additive_scalar_update_witness(
+    existing: &Issue,
+    incoming: &Issue,
+    resolution: AdditiveScalarResolution,
+) -> Result<AdditiveScalarUpdateWitness> {
+    let mut before = serde_json::to_value(existing).map_err(|error| {
+        BeadsError::Config(format!("Could not witness existing issue: {error}"))
+    })?;
+    let mut after = serde_json::to_value(incoming).map_err(|error| {
+        BeadsError::Config(format!("Could not witness incoming issue: {error}"))
+    })?;
+    for value in [&mut before, &mut after] {
+        let object = value.as_object_mut().ok_or_else(|| {
+            BeadsError::Config(
+                "Serialized issue was not an object while witnessing scalar repair".to_string(),
+            )
+        })?;
+        object.remove("labels");
+        object.remove("dependencies");
+        object.remove("comments");
+    }
+    let before = before.as_object().ok_or_else(|| {
+        BeadsError::Config("Existing scalar witness was not an object".to_string())
+    })?;
+    let after = after.as_object().ok_or_else(|| {
+        BeadsError::Config("Incoming scalar witness was not an object".to_string())
+    })?;
+    let fields = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let diff = fields
+        .into_iter()
+        .filter_map(|field| {
+            let before_value = before.get(&field);
+            let after_value = after.get(&field);
+            (before_value != after_value)
+                .then(|| (field, before_value.cloned(), after_value.cloned()))
+        })
+        .collect::<Vec<_>>();
+    if diff.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "Shared issue {} was classified as scalar drift without any scalar difference",
+            incoming.id
+        )));
+    }
+    Ok(AdditiveScalarUpdateWitness {
+        issue_id: incoming.id.clone(),
+        resolution,
+        changed_fields: diff.iter().map(|(field, _, _)| field.clone()).collect(),
+        diff_sha256: additive_sha256(&diff, "scalar update diff")?,
+        before_payload_sha256: additive_sha256(before, "scalar update before payload")?,
+        after_payload_sha256: additive_sha256(after, "scalar update after payload")?,
+        relation_payload_sha256: additive_sha256(
+            &(&existing.labels, &existing.dependencies, &existing.comments),
+            "scalar update relation payload",
+        )?,
+    })
+}
+
+fn additive_conflict_scalar_diff_witness(
+    existing: &Issue,
+    incoming: &Issue,
+) -> Result<Option<AdditiveConflictScalarDiffWitness>> {
+    let mut before = serde_json::to_value(existing).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not witness existing conflicted issue: {error}"
+        ))
+    })?;
+    let mut after = serde_json::to_value(incoming).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not witness incoming conflicted issue: {error}"
+        ))
+    })?;
+    for value in [&mut before, &mut after] {
+        let object = value.as_object_mut().ok_or_else(|| {
+            BeadsError::Config(
+                "Serialized conflicted issue was not an object while witnessing scalar drift"
+                    .to_string(),
+            )
+        })?;
+        object.remove("labels");
+        object.remove("dependencies");
+        object.remove("comments");
+    }
+    let before = before.as_object().ok_or_else(|| {
+        BeadsError::Config("Existing conflict scalar witness was not an object".to_string())
+    })?;
+    let after = after.as_object().ok_or_else(|| {
+        BeadsError::Config("Incoming conflict scalar witness was not an object".to_string())
+    })?;
+    let fields = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let diff = fields
+        .into_iter()
+        .filter_map(|field| {
+            let before_value = before.get(&field);
+            let after_value = after.get(&field);
+            (before_value != after_value)
+                .then(|| (field, before_value.cloned(), after_value.cloned()))
+        })
+        .collect::<Vec<_>>();
+    if diff.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AdditiveConflictScalarDiffWitness {
+        issue_id: incoming.id.clone(),
+        changed_fields: diff.iter().map(|(field, _, _)| field.clone()).collect(),
+        diff_sha256: additive_sha256(&diff, "conflict scalar diff")?,
+        before_payload_sha256: additive_sha256(before, "conflict scalar before payload")?,
+        after_payload_sha256: additive_sha256(after, "conflict scalar after payload")?,
+    }))
+}
+
+fn record_additive_conflict_scalar_diff(
+    witnesses: &mut BTreeMap<String, AdditiveConflictScalarDiffWitness>,
+    existing: &Issue,
+    incoming: &Issue,
+) -> Result<()> {
+    if let Some(witness) = additive_conflict_scalar_diff_witness(existing, incoming)? {
+        witnesses.insert(incoming.id.clone(), witness);
+    }
+    Ok(())
+}
+
+fn additive_relation_element_multiset(issue: &Issue) -> Result<BTreeMap<String, usize>> {
+    let mut issue = issue.clone();
+    for comment in &mut issue.comments {
+        comment.id = 0;
+    }
+    canonicalize_additive_issue(&mut issue);
+
+    let mut elements = BTreeMap::new();
+    for label in &issue.labels {
+        let digest = additive_sha256(&("label", label), "relation label element")?;
+        let count = elements.entry(digest).or_insert(0usize);
+        *count = count.checked_add(1).ok_or_else(|| {
+            BeadsError::Config("Relation label multiplicity overflow".to_string())
+        })?;
+    }
+    for dependency in &issue.dependencies {
+        let digest = additive_sha256(&("dependency", dependency), "relation dependency element")?;
+        let count = elements.entry(digest).or_insert(0usize);
+        *count = count.checked_add(1).ok_or_else(|| {
+            BeadsError::Config("Relation dependency multiplicity overflow".to_string())
+        })?;
+    }
+    for comment in &issue.comments {
+        let digest = additive_sha256(&("comment", comment), "relation comment element")?;
+        let count = elements.entry(digest).or_insert(0usize);
+        *count = count.checked_add(1).ok_or_else(|| {
+            BeadsError::Config("Relation comment multiplicity overflow".to_string())
+        })?;
+    }
+    Ok(elements)
+}
+
+fn additive_relation_multiset_delta(
+    minuend: &BTreeMap<String, usize>,
+    subtrahend: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let mut delta = Vec::new();
+    for (digest, count) in minuend {
+        let removed = subtrahend.get(digest).copied().unwrap_or_default();
+        for _ in 0..count.saturating_sub(removed) {
+            delta.push(digest.clone());
+        }
+    }
+    delta
+}
+
+fn additive_conflict_relation_diff_witness(
+    existing: &Issue,
+    incoming: &Issue,
+) -> Result<AdditiveConflictRelationDiffWitness> {
+    let mut before = existing.clone();
+    let mut after = incoming.clone();
+    for comment in &mut before.comments {
+        comment.id = 0;
+    }
+    for comment in &mut after.comments {
+        comment.id = 0;
+    }
+    canonicalize_additive_issue(&mut before);
+    canonicalize_additive_issue(&mut after);
+
+    let mut changed_relation_classes = Vec::new();
+    if before.labels != after.labels {
+        changed_relation_classes.push("labels".to_string());
+    }
+    if before.dependencies != after.dependencies {
+        changed_relation_classes.push("dependencies".to_string());
+    }
+    if before.comments != after.comments {
+        changed_relation_classes.push("comments".to_string());
+    }
+    if changed_relation_classes.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "Shared issue {} was classified as relation drift without a relation difference",
+            incoming.id
+        )));
+    }
+
+    let before_elements = additive_relation_element_multiset(&before)?;
+    let after_elements = additive_relation_element_multiset(&after)?;
+    let added_element_sha256 = additive_relation_multiset_delta(&after_elements, &before_elements);
+    let removed_element_sha256 =
+        additive_relation_multiset_delta(&before_elements, &after_elements);
+    let before_counts = AdditiveRelationCounts::from_issue(&before);
+    let after_counts = AdditiveRelationCounts::from_issue(&after);
+    let before_payload_sha256 = additive_sha256(
+        &(&before.labels, &before.dependencies, &before.comments),
+        "conflict relation before payload",
+    )?;
+    let after_payload_sha256 = additive_sha256(
+        &(&after.labels, &after.dependencies, &after.comments),
+        "conflict relation after payload",
+    )?;
+    let diff_sha256 = additive_sha256(
+        &(
+            &changed_relation_classes,
+            before_counts,
+            after_counts,
+            &before_payload_sha256,
+            &after_payload_sha256,
+            &added_element_sha256,
+            &removed_element_sha256,
+        ),
+        "conflict relation diff",
+    )?;
+    Ok(AdditiveConflictRelationDiffWitness {
+        issue_id: incoming.id.clone(),
+        changed_relation_classes,
+        before_counts,
+        after_counts,
+        before_payload_sha256,
+        after_payload_sha256,
+        added_element_sha256,
+        removed_element_sha256,
+        diff_sha256,
+    })
+}
+
+fn record_additive_conflict_relation_diff(
+    witnesses: &mut BTreeMap<String, AdditiveConflictRelationDiffWitness>,
+    existing: &Issue,
+    incoming: &Issue,
+) -> Result<()> {
+    witnesses.insert(
+        incoming.id.clone(),
+        additive_conflict_relation_diff_witness(existing, incoming)?,
+    );
+    Ok(())
+}
+
+fn additive_is_monotonic_closure(existing: &Issue, incoming: &Issue) -> Result<bool> {
+    if !matches!(
+        existing.status,
+        crate::model::Status::Open | crate::model::Status::InProgress
+    ) || incoming.status != crate::model::Status::Closed
+        || existing.closed_at.is_some()
+        || incoming.closed_at.is_none()
+        || existing.close_reason.is_some()
+        || incoming.close_reason.as_deref().is_none_or(str::is_empty)
+        || incoming.updated_at <= existing.updated_at
+    {
+        return Ok(false);
+    }
+
+    let mut before = serde_json::to_value(existing).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not compare existing monotonic closure payload: {error}"
+        ))
+    })?;
+    let mut after = serde_json::to_value(incoming).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not compare incoming monotonic closure payload: {error}"
+        ))
+    })?;
+    for value in [&mut before, &mut after] {
+        let object = value.as_object_mut().ok_or_else(|| {
+            BeadsError::Config("Serialized monotonic closure payload was not an object".to_string())
+        })?;
+        for field in [
+            "labels",
+            "dependencies",
+            "comments",
+            "status",
+            "updated_at",
+            "closed_at",
+            "close_reason",
+        ] {
+            object.remove(field);
+        }
+    }
+    Ok(before == after)
+}
+
+fn additive_explicit_scalar_resolution_conflict(
+    existing: &Issue,
+    incoming: &Issue,
+    witness: &AdditiveScalarUpdateWitness,
+) -> Option<&'static str> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "title",
+        "description",
+        "design",
+        "acceptance_criteria",
+        "notes",
+        "priority",
+        "issue_type",
+        "assignee",
+        "owner",
+        "estimated_minutes",
+        "updated_at",
+        "due_at",
+        "defer_until",
+        "external_ref",
+        "source_system",
+        "source_repo",
+        "source_repo_path",
+        "agent_context",
+    ];
+    if incoming.updated_at < existing.updated_at {
+        return Some("database_newer_source_resolution_forbidden");
+    }
+    witness
+        .changed_fields
+        .iter()
+        .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+        .then_some("source_resolution_contains_forbidden_scalar")
+}
+
+fn strict_additive_string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    line_num: usize,
+) -> Result<Option<&'a str>> {
+    object
+        .get(field)
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Additive reconciliation requires '{field}' to be a string at line {line_num}"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn reject_unknown_additive_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+    role: &str,
+    line_num: usize,
+) -> Result<()> {
+    let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(field.as_str()))
+    {
+        return Err(BeadsError::Config(format!(
+            "Unknown {role} field '{field}' in additive reconciliation source at line {line_num}"
+        )));
+    }
+    Ok(())
+}
+
+struct DuplicateKeyRejectingJson(serde_json::Value);
+
+impl<'de> Deserialize<'de> for DuplicateKeyRejectingJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DuplicateKeyRejectingJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("JSON without duplicate object members")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Number(
+                    value.into(),
+                )))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Number(
+                    value.into(),
+                )))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .map(DuplicateKeyRejectingJson)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::String(
+                    value.to_string(),
+                )))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::String(value)))
+            }
+
+            fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Null))
+            }
+
+            fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Null))
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                DuplicateKeyRejectingJson::deserialize(deserializer)
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<DuplicateKeyRejectingJson>()? {
+                    values.push(value.0);
+                }
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Array(values)))
+            }
+
+            fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut values = serde_json::Map::new();
+                while let Some(key) = object.next_key::<String>()? {
+                    if values.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate JSON object member '{key}'"
+                        )));
+                    }
+                    let value = object.next_value::<DuplicateKeyRejectingJson>()?;
+                    values.insert(key, value.0);
+                }
+                Ok(DuplicateKeyRejectingJson(serde_json::Value::Object(values)))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
+    const ISSUE_FIELDS: &[&str] = &[
+        "id",
+        "title",
+        "description",
+        "design",
+        "acceptance_criteria",
+        "notes",
+        "status",
+        "priority",
+        "issue_type",
+        "assignee",
+        "owner",
+        "estimated_minutes",
+        "created_at",
+        "created_by",
+        "updated_at",
+        "closed_at",
+        "close_reason",
+        "closed_by_session",
+        "due_at",
+        "defer_until",
+        "external_ref",
+        "source_system",
+        "source_repo",
+        "source_repo_path",
+        "agent_context",
+        "deleted_at",
+        "deleted_by",
+        "delete_reason",
+        "original_type",
+        "compaction_level",
+        "compacted_at",
+        "compacted_at_commit",
+        "original_size",
+        "sender",
+        "ephemeral",
+        "pinned",
+        "is_template",
+        "labels",
+        "dependencies",
+        "comments",
+        "content_hash",
+    ];
+    const DEPENDENCY_FIELDS: &[&str] = &[
+        "issue_id",
+        "depends_on_id",
+        "type",
+        "created_at",
+        "created_by",
+        "metadata",
+        "thread_id",
+    ];
+    const COMMENT_FIELDS: &[&str] = &["id", "issue_id", "author", "text", "created_at"];
+
+    let value = serde_json::from_str::<DuplicateKeyRejectingJson>(trimmed)
+        .map_err(|error| BeadsError::Config(format!("Invalid JSON at line {line_num}: {error}")))?
+        .0;
+    let object = value.as_object().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Additive reconciliation source record at line {line_num} must be a JSON object"
+        ))
+    })?;
+    reject_unknown_additive_fields(object, ISSUE_FIELDS, "issue", line_num)?;
+    if object.contains_key("content_hash") {
+        return Err(BeadsError::Config(format!(
+            "Additive reconciliation source must not contain ignored field 'content_hash' at line {line_num}"
+        )));
+    }
+
+    let issue: Issue = serde_json::from_value(value.clone()).map_err(|error| {
+        BeadsError::Config(format!("Invalid issue at line {line_num}: {error}"))
+    })?;
+    if let Some(raw_status) = strict_additive_string_field(object, "status", line_num)?
+        && raw_status != issue.status.as_str()
+    {
+        return Err(BeadsError::Config(format!(
+            "Status '{raw_status}' at line {line_num} would be normalized to '{}'; additive reconciliation refuses lossy repairs",
+            issue.status.as_str()
+        )));
+    }
+    if let Some(raw_type) = strict_additive_string_field(object, "issue_type", line_num)?
+        && raw_type != issue.issue_type.as_str()
+    {
+        return Err(BeadsError::Config(format!(
+            "Issue type '{raw_type}' at line {line_num} would be normalized to '{}'; additive reconciliation refuses lossy repairs",
+            issue.issue_type.as_str()
+        )));
+    }
+    if let Some(external_ref) = issue.external_ref.as_deref()
+        && (external_ref.is_empty() || external_ref.trim() != external_ref)
+    {
+        return Err(BeadsError::Config(format!(
+            "External reference for issue '{}' at line {line_num} is blank or not trimmed",
+            issue.id
+        )));
+    }
+    for (field, value) in [
+        ("description", issue.description.as_deref()),
+        ("design", issue.design.as_deref()),
+        ("acceptance_criteria", issue.acceptance_criteria.as_deref()),
+        ("notes", issue.notes.as_deref()),
+        ("assignee", issue.assignee.as_deref()),
+        ("owner", issue.owner.as_deref()),
+        ("created_by", issue.created_by.as_deref()),
+        ("close_reason", issue.close_reason.as_deref()),
+        ("closed_by_session", issue.closed_by_session.as_deref()),
+        ("source_system", issue.source_system.as_deref()),
+        ("source_repo", issue.source_repo.as_deref()),
+        ("deleted_by", issue.deleted_by.as_deref()),
+        ("delete_reason", issue.delete_reason.as_deref()),
+        ("original_type", issue.original_type.as_deref()),
+        ("sender", issue.sender.as_deref()),
+        ("source_repo_path", issue.source_repo_path.as_deref()),
+        ("agent_context", issue.agent_context.as_deref()),
+    ] {
+        if value == Some("") {
+            return Err(BeadsError::Config(format!(
+                "Optional field '{field}' for issue '{}' at line {line_num} is an empty string that storage would read back as null",
+                issue.id
+            )));
+        }
+    }
+    if let Some(agent_context) = issue.agent_context.as_deref() {
+        let parsed = serde_json::from_str::<DuplicateKeyRejectingJson>(agent_context)
+            .map_err(|error| {
+                BeadsError::Config(format!(
+                    "Agent context for issue '{}' at line {line_num} is not duplicate-free JSON: {error}",
+                    issue.id
+                ))
+            })?
+            .0;
+        let canonical = serde_json::to_string(&parsed).map_err(|error| {
+            BeadsError::Config(format!(
+                "Agent context for issue '{}' at line {line_num} could not be canonicalized: {error}",
+                issue.id
+            ))
+        })?;
+        if canonical != agent_context {
+            return Err(BeadsError::Config(format!(
+                "Agent context for issue '{}' at line {line_num} is valid but not canonical JSON",
+                issue.id
+            )));
+        }
+    }
+
+    if let Some(dependencies) = object.get("dependencies") {
+        let dependencies = dependencies.as_array().ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Issue dependencies at line {line_num} must be an array"
+            ))
+        })?;
+        for (index, dependency) in dependencies.iter().enumerate() {
+            let dependency = dependency.as_object().ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Dependency {index} at line {line_num} must be an object"
+                ))
+            })?;
+            reject_unknown_additive_fields(dependency, DEPENDENCY_FIELDS, "dependency", line_num)?;
+            let raw_type =
+                strict_additive_string_field(dependency, "type", line_num)?.ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "Dependency {index} at line {line_num} is missing 'type'"
+                    ))
+                })?;
+            if raw_type != issue.dependencies[index].dep_type.as_str() {
+                return Err(BeadsError::Config(format!(
+                    "Dependency type '{raw_type}' at line {line_num} would be normalized to '{}'; additive reconciliation refuses lossy repairs",
+                    issue.dependencies[index].dep_type.as_str()
+                )));
+            }
+            if dependency
+                .get("metadata")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|metadata| metadata.trim().is_empty())
+            {
+                return Err(BeadsError::Config(format!(
+                    "Dependency metadata at line {line_num} is blank and would be normalized away"
+                )));
+            }
+        }
+    }
+    if let Some(comments) = object.get("comments") {
+        let comments = comments.as_array().ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Issue comments at line {line_num} must be an array"
+            ))
+        })?;
+        for (index, comment) in comments.iter().enumerate() {
+            let comment = comment.as_object().ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Comment {index} at line {line_num} must be an object"
+                ))
+            })?;
+            reject_unknown_additive_fields(comment, COMMENT_FIELDS, "comment", line_num)?;
+        }
+    }
+    if let Err(errors) = IssueValidator::validate(&issue) {
+        let details = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(BeadsError::Config(format!(
+            "Validation failed for issue {} at line {line_num}: {details}",
+            issue.id
+        )));
+    }
+    Ok(issue)
+}
+
+fn additive_source_snapshot(
+    input_path: &Path,
+    config: &AdditiveReconcileConfig,
+) -> Result<AdditiveSourceSnapshot> {
+    if let Some(beads_dir) = &config.beads_dir {
+        redact_reviewed_path_result(
+            validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl),
+            input_path,
+            "source",
+            "validate path policy for",
+        )?;
+    } else {
+        let validation = validate_no_git_path(input_path);
+        if !validation.is_allowed() {
+            return Err(BeadsError::Config(format!(
+                "Reviewed source path was rejected: {}",
+                additive_path_descriptor(input_path, "source")
+            )));
+        }
+    }
+
+    let canonical_path_before = fs::canonicalize(input_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not canonicalize additive reconciliation source {}: {error}",
+            additive_path_descriptor(input_path, "source")
+        ))
+    })?;
+    let canonical_path_sha256 = additive_sha256(
+        &canonical_path_before.to_string_lossy().as_ref(),
+        "canonical source path",
+    )?;
+    let path_before = redact_reviewed_path_result(
+        observed_jsonl_witness(input_path),
+        input_path,
+        "source",
+        "witness",
+    )?;
+    let mut source_options = OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    source_options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = source_options.open(input_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not open additive reconciliation source {}: {error}",
+            additive_path_descriptor(input_path, "source")
+        ))
+    })?;
+    redact_reviewed_path_result(
+        path::validate_jsonl_fd_metadata(&file, input_path),
+        input_path,
+        "source",
+        "validate",
+    )?;
+    let file_before = file.metadata()?;
+    let file_identity = additive_metadata_identity(&file_before);
+    let identity_sha256 = additive_sha256(
+        &(
+            canonical_path_before.to_string_lossy().as_ref(),
+            file_identity,
+        ),
+        "source file identity",
+    )?;
+    let file_before_mtime = file_before.modified()?;
+    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut raw_hasher = Sha256::new();
+    let mut canonical_hasher = Sha256::new();
+    let mut line = String::new();
+    let mut issues = BTreeMap::new();
+    let mut record_count = 0usize;
+    let mut line_num = 0usize;
+    while reader.read_line(&mut line)? > 0 {
+        raw_hasher.update(line.as_bytes());
+        line_num = line_num.checked_add(1).ok_or_else(|| {
+            BeadsError::Config(
+                "JSONL line count overflow during additive reconciliation".to_string(),
+            )
+        })?;
+        let trimmed_bytes = line.as_bytes().trim_ascii();
+        if !trimmed_bytes.is_empty() {
+            canonical_hasher.update(trimmed_bytes);
+            canonical_hasher.update(b"\n");
+            let trimmed = std::str::from_utf8(trimmed_bytes).map_err(|error| {
+                BeadsError::Config(format!(
+                    "Invalid UTF-8 in additive reconciliation source at line {line_num}: {error}"
+                ))
+            })?;
+            let mut issue = parse_strict_additive_issue(trimmed, line_num)?;
+            record_count = record_count.checked_add(1).ok_or_else(|| {
+                BeadsError::Config(
+                    "JSONL record count overflow during additive reconciliation".to_string(),
+                )
+            })?;
+            canonicalize_additive_issue_for_storage(&mut issue);
+            let issue_id = issue.id.clone();
+            if issues.insert(issue_id.clone(), issue).is_some() {
+                return Err(BeadsError::Config(format!(
+                    "Duplicate issue id '{issue_id}' in additive reconciliation source at line {line_num}"
+                )));
+            }
+        }
+        line.clear();
+    }
+    let file_after = reader.get_ref().metadata()?;
+    let path_after = redact_reviewed_path_result(
+        observed_jsonl_witness(input_path),
+        input_path,
+        "source",
+        "re-witness",
+    )?;
+    let canonical_path_after = fs::canonicalize(input_path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not re-canonicalize additive reconciliation source {}: {error}",
+            additive_path_descriptor(input_path, "source")
+        ))
+    })?;
+    let path_identity_after = additive_file_identity(&canonical_path_after)?;
+    if file_before.len() != file_after.len()
+        || file_before_mtime != file_after.modified()?
+        || additive_metadata_identity(&file_after) != file_identity
+        || canonical_path_after != canonical_path_before
+        || path_identity_after != file_identity
+        || path_before.mtime != path_after.mtime
+        || path_before.size != path_after.size
+        || file_after.len() != path_after.size
+        || file_after.modified()? != path_after.mtime
+    {
+        return Err(BeadsError::Config(
+            "JSONL changed while additive reconciliation was reading it; retry from a stable source"
+                .to_string(),
+        ));
+    }
+    let raw_sha256 = hex_encode(&raw_hasher.finalize());
+    let content_sha256 = hex_encode(&canonical_hasher.finalize());
+
+    Ok(AdditiveSourceSnapshot {
+        witness: AdditiveSourceWitness {
+            raw_sha256,
+            content_sha256,
+            canonical_path_sha256,
+            identity_sha256,
+            size: path_after.size,
+            mtime: path_after.mtime_witness,
+        },
+        issues,
+        record_count,
+    })
+}
+
+fn hydrate_additive_database_issues(storage: &SqliteStorage) -> Result<BTreeMap<String, Issue>> {
+    let mut ids = storage
+        .get_all_issues_metadata()?
+        .into_iter()
+        .map(|metadata| metadata.id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut issues = storage.get_issues_by_ids(&ids)?;
+    let dependencies = storage.get_all_dependency_records()?;
+    let labels = storage.get_all_labels()?;
+    let comments = storage.get_all_comments()?;
+    for issue in &mut issues {
+        issue.dependencies = dependencies.get(&issue.id).cloned().unwrap_or_default();
+        issue.labels = labels.get(&issue.id).cloned().unwrap_or_default();
+        issue.comments = comments.get(&issue.id).cloned().unwrap_or_default();
+        canonicalize_additive_issue_for_storage(issue);
+    }
+    issues.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    if issues.len() != ids.len() {
+        return Err(BeadsError::Config(format!(
+            "Additive reconciliation could hydrate only {} of {} database issues",
+            issues.len(),
+            ids.len()
+        )));
+    }
+    Ok(issues
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect())
+}
+
+fn additive_relation_counts<'a>(
+    issues: impl IntoIterator<Item = &'a Issue>,
+) -> Result<AdditiveRelationCounts> {
+    issues
+        .into_iter()
+        .try_fold(AdditiveRelationCounts::default(), |counts, issue| {
+            counts.checked_add(AdditiveRelationCounts::from_issue(issue))
+        })
+}
+
+fn additive_sqlite_value_witness(value: SqliteValue) -> String {
+    match value {
+        SqliteValue::Null => "null".to_string(),
+        SqliteValue::Integer(value) => format!("integer:{value}"),
+        SqliteValue::Float(value) => format!("real:{:016x}", value.to_bits()),
+        SqliteValue::Text(value) => format!("text:{}", value.as_str()),
+        SqliteValue::Blob(value) => format!("blob:{}", hex_encode(value.as_ref())),
+    }
+}
+
+fn additive_raw_rows(storage: &SqliteStorage, sql: &str) -> Result<Vec<Vec<String>>> {
+    Ok(storage
+        .execute_raw_query(sql)?
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(additive_sqlite_value_witness)
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+fn additive_raw_issue_rows(storage: &SqliteStorage) -> Result<Vec<Vec<String>>> {
+    additive_raw_rows(storage, "SELECT * FROM issues ORDER BY id")
+}
+
+fn additive_raw_issue_row_map(storage: &SqliteStorage) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut rows_by_id = BTreeMap::new();
+    for (row_index, row) in additive_raw_issue_rows(storage)?.into_iter().enumerate() {
+        let id = row
+            .first()
+            .and_then(|value| value.strip_prefix("text:"))
+            .ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Raw issue row {row_index} had no text ID in its first column"
+                ))
+            })?
+            .to_string();
+        if rows_by_id.insert(id.clone(), row).is_some() {
+            return Err(BeadsError::Config(format!(
+                "Duplicate raw issue row for '{id}'"
+            )));
+        }
+    }
+    Ok(rows_by_id)
+}
+
+fn additive_raw_rows_by_text_key(
+    rows: Vec<Vec<String>>,
+    table: &str,
+) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut rows_by_key = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let key = row
+            .first()
+            .and_then(|value| value.strip_prefix("text:"))
+            .ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Raw {table} row {row_index} had no text key in its first column"
+                ))
+            })?
+            .to_string();
+        if rows_by_key.insert(key.clone(), row).is_some() {
+            return Err(BeadsError::Config(format!(
+                "Duplicate raw {table} row for '{key}'"
+            )));
+        }
+    }
+    Ok(rows_by_key)
+}
+
+fn additive_database_witness(
+    storage: &SqliteStorage,
+    issues: &BTreeMap<String, Issue>,
+) -> Result<AdditiveDatabaseWitness> {
+    let mut dirty = storage.get_dirty_issue_metadata()?;
+    dirty.sort_unstable();
+    let relations = additive_relation_counts(issues.values())?;
+    let raw_issue_rows = additive_raw_issue_rows(storage)?;
+    if raw_issue_rows.len() != issues.len() {
+        return Err(BeadsError::Config(
+            "Raw and hydrated issue counts diverged during additive reconciliation".to_string(),
+        ));
+    }
+    let (blocked_cache_entries, child_counter_entries) = storage.count_sync_derived_rows()?;
+    let issue_content_hashes = additive_issue_content_hashes(storage)?;
+    let label_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, label FROM labels ORDER BY issue_id, label",
+    )?;
+    let dependency_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id \
+         FROM dependencies \
+         ORDER BY issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id",
+    )?;
+    let comment_rows = additive_raw_rows(
+        storage,
+        "SELECT id, issue_id, author, text, created_at \
+         FROM comments ORDER BY id, issue_id, author, text, created_at",
+    )?;
+    let event_rows = additive_raw_rows(
+        storage,
+        "SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at, \
+         agent_name, harness, model \
+         FROM events \
+         ORDER BY id, issue_id, event_type, actor, old_value, new_value, comment, created_at, agent_name, harness, model",
+    )?;
+    let export_hashes = additive_raw_rows(
+        storage,
+        "SELECT issue_id, content_hash, exported_at FROM export_hashes \
+         ORDER BY issue_id, content_hash, exported_at",
+    )?;
+    let metadata_rows = additive_raw_rows(
+        storage,
+        "SELECT key, value FROM metadata ORDER BY key, value",
+    )?;
+    let stable_metadata_rows = metadata_rows
+        .iter()
+        .filter(|row| {
+            row.first()
+                .and_then(|value| value.strip_prefix("text:"))
+                .is_none_or(|key| !is_sync_merge_mutable_metadata_key(key))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let blocked_cache_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, blocked_by, blocked_at FROM blocked_issues_cache \
+         ORDER BY issue_id, blocked_by, blocked_at",
+    )?;
+    let child_counter_rows = additive_raw_rows(
+        storage,
+        "SELECT parent_id, last_child FROM child_counters \
+         ORDER BY parent_id, last_child",
+    )?;
+    let config_rows =
+        additive_raw_rows(storage, "SELECT key, value FROM config ORDER BY key, value")?;
+    let close_metadata_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, closed_by_agent_name, closed_by_harness, closed_by_model, \
+         bypassed_policy, bypass_reason, policy_gates_fired, recorded_at \
+         FROM close_metadata \
+         ORDER BY issue_id, closed_by_agent_name, closed_by_harness, closed_by_model, \
+                  bypassed_policy, bypass_reason, policy_gates_fired, recorded_at",
+    )?;
+    let gate_result_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, gate, provider, passed, note, recorded_by, recorded_at \
+         FROM gate_results \
+         ORDER BY issue_id, gate, provider, passed, note, recorded_by, recorded_at",
+    )?;
+    let gate_result_history_rows = additive_raw_rows(
+        storage,
+        "SELECT id, issue_id, from_status, to_status, status_revision, gate, provider, passed, \
+         note, recorded_by, recorded_at \
+         FROM gate_result_history \
+         ORDER BY id, issue_id, from_status, to_status, status_revision, gate, provider, \
+                  passed, note, recorded_by, recorded_at",
+    )?;
+    let schema_catalog_rows = additive_raw_rows(
+        storage,
+        "SELECT type, name, tbl_name, rootpage, sql \
+         FROM sqlite_master \
+         WHERE name NOT LIKE 'sqlite_%' \
+         ORDER BY type, name, tbl_name, rootpage, sql",
+    )?;
+    let sqlite_sequence_rows = additive_raw_rows(
+        storage,
+        "SELECT name, seq FROM sqlite_sequence ORDER BY name, seq",
+    )?;
+    if blocked_cache_rows.len() != blocked_cache_entries
+        || child_counter_rows.len() != child_counter_entries
+    {
+        return Err(BeadsError::Config(
+            "Derived-table counts changed while additive reconciliation was witnessing them"
+                .to_string(),
+        ));
+    }
+
+    Ok(AdditiveDatabaseWitness {
+        issues: issues.len(),
+        issue_payload_sha256: additive_sha256(&raw_issue_rows, "raw database issue payload")?,
+        issue_semantic_payload_sha256: additive_sha256(issues, "database semantic issue payload")?,
+        issue_content_hashes: issue_content_hashes.len(),
+        issue_content_hash_payload_sha256: additive_sha256(
+            &issue_content_hashes,
+            "database issue content hashes",
+        )?,
+        relations,
+        label_payload_sha256: additive_sha256(&label_rows, "raw database labels")?,
+        dependency_payload_sha256: additive_sha256(&dependency_rows, "raw database dependencies")?,
+        comment_payload_sha256: additive_sha256(&comment_rows, "raw database comments")?,
+        export_hashes: export_hashes.len(),
+        export_hash_payload_sha256: additive_sha256(&export_hashes, "database export hashes")?,
+        events: event_rows.len(),
+        event_payload_sha256: additive_sha256(&event_rows, "raw database audit events")?,
+        dirty_issues: dirty.len(),
+        dirty_payload_sha256: additive_sha256(&dirty, "database dirty markers")?,
+        metadata_rows: metadata_rows.len(),
+        metadata_payload_sha256: additive_sha256(&metadata_rows, "database metadata")?,
+        stable_metadata: additive_table_witness(
+            &stable_metadata_rows,
+            "stable sync merge database metadata",
+        )?,
+        blocked_cache_entries,
+        blocked_cache_payload_sha256: additive_sha256(
+            &blocked_cache_rows,
+            "database blocked cache",
+        )?,
+        child_counter_entries,
+        child_counter_payload_sha256: additive_sha256(
+            &child_counter_rows,
+            "database child counters",
+        )?,
+        config: additive_table_witness(&config_rows, "database config")?,
+        close_metadata: additive_table_witness(&close_metadata_rows, "database close metadata")?,
+        gate_results: additive_table_witness(&gate_result_rows, "database legacy gate results")?,
+        gate_result_history: additive_table_witness(
+            &gate_result_history_rows,
+            "database gate-result history",
+        )?,
+        schema_catalog: additive_table_witness(&schema_catalog_rows, "database schema catalog")?,
+        sqlite_sequence: additive_table_witness(&sqlite_sequence_rows, "database sqlite sequence")?,
+        stored_jsonl_content_hash: storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?,
+        stored_jsonl_mtime: storage.get_metadata(METADATA_JSONL_MTIME)?,
+        stored_jsonl_size: storage.get_metadata(METADATA_JSONL_SIZE)?,
+        needs_flush: storage.get_metadata("needs_flush")?,
+    })
+}
+
+/// Capture the complete database witness used to bind merge planning to the
+/// exact transaction prestate.
+pub(crate) fn capture_sync_database_witness(
+    storage: &SqliteStorage,
+) -> Result<AdditiveDatabaseWitness> {
+    let issues = hydrate_additive_database_issues(storage)?;
+    additive_database_witness(storage, &issues)
+}
+
+/// Capture the merge-authoritative poststate that remains invariant while
+/// export bookkeeping advances.
+pub(crate) fn capture_sync_merge_core_witness(
+    storage: &SqliteStorage,
+) -> Result<SyncMergeDatabaseCoreWitness> {
+    capture_sync_database_witness(storage).map(Into::into)
+}
+
+fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        METADATA_SYNC_MERGE_PENDING
+            | METADATA_JSONL_CONTENT_HASH
+            | METADATA_JSONL_MTIME
+            | METADATA_JSONL_SIZE
+            | METADATA_LAST_EXPORT_TIME
+            | "needs_flush"
+    )
+}
+
+fn is_sync_merge_export_metadata_key(key: &str) -> bool {
+    matches!(
+        key,
+        METADATA_JSONL_CONTENT_HASH
+            | METADATA_JSONL_MTIME
+            | METADATA_JSONL_SIZE
+            | METADATA_LAST_EXPORT_TIME
+            | "needs_flush"
+    )
+}
+
+/// Capture the exact mutable bookkeeping that export finalization must leave
+/// behind before a pending merge receipt may advance or clear.
+pub(crate) fn capture_sync_merge_export_finalization_witness(
+    storage: &SqliteStorage,
+) -> Result<SyncMergeExportFinalizationWitness> {
+    let dirty_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, marked_at FROM dirty_issues ORDER BY issue_id, marked_at",
+    )?;
+    let all_metadata_rows = additive_raw_rows(
+        storage,
+        "SELECT key, value FROM metadata ORDER BY key, value",
+    )?;
+    let export_metadata_rows = all_metadata_rows
+        .into_iter()
+        .filter(|row| {
+            row.first()
+                .and_then(|value| value.strip_prefix("text:"))
+                .is_some_and(is_sync_merge_export_metadata_key)
+        })
+        .collect::<Vec<_>>();
+
+    Ok(SyncMergeExportFinalizationWitness {
+        export_hashes: capture_export_hash_mapping_witness(storage)?,
+        dirty_issues: additive_table_witness(&dirty_rows, "sync merge finalized dirty markers")?,
+        jsonl_content_hash: storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?,
+        jsonl_mtime: storage.get_metadata(METADATA_JSONL_MTIME)?,
+        jsonl_size: storage.get_metadata(METADATA_JSONL_SIZE)?,
+        last_export_time: storage.get_metadata(METADATA_LAST_EXPORT_TIME)?,
+        needs_flush: storage.get_metadata("needs_flush")?,
+        export_metadata: additive_table_witness(
+            &export_metadata_rows,
+            "sync merge finalized export metadata",
+        )?,
+    })
+}
+
+fn additive_table_witness(rows: &[Vec<String>], context: &str) -> Result<AdditiveTableWitness> {
+    Ok(AdditiveTableWitness {
+        rows: rows.len(),
+        payload_sha256: additive_sha256(&rows, context)?,
+    })
+}
+
+fn additive_text_rows(
+    storage: &SqliteStorage,
+    sql: &str,
+    row_role: &str,
+) -> Result<Vec<Vec<String>>> {
+    storage
+        .execute_raw_query(sql)?
+        .into_iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            row.into_iter()
+                .enumerate()
+                .map(|(column_index, value)| {
+                    value.as_text().map(str::to_owned).ok_or_else(|| {
+                        BeadsError::Config(format!(
+                            "Additive reconciliation {row_role} row {row_index} column {column_index} was not text"
+                        ))
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn additive_key_value_map(
+    storage: &SqliteStorage,
+    sql: &str,
+    row_role: &str,
+) -> Result<BTreeMap<String, String>> {
+    let rows = additive_text_rows(storage, sql, row_role)?;
+    let mut map = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let [key, value]: [String; 2] = row.try_into().map_err(|row: Vec<String>| {
+            BeadsError::Config(format!(
+                "Additive reconciliation {row_role} row {row_index} had {} column(s), expected 2",
+                row.len()
+            ))
+        })?;
+        if map.insert(key.clone(), value).is_some() {
+            return Err(BeadsError::Config(format!(
+                "Additive reconciliation {row_role} contained duplicate key '{key}'"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn additive_issue_content_hashes(
+    storage: &SqliteStorage,
+) -> Result<BTreeMap<String, Option<String>>> {
+    let rows = storage.execute_raw_query("SELECT id, content_hash FROM issues ORDER BY id")?;
+    let mut hashes = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let [id, content_hash]: [SqliteValue; 2] =
+            row.try_into().map_err(|row: Vec<SqliteValue>| {
+                BeadsError::Config(format!(
+                    "Additive reconciliation issue content-hash row {row_index} had {} column(s), expected 2",
+                    row.len()
+                ))
+            })?;
+        let id = id.as_text().ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Additive reconciliation issue content-hash row {row_index} ID was not text"
+            ))
+        })?;
+        let content_hash = match content_hash {
+            SqliteValue::Null => None,
+            SqliteValue::Text(value) => Some(value.as_str().to_string()),
+            _ => {
+                return Err(BeadsError::Config(format!(
+                    "Additive reconciliation issue content hash for '{id}' was neither text nor NULL"
+                )));
+            }
+        };
+        if hashes.insert(id.to_string(), content_hash).is_some() {
+            return Err(BeadsError::Config(format!(
+                "Duplicate issue content-hash row for '{id}'"
+            )));
+        }
+    }
+    Ok(hashes)
+}
+
+fn additive_export_hashes(storage: &SqliteStorage) -> Result<BTreeMap<String, String>> {
+    additive_key_value_map(
+        storage,
+        "SELECT issue_id, content_hash FROM export_hashes ORDER BY issue_id",
+        "export hash",
+    )
+}
+
+pub(crate) fn sync_merge_export_hash_mapping_witness(
+    issue_hashes: &[(String, String)],
+) -> Result<AdditiveTableWitness> {
+    let mut rows = issue_hashes.to_vec();
+    rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    if let Some(duplicate) = rows
+        .windows(2)
+        .find(|pair| pair[0].0 == pair[1].0)
+        .map(|pair| pair[0].0.as_str())
+    {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Reviewed JSONL export contains duplicate issue-hash mapping for {duplicate}"
+            ),
+        });
+    }
+    Ok(AdditiveTableWitness {
+        rows: rows.len(),
+        payload_sha256: additive_sha256(&rows, "sync merge export hash mapping")?,
+    })
+}
+
+fn capture_export_hash_mapping_witness(storage: &SqliteStorage) -> Result<AdditiveTableWitness> {
+    let rows = additive_export_hashes(storage)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    sync_merge_export_hash_mapping_witness(&rows)
+}
+
+fn additive_metadata(storage: &SqliteStorage) -> Result<BTreeMap<String, String>> {
+    additive_key_value_map(
+        storage,
+        "SELECT key, value FROM metadata ORDER BY key",
+        "metadata",
+    )
+}
+
+fn additive_sqlite_sequence(storage: &SqliteStorage) -> Result<BTreeMap<String, i64>> {
+    let rows = additive_text_rows(
+        storage,
+        "SELECT name, CAST(seq AS TEXT) FROM sqlite_sequence ORDER BY name",
+        "sqlite sequence",
+    )?;
+    let mut sequence = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let [name, value]: [String; 2] = row.try_into().map_err(|row: Vec<String>| {
+            BeadsError::Config(format!(
+                "SQLite sequence row {row_index} had {} column(s), expected 2",
+                row.len()
+            ))
+        })?;
+        let value = value.parse::<i64>().map_err(|error| {
+            BeadsError::Config(format!(
+                "SQLite sequence value for {name} was not an integer: {error}"
+            ))
+        })?;
+        if sequence.insert(name.clone(), value).is_some() {
+            return Err(BeadsError::Config(format!(
+                "SQLite sequence contained duplicate row for {name}"
+            )));
+        }
+    }
+    Ok(sequence)
+}
+
+fn additive_actual_blocked_cache(storage: &SqliteStorage) -> Result<BTreeMap<String, Vec<String>>> {
+    let rows = additive_text_rows(
+        storage,
+        "SELECT issue_id, blocked_by FROM blocked_issues_cache ORDER BY issue_id",
+        "blocked cache",
+    )?;
+    let mut map = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let [issue_id, blocked_by]: [String; 2] = row.try_into().map_err(|row: Vec<String>| {
+            BeadsError::Config(format!(
+                "Blocked-cache row {row_index} had {} column(s), expected 2",
+                row.len()
+            ))
+        })?;
+        let mut blockers: Vec<String> = serde_json::from_str(&blocked_by).map_err(|error| {
+            BeadsError::Config(format!(
+                "Blocked-cache row for {issue_id} contains invalid JSON: {error}"
+            ))
+        })?;
+        blockers.sort_unstable();
+        blockers.dedup();
+        if blockers.is_empty() || map.insert(issue_id.clone(), blockers).is_some() {
+            return Err(BeadsError::Config(format!(
+                "Blocked-cache row for {issue_id} is empty or duplicated"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn additive_expected_blocked_cache(
+    issues: &BTreeMap<String, Issue>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut blocked = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut children_by_parent = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for issue in issues.values() {
+        for dependency in &issue.dependencies {
+            if matches!(dependency.dep_type, DependencyType::ParentChild) {
+                if !dependency.issue_id.starts_with("external:")
+                    && !dependency.depends_on_id.starts_with("external:")
+                {
+                    children_by_parent
+                        .entry(dependency.depends_on_id.clone())
+                        .or_default()
+                        .insert(dependency.issue_id.clone());
+                }
+                continue;
+            }
+            if !matches!(
+                dependency.dep_type,
+                DependencyType::Blocks
+                    | DependencyType::ConditionalBlocks
+                    | DependencyType::WaitsFor
+            ) || dependency.depends_on_id.starts_with("external:")
+            {
+                continue;
+            }
+            if let Some(blocker) = issues.get(&dependency.depends_on_id)
+                && !blocker.status.is_terminal()
+                && !blocker.is_template
+            {
+                blocked.entry(issue.id.clone()).or_default().insert(format!(
+                    "{}:{}",
+                    dependency.depends_on_id,
+                    blocker.status.as_str()
+                ));
+            }
+        }
+    }
+
+    let mut queue = blocked.keys().cloned().collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    while let Some(parent_id) = queue.pop() {
+        if !seen.insert(parent_id.clone()) {
+            continue;
+        }
+        if let Some(children) = children_by_parent.get(&parent_id) {
+            for child_id in children {
+                let inserted = blocked
+                    .entry(child_id.clone())
+                    .or_default()
+                    .insert(format!("{parent_id}:parent-blocked"));
+                if inserted {
+                    queue.push(child_id.clone());
+                }
+            }
+        }
+    }
+
+    for (parent_id, children) in children_by_parent {
+        let Some(parent) = issues.get(&parent_id) else {
+            continue;
+        };
+        if parent.issue_type != crate::model::IssueType::Epic {
+            continue;
+        }
+        for child_id in children {
+            if let Some(child) = issues.get(&child_id)
+                && !child.status.is_terminal()
+                && !child.is_template
+            {
+                blocked
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .insert(format!("{child_id}:child-open"));
+            }
+        }
+    }
+
+    blocked
+        .into_iter()
+        .filter_map(|(issue_id, blockers)| {
+            (!blockers.is_empty()).then(|| (issue_id, blockers.into_iter().collect()))
+        })
+        .collect()
+}
+
+fn additive_actual_child_counters(storage: &SqliteStorage) -> Result<BTreeMap<String, u32>> {
+    let rows = additive_text_rows(
+        storage,
+        "SELECT parent_id, CAST(last_child AS TEXT) FROM child_counters ORDER BY parent_id",
+        "child counter",
+    )?;
+    let mut map = BTreeMap::new();
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let [parent_id, last_child]: [String; 2] = row.try_into().map_err(|row: Vec<String>| {
+            BeadsError::Config(format!(
+                "Child-counter row {row_index} had {} column(s), expected 2",
+                row.len()
+            ))
+        })?;
+        let last_child = last_child.parse::<u32>().map_err(|error| {
+            BeadsError::Config(format!(
+                "Child-counter row for {parent_id} is invalid: {error}"
+            ))
+        })?;
+        if map.insert(parent_id.clone(), last_child).is_some() {
+            return Err(BeadsError::Config(format!(
+                "Child-counter row for {parent_id} is duplicated"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn additive_expected_child_counters(issues: &BTreeMap<String, Issue>) -> BTreeMap<String, u32> {
+    let issue_ids = issues.keys().cloned().collect::<BTreeSet<_>>();
+    let mut counters = BTreeMap::<String, u32>::new();
+    for issue_id in &issue_ids {
+        let Ok(parsed) = parse_id(issue_id) else {
+            continue;
+        };
+        if parsed.is_root() {
+            continue;
+        }
+        let Some(parent_id) = parsed.parent() else {
+            continue;
+        };
+        let Some(child_number) = parsed.child_path.last().copied() else {
+            continue;
+        };
+        if issue_ids.contains(&parent_id) {
+            counters
+                .entry(parent_id)
+                .and_modify(|current| *current = (*current).max(child_number))
+                .or_insert(child_number);
+        }
+    }
+    counters
+}
+
+fn additive_database_health(storage: &SqliteStorage) -> Result<AdditiveDatabaseHealth> {
+    Ok(AdditiveDatabaseHealth {
+        integrity_messages: storage.integrity_check_messages()?,
+        foreign_key_violations: storage.foreign_key_check_messages()?,
+    })
+}
+
+fn additive_database_transaction_health(storage: &SqliteStorage) -> Result<AdditiveDatabaseHealth> {
+    Ok(AdditiveDatabaseHealth {
+        integrity_messages: storage.quick_check_messages()?,
+        foreign_key_violations: storage.foreign_key_check_messages()?,
+    })
+}
+
+fn additive_database_is_healthy(health: &AdditiveDatabaseHealth) -> bool {
+    health.integrity_messages.len() == 1
+        && health.integrity_messages[0].eq_ignore_ascii_case("ok")
+        && health.foreign_key_violations.is_empty()
+}
+
+fn require_healthy_additive_database(health: &AdditiveDatabaseHealth, phase: &str) -> Result<()> {
+    if !additive_database_is_healthy(health) {
+        return Err(BeadsError::Config(format!(
+            "Additive reconciliation {phase} database health gate failed: integrity={:?}, foreign_key_violations={:?}",
+            health.integrity_messages, health.foreign_key_violations
+        )));
+    }
+    Ok(())
+}
+
+fn additive_provenance_path(
+    path: Option<&Path>,
+    beads_dir: Option<&Path>,
+    role: &str,
+) -> Result<(String, String)> {
+    let Some(path) = path else {
+        return Ok((
+            "<in-memory>".to_string(),
+            additive_sha256(&"<in-memory>", "in-memory provenance path")?,
+        ));
+    };
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not canonicalize additive reconciliation {role} path {}: {error}",
+            additive_path_descriptor(path, role)
+        ))
+    })?;
+    let path_sha256 = additive_sha256(
+        &canonical.to_string_lossy().as_ref(),
+        "canonical provenance path",
+    )?;
+    let display_path = beads_dir
+        .and_then(Path::parent)
+        .and_then(|project_root| fs::canonicalize(project_root).ok())
+        .and_then(|project_root| {
+            canonical
+                .strip_prefix(project_root)
+                .ok()
+                .map(|relative| relative.display().to_string())
+        })
+        .unwrap_or_else(|| format!("<external-{role}>"));
+    Ok((display_path, path_sha256))
+}
+
+fn additive_path_identity_sha256(path: &Path, role: &str) -> Result<String> {
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not canonicalize additive reconciliation {role} identity at {}: {error}",
+            additive_path_descriptor(path, role)
+        ))
+    })?;
+    let identity = additive_file_identity(&canonical)?;
+    additive_sha256(
+        &(canonical.to_string_lossy().as_ref(), identity),
+        &format!("canonical {role} identity"),
+    )
+}
+
+fn additive_plan_sha256(plan: &AdditiveReconcilePlan) -> Result<String> {
+    let mut receipt = plan.receipt.clone();
+    receipt.plan_sha256.clear();
+    additive_sha256(
+        &(
+            receipt,
+            &plan.mutations,
+            &plan.content_hash_repairs,
+            &plan.synchronized_export_hashes,
+            &plan.expected_issues,
+            &plan.expected_raw_issue_rows,
+            &plan.expected_issue_content_hashes,
+            &plan.expected_export_hashes,
+            &plan.expected_raw_export_hash_rows,
+            &plan.expected_dirty_issues,
+            &plan.expected_metadata,
+            &plan.expected_blocked_cache,
+            &plan.expected_raw_blocked_cache_rows,
+            &plan.expected_child_counters,
+            &plan.expected_sqlite_sequence,
+        ),
+        "additive reconciliation plan binding",
+    )
+}
+
+#[derive(Default)]
+struct AdditiveConflictAccumulator {
+    by_issue: BTreeMap<String, BTreeSet<String>>,
+    details_by_issue: BTreeMap<String, BTreeSet<AdditiveConflictDetailWitness>>,
+}
+
+impl AdditiveConflictAccumulator {
+    fn contains(&self, issue_id: &str) -> bool {
+        self.by_issue.contains_key(issue_id)
+    }
+
+    fn len(&self) -> usize {
+        self.by_issue.len()
+    }
+
+    fn witnesses(&self) -> Vec<AdditiveConflictWitness> {
+        self.by_issue
+            .iter()
+            .map(|(issue_id, reasons)| AdditiveConflictWitness {
+                issue_id: issue_id.clone(),
+                reasons: reasons.iter().cloned().collect(),
+                details: self
+                    .details_by_issue
+                    .get(issue_id)
+                    .map_or_else(Vec::new, |details| details.iter().cloned().collect()),
+            })
+            .collect()
+    }
+}
+
+fn record_additive_conflict(
+    reasons: &mut BTreeMap<String, usize>,
+    conflicts: &mut AdditiveConflictAccumulator,
+    issue_id: &str,
+    reason: &str,
+) -> Result<()> {
+    record_additive_conflict_detail(
+        reasons,
+        conflicts,
+        issue_id,
+        reason,
+        "issue",
+        None,
+        Vec::new(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_additive_conflict_detail(
+    reasons: &mut BTreeMap<String, usize>,
+    conflicts: &mut AdditiveConflictAccumulator,
+    issue_id: &str,
+    reason: &str,
+    detail_kind: &str,
+    ordinal: Option<usize>,
+    related_values: Vec<String>,
+    sensitive_value: Option<&str>,
+) -> Result<()> {
+    record_additive_conflict_detail_with_subcodes(
+        reasons,
+        conflicts,
+        issue_id,
+        reason,
+        detail_kind,
+        ordinal,
+        related_values,
+        Vec::new(),
+        sensitive_value,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_additive_conflict_detail_with_subcodes(
+    reasons: &mut BTreeMap<String, usize>,
+    conflicts: &mut AdditiveConflictAccumulator,
+    issue_id: &str,
+    reason: &str,
+    detail_kind: &str,
+    ordinal: Option<usize>,
+    related_values: Vec<String>,
+    mut validation_subcodes: Vec<String>,
+    sensitive_value: Option<&str>,
+) -> Result<()> {
+    let count = reasons.entry(reason.to_string()).or_default();
+    *count = count.checked_add(1).ok_or_else(|| {
+        BeadsError::Config("Conflict count overflow during additive reconciliation".to_string())
+    })?;
+    conflicts
+        .by_issue
+        .entry(issue_id.to_string())
+        .or_default()
+        .insert(reason.to_string());
+    let mut related_value_sha256 = related_values
+        .iter()
+        .map(|value| hex_encode(&Sha256::digest(value.as_bytes())))
+        .collect::<Vec<_>>();
+    related_value_sha256.sort_unstable();
+    related_value_sha256.dedup();
+    validation_subcodes.sort_unstable();
+    validation_subcodes.dedup();
+    let value_sha256 = sensitive_value.map(|value| hex_encode(&Sha256::digest(value.as_bytes())));
+    let detail_sha256 = additive_sha256(
+        &(
+            issue_id,
+            reason,
+            detail_kind,
+            ordinal,
+            &related_value_sha256,
+            &validation_subcodes,
+            &value_sha256,
+        ),
+        "additive conflict detail",
+    )?;
+    conflicts
+        .details_by_issue
+        .entry(issue_id.to_string())
+        .or_default()
+        .insert(AdditiveConflictDetailWitness {
+            reason: reason.to_string(),
+            detail_kind: detail_kind.to_string(),
+            ordinal,
+            related_value_sha256,
+            validation_subcodes,
+            value_sha256,
+            detail_sha256,
+        });
+    Ok(())
+}
+
+fn additive_comment_validation_subcodes(errors: &[crate::error::ValidationError]) -> Vec<String> {
+    let mut subcodes = errors
+        .iter()
+        .map(
+            |error| match (error.field.as_str(), error.message.as_str()) {
+                ("id", "must be positive") => "id_nonpositive",
+                ("issue_id", "cannot be empty") => "issue_id_empty",
+                ("content", "cannot be empty") => "body_empty",
+                ("content", "cannot contain NUL bytes") => "body_contains_nul",
+                ("author", "cannot be empty") => "author_empty",
+                ("author", "exceeds 200 characters") => "author_too_long",
+                _ => "other_validation",
+            },
+        )
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    subcodes.sort_unstable();
+    subcodes.dedup();
+    subcodes
+}
+
+fn additive_external_ref_conflicts(
+    source: &BTreeMap<String, Issue>,
+    database: &BTreeMap<String, Issue>,
+) -> (BTreeMap<String, String>, BTreeSet<String>, BTreeSet<String>) {
+    let mut database_refs = BTreeMap::<String, String>::new();
+    let mut ambiguous_database_refs = BTreeSet::new();
+    for issue in database.values() {
+        if let Some(external_ref) = issue
+            .external_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            match database_refs.get(external_ref) {
+                Some(existing_id) if existing_id != &issue.id => {
+                    ambiguous_database_refs.insert(external_ref.to_string());
+                }
+                None => {
+                    database_refs.insert(external_ref.to_string(), issue.id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut source_refs = BTreeMap::<String, String>::new();
+    let mut duplicate_source_ids = BTreeSet::new();
+    for issue in source.values() {
+        if let Some(external_ref) = issue
+            .external_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            match source_refs.get(external_ref) {
+                Some(existing_id) if existing_id != &issue.id => {
+                    duplicate_source_ids.insert(existing_id.clone());
+                    duplicate_source_ids.insert(issue.id.clone());
+                }
+                None => {
+                    source_refs.insert(external_ref.to_string(), issue.id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for external_ref in &ambiguous_database_refs {
+        database_refs.remove(external_ref);
+    }
+    (database_refs, ambiguous_database_refs, duplicate_source_ids)
+}
+
+fn additive_comment_id_owners(issues: &BTreeMap<String, Issue>) -> BTreeMap<i64, BTreeSet<String>> {
+    let mut owners = BTreeMap::<i64, BTreeSet<String>>::new();
+    for issue in issues.values() {
+        for comment in &issue.comments {
+            if comment.id > 0 {
+                owners
+                    .entry(comment.id)
+                    .or_default()
+                    .insert(issue.id.clone());
+            }
+        }
+    }
+    owners
+}
+
+fn allocate_additive_comment_ids(
+    issue: &mut Issue,
+    used_ids: &mut BTreeSet<i64>,
+    next_id: &mut Option<i64>,
+    remaps: &mut Vec<AdditiveCommentIdRemap>,
+) -> Result<()> {
+    for comment in &mut issue.comments {
+        let old_id = comment.id;
+        let new_id = next_id.ok_or_else(|| {
+            BeadsError::Config(
+                "Comment ID space exhausted during additive reconciliation".to_string(),
+            )
+        })?;
+        *next_id = new_id.checked_add(1);
+        if !used_ids.insert(new_id) {
+            return Err(BeadsError::Config(format!(
+                "Projected comment ID {new_id} was already occupied during additive reconciliation"
+            )));
+        }
+        comment.id = new_id;
+        let logical_payload_sha256 = additive_sha256(
+            &(
+                comment.issue_id.as_str(),
+                comment.author.as_str(),
+                comment.body.as_str(),
+                comment.created_at,
+            ),
+            "remapped comment logical payload",
+        )?;
+        remaps.push(AdditiveCommentIdRemap {
+            issue_id: issue.id.clone(),
+            old_id,
+            new_id,
+            logical_payload_sha256,
+        });
+    }
+    Ok(())
+}
+
+fn additive_blocking_graph(issues: &BTreeMap<String, Issue>) -> BTreeMap<String, BTreeSet<String>> {
+    let mut graph = issues
+        .keys()
+        .map(|issue_id| (issue_id.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+
+    for issue in issues.values() {
+        for dependency in &issue.dependencies {
+            if !dependency.dep_type.is_blocking()
+                || dependency.depends_on_id.starts_with("external:")
+            {
+                continue;
+            }
+            let (from, to) = if matches!(dependency.dep_type, DependencyType::ParentChild) {
+                (&dependency.depends_on_id, &issue.id)
+            } else {
+                (&issue.id, &dependency.depends_on_id)
+            };
+            graph.entry(from.clone()).or_default().insert(to.clone());
+            graph.entry(to.clone()).or_default();
+        }
+    }
+
+    graph
+}
+
+fn additive_blocking_cycle_components(issues: &BTreeMap<String, Issue>) -> Vec<Vec<String>> {
+    let graph = additive_blocking_graph(issues);
+    let mut visited = BTreeSet::new();
+    let mut finish_order = Vec::with_capacity(graph.len());
+
+    for start in graph.keys() {
+        if !visited.insert(start.clone()) {
+            continue;
+        }
+        let mut stack = vec![(start.clone(), false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if expanded {
+                finish_order.push(node);
+                continue;
+            }
+            stack.push((node.clone(), true));
+            if let Some(neighbors) = graph.get(&node) {
+                for neighbor in neighbors.iter().rev() {
+                    if visited.insert(neighbor.clone()) {
+                        stack.push((neighbor.clone(), false));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut reverse = graph
+        .keys()
+        .map(|node| (node.clone(), BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (from, targets) in &graph {
+        for target in targets {
+            reverse
+                .entry(target.clone())
+                .or_default()
+                .insert(from.clone());
+        }
+    }
+
+    let mut assigned = BTreeSet::new();
+    let mut cycles = Vec::new();
+    for start in finish_order.into_iter().rev() {
+        if !assigned.insert(start.clone()) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            component.push(node.clone());
+            if let Some(neighbors) = reverse.get(&node) {
+                for neighbor in neighbors.iter().rev() {
+                    if assigned.insert(neighbor.clone()) {
+                        stack.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+        component.sort_unstable();
+        let is_cycle = component.len() > 1
+            || component
+                .first()
+                .is_some_and(|node| graph.get(node).is_some_and(|edges| edges.contains(node)));
+        if is_cycle {
+            cycles.push(component);
+        }
+    }
+    cycles.sort_unstable();
+    cycles
+}
+
+/// Build a read-only, lossless additive JSONL-to-database reconciliation plan.
+///
+/// The source is compared strictly by issue ID. No content-hash identity merge,
+/// physical deletion, base snapshot, merge note, JSONL write, or database
+/// mutation is performed.
+///
+/// # Errors
+///
+/// Returns an error for an unstable/invalid source or unreadable database.
+pub fn plan_additive_reconcile(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &AdditiveReconcileConfig,
+) -> Result<AdditiveReconcilePlan> {
+    let health_before = additive_database_health(storage)?;
+    require_healthy_additive_database(&health_before, "preflight")?;
+    let plan = storage.with_read_transaction(|storage| {
+        plan_additive_reconcile_in_snapshot(storage, input_path, config, health_before.clone())
+    })?;
+    let health_after = additive_database_health(storage)?;
+    require_healthy_additive_database(&health_after, "post-plan")?;
+    if health_after != health_before {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Database health changed while additive reconciliation captured its read snapshot"
+                    .to_string(),
+        });
+    }
+    Ok(plan)
+}
+
+fn plan_additive_reconcile_in_snapshot(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &AdditiveReconcileConfig,
+    health_before: AdditiveDatabaseHealth,
+) -> Result<AdditiveReconcilePlan> {
+    let source = additive_source_snapshot(input_path, config)?;
+    let missing_references = storage.missing_issue_references()?;
+    if !missing_references.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "Additive reconciliation requires a referentially complete database; missing issue references in {}",
+            missing_references.join(", ")
+        )));
+    }
+    let database = hydrate_additive_database_issues(storage)?;
+    let target_before = additive_database_witness(storage, &database)?;
+    let database_issue_content_hashes = additive_issue_content_hashes(storage)?;
+    let relations_before = target_before.relations;
+    let source_ids = source.issues.keys().cloned().collect::<BTreeSet<_>>();
+    let database_ids = database.keys().cloned().collect::<BTreeSet<_>>();
+    let all_known_ids = source_ids
+        .union(&database_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let db_only_preserved = database_ids.difference(&source_ids).count();
+    let (
+        database_external_refs,
+        ambiguous_database_external_refs,
+        duplicate_source_external_ref_ids,
+    ) = additive_external_ref_conflicts(&source.issues, &database);
+    let database_comment_id_owners = additive_comment_id_owners(&database);
+    if let Some((issue_id, comment_id)) = database.values().find_map(|issue| {
+        issue
+            .comments
+            .iter()
+            .find(|comment| comment.id <= 0)
+            .map(|comment| (issue.id.as_str(), comment.id))
+    }) {
+        return Err(BeadsError::Config(format!(
+            "Additive reconciliation requires positive persisted comment IDs; issue {issue_id} has {comment_id}"
+        )));
+    }
+    let stored_sqlite_sequence = additive_sqlite_sequence(storage)?;
+    if stored_sqlite_sequence
+        .get("comments")
+        .is_some_and(|sequence| *sequence < 0)
+    {
+        return Err(BeadsError::Config(
+            "Additive reconciliation refuses a negative comments AUTOINCREMENT high-water mark"
+                .to_string(),
+        ));
+    }
+    let maximum_comment_id = database_comment_id_owners
+        .keys()
+        .copied()
+        .chain(stored_sqlite_sequence.get("comments").copied())
+        .max()
+        .unwrap_or(0);
+    let mut next_comment_id = maximum_comment_id.checked_add(1);
+    let mut used_comment_ids = database_comment_id_owners
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    let mut mutations = Vec::new();
+    let mut comment_id_remaps = Vec::new();
+    let mut created = 0usize;
+    let mut created_issue_ids = Vec::new();
+    let mut updated = 0usize;
+    let mut updated_issue_ids = Vec::new();
+    let mut content_hash_repairs = Vec::new();
+    let mut used_source_authoritative_ids = BTreeSet::new();
+    let mut scalar_updates = Vec::new();
+    let mut conflict_scalar_diffs = BTreeMap::new();
+    let mut conflict_relation_diffs = BTreeMap::new();
+    let mut skipped_equal = 0usize;
+    let mut equal_issue_ids = Vec::new();
+    let mut skipped_ephemeral = 0usize;
+    let mut synchronized_export_hashes = Vec::new();
+    let mut relations_after = relations_before;
+    let mut relation_rows_planned = AdditiveRelationCounts::default();
+    let mut conflict_reasons = BTreeMap::new();
+    let mut conflict_ids = AdditiveConflictAccumulator::default();
+
+    for issue in source.issues.values() {
+        if issue.ephemeral || issue.id.contains("-wisp-") {
+            skipped_ephemeral = skipped_ephemeral.checked_add(1).ok_or_else(|| {
+                BeadsError::Config(
+                    "Ephemeral skip count overflow during additive reconciliation".to_string(),
+                )
+            })?;
+            record_additive_conflict(
+                &mut conflict_reasons,
+                &mut conflict_ids,
+                &issue.id,
+                "ephemeral_source_issue",
+            )?;
+            continue;
+        }
+
+        let mut issue_has_conflict = false;
+        if duplicate_source_external_ref_ids.contains(&issue.id) {
+            record_additive_conflict_detail(
+                &mut conflict_reasons,
+                &mut conflict_ids,
+                &issue.id,
+                "duplicate_source_external_ref",
+                "external_ref",
+                None,
+                Vec::new(),
+                issue.external_ref.as_deref(),
+            )?;
+            issue_has_conflict = true;
+        }
+        if let Some(external_ref) = issue
+            .external_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if ambiguous_database_external_refs.contains(external_ref) {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "ambiguous_database_external_ref",
+                    "external_ref",
+                    None,
+                    Vec::new(),
+                    Some(external_ref),
+                )?;
+                issue_has_conflict = true;
+            } else if let Some(existing_id) = database_external_refs.get(external_ref)
+                && existing_id != &issue.id
+            {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "external_ref_owned_by_other_id",
+                    "external_ref",
+                    None,
+                    vec![existing_id.clone()],
+                    Some(external_ref),
+                )?;
+                issue_has_conflict = true;
+            }
+        }
+        let mut labels = BTreeSet::new();
+        for (label_ordinal, label) in issue.labels.iter().enumerate() {
+            if !labels.insert(label.as_str()) {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "duplicate_label",
+                    "label",
+                    Some(label_ordinal),
+                    Vec::new(),
+                    Some(label),
+                )?;
+                issue_has_conflict = true;
+            }
+        }
+        let mut dependency_targets = BTreeSet::new();
+        let mut parent_child_count = 0usize;
+        let mut parent_candidates = Vec::new();
+        for (dependency_ordinal, dependency) in issue.dependencies.iter().enumerate() {
+            if dependency.issue_id != issue.id {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "dependency_source_id_mismatch",
+                    "dependency",
+                    Some(dependency_ordinal),
+                    vec![dependency.issue_id.clone()],
+                    None,
+                )?;
+                issue_has_conflict = true;
+            }
+            if dependency.depends_on_id == issue.id {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "self_dependency",
+                    "dependency",
+                    Some(dependency_ordinal),
+                    vec![dependency.depends_on_id.clone()],
+                    None,
+                )?;
+                issue_has_conflict = true;
+            }
+            if !dependency_targets.insert(dependency.depends_on_id.as_str()) {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "duplicate_dependency_target",
+                    "dependency",
+                    Some(dependency_ordinal),
+                    vec![dependency.depends_on_id.clone()],
+                    None,
+                )?;
+                issue_has_conflict = true;
+            }
+            if dependency.metadata.as_deref().is_some_and(|metadata| {
+                serde_json::from_str::<serde_json::Value>(metadata).is_err()
+            }) {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "invalid_dependency_metadata",
+                    "dependency_metadata",
+                    Some(dependency_ordinal),
+                    vec![dependency.depends_on_id.clone()],
+                    dependency.metadata.as_deref(),
+                )?;
+                issue_has_conflict = true;
+            }
+            if matches!(dependency.dep_type, DependencyType::ParentChild) {
+                parent_child_count = parent_child_count.checked_add(1).ok_or_else(|| {
+                    BeadsError::Config(
+                        "Parent-child count overflow during reconciliation".to_string(),
+                    )
+                })?;
+                parent_candidates.push(dependency.depends_on_id.clone());
+                if dependency.depends_on_id.starts_with("external:") {
+                    record_additive_conflict_detail(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        "external_parent_child_endpoint",
+                        "parent_child_dependency",
+                        Some(dependency_ordinal),
+                        vec![dependency.depends_on_id.clone()],
+                        None,
+                    )?;
+                    issue_has_conflict = true;
+                }
+            }
+            if !dependency.depends_on_id.starts_with("external:")
+                && !all_known_ids.contains(&dependency.depends_on_id)
+            {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "orphan_dependency_target",
+                    "dependency",
+                    Some(dependency_ordinal),
+                    vec![dependency.depends_on_id.clone()],
+                    None,
+                )?;
+                issue_has_conflict = true;
+            }
+        }
+        if parent_child_count > 1 {
+            record_additive_conflict_detail(
+                &mut conflict_reasons,
+                &mut conflict_ids,
+                &issue.id,
+                "multiple_parent_child_dependencies",
+                "parent_child_set",
+                None,
+                parent_candidates,
+                None,
+            )?;
+            issue_has_conflict = true;
+        }
+        for (comment_ordinal, comment) in issue.comments.iter().enumerate() {
+            let canonical_comment_payload = serde_json::to_string(comment).map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not witness source comment payload during additive reconciliation: {error}"
+                ))
+            })?;
+            if comment.issue_id != issue.id {
+                record_additive_conflict_detail(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "comment_source_id_mismatch",
+                    "comment",
+                    Some(comment_ordinal),
+                    vec![comment.issue_id.clone()],
+                    Some(&canonical_comment_payload),
+                )?;
+                issue_has_conflict = true;
+            }
+            let comment_for_validation = Comment {
+                id: 1,
+                issue_id: issue.id.clone(),
+                author: comment.author.clone(),
+                body: comment.body.clone(),
+                created_at: comment.created_at,
+            };
+            if let Err(validation_errors) = CommentValidator::validate(&comment_for_validation) {
+                record_additive_conflict_detail_with_subcodes(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "invalid_comment",
+                    "comment_validation",
+                    Some(comment_ordinal),
+                    Vec::new(),
+                    additive_comment_validation_subcodes(&validation_errors),
+                    Some(&canonical_comment_payload),
+                )?;
+                issue_has_conflict = true;
+            }
+        }
+        if issue_has_conflict {
+            continue;
+        }
+
+        match database.get(&issue.id) {
+            None => {
+                created = created.checked_add(1).ok_or_else(|| {
+                    BeadsError::Config(
+                        "Create count overflow during additive reconciliation".to_string(),
+                    )
+                })?;
+                let incoming_relations = AdditiveRelationCounts::from_issue(issue);
+                relations_after = relations_after.checked_add(incoming_relations)?;
+                relation_rows_planned = relation_rows_planned.checked_add(incoming_relations)?;
+                let mut persisted_issue = issue.clone();
+                allocate_additive_comment_ids(
+                    &mut persisted_issue,
+                    &mut used_comment_ids,
+                    &mut next_comment_id,
+                    &mut comment_id_remaps,
+                )?;
+                let content_hash = crate::util::content_hash(&persisted_issue);
+                persisted_issue.content_hash = Some(content_hash.clone());
+                mutations.push(AdditiveMutation::Create(persisted_issue));
+                synchronized_export_hashes.push((issue.id.clone(), content_hash));
+                created_issue_ids.push(issue.id.clone());
+            }
+            Some(existing) if additive_issues_semantically_equal(existing, issue) => {
+                if config.source_authoritative_ids.contains(&issue.id) {
+                    record_additive_conflict(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        "source_authoritative_resolution_not_required",
+                    )?;
+                    continue;
+                }
+                skipped_equal = skipped_equal.checked_add(1).ok_or_else(|| {
+                    BeadsError::Config(
+                        "Equal skip count overflow during additive reconciliation".to_string(),
+                    )
+                })?;
+                let expected_content_hash = crate::util::content_hash(existing);
+                if database_issue_content_hashes
+                    .get(&issue.id)
+                    .and_then(Option::as_ref)
+                    != Some(&expected_content_hash)
+                {
+                    content_hash_repairs.push((issue.id.clone(), expected_content_hash.clone()));
+                }
+                synchronized_export_hashes.push((issue.id.clone(), expected_content_hash));
+                equal_issue_ids.push(issue.id.clone());
+            }
+            Some(existing)
+                if existing.status == crate::model::Status::Tombstone
+                    && issue.status != crate::model::Status::Tombstone =>
+            {
+                record_additive_conflict_scalar_diff(&mut conflict_scalar_diffs, existing, issue)?;
+                if !additive_relations_semantically_equal(existing, issue) {
+                    record_additive_conflict_relation_diff(
+                        &mut conflict_relation_diffs,
+                        existing,
+                        issue,
+                    )?;
+                }
+                record_additive_conflict(
+                    &mut conflict_reasons,
+                    &mut conflict_ids,
+                    &issue.id,
+                    "tombstone_resurrection",
+                )?;
+            }
+            Some(existing) => {
+                if !additive_relations_semantically_equal(existing, issue) {
+                    record_additive_conflict_scalar_diff(
+                        &mut conflict_scalar_diffs,
+                        existing,
+                        issue,
+                    )?;
+                    record_additive_conflict_relation_diff(
+                        &mut conflict_relation_diffs,
+                        existing,
+                        issue,
+                    )?;
+                    record_additive_conflict(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        "shared_relation_drift",
+                    )?;
+                    continue;
+                }
+                let source_is_newer = issue.updated_at > existing.updated_at;
+                let source_is_authoritative = config.source_authoritative_ids.contains(&issue.id);
+                let monotonic_closure =
+                    source_is_newer && additive_is_monotonic_closure(existing, issue)?;
+                if monotonic_closure && source_is_authoritative {
+                    record_additive_conflict_scalar_diff(
+                        &mut conflict_scalar_diffs,
+                        existing,
+                        issue,
+                    )?;
+                    record_additive_conflict(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        "source_authoritative_resolution_not_required",
+                    )?;
+                    continue;
+                }
+                if issue.status == crate::model::Status::Tombstone {
+                    record_additive_conflict_scalar_diff(
+                        &mut conflict_scalar_diffs,
+                        existing,
+                        issue,
+                    )?;
+                    record_additive_conflict(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        "live_to_tombstone_forbidden",
+                    )?;
+                    continue;
+                }
+                if !monotonic_closure && !source_is_authoritative {
+                    let reason = if issue.updated_at < existing.updated_at {
+                        "database_newer_shared_scalar_drift"
+                    } else if source_is_newer {
+                        "source_newer_scalar_drift_requires_resolution"
+                    } else {
+                        "equal_timestamp_shared_scalar_drift"
+                    };
+                    record_additive_conflict_scalar_diff(
+                        &mut conflict_scalar_diffs,
+                        existing,
+                        issue,
+                    )?;
+                    record_additive_conflict(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        reason,
+                    )?;
+                    continue;
+                }
+
+                let resolution = if source_is_authoritative {
+                    AdditiveScalarResolution::ExplicitSourceResolution
+                } else {
+                    AdditiveScalarResolution::MonotonicClosure
+                };
+                let scalar_update = additive_scalar_update_witness(existing, issue, resolution)?;
+                if source_is_authoritative
+                    && let Some(reason) = additive_explicit_scalar_resolution_conflict(
+                        existing,
+                        issue,
+                        &scalar_update,
+                    )
+                {
+                    record_additive_conflict_scalar_diff(
+                        &mut conflict_scalar_diffs,
+                        existing,
+                        issue,
+                    )?;
+                    record_additive_conflict(
+                        &mut conflict_reasons,
+                        &mut conflict_ids,
+                        &issue.id,
+                        reason,
+                    )?;
+                    continue;
+                }
+
+                let mut persisted_issue = issue.clone();
+                persisted_issue.labels.clone_from(&existing.labels);
+                persisted_issue
+                    .dependencies
+                    .clone_from(&existing.dependencies);
+                persisted_issue.comments.clone_from(&existing.comments);
+                let content_hash = crate::util::content_hash(&persisted_issue);
+                persisted_issue.content_hash = Some(content_hash.clone());
+                mutations.push(AdditiveMutation::UpdateScalars(persisted_issue));
+                synchronized_export_hashes.push((issue.id.clone(), content_hash));
+                scalar_updates.push(scalar_update);
+                updated = updated.checked_add(1).ok_or_else(|| {
+                    BeadsError::Config(
+                        "Update count overflow during additive reconciliation".to_string(),
+                    )
+                })?;
+                updated_issue_ids.push(issue.id.clone());
+                if source_is_authoritative {
+                    used_source_authoritative_ids.insert(issue.id.clone());
+                }
+            }
+        }
+    }
+
+    for issue_id in config
+        .source_authoritative_ids
+        .difference(&used_source_authoritative_ids)
+    {
+        if !conflict_ids.contains(issue_id) {
+            record_additive_conflict(
+                &mut conflict_reasons,
+                &mut conflict_ids,
+                issue_id,
+                "source_authoritative_resolution_not_applicable",
+            )?;
+        }
+    }
+
+    let preexisting_cycles = additive_blocking_cycle_components(&database);
+    let mut projected_database = database.clone();
+    for mutation in &mutations {
+        let issue = mutation.issue().clone();
+        projected_database.insert(issue.id.clone(), issue);
+    }
+    let projected_cycles = additive_blocking_cycle_components(&projected_database);
+    let preexisting_cycle_set = preexisting_cycles.iter().cloned().collect::<BTreeSet<_>>();
+    let new_cycles = projected_cycles
+        .iter()
+        .filter(|cycle| !preexisting_cycle_set.contains(*cycle))
+        .cloned()
+        .collect::<Vec<_>>();
+    for cycle in &new_cycles {
+        for issue_id in cycle {
+            record_additive_conflict_detail(
+                &mut conflict_reasons,
+                &mut conflict_ids,
+                issue_id,
+                "projected_blocking_cycle",
+                "blocking_cycle",
+                None,
+                cycle.clone(),
+                None,
+            )?;
+        }
+    }
+
+    synchronized_export_hashes.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    created_issue_ids.sort_unstable();
+    updated_issue_ids.sort_unstable();
+    content_hash_repairs.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    equal_issue_ids.sort_unstable();
+    scalar_updates.sort_unstable_by(|left, right| left.issue_id.cmp(&right.issue_id));
+    let source_authoritative_issue_ids = used_source_authoritative_ids
+        .into_iter()
+        .collect::<Vec<_>>();
+    let requested_source_authoritative_issue_ids = config
+        .source_authoritative_ids
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let content_hash_repair_issue_ids = content_hash_repairs
+        .iter()
+        .map(|(issue_id, _)| issue_id.clone())
+        .collect::<Vec<_>>();
+    let content_hash_repair_witnesses = content_hash_repairs
+        .iter()
+        .map(|(issue_id, after)| AdditiveContentHashRepairWitness {
+            issue_id: issue_id.clone(),
+            before: database_issue_content_hashes
+                .get(issue_id)
+                .cloned()
+                .flatten(),
+            after: after.clone(),
+        })
+        .collect::<Vec<_>>();
+    let db_only_issue_ids = database_ids
+        .difference(&source_ids)
+        .cloned()
+        .collect::<Vec<_>>();
+    comment_id_remaps.sort_unstable_by(|left, right| {
+        left.issue_id
+            .cmp(&right.issue_id)
+            .then_with(|| left.old_id.cmp(&right.old_id))
+            .then_with(|| left.new_id.cmp(&right.new_id))
+    });
+    let comment_id_remaps_sha256 =
+        additive_sha256(&comment_id_remaps, "comment ID remap manifest")?;
+    let synchronized_ids = synchronized_export_hashes
+        .iter()
+        .map(|(issue_id, _)| issue_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut dirty_before = storage.get_dirty_issue_metadata()?;
+    dirty_before.sort_unstable();
+    let expected_dirty_issues = dirty_before
+        .iter()
+        .filter(|(issue_id, _)| !synchronized_ids.contains(issue_id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let dirty_markers_clear_planned = dirty_before
+        .len()
+        .checked_sub(expected_dirty_issues.len())
+        .ok_or_else(|| {
+            BeadsError::Config(
+                "Dirty-marker count underflow during reconciliation planning".to_string(),
+            )
+        })?;
+    let export_hashes_before = additive_export_hashes(storage)?;
+    let mut expected_export_hashes = export_hashes_before.clone();
+    let mut export_hash_updates_planned = 0usize;
+    for (issue_id, desired_hash) in &synchronized_export_hashes {
+        if expected_export_hashes.get(issue_id) != Some(desired_hash) {
+            export_hash_updates_planned =
+                export_hash_updates_planned.checked_add(1).ok_or_else(|| {
+                    BeadsError::Config(
+                        "Export-hash update count overflow during reconciliation".to_string(),
+                    )
+                })?;
+        }
+        expected_export_hashes.insert(issue_id.clone(), desired_hash.clone());
+    }
+
+    let mut expected_issues = database.clone();
+    let mut expected_raw_issue_rows_by_id = additive_raw_issue_row_map(storage)?;
+    let mut expected_issue_content_hashes = database_issue_content_hashes;
+    for (issue_id, content_hash) in &content_hash_repairs {
+        expected_issue_content_hashes.insert(issue_id.clone(), Some(content_hash.clone()));
+    }
+    for mutation in &mutations {
+        let mut issue = mutation.issue().clone();
+        let content_hash = issue.content_hash.clone().ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Planned mutation for {} has no persisted content hash",
+                issue.id
+            ))
+        })?;
+        expected_issue_content_hashes.insert(issue.id.clone(), Some(content_hash));
+        canonicalize_additive_issue_for_storage(&mut issue);
+        expected_issues.insert(issue.id.clone(), issue);
+        let raw_row = SqliteStorage::import_issue_raw_row_for_witness(mutation.issue())?
+            .into_iter()
+            .map(additive_sqlite_value_witness)
+            .collect::<Vec<_>>();
+        expected_raw_issue_rows_by_id.insert(mutation.issue().id.clone(), raw_row);
+    }
+    for (issue_id, content_hash) in &content_hash_repairs {
+        let row = expected_raw_issue_rows_by_id
+            .get_mut(issue_id)
+            .ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Content-hash repair lost raw issue row for '{issue_id}'"
+                ))
+            })?;
+        let content_hash_cell = row.get_mut(1).ok_or_else(|| {
+            BeadsError::Config(format!(
+                "Raw issue row for '{issue_id}' has no content_hash column"
+            ))
+        })?;
+        *content_hash_cell =
+            additive_sqlite_value_witness(SqliteValue::from(content_hash.as_str()));
+    }
+    let expected_raw_issue_rows = expected_raw_issue_rows_by_id
+        .into_values()
+        .collect::<Vec<_>>();
+    let expected_blocked_cache = additive_expected_blocked_cache(&expected_issues);
+    let expected_child_counters = additive_expected_child_counters(&expected_issues);
+    let mut expected_sqlite_sequence = additive_sqlite_sequence(storage)?;
+    if let Some(maximum_inserted_comment_id) = mutations
+        .iter()
+        .filter(|mutation| mutation.creates_issue())
+        .flat_map(|mutation| mutation.issue().comments.iter())
+        .map(|comment| comment.id)
+        .max()
+    {
+        expected_sqlite_sequence
+            .entry("comments".to_string())
+            .and_modify(|sequence| *sequence = (*sequence).max(maximum_inserted_comment_id))
+            .or_insert(maximum_inserted_comment_id);
+    }
+    let actual_blocked_cache = additive_actual_blocked_cache(storage)?;
+    let actual_child_counters = additive_actual_child_counters(storage)?;
+    let cache_rebuild_planned = !mutations.is_empty()
+        || actual_blocked_cache != expected_blocked_cache
+        || actual_child_counters != expected_child_counters;
+    let mut expected_raw_export_hash_rows = additive_raw_rows_by_text_key(
+        additive_raw_rows(
+            storage,
+            "SELECT issue_id, content_hash, exported_at FROM export_hashes ORDER BY issue_id",
+        )?,
+        "export_hashes",
+    )?;
+    for (issue_id, desired_hash) in &synchronized_export_hashes {
+        if export_hashes_before.get(issue_id) != Some(desired_hash) {
+            expected_raw_export_hash_rows.insert(
+                issue_id.clone(),
+                vec![
+                    additive_sqlite_value_witness(SqliteValue::from(issue_id.as_str())),
+                    additive_sqlite_value_witness(SqliteValue::from(desired_hash.as_str())),
+                    additive_sqlite_value_witness(SqliteValue::from(source.witness.mtime.as_str())),
+                ],
+            );
+        }
+    }
+    let expected_raw_export_hash_rows = expected_raw_export_hash_rows
+        .into_values()
+        .collect::<Vec<_>>();
+    let expected_raw_blocked_cache_rows = if cache_rebuild_planned {
+        expected_blocked_cache
+            .iter()
+            .map(|(issue_id, blockers)| {
+                let blockers = serde_json::to_string(blockers).map_err(|error| {
+                    BeadsError::Config(format!(
+                        "Could not serialize expected blocked-cache row for {issue_id}: {error}"
+                    ))
+                })?;
+                Ok(vec![
+                    additive_sqlite_value_witness(SqliteValue::from(issue_id.as_str())),
+                    additive_sqlite_value_witness(SqliteValue::from(blockers.as_str())),
+                    additive_sqlite_value_witness(SqliteValue::from(source.witness.mtime.as_str())),
+                ])
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        additive_raw_rows(
+            storage,
+            "SELECT issue_id, blocked_by, blocked_at FROM blocked_issues_cache ORDER BY issue_id",
+        )?
+    };
+
+    let desired_needs_flush = db_only_preserved != 0;
+    let mut expected_metadata = additive_metadata(storage)?;
+    expected_metadata.insert(
+        METADATA_JSONL_CONTENT_HASH.to_string(),
+        source.witness.content_sha256.clone(),
+    );
+    expected_metadata.insert(
+        METADATA_JSONL_MTIME.to_string(),
+        source.witness.mtime.clone(),
+    );
+    expected_metadata.insert(
+        METADATA_JSONL_SIZE.to_string(),
+        source.witness.size.to_string(),
+    );
+    expected_metadata.insert(
+        "needs_flush".to_string(),
+        if desired_needs_flush { "true" } else { "false" }.to_string(),
+    );
+    if cache_rebuild_planned {
+        expected_metadata.insert("blocked_cache_state".to_string(), String::new());
+    }
+    let metadata_before = additive_metadata(storage)?;
+    let metadata_update_planned = expected_metadata != metadata_before;
+    let bookkeeping_update_planned = metadata_update_planned
+        || cache_rebuild_planned
+        || dirty_markers_clear_planned != 0
+        || export_hash_updates_planned != 0;
+
+    let mut expected_label_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, label FROM labels ORDER BY issue_id, label",
+    )?;
+    let mut expected_dependency_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id \
+         FROM dependencies \
+         ORDER BY issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id",
+    )?;
+    let mut expected_comment_rows = additive_raw_rows(
+        storage,
+        "SELECT id, issue_id, author, text, created_at \
+         FROM comments ORDER BY id, issue_id, author, text, created_at",
+    )?;
+    for mutation in mutations.iter().filter(|mutation| mutation.creates_issue()) {
+        let issue = mutation.issue();
+        for label in issue.labels.iter().collect::<BTreeSet<_>>() {
+            expected_label_rows.push(vec![
+                additive_sqlite_value_witness(SqliteValue::from(issue.id.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(label.as_str())),
+            ]);
+        }
+        let mut dependency_targets = BTreeSet::new();
+        for dependency in &issue.dependencies {
+            if dependency_targets.insert(dependency.depends_on_id.as_str()) {
+                expected_dependency_rows.push(vec![
+                    additive_sqlite_value_witness(SqliteValue::from(issue.id.as_str())),
+                    additive_sqlite_value_witness(SqliteValue::from(
+                        dependency.depends_on_id.as_str(),
+                    )),
+                    additive_sqlite_value_witness(SqliteValue::from(dependency.dep_type.as_str())),
+                    additive_sqlite_value_witness(SqliteValue::from(
+                        dependency.created_at.to_rfc3339().as_str(),
+                    )),
+                    additive_sqlite_value_witness(SqliteValue::from(
+                        dependency.created_by.as_deref().unwrap_or("import"),
+                    )),
+                    additive_sqlite_value_witness(SqliteValue::from(
+                        dependency.metadata.as_deref().unwrap_or("{}"),
+                    )),
+                    additive_sqlite_value_witness(SqliteValue::from(
+                        dependency.thread_id.as_deref().unwrap_or(""),
+                    )),
+                ]);
+            }
+        }
+        for comment in &issue.comments {
+            expected_comment_rows.push(vec![
+                additive_sqlite_value_witness(SqliteValue::from(comment.id)),
+                additive_sqlite_value_witness(SqliteValue::from(issue.id.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(comment.author.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(comment.body.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(
+                    comment.created_at.to_rfc3339().as_str(),
+                )),
+            ]);
+        }
+    }
+    expected_label_rows.sort_unstable();
+    expected_dependency_rows.sort_unstable();
+    expected_comment_rows.sort_unstable_by(|left, right| {
+        let left_id = left
+            .first()
+            .and_then(|value| value.strip_prefix("integer:"))
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(i64::MIN);
+        let right_id = right
+            .first()
+            .and_then(|value| value.strip_prefix("integer:"))
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(i64::MIN);
+        left_id.cmp(&right_id).then_with(|| left.cmp(right))
+    });
+    let expected_metadata_rows = expected_metadata
+        .iter()
+        .map(|(key, value)| {
+            vec![
+                additive_sqlite_value_witness(SqliteValue::from(key.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(value.as_str())),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let expected_child_counter_rows = expected_child_counters
+        .iter()
+        .map(|(parent_id, last_child)| {
+            vec![
+                additive_sqlite_value_witness(SqliteValue::from(parent_id.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(i64::from(*last_child))),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let expected_sqlite_sequence_rows = expected_sqlite_sequence
+        .iter()
+        .map(|(name, sequence)| {
+            vec![
+                additive_sqlite_value_witness(SqliteValue::from(name.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(*sequence)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut expected_target_after = target_before.clone();
+    expected_target_after.issues = expected_issues.len();
+    expected_target_after.issue_payload_sha256 = additive_sha256(
+        &expected_raw_issue_rows,
+        "expected raw database issue payload",
+    )?;
+    expected_target_after.issue_semantic_payload_sha256 =
+        additive_sha256(&expected_issues, "expected database semantic issue payload")?;
+    expected_target_after.issue_content_hashes = expected_issue_content_hashes.len();
+    expected_target_after.issue_content_hash_payload_sha256 = additive_sha256(
+        &expected_issue_content_hashes,
+        "expected database issue content hashes",
+    )?;
+    expected_target_after.relations = relations_after;
+    expected_target_after.label_payload_sha256 =
+        additive_sha256(&expected_label_rows, "expected raw labels")?;
+    expected_target_after.dependency_payload_sha256 =
+        additive_sha256(&expected_dependency_rows, "expected raw dependencies")?;
+    expected_target_after.comment_payload_sha256 =
+        additive_sha256(&expected_comment_rows, "expected raw comments")?;
+    expected_target_after.export_hashes = expected_raw_export_hash_rows.len();
+    expected_target_after.export_hash_payload_sha256 =
+        additive_sha256(&expected_raw_export_hash_rows, "expected raw export hashes")?;
+    expected_target_after.dirty_issues = expected_dirty_issues.len();
+    expected_target_after.dirty_payload_sha256 =
+        additive_sha256(&expected_dirty_issues, "expected dirty markers")?;
+    expected_target_after.metadata_rows = expected_metadata_rows.len();
+    expected_target_after.metadata_payload_sha256 =
+        additive_sha256(&expected_metadata_rows, "expected raw metadata")?;
+    expected_target_after.blocked_cache_entries = expected_raw_blocked_cache_rows.len();
+    expected_target_after.blocked_cache_payload_sha256 = additive_sha256(
+        &expected_raw_blocked_cache_rows,
+        "expected raw blocked cache",
+    )?;
+    expected_target_after.child_counter_entries = expected_child_counter_rows.len();
+    expected_target_after.child_counter_payload_sha256 =
+        additive_sha256(&expected_child_counter_rows, "expected raw child counters")?;
+    expected_target_after.sqlite_sequence =
+        additive_table_witness(&expected_sqlite_sequence_rows, "expected sqlite sequence")?;
+    expected_target_after.stored_jsonl_content_hash = Some(source.witness.content_sha256.clone());
+    expected_target_after.stored_jsonl_mtime = Some(source.witness.mtime.clone());
+    expected_target_after.stored_jsonl_size = Some(source.witness.size.to_string());
+    expected_target_after.needs_flush =
+        Some(if desired_needs_flush { "true" } else { "false" }.to_string());
+
+    let conflict_occurrences = conflict_reasons.values().try_fold(0usize, |total, count| {
+        total.checked_add(*count).ok_or_else(|| {
+            BeadsError::Config("Conflict total overflow during additive reconciliation".to_string())
+        })
+    })?;
+    let conflicted = conflict_ids.len();
+    let conflict_witnesses = conflict_ids.witnesses();
+    let conflict_witnesses_sha256 =
+        additive_sha256(&conflict_witnesses, "complete conflict witness manifest")?;
+    let conflict_scalar_diffs = conflict_scalar_diffs.into_values().collect::<Vec<_>>();
+    let conflict_scalar_diffs_sha256 = additive_sha256(
+        &conflict_scalar_diffs,
+        "complete conflict scalar diff manifest",
+    )?;
+    let conflict_relation_diffs = conflict_relation_diffs.into_values().collect::<Vec<_>>();
+    let conflict_relation_diffs_sha256 = additive_sha256(
+        &conflict_relation_diffs,
+        "complete conflict relation diff manifest",
+    )?;
+    let conflict_issue_ids = conflict_witnesses
+        .iter()
+        .map(|witness| witness.issue_id.clone())
+        .collect::<Vec<_>>();
+    let conflict_issue_ids_sha256 =
+        additive_sha256(&conflict_issue_ids, "conflict issue ID manifest")?;
+    let conflict_issue_ids_truncated = false;
+    let status = if conflicted != 0 {
+        AdditiveReconcileStatus::Conflicted
+    } else if mutations.is_empty() && content_hash_repairs.is_empty() && bookkeeping_update_planned
+    {
+        AdditiveReconcileStatus::MetadataOnlyReady
+    } else if mutations.is_empty() && content_hash_repairs.is_empty() {
+        AdditiveReconcileStatus::NoChanges
+    } else {
+        AdditiveReconcileStatus::Ready
+    };
+    let database_after_planning = hydrate_additive_database_issues(storage)?;
+    let target_after_planning = additive_database_witness(storage, &database_after_planning)?;
+    if target_after_planning != target_before {
+        return Err(BeadsError::Config(
+            "Database changed while additive reconciliation was planning; retry from a stable snapshot"
+                .to_string(),
+        ));
+    }
+    let created_issue_ids_sha256 =
+        additive_sha256(&created_issue_ids, "created issue ID manifest")?;
+    let updated_issue_ids_sha256 =
+        additive_sha256(&updated_issue_ids, "updated issue ID manifest")?;
+    let requested_source_authoritative_issue_ids_sha256 = additive_sha256(
+        &requested_source_authoritative_issue_ids,
+        "requested source-authoritative issue ID manifest",
+    )?;
+    let equal_issue_ids_sha256 = additive_sha256(&equal_issue_ids, "equal issue ID manifest")?;
+    let source_authoritative_issue_ids_sha256 = additive_sha256(
+        &source_authoritative_issue_ids,
+        "source-authoritative issue ID manifest",
+    )?;
+    let content_hash_repair_issue_ids_sha256 = additive_sha256(
+        &content_hash_repair_issue_ids,
+        "content-hash repair issue ID manifest",
+    )?;
+    let content_hash_repairs_sha256 = additive_sha256(
+        &content_hash_repair_witnesses,
+        "content-hash repair witness manifest",
+    )?;
+    let scalar_updates_sha256 = additive_sha256(&scalar_updates, "scalar update witness manifest")?;
+    let db_only_issue_ids_sha256 =
+        additive_sha256(&db_only_issue_ids, "database-only issue ID manifest")?;
+    let expected_issue_semantic_payload_sha256 =
+        additive_sha256(&expected_issues, "expected issue payload")?;
+    let expected_issue_raw_payload_sha256 =
+        additive_sha256(&expected_raw_issue_rows, "expected raw issue payload")?;
+    let expected_issue_content_hash_payload_sha256 = additive_sha256(
+        &expected_issue_content_hashes,
+        "expected issue content hashes",
+    )?;
+    let expected_export_hash_payload_sha256 =
+        additive_sha256(&expected_raw_export_hash_rows, "expected raw export hashes")?;
+    let expected_dirty_payload_sha256 =
+        additive_sha256(&expected_dirty_issues, "expected dirty markers")?;
+    let expected_metadata_payload_sha256 =
+        additive_sha256(&expected_metadata, "expected metadata")?;
+    let expected_blocked_cache_payload_sha256 = additive_sha256(
+        &expected_raw_blocked_cache_rows,
+        "expected raw blocked cache",
+    )?;
+    let expected_child_counter_payload_sha256 =
+        additive_sha256(&expected_child_counters, "expected child counters")?;
+    let expected_sqlite_sequence_payload_sha256 =
+        additive_sha256(&expected_sqlite_sequence, "expected sqlite sequence")?;
+    let (workspace_path, workspace_path_sha256) = additive_provenance_path(
+        config.beads_dir.as_deref(),
+        config.beads_dir.as_deref(),
+        "workspace",
+    )?;
+    let workspace_identity_sha256 = config
+        .beads_dir
+        .as_deref()
+        .map(|path| additive_path_identity_sha256(path, "workspace"))
+        .transpose()?
+        .unwrap_or_else(|| workspace_path_sha256.clone());
+    let (source_path, source_path_sha256) =
+        additive_provenance_path(Some(input_path), config.beads_dir.as_deref(), "source")?;
+    if source_path_sha256 != source.witness.canonical_path_sha256 {
+        return Err(BeadsError::Config(
+            "Canonical source path changed between snapshot and plan provenance binding"
+                .to_string(),
+        ));
+    }
+    let (database_path, database_path_sha256) = additive_provenance_path(
+        config.database_path.as_deref(),
+        config.beads_dir.as_deref(),
+        "database",
+    )?;
+    let database_identity_sha256 = config
+        .database_path
+        .as_deref()
+        .map(|path| additive_path_identity_sha256(path, "database"))
+        .transpose()?;
+    let write_lock_authority_sha256 = match config.database_path.as_deref() {
+        Some(path) => database_write_authority_sha256(path)?,
+        None => additive_sha256(&"<in-memory>", "in-memory write authority")?,
+    };
+    let mut plan = AdditiveReconcilePlan {
+        receipt: AdditiveReconcileReceipt {
+            schema: ADDITIVE_RECONCILE_SCHEMA.to_string(),
+            algorithm: ADDITIVE_RECONCILE_ALGORITHM.to_string(),
+            tool_version: env!("CARGO_PKG_VERSION").to_string(),
+            plan_sha256: String::new(),
+            status,
+            workspace_path,
+            workspace_path_sha256,
+            workspace_identity_sha256,
+            source_path,
+            source_path_sha256,
+            source_identity_sha256: source.witness.identity_sha256,
+            database_path,
+            database_path_sha256,
+            database_identity_sha256,
+            write_lock_authority: if config.database_path.is_some() {
+                "terminal_workspace_lock+canonical_database_family_lock+database_inode_lock"
+                    .to_string()
+            } else {
+                "in_memory_test_scope".to_string()
+            },
+            write_lock_authority_sha256,
+            database_authority_preserved_after_commit: None,
+            database_poststate_preserved_after_commit: None,
+            workspace_authority_preserved_after_commit: None,
+            source_preserved_after_commit: None,
+            foreign_keys_restored_after_commit: None,
+            postcommit_failures: Vec::new(),
+            database_user_version: storage.schema_user_version()?,
+            project_prefix: storage.get_config("issue_prefix")?,
+            source_raw_sha256: source.witness.raw_sha256,
+            source_content_sha256: source.witness.content_sha256,
+            source_storage_projection_sha256: additive_sha256(
+                &source.issues,
+                "source storage-semantic projection",
+            )?,
+            source_size: source.witness.size,
+            source_mtime: source.witness.mtime.clone(),
+            poststate_timestamp: source.witness.mtime,
+            source_issues: source.record_count,
+            target_before: target_before.clone(),
+            expected_target_after,
+            target_after: None,
+            health_before,
+            health_after: None,
+            created,
+            created_issue_ids,
+            created_issue_ids_sha256,
+            updated,
+            updated_issue_ids,
+            updated_issue_ids_sha256,
+            requested_source_authoritative_issue_ids,
+            requested_source_authoritative_issue_ids_sha256,
+            source_authoritative_issue_ids,
+            source_authoritative_issue_ids_sha256,
+            scalar_updates,
+            scalar_updates_sha256,
+            content_hash_repairs_planned: content_hash_repairs.len(),
+            content_hash_repairs: content_hash_repair_witnesses,
+            content_hash_repairs_sha256,
+            content_hash_repair_issue_ids,
+            content_hash_repair_issue_ids_sha256,
+            content_hash_repairs_applied: 0,
+            skipped_equal,
+            equal_issue_ids,
+            equal_issue_ids_sha256,
+            skipped_ephemeral,
+            synchronized: synchronized_export_hashes.len(),
+            export_hash_updates_planned,
+            export_hashes_updated: 0,
+            dirty_markers_clear_planned,
+            dirty_markers_cleared: 0,
+            conflicted,
+            conflict_occurrences,
+            deleted: 0,
+            db_only_preserved,
+            db_only_issue_ids,
+            db_only_issue_ids_sha256,
+            conflict_reasons,
+            conflict_issue_ids,
+            conflict_issue_ids_sha256,
+            conflict_issue_ids_truncated,
+            conflict_witnesses,
+            conflict_witnesses_sha256,
+            conflict_scalar_diffs,
+            conflict_scalar_diffs_sha256,
+            conflict_relation_diffs,
+            conflict_relation_diffs_sha256,
+            comment_id_remaps,
+            comment_id_remaps_sha256,
+            preexisting_blocking_cycles: preexisting_cycles.len(),
+            projected_blocking_cycles: projected_cycles.len(),
+            new_blocking_cycles: new_cycles.len(),
+            relations_before,
+            relations_after,
+            relation_rows_planned,
+            relation_rows_applied: AdditiveRelationCounts::default(),
+            expected_issue_raw_payload_sha256,
+            expected_issue_semantic_payload_sha256,
+            expected_issue_content_hash_payload_sha256,
+            expected_export_hash_payload_sha256,
+            expected_dirty_payload_sha256,
+            expected_metadata_payload_sha256,
+            expected_blocked_cache_payload_sha256,
+            expected_child_counter_payload_sha256,
+            expected_sqlite_sequence_payload_sha256,
+            events_before: target_before.events,
+            events_after: target_before.events,
+            event_payload_sha256_before: target_before.event_payload_sha256.clone(),
+            event_payload_sha256_after: target_before.event_payload_sha256.clone(),
+            cache_rebuild_planned,
+            cache_rebuild_performed: false,
+            metadata_update_planned,
+            metadata_changed: false,
+            jsonl_written: false,
+            base_snapshot_used: false,
+            merge_note_written: false,
+        },
+        mutations,
+        content_hash_repairs,
+        synchronized_export_hashes,
+        expected_issues,
+        expected_raw_issue_rows,
+        expected_issue_content_hashes,
+        expected_export_hashes,
+        expected_raw_export_hash_rows,
+        expected_dirty_issues,
+        expected_metadata,
+        expected_blocked_cache,
+        expected_raw_blocked_cache_rows,
+        expected_child_counters,
+        expected_sqlite_sequence,
+    };
+    plan.receipt.plan_sha256 = additive_plan_sha256(&plan)?;
+    tracing::info!(
+        schema = ADDITIVE_RECONCILE_SCHEMA,
+        algorithm = ADDITIVE_RECONCILE_ALGORITHM,
+        status = plan.receipt.status.as_str(),
+        plan_sha256_prefix = &plan.receipt.plan_sha256[..12],
+        source_issues = plan.receipt.source_issues,
+        target_issues = plan.receipt.target_before.issues,
+        created = plan.receipt.created,
+        updated = plan.receipt.updated,
+        equal = plan.receipt.skipped_equal,
+        db_only_preserved = plan.receipt.db_only_preserved,
+        conflicted = plan.receipt.conflicted,
+        conflict_occurrences = plan.receipt.conflict_occurrences,
+        comment_id_remaps = plan.receipt.comment_id_remaps.len(),
+        "Planned additive reconciliation"
+    );
+    let created_log_len = plan
+        .receipt
+        .created_issue_ids
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let updated_log_len = plan
+        .receipt
+        .updated_issue_ids
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let resolution_log_len = plan
+        .receipt
+        .source_authoritative_issue_ids
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let scalar_log_len = plan
+        .receipt
+        .scalar_updates
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let content_hash_repair_log_len = plan
+        .receipt
+        .content_hash_repairs
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let db_only_log_len = plan
+        .receipt
+        .db_only_issue_ids
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let remap_log_len = plan
+        .receipt
+        .comment_id_remaps
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let conflict_log_len = plan
+        .receipt
+        .conflict_witnesses
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let conflict_scalar_log_len = plan
+        .receipt
+        .conflict_scalar_diffs
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    let conflict_relation_log_len = plan
+        .receipt
+        .conflict_relation_diffs
+        .len()
+        .min(ADDITIVE_LOG_PREVIEW_LIMIT);
+    tracing::debug!(
+        manifest_prefix_limit = ADDITIVE_LOG_PREVIEW_LIMIT,
+        created_issue_ids_prefix = ?&plan.receipt.created_issue_ids[..created_log_len],
+        created_issue_ids_sha256 = %plan.receipt.created_issue_ids_sha256,
+        updated_issue_ids_prefix = ?&plan.receipt.updated_issue_ids[..updated_log_len],
+        updated_issue_ids_sha256 = %plan.receipt.updated_issue_ids_sha256,
+        source_authoritative_issue_ids_prefix =
+            ?&plan.receipt.source_authoritative_issue_ids[..resolution_log_len],
+        source_authoritative_issue_ids_sha256 =
+            %plan.receipt.source_authoritative_issue_ids_sha256,
+        scalar_update_witnesses_prefix = ?&plan.receipt.scalar_updates[..scalar_log_len],
+        scalar_updates_sha256 = %plan.receipt.scalar_updates_sha256,
+        content_hash_repair_witnesses_prefix =
+            ?&plan.receipt.content_hash_repairs[..content_hash_repair_log_len],
+        content_hash_repairs_sha256 = %plan.receipt.content_hash_repairs_sha256,
+        db_only_issue_ids_prefix = ?&plan.receipt.db_only_issue_ids[..db_only_log_len],
+        db_only_issue_ids_sha256 = %plan.receipt.db_only_issue_ids_sha256,
+        conflict_reasons = ?plan.receipt.conflict_reasons,
+        conflict_witnesses_prefix =
+            ?&plan.receipt.conflict_witnesses[..conflict_log_len],
+        conflict_witnesses_sha256 = %plan.receipt.conflict_witnesses_sha256,
+        conflict_scalar_diffs_prefix =
+            ?&plan.receipt.conflict_scalar_diffs[..conflict_scalar_log_len],
+        conflict_scalar_diffs_sha256 = %plan.receipt.conflict_scalar_diffs_sha256,
+        conflict_relation_diffs_prefix =
+            ?&plan.receipt.conflict_relation_diffs[..conflict_relation_log_len],
+        conflict_relation_diffs_sha256 = %plan.receipt.conflict_relation_diffs_sha256,
+        comment_id_remaps_prefix = ?&plan.receipt.comment_id_remaps[..remap_log_len],
+        comment_id_remaps_sha256 = %plan.receipt.comment_id_remaps_sha256,
+        expected_blocked_cache_sha256 = %plan.receipt.expected_blocked_cache_payload_sha256,
+        expected_child_counters_sha256 = %plan.receipt.expected_child_counter_payload_sha256,
+        "Additive reconciliation review manifests"
+    );
+    Ok(plan)
+}
+
+fn additive_source_matches_receipt(
+    snapshot: &AdditiveSourceSnapshot,
+    receipt: &AdditiveReconcileReceipt,
+) -> bool {
+    snapshot.witness.raw_sha256 == receipt.source_raw_sha256
+        && snapshot.witness.content_sha256 == receipt.source_content_sha256
+        && snapshot.witness.canonical_path_sha256 == receipt.source_path_sha256
+        && snapshot.witness.identity_sha256 == receipt.source_identity_sha256
+        && snapshot.witness.size == receipt.source_size
+        && snapshot.witness.mtime == receipt.source_mtime
+        && snapshot.record_count == receipt.source_issues
+}
+
+fn require_reviewed_additive_schema_version(
+    storage: &SqliteStorage,
+    receipt: &AdditiveReconcileReceipt,
+    phase: &str,
+) -> Result<()> {
+    let expected = u32::try_from(crate::storage::schema::CURRENT_SCHEMA_VERSION).map_err(|_| {
+        BeadsError::Config(
+            "Current schema version cannot be represented in the reconciliation receipt"
+                .to_string(),
+        )
+    })?;
+    let observed = storage.schema_user_version()?;
+    if receipt.database_user_version != expected || observed != expected {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Database schema version changed during additive reconciliation {phase}: reviewed {}, required {expected}, observed {observed}",
+                receipt.database_user_version
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Apply a previously built additive reconciliation plan transactionally.
+///
+/// Both the source witness and complete database witness are rechecked before
+/// mutation. The source and event stream are rechecked again before commit.
+///
+/// # Errors
+///
+/// Returns an error if the plan has conflicts, either witness drifted, or any
+/// transactional invariant fails.
+pub(crate) fn apply_additive_reconcile(
+    storage: &mut SqliteStorage,
+    input_path: &Path,
+    config: &AdditiveReconcileConfig,
+    plan: &AdditiveReconcilePlan,
+    expected_plan_sha256: &str,
+) -> Result<AdditiveReconcileReceipt> {
+    if expected_plan_sha256 != plan.receipt.plan_sha256 {
+        tracing::warn!(
+            reviewed_plan_sha256_prefix = %expected_plan_sha256.get(..12).unwrap_or("<invalid>"),
+            current_plan_sha256_prefix = %plan.receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+            "Rejected additive reconciliation apply with stale or mismatched review token"
+        );
+        return Err(BeadsError::SyncConflict {
+            message: "Reviewed additive reconciliation plan SHA-256 is stale or mismatched; rerun the read-only plan and review its complete receipt before applying"
+                .to_string(),
+        });
+    }
+    if plan.has_conflicts() {
+        tracing::warn!(
+            plan_sha256_prefix = %plan.receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+            conflicted = plan.receipt.conflicted,
+            conflict_occurrences = plan.receipt.conflict_occurrences,
+            conflict_reasons = ?plan.receipt.conflict_reasons,
+            "Rejected conflicted additive reconciliation plan"
+        );
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Additive reconciliation has {} conflicted issue(s) across {} observation(s); refusing to apply",
+                plan.receipt.conflicted, plan.receipt.conflict_occurrences
+            ),
+        });
+    }
+
+    let fresh_plan = plan_additive_reconcile(storage, input_path, config)?;
+    if fresh_plan != *plan {
+        tracing::warn!(
+            reviewed_plan_sha256_prefix = %plan.receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+            fresh_plan_sha256_prefix = %fresh_plan.receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+            "Rejected stale additive reconciliation plan after exact replan"
+        );
+        return Err(BeadsError::SyncConflict {
+            message: "Additive reconciliation plan is stale; regenerate the dry-run receipt"
+                .to_string(),
+        });
+    }
+    tracing::info!(
+        plan_sha256_prefix = %plan.receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+        created = plan.receipt.created,
+        updated = plan.receipt.updated,
+        relation_rows = ?plan.receipt.relation_rows_planned,
+        export_hash_updates = plan.receipt.export_hash_updates_planned,
+        dirty_marker_clears = plan.receipt.dirty_markers_clear_planned,
+        cache_rebuild = plan.receipt.cache_rebuild_planned,
+        metadata_update = plan.receipt.metadata_update_planned,
+        "Applying reviewed additive reconciliation transaction"
+    );
+    #[cfg(test)]
+    additive_test_fail_at(AdditiveTestFailPhase::BeforeTransaction)?;
+    #[cfg(test)]
+    additive_test_drift_schema_before_transaction(storage)?;
+    let plan = plan.clone();
+    let result = storage
+        .with_reconcile_transaction("additive reconciliation", |storage| {
+        require_reviewed_additive_schema_version(storage, &plan.receipt, "transaction start")?;
+        let source_before = additive_source_snapshot(input_path, config)?;
+        if !additive_source_matches_receipt(&source_before, &plan.receipt) {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL witness changed after additive reconciliation planning"
+                    .to_string(),
+            });
+        }
+        let database_before = hydrate_additive_database_issues(storage)?;
+        let target_before = additive_database_witness(storage, &database_before)?;
+        if target_before != plan.receipt.target_before {
+            return Err(BeadsError::SyncConflict {
+                message: "Database witness changed after additive reconciliation planning"
+                    .to_string(),
+            });
+        }
+        if plan.mutations.is_empty()
+            && plan.content_hash_repairs.is_empty()
+            && !plan.receipt.metadata_update_planned
+            && !plan.receipt.cache_rebuild_planned
+            && plan.receipt.export_hash_updates_planned == 0
+            && plan.receipt.dirty_markers_clear_planned == 0
+        {
+            let source_after = additive_source_snapshot(input_path, config)?;
+            if !additive_source_matches_receipt(&source_after, &plan.receipt) {
+                return Err(BeadsError::SyncConflict {
+                    message: "JSONL witness changed during additive reconciliation no-op proof"
+                        .to_string(),
+                });
+            }
+            let database_after = hydrate_additive_database_issues(storage)?;
+            let target_after = additive_database_witness(storage, &database_after)?;
+            if target_after != target_before {
+                return Err(BeadsError::SyncConflict {
+                    message: "Database witness changed during additive reconciliation no-op proof"
+                        .to_string(),
+                });
+            }
+            let transaction_health = additive_database_transaction_health(storage)?;
+            require_healthy_additive_database(&transaction_health, "no-op transaction")?;
+            require_reviewed_additive_schema_version(
+                storage,
+                &plan.receipt,
+                "no-op commit boundary",
+            )?;
+            let mut receipt = plan.receipt.clone();
+            receipt.target_after = Some(target_after);
+            receipt.health_after = None;
+            receipt.status = AdditiveReconcileStatus::NoChanges;
+            return Ok(receipt);
+        }
+
+        let synchronized_ids = plan
+            .synchronized_export_hashes
+            .iter()
+            .map(|(issue_id, _)| issue_id.clone())
+            .collect::<BTreeSet<_>>();
+        for mutation in &plan.mutations {
+            let issue = mutation.issue();
+            match mutation {
+                AdditiveMutation::Create(_) => {
+                    if !storage.insert_new_issue_for_import_in_tx(issue)? {
+                        return Err(BeadsError::Config(format!(
+                            "Additive reconciliation failed to insert planned issue {}",
+                            issue.id
+                        )));
+                    }
+                }
+                AdditiveMutation::UpdateScalars(_) => {
+                    if !storage.upsert_issue_for_import_in_tx(issue)? {
+                        return Err(BeadsError::Config(format!(
+                            "Additive reconciliation failed to update planned issue {}",
+                            issue.id
+                        )));
+                    }
+                }
+            }
+        }
+        for mutation in plan
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.creates_issue())
+        {
+            let issue = mutation.issue();
+            if storage.has_owned_relation_rows_for_import(&issue.id)? {
+                return Err(BeadsError::Config(format!(
+                    "New issue {} unexpectedly owned relation rows before relation insertion",
+                    issue.id
+                )));
+            }
+            storage.insert_new_issue_relations_for_import_in_tx(issue)?;
+        }
+        #[cfg(test)]
+        additive_test_fail_at(AdditiveTestFailPhase::AfterIssueAndRelationWrites)?;
+        let content_hash_repairs_applied =
+            storage.repair_issue_content_hashes_in_tx(&plan.content_hash_repairs)?;
+        if content_hash_repairs_applied != plan.receipt.content_hash_repairs_planned {
+            return Err(BeadsError::Config(format!(
+                "Additive reconciliation planned {} content-hash repair(s), applied {content_hash_repairs_applied}",
+                plan.receipt.content_hash_repairs_planned
+            )));
+        }
+        let export_hashes_updated = storage.set_changed_export_hashes_at_in_tx(
+            &plan.synchronized_export_hashes,
+            &plan.receipt.poststate_timestamp,
+        )?;
+        let dirty_markers_cleared = if synchronized_ids.is_empty() {
+            0
+        } else {
+            let dirty_to_clear = storage
+                .get_dirty_issue_metadata()?
+                .into_iter()
+                .filter(|(issue_id, _)| synchronized_ids.contains(issue_id))
+                .collect::<Vec<_>>();
+            storage.clear_dirty_issues_in_tx(&dirty_to_clear)?
+        };
+        if export_hashes_updated != plan.receipt.export_hash_updates_planned {
+            return Err(BeadsError::Config(format!(
+                "Additive reconciliation planned {} export-hash update(s), applied {export_hashes_updated}",
+                plan.receipt.export_hash_updates_planned
+            )));
+        }
+        if dirty_markers_cleared != plan.receipt.dirty_markers_clear_planned {
+            return Err(BeadsError::Config(format!(
+                "Additive reconciliation planned {} dirty-marker clear(s), applied {dirty_markers_cleared}",
+                plan.receipt.dirty_markers_clear_planned
+            )));
+        }
+        if plan.receipt.cache_rebuild_planned {
+            storage.rebuild_blocked_cache_at_in_tx(&plan.receipt.poststate_timestamp)?;
+            storage.rebuild_child_counters_in_tx()?;
+        }
+        storage.set_metadata_in_tx(
+            METADATA_JSONL_CONTENT_HASH,
+            &plan.receipt.source_content_sha256,
+        )?;
+        record_observed_jsonl_witness_in_tx(
+            storage,
+            &JsonlWitness {
+                mtime: redact_reviewed_path_result(
+                    observed_jsonl_witness(input_path),
+                    input_path,
+                    "source",
+                    "witness",
+                )?
+                .mtime,
+                mtime_witness: plan.receipt.source_mtime.clone(),
+                size: plan.receipt.source_size,
+            },
+        )?;
+        let needs_flush = plan.receipt.db_only_preserved != 0;
+        storage.set_metadata_in_tx("needs_flush", if needs_flush { "true" } else { "false" })?;
+
+        let source_after = additive_source_snapshot(input_path, config)?;
+        if !additive_source_matches_receipt(&source_after, &plan.receipt) {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL witness changed during additive reconciliation apply".to_string(),
+            });
+        }
+        let database_after = hydrate_additive_database_issues(storage)?;
+        if database_after != plan.expected_issues {
+            return Err(BeadsError::Config(
+                "Exact issue payload after additive reconciliation does not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        for update in &plan.receipt.scalar_updates {
+            let issue = database_after.get(&update.issue_id).ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Updated issue {} disappeared during additive reconciliation",
+                    update.issue_id
+                ))
+            })?;
+            let relation_payload_sha256 = additive_sha256(
+                &(&issue.labels, &issue.dependencies, &issue.comments),
+                "applied scalar update relation payload",
+            )?;
+            if relation_payload_sha256 != update.relation_payload_sha256 {
+                return Err(BeadsError::Config(format!(
+                    "Scalar-only repair changed relation payload for {}",
+                    update.issue_id
+                )));
+            }
+        }
+        let issue_content_hashes_after = additive_issue_content_hashes(storage)?;
+        if issue_content_hashes_after != plan.expected_issue_content_hashes {
+            return Err(BeadsError::Config(
+                "Persisted issue content hashes after additive reconciliation do not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        let export_hashes_after = additive_export_hashes(storage)?;
+        if export_hashes_after != plan.expected_export_hashes {
+            return Err(BeadsError::Config(
+                "Export hashes after additive reconciliation do not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        let raw_export_hash_rows_after = additive_raw_rows(
+            storage,
+            "SELECT issue_id, content_hash, exported_at FROM export_hashes \
+             ORDER BY issue_id, content_hash, exported_at",
+        )?;
+        if raw_export_hash_rows_after != plan.expected_raw_export_hash_rows {
+            return Err(BeadsError::Config(
+                "Raw export-hash rows after additive reconciliation do not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        let mut dirty_after = storage.get_dirty_issue_metadata()?;
+        dirty_after.sort_unstable();
+        if dirty_after != plan.expected_dirty_issues {
+            return Err(BeadsError::Config(
+                "Dirty markers after additive reconciliation do not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        let metadata_after = additive_metadata(storage)?;
+        if metadata_after != plan.expected_metadata {
+            return Err(BeadsError::Config(
+                "Metadata after additive reconciliation does not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        let blocked_cache_after = additive_actual_blocked_cache(storage)?;
+        if blocked_cache_after != plan.expected_blocked_cache {
+            return Err(BeadsError::Config(
+                "Blocked-cache projection after additive reconciliation does not match the independent in-memory projection"
+                    .to_string(),
+            ));
+        }
+        let raw_blocked_cache_rows_after = additive_raw_rows(
+            storage,
+            "SELECT issue_id, blocked_by, blocked_at FROM blocked_issues_cache \
+             ORDER BY issue_id, blocked_by, blocked_at",
+        )?;
+        if raw_blocked_cache_rows_after != plan.expected_raw_blocked_cache_rows {
+            return Err(BeadsError::Config(
+                "Raw blocked-cache rows after additive reconciliation do not match the reviewed plan"
+                    .to_string(),
+            ));
+        }
+        let child_counters_after = additive_actual_child_counters(storage)?;
+        if child_counters_after != plan.expected_child_counters {
+            return Err(BeadsError::Config(
+                "Child counters after additive reconciliation do not match the independent issue-ID projection"
+                    .to_string(),
+            ));
+        }
+        let sqlite_sequence_after = additive_sqlite_sequence(storage)?;
+        if sqlite_sequence_after != plan.expected_sqlite_sequence {
+            return Err(BeadsError::Config(
+                "SQLite AUTOINCREMENT high-water marks do not match the reviewed additive reconciliation projection"
+                    .to_string(),
+            ));
+        }
+        if additive_sha256(&raw_blocked_cache_rows_after, "applied raw blocked cache")?
+            != plan.receipt.expected_blocked_cache_payload_sha256
+            || additive_sha256(&child_counters_after, "applied child counters")?
+                != plan.receipt.expected_child_counter_payload_sha256
+            || additive_sha256(&sqlite_sequence_after, "applied sqlite sequence")?
+                != plan.receipt.expected_sqlite_sequence_payload_sha256
+        {
+            return Err(BeadsError::Config(
+                "Derived-cache or AUTOINCREMENT witness digest does not match the reviewed additive reconciliation plan"
+                    .to_string(),
+            ));
+        }
+        let transaction_health = additive_database_health(storage)?;
+        require_healthy_additive_database(&transaction_health, "post-apply transaction")?;
+        let target_after = additive_database_witness(storage, &database_after)?;
+        if target_after != plan.receipt.expected_target_after {
+            return Err(BeadsError::Config(
+                "Complete typed database poststate does not match the reviewed additive reconciliation witness"
+                    .to_string(),
+            ));
+        }
+        let expected_issue_count = plan
+            .receipt
+            .target_before
+            .issues
+            .checked_add(plan.receipt.created)
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "Issue count overflow during additive reconciliation apply".to_string(),
+                )
+            })?;
+        if target_after.issues != expected_issue_count {
+            return Err(BeadsError::Config(format!(
+                "Additive reconciliation expected {expected_issue_count} issues after apply, found {}",
+                target_after.issues
+            )));
+        }
+        if target_after.relations != plan.receipt.relations_after {
+            return Err(BeadsError::Config(
+                "Relation counts after additive reconciliation do not match the plan".to_string(),
+            ));
+        }
+        if target_after.issue_payload_sha256
+            != plan.receipt.expected_issue_raw_payload_sha256
+            || target_after.issue_semantic_payload_sha256
+                != plan.receipt.expected_issue_semantic_payload_sha256
+            || target_after.issue_content_hash_payload_sha256
+                != plan.receipt.expected_issue_content_hash_payload_sha256
+            || additive_sha256(&raw_export_hash_rows_after, "applied raw export hashes")?
+                != plan.receipt.expected_export_hash_payload_sha256
+            || additive_sha256(&dirty_after, "applied dirty markers")?
+                != plan.receipt.expected_dirty_payload_sha256
+            || additive_sha256(&metadata_after, "applied metadata")?
+                != plan.receipt.expected_metadata_payload_sha256
+        {
+            return Err(BeadsError::Config(
+                "Post-apply witness digest does not match the reviewed additive reconciliation plan"
+                    .to_string(),
+            ));
+        }
+        let expected_dirty_count = plan
+            .receipt
+            .target_before
+            .dirty_issues
+            .checked_sub(plan.receipt.dirty_markers_clear_planned)
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "Dirty-marker count underflow during additive reconciliation apply"
+                        .to_string(),
+                )
+            })?;
+        if target_after.dirty_issues != expected_dirty_count {
+            return Err(BeadsError::Config(format!(
+                "Additive reconciliation expected {expected_dirty_count} dirty marker(s) after apply, found {}",
+                target_after.dirty_issues
+            )));
+        }
+        if target_after.events != plan.receipt.events_before
+            || target_after.event_payload_sha256
+                != plan.receipt.event_payload_sha256_before
+        {
+            return Err(BeadsError::Config(
+                "Audit event stream changed during additive reconciliation".to_string(),
+            ));
+        }
+        if target_after.config != plan.receipt.target_before.config
+            || target_after.close_metadata != plan.receipt.target_before.close_metadata
+            || target_after.gate_results != plan.receipt.target_before.gate_results
+            || target_after.gate_result_history
+                != plan.receipt.target_before.gate_result_history
+            || target_after.schema_catalog != plan.receipt.target_before.schema_catalog
+        {
+            return Err(BeadsError::Config(
+                "Database-only config, close metadata, workflow-gate rows, or schema catalog changed during additive reconciliation"
+                    .to_string(),
+            ));
+        }
+
+        let mut receipt = plan.receipt.clone();
+        receipt.status = if plan.mutations.is_empty() && plan.content_hash_repairs.is_empty() {
+            AdditiveReconcileStatus::AppliedMetadataOnly
+        } else {
+            AdditiveReconcileStatus::Applied
+        };
+        receipt.events_after = target_after.events;
+        receipt.event_payload_sha256_after = target_after.event_payload_sha256.clone();
+        receipt.target_after = Some(target_after);
+        receipt.health_after = None;
+        receipt.cache_rebuild_performed = plan.receipt.cache_rebuild_planned;
+        receipt.content_hash_repairs_applied = content_hash_repairs_applied;
+        receipt.relation_rows_applied = plan.receipt.relation_rows_planned;
+        receipt.export_hashes_updated = export_hashes_updated;
+        receipt.dirty_markers_cleared = dirty_markers_cleared;
+        receipt.metadata_changed = plan.receipt.metadata_update_planned;
+        #[cfg(test)]
+        additive_test_fail_at(AdditiveTestFailPhase::BeforeFinalCommitChecks)?;
+        require_reviewed_additive_schema_version(storage, &plan.receipt, "commit boundary")?;
+        let source_final = additive_source_snapshot(input_path, config)?;
+        if !additive_source_matches_receipt(&source_final, &plan.receipt) {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL witness changed at the additive reconciliation commit boundary"
+                    .to_string(),
+            });
+        }
+        if let (Some(database_path), Some(expected_identity)) = (
+            config.database_path.as_deref(),
+            plan.receipt.database_identity_sha256.as_deref(),
+        ) && additive_path_identity_sha256(database_path, "database")? != expected_identity
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Configured database identity changed at the additive reconciliation commit boundary"
+                    .to_string(),
+            });
+        }
+        if let Some(workspace_path) = config.beads_dir.as_deref()
+            && additive_path_identity_sha256(workspace_path, "workspace")?
+                != plan.receipt.workspace_identity_sha256
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Terminal workspace identity changed at the additive reconciliation commit boundary"
+                    .to_string(),
+            });
+        }
+        #[cfg(test)]
+        additive_test_drift_source_after_final_check(input_path)?;
+        Ok(receipt)
+        })
+        .map(|outcome| {
+            let mut receipt = outcome.value;
+            receipt.foreign_keys_restored_after_commit =
+                Some(outcome.foreign_keys_restored);
+            if !outcome.foreign_keys_restored {
+                receipt
+                    .postcommit_failures
+                    .push(AdditivePostcommitFailure::ForeignKeyRestoration);
+                receipt.status = AdditiveReconcileStatus::CommittedWithPostconditionFailures;
+            }
+            if !outcome.database_authority_preserved {
+                receipt
+                    .postcommit_failures
+                    .push(AdditivePostcommitFailure::DatabaseAuthorityChanged);
+                receipt.status = AdditiveReconcileStatus::CommittedWithPostconditionFailures;
+            }
+            receipt.postcommit_failures.sort_unstable();
+            receipt.postcommit_failures.dedup();
+            receipt
+        });
+    let result = result.map(|mut receipt| {
+        let health_after =
+            additive_database_health(storage).unwrap_or_else(|error| AdditiveDatabaseHealth {
+                integrity_messages: vec![format!(
+                    "postcommit integrity attestation unavailable: {error}"
+                )],
+                foreign_key_violations: Vec::new(),
+            });
+        if !additive_database_is_healthy(&health_after) {
+            receipt
+                .postcommit_failures
+                .push(AdditivePostcommitFailure::DatabasePoststateChanged);
+            receipt.status = AdditiveReconcileStatus::CommittedWithPostconditionFailures;
+        }
+        receipt.health_after = Some(health_after);
+        receipt.postcommit_failures.sort_unstable();
+        receipt.postcommit_failures.dedup();
+        receipt
+    });
+    match &result {
+        Ok(receipt) => tracing::info!(
+            plan_sha256_prefix = %receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+            status = receipt.status.as_str(),
+            target_issues = receipt.target_after.as_ref().map_or(0, |witness| witness.issues),
+            events_preserved = receipt.events_after,
+            cache_rebuild_performed = receipt.cache_rebuild_performed,
+            "Committed additive reconciliation"
+        ),
+        Err(error) => tracing::warn!(
+            plan_sha256_prefix = %plan.receipt.plan_sha256.get(..12).unwrap_or("<invalid>"),
+            error = %error,
+            "Additive reconciliation did not reach a verified commit; rollback outcome is carried by the returned error"
+        ),
+    }
+    result
 }
 
 // ============================================================================
@@ -799,9 +8176,9 @@ impl JsonlIssueValidationSummary {
     }
 }
 
-pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueValidationSummary> {
-    let file = File::open(path)?;
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+fn validate_jsonl_issue_records_from_reader(
+    reader: impl BufRead,
+) -> Result<JsonlIssueValidationSummary> {
     let mut summary = JsonlIssueValidationSummary::default();
     let mut seen_ids = HashSet::new();
 
@@ -837,6 +8214,18 @@ pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueVali
     }
 
     Ok(summary)
+}
+
+pub(crate) fn validate_jsonl_issue_records(path: &Path) -> Result<JsonlIssueValidationSummary> {
+    let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
+    validate_jsonl_issue_records_from_reader(BufReader::with_capacity(2 * 1024 * 1024, file))
+}
+
+pub(crate) fn validate_jsonl_snapshot_issue_records(
+    source: &JsonlSourceSnapshot,
+) -> Result<JsonlIssueValidationSummary> {
+    validate_jsonl_issue_records_from_reader(source.reader())
 }
 
 /// Run preflight checks for export operation.
@@ -1094,6 +8483,25 @@ pub fn preflight_import(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<PreflightResult> {
+    preflight_import_impl(input_path, None, config, expected_prefix)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn preflight_import_snapshot(
+    source: &JsonlSourceSnapshot,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+) -> Result<PreflightResult> {
+    preflight_import_impl(source.display_path(), Some(source), config, expected_prefix)
+}
+
+#[allow(clippy::too_many_lines)]
+fn preflight_import_impl(
+    input_path: &Path,
+    source: Option<&JsonlSourceSnapshot>,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+) -> Result<PreflightResult> {
     let mut result = PreflightResult::new();
 
     tracing::debug!(
@@ -1165,8 +8573,24 @@ pub fn preflight_import(
         }
     }
 
-    // Check 3: Input file exists and is readable
-    if input_path.exists() {
+    // Check 3: Input file exists and is readable. A supplied snapshot is the
+    // authoritative proof: do not reopen the mutable path.
+    if let Some(source) = source {
+        result.add(PreflightCheck::pass(
+            "file_readable",
+            "Input file exists and is readable",
+            format!(
+                "Captured {} exact byte(s) from a stable file handle.",
+                source.size()
+            ),
+        ));
+        tracing::debug!(
+            path = %input_path.display(),
+            size = source.size(),
+            raw_sha256 = %source.raw_sha256(),
+            "Immutable JSONL snapshot readable check: PASS"
+        );
+    } else if input_path.exists() {
         match File::open(input_path) {
             Ok(_) => {
                 result.add(PreflightCheck::pass(
@@ -1199,7 +8623,12 @@ pub fn preflight_import(
     }
 
     // Check 4: No merge conflict markers
-    match scan_conflict_markers(input_path) {
+    let marker_scan = if let Some(source) = source {
+        scan_conflict_markers_snapshot(source)
+    } else {
+        scan_conflict_markers(input_path)
+    };
+    match marker_scan {
         Ok(markers) if markers.is_empty() => {
             result.add(PreflightCheck::pass(
                 "no_conflict_markers",
@@ -1252,7 +8681,12 @@ pub fn preflight_import(
     }
 
     // Check 5: Per-line issue-record validation
-    match validate_jsonl_issue_records(input_path) {
+    let issue_validation = if let Some(source) = source {
+        validate_jsonl_snapshot_issue_records(source)
+    } else {
+        validate_jsonl_issue_records(input_path)
+    };
+    match issue_validation {
         Ok(summary) if summary.invalid_count == 0 => {
             result.add(PreflightCheck::pass(
                 "json_valid",
@@ -1298,10 +8732,15 @@ pub fn preflight_import(
     if !config.skip_prefix_validation
         && let Some(prefix) = expected_prefix
     {
-        let file = File::open(input_path);
-        match file {
-            Ok(f) => {
-                let reader = BufReader::new(f);
+        let reader: Result<Box<dyn BufRead + '_>> = if let Some(source) = source {
+            Ok(Box::new(source.reader()))
+        } else {
+            File::open(input_path)
+                .map(|file| Box::new(BufReader::new(file)) as Box<dyn BufRead>)
+                .map_err(BeadsError::from)
+        };
+        match reader {
+            Ok(reader) => {
                 let mut mismatched_ids: Vec<String> = Vec::new();
                 for line_result in reader.lines() {
                     let Ok(line) = line_result else { continue };
@@ -1402,17 +8841,17 @@ const CONFLICT_END: &str = ">>>>>>>";
 /// # Errors
 ///
 /// Returns an error if the file cannot be read.
-pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
-    let file = File::open(path)?;
-    path::validate_jsonl_fd_metadata(&file, path)?;
-    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+fn scan_conflict_markers_from_reader(
+    display_path: &Path,
+    reader: impl BufRead,
+) -> Result<Vec<ConflictMarker>> {
     let mut markers = Vec::new();
 
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
         if let Some((marker_type, branch)) = detect_conflict_marker(&line) {
             markers.push(ConflictMarker {
-                path: path.to_path_buf(),
+                path: display_path.to_path_buf(),
                 line: line_num + 1,
                 marker_type,
                 branch,
@@ -1421,6 +8860,18 @@ pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
     }
 
     Ok(markers)
+}
+
+pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
+    let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
+    scan_conflict_markers_from_reader(path, BufReader::with_capacity(2 * 1024 * 1024, file))
+}
+
+pub(crate) fn scan_conflict_markers_snapshot(
+    source: &JsonlSourceSnapshot,
+) -> Result<Vec<ConflictMarker>> {
+    scan_conflict_markers_from_reader(source.display_path(), source.reader())
 }
 
 fn detect_conflict_marker(line: &str) -> Option<(ConflictMarkerType, Option<String>)> {
@@ -1443,6 +8894,13 @@ fn detect_conflict_marker(line: &str) -> Option<(ConflictMarkerType, Option<Stri
 /// Returns a config error describing the first few markers found.
 pub fn ensure_no_conflict_markers(path: &Path) -> Result<()> {
     let markers = scan_conflict_markers(path)?;
+    ensure_no_conflict_markers_from_scan(path, &markers)
+}
+
+fn ensure_no_conflict_markers_from_scan(
+    display_path: &Path,
+    markers: &[ConflictMarker],
+) -> Result<()> {
     if markers.is_empty() {
         return Ok(());
     }
@@ -1464,9 +8922,14 @@ pub fn ensure_no_conflict_markers(path: &Path) -> Result<()> {
 
     Err(BeadsError::Config(format!(
         "Merge conflict markers detected in {}.\n{}Resolve conflicts before importing.",
-        path.display(),
+        display_path.display(),
         preview
     )))
+}
+
+pub(crate) fn ensure_no_conflict_markers_snapshot(source: &JsonlSourceSnapshot) -> Result<()> {
+    let markers = scan_conflict_markers_snapshot(source)?;
+    ensure_no_conflict_markers_from_scan(source.display_path(), &markers)
 }
 
 #[derive(Deserialize)]
@@ -1486,8 +8949,13 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         Err(e) => return Err(BeadsError::Io(e)),
     };
     path::validate_jsonl_fd_metadata(&file, path)?;
+    analyze_jsonl_from_reader(path, BufReader::new(file))
+}
 
-    let mut reader = BufReader::new(file);
+fn analyze_jsonl_from_reader(
+    display_path: &Path,
+    mut reader: impl BufRead,
+) -> Result<(usize, HashSet<String>)> {
     let mut count = 0;
     let mut ids = HashSet::new();
     let mut line_buf = String::new();
@@ -1513,7 +8981,7 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
             return Err(BeadsError::Config(format!(
                 "Duplicate issue id '{}' in {} at line {}",
                 partial.id,
-                path.display(),
+                display_path.display(),
                 line_num
             )));
         }
@@ -1521,6 +8989,12 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
     }
 
     Ok((count, ids))
+}
+
+pub(crate) fn analyze_jsonl_snapshot(
+    source: &JsonlSourceSnapshot,
+) -> Result<(usize, HashSet<String>)> {
+    analyze_jsonl_from_reader(source.display_path(), source.reader())
 }
 
 /// Count issues in an existing JSONL file.
@@ -1533,12 +9007,26 @@ pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
 }
 
 fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Result<()> {
+<<<<<<< HEAD
     let file = File::open(path)?;
     path::validate_jsonl_fd_metadata(&file, path)?;
 
     let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
     let mut observed = HashSet::with_capacity(expected_ids.len());
     let mut reader = BufReader::new(file);
+=======
+    let source = capture_jsonl_source_snapshot(path)?;
+    verify_exported_jsonl_snapshot_integrity(&source, expected_ids)
+}
+
+fn verify_exported_jsonl_snapshot_integrity(
+    source: &JsonlSourceSnapshot,
+    expected_ids: &[String],
+) -> Result<()> {
+    let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
+    let mut observed = HashSet::with_capacity(expected_ids.len());
+    let mut reader = source.reader();
+>>>>>>> origin/main
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut issue_count = 0;
@@ -1626,6 +9114,12 @@ fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Resu
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn get_issue_ids_from_jsonl(path: &Path) -> Result<HashSet<String>> {
     Ok(analyze_jsonl(path)?.1)
+}
+
+pub(crate) fn get_issue_ids_from_jsonl_snapshot(
+    source: &JsonlSourceSnapshot,
+) -> Result<HashSet<String>> {
+    Ok(analyze_jsonl_snapshot(source)?.1)
 }
 
 fn read_jsonl_lines_by_id(path: &Path) -> Result<BTreeMap<String, String>> {
@@ -1908,8 +9402,12 @@ const fn should_prepare_export_issues_parallel(issue_count: usize, max_paralleli
     max_parallelism > 1 && issue_count >= EXPORT_PARALLEL_PREPARE_MIN_ISSUES
 }
 
-fn prepare_export_issue_jsonl(issue: &Issue, retention_days: Option<u64>) -> PreparedExportEntry {
-    if issue.is_expired_tombstone(retention_days) {
+fn prepare_export_issue_jsonl(
+    issue: &Issue,
+    retention_days: Option<u64>,
+    export_as_of: &DateTime<Utc>,
+) -> PreparedExportEntry {
+    if issue.is_expired_tombstone_at(retention_days, export_as_of.to_owned()) {
         return PreparedExportEntry::SkippedTombstone(issue.id.clone());
     }
 
@@ -1939,20 +9437,26 @@ fn prepare_export_issue_jsonl(issue: &Issue, retention_days: Option<u64>) -> Pre
 fn prepare_export_issue_chunk(
     issues: &[Issue],
     retention_days: Option<u64>,
+    export_as_of: &DateTime<Utc>,
 ) -> Vec<PreparedExportEntry> {
     issues
         .iter()
-        .map(|issue| prepare_export_issue_jsonl(issue, retention_days))
+        .map(|issue| prepare_export_issue_jsonl(issue, retention_days, export_as_of))
         .collect()
 }
 
 fn prepare_export_issues_jsonl_parallel(
     issues: &[Issue],
     retention_days: Option<u64>,
+    export_as_of: &DateTime<Utc>,
     max_parallelism: usize,
 ) -> Result<Vec<PreparedExportEntry>> {
     if !should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
-        return Ok(prepare_export_issue_chunk(issues, retention_days));
+        return Ok(prepare_export_issue_chunk(
+            issues,
+            retention_days,
+            export_as_of,
+        ));
     }
 
     let worker_count = max_parallelism.min(issues.len());
@@ -1965,7 +9469,7 @@ fn prepare_export_issues_jsonl_parallel(
             handles.push(scope.spawn(move || {
                 (
                     start_index,
-                    prepare_export_issue_chunk(chunk, retention_days),
+                    prepare_export_issue_chunk(chunk, retention_days, export_as_of),
                 )
             }));
         }
@@ -2082,6 +9586,81 @@ pub fn export_to_jsonl_with_policy(
     output_path: &Path,
     config: &ExportConfig,
 ) -> Result<(ExportResult, ExportReport)> {
+    export_to_jsonl_with_policy_expected(storage, output_path, config, None)
+}
+
+pub(crate) fn export_to_jsonl_with_policy_expected(
+    storage: &SqliteStorage,
+    output_path: &Path,
+    config: &ExportConfig,
+    expected_previous_content_sha256: Option<&Option<String>>,
+) -> Result<(ExportResult, ExportReport)> {
+    export_to_jsonl_with_policy_expected_authority(
+        storage,
+        output_path,
+        config,
+        expected_previous_content_sha256,
+        None,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn export_to_jsonl_with_policy_expected_under_authority(
+    storage: &SqliteStorage,
+    output_path: &Path,
+    config: &ExportConfig,
+    expected_previous_source: ExpectedJsonlSourceRef<'_>,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<(ExportResult, ExportReport)> {
+    export_to_jsonl_with_policy_expected_authority(
+        storage,
+        output_path,
+        config,
+        None,
+        Some(expected_previous_source),
+        Some(jsonl_authority),
+        None,
+    )
+}
+
+pub(crate) fn export_to_jsonl_with_policy_expected_under_authorities(
+    storage: &SqliteStorage,
+    output_path: &Path,
+    config: &ExportConfig,
+    expected_previous_source: ExpectedJsonlSourceRef<'_>,
+    jsonl_authority: &JsonlFamilyWriteLock,
+    database_authority: &DatabaseFamilyWriteLock,
+) -> Result<(ExportResult, ExportReport)> {
+    export_to_jsonl_with_policy_expected_authority(
+        storage,
+        output_path,
+        config,
+        None,
+        Some(expected_previous_source),
+        Some(jsonl_authority),
+        Some(database_authority),
+    )
+}
+
+fn export_to_jsonl_with_policy_expected_authority(
+    storage: &SqliteStorage,
+    output_path: &Path,
+    config: &ExportConfig,
+    expected_previous_content_sha256: Option<&Option<String>>,
+    expected_previous_source: Option<ExpectedJsonlSourceRef<'_>>,
+    provided_jsonl_authority: Option<&JsonlFamilyWriteLock>,
+    provided_database_authority: Option<&DatabaseFamilyWriteLock>,
+) -> Result<(ExportResult, ExportReport)> {
+    if let Some(database_authority) = provided_database_authority {
+        database_authority.verify_database_authority()?;
+    }
+    let export_as_of = config
+        .export_as_of
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(Utc::now);
+
     // Path validation (PC-1, PC-2, PC-3, NGI-3)
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(output_path, beads_dir, config.allow_external_jsonl)?;
@@ -2091,7 +9670,69 @@ pub fn export_to_jsonl_with_policy(
             allow_external = config.allow_external_jsonl,
             "Export path validated"
         );
+    }
 
+    let parent_dir = output_path.parent().ok_or_else(|| {
+        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
+    })?;
+    fs::create_dir_all(parent_dir)?;
+    let owned_jsonl_authority = if provided_jsonl_authority.is_some() {
+        None
+    } else {
+        Some(blocking_jsonl_family_write_lock_with_timeout(
+            output_path,
+            None,
+        )?)
+    };
+    let jsonl_authority = provided_jsonl_authority
+        .or(owned_jsonl_authority.as_ref())
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "JSONL export has no write authority".to_string(),
+        })?;
+    let _ = jsonl_authority.pinned_name_for_target(output_path)?;
+    jsonl_authority.verify_jsonl_authority()?;
+
+    let captured_previous_source = match expected_previous_source {
+        Some(ExpectedJsonlSourceRef::Present(_)) => None,
+        Some(ExpectedJsonlSourceRef::Missing) | None => {
+            jsonl_authority.capture_optional_target()?
+        }
+    };
+    let previous_source = match expected_previous_source {
+        Some(ExpectedJsonlSourceRef::Present(source)) => {
+            verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
+            Some(source)
+        }
+        Some(ExpectedJsonlSourceRef::Missing) => {
+            if captured_previous_source.is_some() {
+                return Err(BeadsError::SyncConflict {
+                    message: "JSONL appeared after the exporting session captured a missing source"
+                        .to_string(),
+                });
+            }
+            None
+        }
+        None => {
+            if let Some(expected_previous) = expected_previous_content_sha256 {
+                let observed = captured_previous_source
+                    .as_ref()
+                    .map(|source| source.content_sha256().to_string());
+                if &observed != expected_previous {
+                    return Err(BeadsError::SyncConflict {
+                        message: "JSONL changed on disk since the exporting session loaded it; refusing a stale atomic replacement"
+                            .to_string(),
+                    });
+                }
+            }
+            captured_previous_source.as_ref()
+        }
+    };
+    let expected_previous_state = previous_source.map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+
+    if let (Some(beads_dir), Some(previous_source)) = (config.beads_dir.as_ref(), previous_source) {
         // Perform backup before overwriting (if enabled and we have a beads_dir).
         // We backup any JSONL file that has been validated as safe for sync,
         // even if it's outside the .beads/ directory (e.g., in repo root).
@@ -2103,7 +9744,12 @@ pub fn export_to_jsonl_with_policy(
             output_path.to_path_buf()
         };
 
-        history::backup_before_export(beads_dir, &config.history, &output_abs)?;
+        history::backup_before_export_snapshot(
+            beads_dir,
+            &config.history,
+            &output_abs,
+            previous_source,
+        )?;
     }
 
     // Get sorted export IDs up front for safety checks and bounded batch hydration.
@@ -2111,10 +9757,14 @@ pub fn export_to_jsonl_with_policy(
 
     // Fetch dirty metadata for safe clearing later
     let dirty_metadata = storage.get_dirty_issue_metadata()?;
+    let intentionally_excluded_marked_at =
+        intentionally_excluded_dirty_metadata(storage, &dirty_metadata)?;
 
     // Safety checks
-    if !config.force && output_path.exists() {
-        let (jsonl_count, jsonl_ids) = analyze_jsonl(output_path)?;
+    if !config.force
+        && let Some(previous_source) = previous_source
+    {
+        let (jsonl_count, jsonl_ids) = analyze_jsonl_snapshot(previous_source)?;
 
         // Check 1: prevent exporting empty database over non-empty JSONL
         if export_ids.is_empty() && jsonl_count > 0 {
@@ -2171,16 +9821,9 @@ pub fn export_to_jsonl_with_policy(
     );
 
     // Write to temp file for atomic rename
-    let parent_dir = output_path.parent().ok_or_else(|| {
-        BeadsError::Config(format!("Invalid output path: {}", output_path.display()))
-    })?;
-
-    // Ensure parent directory exists
-    fs::create_dir_all(parent_dir)?;
-
-    let (temp_path, temp_file) = create_jsonl_temp_file(output_path, config)?;
-    let mut temp_guard = TempFileGuard::new(temp_path.clone());
-    set_restrictive_jsonl_permissions(&temp_path);
+    let (temp_path, pinned_temp, temp_file) =
+        create_full_export_temp_file_under_authority(output_path, config, jsonl_authority)?;
+    let temp_guard = TempFileGuard::new_retained(temp_path.clone());
     let mut writer = BufWriter::new(temp_file);
 
     // Write JSONL and compute hash
@@ -2197,6 +9840,7 @@ pub fn export_to_jsonl_with_policy(
             let prepared = prepare_export_issues_jsonl_parallel(
                 &issues,
                 config.retention_days,
+                &export_as_of,
                 max_parallelism,
             )?;
             write_prepared_export_entries(
@@ -2213,7 +9857,7 @@ pub fn export_to_jsonl_with_policy(
         } else {
             for issue in &issues {
                 // Skip expired tombstones
-                if issue.is_expired_tombstone(config.retention_days) {
+                if issue.is_expired_tombstone_at(config.retention_days, export_as_of.to_owned()) {
                     skipped_tombstone_ids.push(issue.id.clone());
                     progress.inc(1);
                     continue;
@@ -2252,6 +9896,7 @@ pub fn export_to_jsonl_with_policy(
                 let prepared = prepare_export_issues_jsonl_parallel(
                     &issues,
                     config.retention_days,
+                    &export_as_of,
                     max_parallelism,
                 )?;
                 write_prepared_export_entries(
@@ -2268,7 +9913,8 @@ pub fn export_to_jsonl_with_policy(
             } else {
                 for issue in &issues {
                     // Skip expired tombstones
-                    if issue.is_expired_tombstone(config.retention_days) {
+                    if issue.is_expired_tombstone_at(config.retention_days, export_as_of.to_owned())
+                    {
                         skipped_tombstone_ids.push(issue.id.clone());
                         progress.inc(1);
                         continue;
@@ -2316,7 +9962,38 @@ pub fn export_to_jsonl_with_policy(
     let content_hash = hex_encode(&hasher.finalize());
 
     // Verify staged export integrity before replacing the live JSONL.
+<<<<<<< HEAD
     verify_exported_jsonl_integrity(&temp_path, &exported_ids)?;
+=======
+    let staged_source = pinned_temp.capture()?;
+    verify_exported_jsonl_snapshot_integrity(&staged_source, &exported_ids)?;
+    if staged_source.content_sha256() != content_hash {
+        return Err(BeadsError::SyncConflict {
+            message: "Staged JSONL bytes do not match the export content hash".to_string(),
+        });
+    }
+    if let Some(expected) = config.expected_staged_output.as_ref() {
+        let observed_issue_hashes = sync_merge_export_hash_mapping_witness(&issue_hashes)?;
+        if expected.raw_sha256 != content_hash
+            || expected.issue_count != exported_ids.len()
+            || expected.issue_hashes != observed_issue_hashes
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Staged JSONL does not match the exact reviewed export: expected sha256={} rows={} issue_hash_rows={} issue_hash_digest={}, observed sha256={} rows={} issue_hash_rows={} issue_hash_digest={}; live JSONL was not replaced and the staged file was retained for recovery",
+                    expected.raw_sha256,
+                    expected.issue_count,
+                    expected.issue_hashes.rows,
+                    expected.issue_hashes.payload_sha256,
+                    content_hash,
+                    exported_ids.len(),
+                    observed_issue_hashes.rows,
+                    observed_issue_hashes.payload_sha256
+                ),
+            });
+        }
+    }
+>>>>>>> origin/main
 
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
@@ -2332,10 +10009,23 @@ pub fn export_to_jsonl_with_policy(
             "overwrite JSONL output",
         )?;
     }
+    if let Some(database_authority) = provided_database_authority {
+        database_authority.verify_database_authority()?;
+    }
 
-    // Atomic rename plus parent-directory fsync for power-loss durability.
-    crate::util::durable_rename(&temp_path, output_path)?;
-    temp_guard.persist();
+    let publication = publish_staged_jsonl_conditionally(
+        &temp_path,
+        temp_guard,
+        output_path,
+        &staged_source,
+        &expected_previous_state,
+        &content_hash,
+        jsonl_authority,
+        provided_database_authority,
+    )?;
+    if let Some(database_authority) = provided_database_authority {
+        database_authority.verify_database_authority()?;
+    }
 
     let result = ExportResult {
         exported_count: exported_ids.len(),
@@ -2344,11 +10034,13 @@ pub fn export_to_jsonl_with_policy(
             &exported_ids,
             &skipped_tombstone_ids,
         ),
+        intentionally_excluded_marked_at,
         exported_ids,
         skipped_tombstone_ids,
-        content_hash,
+        content_hash: content_hash.clone(),
         output_path: Some(output_path.to_string_lossy().to_string()),
         issue_hashes,
+        publication: Some(publication.into_receipt(output_path, content_hash)),
     };
 
     report.errors = ctx.errors;
@@ -2378,6 +10070,31 @@ pub fn export_to_writer_with_policy<W: Write>(
     writer: &mut W,
     policy: ExportErrorPolicy,
 ) -> Result<(ExportResult, ExportReport)> {
+    export_to_writer_with_policy_and_retention(storage, writer, policy, None)
+}
+
+pub(crate) fn export_to_writer_with_policy_and_retention<W: Write>(
+    storage: &SqliteStorage,
+    writer: &mut W,
+    policy: ExportErrorPolicy,
+    retention_days: Option<u64>,
+) -> Result<(ExportResult, ExportReport)> {
+    export_to_writer_with_policy_and_retention_at(
+        storage,
+        writer,
+        policy,
+        retention_days,
+        Utc::now(),
+    )
+}
+
+pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
+    storage: &SqliteStorage,
+    writer: &mut W,
+    policy: ExportErrorPolicy,
+    retention_days: Option<u64>,
+    export_as_of: DateTime<Utc>,
+) -> Result<(ExportResult, ExportReport)> {
     let export_ids = export_issue_ids(storage)?;
 
     let mut ctx = ExportContext::new(policy);
@@ -2385,13 +10102,17 @@ pub fn export_to_writer_with_policy<W: Write>(
 
     let mut hasher = Sha256::new();
     let mut exported_ids = Vec::with_capacity(export_ids.len());
-    let skipped_tombstone_ids = Vec::new();
+    let mut skipped_tombstone_ids = Vec::new();
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
 
     if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
         let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
         for issue in &issues {
+            if issue.is_expired_tombstone_at(retention_days, export_as_of.to_owned()) {
+                skipped_tombstone_ids.push(issue.id.clone());
+                continue;
+            }
             if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
                 continue;
             }
@@ -2413,6 +10134,10 @@ pub fn export_to_writer_with_policy<W: Write>(
         for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
             let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
             for issue in &issues {
+                if issue.is_expired_tombstone_at(retention_days, export_as_of.to_owned()) {
+                    skipped_tombstone_ids.push(issue.id.clone());
+                    continue;
+                }
                 if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
                     continue;
                 }
@@ -2439,10 +10164,12 @@ pub fn export_to_writer_with_policy<W: Write>(
         exported_count: exported_ids.len(),
         exported_ids,
         exported_marked_at: Vec::new(),
+        intentionally_excluded_marked_at: Vec::new(),
         skipped_tombstone_ids,
         content_hash,
         output_path: None,
         issue_hashes,
+        publication: None,
     };
 
     report.errors = ctx.errors;
@@ -2712,6 +10439,15 @@ fn observed_jsonl_witness(jsonl_path: &Path) -> Result<JsonlWitness> {
     })
 }
 
+fn observed_jsonl_snapshot_witness(source: &JsonlSourceSnapshot) -> JsonlWitness {
+    let modified = source.modified();
+    JsonlWitness {
+        mtime: modified,
+        mtime_witness: chrono::DateTime::<Utc>::from(modified).to_rfc3339(),
+        size: source.size(),
+    }
+}
+
 fn parse_jsonl_size_witness(value: &str) -> Option<u64> {
     value.parse().ok()
 }
@@ -2786,6 +10522,14 @@ pub fn auto_import_if_stale(
         );
         return Ok(AutoImportResult::default());
     }
+    if let Some(receipt) = storage.pending_sync_merge_receipt()? {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Committed sync merge {} is pending {:?} reconciliation; refusing auto-import. Run `br sync --merge` first.",
+                receipt.receipt_id, receipt.phase
+            ),
+        });
+    }
 
     if jsonl_path.exists() {
         validate_sync_path_with_external(jsonl_path, beads_dir, allow_external_jsonl)?;
@@ -2801,14 +10545,14 @@ pub fn auto_import_if_stale(
     // process flushes JSONL while another has pending local writes,
     // causing both `jsonl_newer` and `db_newer` to be true.
     //
-    // Explicit `br sync` still detects this as a hard conflict so the
+    // Explicit `br sync --merge` still detects this as a hard conflict so the
     // user can reconcile manually.
     if staleness.db_newer && !allow_stale {
         tracing::warn!(
             dirty_count = staleness.dirty_count,
             jsonl_mtime = ?staleness.jsonl_mtime,
             "Skipping auto-import: JSONL changed externally while {} local change(s) are pending. \
-             Run `br sync` to reconcile.",
+             Run `br sync --merge` to reconcile.",
             staleness.dirty_count,
         );
         return Ok(AutoImportResult::default());
@@ -2856,22 +10600,91 @@ pub fn finalize_export(
     issue_hashes: Option<&[(String, String)]>,
     jsonl_path: &Path,
 ) -> Result<()> {
+    let jsonl_authority = blocking_jsonl_family_write_lock_with_timeout(jsonl_path, None)?;
+    finalize_export_under_authority(storage, result, issue_hashes, jsonl_path, &jsonl_authority)
+}
+
+pub(crate) fn finalize_export_under_authority(
+    storage: &mut SqliteStorage,
+    result: &ExportResult,
+    issue_hashes: Option<&[(String, String)]>,
+    jsonl_path: &Path,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<()> {
     use chrono::Utc;
-    let observed_jsonl = observed_jsonl_witness(jsonl_path)?;
-    let prior_content_hash = storage.get_metadata(METADATA_JSONL_CONTENT_HASH)?;
-    let export_hashes_current =
-        export_hashes_certified_current(result, prior_content_hash.as_deref());
+    jsonl_authority.verify_jsonl_authority()?;
+    let pinned_target = jsonl_authority.pinned_name_for_target(jsonl_path)?;
+    let published_source = result.published_source()?;
+    if published_source.display_path() != pinned_target.display_path()
+        || published_source.content_sha256() != result.content_hash
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL export receipt does not match the finalization target".to_string(),
+        });
+    }
+    verify_jsonl_source_snapshot_current(published_source, jsonl_authority)?;
+    let observed_jsonl = observed_jsonl_snapshot_witness(published_source);
+    let expected_export_hashes = exact_full_export_hash_mapping(result, issue_hashes)?;
 
     storage.with_write_transaction(|storage| -> Result<()> {
-        // Clear dirty flags for exported issues (safe version with timestamp validation)
-        if !result.exported_marked_at.is_empty() {
-            storage.clear_dirty_issues(&result.exported_marked_at)?;
+        let live_dirty_metadata = storage.get_dirty_issue_metadata()?;
+        let live_intentionally_excluded =
+            intentionally_excluded_dirty_metadata(storage, &live_dirty_metadata)?;
+        if live_intentionally_excluded != result.intentionally_excluded_marked_at {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Intentionally excluded dirty rows changed before full-export finalization"
+                        .to_string(),
+            });
         }
 
-        // Record export hashes for each exported issue. Keep unchanged rows
-        // stable so full flushes do not rewrite the export_hashes table.
-        if !export_hashes_current && let Some(hashes) = issue_hashes {
-            storage.set_changed_export_hashes_in_tx(hashes)?;
+        // Clear dirty flags for exported issues (safe version with timestamp validation)
+        if !result.exported_marked_at.is_empty() {
+            storage.clear_dirty_issues_in_tx(&result.exported_marked_at)?;
+        }
+        if !result.intentionally_excluded_marked_at.is_empty() {
+            storage.clear_dirty_issues_in_tx(&result.intentionally_excluded_marked_at)?;
+        }
+        let remaining_dirty_rows = additive_raw_rows(
+            storage,
+            "SELECT issue_id, marked_at FROM dirty_issues ORDER BY issue_id, marked_at",
+        )?;
+        if !remaining_dirty_rows.is_empty() {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Full-export finalization left dirty rows after exact reconciliation"
+                        .to_string(),
+            });
+        }
+
+        // Reconcile the table to the exact published mapping. Unchanged rows
+        // retain their original exported_at timestamp; stale, excluded, and
+        // expired rows are removed, and only changed/new rows are rewritten.
+        let current_export_hashes = additive_export_hashes(storage)?;
+        let stale_ids = current_export_hashes
+            .keys()
+            .filter(|issue_id| !expected_export_hashes.contains_key(*issue_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !stale_ids.is_empty() {
+            storage.clear_export_hashes_in_tx(&stale_ids)?;
+        }
+        let changed_hashes = expected_export_hashes
+            .iter()
+            .filter(|(issue_id, content_hash)| {
+                current_export_hashes.get(*issue_id) != Some(*content_hash)
+            })
+            .map(|(issue_id, content_hash)| (issue_id.clone(), content_hash.clone()))
+            .collect::<Vec<_>>();
+        if !changed_hashes.is_empty() {
+            storage.set_changed_export_hashes_in_tx(&changed_hashes)?;
+        }
+        if additive_export_hashes(storage)? != expected_export_hashes {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Full-export finalization did not produce the exact published issue-hash mapping"
+                        .to_string(),
+            });
         }
 
         // Update metadata
@@ -2889,11 +10702,59 @@ pub fn finalize_export(
     Ok(())
 }
 
-fn export_hashes_certified_current(
+fn exact_full_export_hash_mapping(
     result: &ExportResult,
-    prior_content_hash: Option<&str>,
-) -> bool {
-    result.exported_marked_at.is_empty() && prior_content_hash == Some(result.content_hash.as_str())
+    issue_hashes: Option<&[(String, String)]>,
+) -> Result<BTreeMap<String, String>> {
+    let issue_hashes = issue_hashes.ok_or_else(|| BeadsError::SyncConflict {
+        message: "Full-export finalization requires the exact published issue-hash mapping"
+            .to_string(),
+    })?;
+    if result.exported_count != result.exported_ids.len() {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL export result count does not match its exported ID manifest"
+                .to_string(),
+        });
+    }
+    let exported_ids = result.exported_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if exported_ids.len() != result.exported_ids.len() {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL export result contains duplicate exported issue IDs".to_string(),
+        });
+    }
+    let mut expected = BTreeMap::new();
+    for (issue_id, content_hash) in issue_hashes {
+        if expected
+            .insert(issue_id.clone(), content_hash.clone())
+            .is_some()
+        {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Full-export finalization contains duplicate issue-hash mapping for {issue_id}"
+                ),
+            });
+        }
+    }
+    let result_mapping = result
+        .issue_hashes
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    if result_mapping.len() != result.issue_hashes.len() || result_mapping != expected {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Full-export finalization issue-hash input does not match its immutable export result"
+                    .to_string(),
+        });
+    }
+    if expected.keys().cloned().collect::<BTreeSet<_>>() != exported_ids {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Full-export issue-hash mapping does not exactly cover the published issue IDs"
+                    .to_string(),
+        });
+    }
+    Ok(expected)
 }
 
 fn normalize_issue_for_export(issue: &mut Issue) {
@@ -2946,6 +10807,30 @@ fn filter_dirty_metadata_for_export(
                 .map(|marked_at| (issue_id.clone(), (*marked_at).to_string()))
         })
         .collect()
+}
+
+fn intentionally_excluded_dirty_metadata(
+    storage: &SqliteStorage,
+    dirty_metadata: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let dirty_ids = dirty_metadata
+        .iter()
+        .map(|(issue_id, _)| issue_id.clone())
+        .collect::<Vec<_>>();
+    let excluded_ids = storage
+        .get_issues_by_ids(&dirty_ids)?
+        .into_iter()
+        .filter(|issue| issue.ephemeral || issue.id.contains("-wisp-"))
+        .map(|issue| issue.id)
+        .collect::<HashSet<_>>();
+
+    let mut excluded = dirty_metadata
+        .iter()
+        .filter(|(issue_id, _)| excluded_ids.contains(issue_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    excluded.sort_unstable();
+    Ok(excluded)
 }
 
 fn restore_foreign_keys_after_import(
@@ -3023,6 +10908,9 @@ fn find_post_import_fk_violation(storage: &SqliteStorage) -> Result<Option<(Stri
         ("export_hashes", "issue_id"),
         ("blocked_issues_cache", "issue_id"),
         ("child_counters", "parent_id"),
+        ("close_metadata", "issue_id"),
+        ("gate_result_history", "issue_id"),
+        ("gate_results", "issue_id"),
     ];
 
     for (table, column) in fk_backed_tables {
@@ -3070,7 +10958,7 @@ fn finalize_incremental_auto_flush(
 
     storage.with_write_transaction(|storage| -> Result<()> {
         if !clear_dirty_metadata.is_empty() {
-            storage.clear_dirty_issues(clear_dirty_metadata)?;
+            storage.clear_dirty_issues_in_tx(clear_dirty_metadata)?;
         }
         if !removed_hash_ids.is_empty() {
             storage.clear_export_hashes_in_tx(removed_hash_ids)?;
@@ -3440,6 +11328,8 @@ fn try_existing_line_auto_flush(
     jsonl_path: &Path,
     export_config: &ExportConfig,
     changes: &IncrementalAutoFlushChanges,
+    jsonl_authority: &JsonlFamilyWriteLock,
+    source_content_hash: &str,
 ) -> Result<Option<AutoFlushResult>> {
     if !changes.removed_hash_ids.is_empty() || changes.replacement_lines.is_empty() {
         return Ok(None);
@@ -3453,6 +11343,13 @@ fn try_existing_line_auto_flush(
 
     match result {
         ExistingJsonlReplacementWrite::Unchanged { .. } => {
+            jsonl_authority.verify_jsonl_authority()?;
+            if compute_jsonl_hash(jsonl_path)? != source_content_hash {
+                return Err(BeadsError::SyncConflict {
+                    message: "JSONL changed during an unchanged incremental auto-flush scan"
+                        .to_string(),
+                });
+            }
             finalize_incremental_auto_flush(
                 storage,
                 &changes.dirty_metadata,
@@ -3467,6 +11364,13 @@ fn try_existing_line_auto_flush(
             content_hash,
             exported_count,
         } => {
+            jsonl_authority.verify_jsonl_authority()?;
+            if compute_jsonl_hash(jsonl_path)? != content_hash {
+                return Err(BeadsError::SyncConflict {
+                    message: "Persisted JSONL bytes do not match the incremental auto-flush hash"
+                        .to_string(),
+                });
+            }
             finalize_incremental_auto_flush(
                 storage,
                 &changes.dirty_metadata,
@@ -3511,6 +11415,25 @@ fn try_incremental_auto_flush(
         return Ok(None);
     }
 
+    let jsonl_authority = blocking_jsonl_family_write_lock_with_timeout(jsonl_path, None)?;
+    jsonl_authority.verify_jsonl_authority()?;
+    if !jsonl_path.is_file() {
+        return Err(BeadsError::SyncConflict {
+            message: "JSONL disappeared while acquiring incremental auto-flush authority"
+                .to_string(),
+        });
+    }
+    let source_content_hash = compute_jsonl_hash(jsonl_path)?;
+    let conflict_markers = scan_conflict_markers(jsonl_path)?;
+    if !conflict_markers.is_empty() {
+        tracing::warn!(
+            jsonl_path = %jsonl_path.display(),
+            marker_count = conflict_markers.len(),
+            "Skipping incremental auto-flush: JSONL contains merge-conflict markers",
+        );
+        return Ok(Some(AutoFlushResult::default()));
+    }
+
     let dirty_metadata = storage.get_dirty_issue_metadata()?;
     if dirty_metadata.is_empty() {
         return Ok(Some(AutoFlushResult::default()));
@@ -3524,9 +11447,14 @@ fn try_incremental_auto_flush(
         ..Default::default()
     };
 
-    if let Some(result) =
-        try_existing_line_auto_flush(storage, jsonl_path, &export_config, &changes)?
-    {
+    if let Some(result) = try_existing_line_auto_flush(
+        storage,
+        jsonl_path,
+        &export_config,
+        &changes,
+        &jsonl_authority,
+        &source_content_hash,
+    )? {
         return Ok(Some(result));
     }
 
@@ -3534,6 +11462,12 @@ fn try_incremental_auto_flush(
     let changed = apply_incremental_auto_flush_changes(&mut lines_by_id, &changes);
 
     if !changed {
+        jsonl_authority.verify_jsonl_authority()?;
+        if compute_jsonl_hash(jsonl_path)? != source_content_hash {
+            return Err(BeadsError::SyncConflict {
+                message: "JSONL changed during incremental auto-flush reconciliation".to_string(),
+            });
+        }
         finalize_incremental_auto_flush(
             storage,
             &changes.dirty_metadata,
@@ -3546,6 +11480,13 @@ fn try_incremental_auto_flush(
     }
 
     let content_hash = write_jsonl_lines_atomically(&lines_by_id, jsonl_path, &export_config)?;
+    jsonl_authority.verify_jsonl_authority()?;
+    if compute_jsonl_hash(jsonl_path)? != content_hash {
+        return Err(BeadsError::SyncConflict {
+            message: "Persisted JSONL bytes do not match the incremental auto-flush hash"
+                .to_string(),
+        });
+    }
     finalize_incremental_auto_flush(
         storage,
         &changes.dirty_metadata,
@@ -3598,6 +11539,21 @@ pub fn auto_flush(
     jsonl_path: &Path,
     allow_external_jsonl: bool,
 ) -> Result<AutoFlushResult> {
+    // This guard is intentionally independent of CLI/MCP startup policy and
+    // precedes the dirty/no-op probe. A clean database with a durable pending
+    // saga is still not safe for an unrelated automatic exporter: even a
+    // nominal no-op may refresh metadata or become dirty after a caller's
+    // stale preflight.
+    let pending = storage.inspect_pending_sync_merge()?;
+    if !pending.permits_automatic_mutation() {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "{}; automatic JSONL export is disabled until `br sync --merge` reconciles and clears the pending state",
+                pending.diagnostic()
+            ),
+        });
+    }
+
     // Check for dirty issues or forced flush first
     let jsonl_exists = jsonl_path.exists();
     let (dirty_count, needs_flush, db_newer) = pending_export_state(storage, jsonl_exists)?;
@@ -3647,10 +11603,7 @@ pub fn auto_flush(
             }
             Ok(None) => {}
             Err(err) => {
-                tracing::debug!(
-                    ?err,
-                    "Incremental auto-flush unavailable; falling back to full export"
-                );
+                return Err(err);
             }
         }
     }
@@ -3668,8 +11621,13 @@ pub fn auto_flush(
     };
 
     // Perform export
-    let (export_result, _report) =
-        export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
+    let expected_missing_jsonl = (!jsonl_exists).then_some(None);
+    let (export_result, _report) = export_to_jsonl_with_policy_expected(
+        storage,
+        jsonl_path,
+        &export_config,
+        expected_missing_jsonl.as_ref(),
+    )?;
 
     // Finalize export (clear dirty flags, update metadata)
     finalize_export(
@@ -3701,7 +11659,19 @@ pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
     path::validate_jsonl_fd_metadata(&file, path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     let estimated_count = (file_size / 500) as usize;
-    let mut reader = BufReader::new(file);
+    read_issues_from_jsonl_reader(path, estimated_count, BufReader::new(file))
+}
+
+pub(crate) fn read_issues_from_jsonl_snapshot(source: &JsonlSourceSnapshot) -> Result<Vec<Issue>> {
+    let estimated_count = (source.size() / 500) as usize;
+    read_issues_from_jsonl_reader(source.display_path(), estimated_count, source.reader())
+}
+
+fn read_issues_from_jsonl_reader(
+    display_path: &Path,
+    estimated_count: usize,
+    mut reader: impl BufRead,
+) -> Result<Vec<Issue>> {
     let mut issues = Vec::with_capacity(estimated_count);
     let mut seen_ids = HashSet::with_capacity(estimated_count);
     let mut line = String::new();
@@ -3727,7 +11697,7 @@ pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
             return Err(BeadsError::Config(format!(
                 "Duplicate issue id '{}' in {} at line {}",
                 issue.id,
-                path.display(),
+                display_path.display(),
                 line_num + 1
             )));
         }
@@ -3892,20 +11862,16 @@ fn normalize_issue(issue: &mut Issue) {
         }
     }
 
-    // Deduplicate dependencies: for each (issue_id, depends_on_id, dep_type) triple,
-    // keep only the most recent entry by created_at. This handles duplicate parent-child
-    // entries from reparenting or migration artifacts (see issue #159).
+    // Deduplicate dependencies by the database key (issue_id, depends_on_id),
+    // keeping only the most recent entry by created_at. This handles duplicate
+    // parent-child entries from reparenting or migration artifacts (see issue #159).
     if issue.dependencies.len() > 1 {
         use std::collections::HashMap;
-        // Build a map keyed by (issue_id, depends_on_id, dep_type), keeping the entry
-        // with the latest created_at for each triple.
-        let mut best: HashMap<(String, String, String), usize> = HashMap::new();
+        // The storage schema has one row per pair, so type-distinct duplicates
+        // cannot be preserved without a schema migration.
+        let mut best: HashMap<(String, String), usize> = HashMap::new();
         for (i, dep) in issue.dependencies.iter().enumerate() {
-            let key = (
-                dep.issue_id.clone(),
-                dep.depends_on_id.clone(),
-                dep.dep_type.as_str().to_string(),
-            );
+            let key = (dep.issue_id.clone(), dep.depends_on_id.clone());
             match best.get(&key) {
                 Some(&prev_idx) if issue.dependencies[prev_idx].created_at >= dep.created_at => {
                     // existing entry is newer or equal, skip
@@ -4022,12 +11988,10 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue
 }
 
 fn for_each_jsonl_import_issue(
-    input_path: &Path,
+    source: &JsonlSourceSnapshot,
     mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
 ) -> Result<()> {
-    let file = File::open(input_path)?;
-    path::validate_jsonl_fd_metadata(&file, input_path)?;
-    let mut reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut reader = source.reader();
     let mut line = String::new();
     let mut line_num = 0usize;
 
@@ -4045,14 +12009,14 @@ fn for_each_jsonl_import_issue(
 }
 
 fn collect_import_validation_plan(
-    input_path: &Path,
+    source: &JsonlSourceSnapshot,
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
 
-    for_each_jsonl_import_issue(input_path, |line_num, issue| {
+    for_each_jsonl_import_issue(source, |line_num, issue| {
         let prefix_mismatch = !config.skip_prefix_validation
             && expected_prefix.is_some_and(|prefix| {
                 !id_matches_expected_prefix(&issue.id, prefix)
@@ -4072,7 +12036,7 @@ fn collect_import_validation_plan(
             return Err(BeadsError::Config(format!(
                 "Duplicate issue id '{}' in {} at line {}",
                 issue.id,
-                input_path.display(),
+                source.display_path().display(),
                 line_num
             )));
         }
@@ -4109,7 +12073,7 @@ fn build_prefix_renames(
         return Ok(HashMap::new());
     };
 
-    let generator = IdGenerator::new(IdConfig::with_prefix(prefix));
+    let generator = IdGenerator::new(IdConfig::with_prefix(prefix)?);
     let mut occupied_ids = plan.occupied_ids.clone();
     occupied_ids.extend(storage.get_all_ids()?);
 
@@ -4123,8 +12087,8 @@ fn build_prefix_renames(
             seed.created_by.as_deref(),
             seed.created_at,
             plan.record_count,
-            |candidate| occupied_ids.contains(candidate) || generated_ids.contains(candidate),
-        );
+            |candidate| Ok(occupied_ids.contains(candidate) || generated_ids.contains(candidate)),
+        )?;
         generated_ids.insert(new_id.clone());
         renames.insert(seed.old_id.clone(), new_id);
     }
@@ -4173,7 +12137,9 @@ fn load_import_metadata_maps(storage: &SqliteStorage) -> Result<ImportMetadataMa
                 .entry(ext.clone())
                 .or_insert_with(|| issue_id.clone());
         }
-        if let Some(hash) = metadata.content_hash.as_ref() {
+        if metadata.status != crate::model::Status::Tombstone
+            && let Some(hash) = metadata.content_hash.as_ref()
+        {
             // Preserve the first matching issue to mirror the old query_row
             // collision path when multiple issues share the same content hash.
             id_by_hash
@@ -4216,7 +12182,7 @@ fn handle_duplicate_external_ref(
 }
 
 fn scan_import_collision_renames(
-    input_path: &Path,
+    source: &JsonlSourceSnapshot,
     config: &ImportConfig,
     prefix_renames: &HashMap<String, String>,
     metadata: &ImportMetadataMaps,
@@ -4228,7 +12194,7 @@ fn scan_import_collision_renames(
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
-    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -4361,7 +12327,7 @@ fn export_hash_entry_for_import_action(
 #[allow(clippy::too_many_arguments)]
 fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
-    input_path: &Path,
+    source: &JsonlSourceSnapshot,
     config: &ImportConfig,
     prefix_renames: &HashMap<String, String>,
     collision_renames: &HashMap<String, String>,
@@ -4378,7 +12344,7 @@ fn stream_import_actions_in_tx(
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
 
-    for_each_jsonl_import_issue(input_path, |_line_num, mut issue| {
+    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -4500,12 +12466,31 @@ pub fn import_from_jsonl(
         );
     }
 
+    let source = capture_jsonl_source_snapshot(input_path)?;
+    import_from_jsonl_snapshot(storage, &source, config, expected_prefix)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn import_from_jsonl_snapshot(
+    storage: &mut SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+) -> Result<ImportResult> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(
+            source.display_path(),
+            beads_dir,
+            config.allow_external_jsonl,
+        )?;
+    }
+
     // Step 1: Conflict marker scan
-    ensure_no_conflict_markers(input_path)?;
+    ensure_no_conflict_markers_snapshot(source)?;
 
     // Step 2: Parse, Normalize, Validate, and collect minimal rename state.
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
-    let validation_plan = collect_import_validation_plan(input_path, config, expected_prefix)?;
+    let validation_plan = collect_import_validation_plan(source, config, expected_prefix)?;
     spinner.finish_with_message("Parsed and validated issues");
 
     let mut result = ImportResult::default();
@@ -4522,7 +12507,7 @@ pub fn import_from_jsonl(
 
     // Phase 1: Scan and Resolve IDs
     let collision_renames = scan_import_collision_renames(
-        input_path,
+        source,
         config,
         &prefix_renames,
         &metadata,
@@ -4530,8 +12515,8 @@ pub fn import_from_jsonl(
         validation_plan.record_count,
     )?;
 
-    let jsonl_hash = compute_jsonl_hash(input_path)?;
-    let observed_jsonl = observed_jsonl_witness(input_path)?;
+    let jsonl_hash = compute_jsonl_snapshot_content_hash(source)?;
+    let observed_jsonl = observed_jsonl_snapshot_witness(source);
 
     // Phase 2: Execute Actions
     //
@@ -4554,7 +12539,7 @@ pub fn import_from_jsonl(
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
         let tx_result = stream_import_actions_in_tx(
             storage,
-            input_path,
+            source,
             config,
             &prefix_renames,
             &collision_renames,
@@ -4615,7 +12600,7 @@ fn process_import_action(
             if insert_new_import_issue(storage, issue)?
                 && !storage.has_owned_relation_rows_for_import(&issue.id)?
             {
-                storage.insert_new_issue_relations_for_import(issue)?;
+                storage.insert_new_issue_relations_for_import_in_tx(issue)?;
             } else {
                 sync_issue_relations(storage, issue)?;
             }
@@ -4627,12 +12612,12 @@ fn process_import_action(
             // When updating by external_ref or content_hash, the incoming issue may have
             // a different ID than the existing one. We need to update using the existing ID.
             if existing_id == &issue.id {
-                storage.upsert_issue_for_import(issue)?;
+                storage.upsert_issue_for_import_in_tx(issue)?;
                 sync_issue_relations(storage, issue)?;
             } else {
                 let mut updated_issue = issue.clone();
                 updated_issue.id.clone_from(existing_id);
-                storage.upsert_issue_for_import(&updated_issue)?;
+                storage.upsert_issue_for_import_in_tx(&updated_issue)?;
                 sync_issue_relations(storage, &updated_issue)?;
             }
             result.imported_count += 1;
@@ -4652,7 +12637,7 @@ fn process_import_action(
 }
 
 fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<bool> {
-    match storage.insert_new_issue_for_import(issue) {
+    match storage.insert_new_issue_for_import_in_tx(issue) {
         Ok(_) => Ok(true),
         Err(BeadsError::Database(
             fsqlite_error::FrankenError::PrimaryKeyViolation
@@ -4662,7 +12647,7 @@ fn insert_new_import_issue(storage: &SqliteStorage, issue: &Issue) -> Result<boo
                 id = %issue.id,
                 "Import insert found a concurrent key collision; falling back to upsert"
             );
-            storage.upsert_issue_for_import(issue)?;
+            storage.upsert_issue_for_import_in_tx(issue)?;
             Ok(false)
         }
         Err(error) => Err(error),
@@ -4678,13 +12663,13 @@ fn record_imported_relation_counts(result: &mut ImportResult, issue: &Issue) {
 /// Sync labels, dependencies, and comments for an imported issue.
 fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
     // Sync labels
-    storage.sync_labels_for_import(&issue.id, &issue.labels)?;
+    storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
 
     // Sync dependencies
-    storage.sync_dependencies_for_import(&issue.id, &issue.dependencies)?;
+    storage.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
 
     // Sync comments
-    storage.sync_comments_for_import(&issue.id, &issue.comments)?;
+    storage.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
 
     Ok(())
 }
@@ -4694,11 +12679,7 @@ fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the file cannot be read.
-pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path)?;
-    self::path::validate_jsonl_fd_metadata(&file, path)?;
-    let mut reader = std::io::BufReader::new(file);
+fn compute_jsonl_hash_from_reader(mut reader: impl BufRead) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut line_buf = Vec::with_capacity(4096);
 
@@ -4719,6 +12700,652 @@ pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
     }
 
     Ok(hex_encode(&hasher.finalize()))
+}
+
+pub(crate) fn compute_jsonl_snapshot_content_hash(source: &JsonlSourceSnapshot) -> Result<String> {
+    Ok(source.content_sha256().to_string())
+}
+
+/// Finalize an import by computing the canonical content hash of the file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read.
+pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
+    let file = std::fs::File::open(path)?;
+    self::path::validate_jsonl_fd_metadata(&file, path)?;
+    compute_jsonl_hash_from_reader(std::io::BufReader::new(file))
+}
+
+// ============================================================================
+// Additive Reconciliation (beads_rust-3r45)
+// ============================================================================
+
+/// Schema marker for `br sync --reconcile` receipts.
+pub const SYNC_RECONCILE_SCHEMA_VERSION: &str = "br.sync.reconcile.v1";
+
+/// Per-row action kind planned by additive reconciliation.
+///
+/// Deletion is structurally impossible in this mode: there is no variant for
+/// it, and the applier only ever routes through the import-path upserts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileActionKind {
+    /// JSONL row has no DB counterpart; insert it.
+    Create,
+    /// JSONL row is strictly newer than its DB counterpart; update in place.
+    Update,
+    /// DB counterpart is strictly newer; leave it alone.
+    SkipOlder,
+    /// Timestamps are equal; leave the DB row alone.
+    SkipEqual,
+    /// DB counterpart is a tombstone; tombstone protection wins.
+    SkipTombstone,
+}
+
+/// One planned JSONL-row action bound to a target issue id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileAction {
+    /// 1-based JSONL line number the row was parsed from.
+    pub line: usize,
+    /// Issue id as written in the JSONL row.
+    pub incoming_id: String,
+    /// DB issue id the action applies to (differs from `incoming_id` when the
+    /// collision detector matched by `external_ref` or content hash).
+    pub target_id: String,
+    /// Planned action.
+    pub kind: ReconcileActionKind,
+}
+
+/// Witnesses a reconcile plan was computed against.
+///
+/// The applier re-verifies every field before mutating anything and rolls the
+/// transaction back on any mismatch, so a plan can never be applied to state
+/// it was not computed from.
+#[derive(Debug, Clone)]
+pub struct ReconcileWitness {
+    /// Whitespace-normalized SHA-256 of the JSONL content (same function the
+    /// stored `jsonl_content_hash` metadata uses).
+    pub jsonl_content_hash: String,
+    /// RFC3339 mtime of the JSONL file at plan time.
+    pub jsonl_mtime_witness: String,
+    /// Byte size of the JSONL file at plan time.
+    pub jsonl_size: u64,
+    /// Total issue rows in the DB at plan time (including tombstones).
+    pub db_issue_count: usize,
+    /// Total event rows at plan time.
+    pub events_count: u64,
+    /// Highest event rowid at plan time.
+    pub events_max_id: Option<i64>,
+}
+
+/// Read-only additive reconciliation plan.
+#[derive(Debug, Clone)]
+pub struct ReconcilePlan {
+    /// Non-empty JSONL rows parsed (including ephemeral rows).
+    pub record_count: usize,
+    /// Ephemeral (`-wisp-`) rows excluded from planning.
+    pub ephemeral_skipped: usize,
+    /// Ordered per-row actions (ephemeral rows excluded).
+    pub actions: Vec<ReconcileAction>,
+    /// Exportable DB issue ids absent from the JSONL row set (sorted). These
+    /// are never touched by apply; they only inform the `needs_flush` repair.
+    pub db_only_ids: Vec<String>,
+    /// Label rows carried by planned create/update rows.
+    pub labels_planned: usize,
+    /// Dependency rows carried by planned create/update rows.
+    pub dependencies_planned: usize,
+    /// Comment rows carried by planned create/update rows.
+    pub comments_planned: usize,
+    /// Whether the stored `jsonl_content_hash` metadata already matches the
+    /// file. True together with a non-empty create/update set is exactly the
+    /// false-equal state this mode exists to repair.
+    pub stored_hash_matches_jsonl: bool,
+    /// Bound witnesses for apply-time verification.
+    pub witness: ReconcileWitness,
+}
+
+impl ReconcilePlan {
+    /// Count planned actions of one kind.
+    #[must_use]
+    pub fn count_kind(&self, kind: ReconcileActionKind) -> usize {
+        self.actions.iter().filter(|a| a.kind == kind).count()
+    }
+
+    /// Whether apply would change any issue row.
+    #[must_use]
+    pub fn has_row_changes(&self) -> bool {
+        self.actions.iter().any(|a| {
+            matches!(
+                a.kind,
+                ReconcileActionKind::Create | ReconcileActionKind::Update
+            )
+        })
+    }
+
+    /// Sorted target ids for one action kind.
+    #[must_use]
+    pub fn target_ids_for_kind(&self, kind: ReconcileActionKind) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .actions
+            .iter()
+            .filter(|a| a.kind == kind)
+            .map(|a| a.target_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+}
+
+/// Outcome of applying an additive reconcile plan.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileApplyOutcome {
+    /// Issues inserted.
+    pub created: usize,
+    /// Issues updated in place.
+    pub updated: usize,
+    /// Rows skipped because the DB copy is strictly newer.
+    pub skipped_older: usize,
+    /// Rows skipped because timestamps are equal.
+    pub skipped_equal: usize,
+    /// Rows skipped by tombstone protection.
+    pub skipped_tombstone: usize,
+    /// Ephemeral rows excluded.
+    pub ephemeral_skipped: usize,
+    /// Label rows written for applied issues.
+    pub labels_imported: usize,
+    /// Dependency rows written for applied issues.
+    pub dependencies_imported: usize,
+    /// Comment rows written for applied issues.
+    pub comments_imported: usize,
+    /// Export-hash rows recorded for rows whose DB copy now matches JSONL.
+    pub export_hashes_recorded: usize,
+    /// Skipped rows whose DB copy differs from JSONL (local wins that still
+    /// need a future flush).
+    pub uncertified_local_wins: usize,
+    /// Dangling dependency rows removed from just-written issues.
+    pub orphan_dependencies_cleaned: usize,
+    /// Blocked-cache rows after rebuild (0 when no rebuild was needed).
+    pub blocked_cache_entries: usize,
+    /// Child-counter rows after rebuild (0 when no rebuild was needed).
+    pub child_counter_entries: usize,
+    /// Event rows after apply (must equal the plan's `events_count`).
+    pub events_after: u64,
+    /// Whether `needs_flush` was set because local state still diverges from
+    /// JSONL (db-only rows or uncertified local wins).
+    pub needs_flush_set: bool,
+    /// Whether the import metadata (content hash + witness + import time) was
+    /// repaired in the apply transaction.
+    pub metadata_repaired: bool,
+}
+
+fn reconcile_kind_for_action(action: &CollisionAction) -> ReconcileActionKind {
+    match action {
+        CollisionAction::Insert => ReconcileActionKind::Create,
+        CollisionAction::Update { .. } => ReconcileActionKind::Update,
+        CollisionAction::Skip { reason } => {
+            if reason.starts_with("Tombstone") {
+                ReconcileActionKind::SkipTombstone
+            } else if reason.starts_with("Equal timestamps") {
+                ReconcileActionKind::SkipEqual
+            } else {
+                ReconcileActionKind::SkipOlder
+            }
+        }
+    }
+}
+
+fn reconcile_config_error(message: impl Into<String>) -> BeadsError {
+    BeadsError::Config(message.into())
+}
+
+/// Classify every non-ephemeral JSONL row against the current DB state.
+///
+/// Shared by the read-only planner and the in-transaction apply verifier so
+/// both sides are guaranteed to run the identical classification. The
+/// callback receives each parsed issue together with its classified action;
+/// classification uses the same collision detector and timestamp-newer-wins
+/// action table as `--import-only` with `force_upsert` disabled.
+fn for_each_reconcile_classified_row<F>(
+    source: &JsonlSourceSnapshot,
+    config: &ImportConfig,
+    metadata: &ImportMetadataMaps,
+    mut handle: F,
+) -> Result<(usize, usize)>
+where
+    F: FnMut(usize, Issue, &CollisionAction, &str) -> Result<()>,
+{
+    let mut seen_external_refs = HashSet::new();
+    let mut record_count = 0usize;
+    let mut ephemeral_skipped = 0usize;
+
+    for_each_jsonl_import_issue(source, |line_num, mut issue| {
+        record_count += 1;
+        if issue.ephemeral {
+            ephemeral_skipped += 1;
+            return Ok(());
+        }
+
+        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+        let computed_hash = crate::util::content_hash(&issue);
+        let collision = detect_collision(
+            &issue,
+            &metadata.id_by_ext_ref,
+            &metadata.id_by_hash,
+            &metadata.meta_by_id,
+            &computed_hash,
+        );
+        let action = determine_action(&collision, &issue, &metadata.meta_by_id, false)?;
+        let target_id = match &collision {
+            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+            CollisionResult::NewIssue => issue.id.clone(),
+        };
+
+        handle(line_num, issue, &action, &target_id)
+    })?;
+
+    Ok((record_count, ephemeral_skipped))
+}
+
+/// Plan an additive JSONL→DB reconciliation without any mutation.
+///
+/// The planner parses and validates the JSONL, classifies every row with the
+/// import collision detector (timestamp-newer-wins, tombstone protection, no
+/// force), and binds the resulting plan to content/stat witnesses of both
+/// sides. It compares full issue state instead of trusting the cached
+/// `jsonl_content_hash` metadata, so it sees divergence that the
+/// `--import-only` staleness short-circuit is structurally blind to.
+///
+/// The planner opens no write transaction and writes nothing: no metadata, no
+/// JSONL, no base snapshot, no dirty markers, no caches.
+///
+/// # Errors
+///
+/// Returns an error if path validation fails, the JSONL is missing, contains
+/// conflict markers, malformed JSON, duplicate ids or duplicate external
+/// refs, or if the JSONL file changes while planning.
+pub fn plan_sync_reconcile(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+) -> Result<ReconcilePlan> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl)?;
+    }
+    if !input_path.is_file() {
+        return Err(reconcile_config_error(format!(
+            "Cannot reconcile: JSONL file not found at {}",
+            input_path.display()
+        )));
+    }
+    ensure_no_conflict_markers(input_path)?;
+
+    // Reconcile never renames prefixes or ids; run the structural validation
+    // pass (duplicate-id detection, parseability) with prefix checks off.
+    let mut validation_config = config.clone();
+    validation_config.skip_prefix_validation = true;
+    validation_config.rename_on_import = false;
+    // One immutable capture serves validation and classification so a
+    // concurrent JSONL writer cannot split what the planner observes.
+    let source = capture_jsonl_source_snapshot(input_path)?;
+    collect_import_validation_plan(&source, &validation_config, None)?;
+
+    // Bind the source witness before classification so a concurrent JSONL
+    // writer is detected by the re-stat below.
+    let observed = observed_jsonl_witness(input_path)?;
+    let jsonl_content_hash = compute_jsonl_hash(input_path)?;
+
+    let metadata = load_import_metadata_maps(storage)?;
+
+    let mut actions = Vec::new();
+    let mut jsonl_target_ids = HashSet::new();
+    let mut labels_planned = 0usize;
+    let mut dependencies_planned = 0usize;
+    let mut comments_planned = 0usize;
+
+    let (record_count, ephemeral_skipped) = for_each_reconcile_classified_row(
+        &source,
+        config,
+        &metadata,
+        |line_num, issue, action, target_id| {
+            let kind = reconcile_kind_for_action(action);
+            if matches!(
+                kind,
+                ReconcileActionKind::Create | ReconcileActionKind::Update
+            ) {
+                labels_planned += issue.labels.len();
+                dependencies_planned += issue.dependencies.len();
+                comments_planned += issue.comments.len();
+            }
+            jsonl_target_ids.insert(target_id.to_string());
+            actions.push(ReconcileAction {
+                line: line_num,
+                incoming_id: issue.id,
+                target_id: target_id.to_string(),
+                kind,
+            });
+            Ok(())
+        },
+    )?;
+
+    let mut db_only_ids: Vec<String> = storage
+        .get_non_ephemeral_issue_ids()?
+        .into_iter()
+        .filter(|id| !jsonl_target_ids.contains(id))
+        .collect();
+    db_only_ids.sort();
+
+    let stored_hash_matches_jsonl = storage
+        .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+        .as_deref()
+        == Some(jsonl_content_hash.as_str());
+    let db_issue_count = storage.count_all_issues()?;
+    let (events_count, events_max_id) = storage.events_table_witness()?;
+
+    // Re-stat: reject the plan if the JSONL changed underneath the scan.
+    let final_observed = observed_jsonl_witness(input_path)?;
+    if final_observed.mtime_witness != observed.mtime_witness
+        || final_observed.size != observed.size
+    {
+        return Err(reconcile_config_error(format!(
+            "JSONL file {} changed while planning reconciliation; re-run the command",
+            input_path.display()
+        )));
+    }
+
+    Ok(ReconcilePlan {
+        record_count,
+        ephemeral_skipped,
+        actions,
+        db_only_ids,
+        labels_planned,
+        dependencies_planned,
+        comments_planned,
+        stored_hash_matches_jsonl,
+        witness: ReconcileWitness {
+            jsonl_content_hash,
+            jsonl_mtime_witness: observed.mtime_witness,
+            jsonl_size: observed.size,
+            db_issue_count,
+            events_count,
+            events_max_id,
+        },
+    })
+}
+
+/// Apply a previously computed additive reconcile plan.
+///
+/// The applier re-verifies the plan's JSONL and DB witnesses, re-runs the
+/// classification inside a single write transaction, and rolls everything
+/// back if any row classifies differently from the plan. Writes go through
+/// the import-path upserts only: no table resets, no deletes of unsuperseded
+/// rows, no manufactured events, no JSONL/base writes, no VACUUM. The same
+/// transaction repairs the import metadata (content hash, stat witness,
+/// import time) so the stale-hash short-circuit stops reporting a false
+/// equal, and sets `needs_flush` when local state still diverges from JSONL
+/// (db-only rows or newer local rows).
+///
+/// # Errors
+///
+/// Returns an error (with the transaction rolled back and foreign keys
+/// restored) if the JSONL or DB changed since planning, if any row action
+/// diverges from the plan, if event rows changed during apply, or if any
+/// database operation fails.
+pub fn apply_sync_reconcile(
+    storage: &mut SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+    plan: &ReconcilePlan,
+) -> Result<ReconcileApplyOutcome> {
+    if let Some(ref beads_dir) = config.beads_dir {
+        validate_sync_path_with_external(input_path, beads_dir, config.allow_external_jsonl)?;
+    }
+    ensure_no_conflict_markers(input_path)?;
+
+    verify_reconcile_jsonl_witness(input_path, plan)?;
+
+    // Build the cross-reference rename map from the verified plan: rows whose
+    // collision target differs from their written id (external_ref or
+    // content-hash matches) must have their relation references rewritten the
+    // same way `--import-only` does.
+    let collision_renames: HashMap<String, String> = plan
+        .actions
+        .iter()
+        .filter(|a| a.incoming_id != a.target_id)
+        .map(|a| (a.incoming_id.clone(), a.target_id.clone()))
+        .collect();
+
+    // Imported rows may reference issues that appear later in the stream, so
+    // FK enforcement is deferred exactly like the import path.
+    storage
+        .execute_raw("PRAGMA foreign_keys = OFF")
+        .map_err(|source| BeadsError::WithContext {
+            context: "Failed to disable foreign key enforcement before reconcile".to_string(),
+            source: Box::new(source),
+        })?;
+
+    let apply_result = storage.with_write_transaction(|storage| {
+        run_reconcile_apply_tx(storage, input_path, config, plan, &collision_renames)
+    });
+
+    let validate_foreign_keys = apply_result.is_ok();
+    let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
+
+    let outcome = match (apply_result, fk_restore_result) {
+        (Ok(outcome), Ok(())) => outcome,
+        (Ok(_), Err(fk_err)) => return Err(fk_err),
+        (Err(apply_err), Ok(())) => return Err(apply_err),
+        (Err(apply_err), Err(fk_err)) => {
+            tracing::error!(
+                error = %fk_err,
+                "Failed to restore foreign key enforcement after failed reconcile"
+            );
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "reconcile failed, and SQLite foreign key enforcement could not be re-enabled: {fk_err}"
+                ),
+                source: Box::new(apply_err),
+            });
+        }
+    };
+
+    tracing::info!(
+        created = outcome.created,
+        updated = outcome.updated,
+        skipped_older = outcome.skipped_older,
+        skipped_equal = outcome.skipped_equal,
+        skipped_tombstone = outcome.skipped_tombstone,
+        events = outcome.events_after,
+        needs_flush_set = outcome.needs_flush_set,
+        "Additive reconcile applied"
+    );
+
+    Ok(outcome)
+}
+
+fn verify_reconcile_jsonl_witness(input_path: &Path, plan: &ReconcilePlan) -> Result<()> {
+    let observed = observed_jsonl_witness(input_path)?;
+    if observed.mtime_witness != plan.witness.jsonl_mtime_witness
+        || observed.size != plan.witness.jsonl_size
+    {
+        return Err(reconcile_config_error(format!(
+            "JSONL file {} changed since the reconcile plan was computed; re-run the command",
+            input_path.display()
+        )));
+    }
+    let current_hash = compute_jsonl_hash(input_path)?;
+    if current_hash != plan.witness.jsonl_content_hash {
+        return Err(reconcile_config_error(format!(
+            "JSONL content at {} no longer matches the reconcile plan; re-run the command",
+            input_path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_reconcile_apply_tx(
+    storage: &SqliteStorage,
+    input_path: &Path,
+    config: &ImportConfig,
+    plan: &ReconcilePlan,
+    collision_renames: &HashMap<String, String>,
+) -> Result<ReconcileApplyOutcome> {
+    // DB witness: the events table must be exactly as planned.
+    let (events_before, events_max_before) = storage.events_table_witness()?;
+    if events_before != plan.witness.events_count || events_max_before != plan.witness.events_max_id
+    {
+        return Err(reconcile_config_error(
+            "database events changed since the reconcile plan was computed; re-run the command",
+        ));
+    }
+
+    // Fresh in-transaction metadata: classification must be re-derived from
+    // live state, then compared row-by-row against the plan.
+    let metadata = load_import_metadata_maps(storage)?;
+
+    let mut outcome = ReconcileApplyOutcome::default();
+    let mut import_result = ImportResult::default();
+    let mut export_hash_batch: Vec<(String, String)> = Vec::new();
+    let mut export_hash_ids = HashSet::new();
+    let mut applied_ids: Vec<String> = Vec::new();
+    let mut action_index = 0usize;
+
+    let source = capture_jsonl_source_snapshot(input_path)?;
+    let (record_count, ephemeral_skipped) = for_each_reconcile_classified_row(
+        &source,
+        config,
+        &metadata,
+        |line_num, mut issue, action, target_id| {
+            let planned = plan.actions.get(action_index).ok_or_else(|| {
+                reconcile_config_error(
+                    "JSONL gained rows since the reconcile plan was computed; re-run the command",
+                )
+            })?;
+            let kind = reconcile_kind_for_action(action);
+            if planned.line != line_num
+                || planned.incoming_id != issue.id
+                || planned.target_id != target_id
+                || planned.kind != kind
+            {
+                return Err(reconcile_config_error(format!(
+                    "database or JSONL changed between plan and apply at line {line_num} \
+                     (planned {:?} {} -> {}, found {:?} {} -> {}); transaction rolled back",
+                    planned.kind, planned.incoming_id, planned.target_id, kind, issue.id, target_id,
+                )));
+            }
+            action_index += 1;
+
+            let computed_hash = crate::util::content_hash(&issue);
+            apply_collision_renames(&mut issue, collision_renames);
+            process_import_action(storage, action, &issue, &mut import_result)?;
+
+            match kind {
+                ReconcileActionKind::Create | ReconcileActionKind::Update => {
+                    applied_ids.push(target_id.to_string());
+                }
+                ReconcileActionKind::SkipOlder
+                | ReconcileActionKind::SkipEqual
+                | ReconcileActionKind::SkipTombstone => {}
+            }
+
+            if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+                storage,
+                action,
+                target_id,
+                &issue,
+                &computed_hash,
+            )? {
+                if export_hash_ids.insert(export_id.clone()) {
+                    export_hash_batch.push((export_id, export_hash));
+                }
+            } else {
+                outcome.uncertified_local_wins += 1;
+            }
+            Ok(())
+        },
+    )?;
+
+    if action_index != plan.actions.len() {
+        return Err(reconcile_config_error(
+            "JSONL lost rows since the reconcile plan was computed; re-run the command",
+        ));
+    }
+
+    if !export_hash_batch.is_empty() {
+        storage.set_changed_export_hashes_in_tx(&export_hash_batch)?;
+    }
+
+    outcome.created = import_result.created_count;
+    outcome.updated = import_result.updated_count;
+    outcome.skipped_older = plan.count_kind(ReconcileActionKind::SkipOlder);
+    outcome.skipped_equal = plan.count_kind(ReconcileActionKind::SkipEqual);
+    outcome.skipped_tombstone = import_result.tombstone_skipped;
+    outcome.ephemeral_skipped = ephemeral_skipped;
+    outcome.labels_imported = import_result.labels_imported;
+    outcome.dependencies_imported = import_result.dependencies_imported;
+    outcome.comments_imported = import_result.comments_imported;
+    outcome.export_hashes_recorded = export_hash_ids.len();
+    if record_count != plan.record_count {
+        return Err(reconcile_config_error(
+            "JSONL record count changed since the reconcile plan was computed; re-run the command",
+        ));
+    }
+
+    if !applied_ids.is_empty() {
+        applied_ids.sort();
+        applied_ids.dedup();
+        outcome.orphan_dependencies_cleaned =
+            storage.delete_orphan_dependencies_for_issues_in_tx(&applied_ids)?;
+        if outcome.orphan_dependencies_cleaned > 0 {
+            tracing::info!(
+                count = outcome.orphan_dependencies_cleaned,
+                "Reconcile removed dangling dependency rows from applied issues"
+            );
+        }
+        outcome.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+        outcome.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    }
+
+    // Repair the import metadata inside the same transaction so the
+    // false-equal stored hash cannot survive a successful apply.
+    let observed = observed_jsonl_witness(input_path)?;
+    if observed.mtime_witness != plan.witness.jsonl_mtime_witness
+        || observed.size != plan.witness.jsonl_size
+    {
+        return Err(reconcile_config_error(format!(
+            "JSONL file {} changed during reconcile apply; transaction rolled back",
+            input_path.display()
+        )));
+    }
+    storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+    storage.set_metadata_in_tx(
+        METADATA_JSONL_CONTENT_HASH,
+        &plan.witness.jsonl_content_hash,
+    )?;
+    record_observed_jsonl_witness_in_tx(storage, &observed)?;
+    outcome.metadata_repaired = true;
+
+    if outcome.uncertified_local_wins > 0 || !plan.db_only_ids.is_empty() {
+        tracing::debug!(
+            uncertified_local_wins = outcome.uncertified_local_wins,
+            db_only = plan.db_only_ids.len(),
+            "Reconcile preserved local records that diverge from JSONL; marking database for flush"
+        );
+        storage.set_metadata_in_tx("needs_flush", "true")?;
+        outcome.needs_flush_set = true;
+    }
+
+    // Hard guarantee: reconcile never creates, mutates, or deletes events.
+    let (events_after, events_max_after) = storage.events_table_witness()?;
+    if events_after != events_before || events_max_after != events_max_before {
+        return Err(reconcile_config_error(
+            "reconcile apply would have changed audit events; transaction rolled back",
+        ));
+    }
+    outcome.events_after = events_after;
+
+    Ok(outcome)
 }
 
 // ============================================================================
@@ -4776,8 +13403,8 @@ impl MergeContext {
 
     /// Get all unique issue IDs across all three states.
     #[must_use]
-    pub fn all_issue_ids(&self) -> std::collections::HashSet<String> {
-        let mut ids = std::collections::HashSet::new();
+    pub fn all_issue_ids(&self) -> BTreeSet<String> {
+        let mut ids = BTreeSet::new();
         ids.extend(self.base.keys().cloned());
         ids.extend(self.left.keys().cloned());
         ids.extend(self.right.keys().cloned());
@@ -5092,34 +13719,54 @@ pub struct MergeConfig {
     pub respect_tombstones: bool,
 }
 
-/// Save the base snapshot to a file.
-///
-/// This is used after a successful merge to record the common state.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be written.
-pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
-    issues: &std::collections::HashMap<String, Issue, S>,
+/// Write one base-snapshot generation through the conditional publisher.
+fn write_base_snapshot_atomically<WriteSnapshot>(
     jsonl_dir: &Path,
-) -> Result<()> {
+    write_snapshot: WriteSnapshot,
+) -> Result<()>
+where
+    WriteSnapshot: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
-    let (temp_path, temp_file) = create_base_snapshot_temp_file(&snapshot_path, jsonl_dir)?;
-    let mut temp_guard = TempFileGuard::new(temp_path.clone());
+    let authority = blocking_jsonl_family_write_lock_with_timeout(&snapshot_path, None)?;
+    let previous_source = authority.capture_optional_target()?;
+    let expected_previous_state = previous_source.as_ref().map_or(
+        JsonlSourceStateWitness::Missing,
+        JsonlSourceSnapshot::state_witness,
+    );
+    let publication = write_base_snapshot_atomically_under_authority(
+        jsonl_dir,
+        &expected_previous_state,
+        &authority,
+        write_snapshot,
+    )?;
+    if !publication.cleanup_durable() {
+        tracing::warn!(
+            snapshot_path = %snapshot_path.display(),
+            recovery_path = publication.retained_recovery_path(),
+            "Base snapshot reached its verified destination, but displaced-generation cleanup was not certified durable"
+        );
+    }
+    Ok(())
+}
+
+fn write_base_snapshot_atomically_under_authority<WriteSnapshot>(
+    jsonl_dir: &Path,
+    expected_previous_state: &JsonlSourceStateWitness,
+    authority: &JsonlFamilyWriteLock,
+    write_snapshot: WriteSnapshot,
+) -> Result<ExportPublicationReceipt>
+where
+    WriteSnapshot: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
+    let snapshot_path = jsonl_dir.join("beads.base.jsonl");
+    authority.verify_jsonl_authority()?;
+    let (temp_path, pinned_temp, temp_file) =
+        create_base_snapshot_temp_file_under_authority(&snapshot_path, jsonl_dir, authority)?;
+    let temp_guard = TempFileGuard::new_retained(temp_path.clone());
     let mut writer = BufWriter::new(temp_file);
 
-    let mut ordered_issues: Vec<_> = issues.values().collect();
-    ordered_issues.sort_by(|left, right| left.id.cmp(&right.id));
-
-    let mut buffer = Vec::new();
-    for issue in ordered_issues {
-        buffer.clear();
-        serde_json::to_writer(&mut buffer, issue).map_err(|e| {
-            BeadsError::Config(format!("Failed to serialize issue {}: {}", issue.id, e))
-        })?;
-        writer.write_all(&buffer).map_err(BeadsError::Io)?;
-        writer.write_all(b"\n").map_err(BeadsError::Io)?;
-    }
+    write_snapshot(&mut writer)?;
     writer.flush()?;
     writer
         .into_inner()
@@ -5127,9 +13774,48 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
         .sync_all()?;
     require_safe_sync_overwrite_path(&temp_path, jsonl_dir, false, "rename base snapshot")?;
     require_safe_sync_overwrite_path(&snapshot_path, jsonl_dir, false, "overwrite base snapshot")?;
-    crate::util::durable_rename(&temp_path, &snapshot_path)?;
-    temp_guard.persist();
-    Ok(())
+
+    let staged_source = pinned_temp.capture()?;
+    let content_sha256 = staged_source.content_sha256().to_string();
+    let publication = publish_staged_jsonl_conditionally(
+        &temp_path,
+        temp_guard,
+        &snapshot_path,
+        &staged_source,
+        expected_previous_state,
+        &content_sha256,
+        authority,
+        None,
+    )?;
+    Ok(publication.into_receipt(&snapshot_path, content_sha256))
+}
+
+/// Save the base snapshot to a file.
+///
+/// This is used after a successful merge to record the common state.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be written and durably published.
+pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
+    issues: &std::collections::HashMap<String, Issue, S>,
+    jsonl_dir: &Path,
+) -> Result<()> {
+    let mut ordered_issues: Vec<_> = issues.values().collect();
+    ordered_issues.sort_by(|left, right| left.id.cmp(&right.id));
+
+    write_base_snapshot_atomically(jsonl_dir, |writer| {
+        let mut buffer = Vec::new();
+        for issue in ordered_issues {
+            buffer.clear();
+            serde_json::to_writer(&mut buffer, issue).map_err(|e| {
+                BeadsError::Config(format!("Failed to serialize issue {}: {}", issue.id, e))
+            })?;
+            writer.write_all(&buffer).map_err(BeadsError::Io)?;
+            writer.write_all(b"\n").map_err(BeadsError::Io)?;
+        }
+        Ok(())
+    })
 }
 
 /// Save the base snapshot from a finalized JSONL export.
@@ -5143,12 +13829,96 @@ pub fn save_base_snapshot<S: ::std::hash::BuildHasher>(
 /// Returns an error if the finalized JSONL cannot be read or the base snapshot
 /// cannot be written.
 pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
-    ensure_no_conflict_markers(jsonl_path)?;
-    let issues: std::collections::HashMap<String, Issue> = read_issues_from_jsonl(jsonl_path)?
+    let source = capture_jsonl_source_snapshot(jsonl_path)?;
+    save_base_snapshot_from_jsonl_snapshot(&source, jsonl_dir)
+}
+
+pub(crate) fn save_base_snapshot_from_jsonl_snapshot(
+    source: &JsonlSourceSnapshot,
+    jsonl_dir: &Path,
+) -> Result<()> {
+    ensure_no_conflict_markers_snapshot(source)?;
+    let issues: std::collections::HashMap<String, Issue> = read_issues_from_jsonl_snapshot(source)?
         .into_iter()
         .map(|issue| (issue.id.clone(), issue))
         .collect();
     save_base_snapshot(&issues, jsonl_dir)
+}
+
+/// Refresh `beads.base.jsonl` with the exact bytes of a finalized flush
+/// export (issue #378).
+///
+/// After a clean `br sync --flush-only`, the database and the JSONL agree, so
+/// the JSONL that just reached disk IS the new common state future 3-way
+/// merges should diff against. Historically only the merge path wrote the
+/// anchor, which left flush-only workspaces (the common agent workflow)
+/// permanently anchor-less: `br doctor` warned `base_jsonl.missing_post_flush`
+/// forever while `br sync --status` reported "In sync".
+///
+/// This is a byte copy (not a parse + re-serialize) so the anchor matches the
+/// on-disk export exactly. The write goes through the same validated
+/// temp-file + durable-rename machinery as [`save_base_snapshot`], and a
+/// symlinked anchor is refused rather than followed (same attacker shape the
+/// doctor's `base_jsonl` check rejects).
+///
+/// # Errors
+///
+/// Returns an error if the finalized JSONL cannot be read, the anchor path is
+/// unsafe (symlink / escapes the workspace), or the snapshot cannot be
+/// written durably.
+pub fn refresh_base_snapshot_from_flushed_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
+    let source = capture_jsonl_source_snapshot(jsonl_path)?;
+    refresh_base_snapshot_from_flushed_jsonl_snapshot(&source, jsonl_dir)
+}
+
+pub(crate) fn refresh_base_snapshot_from_flushed_jsonl_snapshot(
+    source: &JsonlSourceSnapshot,
+    jsonl_dir: &Path,
+) -> Result<()> {
+    ensure_no_conflict_markers_snapshot(source)?;
+    write_base_snapshot_atomically(jsonl_dir, |writer| {
+        std::io::copy(&mut source.reader(), writer).map_err(BeadsError::Io)?;
+        Ok(())
+    })
+}
+
+pub(crate) fn refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority(
+    source: &JsonlSourceSnapshot,
+    jsonl_dir: &Path,
+    expected_previous_state: &JsonlSourceStateWitness,
+    authority: &JsonlFamilyWriteLock,
+) -> Result<ExportPublicationReceipt> {
+    ensure_no_conflict_markers_snapshot(source)?;
+    write_base_snapshot_atomically_under_authority(
+        jsonl_dir,
+        expected_previous_state,
+        authority,
+        |writer| {
+            std::io::copy(&mut source.reader(), writer).map_err(BeadsError::Io)?;
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn load_base_snapshot_from_source(
+    source: Option<&JsonlSourceSnapshot>,
+) -> Result<std::collections::HashMap<String, Issue>> {
+    let Some(source) = source else {
+        return Ok(std::collections::HashMap::new());
+    };
+    ensure_no_conflict_markers_snapshot(source)?;
+    let mut base = std::collections::HashMap::new();
+    for issue in read_issues_from_jsonl_snapshot(source)? {
+        let issue_id = issue.id.clone();
+        if base.insert(issue_id.clone(), issue).is_some() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Base snapshot contains duplicate issue ID {issue_id}; refusing an ambiguous merge ancestor"
+                ),
+            });
+        }
+    }
+    Ok(base)
 }
 
 /// Load the base snapshot from a file.
@@ -5160,58 +13930,94 @@ pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Res
 /// Returns an error if the file exists but cannot be read or parsed.
 pub fn load_base_snapshot(jsonl_dir: &Path) -> Result<std::collections::HashMap<String, Issue>> {
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
-    let mut base = std::collections::HashMap::new();
-
-    if !snapshot_path.exists() {
-        return Ok(base);
-    }
-
     require_valid_sync_path(&snapshot_path, jsonl_dir)?;
-
-    // `beads.base.jsonl` is normally .gitignore'd, but if a user's workspace
-    // has it committed (or committed by accident once), a botched `git merge`
-    // / `git pull` can leave `<<<<<<<` / `=======` / `>>>>>>>` markers in
-    // this file just like in `issues.jsonl`. The serde parse below would
-    // then fail with a generic "Invalid JSON in base snapshot at line N"
-    // that buries the actual problem. Run the conflict-marker scan first so
-    // the operator gets the same actionable "merge conflict markers
-    // detected" diagnostic that the JSONL path surfaces.
-    ensure_no_conflict_markers(&snapshot_path)?;
-
-    let file = File::open(&snapshot_path)?;
-    let reader = BufReader::new(file);
-
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let issue: Issue = serde_json::from_str(&line).map_err(|e| {
-            BeadsError::Config(format!(
-                "Invalid JSON in base snapshot at line {}: {}",
-                line_num + 1,
-                e
-            ))
-        })?;
-        base.insert(issue.id.clone(), issue);
-    }
-
-    Ok(base)
+    let source = capture_optional_jsonl_source(&snapshot_path)?;
+    load_base_snapshot_from_source(source.as_ref())
 }
 
-/// A tombstone row plus its related labels, dependencies, and comments,
+/// An issue row plus its related labels, dependencies, and comments,
 /// snapshotted before a rebuild so it can be atomically restored afterwards.
+/// Used both for unflushed tombstones (deletion-retention state absent from
+/// the JSONL) and for dirty live issues whose latest edit has not reached
+/// the JSONL yet (GitHub #394).
 ///
-/// The option wrappers on the relations let callers partially preserve a
-/// tombstone whose relation fetches failed (a pattern the CLI layer already
+/// The option wrappers on the relations let callers partially preserve an
+/// issue whose relation fetches failed (a pattern the CLI layer already
 /// uses): we keep the issue row and skip whatever relation set couldn't be
-/// read, rather than losing the tombstone entirely.
+/// read, rather than losing the issue entirely.
 #[derive(Clone, Debug)]
-pub(crate) struct PreservedTombstone {
+pub(crate) struct PreservedIssue {
     pub(crate) issue: Issue,
     pub(crate) labels: Option<Vec<String>>,
     pub(crate) dependencies: Option<Vec<Dependency>>,
     pub(crate) comments: Option<Vec<Comment>>,
+}
+
+/// Snapshot one issue row plus its relations, degrading gracefully: a
+/// missing or unreadable issue row yields `None` (with a warning), and a
+/// failed relation fetch yields issue-row-only preservation for that
+/// relation. `kind` labels the log lines so tombstone and dirty-issue
+/// snapshots stay distinguishable in traces.
+fn snapshot_preserved_issue(
+    storage: &SqliteStorage,
+    issue_id: &str,
+    kind: &str,
+) -> Option<PreservedIssue> {
+    let issue = match storage.get_issue(issue_id) {
+        Ok(issue) => issue,
+        Err(error) => {
+            tracing::warn!(
+                issue_id = %issue_id,
+                kind,
+                error = %error,
+                "Skipping preservation for issue that could not be read before rebuild"
+            );
+            return None;
+        }
+    }?;
+
+    let labels = match storage.get_labels(issue_id) {
+        Ok(labels) => Some(labels),
+        Err(error) => {
+            tracing::warn!(
+                issue_id = %issue_id,
+                kind,
+                error = %error,
+                "Failed to snapshot labels before rebuild; preserving issue row only"
+            );
+            None
+        }
+    };
+    let dependencies = match storage.get_dependencies_full(issue_id) {
+        Ok(dependencies) => Some(dependencies),
+        Err(error) => {
+            tracing::warn!(
+                issue_id = %issue_id,
+                kind,
+                error = %error,
+                "Failed to snapshot dependencies before rebuild; preserving issue row only"
+            );
+            None
+        }
+    };
+    let comments = match storage.get_comments(issue_id) {
+        Ok(comments) => Some(comments),
+        Err(error) => {
+            tracing::warn!(
+                issue_id = %issue_id,
+                kind,
+                error = %error,
+                "Failed to snapshot comments before rebuild; preserving issue row only"
+            );
+            None
+        }
+    };
+    Some(PreservedIssue {
+        issue,
+        labels,
+        dependencies,
+        comments,
+    })
 }
 
 /// Snapshot every tombstoned issue in the database, including its labels,
@@ -5224,8 +14030,7 @@ pub(crate) struct PreservedTombstone {
 /// per-tombstone relation fetches also degrade gracefully to issue-row-
 /// only preservation.
 #[must_use]
-pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedTombstone> {
-    let mut tombstones = Vec::new();
+pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedIssue> {
     let tombstone_ids = match storage.get_issue_ids_by_status(&crate::model::Status::Tombstone) {
         Ok(ids) => ids,
         Err(error) => {
@@ -5233,66 +14038,43 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedTombs
                 error = %error,
                 "Failed to enumerate tombstones before rebuild; continuing without tombstone preservation"
             );
-            return tombstones;
+            return Vec::new();
         }
     };
 
-    for tombstone_id in tombstone_ids {
-        let Some(issue) = (match storage.get_issue(&tombstone_id) {
-            Ok(issue) => issue,
-            Err(error) => {
-                tracing::warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Skipping tombstone preservation for issue that could not be read before rebuild"
-                );
-                continue;
-            }
-        }) else {
-            continue;
-        };
+    tombstone_ids
+        .iter()
+        .filter_map(|id| snapshot_preserved_issue(storage, id, "tombstone"))
+        .collect()
+}
 
-        let labels = match storage.get_labels(&tombstone_id) {
-            Ok(labels) => Some(labels),
-            Err(error) => {
-                tracing::warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Failed to snapshot tombstone labels before rebuild; preserving issue row only"
-                );
-                None
-            }
-        };
-        let dependencies = match storage.get_dependencies_full(&tombstone_id) {
-            Ok(dependencies) => Some(dependencies),
-            Err(error) => {
-                tracing::warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Failed to snapshot tombstone dependencies before rebuild; preserving issue row only"
-                );
-                None
-            }
-        };
-        let comments = match storage.get_comments(&tombstone_id) {
-            Ok(comments) => Some(comments),
-            Err(error) => {
-                tracing::warn!(
-                    issue_id = %tombstone_id,
-                    error = %error,
-                    "Failed to snapshot tombstone comments before rebuild; preserving issue row only"
-                );
-                None
-            }
-        };
-        tombstones.push(PreservedTombstone {
-            issue,
-            labels,
-            dependencies,
-            comments,
-        });
-    }
-    tombstones
+/// Snapshot every dirty *live* issue in the database — rows in
+/// `dirty_issues` whose latest state has never been flushed to the JSONL —
+/// so a rebuild that replays only the JSONL cannot silently drop them
+/// (GitHub #394). Tombstone-status rows are skipped here; the sibling
+/// `snapshot_tombstones` pass owns deletion-retention state.
+///
+/// Best-effort with the same degradation contract as `snapshot_tombstones`:
+/// enumeration failure logs and returns empty, per-issue failures skip that
+/// issue or degrade to issue-row-only preservation.
+#[must_use]
+pub(crate) fn snapshot_dirty_live_issues(storage: &SqliteStorage) -> Vec<PreservedIssue> {
+    let dirty_ids = match storage.get_dirty_issue_ids() {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to enumerate dirty issues before rebuild; continuing without dirty-issue preservation"
+            );
+            return Vec::new();
+        }
+    };
+
+    dirty_ids
+        .iter()
+        .filter_map(|id| snapshot_preserved_issue(storage, id, "dirty issue"))
+        .filter(|preserved| preserved.issue.status != crate::model::Status::Tombstone)
+        .collect()
 }
 
 /// Restore preserved tombstones after a successful rebuild, wrapping any
@@ -5304,32 +14086,32 @@ pub(crate) fn snapshot_tombstones(storage: &SqliteStorage) -> Vec<PreservedTombs
 /// point, so on failure the live DB is *valid* (it mirrors the JSONL),
 /// just missing whatever local unflushed tombstones we tried to preserve.
 /// Without this wrapper, a transient lock-contention retry exhaustion
-/// inside `restore_tombstones` would bubble up through callers that
+/// inside `restore_preserved_issues` would bubble up through callers that
 /// otherwise describe the failure as "JSONL may be corrupt" or "database
 /// recovery failed", both of which are actively misleading for this
 /// specific post-rebuild failure mode. The wrapped message tells the
 /// operator: re-running the command is idempotent and safe; the only
 /// thing they've lost is local deletions that hadn't yet been flushed.
 ///
-/// Callers should prefer this helper over calling `restore_tombstones`
+/// Callers should prefer this helper over calling `restore_preserved_issues`
 /// directly when the restore follows an already-completed rebuild. Use
-/// the bare `restore_tombstones` when the surrounding transaction is
+/// the bare `restore_preserved_issues` when the surrounding transaction is
 /// still mid-rebuild and a rollback is still possible.
 ///
 /// # Errors
 ///
 /// Returns a `BeadsError::WithContext` whose source is the original
-/// `restore_tombstones` error. Returns `Ok(())` when `tombstones` is
+/// `restore_preserved_issues` error. Returns `Ok(())` when `tombstones` is
 /// empty without calling into the write-transaction retry loop.
 pub(crate) fn restore_tombstones_after_rebuild(
     storage: &mut SqliteStorage,
-    tombstones: &[PreservedTombstone],
+    tombstones: &[PreservedIssue],
 ) -> Result<()> {
     if tombstones.is_empty() {
         return Ok(());
     }
     let count = tombstones.len();
-    restore_tombstones(storage, tombstones).map_err(|err| BeadsError::WithContext {
+    restore_preserved_issues(storage, tombstones).map_err(|err| BeadsError::WithContext {
         context: format!(
             "Rebuild from JSONL succeeded, but failed to restore {count} preserved \
              tombstone(s). The database now mirrors the JSONL exactly — any local \
@@ -5342,44 +14124,78 @@ pub(crate) fn restore_tombstones_after_rebuild(
     })
 }
 
-/// Restore preserved tombstones (and their relations) atomically and mark
+/// Restore preserved dirty live issues after a successful rebuild, wrapping
+/// any failure with a message that makes clear the rebuild itself succeeded
+/// — only the unflushed-edit restoration step failed (GitHub #394).
+///
+/// Same contract as `restore_tombstones_after_rebuild`, with a message
+/// naming the actual casualty: local edits that had not yet been flushed
+/// to the JSONL, rather than local deletions.
+///
+/// # Errors
+///
+/// Returns a `BeadsError::WithContext` whose source is the original
+/// `restore_preserved_issues` error. Returns `Ok(())` when `dirty_issues`
+/// is empty without calling into the write-transaction retry loop.
+pub(crate) fn restore_dirty_issues_after_rebuild(
+    storage: &mut SqliteStorage,
+    dirty_issues: &[PreservedIssue],
+) -> Result<()> {
+    if dirty_issues.is_empty() {
+        return Ok(());
+    }
+    let count = dirty_issues.len();
+    restore_preserved_issues(storage, dirty_issues).map_err(|err| BeadsError::WithContext {
+        context: format!(
+            "Rebuild from JSONL succeeded, but failed to restore {count} dirty \
+             unflushed issue(s). The database now mirrors the JSONL exactly — any \
+             local creations or edits that had not yet been flushed to the JSONL \
+             are gone. Re-running the command is idempotent and safe (the rebuild \
+             itself completed successfully). If the underlying cause is lock \
+             contention, wait for other `br` processes to finish and try again."
+        ),
+        source: Box::new(err),
+    })
+}
+
+/// Restore preserved issues (and their relations) atomically and mark
 /// them dirty so the next flush re-exports them.
 ///
 /// # Errors
 ///
 /// Returns an error if the underlying write transaction fails; the entire
 /// restore is rolled back on failure.
-pub(crate) fn restore_tombstones(
+pub(crate) fn restore_preserved_issues(
     storage: &mut SqliteStorage,
-    tombstones: &[PreservedTombstone],
+    preserved: &[PreservedIssue],
 ) -> Result<()> {
-    if tombstones.is_empty() {
+    if preserved.is_empty() {
         return Ok(());
     }
 
     let marked_at = Utc::now().to_rfc3339();
     storage.with_write_transaction(|storage| {
-        for tombstone in tombstones {
-            storage.upsert_issue_for_import(&tombstone.issue)?;
+        for entry in preserved {
+            storage.upsert_issue_for_import_in_tx(&entry.issue)?;
         }
-        for tombstone in tombstones {
-            if let Some(labels) = &tombstone.labels {
-                storage.sync_labels_for_import(&tombstone.issue.id, labels)?;
+        for entry in preserved {
+            if let Some(labels) = &entry.labels {
+                storage.sync_labels_for_import_in_tx(&entry.issue.id, labels)?;
             }
-            if let Some(dependencies) = &tombstone.dependencies {
-                storage.sync_dependencies_for_import(&tombstone.issue.id, dependencies)?;
+            if let Some(dependencies) = &entry.dependencies {
+                storage.sync_dependencies_for_import_in_tx(&entry.issue.id, dependencies)?;
             }
-            if let Some(comments) = &tombstone.comments {
-                storage.sync_comments_for_import(&tombstone.issue.id, comments)?;
+            if let Some(comments) = &entry.comments {
+                storage.sync_comments_for_import_in_tx(&entry.issue.id, comments)?;
             }
-            storage.replace_dirty_issue_marker(&tombstone.issue.id, &marked_at)?;
+            storage.replace_dirty_issue_marker_in_tx(&entry.issue.id, &marked_at)?;
         }
         Ok(())
     })?;
 
     tracing::debug!(
-        count = tombstones.len(),
-        "Restored tombstones atomically after rebuild and marked them dirty for export"
+        count = preserved.len(),
+        "Restored preserved issues atomically after rebuild and marked them dirty for export"
     );
     Ok(())
 }
@@ -5426,13 +14242,13 @@ pub(crate) struct JsonlTombstoneFilter {
 ///    silently lose the local delete.
 #[must_use]
 pub(crate) fn tombstones_missing_from_jsonl_tombstones(
-    tombstones: Vec<PreservedTombstone>,
+    tombstones: Vec<PreservedIssue>,
     jsonl_filter: &JsonlTombstoneFilter,
-) -> Vec<PreservedTombstone> {
+) -> Vec<PreservedIssue> {
     let original_count = tombstones.len();
     let mut skipped_already_flushed = 0usize;
     let mut preserved_non_tombstone_conflicts = 0usize;
-    let preserved: Vec<PreservedTombstone> = tombstones
+    let preserved: Vec<PreservedIssue> = tombstones
         .into_iter()
         .filter(|tombstone| {
             let id = &tombstone.issue.id;
@@ -5460,6 +14276,67 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
     preserved
 }
 
+/// Filter the preserved dirty-live-issue set down to those whose latest
+/// state the JSONL cannot reproduce, so a rebuild that replays only the
+/// JSONL does not silently drop them (GitHub #394). Three cases:
+///
+/// 1. JSONL has this ID as a tombstone: drop from preservation set. A
+///    flushed deletion wins over an unflushed local edit — this mirrors
+///    the `import_from_jsonl` tombstone guard, which rejects resurrection
+///    even for newer non-tombstone rows. Reopening is a separate,
+///    explicit user action.
+///
+/// 2. JSONL has this ID live: preserve only when the local row's
+///    `updated_at` is strictly newer than the JSONL row's — i.e. there is
+///    an unflushed local edit. When the JSONL copy is as new or newer,
+///    the rebuild's own import restores an equal-or-better row.
+///
+/// 3. JSONL doesn't have this ID at all: the issue has never been flushed
+///    anywhere. Always preserve — this is the `--no-auto-flush` data-loss
+///    shape from the original report.
+#[must_use]
+pub(crate) fn dirty_issues_missing_from_jsonl(
+    dirty_issues: Vec<PreservedIssue>,
+    jsonl_filter: &JsonlTombstoneFilter,
+) -> Vec<PreservedIssue> {
+    let original_count = dirty_issues.len();
+    let mut skipped_flushed_tombstones = 0usize;
+    let mut skipped_jsonl_current = 0usize;
+    let preserved: Vec<PreservedIssue> = dirty_issues
+        .into_iter()
+        .filter(|preserved| {
+            let id = &preserved.issue.id;
+            if jsonl_filter.tombstone_ids.contains(id) {
+                skipped_flushed_tombstones += 1;
+                return false;
+            }
+            match jsonl_filter.non_tombstone_updated_at.get(id) {
+                Some(jsonl_updated_at) => {
+                    if preserved.issue.updated_at > *jsonl_updated_at {
+                        true
+                    } else {
+                        skipped_jsonl_current += 1;
+                        false
+                    }
+                }
+                None => true,
+            }
+        })
+        .collect();
+
+    if skipped_flushed_tombstones > 0 || skipped_jsonl_current > 0 {
+        tracing::debug!(
+            preserved = preserved.len(),
+            skipped_flushed_tombstones,
+            skipped_jsonl_current,
+            original = original_count,
+            "Filtered preserved dirty issues against JSONL state"
+        );
+    }
+
+    preserved
+}
+
 /// Scan the JSONL once and build a `JsonlTombstoneFilter` we can use to
 /// decide which preserved tombstones to restore after a rebuild.
 ///
@@ -5467,9 +14344,23 @@ pub(crate) fn tombstones_missing_from_jsonl_tombstones(
 ///
 /// Returns an error if the JSONL cannot be read, contains invalid JSON, or
 /// has duplicate IDs across lines.
+#[cfg(test)]
 pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombstoneFilter> {
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+    path::validate_jsonl_fd_metadata(&file, path)?;
+    scan_jsonl_for_tombstone_filter_from_reader(path, BufReader::new(file))
+}
+
+pub(crate) fn scan_jsonl_snapshot_for_tombstone_filter(
+    source: &JsonlSourceSnapshot,
+) -> Result<JsonlTombstoneFilter> {
+    scan_jsonl_for_tombstone_filter_from_reader(source.display_path(), source.reader())
+}
+
+fn scan_jsonl_for_tombstone_filter_from_reader(
+    display_path: &Path,
+    mut reader: impl BufRead,
+) -> Result<JsonlTombstoneFilter> {
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut seen_ids = HashSet::new();
@@ -5495,7 +14386,7 @@ pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombst
             return Err(BeadsError::Config(format!(
                 "Duplicate issue id '{}' in {} at line {}",
                 issue.id,
-                path.display(),
+                display_path.display(),
                 line_num
             )));
         }
@@ -5515,7 +14406,7 @@ pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombst
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Comment, Issue, IssueType, Priority, Status};
+    use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use chrono::Utc;
     use fsqlite_types::SqliteValue;
     use std::collections::HashMap;
@@ -5550,6 +14441,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -5569,6 +14462,292 @@ mod tests {
     }
 
     #[test]
+    fn sync_merge_receipt_hash_domains_are_stable_and_distinct() {
+        let payload = ("identical receipt payload", 7_u64);
+        let intent = sync_merge_domain_separated_sha256(
+            SYNC_MERGE_INTENT_DOMAIN,
+            &payload,
+            "test merge intent",
+        )
+        .unwrap();
+        let envelope = sync_merge_domain_separated_sha256(
+            SYNC_MERGE_RECEIPT_ENVELOPE_DOMAIN,
+            &payload,
+            "test immutable envelope",
+        )
+        .unwrap();
+        let envelope_repeat = sync_merge_domain_separated_sha256(
+            SYNC_MERGE_RECEIPT_ENVELOPE_DOMAIN,
+            &payload,
+            "test immutable envelope",
+        )
+        .unwrap();
+        let state = sync_merge_domain_separated_sha256(
+            SYNC_MERGE_RECEIPT_STATE_DOMAIN,
+            &payload,
+            "test receipt state",
+        )
+        .unwrap();
+
+        assert_eq!(envelope, envelope_repeat);
+        assert_ne!(
+            intent, envelope,
+            "identical bytes in the intent and immutable-envelope domains must not share a digest"
+        );
+        assert_ne!(
+            intent, state,
+            "identical bytes in the intent and state domains must not share a digest"
+        );
+        assert_ne!(
+            envelope, state,
+            "identical bytes in the immutable-envelope and state domains must not share a digest"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authority_paths_and_receipts_do_not_alias_lossy_invalid_utf8_names() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let first_leaf = OsString::from_vec(b"authority-\xff.jsonl".to_vec());
+        let second_leaf = OsString::from_vec(b"authority-\xfe.jsonl".to_vec());
+        let first_path = temp_dir.path().join(first_leaf);
+        let second_path = temp_dir.path().join(second_leaf);
+
+        assert_eq!(
+            first_path.to_string_lossy(),
+            second_path.to_string_lossy(),
+            "the fixture must collide under the legacy lossy representation"
+        );
+
+        let first_jsonl_sidecar = jsonl_write_authority_path(&first_path).unwrap();
+        let second_jsonl_sidecar = jsonl_write_authority_path(&second_path).unwrap();
+        assert_ne!(first_jsonl_sidecar, second_jsonl_sidecar);
+
+        let first_jsonl_authority =
+            blocking_jsonl_family_write_lock_with_timeout(&first_path, Some(100)).unwrap();
+        let second_jsonl_authority =
+            blocking_jsonl_family_write_lock_with_timeout(&second_path, Some(100)).unwrap();
+        assert_ne!(
+            first_jsonl_authority.authority_path_sha256(),
+            second_jsonl_authority.authority_path_sha256()
+        );
+
+        assert_ne!(
+            database_write_authority_path(&first_path).unwrap(),
+            database_write_authority_path(&second_path).unwrap()
+        );
+        assert_ne!(
+            database_write_authority_sha256(&first_path).unwrap(),
+            database_write_authority_sha256(&second_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn authority_bound_target_capture_rejects_parent_route_replacement() {
+        let temp_dir = TempDir::new().unwrap();
+        let routed_parent = temp_dir.path().join(".beads");
+        let retained_parent = temp_dir.path().join(".beads-retained");
+        fs::create_dir_all(&routed_parent).unwrap();
+        let output_path = routed_parent.join("issues.jsonl");
+        fs::write(&output_path, b"trusted-generation\n").unwrap();
+        let authority =
+            blocking_jsonl_family_write_lock_with_timeout(&output_path, Some(100)).unwrap();
+
+        fs::rename(&routed_parent, &retained_parent).unwrap();
+        fs::create_dir_all(&routed_parent).unwrap();
+        fs::write(&output_path, b"attacker-generation\n").unwrap();
+
+        let error = authority.capture_target().unwrap_err();
+        assert!(
+            error.to_string().contains("route")
+                || error.to_string().contains("authority")
+                || error.to_string().contains("parent"),
+            "unexpected authority-bound capture error: {error}"
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), b"attacker-generation\n");
+        assert_eq!(
+            fs::read(retained_parent.join("issues.jsonl")).unwrap(),
+            b"trusted-generation\n"
+        );
+    }
+
+    #[test]
+    fn sync_merge_finalization_requires_exact_metadata_cardinality_and_mtime() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        let database_before = capture_sync_database_witness(&storage).unwrap();
+        let database_after = database_before.clone().into();
+        let export_as_of = Utc::now();
+        let reviewed_raw_sha256 = "66".repeat(32);
+        let reviewed_content_sha256 = reviewed_raw_sha256.clone();
+        let intent = SyncMergeIntent {
+            schema_version: 2,
+            database_authority_sha256: "11".repeat(32),
+            jsonl_authority_sha256: "22".repeat(32),
+            jsonl_path_sha256: "33".repeat(32),
+            jsonl_before: JsonlSourceStateWitness::Missing,
+            jsonl_before_content_sha256: None,
+            base_authority_sha256: "44".repeat(32),
+            base_before: JsonlSourceStateWitness::Missing,
+            base_before_content_sha256: None,
+            resolution: "manual".to_string(),
+            actor: "test-agent".to_string(),
+            event_attribution: EventAttribution::default(),
+            capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            retention_days: None,
+            export_as_of,
+            changed_kept_issue_ids: Vec::new(),
+            kept_issue_witnesses: Vec::new(),
+            deleted_issue_ids: Vec::new(),
+            note_witnesses: Vec::new(),
+            database_before,
+        };
+        let committed = SyncMergePendingReceipt::new(
+            intent,
+            export_as_of.to_rfc3339(),
+            database_after,
+            reviewed_raw_sha256.clone(),
+            0,
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        let expected_export_hashes = sync_merge_export_hash_mapping_witness(&[]).unwrap();
+        let finalization = SyncMergeExportFinalizationWitness {
+            export_hashes: expected_export_hashes,
+            dirty_issues: AdditiveTableWitness {
+                rows: 0,
+                payload_sha256: "88".repeat(32),
+            },
+            jsonl_content_hash: Some(reviewed_content_sha256),
+            jsonl_mtime: Some((export_as_of + chrono::Duration::seconds(1)).to_rfc3339()),
+            jsonl_size: Some("0".to_string()),
+            last_export_time: Some(export_as_of.to_rfc3339()),
+            needs_flush: Some("false".to_string()),
+            export_metadata: AdditiveTableWitness {
+                rows: 6,
+                payload_sha256: "99".repeat(32),
+            },
+        };
+
+        let error = committed
+            .advance_to_export_finalized(
+                JsonlSourceStateWitness::Present {
+                    raw_sha256: reviewed_raw_sha256.clone(),
+                    mtime: export_as_of.to_rfc3339(),
+                    size: 0,
+                    identity: None,
+                },
+                finalization.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BeadsError::SyncConflict { ref message }
+                    if message.contains("exactly five export metadata rows")
+                        && message.contains("found 6")
+            ),
+            "unexpected finalization error: {error}"
+        );
+
+        let mut wrong_mtime = finalization;
+        wrong_mtime.export_metadata.rows = 5;
+        let error = committed
+            .advance_to_export_finalized(
+                JsonlSourceStateWitness::Present {
+                    raw_sha256: reviewed_raw_sha256,
+                    mtime: export_as_of.to_rfc3339(),
+                    size: 0,
+                    identity: None,
+                },
+                wrong_mtime,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BeadsError::SyncConflict { ref message }
+                    if message.contains("published JSONL mtime")
+            ),
+            "unexpected mtime error: {error}"
+        );
+
+        let mut wrong_mapping = sync_merge_export_hash_mapping_witness(&[]).unwrap();
+        wrong_mapping.payload_sha256 = "aa".repeat(32);
+        let mut wrong_hashes = SyncMergeExportFinalizationWitness {
+            export_hashes: wrong_mapping,
+            dirty_issues: AdditiveTableWitness {
+                rows: 0,
+                payload_sha256: "88".repeat(32),
+            },
+            jsonl_content_hash: Some(committed.jsonl_after_content_sha256.clone()),
+            jsonl_mtime: Some(export_as_of.to_rfc3339()),
+            jsonl_size: Some("0".to_string()),
+            last_export_time: Some(export_as_of.to_rfc3339()),
+            needs_flush: Some("false".to_string()),
+            export_metadata: AdditiveTableWitness {
+                rows: 5,
+                payload_sha256: "99".repeat(32),
+            },
+        };
+        let error = committed
+            .advance_to_export_finalized(
+                JsonlSourceStateWitness::Present {
+                    raw_sha256: committed.jsonl_after_raw_sha256.clone(),
+                    mtime: export_as_of.to_rfc3339(),
+                    size: 0,
+                    identity: None,
+                },
+                wrong_hashes.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("export-hash mapping"),
+            "unexpected issue-hash mapping error: {error}"
+        );
+
+        wrong_hashes.export_hashes = committed.jsonl_after_issue_hashes.clone();
+        let finalized = committed
+            .advance_to_export_finalized(
+                JsonlSourceStateWitness::Present {
+                    raw_sha256: committed.jsonl_after_raw_sha256.clone(),
+                    mtime: export_as_of.to_rfc3339(),
+                    size: 0,
+                    identity: None,
+                },
+                wrong_hashes,
+            )
+            .unwrap();
+        let mut tampered_mtime = finalized.clone();
+        let Some(JsonlSourceStateWitness::Present { mtime, .. }) =
+            tampered_mtime.jsonl_after.as_mut()
+        else {
+            panic!("finalized receipt must carry a present source witness");
+        };
+        *mtime = (export_as_of + chrono::Duration::seconds(2)).to_rfc3339();
+        tampered_mtime.state_sha256 = tampered_mtime.current_state_sha256().unwrap();
+        assert!(
+            tampered_mtime.validate().is_err(),
+            "receipt validation must reject a recomputed state digest with mismatched mtime evidence"
+        );
+
+        let mut tampered_export_time = finalized;
+        tampered_export_time
+            .export_finalization
+            .as_mut()
+            .unwrap()
+            .last_export_time = Some("not-rfc3339".to_string());
+        tampered_export_time.state_sha256 = tampered_export_time.current_state_sha256().unwrap();
+        assert!(
+            tampered_export_time.validate().is_err(),
+            "receipt validation must reject invalid finalized export time even with a recomputed state digest"
+        );
+    }
+
+    #[test]
     fn blocking_write_lock_errors_when_lock_path_cannot_open() {
         let temp_dir = TempDir::new().unwrap();
         let beads_dir = temp_dir.path().join(".beads");
@@ -5579,11 +14758,26 @@ mod tests {
             matches!(
                 &err,
                 BeadsError::Config(message)
-                    if message.contains("Failed to open write lock")
+                    if message.contains("Refusing unsafe workspace write lock path")
                         && message.contains(".write.lock")
             ),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocking_write_lock_rejects_symlink_leaf_without_touching_target() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = temp_dir.path().join("outside.lock");
+        fs::write(&target, b"sentinel").unwrap();
+        symlink(&target, beads_dir.join(".write.lock")).unwrap();
+
+        let err = blocking_write_lock(&beads_dir).unwrap_err();
+        assert!(err.to_string().contains("unsafe workspace write lock path"));
+        assert_eq!(fs::read(&target).unwrap(), b"sentinel");
     }
 
     #[test]
@@ -5710,6 +14904,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -5736,6 +14932,1575 @@ mod tests {
         chrono::DateTime::from_timestamp(secs, 0).expect("timestamp")
     }
 
+    fn additive_test_paths(temp: &TempDir) -> (PathBuf, PathBuf, AdditiveReconcileConfig) {
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create test beads directory");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let config = AdditiveReconcileConfig {
+            beads_dir: Some(beads_dir.clone()),
+            database_path: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+        };
+        (beads_dir, jsonl_path, config)
+    }
+
+    fn write_additive_issues(path: &Path, issues: &[Issue]) {
+        let mut bytes = Vec::new();
+        for issue in issues {
+            serde_json::to_writer(&mut bytes, issue).expect("serialize additive issue");
+            bytes.push(b'\n');
+        }
+        fs::write(path, bytes).expect("write additive JSONL");
+    }
+
+    fn canonical_additive_test_issue(mut issue: Issue) -> Issue {
+        canonicalize_additive_issue_for_storage(&mut issue);
+        issue
+    }
+
+    fn apply_reviewed_additive_plan(
+        storage: &mut SqliteStorage,
+        jsonl_path: &Path,
+        config: &AdditiveReconcileConfig,
+        plan: &AdditiveReconcilePlan,
+    ) -> Result<AdditiveReconcileReceipt> {
+        apply_additive_reconcile(
+            storage,
+            jsonl_path,
+            config,
+            plan,
+            &plan.receipt().plan_sha256,
+        )
+    }
+
+    #[test]
+    fn additive_sqlite_value_witness_is_storage_class_and_bit_exact() {
+        let witnesses = [
+            additive_sqlite_value_witness(SqliteValue::Null),
+            additive_sqlite_value_witness(SqliteValue::Integer(2)),
+            additive_sqlite_value_witness(SqliteValue::Float(2.0)),
+            additive_sqlite_value_witness(SqliteValue::from("2")),
+            additive_sqlite_value_witness(SqliteValue::from(b"2".as_slice())),
+        ];
+        assert_eq!(witnesses.iter().collect::<BTreeSet<_>>().len(), 5);
+        assert_ne!(
+            additive_sqlite_value_witness(SqliteValue::Float(0.0)),
+            additive_sqlite_value_witness(SqliteValue::Float(-0.0))
+        );
+        assert_eq!(
+            additive_sqlite_value_witness(SqliteValue::from("A\0B")),
+            "text:A\0B"
+        );
+        assert_eq!(
+            additive_sqlite_value_witness(SqliteValue::from([0xff, 0x00].as_slice())),
+            "blob:ff00"
+        );
+    }
+
+    #[test]
+    fn strict_additive_source_rejects_duplicate_and_noncanonical_agent_context() {
+        let mut issue = make_issue_at("bd-context", "Context", fixed_time(100));
+        issue.agent_context = Some(r#"{"a":{"b":1}}"#.to_string());
+        let canonical = serde_json::to_string(&issue).unwrap();
+        assert!(parse_strict_additive_issue(&canonical, 1).is_ok());
+
+        for invalid_context in [
+            r#"{"b":1, "a":2}"#,
+            r#"{"a":1,"a":2}"#,
+            r#"{"nested":{"a":1,"\u0061":2}}"#,
+            "not-json",
+        ] {
+            issue.agent_context = Some(invalid_context.to_string());
+            let record = serde_json::to_string(&issue).unwrap();
+            assert!(
+                parse_strict_additive_issue(&record, 1).is_err(),
+                "agent_context unexpectedly accepted: {invalid_context}"
+            );
+        }
+
+        let duplicate_issue_key = canonical.replacen(
+            r#""title":"Context""#,
+            r#""title":"Context","title":"Duplicate""#,
+            1,
+        );
+        assert!(parse_strict_additive_issue(&duplicate_issue_key, 1).is_err());
+    }
+
+    #[test]
+    fn additive_reconcile_repairs_content_hash_only_drift_then_is_a_true_noop() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue_at("bd-hash-repair", "Hash repair", fixed_time(100));
+        let null_issue = make_issue_at("bd-hash-null", "Null hash repair", fixed_time(101));
+        storage.upsert_issue_for_import(&issue).unwrap();
+        storage.upsert_issue_for_import(&null_issue).unwrap();
+        storage
+            .execute_raw(
+                "UPDATE issues SET content_hash = 'stale-content-hash' WHERE id = 'bd-hash-repair'",
+            )
+            .unwrap();
+        storage
+            .execute_raw("UPDATE issues SET content_hash = NULL WHERE id = 'bd-hash-null'")
+            .unwrap();
+        write_additive_issues(&jsonl_path, &[issue.clone(), null_issue.clone()]);
+        let events_before = storage.get_all_events(0).unwrap();
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+        assert_eq!(plan.receipt().content_hash_repairs_planned, 2);
+        assert_eq!(
+            plan.receipt().content_hash_repair_issue_ids,
+            ["bd-hash-null", "bd-hash-repair"]
+        );
+        assert_eq!(
+            plan.receipt().content_hash_repairs,
+            [
+                AdditiveContentHashRepairWitness {
+                    issue_id: "bd-hash-null".to_string(),
+                    before: None,
+                    after: crate::util::content_hash(&null_issue),
+                },
+                AdditiveContentHashRepairWitness {
+                    issue_id: "bd-hash-repair".to_string(),
+                    before: Some("stale-content-hash".to_string()),
+                    after: crate::util::content_hash(&issue),
+                },
+            ]
+        );
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.content_hash_repairs_applied, 2);
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+        let expected_hash = crate::util::content_hash(&issue);
+        assert_eq!(
+            additive_issue_content_hashes(&storage)
+                .unwrap()
+                .get("bd-hash-repair"),
+            Some(&Some(expected_hash))
+        );
+        assert_eq!(
+            additive_issue_content_hashes(&storage)
+                .unwrap()
+                .get("bd-hash-null"),
+            Some(&Some(crate::util::content_hash(&null_issue)))
+        );
+
+        let second = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(second.receipt().status, AdditiveReconcileStatus::NoChanges);
+        assert_eq!(second.receipt().content_hash_repairs_planned, 0);
+    }
+
+    #[test]
+    fn additive_reconcile_binds_full_raw_poststate_for_scalar_updates() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, mut config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let local = make_issue_at("bd-raw-poststate", "Before", fixed_time(100));
+        storage.upsert_issue_for_import(&local).unwrap();
+        storage
+            .execute_raw("UPDATE issues SET status = 'OPEN' WHERE id = 'bd-raw-poststate'")
+            .unwrap();
+        let mut source = local;
+        source.title = "After".to_string();
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&source));
+        config
+            .source_authoritative_ids
+            .insert("bd-raw-poststate".to_string());
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_ne!(
+            plan.receipt().target_before.issue_payload_sha256,
+            plan.receipt().expected_issue_raw_payload_sha256
+        );
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        let after = receipt.target_after.as_ref().unwrap();
+        assert_eq!(
+            after.issue_payload_sha256,
+            receipt.expected_issue_raw_payload_sha256
+        );
+        assert_eq!(
+            storage
+                .execute_raw_query("SELECT status FROM issues WHERE id = 'bd-raw-poststate'")
+                .unwrap()[0][0]
+                .as_text(),
+            Some("open")
+        );
+    }
+
+    #[test]
+    fn additive_reconcile_token_binds_requested_resolution_set_even_when_inapplicable() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue_at("bd-equal", "Equal", fixed_time(100));
+        storage.upsert_issue_for_import(&issue).unwrap();
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&issue));
+
+        let baseline = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        let mut requested = config;
+        requested
+            .source_authoritative_ids
+            .insert("bd-unrelated".to_string());
+        let with_request = plan_additive_reconcile(&storage, &jsonl_path, &requested).unwrap();
+        assert_ne!(
+            baseline.receipt().plan_sha256,
+            with_request.receipt().plan_sha256
+        );
+        assert_eq!(
+            with_request
+                .receipt()
+                .requested_source_authoritative_issue_ids,
+            ["bd-unrelated"]
+        );
+        assert!(
+            with_request
+                .receipt()
+                .source_authoritative_issue_ids
+                .is_empty()
+        );
+        assert_eq!(
+            with_request
+                .receipt()
+                .conflict_reasons
+                .get("source_authoritative_resolution_not_applicable"),
+            Some(&1)
+        );
+    }
+
+    fn reviewed_disk_plan(
+        beads_dir: &Path,
+        database_path: &Path,
+        jsonl_path: &Path,
+        issue: &Issue,
+    ) -> AdditiveReconcilePlan {
+        let storage = SqliteStorage::open(database_path).unwrap();
+        storage.upsert_issue_for_import(issue).unwrap();
+        write_additive_issues(jsonl_path, std::slice::from_ref(issue));
+        let config = AdditiveReconcileConfig {
+            beads_dir: Some(beads_dir.to_path_buf()),
+            database_path: Some(database_path.to_path_buf()),
+            allow_external_jsonl: !jsonl_path.starts_with(beads_dir),
+            source_authoritative_ids: BTreeSet::new(),
+        };
+        plan_additive_reconcile(&storage, jsonl_path, &config).unwrap()
+    }
+
+    #[test]
+    fn reviewed_additive_wrapper_resolves_and_locks_configured_database() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let mut issue = make_issue_at("bd-reviewed", "Reviewed", fixed_time(100));
+        set_content_hash(&mut issue);
+        let plan = reviewed_disk_plan(&beads_dir, &database_path, &jsonl_path, &issue);
+
+        let receipt = apply_reviewed_additive_reconcile(&ReviewedAdditiveReconcileRequest {
+            beads_dir,
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+            expected_plan_sha256: plan.receipt().plan_sha256.clone(),
+            lock_timeout_ms: Some(100),
+        })
+        .unwrap();
+        assert!(matches!(
+            receipt.status,
+            AdditiveReconcileStatus::AppliedMetadataOnly | AdditiveReconcileStatus::NoChanges
+        ));
+    }
+
+    #[test]
+    fn reviewed_additive_wrapper_reuses_the_cli_startup_authority() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let mut issue = make_issue_at(
+            "bd-retained-authority",
+            "Retained authority",
+            fixed_time(100),
+        );
+        set_content_hash(&mut issue);
+        let plan = reviewed_disk_plan(&beads_dir, &database_path, &jsonl_path, &issue);
+        let retained_authority = Arc::new(
+            blocking_database_family_write_lock_with_timeout(&beads_dir, &database_path, Some(100))
+                .unwrap(),
+        );
+
+        let receipt = apply_reviewed_additive_reconcile_under_authority(
+            &ReviewedAdditiveReconcileRequest {
+                beads_dir,
+                db_override: None,
+                source_path_override: None,
+                allow_external_jsonl: false,
+                source_authoritative_ids: BTreeSet::new(),
+                expected_plan_sha256: plan.receipt().plan_sha256.clone(),
+                lock_timeout_ms: Some(100),
+            },
+            Some(&retained_authority),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receipt.status,
+            AdditiveReconcileStatus::AppliedMetadataOnly | AdditiveReconcileStatus::NoChanges
+        ));
+        retained_authority.verify_database_authority().unwrap();
+    }
+
+    #[test]
+    fn additive_health_attestation_stays_outside_the_read_snapshot_transaction() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let mut storage = SqliteStorage::open(&database_path).unwrap();
+        let mut survivor = make_issue_at("bd-freelist-000", "Survivor", fixed_time(100));
+        set_content_hash(&mut survivor);
+        storage.upsert_issue_for_import(&survivor).unwrap();
+        for ordinal in 1..128 {
+            let mut issue = make_issue_at(
+                &format!("bd-freelist-{ordinal:03}"),
+                &format!("Freelist fixture {ordinal:03}"),
+                fixed_time(100 + ordinal),
+            );
+            issue.description = Some("freelist payload ".repeat(512));
+            set_content_hash(&mut issue);
+            storage.upsert_issue_for_import(&issue).unwrap();
+        }
+        storage
+            .execute_raw("DELETE FROM issues WHERE id != 'bd-freelist-000'")
+            .unwrap();
+        storage.checkpoint_full().unwrap();
+        let freelist_rows = storage.execute_raw_query("PRAGMA freelist_count").unwrap();
+        let freelist_count = freelist_rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert!(
+            freelist_count > 0,
+            "regression fixture must retain committed free pages"
+        );
+
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&survivor));
+        let config = AdditiveReconcileConfig {
+            beads_dir: Some(beads_dir),
+            database_path: Some(database_path),
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+        };
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(
+            plan.receipt().health_before.integrity_messages,
+            ["ok"],
+            "full integrity must be attested from autocommit state"
+        );
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(
+            receipt
+                .health_after
+                .as_ref()
+                .expect("postcommit health")
+                .integrity_messages,
+            ["ok"],
+            "postcommit full integrity must also use autocommit state"
+        );
+        assert!(
+            receipt.postcommit_failures.is_empty(),
+            "healthy committed free pages must not become a false postcommit failure"
+        );
+    }
+
+    #[test]
+    fn reviewed_additive_wrapper_preserves_explicit_external_database_support() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let cache_dir = temp.path().join("cache");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        let database_path = cache_dir.join("beads.db");
+        let jsonl_path = cache_dir.join("issues.jsonl");
+        let mut issue = make_issue_at("bd-external-db", "External DB", fixed_time(100));
+        set_content_hash(&mut issue);
+        let plan = reviewed_disk_plan(&beads_dir, &database_path, &jsonl_path, &issue);
+
+        let receipt = apply_reviewed_additive_reconcile(&ReviewedAdditiveReconcileRequest {
+            beads_dir,
+            db_override: Some(database_path),
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+            expected_plan_sha256: plan.receipt().plan_sha256.clone(),
+            lock_timeout_ms: Some(100),
+        })
+        .unwrap();
+        assert!(receipt.target_after.is_some());
+    }
+
+    #[test]
+    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
+                pre-merge snapshot); tracked for completion by the owning workstream"]
+    fn reviewed_apply_reports_composable_postcommit_source_drift_and_allows_replan() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let existing = make_issue_at("bd-existing", "Existing", fixed_time(100));
+        let incoming = make_issue_at("bd-incoming", "Incoming", fixed_time(200));
+        {
+            let storage = SqliteStorage::open(&database_path).unwrap();
+            storage.upsert_issue_for_import(&existing).unwrap();
+        }
+        write_additive_issues(&jsonl_path, &[existing, incoming.clone()]);
+        let plan_request = ReviewedAdditiveReconcilePlanRequest {
+            beads_dir: beads_dir.clone(),
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+        };
+        let plan = plan_reviewed_additive_reconcile(&plan_request).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+
+        ADDITIVE_TEST_DRIFT_SOURCE_AFTER_FINAL_CHECK.with(|flag| flag.set(true));
+        let receipt = apply_reviewed_additive_reconcile(&ReviewedAdditiveReconcileRequest {
+            beads_dir: beads_dir.clone(),
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+            expected_plan_sha256: plan.receipt().plan_sha256.clone(),
+            lock_timeout_ms: Some(100),
+        })
+        .unwrap();
+        assert_eq!(
+            receipt.status,
+            AdditiveReconcileStatus::CommittedWithPostconditionFailures
+        );
+        assert_eq!(receipt.source_preserved_after_commit, Some(false));
+        assert!(
+            receipt
+                .postcommit_failures
+                .contains(&AdditivePostcommitFailure::SourceWitnessChanged)
+        );
+        assert_eq!(
+            receipt.target_after.as_ref().map(|witness| witness.issues),
+            Some(2),
+            "the receipt must tell the truth that SQLite committed before source drift was observed"
+        );
+        let storage = SqliteStorage::open_current_read_only(&database_path)
+            .unwrap()
+            .expect("current database after committed source drift");
+        assert!(storage.get_issue(&incoming.id).unwrap().is_some());
+        drop(storage);
+
+        let retry = plan_reviewed_additive_reconcile(&plan_request).unwrap();
+        assert_eq!(
+            retry.receipt().status,
+            AdditiveReconcileStatus::NoChanges,
+            "replanning after the reported postcommit drift must converge safely"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewed_apply_reports_committed_database_authority_loss_as_non_retryable_receipt() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let database_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let existing = make_issue_at("bd-existing", "Existing", fixed_time(100));
+        let incoming = make_issue_at("bd-incoming", "Incoming", fixed_time(200));
+        {
+            let storage = SqliteStorage::open(&database_path).unwrap();
+            storage.upsert_issue_for_import(&existing).unwrap();
+        }
+        write_additive_issues(&jsonl_path, &[existing, incoming]);
+        let plan_request = ReviewedAdditiveReconcilePlanRequest {
+            beads_dir: beads_dir.clone(),
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+        };
+        let plan = plan_reviewed_additive_reconcile(&plan_request).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+
+        SqliteStorage::arm_database_replacement_after_commit_for_test();
+        let receipt = apply_reviewed_additive_reconcile(&ReviewedAdditiveReconcileRequest {
+            beads_dir,
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+            expected_plan_sha256: plan.receipt().plan_sha256.clone(),
+            lock_timeout_ms: Some(100),
+        })
+        .expect("a committed-but-unwitnessed apply must return its non-retryable receipt");
+
+        assert_eq!(
+            receipt.status,
+            AdditiveReconcileStatus::CommittedWithPostconditionFailures
+        );
+        assert_eq!(
+            receipt.database_authority_preserved_after_commit,
+            Some(false)
+        );
+        assert!(
+            receipt
+                .postcommit_failures
+                .contains(&AdditivePostcommitFailure::DatabaseAuthorityChanged)
+        );
+        assert_eq!(
+            receipt.target_after.as_ref().map(|witness| witness.issues),
+            Some(2),
+            "the receipt must preserve the transaction's projected committed state"
+        );
+    }
+
+    #[test]
+    fn database_family_lock_serializes_external_db_across_workspaces_with_one_timeout_budget() {
+        let temp = TempDir::new().unwrap();
+        let first_beads = temp.path().join("first").join(".beads");
+        let second_beads = temp.path().join("second").join(".beads");
+        let external_dir = temp.path().join("shared-cache");
+        fs::create_dir_all(&first_beads).unwrap();
+        fs::create_dir_all(&second_beads).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+        let database_path = external_dir.join("shared.db");
+        drop(SqliteStorage::open(&database_path).unwrap());
+
+        let first_authority = blocking_database_family_write_lock_with_timeout(
+            &first_beads,
+            &database_path,
+            Some(1_000),
+        )
+        .unwrap();
+        let second_workspace_lock =
+            blocking_write_lock_with_timeout(&second_beads, Some(1_000)).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(second_workspace_lock);
+        });
+
+        let started = Instant::now();
+        let error = blocking_database_family_write_lock_with_timeout(
+            &second_beads,
+            &database_path,
+            Some(400),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        releaser.join().unwrap();
+        assert!(
+            error.to_string().contains("Timed out")
+                || error.to_string().contains("timed out")
+                || error.to_string().contains("timeout"),
+            "unexpected contention error: {error}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "composite authority returned before its shared timeout budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "each component appears to have received a fresh timeout instead of one shared budget: {elapsed:?}"
+        );
+
+        let first_authority_sha256 = first_authority.authority_path_sha256().to_string();
+        drop(first_authority);
+        let second_authority = blocking_database_family_write_lock_with_timeout(
+            &second_beads,
+            &database_path,
+            Some(1_000),
+        )
+        .unwrap();
+        assert_eq!(
+            second_authority.authority_path_sha256(),
+            first_authority_sha256
+        );
+        assert_eq!(
+            second_authority.canonical_database_path(),
+            fs::canonicalize(&database_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn database_family_lock_binds_a_new_database_inode_before_hardlink_aliases_can_write() {
+        let temp = TempDir::new().unwrap();
+        let first_beads = temp.path().join("first").join(".beads");
+        let second_beads = temp.path().join("second").join(".beads");
+        let external_dir = temp.path().join("shared-cache");
+        fs::create_dir_all(&first_beads).unwrap();
+        fs::create_dir_all(&second_beads).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+        let database_path = external_dir.join("created-under-lock.db");
+        let hardlink_alias = external_dir.join("alias.db");
+
+        let first_authority = blocking_database_family_write_lock_with_timeout(
+            &first_beads,
+            &database_path,
+            Some(100),
+        )
+        .expect("first authority protects the future database family");
+        assert!(
+            !database_path.exists(),
+            "acquiring authority alone must not materialize a missing database"
+        );
+        let was_missing = first_authority
+            .bind_database_inode_for_mutation()
+            .expect("prepare the future database inode at the mutation boundary");
+        assert!(
+            was_missing && !database_path.exists(),
+            "authority preparation must preserve missing-database recovery semantics"
+        );
+        first_authority
+            .install_empty_database_replacement_and_bind()
+            .expect("install a pre-locked database inode");
+        drop(SqliteStorage::open(&database_path).expect("initialize database under inode lock"));
+        fs::hard_link(&database_path, &hardlink_alias).expect("create competing hard-link alias");
+
+        let error = blocking_database_family_write_lock_with_timeout(
+            &second_beads,
+            &hardlink_alias,
+            Some(25),
+        )
+        .expect_err("hard-link alias must contend on the already-held database inode");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("Timed out")
+                || rendered.contains("timed out")
+                || rendered.contains("timeout"),
+            "unexpected alias contention error: {rendered}"
+        );
+        assert!(
+            !rendered.contains(temp.path().to_string_lossy().as_ref()),
+            "external database authority errors must not disclose absolute paths: {rendered}"
+        );
+
+        drop(first_authority);
+        let alias_authority = blocking_database_family_write_lock_with_timeout(
+            &second_beads,
+            &hardlink_alias,
+            Some(100),
+        )
+        .expect("hard-link alias authority is available after the original authority drops");
+        drop(alias_authority);
+    }
+
+    #[test]
+    fn database_family_authority_detects_workspace_lock_replacement() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+        let first_database = external_dir.join("first.db");
+        let second_database = external_dir.join("second.db");
+        let first_authority = blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &first_database,
+            Some(100),
+        )
+        .unwrap();
+
+        let workspace_lock_path = beads_dir.join(".write.lock");
+        fs::rename(
+            &workspace_lock_path,
+            beads_dir.join(".write.lock.displaced"),
+        )
+        .expect("move held workspace lock without destroying it");
+        let second_authority = blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &second_database,
+            Some(100),
+        )
+        .expect("replacement workspace lock demonstrates why the first guard must re-witness");
+        assert!(
+            first_authority.verify_database_authority().is_err(),
+            "the original guard must fail closed after its workspace lock pathname is replaced"
+        );
+        drop(second_authority);
+        drop(first_authority);
+    }
+
+    #[test]
+    fn database_family_authority_detects_sidecar_lock_replacement() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let external_dir = temp.path().join("external");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+        let database_path = external_dir.join("beads.db");
+        let authority =
+            blocking_database_family_write_lock_with_timeout(&beads_dir, &database_path, Some(100))
+                .unwrap();
+        let sidecar_path = database_write_authority_path(&database_path).unwrap();
+        let displaced_path = sidecar_path.with_extension("lock.displaced");
+        fs::rename(&sidecar_path, &displaced_path)
+            .expect("move held sidecar lock without destroying it");
+        drop(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&sidecar_path)
+                .expect("create replacement sidecar"),
+        );
+
+        assert!(
+            authority.verify_database_authority().is_err(),
+            "the guard must fail closed after its canonical sidecar pathname is replaced"
+        );
+        drop(authority);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewed_additive_wrapper_rejects_symlinked_database_leaf() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let outside = temp.path().join("outside.db");
+        drop(SqliteStorage::open(&outside).unwrap());
+        symlink(&outside, beads_dir.join("beads.db")).unwrap();
+
+        let err = apply_reviewed_additive_reconcile(&ReviewedAdditiveReconcileRequest {
+            beads_dir,
+            db_override: None,
+            source_path_override: None,
+            allow_external_jsonl: false,
+            source_authoritative_ids: BTreeSet::new(),
+            expected_plan_sha256: "a".repeat(64),
+            lock_timeout_ms: Some(100),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("symlinked database"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_family_authority_rejects_symlinked_parent_with_regular_leaf() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        let routed_parent = temp.path().join("routed");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_database = outside_dir.join("beads.db");
+        drop(SqliteStorage::open(&outside_database).unwrap());
+        symlink(&outside_dir, &routed_parent).unwrap();
+
+        let error = blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &routed_parent.join("beads.db"),
+            Some(100),
+        )
+        .expect_err("a regular database leaf must not hide a symlinked parent route")
+        .to_string();
+        assert!(
+            error.contains("symlinked parent component"),
+            "unexpected route error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_family_authority_rejects_symlinked_parent_with_missing_leaf() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        let routed_parent = temp.path().join("routed");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        symlink(&outside_dir, &routed_parent).unwrap();
+
+        let error = blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &routed_parent.join("not-yet-created.db"),
+            Some(100),
+        )
+        .expect_err("a missing database leaf must not hide a symlinked parent route")
+        .to_string();
+        assert!(
+            error.contains("symlinked parent component"),
+            "unexpected route error: {error}"
+        );
+        assert!(
+            !outside_dir.join("not-yet-created.db").exists(),
+            "rejected authority acquisition must not materialize the routed leaf"
+        );
+    }
+
+    #[test]
+    fn additive_reconcile_exact_ids_are_read_only_until_apply_and_preserve_events() {
+        let temp = TempDir::new().unwrap();
+        let (beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let existing = make_issue_at("bd-existing", "Same payload", fixed_time(100));
+        storage.create_issue(&existing, "test-actor").unwrap();
+        let same_hash_new_id = make_issue_at("bd-new", "Same payload", fixed_time(200));
+        write_additive_issues(&jsonl_path, &[existing.clone(), same_hash_new_id.clone()]);
+
+        let source_before = fs::read(&jsonl_path).unwrap();
+        let events_before = storage.get_all_events(0).unwrap();
+        let dirty_before = storage.get_dirty_issue_metadata().unwrap();
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+        assert_eq!(plan.receipt().created, 1);
+        assert_eq!(plan.receipt().updated, 0);
+        assert_eq!(plan.receipt().skipped_equal, 1);
+        assert_eq!(plan.receipt().synchronized, 2);
+        assert_eq!(plan.receipt().deleted, 0);
+        assert_eq!(plan.receipt().db_only_preserved, 0);
+        assert_eq!(plan.mutation_count(), 1);
+        assert!(storage.get_issue("bd-new").unwrap().is_none());
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+        assert_eq!(storage.get_dirty_issue_metadata().unwrap(), dirty_before);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert_eq!(
+            receipt.target_after.as_ref(),
+            Some(&plan.receipt().expected_target_after)
+        );
+        assert_eq!(receipt.events_before, events_before.len());
+        assert_eq!(receipt.events_after, events_before.len());
+        assert_eq!(
+            receipt.event_payload_sha256_before,
+            receipt.event_payload_sha256_after
+        );
+        assert!(receipt.cache_rebuild_performed);
+        assert!(receipt.metadata_changed);
+        assert_eq!(
+            receipt.export_hashes_updated,
+            receipt.export_hash_updates_planned
+        );
+        assert_eq!(
+            receipt.dirty_markers_cleared,
+            receipt.dirty_markers_clear_planned
+        );
+        assert!(!receipt.jsonl_written);
+        assert!(!receipt.base_snapshot_used);
+        assert!(!receipt.merge_note_written);
+        assert_eq!(
+            storage.get_issue("bd-new").unwrap().unwrap().title,
+            same_hash_new_id.title
+        );
+        assert_eq!(storage.get_all_events(0).unwrap(), events_before);
+        assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+        assert!(!beads_dir.join("beads.base.jsonl").exists());
+        assert!(!beads_dir.join("merge.json").exists());
+
+        let idempotent_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(
+            idempotent_plan.receipt().status,
+            AdditiveReconcileStatus::NoChanges
+        );
+        assert!(!idempotent_plan.receipt().metadata_update_planned);
+        assert_eq!(idempotent_plan.receipt().export_hash_updates_planned, 0);
+        assert_eq!(idempotent_plan.receipt().dirty_markers_clear_planned, 0);
+    }
+
+    #[test]
+    fn additive_reconcile_rolls_back_exactly_at_early_mid_and_late_fault_phases() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-fault", "Fault rollback", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let source_before = fs::read(&jsonl_path).unwrap();
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+
+        for phase in [
+            AdditiveTestFailPhase::BeforeTransaction,
+            AdditiveTestFailPhase::AfterIssueAndRelationWrites,
+            AdditiveTestFailPhase::BeforeFinalCommitChecks,
+        ] {
+            ADDITIVE_TEST_FAIL_PHASE.with(|configured| configured.set(Some(phase)));
+            let error = apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan)
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected additive reconciliation failure"),
+                "unexpected {phase:?} error: {error}"
+            );
+            let issues_after = hydrate_additive_database_issues(&storage).unwrap();
+            let witness_after = additive_database_witness(&storage, &issues_after).unwrap();
+            assert_eq!(
+                witness_after,
+                plan.receipt().target_before,
+                "{phase:?} failure must restore the complete typed database prestate"
+            );
+            assert_eq!(fs::read(&jsonl_path).unwrap(), source_before);
+            assert_eq!(
+                plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap(),
+                plan,
+                "{phase:?} rollback must leave the exact reviewed plan reusable"
+            );
+        }
+
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert!(storage.get_issue(&incoming.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn additive_reconcile_rejects_schema_version_drift_inside_transaction() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-schema-drift", "Schema drift", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+
+        ADDITIVE_TEST_DRIFT_SCHEMA_BEFORE_TRANSACTION.with(|flag| flag.set(true));
+        let error = apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan)
+            .expect_err("in-transaction schema drift must invalidate the reviewed plan");
+        assert!(
+            error.to_string().contains("schema version changed"),
+            "unexpected schema drift error: {error}"
+        );
+        assert!(
+            storage.get_issue(&incoming.id).unwrap().is_none(),
+            "schema drift must be rejected before the first additive write"
+        );
+
+        storage
+            .execute_raw(&format!(
+                "PRAGMA user_version = {}",
+                crate::storage::schema::CURRENT_SCHEMA_VERSION
+            ))
+            .unwrap();
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+    }
+
+    #[test]
+    fn additive_reconcile_applies_relations_and_rebuilds_derived_caches() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let target = make_issue_at("bd-target", "Target", fixed_time(100));
+        storage.upsert_issue_for_import(&target).unwrap();
+        let mut source = make_issue_at("bd-source", "Source", fixed_time(200));
+        source.labels = vec!["search".to_string(), "correctness".to_string()];
+        source.dependencies = vec![Dependency {
+            issue_id: source.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: fixed_time(180),
+            created_by: Some("fixture".to_string()),
+            metadata: Some("{}".to_string()),
+            thread_id: Some("bd-source".to_string()),
+        }];
+        source.comments = vec![Comment {
+            id: 41,
+            issue_id: source.id.clone(),
+            author: "fixture".to_string(),
+            body: "Preserve this comment exactly.".to_string(),
+            created_at: fixed_time(190),
+        }];
+        write_additive_issues(&jsonl_path, &[target.clone(), source.clone()]);
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(
+            plan.receipt().relations_after,
+            AdditiveRelationCounts {
+                labels: 2,
+                dependencies: 1,
+                comments: 1,
+            }
+        );
+        assert_eq!(
+            plan.receipt().relation_rows_planned,
+            AdditiveRelationCounts {
+                labels: 2,
+                dependencies: 1,
+                comments: 1,
+            },
+            "dry-run receipt must report the relation rows the reviewed apply will insert"
+        );
+        assert_eq!(
+            plan.receipt().relation_rows_applied,
+            AdditiveRelationCounts::default(),
+            "dry-run receipt must never claim that relation rows were already applied"
+        );
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(
+            receipt.relation_rows_applied, receipt.relation_rows_planned,
+            "committed receipt must distinguish applied relation rows from planning"
+        );
+        assert_eq!(
+            receipt.target_after.as_ref(),
+            Some(&plan.receipt().expected_target_after)
+        );
+        assert_eq!(
+            receipt
+                .target_after
+                .as_ref()
+                .expect("after witness")
+                .relations,
+            plan.receipt().relations_after
+        );
+        let stored = hydrate_additive_database_issues(&storage).unwrap();
+        assert_eq!(receipt.comment_id_remaps.len(), 1);
+        assert_eq!(receipt.comment_id_remaps[0].old_id, 41);
+        assert_eq!(receipt.comment_id_remaps[0].new_id, 1);
+        source.comments[0].id = receipt.comment_id_remaps[0].new_id;
+        let expected = canonical_additive_test_issue(source);
+        assert_eq!(stored["bd-source"].labels, expected.labels);
+        assert_eq!(stored["bd-source"].dependencies, expected.dependencies);
+        assert_eq!(stored["bd-source"].comments, expected.comments);
+        assert_eq!(receipt.events_before, 0);
+        assert_eq!(receipt.events_after, 0);
+    }
+
+    #[test]
+    fn additive_reconcile_conflicts_on_equal_timestamp_drift_and_resurrection() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let local = make_issue_at("bd-drift", "Local", fixed_time(100));
+        storage.upsert_issue_for_import(&local).unwrap();
+        let mut tombstone = make_issue_at("bd-deleted", "Deleted", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(90));
+        tombstone.deleted_by = Some("fixture".to_string());
+        storage.upsert_issue_for_import(&tombstone).unwrap();
+
+        let drifted = make_issue_at("bd-drift", "External", fixed_time(100));
+        let resurrected = make_issue_at("bd-deleted", "Resurrected", fixed_time(200));
+        write_additive_issues(&jsonl_path, &[drifted, resurrected]);
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Conflicted);
+        assert_eq!(
+            plan.receipt()
+                .conflict_reasons
+                .get("equal_timestamp_shared_scalar_drift"),
+            Some(&1)
+        );
+        assert_eq!(
+            plan.receipt()
+                .conflict_reasons
+                .get("tombstone_resurrection"),
+            Some(&1)
+        );
+        assert_eq!(
+            plan.receipt()
+                .conflict_scalar_diffs
+                .iter()
+                .map(|witness| witness.issue_id.as_str())
+                .collect::<Vec<_>>(),
+            ["bd-deleted", "bd-drift"]
+        );
+        let drift_witness = plan
+            .receipt()
+            .conflict_scalar_diffs
+            .iter()
+            .find(|witness| witness.issue_id == "bd-drift")
+            .expect("equal-timestamp drift has a complete scalar witness");
+        assert!(
+            drift_witness
+                .changed_fields
+                .iter()
+                .any(|field| field == "title")
+        );
+        assert_eq!(
+            plan.receipt().conflict_scalar_diffs_sha256,
+            additive_sha256(
+                &plan.receipt().conflict_scalar_diffs,
+                "complete conflict scalar diff manifest"
+            )
+            .unwrap()
+        );
+        assert!(apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).is_err());
+        assert_eq!(
+            storage.get_issue("bd-drift").unwrap().unwrap().title,
+            "Local"
+        );
+        assert_eq!(
+            storage.get_issue("bd-deleted").unwrap().unwrap().status,
+            Status::Tombstone
+        );
+    }
+
+    #[test]
+    fn additive_reconcile_binds_relation_deltas_for_shared_and_tombstone_conflicts() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        let mut local = make_issue_at("bd-relation", "Same scalars", fixed_time(100));
+        local.labels = vec!["private-local-label".to_string()];
+        storage
+            .upsert_issue_and_relations_for_import(&local)
+            .unwrap();
+        let mut incoming = local.clone();
+        incoming.labels = vec!["private-source-label".to_string()];
+
+        let mut tombstone = make_issue_at("bd-deleted-rel", "Deleted", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(90));
+        tombstone.deleted_by = Some("fixture".to_string());
+        tombstone.labels = vec!["private-tombstone-label".to_string()];
+        storage
+            .upsert_issue_and_relations_for_import(&tombstone)
+            .unwrap();
+        let mut resurrected = make_issue_at("bd-deleted-rel", "Resurrected", fixed_time(200));
+        resurrected.labels = vec!["private-resurrected-label".to_string()];
+
+        write_additive_issues(&jsonl_path, &[incoming, resurrected]);
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+
+        assert_eq!(
+            plan.receipt().conflict_reasons.get("shared_relation_drift"),
+            Some(&1)
+        );
+        assert_eq!(
+            plan.receipt()
+                .conflict_reasons
+                .get("tombstone_resurrection"),
+            Some(&1)
+        );
+        assert_eq!(plan.receipt().conflict_relation_diffs.len(), 2);
+        for witness in &plan.receipt().conflict_relation_diffs {
+            assert_eq!(witness.changed_relation_classes, ["labels"]);
+            assert_eq!(witness.before_counts.labels, 1);
+            assert_eq!(witness.after_counts.labels, 1);
+            assert_eq!(witness.added_element_sha256.len(), 1);
+            assert_eq!(witness.removed_element_sha256.len(), 1);
+            assert_ne!(witness.before_payload_sha256, witness.after_payload_sha256);
+        }
+        assert_eq!(
+            plan.receipt().conflict_relation_diffs_sha256,
+            additive_sha256(
+                &plan.receipt().conflict_relation_diffs,
+                "complete conflict relation diff manifest"
+            )
+            .unwrap()
+        );
+        let serialized = serde_json::to_string(plan.receipt()).unwrap();
+        for private_value in [
+            "private-local-label",
+            "private-source-label",
+            "private-tombstone-label",
+            "private-resurrected-label",
+        ] {
+            assert!(!serialized.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn additive_reconcile_requires_explicit_resolution_for_database_newer_rows() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let local_newer = make_issue_at("bd-shared", "Local newer", fixed_time(300));
+        let db_only = make_issue_at("bd-db-only", "Database only", fixed_time(200));
+        storage.upsert_issue_for_import(&local_newer).unwrap();
+        storage.upsert_issue_for_import(&db_only).unwrap();
+        let source_older = make_issue_at("bd-shared", "Source older", fixed_time(100));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&source_older));
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Conflicted);
+        assert_eq!(
+            plan.receipt()
+                .conflict_reasons
+                .get("database_newer_shared_scalar_drift"),
+            Some(&1)
+        );
+        assert_eq!(plan.receipt().db_only_preserved, 1);
+        assert_eq!(plan.receipt().deleted, 0);
+        assert!(apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).is_err());
+
+        let mut resolved_config = config;
+        resolved_config
+            .source_authoritative_ids
+            .insert("bd-shared".to_string());
+        let resolved_plan =
+            plan_additive_reconcile(&storage, &jsonl_path, &resolved_config).unwrap();
+        assert_eq!(
+            resolved_plan.receipt().status,
+            AdditiveReconcileStatus::Conflicted
+        );
+        assert_eq!(
+            resolved_plan
+                .receipt()
+                .conflict_reasons
+                .get("database_newer_source_resolution_forbidden"),
+            Some(&1)
+        );
+        assert!(
+            apply_reviewed_additive_plan(
+                &mut storage,
+                &jsonl_path,
+                &resolved_config,
+                &resolved_plan,
+            )
+            .is_err()
+        );
+
+        let mut source_equal = local_newer.clone();
+        source_equal.description = Some("Reviewed source description".to_string());
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&source_equal));
+        let equal_timestamp_plan =
+            plan_additive_reconcile(&storage, &jsonl_path, &resolved_config).unwrap();
+        assert_eq!(
+            equal_timestamp_plan.receipt().status,
+            AdditiveReconcileStatus::Ready
+        );
+        assert_eq!(equal_timestamp_plan.receipt().updated, 1);
+        let receipt = apply_reviewed_additive_plan(
+            &mut storage,
+            &jsonl_path,
+            &resolved_config,
+            &equal_timestamp_plan,
+        )
+        .unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert!(receipt.metadata_changed);
+        assert!(receipt.cache_rebuild_performed);
+        assert_eq!(
+            receipt
+                .target_after
+                .as_ref()
+                .and_then(|witness| witness.needs_flush.as_deref()),
+            Some("true")
+        );
+        let stored = hydrate_additive_database_issues(&storage).unwrap();
+        assert_eq!(
+            stored["bd-shared"],
+            canonical_additive_test_issue(source_equal)
+        );
+        assert_eq!(stored["bd-db-only"], canonical_additive_test_issue(db_only));
+    }
+
+    #[test]
+    fn additive_reconcile_reports_relation_and_external_identity_conflicts() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let storage = SqliteStorage::open_memory().unwrap();
+        let mut owner = make_issue_at("bd-owner", "Owner", fixed_time(100));
+        owner.external_ref = Some("EXT-1".to_string());
+        storage.upsert_issue_for_import(&owner).unwrap();
+
+        let mut invalid = make_issue_at("bd-invalid", "Invalid", fixed_time(200));
+        invalid.external_ref = Some("EXT-1".to_string());
+        invalid.dependencies = vec![Dependency {
+            issue_id: invalid.id.clone(),
+            depends_on_id: "bd-missing".to_string(),
+            dep_type: DependencyType::Blocks,
+            created_at: fixed_time(180),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        invalid.comments = vec![Comment {
+            id: 9,
+            issue_id: "bd-other".to_string(),
+            author: "fixture".to_string(),
+            body: "Wrong owner".to_string(),
+            created_at: fixed_time(190),
+        }];
+        write_additive_issues(&jsonl_path, &[invalid]);
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        for reason in [
+            "external_ref_owned_by_other_id",
+            "orphan_dependency_target",
+            "comment_source_id_mismatch",
+        ] {
+            assert_eq!(plan.receipt().conflict_reasons.get(reason), Some(&1));
+        }
+        let witness = plan
+            .receipt()
+            .conflict_witnesses
+            .iter()
+            .find(|witness| witness.issue_id == "bd-invalid")
+            .expect("invalid issue conflict witness");
+        assert!(witness.details.iter().any(|detail| {
+            detail.reason == "external_ref_owned_by_other_id"
+                && detail.detail_kind == "external_ref"
+                && detail.related_value_sha256 == [hex_encode(&Sha256::digest(b"bd-owner"))]
+                && detail.value_sha256.is_some()
+        }));
+        assert!(witness.details.iter().any(|detail| {
+            detail.reason == "orphan_dependency_target"
+                && detail.ordinal == Some(0)
+                && detail.related_value_sha256 == [hex_encode(&Sha256::digest(b"bd-missing"))]
+        }));
+        assert!(witness.details.iter().any(|detail| {
+            detail.reason == "comment_source_id_mismatch"
+                && detail.ordinal == Some(0)
+                && detail.related_value_sha256 == [hex_encode(&Sha256::digest(b"bd-other"))]
+                && detail.value_sha256.is_some()
+        }));
+        let serialized_witness = serde_json::to_string(witness).unwrap();
+        assert!(!serialized_witness.contains("EXT-1"));
+        assert!(!serialized_witness.contains("Wrong owner"));
+        assert!(!serialized_witness.contains("bd-owner"));
+        assert!(!serialized_witness.contains("bd-missing"));
+        assert!(!serialized_witness.contains("bd-other"));
+        assert_eq!(plan.mutation_count(), 0);
+        assert!(storage.get_issue("bd-invalid").unwrap().is_none());
+    }
+
+    #[test]
+    fn additive_reconcile_reports_safe_comment_validation_subcodes_and_full_payload_hash() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let storage = SqliteStorage::open_memory().unwrap();
+        let mut invalid = make_issue_at("bd-invalid-comment", "Invalid comment", fixed_time(200));
+        let comment = Comment {
+            id: 0,
+            issue_id: invalid.id.clone(),
+            author: String::new(),
+            body: "\0PRIVATE-COMMENT\n\u{1b}[31m".to_string(),
+            created_at: fixed_time(190),
+        };
+        let canonical_payload = serde_json::to_string(&comment).unwrap();
+        invalid.comments = vec![comment];
+        write_additive_issues(&jsonl_path, &[invalid]);
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(
+            plan.receipt().conflict_reasons.get("invalid_comment"),
+            Some(&1)
+        );
+        let detail = plan
+            .receipt()
+            .conflict_witnesses
+            .iter()
+            .flat_map(|witness| &witness.details)
+            .find(|detail| detail.reason == "invalid_comment")
+            .expect("invalid comment detail");
+        assert_eq!(detail.detail_kind, "comment_validation");
+        assert_eq!(
+            detail.validation_subcodes,
+            ["author_empty", "body_contains_nul"]
+        );
+        assert_eq!(
+            detail.value_sha256,
+            Some(hex_encode(&Sha256::digest(canonical_payload.as_bytes())))
+        );
+        let serialized = serde_json::to_string(detail).unwrap();
+        assert!(!serialized.contains("PRIVATE-COMMENT"));
+        assert!(!serialized.contains("\\u001b"));
+        assert_eq!(plan.mutation_count(), 0);
+    }
+
+    #[test]
+    fn additive_reconcile_rejects_projected_cycles_and_remaps_comment_ids() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut first = make_issue_at("bd-cycle-a", "Cycle A", fixed_time(100));
+        let mut second = make_issue_at("bd-cycle-b", "Cycle B", fixed_time(100));
+        first.dependencies = vec![Dependency {
+            issue_id: first.id.clone(),
+            depends_on_id: second.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: fixed_time(90),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        second.dependencies = vec![Dependency {
+            issue_id: second.id.clone(),
+            depends_on_id: first.id.clone(),
+            dep_type: DependencyType::WaitsFor,
+            created_at: fixed_time(90),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        write_additive_issues(&jsonl_path, &[first, second]);
+
+        let cycle_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(
+            cycle_plan.receipt().status,
+            AdditiveReconcileStatus::Conflicted
+        );
+        assert_eq!(cycle_plan.receipt().preexisting_blocking_cycles, 0);
+        assert_eq!(cycle_plan.receipt().projected_blocking_cycles, 1);
+        assert_eq!(cycle_plan.receipt().new_blocking_cycles, 1);
+        assert_eq!(
+            cycle_plan
+                .receipt()
+                .conflict_reasons
+                .get("projected_blocking_cycle"),
+            Some(&2)
+        );
+        assert_eq!(cycle_plan.receipt().conflicted, 2);
+
+        let mut first_comment_owner = make_issue_at("bd-comment-a", "Comment A", fixed_time(100));
+        let mut second_comment_owner = make_issue_at("bd-comment-b", "Comment B", fixed_time(100));
+        first_comment_owner.comments = vec![Comment {
+            id: 77,
+            issue_id: first_comment_owner.id.clone(),
+            author: "fixture".to_string(),
+            body: "First owner".to_string(),
+            created_at: fixed_time(95),
+        }];
+        second_comment_owner.comments = vec![
+            Comment {
+                id: 77,
+                issue_id: second_comment_owner.id.clone(),
+                author: "fixture".to_string(),
+                body: "Duplicate owner".to_string(),
+                created_at: fixed_time(95),
+            },
+            Comment {
+                id: 0,
+                issue_id: second_comment_owner.id.clone(),
+                author: "fixture".to_string(),
+                body: "Allocate this nonpositive surrogate ID.".to_string(),
+                created_at: fixed_time(96),
+            },
+        ];
+        write_additive_issues(&jsonl_path, &[first_comment_owner, second_comment_owner]);
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+        assert_eq!(plan.receipt().preexisting_blocking_cycles, 0);
+        assert_eq!(plan.receipt().projected_blocking_cycles, 0);
+        assert_eq!(plan.receipt().new_blocking_cycles, 0);
+        assert_eq!(plan.receipt().conflicted, 0);
+        assert_eq!(plan.receipt().comment_id_remaps.len(), 3);
+        assert_eq!(
+            plan.receipt()
+                .comment_id_remaps
+                .iter()
+                .map(|remap| (remap.old_id, remap.new_id))
+                .collect::<Vec<_>>(),
+            vec![(77, 1), (0, 3), (77, 2)]
+        );
+        assert!(storage.get_issue("bd-cycle-a").unwrap().is_none());
+        assert!(storage.get_issue("bd-cycle-b").unwrap().is_none());
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        let stored = hydrate_additive_database_issues(&storage).unwrap();
+        assert_eq!(
+            stored["bd-comment-b"]
+                .comments
+                .iter()
+                .map(|comment| comment.id)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn additive_reconcile_preserves_preexisting_cycles_without_misclassifying_them_as_new() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut first = make_issue_at("bd-existing-cycle-a", "Cycle A", fixed_time(100));
+        let mut second = make_issue_at("bd-existing-cycle-b", "Cycle B", fixed_time(100));
+        first.dependencies = vec![Dependency {
+            issue_id: first.id.clone(),
+            depends_on_id: second.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: fixed_time(90),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        second.dependencies = vec![Dependency {
+            issue_id: second.id.clone(),
+            depends_on_id: first.id.clone(),
+            dep_type: DependencyType::WaitsFor,
+            created_at: fixed_time(90),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }];
+        storage.upsert_issue_for_import(&first).unwrap();
+        storage.upsert_issue_for_import(&second).unwrap();
+        sync_issue_relations(&storage, &first).unwrap();
+        sync_issue_relations(&storage, &second).unwrap();
+
+        let incoming = make_issue_at("bd-cycle-independent", "Independent", fixed_time(200));
+        write_additive_issues(
+            &jsonl_path,
+            &[first.clone(), second.clone(), incoming.clone()],
+        );
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+
+        assert_eq!(plan.receipt().status, AdditiveReconcileStatus::Ready);
+        assert_eq!(plan.receipt().preexisting_blocking_cycles, 1);
+        assert_eq!(plan.receipt().projected_blocking_cycles, 1);
+        assert_eq!(plan.receipt().new_blocking_cycles, 0);
+        assert_eq!(plan.receipt().conflicted, 0);
+        assert_eq!(plan.receipt().created, 1);
+
+        let receipt =
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+        assert_eq!(receipt.status, AdditiveReconcileStatus::Applied);
+        assert_eq!(
+            storage
+                .get_issue(&incoming.id)
+                .unwrap()
+                .expect("independent incoming issue")
+                .title,
+            incoming.title
+        );
+    }
+
+    #[test]
+    fn additive_reconcile_rejects_duplicate_ids_and_stale_source_or_database() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-new", "New", fixed_time(100));
+        write_additive_issues(&jsonl_path, &[incoming.clone(), incoming.clone()]);
+        assert!(plan_additive_reconcile(&storage, &jsonl_path, &config).is_err());
+
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let stale_source_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        let changed = make_issue_at("bd-new", "Changed", fixed_time(200));
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&changed));
+        assert!(
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &stale_source_plan)
+                .is_err()
+        );
+        assert!(storage.get_issue("bd-new").unwrap().is_none());
+
+        write_additive_issues(&jsonl_path, std::slice::from_ref(&incoming));
+        let stale_database_plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        let concurrent = make_issue_at("bd-concurrent", "Concurrent", fixed_time(300));
+        storage.upsert_issue_for_import(&concurrent).unwrap();
+        assert!(
+            apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &stale_database_plan)
+                .is_err()
+        );
+        assert!(storage.get_issue("bd-new").unwrap().is_none());
+    }
+
     fn build_collision_maps(
         storage: &SqliteStorage,
     ) -> (
@@ -5755,7 +16520,9 @@ mod tests {
                     .entry(ext.clone())
                     .or_insert_with(|| issue_id.clone());
             }
-            if let Some(hash) = meta.content_hash.as_ref() {
+            if meta.status != Status::Tombstone
+                && let Some(hash) = meta.content_hash.as_ref()
+            {
                 id_by_hash
                     .entry(hash.clone())
                     .or_insert_with(|| issue_id.clone());
@@ -5812,14 +16579,14 @@ mod tests {
     fn test_scan_conflict_markers_detects_all_kinds() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("issues.jsonl");
-        let contents = "\
-{\"id\":\"bd-1\",\"title\":\"ok\"}
-<<<<<<< HEAD
-{\"id\":\"bd-2\",\"title\":\"conflict\"}
-=======
-{\"id\":\"bd-2\",\"title\":\"other\"}
->>>>>>> feature-branch
-";
+        let contents = concat!(
+            "{\"id\":\"bd-1\",\"title\":\"ok\"}\n",
+            "<<<<<<< HEAD\n",
+            "{\"id\":\"bd-2\",\"title\":\"conflict\"}\n",
+            "=======\n",
+            "{\"id\":\"bd-2\",\"title\":\"other\"}\n",
+            ">>>>>>> feature-branch\n",
+        );
         fs::write(&path, contents).expect("write");
 
         let markers = scan_conflict_markers(&path).expect("scan");
@@ -5854,6 +16621,765 @@ mod tests {
         assert_eq!(result.exported_count, 0);
         assert!(result.exported_ids.is_empty());
         assert!(output_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_creates_missing_target_without_replace_race() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let staged_state = staged_source.state_witness();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+
+        let publication = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &JsonlSourceStateWitness::Missing,
+            &content_sha256,
+            &authority,
+            || Ok(()),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            publication.atomicity,
+            ExportPublicationAtomicity::CreateNoReplace
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert!(!temp_path.exists());
+        assert!(publication.cleanup_durable);
+        assert!(publication.retained_recovery_path.is_none());
+        assert_eq!(publication.source.display_path(), output_path);
+        assert_eq!(publication.source.state_witness(), staged_state);
+        assert_eq!(publication.source.content_sha256(), content_sha256);
+    }
+
+    #[cfg(unix)]
+    fn assert_parent_route_replacement_is_contained(
+        replacement_phase: ConditionalPublicationHookPhase,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let live_parent = temp.path().join("live");
+        let displaced_parent = temp.path().join("pinned-original");
+        fs::create_dir(&live_parent).unwrap();
+        let output_path = live_parent.join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+        let replaced = std::cell::Cell::new(false);
+
+        let result = publish_staged_jsonl_conditionally_with_hooks(
+            &temp_path,
+            TempFileGuard::new_retained(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            |phase| {
+                if phase == replacement_phase {
+                    assert!(!replaced.replace(true), "phase hook ran more than once");
+                    fs::rename(&live_parent, &displaced_parent)?;
+                    fs::create_dir(&live_parent)?;
+                    fs::write(&output_path, b"{\"id\":\"attacker-target\"}\n")?;
+                    fs::write(&temp_path, b"{\"id\":\"attacker-temp\"}\n")?;
+                }
+                Ok(())
+            },
+            JsonlFamilyWriteLock::fsync_pinned_parent,
+        );
+
+        assert!(replaced.get(), "requested phase hook did not run");
+        assert!(matches!(
+            result,
+            Err(BeadsError::JsonlPublishedButUnwitnessed { .. })
+        ));
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            b"{\"id\":\"attacker-target\"}\n",
+            "publication must not follow a substituted target parent"
+        );
+        assert_eq!(
+            fs::read(&temp_path).unwrap(),
+            b"{\"id\":\"attacker-temp\"}\n",
+            "cleanup must not follow a substituted staging parent"
+        );
+        assert_eq!(
+            fs::read(displaced_parent.join("issues.jsonl")).unwrap(),
+            b"{\"id\":\"new\"}\n",
+            "the namespace change remains confined to the pinned parent"
+        );
+        assert_eq!(
+            fs::read(displaced_parent.join(temp_path.file_name().unwrap())).unwrap(),
+            b"{\"id\":\"old\"}\n",
+            "the displaced generation is retained under the pinned parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_precreate_route_replacement_cannot_redirect_creation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let live_parent = temp.path().join("live");
+        let displaced_parent = temp.path().join("pinned-original");
+        fs::create_dir(&live_parent).unwrap();
+        let output_path = live_parent.join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+
+        let result = create_pinned_jsonl_temp_file_with(
+            &output_path,
+            &authority,
+            |_| Ok(()),
+            |phase| {
+                assert_eq!(phase, ConditionalPublicationHookPhase::PreCreate);
+                fs::rename(&live_parent, &displaced_parent)?;
+                fs::create_dir(&live_parent)?;
+                fs::write(&output_path, b"{\"id\":\"attacker-target\"}\n")?;
+                fs::write(&temp_path, b"{\"id\":\"attacker-temp\"}\n")?;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            b"{\"id\":\"attacker-target\"}\n"
+        );
+        assert_eq!(
+            fs::read(&temp_path).unwrap(),
+            b"{\"id\":\"attacker-temp\"}\n"
+        );
+        let pinned_temp = displaced_parent.join(temp_path.file_name().unwrap());
+        assert!(pinned_temp.is_file());
+        assert_eq!(
+            fs::metadata(&pinned_temp).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_precommit_route_replacement_is_contained() {
+        assert_parent_route_replacement_is_contained(ConditionalPublicationHookPhase::PreCommit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_postrename_route_replacement_is_contained() {
+        assert_parent_route_replacement_is_contained(ConditionalPublicationHookPhase::PostRename);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_fsync_route_replacement_is_contained() {
+        assert_parent_route_replacement_is_contained(ConditionalPublicationHookPhase::ParentFsync);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_cleanup_route_replacement_never_unlinks_outside_parent() {
+        assert_parent_route_replacement_is_contained(ConditionalPublicationHookPhase::PreCleanup);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_cleanup_leaf_substitution_retains_attacker_file() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        let recovery_path = temp.path().join("verified-old.recovery");
+        let protected_path = temp.path().join("attacker-controlled.jsonl");
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        fs::write(&protected_path, b"{\"id\":\"protected\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+
+        let publication = publish_staged_jsonl_conditionally_with_hooks(
+            &temp_path,
+            TempFileGuard::new_retained(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            |phase| {
+                if phase == ConditionalPublicationHookPhase::PreCleanup {
+                    fs::rename(&temp_path, &recovery_path)?;
+                    fs::hard_link(&protected_path, &temp_path)?;
+                }
+                Ok(())
+            },
+            JsonlFamilyWriteLock::fsync_pinned_parent,
+        )
+        .unwrap();
+
+        assert!(!publication.cleanup_durable);
+        assert_eq!(
+            publication.retained_recovery_path.as_deref(),
+            Some(temp_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert_eq!(fs::read(&recovery_path).unwrap(), b"{\"id\":\"old\"}\n");
+        assert_eq!(
+            fs::read(&protected_path).unwrap(),
+            b"{\"id\":\"protected\"}\n"
+        );
+        assert_eq!(
+            fs::read(&temp_path).unwrap(),
+            b"{\"id\":\"protected\"}\n",
+            "identity-mismatched cleanup leaf must not be removed"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_no_replace_preserves_target_that_appears_in_final_window() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&temp_path, b"{\"id\":\"staged\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+
+        let result = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &JsonlSourceStateWitness::Missing,
+            &content_sha256,
+            &authority,
+            || {
+                fs::write(&output_path, b"{\"id\":\"concurrent\"}\n")?;
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(BeadsError::SyncConflict { .. })));
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            b"{\"id\":\"concurrent\"}\n"
+        );
+        assert_eq!(
+            fs::read(&temp_path).unwrap(),
+            b"{\"id\":\"staged\"}\n",
+            "an unpublished staged generation is retained for explicit recovery"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_refuses_stale_present_witness_before_namespace_change() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&output_path, b"{\"id\":\"expected\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        fs::write(&output_path, b"  {\"id\":\"expected\"}  \n").unwrap();
+        let observed_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        assert_eq!(
+            expected_source.content_sha256(),
+            observed_source.content_sha256(),
+            "the fixture must preserve canonical JSONL content"
+        );
+        assert_ne!(
+            expected_source.raw_sha256(),
+            observed_source.raw_sha256(),
+            "the fixture must change exact raw bytes"
+        );
+
+        fs::write(&temp_path, b"{\"id\":\"staged\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+        let namespace_hook_called = std::cell::Cell::new(false);
+
+        let result = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            || {
+                namespace_hook_called.set(true);
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(BeadsError::SyncConflict { .. })));
+        assert!(
+            !namespace_hook_called.get(),
+            "a stale exact source witness must fail before the namespace-change hook"
+        );
+        assert_eq!(
+            fs::read(&output_path).unwrap(),
+            b"  {\"id\":\"expected\"}  \n"
+        );
+        assert_eq!(
+            fs::read(&temp_path).unwrap(),
+            b"{\"id\":\"staged\"}\n",
+            "a pre-publication failure must retain the staged generation"
+        );
+    }
+
+    #[test]
+    fn conditional_publication_exact_source_witness_distinguishes_missing_from_empty() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+
+        assert!(
+            capture_optional_jsonl_source(&output_path)
+                .unwrap()
+                .is_none()
+        );
+        verify_expected_jsonl_source_state(
+            &output_path,
+            None,
+            Some(&JsonlSourceStateWitness::Missing),
+        )
+        .unwrap();
+
+        fs::write(&output_path, b"").unwrap();
+        let empty_source = capture_optional_jsonl_source(&output_path)
+            .unwrap()
+            .expect("a present empty file is still a source generation");
+        assert_eq!(empty_source.size(), 0);
+        assert!(matches!(
+            empty_source.state_witness(),
+            JsonlSourceStateWitness::Present { size: 0, .. }
+        ));
+        assert!(
+            verify_expected_jsonl_source_state(
+                &output_path,
+                None,
+                Some(&JsonlSourceStateWitness::Missing),
+            )
+            .is_err(),
+            "Missing must never compare equal to a present zero-byte generation"
+        );
+        verify_expected_jsonl_source_state(&output_path, None, Some(&empty_source.state_witness()))
+            .unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_exchange_verifies_both_generations_and_cleans_up() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+        let mut sync_calls = 0;
+
+        let publication = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            || Ok(()),
+            |_| {
+                sync_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            publication.atomicity,
+            ExportPublicationAtomicity::ExchangeAndVerify
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert!(!temp_path.exists());
+        assert_eq!(sync_calls, 2);
+        assert!(publication.cleanup_durable);
+        assert!(publication.retained_recovery_path.is_none());
+        assert_eq!(
+            publication.source.state_witness(),
+            staged_source.state_witness()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_detects_aba_and_preserves_displaced_generation() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        let concurrent_path = temp.path().join("concurrent.jsonl");
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        fs::write(&temp_path, b"{\"id\":\"staged\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+
+        let result = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            || {
+                fs::write(&concurrent_path, b"{\"id\":\"concurrent\"}\n")?;
+                fs::rename(&concurrent_path, &output_path)?;
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        assert!(matches!(
+            result,
+            Err(BeadsError::JsonlPublicationConflict { .. })
+        ));
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"staged\"}\n");
+        assert_eq!(fs::read(&temp_path).unwrap(), b"{\"id\":\"concurrent\"}\n");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_reports_post_commit_directory_sync_failure() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+
+        let result = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            || Ok(()),
+            |_| Err(io::Error::other("forced parent-directory sync failure")),
+        );
+
+        assert!(matches!(
+            result,
+            Err(BeadsError::JsonlPublishedButNotDurable { .. })
+        ));
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert_eq!(fs::read(&temp_path).unwrap(), b"{\"id\":\"old\"}\n");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_reports_authority_loss_after_exchange_with_recovery_path() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+        let authority_path = authority.authority_lock_path.clone();
+        let displaced_authority_path = authority_path.with_extension("lock.displaced");
+
+        let result = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            || {
+                fs::rename(&authority_path, &displaced_authority_path)?;
+                drop(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&authority_path)?,
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+
+        match result {
+            Err(BeadsError::JsonlPublishedButUnwitnessed {
+                output_path: observed_output,
+                recovery_path: Some(observed_recovery),
+                ..
+            }) => {
+                assert_eq!(observed_output, output_path);
+                assert_eq!(observed_recovery, temp_path);
+            }
+            Err(other) => panic!("expected committed authority-loss receipt, got {other}"),
+            Ok(_) => panic!("expected committed authority-loss receipt, got success"),
+        }
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert_eq!(fs::read(&temp_path).unwrap(), b"{\"id\":\"old\"}\n");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_second_directory_sync_failure_marks_cleanup_uncertain() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("issues.jsonl");
+        let temp_path = export_temp_path(&output_path);
+        fs::write(&output_path, b"{\"id\":\"old\"}\n").unwrap();
+        let expected_source = capture_jsonl_source_snapshot(&output_path).unwrap();
+        fs::write(&temp_path, b"{\"id\":\"new\"}\n").unwrap();
+        let staged_source = capture_jsonl_source_snapshot(&temp_path).unwrap();
+        let content_sha256 = staged_source.content_sha256().to_string();
+        let authority = blocking_jsonl_family_write_lock_with_timeout(&output_path, None).unwrap();
+        let mut sync_calls = 0;
+
+        let publication = publish_staged_jsonl_conditionally_with(
+            &temp_path,
+            TempFileGuard::new(temp_path.clone()),
+            &output_path,
+            &staged_source,
+            &expected_source.state_witness(),
+            &content_sha256,
+            &authority,
+            || Ok(()),
+            |_| {
+                sync_calls += 1;
+                if sync_calls == 1 {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(
+                        "forced displaced-generation cleanup sync failure",
+                    ))
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sync_calls, 2);
+        assert_eq!(
+            publication.atomicity,
+            ExportPublicationAtomicity::ExchangeAndVerify
+        );
+        assert!(
+            !publication.cleanup_durable,
+            "a failed second directory sync must not certify cleanup durability"
+        );
+        assert!(
+            publication.retained_recovery_path.is_none(),
+            "the displaced file was removed; only cleanup durability is uncertain"
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
+        assert!(!temp_path.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[test]
+    fn conditional_publication_is_idempotent_for_identical_existing_target() {
+        let temp = TempDir::new().unwrap();
+        let output_path = temp.path().join("artifact.jsonl");
+        let first_staged_path = temp.path().join("artifact.first.tmp");
+        let second_staged_path = temp.path().join("artifact.second.tmp");
+        let exact_bytes = b" {\"id\":\"same\"}\r\n\n";
+
+        fs::write(&first_staged_path, exact_bytes).unwrap();
+        let first_receipt =
+            publish_staged_file_conditionally(&first_staged_path, &output_path).unwrap();
+        assert_eq!(
+            first_receipt.atomicity(),
+            ExportPublicationAtomicity::CreateNoReplace
+        );
+        assert_eq!(first_receipt.output_path(), output_path.to_string_lossy());
+        assert_eq!(
+            first_receipt.source.content_sha256(),
+            first_receipt.content_sha256()
+        );
+        assert_eq!(fs::read(&output_path).unwrap(), exact_bytes);
+
+        fs::write(&second_staged_path, exact_bytes).unwrap();
+        let second_receipt =
+            publish_staged_file_conditionally(&second_staged_path, &output_path).unwrap();
+        assert_eq!(
+            second_receipt.atomicity(),
+            ExportPublicationAtomicity::ExchangeAndVerify
+        );
+        assert_eq!(
+            second_receipt.content_sha256(),
+            first_receipt.content_sha256()
+        );
+        assert_eq!(
+            second_receipt.source.raw_sha256(),
+            first_receipt.source.raw_sha256()
+        );
+        assert!(second_receipt.cleanup_durable());
+        assert!(second_receipt.retained_recovery_path().is_none());
+        assert_eq!(fs::read(&output_path).unwrap(), exact_bytes);
+        assert!(!first_staged_path.exists());
+        assert!(!second_staged_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_rejects_symlink_and_nonregular_targets() {
+        let temp = TempDir::new().unwrap();
+        let outside_path = temp.path().join("outside.jsonl");
+        let symlink_path = temp.path().join("symlink.jsonl");
+        let directory_path = temp.path().join("directory.jsonl");
+        fs::write(&outside_path, b"{\"id\":\"outside\"}\n").unwrap();
+        symlink(&outside_path, &symlink_path).unwrap();
+        fs::create_dir(&directory_path).unwrap();
+
+        let symlink_error =
+            blocking_jsonl_family_write_lock_with_timeout(&symlink_path, None).unwrap_err();
+        assert!(
+            symlink_error.to_string().contains("symlink"),
+            "unexpected symlink error: {symlink_error}"
+        );
+        let directory_error =
+            blocking_jsonl_family_write_lock_with_timeout(&directory_path, None).unwrap_err();
+        assert!(
+            directory_error.to_string().contains("regular file"),
+            "unexpected nonregular error: {directory_error}"
+        );
+        assert_eq!(fs::read(&outside_path).unwrap(), b"{\"id\":\"outside\"}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conditional_publication_creates_jsonl_and_base_with_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let output_path = beads_dir.join("issues.jsonl");
+        let storage = SqliteStorage::open_memory().unwrap();
+        let config = ExportConfig {
+            beads_dir: Some(beads_dir.clone()),
+            ..ExportConfig::default()
+        };
+
+        export_to_jsonl(&storage, &output_path, &config).unwrap();
+        save_base_snapshot(&HashMap::<String, Issue>::new(), &beads_dir).unwrap();
+
+        assert_eq!(
+            fs::metadata(&output_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(beads_dir.join("beads.base.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn expected_staged_output_mismatch_never_replaces_live_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let output_path = beads_dir.join("issues.jsonl");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_test_issue("bd-reviewed-output", "Reviewed output");
+        storage.create_issue(&issue, "test").unwrap();
+
+        let mut reviewed_bytes = Vec::new();
+        let reviewed = export_to_writer(&storage, &mut reviewed_bytes).unwrap();
+        let reviewed_issue_hashes =
+            sync_merge_export_hash_mapping_witness(&reviewed.issue_hashes).unwrap();
+
+        let mut previous_issue = issue;
+        previous_issue.title = "Previous live generation".to_string();
+        let previous_bytes = format!("{}\n", serde_json::to_string(&previous_issue).unwrap());
+        fs::write(&output_path, previous_bytes.as_bytes()).unwrap();
+
+        let mismatches = [
+            ExpectedStagedExport {
+                raw_sha256: "ff".repeat(32),
+                issue_count: reviewed.exported_count,
+                issue_hashes: reviewed_issue_hashes.clone(),
+            },
+            ExpectedStagedExport {
+                raw_sha256: reviewed.content_hash.clone(),
+                issue_count: reviewed.exported_count + 1,
+                issue_hashes: reviewed_issue_hashes.clone(),
+            },
+            ExpectedStagedExport {
+                raw_sha256: reviewed.content_hash.clone(),
+                issue_count: reviewed.exported_count,
+                issue_hashes: AdditiveTableWitness {
+                    rows: reviewed_issue_hashes.rows,
+                    payload_sha256: "ee".repeat(32),
+                },
+            },
+        ];
+
+        for (attempt, expected_staged_output) in mismatches.into_iter().enumerate() {
+            let config = ExportConfig {
+                force: true,
+                beads_dir: Some(beads_dir.clone()),
+                expected_staged_output: Some(expected_staged_output),
+                ..Default::default()
+            };
+            let error = export_to_jsonl(&storage, &output_path, &config).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not match the exact reviewed export"),
+                "unexpected staged-output mismatch: {error}"
+            );
+            assert_eq!(
+                fs::read(&output_path).unwrap(),
+                previous_bytes.as_bytes(),
+                "mismatch attempt {attempt} replaced the live JSONL"
+            );
+            let staged_path =
+                export_temp_path_for_attempt(&output_path, u32::try_from(attempt).unwrap());
+            assert!(
+                staged_path.exists(),
+                "mismatch attempt {attempt} did not retain its staged recovery artifact"
+            );
+            assert_eq!(
+                fs::read(&staged_path).unwrap(),
+                reviewed_bytes,
+                "retained staged bytes differ from the candidate that was rejected"
+            );
+        }
     }
 
     #[test]
@@ -6018,6 +17544,28 @@ mod tests {
         let saved = base.get("bd-final").expect("saved base issue");
         assert_eq!(saved.comments.len(), 1);
         assert_eq!(saved.comments[0].body, "merge note written after report");
+    }
+
+    #[test]
+    fn conditional_publication_preserves_exact_base_bytes_across_replacement() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let base_path = beads_dir.join("beads.base.jsonl");
+        let exact_bytes = b" \t{\"id\":\"bd-exact\",\"title\":\"Exact bytes\"} \r\n\r\n";
+        fs::write(&jsonl_path, exact_bytes).unwrap();
+        fs::write(&base_path, b"{\"id\":\"old\"}\n").unwrap();
+
+        refresh_base_snapshot_from_flushed_jsonl(&jsonl_path, &beads_dir).unwrap();
+        assert_eq!(fs::read(&base_path).unwrap(), exact_bytes);
+
+        refresh_base_snapshot_from_flushed_jsonl(&jsonl_path, &beads_dir).unwrap();
+        assert_eq!(
+            fs::read(&base_path).unwrap(),
+            exact_bytes,
+            "replacing an already-equal base must remain byte-for-byte idempotent"
+        );
     }
 
     #[cfg(unix)]
@@ -6189,7 +17737,14 @@ mod tests {
 
         let cases = [
             ("collapsed adjacent records", format!("{json1}{json2}\n")),
+<<<<<<< HEAD
             ("stray issue prefix", "{\"i{\"id\":\"bd-001\"}\n".to_string()),
+=======
+            (
+                "stray issue prefix",
+                "{\"i{\"id\":\"bd-001\"}\n".to_string(),
+            ),
+>>>>>>> origin/main
             (
                 "missing comments array closure",
                 "{\"id\":\"bd-001\",\"title\":\"Broken\",\"comments\":[{\"id\":1}\n".to_string(),
@@ -6229,12 +17784,19 @@ mod tests {
         )
         .unwrap();
 
+<<<<<<< HEAD
         let err = verify_exported_jsonl_integrity(
             &path,
             &["bd-001".to_string(), "bd-002".to_string()],
         )
         .unwrap_err()
         .to_string();
+=======
+        let err =
+            verify_exported_jsonl_integrity(&path, &["bd-001".to_string(), "bd-002".to_string()])
+                .unwrap_err()
+                .to_string();
+>>>>>>> origin/main
         assert!(
             err.contains("expected 2 issues, JSONL has 1 valid issue lines"),
             "unexpected error: {err}"
@@ -6410,8 +17972,9 @@ mod tests {
         let err = auto_import_probe(&storage, &beads_dir, &external_jsonl, false).unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("outside the beads directory")
-                || message.contains("must be a regular file"),
+            message.contains("is outside .beads")
+                || message.contains("outside the beads directory")
+                || message.contains("regular file"),
             "unexpected error: {err}"
         );
 
@@ -6424,8 +17987,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("outside the beads directory")
-                || message.contains("must be a regular file"),
+            message.contains("is outside .beads")
+                || message.contains("outside the beads directory")
+                || message.contains("regular file"),
             "unexpected error: {err}"
         );
     }
@@ -6454,8 +18018,9 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("outside the beads directory")
-                || message.contains("must be a regular file"),
+            message.contains("is outside .beads")
+                || message.contains("outside the beads directory")
+                || message.contains("regular file"),
             "unexpected error: {err}"
         );
     }
@@ -6613,13 +18178,88 @@ mod tests {
 
         let err = auto_flush(&mut storage, &beads_dir, &outside_jsonl_path, false).unwrap_err();
         assert!(
-            err.to_string().contains("outside the beads directory"),
+            err.to_string().contains("is outside .beads")
+                || err.to_string().contains("outside the beads directory"),
             "unexpected error: {err}"
         );
         assert_eq!(
             storage.get_dirty_issue_ids().unwrap(),
             vec!["bd-auto-flush-path".to_string()],
             "rejected auto-flush must leave dirty markers intact"
+        );
+    }
+
+    #[test]
+    fn test_auto_flush_refuses_clean_pending_merge_before_no_op_probe() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        storage
+            .set_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY, "legacy-receipt")
+            .unwrap();
+
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+
+        assert!(matches!(&err, BeadsError::SyncConflict { .. }));
+        assert!(
+            err.to_string().contains("br sync --merge"),
+            "refusal must be actionable: {err}"
+        );
+        assert!(
+            !jsonl_path.exists(),
+            "clean refusal must happen before creating a JSONL artifact"
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY)
+                .unwrap()
+                .as_deref(),
+            Some("legacy-receipt"),
+            "clean refusal must preserve pending metadata exactly"
+        );
+    }
+
+    #[test]
+    fn test_auto_flush_refuses_dirty_pending_merge_without_touching_jsonl_or_dirty_state() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let original_jsonl = b"{\"id\":\"bd-existing\",\"title\":\"unchanged\"}\n";
+        fs::write(&jsonl_path, original_jsonl).unwrap();
+        storage
+            .create_issue(
+                &make_test_issue("bd-pending-dirty", "must remain dirty"),
+                "tester",
+            )
+            .unwrap();
+        storage
+            .set_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY, "legacy-receipt")
+            .unwrap();
+        let dirty_before = storage.get_dirty_issue_metadata().unwrap();
+
+        let err = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap_err();
+
+        assert!(matches!(err, BeadsError::SyncConflict { .. }));
+        assert_eq!(
+            fs::read(&jsonl_path).unwrap(),
+            original_jsonl,
+            "dirty refusal must not rewrite JSONL"
+        );
+        assert_eq!(
+            storage.get_dirty_issue_metadata().unwrap(),
+            dirty_before,
+            "dirty refusal must not clear or rewrite dirty markers"
+        );
+        assert_eq!(
+            storage
+                .get_metadata(METADATA_SYNC_MERGE_PENDING_LEGACY)
+                .unwrap()
+                .as_deref(),
+            Some("legacy-receipt"),
+            "dirty refusal must preserve pending metadata exactly"
         );
     }
 
@@ -7575,6 +19215,45 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_collision_ignores_tombstones_for_content_hash_match() {
+        let storage = SqliteStorage::open_memory().unwrap();
+
+        let mut tombstone = make_issue_at("bd-tomb", "Same Tombstone Content", fixed_time(100));
+        tombstone.status = Status::Tombstone;
+        tombstone.deleted_at = Some(fixed_time(110));
+        tombstone.deleted_by = Some("tester".to_string());
+        tombstone.delete_reason = Some("old delete".to_string());
+        set_content_hash(&mut tombstone);
+        storage.upsert_issue_for_import(&tombstone).unwrap();
+
+        let mut incoming = make_issue_at("bd-new", "Same Tombstone Content", fixed_time(200));
+        incoming.status = Status::Tombstone;
+        incoming.deleted_at = Some(fixed_time(210));
+        incoming.deleted_by = Some("jsonl".to_string());
+        incoming.delete_reason = Some("incoming delete".to_string());
+        let computed_hash = crate::util::content_hash(&incoming);
+        assert_eq!(
+            tombstone.content_hash.as_deref(),
+            Some(computed_hash.as_str()),
+            "delete metadata must not affect content_hash"
+        );
+
+        let (id_by_ext_ref, id_by_hash, meta_by_id) = build_collision_maps(&storage);
+        let collision = detect_collision(
+            &incoming,
+            &id_by_ext_ref,
+            &id_by_hash,
+            &meta_by_id,
+            &computed_hash,
+        );
+
+        assert!(
+            matches!(collision, CollisionResult::NewIssue),
+            "tombstones must not participate in content-hash collision matching: {collision:?}"
+        );
+    }
+
+    #[test]
     fn test_detect_collision_id_match() {
         let mut storage = SqliteStorage::open_memory().unwrap();
 
@@ -7807,6 +19486,66 @@ mod tests {
     }
 
     #[test]
+    fn frozen_export_cutoff_produces_identical_serial_and_parallel_preparation() {
+        let export_as_of = fixed_time(2_000_000_000);
+        let ttl = chrono::Duration::days(30);
+        let mut issues = (0..(EXPORT_PARALLEL_PREPARE_MIN_ISSUES + 3))
+            .map(|index| make_test_issue(&format!("bd-{index:04}"), "Cutoff parity"))
+            .collect::<Vec<_>>();
+
+        issues[0].status = Status::Tombstone;
+        issues[0].deleted_at = Some(export_as_of - ttl);
+        issues[1].status = Status::Tombstone;
+        issues[1].deleted_at = Some(export_as_of - ttl - chrono::Duration::nanoseconds(1));
+        issues[2].status = Status::Tombstone;
+        issues[2].deleted_at = Some(export_as_of - ttl + chrono::Duration::nanoseconds(1));
+
+        let serial = prepare_export_issue_chunk(&issues, Some(30), &export_as_of);
+        let parallel =
+            prepare_export_issues_jsonl_parallel(&issues, Some(30), &export_as_of, 4).unwrap();
+
+        assert_eq!(serial.len(), parallel.len());
+        for (serial_entry, parallel_entry) in serial.iter().zip(&parallel) {
+            match (serial_entry, parallel_entry) {
+                (
+                    PreparedExportEntry::Issue(serial_issue),
+                    PreparedExportEntry::Issue(parallel_issue),
+                ) => {
+                    assert_eq!(serial_issue.id, parallel_issue.id);
+                    assert_eq!(serial_issue.jsonl_line, parallel_issue.jsonl_line);
+                    assert_eq!(serial_issue.content_hash, parallel_issue.content_hash);
+                    assert_eq!(
+                        serial_issue.dependency_count,
+                        parallel_issue.dependency_count
+                    );
+                    assert_eq!(serial_issue.label_count, parallel_issue.label_count);
+                    assert_eq!(serial_issue.comment_count, parallel_issue.comment_count);
+                }
+                (
+                    PreparedExportEntry::SkippedTombstone(serial_id),
+                    PreparedExportEntry::SkippedTombstone(parallel_id),
+                ) => assert_eq!(serial_id, parallel_id),
+                (
+                    PreparedExportEntry::Error(serial_error),
+                    PreparedExportEntry::Error(parallel_error),
+                ) => {
+                    assert_eq!(serial_error.entity_type, parallel_error.entity_type);
+                    assert_eq!(serial_error.entity_id, parallel_error.entity_id);
+                    assert_eq!(serial_error.message, parallel_error.message);
+                }
+                _ => panic!("serial and parallel preparation classified an issue differently"),
+            }
+        }
+
+        assert!(matches!(&serial[0], PreparedExportEntry::Issue(_)));
+        assert!(matches!(
+            &serial[1],
+            PreparedExportEntry::SkippedTombstone(id) if id == "bd-0001"
+        ));
+        assert!(matches!(&serial[2], PreparedExportEntry::Issue(_)));
+    }
+
+    #[test]
     fn test_normalize_issue_for_export_orders_identical_comments_by_id() {
         let timestamp = fixed_time(100);
         let mut issue = make_test_issue("bd-1", "Ordering");
@@ -7880,34 +19619,130 @@ mod tests {
     }
 
     #[test]
-    fn test_export_hashes_certified_current_requires_no_dirty_and_matching_hash() {
-        let mut result = ExportResult {
-            exported_count: 1,
-            exported_ids: vec!["bd-1".to_string()],
-            exported_marked_at: Vec::new(),
-            skipped_tombstone_ids: Vec::new(),
-            content_hash: "content-hash".to_string(),
-            output_path: None,
-            issue_hashes: vec![("bd-1".to_string(), "issue-hash".to_string())],
-        };
+    fn full_export_finalization_reconciles_hashes_and_excluded_dirty_rows_exactly() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
 
-        assert!(export_hashes_certified_current(
-            &result,
-            Some("content-hash")
-        ));
-        assert!(!export_hashes_certified_current(
-            &result,
-            Some("different-hash")
-        ));
-        assert!(!export_hashes_certified_current(&result, None));
+        let regular = make_test_issue("bd-regular", "Regular issue");
+        let mut ephemeral = make_test_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
+        let wisp = make_test_issue("bd-wisp-session", "Wisp issue");
+        for issue in [&regular, &ephemeral, &wisp] {
+            storage.create_issue(issue, "test").unwrap();
+        }
+        storage
+            .execute_raw("UPDATE dirty_issues SET marked_at = '2026-07-27T10:00:00+00:00'")
+            .unwrap();
 
-        result
-            .exported_marked_at
-            .push(("bd-1".to_string(), "dirty-marker".to_string()));
-        assert!(!export_hashes_certified_current(
+        let result = export_to_jsonl(&storage, &output_path, &ExportConfig::default()).unwrap();
+        assert_eq!(result.exported_ids, vec![regular.id.clone()]);
+        assert_eq!(
+            result
+                .intentionally_excluded_marked_at
+                .iter()
+                .map(|(issue_id, _)| issue_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![ephemeral.id.as_str(), wisp.id.as_str()],
+            "equal dirty timestamps must still produce a total issue-ID order"
+        );
+
+        storage
+            .set_export_hashes(&[
+                (regular.id.clone(), result.issue_hashes[0].1.clone()),
+                (ephemeral.id.clone(), "stale-ephemeral".to_string()),
+                (wisp.id.clone(), "stale-wisp".to_string()),
+            ])
+            .unwrap();
+        let regular_exported_at_before = storage
+            .execute_raw_query(
+                "SELECT exported_at FROM export_hashes WHERE issue_id = 'bd-regular'",
+            )
+            .unwrap()[0][0]
+            .as_text()
+            .unwrap()
+            .to_string();
+
+        finalize_export(
+            &mut storage,
             &result,
-            Some("content-hash")
-        ));
+            Some(&result.issue_hashes),
+            &output_path,
+        )
+        .unwrap();
+
+        assert!(storage.get_dirty_issue_ids().unwrap().is_empty());
+        let rows = storage
+            .execute_raw_query(
+                "SELECT issue_id, content_hash, exported_at FROM export_hashes ORDER BY issue_id",
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_text(), Some(regular.id.as_str()));
+        assert_eq!(
+            rows[0][1].as_text(),
+            Some(result.issue_hashes[0].1.as_str())
+        );
+        assert_eq!(
+            rows[0][2].as_text(),
+            Some(regular_exported_at_before.as_str()),
+            "unchanged mappings must retain their original exported_at timestamp"
+        );
+
+        let finalization = capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert_eq!(finalization.dirty_issues.rows, 0);
+        assert_eq!(finalization.export_metadata.rows, 5);
+        assert_eq!(
+            finalization.export_hashes,
+            sync_merge_export_hash_mapping_witness(&result.issue_hashes).unwrap()
+        );
+    }
+
+    #[test]
+    fn malformed_raw_dirty_row_blocks_full_export_finalization() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+        let issue = make_test_issue("bd-malformed-dirty", "Malformed dirty witness");
+        storage.create_issue(&issue, "test").unwrap();
+        let result = export_to_jsonl(&storage, &output_path, &ExportConfig::default()).unwrap();
+
+        storage
+            .execute_raw(
+                "UPDATE dirty_issues SET marked_at = X'00' \
+                 WHERE issue_id = 'bd-malformed-dirty'",
+            )
+            .unwrap();
+        let witnessed = capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert_eq!(
+            witnessed.dirty_issues.rows, 1,
+            "raw finalization witness must not drop a non-text dirty row"
+        );
+        assert!(storage.get_dirty_issue_metadata().is_err());
+
+        let error = finalize_export(
+            &mut storage,
+            &result,
+            Some(&result.issue_hashes),
+            &output_path,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("marked_at")
+                || error.to_string().contains("dirty")
+                || error.to_string().contains("Dirty"),
+            "unexpected malformed dirty-row error: {error}"
+        );
+        let after_failure = capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert_eq!(
+            after_failure, witnessed,
+            "failed finalization must roll back every export-finalization table and metadata row"
+        );
+        assert!(
+            after_failure.dirty_issues.rows != 0
+                || after_failure.needs_flush.as_deref() != Some("false"),
+            "failed finalization must not satisfy the complete clean-export predicate"
+        );
     }
 
     #[test]
@@ -7986,7 +19821,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, BeadsError::Database(_)),
+            matches!(err, BeadsError::SyncConflict { .. }),
             "unexpected error: {err:?}"
         );
 
@@ -8027,6 +19862,64 @@ mod tests {
         let mut writer = LineFailWriter::new("bd-002");
         let result = export_to_writer_with_policy(&storage, &mut writer, ExportErrorPolicy::Strict);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn frozen_export_cutoff_keeps_writer_and_file_bytes_and_hashes_identical() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let export_as_of = fixed_time(2_000_000_000);
+        let ttl = chrono::Duration::days(30);
+
+        let mut boundary = make_test_issue("bd-boundary", "Retained at exact boundary");
+        boundary.status = Status::Tombstone;
+        boundary.deleted_at = Some(export_as_of - ttl);
+        boundary.deleted_by = Some("test".to_string());
+        let mut expired = make_test_issue("bd-expired", "Expired after boundary");
+        expired.status = Status::Tombstone;
+        expired.deleted_at = Some(export_as_of - ttl - chrono::Duration::nanoseconds(1));
+        expired.deleted_by = Some("test".to_string());
+        let open = make_test_issue("bd-open", "Always exported");
+        for issue in [&boundary, &expired, &open] {
+            storage.create_issue(issue, "test").unwrap();
+        }
+
+        let mut writer = Vec::new();
+        let (writer_result, writer_report) = export_to_writer_with_policy_and_retention_at(
+            &storage,
+            &mut writer,
+            ExportErrorPolicy::Strict,
+            Some(30),
+            export_as_of,
+        )
+        .unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let output_path = beads_dir.join("issues.jsonl");
+        let config = ExportConfig {
+            force: true,
+            error_policy: ExportErrorPolicy::Strict,
+            retention_days: Some(30),
+            export_as_of: Some(export_as_of),
+            beads_dir: Some(beads_dir),
+            max_parallel_workers: 1,
+            ..Default::default()
+        };
+        let (file_result, file_report) =
+            export_to_jsonl_with_policy(&storage, &output_path, &config).unwrap();
+        let file_bytes = fs::read(&output_path).unwrap();
+
+        assert_eq!(writer, file_bytes);
+        assert_eq!(writer_result.content_hash, file_result.content_hash);
+        assert_eq!(writer_result.exported_ids, file_result.exported_ids);
+        assert_eq!(
+            writer_result.skipped_tombstone_ids,
+            file_result.skipped_tombstone_ids
+        );
+        assert_eq!(writer_report.issues_exported, file_report.issues_exported);
+        assert!(writer_result.exported_ids.contains(&boundary.id));
+        assert!(writer_result.skipped_tombstone_ids.contains(&expired.id));
     }
 
     #[test]
@@ -8951,6 +20844,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,

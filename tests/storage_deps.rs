@@ -10,6 +10,11 @@ mod common;
 
 use beads_rust::model::{DependencyType, EventType, Status};
 use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+#[allow(unused_imports)]
+use common::ordering::{
+    assert_contains_exactly_one, assert_hybrid_ordered, assert_no_duplicate_ids,
+    assert_oldest_first, assert_ordered_by, assert_priority_ordered,
+};
 use common::{fixtures, test_db};
 
 fn blocked_ids_for(storage: &SqliteStorage) -> Vec<String> {
@@ -613,6 +618,108 @@ fn detect_all_cycles_collapses_dense_component_to_witness() {
     }
 }
 
+#[test]
+fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking() {
+    let mut storage = test_db();
+
+    let active_a = fixtures::issue("active-cycle-a");
+    let active_b = fixtures::issue("active-cycle-b");
+    let archived_a = fixtures::IssueBuilder::new("archived-cycle-a")
+        .with_status(Status::Closed)
+        .build();
+    let archived_b = fixtures::IssueBuilder::new("archived-cycle-b")
+        .with_status(Status::Closed)
+        .build();
+    let related_a = fixtures::issue("related-cycle-a");
+    let related_b = fixtures::issue("related-cycle-b");
+
+    for issue in [
+        &active_a,
+        &active_b,
+        &archived_a,
+        &archived_b,
+        &related_a,
+        &related_b,
+    ] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+
+    storage
+        .add_dependency(
+            &active_a.id,
+            &active_b.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &active_b.id,
+            &active_a.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &archived_a.id,
+            &archived_b.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &archived_b.id,
+            &archived_a.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &related_a.id,
+            &related_b.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+    storage
+        .add_dependency(
+            &related_b.id,
+            &related_a.id,
+            DependencyType::Related.as_str(),
+            "tester",
+        )
+        .unwrap();
+
+    let all_report = storage.detect_dependency_cycle_report(false).unwrap();
+    assert_eq!(all_report.active_cycles.len(), 2);
+    assert_eq!(all_report.archived_closed_cycles.len(), 1);
+    assert!(
+        all_report
+            .active_cycles
+            .iter()
+            .any(|cycle| cycle.contains(&active_a.id) && cycle.contains(&active_b.id))
+    );
+    assert!(
+        all_report
+            .active_cycles
+            .iter()
+            .any(|cycle| cycle.contains(&related_a.id) && cycle.contains(&related_b.id))
+    );
+    assert!(
+        all_report
+            .archived_closed_cycles
+            .iter()
+            .any(|cycle| cycle.contains(&archived_a.id) && cycle.contains(&archived_b.id))
+    );
+
+    let blocking_report = storage.detect_dependency_cycle_report(true).unwrap();
+    assert!(blocking_report.active_cycles.is_empty());
+    assert!(blocking_report.archived_closed_cycles.is_empty());
+}
+
 // ============================================================================
 // DEEP HIERARCHY TESTS (5+ levels)
 // ============================================================================
@@ -1126,4 +1233,261 @@ fn blocked_issues_excluded_from_ready_list() {
     assert!(ready_ids.contains(&blocker.id));
     assert!(ready_ids.contains(&unblocked.id));
     assert!(!ready_ids.contains(&blocked.id));
+}
+
+// ============================================================================
+// beads_rust-uelt: dep-type matrix coverage (added 2026-05-09)
+// Verifies the single-parent rule applies ONLY to `parent-child`, not to
+// any other dep type. Each test is paired with its specific assertion.
+// ============================================================================
+
+/// uelt: adding multiple `blocks` deps to the SAME issue must succeed.
+/// (single-parent rule does NOT apply to `blocks`.)
+#[test]
+fn test_dep_add_multiple_blocks_deps_allowed() {
+    let mut storage = test_db();
+    let blocker_a = fixtures::issue("multi-blocks-a");
+    let blocker_b = fixtures::issue("multi-blocks-b");
+    let blocker_c = fixtures::issue("multi-blocks-c");
+    let target = fixtures::issue("multi-blocks-target");
+
+    storage.create_issue(&blocker_a, "tester").unwrap();
+    storage.create_issue(&blocker_b, "tester").unwrap();
+    storage.create_issue(&blocker_c, "tester").unwrap();
+    storage.create_issue(&target, "tester").unwrap();
+
+    storage
+        .add_dependency(&target.id, &blocker_a.id, "blocks", "tester")
+        .expect("first blocks dep must succeed");
+    storage
+        .add_dependency(&target.id, &blocker_b.id, "blocks", "tester")
+        .expect("second blocks dep must also succeed (no single-blocker rule)");
+    storage
+        .add_dependency(&target.id, &blocker_c.id, "blocks", "tester")
+        .expect("third blocks dep must also succeed");
+
+    let deps = storage.get_dependencies(&target.id).unwrap();
+    assert_eq!(
+        deps.len(),
+        3,
+        "target should have 3 blocks deps; got {deps:?}"
+    );
+}
+
+/// uelt: an issue can have parent X AND be blocked-by Y simultaneously,
+/// because they are different dep types and the single-parent rule applies
+/// only to `parent-child`.
+#[test]
+fn test_dep_add_blocks_alongside_parent_child_allowed() {
+    let mut storage = test_db();
+    let parent = fixtures::issue("mixed-parent");
+    let blocker = fixtures::issue("mixed-blocker");
+    let child = fixtures::issue("mixed-child");
+
+    storage.create_issue(&parent, "tester").unwrap();
+    storage.create_issue(&blocker, "tester").unwrap();
+    storage.create_issue(&child, "tester").unwrap();
+
+    storage
+        .add_dependency(&child.id, &parent.id, "parent-child", "tester")
+        .expect("parent-child must succeed");
+    storage
+        .add_dependency(&child.id, &blocker.id, "blocks", "tester")
+        .expect("blocks alongside parent-child must succeed");
+
+    let deps = storage.get_dependencies(&child.id).unwrap();
+    assert_eq!(
+        deps.len(),
+        2,
+        "child should have parent-child + blocks = 2 deps; got {deps:?}"
+    );
+}
+
+/// uelt: removing the parent-child edge must allow a subsequent
+/// parent-child add to succeed (no stale "was already replaced" state).
+#[test]
+fn test_dep_remove_parent_allows_subsequent_add() {
+    let mut storage = test_db();
+    let parent_a = fixtures::issue("remove-add-parent-a");
+    let parent_b = fixtures::issue("remove-add-parent-b");
+    let child = fixtures::issue("remove-add-child");
+
+    storage.create_issue(&parent_a, "tester").unwrap();
+    storage.create_issue(&parent_b, "tester").unwrap();
+    storage.create_issue(&child, "tester").unwrap();
+
+    // Initial parent
+    storage
+        .add_dependency(&child.id, &parent_a.id, "parent-child", "tester")
+        .expect("first parent-child must succeed");
+
+    // Remove
+    storage
+        .remove_dependency(&child.id, &parent_a.id, "tester")
+        .expect("remove must succeed");
+
+    let deps = storage.get_dependencies(&child.id).unwrap();
+    assert_eq!(deps.len(), 0, "child should have no deps after remove");
+
+    // New parent — must succeed (no stale validator state)
+    storage
+        .add_dependency(&child.id, &parent_b.id, "parent-child", "tester")
+        .expect("subsequent parent-child must succeed after remove");
+
+    let deps = storage.get_dependencies(&child.id).unwrap();
+    assert_eq!(deps.len(), 1, "child should have new parent");
+    assert_eq!(deps[0], parent_b.id);
+}
+
+/// uelt: every supported dep type round-trips through `add_dependency`,
+/// `get_dependencies`, and (for blocking types) blocked-cache rebuild.
+/// Exercises the full {blocks, parent-child, related, conditional-blocks,
+/// waits-for, discovered-from, replies-to, relates-to, duplicates,
+/// supersedes, caused-by} matrix.
+#[test]
+fn test_dep_add_each_supported_type_against_full_matrix() {
+    let mut storage = test_db();
+    let target = fixtures::issue("matrix-target");
+    storage.create_issue(&target, "tester").unwrap();
+
+    // For each dep type, create a fresh peer (so single-parent rule doesn't
+    // collide with multiple parent-child variants — only one parent allowed).
+    let dep_types: &[&str] = &[
+        "blocks",
+        "parent-child", // ← exactly one allowed
+        "related",
+        "conditional-blocks",
+        "waits-for",
+        "discovered-from",
+        "replies-to",
+        "relates-to",
+        "duplicates",
+        "supersedes",
+        "caused-by",
+    ];
+
+    let mut added_count = 0;
+    let mut parent_child_used = false;
+
+    for (i, dep_type) in dep_types.iter().enumerate() {
+        let peer = fixtures::issue(&format!("matrix-peer-{i}"));
+        storage.create_issue(&peer, "tester").unwrap();
+
+        let result = storage.add_dependency(&target.id, &peer.id, dep_type, "tester");
+
+        if *dep_type == "parent-child" {
+            // First parent-child must succeed; if we hit it twice (we don't,
+            // but defensively), only the first should win
+            if parent_child_used {
+                assert!(result.is_err(), "second parent-child must reject; got Ok");
+            } else {
+                result.unwrap_or_else(|e| panic!("parent-child should succeed: {e}"));
+                parent_child_used = true;
+                added_count += 1;
+            }
+        } else {
+            result.unwrap_or_else(|e| panic!("{dep_type} should succeed: {e}"));
+            added_count += 1;
+        }
+    }
+
+    let deps = storage.get_dependencies(&target.id).unwrap();
+    assert_eq!(
+        deps.len(),
+        added_count,
+        "expected {added_count} deps, got {deps:?}"
+    );
+}
+
+// ============================================================================
+// DIRECTIONAL BATCH QUERIES (beads_rust-mf72)
+// ============================================================================
+
+/// `get_blocking_dependencies_for_issue_ids` backs `br graph --dependencies`
+/// and must be the exact inverse of the dependents query that backs the
+/// default walk. Asserting the inverse relation — rather than each query's
+/// rows independently — is what keeps the two graph directions consistent.
+#[test]
+fn blocking_dependencies_batch_is_the_inverse_of_blocking_dependents() {
+    let mut storage = test_db();
+
+    // A depends on B, B depends on C. C blocks B blocks A.
+    let (a, b, c) = (
+        fixtures::issue("dir-a"),
+        fixtures::issue("dir-b"),
+        fixtures::issue("dir-c"),
+    );
+    for issue in [&a, &b, &c] {
+        storage.create_issue(issue, "tester").unwrap();
+    }
+    storage
+        .add_dependency(&a.id, &b.id, DependencyType::Blocks.as_str(), "tester")
+        .unwrap();
+    storage
+        .add_dependency(&b.id, &c.id, DependencyType::Blocks.as_str(), "tester")
+        .unwrap();
+
+    let ids: Vec<String> = vec![a.id.clone(), b.id.clone(), c.id.clone()];
+    let dependents = storage.get_blocking_dependents_for_issue_ids(&ids).unwrap();
+    let dependencies = storage
+        .get_blocking_dependencies_for_issue_ids(&ids)
+        .unwrap();
+
+    let neighbours = |map: &std::collections::HashMap<
+        String,
+        Vec<beads_rust::format::IssueWithDependencyMetadata>,
+    >,
+                      id: &str|
+     -> Vec<String> {
+        let mut out: Vec<String> = map
+            .get(id)
+            .map(|v| v.iter().map(|m| m.id.clone()).collect())
+            .unwrap_or_default();
+        out.sort();
+        out
+    };
+
+    // Dependents: who is blocked by me.
+    assert_eq!(neighbours(&dependents, &c.id), vec![b.id.clone()]);
+    assert_eq!(neighbours(&dependents, &b.id), vec![a.id.clone()]);
+    assert!(neighbours(&dependents, &a.id).is_empty());
+
+    // Dependencies: who blocks me. Exactly the reverse of the above.
+    assert_eq!(neighbours(&dependencies, &a.id), vec![b.id.clone()]);
+    assert_eq!(neighbours(&dependencies, &b.id), vec![c.id.clone()]);
+    assert!(neighbours(&dependencies, &c.id).is_empty());
+
+    // State the inverse relation directly: `x` is a dependent of `y` if and
+    // only if `y` is a dependency of `x`.
+    for id in &ids {
+        for neighbour in neighbours(&dependents, id) {
+            assert!(
+                neighbours(&dependencies, &neighbour).contains(id),
+                "{neighbour} lists {id} as a dependent but not the reverse"
+            );
+        }
+        for neighbour in neighbours(&dependencies, id) {
+            assert!(
+                neighbours(&dependents, &neighbour).contains(id),
+                "{neighbour} lists {id} as a dependency but not the reverse"
+            );
+        }
+    }
+}
+
+#[test]
+fn blocking_dependencies_batch_handles_empty_input_and_unknown_ids() {
+    let storage = test_db();
+    assert!(
+        storage
+            .get_blocking_dependencies_for_issue_ids(&[])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage
+            .get_blocking_dependencies_for_issue_ids(&["dir-missing".to_string()])
+            .unwrap()
+            .is_empty()
+    );
 }

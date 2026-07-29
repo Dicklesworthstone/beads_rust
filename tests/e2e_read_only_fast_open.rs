@@ -159,15 +159,10 @@ fn matrix_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
 
 fn core_read_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
     vec![
-        exact_command(
-            "list_json",
-            strings(["--lock-timeout", "50", "list", "--json", "--limit", "5"]),
-        ),
+        exact_command("list_json", strings(["list", "--json", "--limit", "5"])),
         exact_command(
             "show_json",
             vec![
-                "--lock-timeout".into(),
-                "50".into(),
                 "show".into(),
                 seed.blocker_id.clone(),
                 "--format".into(),
@@ -176,26 +171,12 @@ fn core_read_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
         ),
         exact_command(
             "search_json",
-            strings([
-                "--lock-timeout",
-                "50",
-                "search",
-                "Fast-open",
-                "--format",
-                "json",
-                "--limit",
-                "5",
-            ]),
+            strings(["search", "Fast-open", "--format", "json", "--limit", "5"]),
         ),
-        exact_command(
-            "ready_json",
-            strings(["--lock-timeout", "50", "ready", "--json", "--limit", "5"]),
-        ),
+        exact_command("ready_json", strings(["ready", "--json", "--limit", "5"])),
         normalized_json_command(
             "scheduler_json",
             strings([
-                "--lock-timeout",
-                "50",
                 "scheduler",
                 "--json",
                 "--limit",
@@ -207,61 +188,39 @@ fn core_read_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
         ),
         exact_command(
             "blocked_json",
-            strings(["--lock-timeout", "50", "blocked", "--json", "--limit", "5"]),
+            strings(["blocked", "--json", "--limit", "5"]),
         ),
     ]
 }
 
 fn status_and_report_commands() -> Vec<MatrixCommand> {
     vec![
-        exact_command(
-            "count_json",
-            strings(["--lock-timeout", "50", "count", "--json"]),
-        ),
+        exact_command("count_json", strings(["count", "--json"])),
         exact_command(
             "count_by_label_json",
-            strings(["--lock-timeout", "50", "count", "--by", "label", "--json"]),
+            strings(["count", "--by", "label", "--json"]),
         ),
-        exact_command(
-            "stale_json",
-            strings(["--lock-timeout", "50", "stale", "--days", "0", "--json"]),
-        ),
-        exact_command(
-            "lint_json",
-            strings(["--lock-timeout", "50", "lint", "--json"]),
-        ),
-        exact_command(
-            "sync_status_json",
-            strings(["--lock-timeout", "50", "sync", "--status", "--json"]),
-        ),
+        exact_command("stale_json", strings(["stale", "--days", "0", "--json"])),
+        exact_command("lint_json", strings(["lint", "--json"])),
+        exact_command("sync_status_json", strings(["sync", "--status", "--json"])),
         exact_command(
             "stats_no_activity_json",
-            strings(["--lock-timeout", "50", "stats", "--no-activity", "--json"]),
+            strings(["stats", "--no-activity", "--json"]),
         ),
         exact_command(
             "status_no_activity_json",
-            strings(["--lock-timeout", "50", "status", "--no-activity", "--json"]),
+            strings(["status", "--no-activity", "--json"]),
         ),
         normalized_json_command(
             "changelog_robot",
-            strings([
-                "--lock-timeout",
-                "50",
-                "changelog",
-                "--since",
-                "2100-01-01",
-                "--robot",
-            ]),
+            strings(["changelog", "--since", "2100-01-01", "--robot"]),
             &["until"],
         ),
         exact_command(
             "graph_all_compact",
-            strings(["--lock-timeout", "50", "graph", "--all", "--compact"]),
+            strings(["graph", "--all", "--compact"]),
         ),
-        exact_command(
-            "orphans_robot",
-            strings(["--lock-timeout", "50", "orphans", "--robot"]),
-        ),
+        exact_command("orphans_robot", strings(["orphans", "--robot"])),
     ]
 }
 
@@ -270,8 +229,6 @@ fn relation_and_query_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
         exact_command(
             "comments_json",
             vec![
-                "--lock-timeout".into(),
-                "50".into(),
                 "comments".into(),
                 "list".into(),
                 seed.blocker_id.clone(),
@@ -280,31 +237,17 @@ fn relation_and_query_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
         ),
         exact_command(
             "comments_shorthand_json",
-            vec![
-                "--lock-timeout".into(),
-                "50".into(),
-                "comments".into(),
-                seed.blocker_id.clone(),
-                "--json".into(),
-            ],
+            vec!["comments".into(), seed.blocker_id.clone(), "--json".into()],
         ),
-        exact_command(
-            "epic_status_json",
-            strings(["--lock-timeout", "50", "epic", "status", "--json"]),
-        ),
-        exact_command(
-            "label_list_unique",
-            strings(["--lock-timeout", "50", "label", "list"]),
-        ),
+        exact_command("epic_status_json", strings(["epic", "status", "--json"])),
+        exact_command("label_list_unique", strings(["label", "list"])),
         exact_command(
             "label_list_all_json",
-            strings(["--lock-timeout", "50", "label", "list-all", "--json"]),
+            strings(["label", "list-all", "--json"]),
         ),
         exact_command(
             "dep_list_json",
             vec![
-                "--lock-timeout".into(),
-                "50".into(),
                 "dep".into(),
                 "list".into(),
                 seed.blocked_id.clone(),
@@ -315,34 +258,18 @@ fn relation_and_query_commands(seed: &SeededWorkspace) -> Vec<MatrixCommand> {
         exact_command(
             "dep_tree_json",
             vec![
-                "--lock-timeout".into(),
-                "50".into(),
                 "dep".into(),
                 "tree".into(),
                 seed.blocked_id.clone(),
                 "--json".into(),
             ],
         ),
-        exact_command(
-            "dep_cycles_json",
-            strings(["--lock-timeout", "50", "dep", "cycles", "--json"]),
-        ),
+        exact_command("dep_cycles_json", strings(["dep", "cycles", "--json"])),
         exact_command(
             "query_run_json",
-            strings([
-                "--lock-timeout",
-                "50",
-                "query",
-                "run",
-                "fast-open-p1",
-                "--format",
-                "json",
-            ]),
+            strings(["query", "run", "fast-open-p1", "--format", "json"]),
         ),
-        exact_command(
-            "query_list_json",
-            strings(["--lock-timeout", "50", "query", "list", "--json"]),
-        ),
+        exact_command("query_list_json", strings(["query", "list", "--json"])),
     ]
 }
 
@@ -371,17 +298,22 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 }
 
 fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_open: bool) -> BrRun {
-    let args = command.args.iter().map(String::as_str);
     if disable_fast_open {
-        run_br_with_env(
+        return run_br_with_env(
             workspace,
-            args,
+            command.args.iter().map(String::as_str),
             [DISABLE_FAST_OPEN_ENV],
             &format!("{}_conservative", command.label),
-        )
-    } else {
-        run_br(workspace, args, &format!("{}_fast", command.label))
+        );
     }
+
+    // The read-only fast path is opt-in: it is only selected when the caller
+    // has also waived auto-import and auto-flush, since both of those write.
+    // Ask for it explicitly rather than relying on the bare command happening
+    // to avoid the workspace write lock.
+    let mut args: Vec<&str> = vec!["--no-auto-import", "--no-auto-flush"];
+    args.extend(command.args.iter().map(String::as_str));
+    run_br(workspace, args, &format!("{}_fast", command.label))
 }
 
 fn assert_outputs_match(command: &MatrixCommand, fast: &BrRun, conservative: &BrRun) {

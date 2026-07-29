@@ -5,7 +5,7 @@ name: Notify ACFS of Installer Changes
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
     paths:
       - 'install.sh'
   workflow_dispatch:
@@ -33,7 +33,7 @@ jobs:
       contents: read
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 2
 
@@ -41,18 +41,19 @@ jobs:
         id: checksum
         run: |
           SHA256=$(sha256sum "${{ env.INSTALLER_PATH }}" | cut -d' ' -f1)
-          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
           echo "Computed SHA256: $SHA256"
 
       - name: Get previous checksum
         id: previous
         run: |
-          if git show HEAD~1:"${{ env.INSTALLER_PATH }}" > /tmp/prev 2>/dev/null; then
-            PREV=$(sha256sum /tmp/prev | cut -d' ' -f1)
-            echo "prev_sha256=$PREV" >> $GITHUB_OUTPUT
+          previous_installer="$(mktemp)"
+          if git show HEAD~1:"${{ env.INSTALLER_PATH }}" > "$previous_installer" 2>/dev/null; then
+            PREV=$(sha256sum "$previous_installer" | cut -d' ' -f1)
+            echo "prev_sha256=$PREV" >> "$GITHUB_OUTPUT"
             echo "Previous SHA256: $PREV"
           else
-            echo "prev_sha256=none" >> $GITHUB_OUTPUT
+            echo "prev_sha256=none" >> "$GITHUB_OUTPUT"
             echo "No previous version found"
           fi
 
@@ -60,9 +61,9 @@ jobs:
         id: compare
         run: |
           if [[ "${{ steps.checksum.outputs.sha256 }}" != "${{ steps.previous.outputs.prev_sha256 }}" ]]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Notify ACFS (dry run)
@@ -94,7 +95,7 @@ jobs:
           (steps.compare.outputs.changed == 'true' || github.event.inputs.force == 'true') &&
           github.event.inputs.dry_run != 'true' &&
           steps.check_token.outputs.has_token == 'true'
-        uses: peter-evans/repository-dispatch@v4
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697  # v4
         with:
           token: ${{ secrets.ACFS_NOTIFY_TOKEN }}
           repository: ${{ env.ACFS_REPO }}
@@ -111,9 +112,11 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "## ACFS Notification Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Tool | ${{ env.TOOL_NAME }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| SHA256 | \`${{ steps.checksum.outputs.sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Changed | ${{ steps.compare.outputs.changed }} |" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## ACFS Notification Summary"
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Tool | ${{ env.TOOL_NAME }} |"
+            echo "| SHA256 | \`${{ steps.checksum.outputs.sha256 }}\` |"
+            echo "| Changed | ${{ steps.compare.outputs.changed }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

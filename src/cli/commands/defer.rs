@@ -3,7 +3,7 @@
 use crate::cli::commands::{
     acquire_routed_workspace_write_lock, auto_import_storage_ctx_if_stale,
     finalize_batched_blocked_cache_refresh, preserve_blocked_cache_on_error,
-    report_auto_flush_failure, resolve_issue_ids, update_issue_with_recovery,
+    report_auto_flush_failure, resolve_issue_ids, update_issues_atomically_with_recovery,
 };
 use crate::cli::{DeferArgs, UndeferArgs};
 use crate::config;
@@ -42,6 +42,8 @@ struct DeferResult {
     pub deferred: Vec<DeferredIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
     #[serde(skip)]
     ordered_outcomes: Vec<DeferredOutcome>,
 }
@@ -51,6 +53,8 @@ struct UndeferResult {
     pub undeferred: Vec<DeferredIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skipped: Vec<SkippedIssue>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
     #[serde(skip)]
     ordered_outcomes: Vec<DeferredOutcome>,
 }
@@ -105,6 +109,7 @@ pub fn execute_defer(
     let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, &beads_dir)?;
     let mut deferred_issues = Vec::new();
     let mut skipped_issues = Vec::new();
+    let mut capacity_warnings = Vec::new();
 
     if routed_batches.iter().any(|batch| batch.is_external) {
         let normalized_local_beads_dir =
@@ -132,6 +137,7 @@ pub fn execute_defer(
                 batch.is_external,
             )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
+            capacity_warnings.extend(result.warnings);
         }
 
         let ordered_outcomes =
@@ -146,19 +152,28 @@ pub fn execute_defer(
         let result = execute_defer_route(args, cli, ctx, &beads_dir, false)?;
         deferred_issues = result.deferred;
         skipped_issues = result.skipped;
+        capacity_warnings = result.warnings;
     }
 
     if let Some(last_deferred) = deferred_issues.last() {
         crate::util::set_last_touched_id(&beads_dir, &last_deferred.id);
     }
 
-    render_defer_output(&deferred_issues, &skipped_issues, args, json, ctx)?;
+    render_defer_output(
+        &deferred_issues,
+        &skipped_issues,
+        &capacity_warnings,
+        args,
+        json,
+        ctx,
+    )?;
     Ok(())
 }
 
 fn render_defer_output(
     deferred_issues: &[DeferredIssue],
     skipped_issues: &[SkippedIssue],
+    capacity_warnings: &[crate::close_policy::WorkflowCapacityWarning],
     args: &DeferArgs,
     json: bool,
     ctx: &OutputContext,
@@ -168,6 +183,7 @@ fn render_defer_output(
         let result = DeferResult {
             deferred: deferred_issues.to_vec(),
             skipped: skipped_issues.to_vec(),
+            warnings: capacity_warnings.to_vec(),
             ordered_outcomes: Vec::new(),
         };
         emit_structured_output(&result, ctx)?;
@@ -175,6 +191,9 @@ fn render_defer_output(
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_defer_rich(deferred_issues, skipped_issues, ctx);
+        for warning in capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     } else {
         for deferred in deferred_issues {
             let id = issue_id_text(&deferred.id);
@@ -196,6 +215,9 @@ fn render_defer_output(
         }
         if deferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to defer.");
+        }
+        for warning in capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
     }
 
@@ -232,8 +254,12 @@ fn execute_defer_route(
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
+    let mut atomic_updates = Vec::new();
+    let mut planned_changes = Vec::new();
 
     for id in &resolved_ids {
+        let outcome_index = ordered_outcomes.len();
+        ordered_outcomes.push(None);
         tracing::info!(id = %id, until = ?defer_until, "Deferring issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);
@@ -248,7 +274,7 @@ fn execute_defer_route(
                 id: id.clone(),
                 reason: "issue not found".to_string(),
             };
-            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         };
@@ -259,7 +285,7 @@ fn execute_defer_route(
                 id: id.clone(),
                 reason: format!("cannot defer {} issue", issue.status.as_str()),
             };
-            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -270,7 +296,7 @@ fn execute_defer_route(
                 id: id.clone(),
                 reason: "already deferred".to_string(),
             };
-            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -278,25 +304,38 @@ fn execute_defer_route(
         let update = IssueUpdate {
             status: Some(Status::Deferred),
             defer_until: Some(defer_until),
+            transition_comment: args.transition_comment.clone(),
             skip_cache_rebuild: true,
             ..Default::default()
         };
 
-        let update_result = update_issue_with_recovery(
+        atomic_updates.push((id.clone(), update));
+        planned_changes.push((outcome_index, id.clone(), issue));
+    }
+
+    let mut capacity_warnings = Vec::new();
+    if !atomic_updates.is_empty() {
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
+            ));
+        let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,
-            !cache_dirty,
+            true,
             "defer",
-            id,
-            &update,
+            &atomic_updates,
             &actor,
         );
-        preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "defer",
-            update_result,
-        )?;
+        preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "defer", update_result)?;
+        capacity_warnings = storage_ctx.storage.take_capacity_warnings();
         cache_dirty = true;
+    }
+
+    for (outcome_index, id, issue) in planned_changes {
         tracing::info!(id = %id, defer_until = ?defer_until, "Issue deferred");
 
         let deferred = DeferredIssue {
@@ -306,9 +345,16 @@ fn execute_defer_route(
             status: "deferred".to_string(),
             defer_until: defer_until.map(|dt| dt.to_rfc3339()),
         };
-        ordered_outcomes.push(DeferredOutcome::Changed(deferred.clone()));
+        ordered_outcomes[outcome_index] = Some(DeferredOutcome::Changed(deferred.clone()));
         deferred_issues.push(deferred);
     }
+
+    let ordered_outcomes = ordered_outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| BeadsError::internal("defer batch outcome was not populated"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if cache_dirty {
         tracing::info!(
@@ -331,6 +377,7 @@ fn execute_defer_route(
     Ok(DeferResult {
         deferred: deferred_issues,
         skipped: skipped_issues,
+        warnings: capacity_warnings,
         ordered_outcomes,
     })
 }
@@ -359,6 +406,7 @@ pub fn execute_undefer(
     let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, &beads_dir)?;
     let mut undeferred_issues = Vec::new();
     let mut skipped_issues = Vec::new();
+    let mut capacity_warnings = Vec::new();
 
     if routed_batches.iter().any(|batch| batch.is_external) {
         let normalized_local_beads_dir =
@@ -386,6 +434,7 @@ pub fn execute_undefer(
                 batch.is_external,
             )?;
             routed_outcomes.push((batch.issue_inputs.clone(), result.ordered_outcomes));
+            capacity_warnings.extend(result.warnings);
         }
 
         let ordered_outcomes = reorder_routed_items_by_requested_inputs(
@@ -403,19 +452,28 @@ pub fn execute_undefer(
         let result = execute_undefer_route(args, cli, ctx, &beads_dir, false)?;
         undeferred_issues = result.undeferred;
         skipped_issues = result.skipped;
+        capacity_warnings = result.warnings;
     }
 
     if let Some(last_undeferred) = undeferred_issues.last() {
         crate::util::set_last_touched_id(&beads_dir, &last_undeferred.id);
     }
 
-    render_undefer_output(&undeferred_issues, &skipped_issues, json, args, ctx)?;
+    render_undefer_output(
+        &undeferred_issues,
+        &skipped_issues,
+        &capacity_warnings,
+        json,
+        args,
+        ctx,
+    )?;
     Ok(())
 }
 
 fn render_undefer_output(
     undeferred_issues: &[DeferredIssue],
     skipped_issues: &[SkippedIssue],
+    capacity_warnings: &[crate::close_policy::WorkflowCapacityWarning],
     json: bool,
     args: &UndeferArgs,
     ctx: &OutputContext,
@@ -425,6 +483,7 @@ fn render_undefer_output(
         let result = UndeferResult {
             undeferred: undeferred_issues.to_vec(),
             skipped: skipped_issues.to_vec(),
+            warnings: capacity_warnings.to_vec(),
             ordered_outcomes: Vec::new(),
         };
         emit_structured_output(&result, ctx)?;
@@ -432,6 +491,9 @@ fn render_undefer_output(
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_undefer_rich(undeferred_issues, skipped_issues, ctx);
+        for warning in capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     } else {
         for undeferred in undeferred_issues {
             let id = issue_id_text(&undeferred.id);
@@ -450,6 +512,9 @@ fn render_undefer_output(
         }
         if undeferred_issues.is_empty() && skipped_issues.is_empty() {
             println!("No issues to undefer.");
+        }
+        for warning in capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
     }
 
@@ -479,8 +544,12 @@ fn execute_undefer_route(
     let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
     let mut ordered_outcomes = Vec::with_capacity(resolved_ids.len());
     let mut cache_dirty = false;
+    let mut atomic_updates = Vec::new();
+    let mut planned_changes = Vec::new();
 
     for id in &resolved_ids {
+        let outcome_index = ordered_outcomes.len();
+        ordered_outcomes.push(None);
         tracing::info!(id = %id, "Undeferring issue");
 
         let issue_result = storage_ctx.storage.get_issue(id);
@@ -495,7 +564,7 @@ fn execute_undefer_route(
                 id: id.clone(),
                 reason: "issue not found".to_string(),
             };
-            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         };
@@ -506,7 +575,7 @@ fn execute_undefer_route(
                 id: id.clone(),
                 reason: format!("not deferred (status: {})", issue.status.as_str()),
             };
-            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -517,7 +586,7 @@ fn execute_undefer_route(
                 id: id.clone(),
                 reason: format!("cannot undefer {} issue", issue.status.as_str()),
             };
-            ordered_outcomes.push(DeferredOutcome::Skipped(skipped.clone()));
+            ordered_outcomes[outcome_index] = Some(DeferredOutcome::Skipped(skipped.clone()));
             skipped_issues.push(skipped);
             continue;
         }
@@ -530,27 +599,43 @@ fn execute_undefer_route(
         };
 
         let update = IssueUpdate {
+            transition_comment: status_update
+                .as_ref()
+                .and(args.transition_comment.as_ref())
+                .cloned(),
             status: status_update,
             defer_until: Some(None),
             skip_cache_rebuild: true,
             ..Default::default()
         };
 
-        let update_result = update_issue_with_recovery(
+        atomic_updates.push((id.clone(), update));
+        planned_changes.push((outcome_index, id.clone(), issue, restored_status));
+    }
+
+    let mut capacity_warnings = Vec::new();
+    if !atomic_updates.is_empty() {
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
+            ));
+        let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,
-            !cache_dirty,
+            true,
             "undefer",
-            id,
-            &update,
+            &atomic_updates,
             &actor,
         );
-        preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "undefer",
-            update_result,
-        )?;
+        preserve_blocked_cache_on_error(&mut storage_ctx.storage, false, "undefer", update_result)?;
+        capacity_warnings = storage_ctx.storage.take_capacity_warnings();
         cache_dirty = true;
+    }
+
+    for (outcome_index, id, issue, restored_status) in planned_changes {
         tracing::info!(id = %id, "Issue undeferred");
 
         let undeferred = DeferredIssue {
@@ -560,9 +645,16 @@ fn execute_undefer_route(
             status: restored_status.as_str().to_string(),
             defer_until: None,
         };
-        ordered_outcomes.push(DeferredOutcome::Changed(undeferred.clone()));
+        ordered_outcomes[outcome_index] = Some(DeferredOutcome::Changed(undeferred.clone()));
         undeferred_issues.push(undeferred);
     }
+
+    let ordered_outcomes = ordered_outcomes
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| BeadsError::internal("undefer batch outcome was not populated"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     if cache_dirty {
         tracing::info!(
@@ -585,6 +677,7 @@ fn execute_undefer_route(
     Ok(UndeferResult {
         undeferred: undeferred_issues,
         skipped: skipped_issues,
+        warnings: capacity_warnings,
         ordered_outcomes,
     })
 }
@@ -819,6 +912,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -892,6 +987,7 @@ mod tests {
             deferred: vec![deferred_output_item("bd-defer-1")],
             skipped: Vec::new(),
             ordered_outcomes: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let value = serde_json::to_value(result).expect("serialize defer result");
@@ -913,6 +1009,7 @@ mod tests {
             }],
             skipped: Vec::new(),
             ordered_outcomes: Vec::new(),
+            warnings: Vec::new(),
         };
 
         let value = serde_json::to_value(result).expect("serialize undefer result");
@@ -1113,6 +1210,7 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
+            ..Default::default()
         };
         execute_defer(&args, true, &cli, &ctx).expect("defer");
 
@@ -1150,6 +1248,7 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: None,
             robot: true,
+            ..Default::default()
         };
         execute_defer(&args, true, &cli, &ctx).expect("defer");
 
@@ -1192,12 +1291,14 @@ mod tests {
             ids: vec![issue_id.clone()],
             until: Some("+1d".to_string()),
             robot: true,
+            ..Default::default()
         };
         execute_defer(&defer_args, true, &cli, &ctx).expect("defer");
 
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
@@ -1237,6 +1338,7 @@ mod tests {
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx).expect("undefer");
 
@@ -1275,6 +1377,7 @@ mod tests {
         let undefer_args = UndeferArgs {
             ids: vec![issue_id.clone()],
             robot: true,
+            ..Default::default()
         };
         execute_undefer(&undefer_args, true, &cli, &ctx)?;
 

@@ -465,11 +465,17 @@ fn e2e_doctor_repair_json_rebuilds_and_returns_single_payload() {
         "issues.jsonl should exist before repair test"
     );
 
-    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
-        .expect("insert duplicate config row a");
-    conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
-        .expect("insert duplicate config row b");
+    // Scoped so the injecting connection is closed before `doctor --repair`
+    // runs. The repair path rebuilds the database and needs an exclusive open;
+    // holding this connection across it makes the engine refuse with
+    // "unable to open database file" instead of repairing.
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open beads db");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+            .expect("insert duplicate config row a");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+            .expect("insert duplicate config row b");
+    }
 
     let pre_repair = run_br(&workspace, ["doctor", "--json"], "doctor_pre_repair_json");
     assert!(
@@ -522,7 +528,7 @@ fn e2e_startup_auto_recovery_preserves_unflushed_tombstones() {
     // showed the issue as open and the rebuild only imports what's in the
     // JSONL. The fix snapshots tombstones from the anomalous-but-queryable
     // storage before dropping it and restores them after the rebuild, the
-    // same way the explicit `br sync --rebuild` delegation path does.
+    // same way the explicit `br sync --import-only --rebuild` delegation path does.
     let _log = common::test_log("e2e_startup_auto_recovery_preserves_unflushed_tombstones");
     let workspace = BrWorkspace::new();
 
@@ -684,9 +690,13 @@ fn e2e_doctor_repair_preserves_unflushed_tombstones() {
         ["doctor", "--repair", "--json"],
         "doctor_repair",
     );
+    // `doctor --repair --json` reports failures as a JSON envelope on stdout,
+    // so stderr alone says nothing about why a repair was refused.
     assert!(
         repaired.status.success(),
-        "doctor --repair failed: stderr={}",
+        "doctor --repair failed: exit={:?}\nstdout={}\nstderr={}",
+        repaired.status.code(),
+        repaired.stdout,
         repaired.stderr
     );
 
@@ -845,10 +855,16 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
             let beads_dir = workspace.root.join(".beads");
             let wal_path = beads_dir.join("beads.db-wal");
             fs::write(&wal_path, b"synthetic orphan wal").expect("seed anomalous wal");
-            assert!(
-                !beads_dir.join("beads.db-shm").exists(),
-                "fixture should keep the WAL anomaly isolated to a missing SHM sidecar"
-            );
+            // Which sidecars survive a clean exit is an fsqlite implementation
+            // detail, not a property this fixture may assert: 0.1.18 retains
+            // `-shm` where earlier versions dropped it. Establish the intended
+            // state instead of asserting the engine happened to leave it —
+            // an unusable WAL with no SHM to pair it — so the fixture means the
+            // same thing on every engine version.
+            let shm_path = beads_dir.join("beads.db-shm");
+            if shm_path.exists() {
+                fs::remove_file(&shm_path).expect("clear engine-managed SHM sidecar");
+            }
             wal_path
         };
 
@@ -864,7 +880,22 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
     // Parse the JSON output regardless of exit code.
     let doctor_json: Value =
         serde_json::from_str(&extract_json_payload(&doctor.stdout)).expect("doctor json");
-    // Doctor should detect the sidecar anomaly (error or warning) or auto-repair it.
+
+    // The anomaly here is the WAL's *contents* (20 bytes of garbage), not the
+    // sidecar pairing. `db.sidecars` only classifies which sidecars exist, and
+    // a WAL without a matching SHM is the normal frankensqlite state, so it
+    // reports `ok` with an informational message. The content anomaly surfaces
+    // in the reliability audit as `truncated_wal`. Accept either signal: what
+    // must hold is that doctor reports the planted anomaly somewhere
+    // authoritative, not that one particular check changes status.
+    let audit_flags_truncated_wal = doctor_json["reliability_audit"]["anomalies"]
+        .as_array()
+        .is_some_and(|anomalies| {
+            anomalies
+                .iter()
+                .any(|anomaly| anomaly["code"] == "truncated_wal")
+        });
+
     if let Some(checks) = doctor_json["checks"].as_array() {
         let has_sidecar_check = checks.iter().any(|check| {
             check["name"] == "db.sidecars"
@@ -875,8 +906,10 @@ fn e2e_doctor_detects_and_quarantines_anomalous_wal_sidecar() {
         // If checks array exists and has items, expect to find the sidecar check
         if !checks.is_empty() {
             assert!(
-                has_sidecar_check,
-                "doctor should surface the sidecar anomaly: {doctor_json}"
+                has_sidecar_check || audit_flags_truncated_wal,
+                "doctor should surface the planted WAL anomaly either as a non-ok \
+                 db.sidecars check or as a `truncated_wal` reliability-audit anomaly: \
+                 {doctor_json}"
             );
         }
     }

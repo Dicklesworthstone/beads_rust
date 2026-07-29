@@ -120,7 +120,9 @@ pub fn find_town_root(start: &Path) -> Option<PathBuf> {
 
 /// Load route entries from a routes.jsonl file.
 ///
-/// Returns an empty vector if the file doesn't exist.
+/// Returns an empty vector if the file doesn't exist. Blank lines and
+/// whole-line `#` comments are ignored for parity with classic beads route
+/// files.
 ///
 /// # Errors
 ///
@@ -136,7 +138,7 @@ pub fn load_routes(routes_path: &Path) -> Result<Vec<RouteEntry>> {
 
     for (line_num, line_result) in reader.lines().enumerate() {
         let line = line_result?;
-        if line.trim().is_empty() {
+        if is_ignorable_route_jsonl_line(&line) {
             continue;
         }
 
@@ -159,6 +161,13 @@ pub fn load_routes(routes_path: &Path) -> Result<Vec<RouteEntry>> {
     );
 
     Ok(routes)
+}
+
+/// Return true for route-file lines that carry no route entry.
+#[must_use]
+pub(crate) fn is_ignorable_route_jsonl_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with('#')
 }
 
 /// Find a route entry matching the given prefix.
@@ -483,6 +492,24 @@ mod tests {
         assert_eq!(routes[0].path, ".");
         assert_eq!(routes[1].prefix, "fe-");
         assert_eq!(routes[1].path, "../frontend");
+    }
+
+    #[test]
+    fn load_routes_skips_comments() {
+        let dir = TempDir::new().unwrap();
+        let routes_path = dir.path().join("routes.jsonl");
+
+        let content = r#"# Local route table
+        {"prefix":"bd-","path":"."}
+        # Keep this in sync with the town map.
+        {"prefix":"fe-","path":"../frontend"}
+        "#;
+        fs::write(&routes_path, content).unwrap();
+
+        let routes = load_routes(&routes_path).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].prefix, "bd-");
+        assert_eq!(routes[1].prefix, "fe-");
     }
 
     #[test]

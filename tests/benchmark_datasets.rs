@@ -31,23 +31,34 @@ use tracing::info;
 // BENCHMARK INFRASTRUCTURE
 // ============================================================================
 
-/// Check if the `bd` (Go beads) binary is available on the system.
-/// Returns true if `bd version` runs successfully, false otherwise.
-fn bd_available() -> bool {
-    std::process::Command::new("bd")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Skip test if bd binary is not available (used in CI where only br is built)
+/// Skip test when `bd` is not a usable classic comparison reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping benchmark comparison: {reason}");
             return;
         }
     };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickBenchmarkReadiness {
+    Ready,
+    MissingBd,
+    MissingDataset,
+}
+
+const fn quick_benchmark_readiness(
+    bd_is_available: bool,
+    dataset_is_available: bool,
+) -> QuickBenchmarkReadiness {
+    if !bd_is_available {
+        QuickBenchmarkReadiness::MissingBd
+    } else if !dataset_is_available {
+        QuickBenchmarkReadiness::MissingDataset
+    } else {
+        QuickBenchmarkReadiness::Ready
+    }
 }
 
 /// Output from running a command
@@ -1220,8 +1231,26 @@ fn benchmark_dataset_full() {
 /// Quick benchmark on beads_rust only for CI
 #[test]
 fn benchmark_dataset_quick() {
-    skip_if_no_bd!();
     init_test_logging();
+
+    let registry = DatasetRegistry::new();
+    match quick_benchmark_readiness(
+        common::bd_available(),
+        registry.is_available(KnownDataset::BeadsRust),
+    ) {
+        QuickBenchmarkReadiness::Ready => {}
+        QuickBenchmarkReadiness::MissingBd => {
+            eprintln!("Skipping benchmark_dataset_quick: 'bd' binary not found (expected in CI)");
+            return;
+        }
+        QuickBenchmarkReadiness::MissingDataset => {
+            eprintln!(
+                "Skipping benchmark_dataset_quick: beads_rust dataset not available \
+                 (no untracked .beads/beads.db in this checkout)"
+            );
+            return;
+        }
+    }
 
     info!("benchmark_dataset_quick: starting");
 
@@ -1249,6 +1278,28 @@ fn benchmark_dataset_quick() {
     run_regression_checks(std::slice::from_ref(&result));
 
     info!("benchmark_dataset_quick: completed successfully");
+}
+
+#[test]
+fn quick_benchmark_readiness_runs_only_with_both_preconditions() {
+    assert_eq!(
+        quick_benchmark_readiness(true, true),
+        QuickBenchmarkReadiness::Ready,
+        "an installed bd binary and an available registry dataset must run the benchmark"
+    );
+    assert_eq!(
+        quick_benchmark_readiness(false, true),
+        QuickBenchmarkReadiness::MissingBd
+    );
+    assert_eq!(
+        quick_benchmark_readiness(true, false),
+        QuickBenchmarkReadiness::MissingDataset
+    );
+    assert_eq!(
+        quick_benchmark_readiness(false, false),
+        QuickBenchmarkReadiness::MissingBd,
+        "report the missing executable before the dataset precondition"
+    );
 }
 
 /// Test that dataset benchmark infrastructure works

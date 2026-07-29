@@ -6,6 +6,10 @@
 use super::auto_import_external_projects_if_stale;
 use crate::cli::{OutputFormat, SchedulerArgs, resolve_output_format_basic_with_outer_mode};
 use crate::config;
+use crate::coordination::{
+    ClaimAssessmentInput, ClaimAssessmentPolicy, ClaimClassification, ClaimOwnerKind,
+    RecommendedAction, ReservationEvidence, assess_claim_with_policy,
+};
 use crate::error::{BeadsError, Result};
 use crate::format::{ReadyIssue, sanitize_terminal_inline};
 use crate::output::{OutputContext, OutputMode};
@@ -81,10 +85,17 @@ struct DependencyImpactEvidence {
 #[derive(Debug, Serialize)]
 struct StaleClaimEvidence {
     assignee: Option<String>,
+    owner_kind: ClaimOwnerKind,
     updated_age_minutes: i64,
     stale_threshold_minutes: i64,
+    abandoned_threshold_minutes: i64,
+    classification: ClaimClassification,
+    recommended_action: RecommendedAction,
+    reservation_status: &'static str,
     is_stale: bool,
     contribution: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coordination_status_hint: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,8 +211,13 @@ fn build_scheduler_output(
 ) -> Result<SchedulerOutput> {
     let now = Utc::now();
     let candidate_limit = (args.candidate_limit > 0).then_some(args.candidate_limit);
+    // Honor the configured "ready" status group (#354) so the scheduler scores
+    // the same candidate set `br ready` surfaces. Defaults to `[open]`.
+    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
+    workflow.validate_ready_status_group()?;
     let mut filters = ReadyFilters {
         limit: candidate_limit,
+        ready_statuses: workflow.ready_status_group(),
         ..ReadyFilters::default()
     };
     let mut issues =
@@ -381,14 +397,19 @@ fn score_candidate(
         .signed_duration_since(issue.updated_at)
         .num_minutes()
         .max(0);
+    let stale_claim = scheduler_stale_claim_evidence(
+        &issue,
+        inputs.now,
+        updated_age_minutes,
+        inputs.stale_threshold_minutes,
+    );
 
     let priority_contribution =
         i64::from(4_i32.saturating_sub(issue.priority.0.clamp(0, 4))) * PRIORITY_WEIGHT;
     let dependency_contribution = usize_to_i64(dependent_count)
         .saturating_mul(DEPENDENT_WEIGHT)
         .min(MAX_DEPENDENT_CONTRIBUTION);
-    let is_stale =
-        issue.assignee.is_some() && updated_age_minutes >= inputs.stale_threshold_minutes;
+    let is_stale = stale_claim.is_stale;
     let stale_contribution = if is_stale { 4 } else { 0 };
     let (fairness_contribution, fairness_reason) = match issue.assignee.as_deref() {
         None | Some("") => (3, "unassigned work is easiest to allocate fairly"),
@@ -417,11 +438,8 @@ fn score_candidate(
             contribution: dependency_contribution,
         },
         stale_claim: StaleClaimEvidence {
-            assignee: ready_issue.assignee.clone(),
-            updated_age_minutes,
-            stale_threshold_minutes: inputs.stale_threshold_minutes,
-            is_stale,
             contribution: stale_contribution,
+            ..stale_claim
         },
         fairness: FairnessEvidence {
             unassigned: ready_issue.assignee.is_none(),
@@ -447,6 +465,11 @@ fn score_candidate(
             "domain {domain} has {domain_count} ready candidate(s), title: {}",
             sanitize_terminal_inline(&issue_title)
         ),
+        scheduler_coordination_rationale(
+            evidence.stale_claim.classification,
+            evidence.stale_claim.recommended_action,
+        )
+        .to_string(),
     ];
 
     ScoredCandidate {
@@ -476,6 +499,104 @@ fn primary_domain(issue: &crate::model::Issue, labels: &[String]) -> String {
         .first()
         .cloned()
         .unwrap_or_else(|| format!("type:{}", issue.issue_type))
+}
+
+fn scheduler_stale_claim_evidence(
+    issue: &crate::model::Issue,
+    now: &DateTime<Utc>,
+    updated_age_minutes: i64,
+    stale_threshold_minutes: i64,
+) -> StaleClaimEvidence {
+    let claim_assessment = assess_claim_with_policy(
+        ClaimAssessmentInput {
+            assignee: issue.assignee.clone(),
+            updated_at: issue.updated_at,
+            now: *now,
+            owner_kind: ClaimOwnerKind::SwarmAgent,
+            reservation: ReservationEvidence::NoSnapshot,
+        },
+        scheduler_claim_policy(stale_threshold_minutes),
+    );
+    let is_stale = scheduler_stale_claim_is_stale(claim_assessment.classification);
+
+    StaleClaimEvidence {
+        assignee: claim_assessment.assignee,
+        owner_kind: claim_assessment.owner_kind,
+        updated_age_minutes,
+        stale_threshold_minutes: claim_assessment.stale_threshold_minutes,
+        abandoned_threshold_minutes: claim_assessment.abandoned_threshold_minutes,
+        classification: claim_assessment.classification,
+        recommended_action: claim_assessment.recommended_action,
+        reservation_status: "no_snapshot",
+        is_stale,
+        contribution: 0,
+        coordination_status_hint: scheduler_coordination_status_hint(
+            claim_assessment.recommended_action,
+        ),
+    }
+}
+
+const fn scheduler_claim_policy(stale_threshold_minutes: i64) -> ClaimAssessmentPolicy {
+    ClaimAssessmentPolicy {
+        stale_candidate_after_minutes: stale_threshold_minutes,
+        abandoned_likely_after_minutes: stale_threshold_minutes.saturating_mul(4),
+    }
+}
+
+const fn scheduler_stale_claim_is_stale(classification: ClaimClassification) -> bool {
+    matches!(
+        classification,
+        ClaimClassification::StaleCandidate
+            | ClaimClassification::AbandonedLikely
+            | ClaimClassification::NoMailSnapshot
+            | ClaimClassification::Ambiguous
+    )
+}
+
+const fn scheduler_coordination_status_hint(
+    recommended_action: RecommendedAction,
+) -> Option<&'static str> {
+    match recommended_action {
+        RecommendedAction::InspectMail => Some(
+            "run br coordination status with Agent Mail snapshots before treating this claim as abandoned",
+        ),
+        RecommendedAction::AskOwner => {
+            Some("ask the assignee or operator before changing ownership")
+        }
+        RecommendedAction::ReclaimCandidate => {
+            Some("review br coordination status suggested_commands before reclaiming")
+        }
+        RecommendedAction::LeaveActive => Some("leave active coordination evidence alone"),
+        RecommendedAction::Observe => None,
+    }
+}
+
+const fn scheduler_coordination_rationale(
+    classification: ClaimClassification,
+    recommended_action: RecommendedAction,
+) -> &'static str {
+    match (classification, recommended_action) {
+        (ClaimClassification::Unassigned, _) => {
+            "coordination policy classifies this as unassigned; no reclaim evidence is needed"
+        }
+        (ClaimClassification::Fresh, _) => {
+            "coordination policy classifies this assignment as fresh"
+        }
+        (ClaimClassification::NoMailSnapshot, RecommendedAction::InspectMail) => {
+            "coordination policy has no Agent Mail snapshot, so this is inspection evidence, not abandonment proof"
+        }
+        (_, RecommendedAction::InspectMail) => {
+            "coordination policy needs Agent Mail evidence before ownership changes"
+        }
+        (_, RecommendedAction::AskOwner) => {
+            "coordination policy requires human or owner confirmation before ownership changes"
+        }
+        (_, RecommendedAction::ReclaimCandidate) => {
+            "coordination policy allows only the documented advisory reclaim sequence"
+        }
+        (_, RecommendedAction::LeaveActive) => "coordination policy found active work evidence",
+        (_, RecommendedAction::Observe) => "coordination policy recommends observation",
+    }
 }
 
 fn usize_to_i64(value: usize) -> i64 {

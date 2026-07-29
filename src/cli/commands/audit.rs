@@ -4,7 +4,10 @@ use super::{
     RoutedWorkspaceWriteLock, acquire_routed_workspace_write_lock,
     auto_import_storage_ctx_if_stale, cli_for_routed_workspace, resolve_issue_id,
 };
-use crate::cli::{AuditCommands, AuditLabelArgs, AuditLogArgs, AuditRecordArgs, AuditSummaryArgs};
+use crate::cli::{
+    AuditCommands, AuditCoordinationArgs, AuditLabelArgs, AuditLogArgs, AuditRecordArgs,
+    AuditSummaryArgs,
+};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{sanitize_terminal_inline, sanitize_terminal_text};
@@ -15,6 +18,7 @@ use crate::util::id::{IdResolver, ResolverConfig};
 use chrono::{DateTime, Utc};
 use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -25,6 +29,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const MAX_AUDIT_STDIN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_AUDIT_STDIN_BYTES_U64: u64 = 10 * 1024 * 1024;
+const MAX_COORDINATION_EVIDENCE_SUMMARY_CHARS: usize = 512;
+const MAX_COORDINATION_COMMAND_CHARS: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +76,13 @@ struct AuditRecordOutput {
 }
 
 #[derive(Debug, Serialize)]
+struct AuditCoordinationOutput {
+    recorded: usize,
+    snapshot_hash: String,
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct AuditLabelOutput {
     id: String,
     parent_id: String,
@@ -95,6 +108,13 @@ struct AuditEventOutput {
     new_value: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
+    // Tier 1 attribution (issue #312, Layer 3 capture-only). Recorded only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +160,9 @@ pub fn execute(
 
     match command {
         AuditCommands::Record(args) => record_entry(args, &beads_dir, &actor, ctx),
+        AuditCommands::Coordination(args) => {
+            record_coordination_entries(args, &beads_dir, &actor, ctx)
+        }
         AuditCommands::Label(args) => label_entry(args, &beads_dir, &actor, ctx),
         AuditCommands::Log(args) => execute_log(args, &beads_dir, cli, ctx),
         AuditCommands::Summary(args) => execute_summary(args, &beads_dir, cli, ctx),
@@ -308,6 +331,9 @@ fn map_event_to_output(event: &crate::model::Event) -> AuditEventOutput {
         old_value: event.old_value.clone(),
         new_value: event.new_value.clone(),
         comment: event.comment.clone(),
+        agent_name: event.agent_name.clone(),
+        harness: event.harness.clone(),
+        model: event.model.clone(),
     }
 }
 
@@ -378,6 +404,78 @@ fn record_entry(
     Ok(())
 }
 
+fn record_coordination_entries(
+    args: &AuditCoordinationArgs,
+    beads_dir: &Path,
+    actor: &str,
+    ctx: &OutputContext,
+) -> Result<()> {
+    if !args.stdin {
+        return Err(BeadsError::validation(
+            "stdin",
+            "audit coordination requires --stdin",
+        ));
+    }
+
+    let input = read_audit_stdin_limited(io::stdin())?;
+    let snapshot = parse_coordination_snapshot_stream(&input)?;
+    let snapshot_hash = stable_snapshot_hash(&snapshot.source_values)?;
+    let command = bounded_clean_text(&args.command, MAX_COORDINATION_COMMAND_CHARS);
+    let incidents = snapshot
+        .claims
+        .iter()
+        .map(coordination_incident_from_claim)
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut ids = Vec::with_capacity(incidents.len());
+    for incident in &incidents {
+        let mut entry = AuditEntry {
+            id: None,
+            kind: "coordination_incident".to_string(),
+            created_at: None,
+            actor: clean_actor(actor),
+            issue_id: Some(incident.issue_id.clone()),
+            model: None,
+            prompt: None,
+            response: None,
+            error: None,
+            tool_name: None,
+            exit_code: None,
+            parent_id: None,
+            label: None,
+            reason: None,
+            extra: Some(coordination_extra_fields(
+                &command,
+                &snapshot_hash,
+                incident,
+            )),
+        };
+        ids.push(append_entry(beads_dir, &mut entry)?);
+    }
+
+    let output = AuditCoordinationOutput {
+        recorded: ids.len(),
+        snapshot_hash,
+        ids,
+    };
+
+    if ctx.is_toon() {
+        ctx.toon(&output);
+    } else if ctx.is_json() {
+        ctx.json_pretty(&output);
+    } else if !ctx.is_quiet() {
+        if output.ids.is_empty() {
+            println!("recorded 0 coordination audit entries");
+        } else {
+            for id in &output.ids {
+                println!("{id}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn label_entry(
     args: &AuditLabelArgs,
     beads_dir: &Path,
@@ -436,6 +534,205 @@ fn label_entry(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct CoordinationIncident {
+    issue_id: String,
+    classification: String,
+    evidence_summary: String,
+    suggested_action: String,
+}
+
+#[derive(Debug)]
+struct CoordinationSnapshotInput {
+    source_values: Vec<Value>,
+    claims: Vec<Value>,
+}
+
+fn parse_coordination_snapshot_stream(raw: &str) -> Result<CoordinationSnapshotInput> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(BeadsError::validation(
+            "stdin",
+            "expected coordination status JSON but stdin was empty",
+        ));
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => {
+            let claims = coordination_claims_from_value(&value)?;
+            return Ok(CoordinationSnapshotInput {
+                source_values: vec![value],
+                claims,
+            });
+        }
+        Err(err) if !trimmed.contains('\n') => {
+            return Err(BeadsError::validation(
+                "stdin",
+                format!("invalid coordination JSON: {err}"),
+            ));
+        }
+        Err(_) => {}
+    }
+
+    let mut source_values = Vec::new();
+    let mut claims = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<Value>(line).map_err(|err| {
+            BeadsError::validation(
+                "stdin",
+                format!("line {} is not valid coordination JSON: {err}", idx + 1),
+            )
+        })?;
+        claims.extend(coordination_claims_from_value(&value)?);
+        source_values.push(value);
+    }
+
+    Ok(CoordinationSnapshotInput {
+        source_values,
+        claims,
+    })
+}
+
+fn coordination_claims_from_value(value: &Value) -> Result<Vec<Value>> {
+    if let Some(array) = value.as_array() {
+        let mut claims = Vec::new();
+        for item in array {
+            claims.extend(coordination_claims_from_value(item)?);
+        }
+        return Ok(claims);
+    }
+
+    if let Some(claims) = value.get("claims") {
+        let claims = claims.as_array().ok_or_else(|| {
+            BeadsError::validation("claims", "coordination status claims must be an array")
+        })?;
+        return Ok(claims.clone());
+    }
+
+    if value.get("issue").is_some() && value.get("assessment").is_some() {
+        return Ok(vec![value.clone()]);
+    }
+
+    Err(BeadsError::validation(
+        "coordination_snapshot",
+        "expected coordination status object with claims[] or a coordination claim row",
+    ))
+}
+
+fn coordination_incident_from_claim(claim: &Value) -> Result<CoordinationIncident> {
+    let issue_id = required_claim_string(claim, "/issue/id", "issue.id")?;
+    let classification = required_claim_string(
+        claim,
+        "/assessment/classification",
+        "assessment.classification",
+    )?;
+    let suggested_action = required_claim_string(
+        claim,
+        "/assessment/recommended_action",
+        "assessment.recommended_action",
+    )?;
+    let evidence_summary = required_claim_string(claim, "/evidence_summary", "evidence_summary")?;
+
+    Ok(CoordinationIncident {
+        issue_id: bounded_clean_text(&issue_id, MAX_COORDINATION_COMMAND_CHARS),
+        classification: bounded_clean_text(&classification, MAX_COORDINATION_COMMAND_CHARS),
+        evidence_summary: bounded_clean_text(
+            &evidence_summary,
+            MAX_COORDINATION_EVIDENCE_SUMMARY_CHARS,
+        ),
+        suggested_action: bounded_clean_text(&suggested_action, MAX_COORDINATION_COMMAND_CHARS),
+    })
+}
+
+fn required_claim_string(claim: &Value, pointer: &str, field: &str) -> Result<String> {
+    claim
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| BeadsError::validation(field, "required coordination claim field"))
+}
+
+fn coordination_extra_fields(
+    command: &str,
+    snapshot_hash: &str,
+    incident: &CoordinationIncident,
+) -> Map<String, Value> {
+    Map::from_iter([
+        ("command".to_string(), Value::String(command.to_string())),
+        (
+            "issue_id".to_string(),
+            Value::String(incident.issue_id.clone()),
+        ),
+        (
+            "classification".to_string(),
+            Value::String(incident.classification.clone()),
+        ),
+        (
+            "evidence_summary".to_string(),
+            Value::String(incident.evidence_summary.clone()),
+        ),
+        (
+            "snapshot_hash".to_string(),
+            Value::String(snapshot_hash.to_string()),
+        ),
+        (
+            "suggested_action".to_string(),
+            Value::String(incident.suggested_action.clone()),
+        ),
+    ])
+}
+
+fn bounded_clean_text(value: &str, max_chars: usize) -> String {
+    let sanitized = sanitize_terminal_inline(value.trim());
+    if sanitized.chars().count() <= max_chars {
+        return sanitized.into_owned();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut truncated = sanitized.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn stable_snapshot_hash(values: &[Value]) -> Result<String> {
+    let normalized = values.iter().map(normalize_json_value).collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&normalized)?;
+    let digest = Sha256::digest(&bytes);
+    Ok(lower_hex(&digest))
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn normalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(normalize_json_value).collect()),
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut normalized = Map::new();
+            for key in keys {
+                normalized.insert(key.clone(), normalize_json_value(&map[key]));
+            }
+            Value::Object(normalized)
+        }
+        _ => value.clone(),
+    }
 }
 
 fn read_audit_stdin_limited<R: Read>(reader: R) -> Result<String> {
@@ -646,6 +943,10 @@ fn render_audit_log_rich(issue_id: &str, events: &[crate::model::Event], ctx: &O
             );
         }
 
+        if let Some(attribution) = format_event_attribution(event) {
+            content.append_styled(&format!("   {attribution}\n"), theme.dimmed.clone());
+        }
+
         content.append("\n");
     }
 
@@ -688,7 +989,32 @@ fn render_audit_log_plain(issue_id: &str, events: &[crate::model::Event]) {
         if let Some(comment) = &event.comment {
             println!("   \"{}\"", sanitize_terminal_text(comment));
         }
+        if let Some(attribution) = format_event_attribution(event) {
+            println!("   {attribution}");
+        }
         println!();
+    }
+}
+
+/// Format the captured Tier 1 attribution (issue #312, Layer 3 capture-only)
+/// for display, e.g. `via agent=foo harness=bar model=baz`. Returns `None`
+/// when the event carries no attribution. Recorded/displayed only — never
+/// used for any gating decision.
+fn format_event_attribution(event: &crate::model::Event) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(agent) = &event.agent_name {
+        parts.push(format!("agent={}", sanitize_terminal_inline(agent)));
+    }
+    if let Some(harness) = &event.harness {
+        parts.push(format!("harness={}", sanitize_terminal_inline(harness)));
+    }
+    if let Some(model) = &event.model {
+        parts.push(format!("model={}", sanitize_terminal_inline(model)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("via {}", parts.join(" ")))
     }
 }
 
@@ -809,6 +1135,19 @@ mod tests {
         }
     }
 
+    fn coordination_claim(issue_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "issue": {
+                "id": issue_id
+            },
+            "assessment": {
+                "classification": "no_mail_snapshot",
+                "recommended_action": "inspect_mail"
+            },
+            "evidence_summary": "updated_at=2026-05-08T00:00:00Z, assignee=agent-a"
+        })
+    }
+
     #[test]
     fn test_append_preserves_order() {
         let dir = temp_beads_dir();
@@ -844,6 +1183,71 @@ mod tests {
     }
 
     #[test]
+    fn coordination_snapshot_parser_accepts_status_object_and_jsonl_rows() {
+        let status = serde_json::json!({
+            "schema_version": "br.coordination.v1",
+            "claims": [coordination_claim("bd-one"), coordination_claim("bd-two")]
+        });
+        let parsed = parse_coordination_snapshot_stream(&status.to_string()).expect("status");
+        assert_eq!(parsed.claims.len(), 2);
+
+        let jsonl = format!(
+            "{}\n{}\n",
+            coordination_claim("bd-three"),
+            coordination_claim("bd-four")
+        );
+        let parsed_jsonl = parse_coordination_snapshot_stream(&jsonl).expect("jsonl");
+        assert_eq!(parsed_jsonl.claims.len(), 2);
+    }
+
+    #[test]
+    fn coordination_incident_requires_normalized_fields() {
+        let mut claim = coordination_claim("bd-one");
+        claim["assessment"]["recommended_action"] = serde_json::Value::Null;
+
+        let err = coordination_incident_from_claim(&claim).expect_err("missing action");
+
+        assert!(
+            matches!(&err, BeadsError::Validation { field, reason } if field == "assessment.recommended_action" && reason.contains("required")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn coordination_evidence_summary_is_bounded_and_sanitized() {
+        let dirty = format!("{}{}", "\u{1b}[31m", "x".repeat(800));
+        let mut claim = coordination_claim("bd-one");
+        claim["evidence_summary"] = serde_json::Value::String(dirty);
+
+        let incident = coordination_incident_from_claim(&claim).expect("incident");
+
+        assert!(incident.evidence_summary.len() <= MAX_COORDINATION_EVIDENCE_SUMMARY_CHARS);
+        assert!(!incident.evidence_summary.contains('\u{1b}'));
+        assert!(incident.evidence_summary.ends_with("..."));
+    }
+
+    #[test]
+    fn coordination_snapshot_hash_is_stable_for_object_key_order() {
+        let first = serde_json::json!({"b": 2, "a": {"d": 4, "c": 3}});
+        let second = serde_json::json!({"a": {"c": 3, "d": 4}, "b": 2});
+
+        assert_eq!(
+            stable_snapshot_hash(&[first]).expect("first hash"),
+            stable_snapshot_hash(&[second]).expect("second hash")
+        );
+    }
+
+    #[test]
+    fn coordination_snapshot_parser_rejects_malformed_json() {
+        let err = parse_coordination_snapshot_stream("{").expect_err("malformed JSON");
+
+        assert!(
+            matches!(&err, BeadsError::Validation { field, reason } if field == "stdin" && reason.contains("invalid coordination JSON")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn test_label_output_shape() {
         let output = AuditLabelOutput {
             id: "int-2b3c4d5e".to_string(),
@@ -857,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_audit_stdin_limited_checks_size_before_utf8_decode() {
+    fn test_read_audit_stdin_limited_checks_size_before_utf8_parse() {
         let mut payload = vec![b'a'; MAX_AUDIT_STDIN_BYTES];
         payload.push(0xc3);
 

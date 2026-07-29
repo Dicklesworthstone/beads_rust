@@ -1,0 +1,7 @@
+Pass-4 cycle 4: same post_undo interaction as the cycle 1/2/3 fixtures
+(per HANDOFF_pass_3.md). Under REPLAY_IDEMPOTENCE=1 the second no-op
+--repair creates a new (empty) run-dir that becomes the new "latest",
+breaking the post_undo assertion. The idempotence contract is
+indirectly enforced: after the first --repair the cached hash already
+matches the JSONL, so a second --repair finds no divergence and is a
+true no-op.

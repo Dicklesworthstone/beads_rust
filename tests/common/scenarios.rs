@@ -244,15 +244,13 @@ impl NormalizationRules {
                     });
                 }
             }
-            Value::String(s) => {
+            Value::String(s) if self.normalize_line_endings && s.contains("\r\n") => {
                 // Normalize line endings for all string values
-                if self.normalize_line_endings && s.contains("\r\n") {
-                    let normalized = s.replace("\r\n", "\n");
-                    if self.log_normalization {
-                        log.push(format!("Normalized line endings: {path}"));
-                    }
-                    *s = normalized;
+                let normalized = s.replace("\r\n", "\n");
+                if self.log_normalization {
+                    log.push(format!("Normalized line endings: {path}"));
                 }
+                *s = normalized;
             }
             _ => {}
         }
@@ -2555,8 +2553,7 @@ fn extract_issue_id_from_output(output: &str) -> Option<String> {
 fn append_text_to_issues_jsonl(beads_dir: &Path, text: &str) -> std::io::Result<()> {
     let jsonl_path = beads_dir.join("issues.jsonl");
     let needs_newline = std::fs::read_to_string(&jsonl_path)
-        .ok()
-        .is_some_and(|content| !content.is_empty() && !content.ends_with('\n'));
+        .is_ok_and(|content| !content.is_empty() && !content.ends_with('\n'));
 
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -3212,9 +3209,20 @@ pub mod catalog {
             "where_after_stress",
         ));
         steps.push(sync_flush_step("flush_after_stress"));
-        steps.push(command_step(
-            vec!["doctor".to_string(), "--json".to_string()],
-            "doctor_after_stress",
+        // Per the post-#292 doctor contract (commits 96c3fad2, 1c3c4fe1):
+        // any non-OK check — WARN or ERROR — now flips `ok` to false and
+        // exits 1. The stress harness legitimately produces WARN-level
+        // finding (RUST_LOG=beads_rust=debug set by the test runner).
+        // This does not degrade the
+        // workspace's semantic health, so the e2e test asserts
+        // `workspace_health == "healthy"` on the JSON payload rather
+        // than exit-code success; the step itself is `allow_either`
+        // so the workspace-evolution executor doesn't trip on exit 1.
+        steps.push(WorkspaceEvolutionStep::command(
+            WorkspaceEvolutionCommand::new(
+                ScenarioCommand::new(["doctor", "--json"]).with_label("doctor_after_stress"),
+            )
+            .allow_either(),
         ));
 
         WorkspaceEvolutionPlan::new("long_lived_mixed_order_stress", seed)
@@ -3304,7 +3312,7 @@ mod tests {
 
         assert_eq!(value["created_at"], "NORMALIZED_TIMESTAMP");
         assert_eq!(value["updated_at"], "NORMALIZED_TIMESTAMP");
-        assert_eq!(value["id"], "bd-HASH");
+        assert_eq!(value["id"], "bd-HASH"); // invariant: NormalizationRules placeholder, not ID-pinning
         assert!(!log.is_empty());
     }
 
@@ -3845,9 +3853,9 @@ mod tests {
         let log = rules.apply(&mut value);
 
         // IDs should have hash portion masked
-        assert_eq!(value["id"], "bd-HASH");
-        assert_eq!(value["parent_id"], "bd-HASH");
-        assert_eq!(value["blocked_by_id"], "bd-HASH");
+        assert_eq!(value["id"], "bd-HASH"); // invariant: NormalizationRules placeholder
+        assert_eq!(value["parent_id"], "bd-HASH"); // invariant: NormalizationRules placeholder
+        assert_eq!(value["blocked_by_id"], "bd-HASH"); // invariant: NormalizationRules placeholder
         assert!(log.iter().any(|l| l.contains("Normalized ID")));
     }
 
@@ -3890,7 +3898,7 @@ mod tests {
         rules.apply(&mut value);
 
         // ID should remain unchanged when normalize_ids is false
-        assert_eq!(value["id"], "bd-abc123");
+        assert_eq!(value["id"], "bd-abc123"); // invariant: fixture round-trip when normalize_ids=false
     }
 
     // --- Clock Tolerance / Timestamp Tolerance Tests ---

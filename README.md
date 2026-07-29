@@ -59,6 +59,7 @@ You need to track issues for your project, but:
 br init                              # Initialize in your repo
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
+br coordination status --json        # Inspect hidden in-progress claims
 br close br-abc123                   # Close when done; JSONL auto-flushes by default
 br sync --flush-only                 # Optional final export check before git commit
 ```
@@ -131,7 +132,8 @@ Some explicit commands intentionally step outside that default storage boundary:
 the project `.gitignore`, `br config edit/set` updates config files,
 `br completions -o` writes shell completion files, `br upgrade` updates the
 installed binary, and git-reporting commands such as `br changelog`, `br
-orphans`, and commit-activity `br stats` inspect git history.
+orphans`, commit-activity `br stats`, and the explicitly requested bounded
+`br vcs-status` diagnostic inspect git state/history.
 
 ```bash
 # Normal issue state lives under .beads/
@@ -174,6 +176,16 @@ br sync --import-only
 # Merge divergent DB and JSONL edits using the saved base snapshot
 br sync --merge
 
+# Additively pull JSONL rows the database is missing (previewable, lossless)
+br sync --reconcile --dry-run
+br sync --reconcile
+# Recover JSONL-only rows without deleting SQLite-only rows.
+# Review the dry-run receipt, then bind apply to that exact plan.
+plan="$(br sync --reconcile-additive --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+br sync --reconcile-additive --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
+
 # Rebuild SQLite from authoritative JSONL after recovery/corruption
 br sync --import-only --rebuild
 
@@ -189,6 +201,9 @@ Every command supports `--json` for AI coding agents:
 br list --json | jq '.issues[] | select(.priority <= 1)'
 br ready --json  # Structured output for agents
 br show br-abc123 --json
+br capabilities --format json
+br capabilities --format json --command "create"
+br robot-docs guide
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -226,6 +241,18 @@ br has grown into a full CLI surface for local issue tracking: routing, recovery
 TOON/JSON schemas, MCP support, conformance checks, and sync safety tools are
 all part of the current scope. The focus is still local-first operation, explicit
 git/VCS handoff, and no background services installed behind your back.
+
+Agent-facing output contracts have a focused verifier:
+
+```bash
+BR_AGENT_CONTRACT_USE_RCH=1 ./scripts/verify-agent-contracts.sh
+```
+
+Run it before changing schema command metadata, CLI JSON/TOON output, MCP
+resources/tools/prompts, README/docs examples, or `agent_baseline/` artifacts.
+With `BR_AGENT_CONTRACT_USE_RCH=1`, the script delegates each Cargo target to
+`rch exec --`. The contract tests do not run git, project network calls, live
+Agent Mail, MCP clients, or fixture update modes.
 
 ---
 
@@ -287,14 +314,18 @@ cargo build --release
 ./target/release/br --help
 
 # Or install globally
-cargo install --path .
+cargo install --path . --locked
 ```
 
 ### Cargo Install
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked
 ```
+
+The explicit `beads_rust` package selector avoids ambiguity with the
+repository's fuzz package. `--locked` makes Cargo use the dependency versions
+validated against the repository's pinned nightly toolchain.
 
 > **Note:** `cargo install` places binaries in `~/.cargo/bin/`, while the install script uses `~/.local/bin/`. If you have both in PATH, ensure the desired location has higher priority to avoid running an outdated version. Run `which br` to verify which binary is active.
 
@@ -305,7 +336,7 @@ cargo install --git https://github.com/Dicklesworthstone/beads_rust.git
 cargo build --release --no-default-features
 
 # Or install without it
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --no-default-features
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --no-default-features
 ```
 
 ### Enable MCP Server Support
@@ -318,7 +349,7 @@ Context Protocol instead of shelling out to CLI commands.
 cargo build --release --features mcp
 
 # Or install globally with MCP support
-cargo install --git https://github.com/Dicklesworthstone/beads_rust.git --features mcp
+cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --features mcp
 ```
 
 Run it from an initialized beads workspace:
@@ -332,7 +363,19 @@ on a network port, and uses the same SQLite database, JSONL export path, write
 locks, audit events, and sync safety model as the normal CLI. It does not run
 git. Use shell/JSON
 commands for simple scripts; use MCP when an agent benefits from discoverable
-tools, resources, prompts, and structured recovery hints.
+tools, resources, prompts, and structured recovery hints. MCP clients can read
+`beads://coordination/status` for the same `br.coordination.v1` stale-claim
+evidence shape as `br coordination status --json`; use the CLI snapshot flags
+when Agent Mail reservation or liveness evidence is required.
+
+The MCP tool surface is `list_issues`, `show_issue`, `create_issue`,
+`update_issue`, `close_issue`, `manage_dependencies`, and `project_overview`.
+The resource surface is `beads://project/info`, `beads://issues/{id}`,
+`beads://schema`, `beads://labels`, `beads://issues/ready`,
+`beads://issues/blocked`, `beads://issues/in_progress`,
+`beads://coordination/status`, `beads://issues/deferred`,
+`beads://issues/bottlenecks`, `beads://graph/health`, and
+`beads://events/recent`.
 
 ### Verify Installation
 
@@ -424,6 +467,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `blocked` | Blocked issues | `br blocked` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
+| `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
 | `count` | Count with grouping | `br count --by status` |
 | `query` | Manage saved queries | `br query save mine --status open --assignee alice` |
 
@@ -432,6 +476,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `dep add` | Add dependency | `br dep add br-child br-parent` |
+| `dep import` | Bulk import dependency JSONL | `br dep import edges.jsonl --robot` |
 | `dep remove` | Remove dependency | `br dep remove br-child br-parent` |
 | `dep list` | List dependencies | `br dep list br-abc123` |
 | `dep tree` | Dependency tree | `br dep tree br-abc123` |
@@ -458,7 +503,8 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `epic` | Manage epic rollups | `br epic status --eligible-only` |
-| `graph` | Visualize dependency graph | `br graph br-abc123` |
+| `graph` | Show what an issue unblocks (its dependents) | `br graph br-abc123` |
+| `graph --dependencies` | Show what is blocking an issue | `br graph br-abc123 --dependencies` |
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
@@ -471,17 +517,23 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `agents` | Manage AGENTS.md workflow instructions | `br agents --add --force` |
 | `audit` | Record and label agent interactions | `br audit record --kind note` |
+| `capabilities` | Describe machine-readable contracts and safety guarantees | `br capabilities --format json` |
 | `completions` | Generate shell completions | `br completions zsh` |
 | `info` | Show workspace diagnostics | `br info` |
+| `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
 | `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
+| `vcs-status` | Explicit bounded JSONL Git visibility | `br vcs-status --json` |
 | `where` | Show active `.beads` directory | `br where` |
 
 ### Sync & System
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `sync` | Sync DB ↔ JSONL | `br sync --flush-only` |
+| `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
+| `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
+| `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
+| `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
 | `stats` | Project statistics | `br stats` |
 | `config` | Manage config | `br config list` |
 | `upgrade` | Self-update | `br upgrade` |
@@ -551,6 +603,190 @@ br config set defaults.priority=1
 br config edit
 ```
 
+### Workflow Policy (`.beads/policy.yaml`)
+
+Workflow behavior is configured separately in `.beads/policy.yaml`. One use is
+defining a **configurable ready status group**: which statuses `br ready` treats
+as actionable work. By default only `open` is ready, but projects with a review
+workflow can widen it so review-returned work (e.g. `rework`) resurfaces through
+the same `br ready --json` entrypoint:
+
+```yaml
+# .beads/policy.yaml
+workflow:
+  status_groups:
+    ready:
+      - open
+      - rework
+```
+
+- Default (when unset): `[open]` — no change for existing repos.
+- Returned issues keep their real status (`{"status":"rework"}` in `--json`).
+- The `defer_until` time-gate still applies to non-`deferred` members;
+  `--include-deferred` additionally surfaces `deferred` work and drops the gate.
+- Under `workflow.strict: true`, the ready group must be a subset of
+  `workflow.statuses` or `br ready` rejects it with a clear error.
+- `br ready` (text/json/toon/robot) and `br scheduler` all honor the group.
+
+See `docs/CLI_REFERENCE.md` (the `ready` command) for full details.
+
+The same policy file can enforce **atomic repository-level workflow capacity**.
+Hard limits are checked inside the same `BEGIN IMMEDIATE` transaction that
+creates an issue or changes its status, so two concurrent agents cannot both
+claim the final slot:
+
+```yaml
+workflow:
+  statuses: [open, in_progress, in_review, rework, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 3
+    groups:
+      active_work:
+        statuses: [in_progress, in_review, rework]
+        hard: 5
+    admission:
+      - name: drain_review_before_starting
+        transitions:
+          from: [open]
+          to: [in_progress]
+        require_below:
+          statuses:
+            in_review: 2
+```
+
+Individual status and named multi-status group limits allow the configured
+count and reject only transitions that would exceed it. Admission thresholds
+are exclusive (`count < threshold`) and can inspect a different queue before a
+matching transition. Rejected multi-field updates roll back completely;
+transitions that drain an already-overfull queue remain allowed. Capacity is
+disabled when `workflow.capacity` is absent.
+
+Soft thresholds admit the transition but emit actionable evidence. Human output
+prints a warning; JSON and TOON preserve their legacy shape when no warning is
+present and otherwise return the successful result together with a structured
+`warnings` array. Multi-target `update`/`--claim`, `close`, `reopen`, `defer`,
+and `undefer` operations preflight the final prospective state and commit every
+status mutation for one repository in a single transaction. A capacity-neutral
+swap therefore succeeds regardless of request order, while any hard-limit or
+validation failure rolls back the complete repository-local batch. Each route
+in a multi-repository command is an independent SQLite transaction, so an
+earlier repository may already be committed if a later route fails; br does not
+claim distributed atomicity across repositories.
+
+Workflows can also require satisfied acceptance criteria and a fresh comment
+for an exact transition or every transition entering a target status. This is
+enabled by `required_fields` itself and does not require strict status mode:
+
+```yaml
+workflow:
+  required_fields:
+    in_review:
+      - transition_comment
+    "in_progress -> in_review":
+      - acceptance_criteria
+      - transition_comment
+```
+
+Pass the request-scoped comment with `br update --transition-comment`,
+`br close --transition-comment`, `br defer --transition-comment`, or
+`br undefer --transition-comment`; `br reopen --reason` is its transition
+comment, and `br epic close-eligible --transition-comment` applies one comment
+to every epic in its atomic batch. A historical comment never satisfies the
+rule. The prospective acceptance-criteria value must be non-empty and contain
+no unchecked markdown boxes. Any failure rolls back the status, other field
+updates, comments, and every sibling mutation in the repository-local batch.
+
+Named workflow gate verdicts are likewise bound to the issue's current status
+revision and an explicit target. Use `br gate report ... --to <STATUS>` when a
+gate can authorize multiple targets; the flag is optional only when the policy
+has one matching target. Leaving and later re-entering review invalidates prior
+passes without deleting their append-only audit history. Pre-v15 unscoped gate
+rows remain visible through `br gate list` but can never authorize a transition.
+
+Capacity counts every matching issue by default. `workflow.capacity.counting.
+hierarchy` measures occupancy across `parent-child` edges instead, so an
+aggregate parent and its executable child do not each consume a slot:
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: leaf_work   # all | leaf_work | roots | weighted
+```
+
+Under `leaf_work` an active leaf counts one and a parent with active counted
+descendants counts zero, so an epic → parent → {child, child} tree consumes
+two slots rather than four; the parent starts counting once its last active
+descendant leaves. `roots` counts each work stream by its highest active
+ancestor, and `weighted` sums explicit `counting.weights` (per issue, then
+per type, then a default), where a weight of `0` is the audited way to say a
+parent carries no independent execution. Only `parent-child` edges
+participate — `blocks` and `related` never affect counting — and the walk
+happens inside the same transaction as admission. Under `leaf_work`/`roots`,
+capacity evidence reports `counting_mode` plus `aggregate_parents_excluded`.
+
+`br show --json` also exposes a derived `rollup` for any issue with local
+children (`{"status": "in_progress", "descendants": {...}}`), letting an epic
+stay `open` while reporting that its subtree has started.
+
+Audited issue-specific **capacity exemptions** let one named issue occupy one
+named capacity without consuming a slot — the escape hatch for a long-lived
+external blocker that legitimately stays in a limited status:
+
+```yaml
+workflow:
+  capacity:
+    exemptions:
+      providers: [operator]     # who may grant; empty disables granting
+      require_expiry: true      # optional: every grant must carry an expiry
+```
+
+```bash
+br capacity exempt br-abc --status blocked \
+  --provider operator \
+  --reason "Awaiting an external regulatory decision" \
+  --expires 2026-08-15
+```
+
+Grants, renewals, revocations, and observed expirations are all recorded in an
+append-only audit table. Exempt issues stay visible in queue metrics, capacity
+evidence reports counted and exempt totals separately, leaving the applicable
+status ends the exemption, and expired exemptions count again. See
+`docs/CLI_REFERENCE.md` (the `capacity` command) for full semantics.
+
+Optional **multi-agent admission scopes** partition capacity beyond the
+repository total — per acting actor, per issue assignee, per self-reported
+harness (`--harness`/`BR_HARNESS`) or session (`BR_SESSION`), or per
+subtree root over parent-child edges:
+
+```yaml
+workflow:
+  capacity:
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+      harness:
+        statuses:
+          in_progress:
+            hard: 6
+```
+
+Every applicable scope composes with the repository limits inside the same
+admission transaction; a partition with no key (e.g. no harness reported)
+is simply not subject to that scope. This is cooperative admission control,
+not process supervision — attribution stays self-reported. Scoped evidence
+carries the partition key as `scope_key` and a
+`workflow.capacity.scopes.<scope>...` policy path. Once any capacity is
+configured, `br stats` and `br coordination status` report per-capacity
+occupancy (counted/exempt/limits/remaining/state, including occupied scope
+partitions) in human, JSON, and TOON output. See `docs/CLI_REFERENCE.md`
+for full semantics and `docs/GH384_ACCEPTANCE_MATRIX.md` for the complete
+GitHub #384 acceptance matrix.
+
 ### Environment Variables
 
 | Variable | Description |
@@ -583,7 +819,7 @@ This keeps successful commands readable by suppressing low-level dependency logg
 │  ┌─────────────────┐              ┌─────────────────────┐    │
 │  │  SqliteStorage  │◄────────────►│  JSONL Export/Import │    │
 │  │                 │   sync       │                     │    │
-│  │  - WAL mode     │              │  - Atomic writes    │    │
+│  │  - WAL mode     │              │  - Atomic publish   │    │
 │  │  - Dirty track  │              │  - Content hashing  │    │
 │  │  - Blocked cache│              │  - Merge support    │    │
 │  └────────┬────────┘              └──────────┬──────────┘    │
@@ -607,13 +843,19 @@ Update issue        ──►      br update        ──►    SQLite UPDATE
 
 Query issues        ──►      br list          ──►    SQLite SELECT
 
-Export to git       ──►      br sync          ──►    Write JSONL
-                             --flush-only     ──►    Clear dirty flags
+Export to git       ──►      br sync --flush-only
+                                              ──►    Write JSONL + clear dirty flags
 
 Pull from git       ──►      git pull         ──►    JSONL updated
-                    ──►      br sync          ──►    Merge to SQLite
-                             --import-only
+                    ──►      br sync --import-only
+                                              ──►    Merge to SQLite
 ```
+
+Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
+`--merge`, `--reconcile`, `--reconcile-additive`, `--status`, or `--witness`
+so the data direction and authority are explicit. `br sync --status` never
+probes Git; run `br vcs-status --json` only when Git visibility is explicitly
+wanted.
 
 ### Safety Model
 
@@ -623,7 +865,7 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 |-----------|----------------|
 | Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
 | Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
-| Atomic writes | Write to temp file, then rename |
+| Checked publication and transactions | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback |
 | No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
 
 ---
@@ -677,6 +919,11 @@ If you want to preserve imported IDs exactly as-is, omit `--rename-prefix`.
 # Check sync status
 br sync --status
 
+# Lossless recovery: preview, then additively pull the missing/newer rows
+# (never deletes, never writes JSONL, preserves all audit events)
+br sync --reconcile --dry-run
+br sync --reconcile
+
 # Force import (may lose local changes)
 br sync --import-only --force
 
@@ -684,9 +931,13 @@ br sync --import-only --force
 br sync --import-only --rebuild
 ```
 
-`--rebuild` is an import-mode operation. It is not valid with `--flush-only` or
-`--merge`; after import it removes database entries that are absent from JSONL,
-while preserving deletion tombstones used by sync.
+The reconcile path also repairs the "false equal" state where `br sync
+--status` reports synchronized (the stored content hash matches the file)
+while the JSONL still holds rows the database never imported.
+
+`--rebuild` is an explicit import-mode operation. It is valid only with
+`--import-only`; after import it removes database entries that are absent from
+JSONL, while preserving deletion tombstones used by sync.
 
 ### Sync Issues After Git Merge
 
@@ -761,10 +1012,19 @@ Yes! br is designed for AI agent integration:
 br list --json
 br ready --json
 br show br-abc123 --json
+br coordination status --json
+br capabilities --format json
+br capabilities --format json --command "comments add"
+br robot-docs guide
 
 # Create issues programmatically
 br create "Title" --json  # Returns created issue as JSON
 ```
+
+When `br ready --json` is empty but `bv --robot-next` or a human operator
+suspects work is hidden behind old claims, use `br coordination status --json`
+alongside Agent Mail reservations. The command is read-only: it does not call
+Agent Mail, does not run git, and never auto-reclaims a bead.
 
 See [AGENTS.md](AGENTS.md) for the complete agent integration guide.
 
@@ -898,6 +1158,11 @@ br is designed for AI coding agents. See [AGENTS.md](AGENTS.md) for:
 - Degraded coordination when Agent Mail is unavailable
 - Robot mode flags
 - Best practices
+
+For CI and release workflow edits, use
+[CI_SUPPLY_CHAIN.md](docs/CI_SUPPLY_CHAIN.md) as the canonical maintenance
+policy for immutable GitHub Action pins, workflow fragment harnesses, update
+audits, and required proof commands.
 
 You can also emit machine-readable JSON Schema documents directly:
 

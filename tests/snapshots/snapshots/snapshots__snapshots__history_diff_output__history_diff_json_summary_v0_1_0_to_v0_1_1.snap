@@ -2,12 +2,4 @@
 source: tests/snapshots/history_diff_output.rs
 expression: normalized
 ---
-{
-  "action": "diff",
-  "backup": "issues.v0.1.0.20260401_000000_000000.jsonl",
-  "current": "$WORKSPACE/.beads/issues.jsonl",
-  "status": "different",
-  "diff_available": true,
-  "current_size_bytes": null,
-  "backup_size_bytes": null
-}
+{"action":"diff","backup":"issues.v0.1.0.20260401_000000_000000.jsonl","current":"$WORKSPACE/.beads/issues.jsonl","status":"different","diff_available":true,"current_size_bytes":null,"backup_size_bytes":null}

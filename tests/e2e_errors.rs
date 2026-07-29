@@ -307,7 +307,7 @@ fn e2e_update_tombstone_rejected() {
     assert!(!update.status.success(), "tombstone update should fail");
     assert_eq!(update.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&update.stderr).expect("should be valid error json");
+    let json = parse_error_json(&update.stdout).expect("should be valid error json");
     assert!(verify_error_structure(&json), "missing required fields");
     assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
     assert!(
@@ -436,6 +436,53 @@ fn e2e_dependency_errors() {
 
     let cycle = run_br(&workspace, ["dep", "add", &id_b, &id_a], "dep_cycle");
     assert!(!cycle.status.success(), "cycle dependency should fail");
+}
+
+#[test]
+fn e2e_dep_add_blocks_ignores_non_blocking_cycle_edges() {
+    let _log = common::test_log("e2e_dep_add_blocks_ignores_non_blocking_cycle_edges");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let issue_a = run_br(&workspace, ["create", "Issue A"], "create_a");
+    assert!(
+        issue_a.status.success(),
+        "create A failed: {}",
+        issue_a.stderr
+    );
+    let id_a = parse_created_id(&issue_a.stdout);
+
+    let issue_b = run_br(&workspace, ["create", "Issue B"], "create_b");
+    assert!(
+        issue_b.status.success(),
+        "create B failed: {}",
+        issue_b.stderr
+    );
+    let id_b = parse_created_id(&issue_b.stdout);
+
+    let related = run_br(
+        &workspace,
+        ["dep", "add", &id_a, &id_b, "--type", "related"],
+        "dep_related",
+    );
+    assert!(
+        related.status.success(),
+        "related dep add failed: {}",
+        related.stderr
+    );
+
+    let blocks = run_br(
+        &workspace,
+        ["dep", "add", &id_b, &id_a, "--type", "blocks"],
+        "dep_blocks",
+    );
+    assert!(
+        blocks.status.success(),
+        "blocking dep should ignore non-blocking related edge: {}",
+        blocks.stderr
+    );
 }
 
 #[test]
@@ -838,7 +885,7 @@ fn e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation() {
     // Regression: `br sync --import-only --rebuild` on an existing DB used
     // to lose tombstones that had not yet been flushed to JSONL. The
     // in-place path preserves them via `snapshot_tombstones` +
-    // `restore_tombstones` across `reset_data_tables`, but the new
+    // `restore_preserved_issues` across `reset_data_tables`, but the new
     // delegation path to `recover_database_from_jsonl` opens a fresh DB and
     // imports only what's in the JSONL. Unflushed tombstones therefore
     // vanished silently, taking their deletion-retention state with them.
@@ -1359,9 +1406,9 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
         "malformed JSONL should fail explicit import after deferred recovery"
     );
     assert!(
-        result.stderr.contains("Invalid JSON"),
-        "unexpected stderr: {}",
-        result.stderr
+        result.stdout.contains("Invalid JSON"),
+        "unexpected stdout: {}",
+        result.stdout
     );
 
     let restored_bytes = fs::read(&alt_db).expect("read restored alt db");
@@ -1564,9 +1611,9 @@ fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
         "malformed JSONL should fail explicit import after deferred recovery"
     );
     assert!(
-        result.stderr.contains("Invalid JSON"),
-        "unexpected stderr: {}",
-        result.stderr
+        result.stdout.contains("Invalid JSON"),
+        "unexpected stdout: {}",
+        result.stdout
     );
     assert!(
         !alt_db.exists(),
@@ -1962,13 +2009,716 @@ fn e2e_structured_error_not_initialized() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(2), "exit code should be 2");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
     assert_eq!(error["code"], "NOT_INITIALIZED");
     assert!(!error["retryable"].as_bool().unwrap());
     assert!(error["hint"].as_str().unwrap().contains("br init"));
+}
+
+#[test]
+fn e2e_partially_applied_close_batch_does_not_exit_zero() {
+    // The process-level half of the defect. `br close <blocked> <closeable>`
+    // exited 0 while printing "Warning: Skipped ..." and leaving the blocked
+    // issue untouched, because the terminal error was gated on
+    // `closed_count == 0`. docs/agent/ERRORS.md tells callers to parse stdout
+    // precisely when the exit code is 0, so the transcript — which shows an
+    // unqualified "✓ Closed" and nothing else — was certified authoritative.
+    //
+    // This asserts the real ExitStatus of the real binary, not a Result, and
+    // then reads the record back rather than trusting the output. Under the old
+    // predicate it fails at the exit-code assertion with `Some(0)`.
+    let _log = common::test_log("e2e_partially_applied_close_batch_does_not_exit_zero");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "partial_close_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(
+        &workspace,
+        ["create", "Blocker issue", "-p", "2"],
+        "partial_close_create_blocker",
+    );
+    assert!(
+        blocker.status.success(),
+        "blocker create failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(
+        &workspace,
+        ["create", "Blocked issue", "-p", "2"],
+        "partial_close_create_blocked",
+    );
+    assert!(
+        blocked.status.success(),
+        "blocked create failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let free = run_br(
+        &workspace,
+        ["create", "Independently closeable issue", "-p", "2"],
+        "partial_close_create_free",
+    );
+    assert!(free.status.success(), "free create failed: {}", free.stderr);
+    let free_id = parse_created_id(&free.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id],
+        "partial_close_dep_add",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    // One id is refused, the other closes. The batch is partially applied.
+    let close = run_br(
+        &workspace,
+        ["close", &blocked_id, &free_id, "--reason", "partial batch"],
+        "partial_close_batch",
+    );
+
+    assert!(
+        !close.status.success(),
+        "a partially applied batch must not report success; stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+    assert_eq!(
+        close.status.code(),
+        Some(3),
+        "partial close should exit 3, not 0; stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+
+    // The record is the authority, not the transcript: one closed, one refused.
+    let show_blocked = run_br(
+        &workspace,
+        ["show", &blocked_id, "--json"],
+        "partial_close_show_blocked",
+    );
+    assert!(
+        show_blocked.status.success(),
+        "show blocked failed: {}",
+        show_blocked.stderr
+    );
+    assert!(
+        show_blocked.stdout.contains("\"status\":\"open\""),
+        "the blocked issue must still be open, got: {}",
+        show_blocked.stdout
+    );
+
+    let show_free = run_br(
+        &workspace,
+        ["show", &free_id, "--json"],
+        "partial_close_show_free",
+    );
+    assert!(
+        show_free.status.success(),
+        "show free failed: {}",
+        show_free.stderr
+    );
+    assert!(
+        show_free.stdout.contains("\"status\":\"closed\""),
+        "the closeable issue should have closed, got: {}",
+        show_free.stdout
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_transition_required_fields_are_structured_fresh_and_atomic() {
+    let _log = common::test_log("e2e_transition_required_fields_are_structured_fresh_and_atomic");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "required_fields_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let issue = run_br(
+        &workspace,
+        ["create", "Review candidate"],
+        "required_fields_create",
+    );
+    assert!(issue.status.success(), "create failed: {}", issue.stderr);
+    let id = parse_created_id(&issue.stdout);
+    let claim = run_br(
+        &workspace,
+        ["update", &id, "--status", "in_progress"],
+        "required_fields_claim",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    let old_comment = run_br(
+        &workspace,
+        [
+            "comments",
+            "add",
+            &id,
+            "--message",
+            "historical review note",
+        ],
+        "required_fields_old_comment",
+    );
+    assert!(
+        old_comment.status.success(),
+        "historical comment failed: {}",
+        old_comment.stderr
+    );
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r#"
+workflow:
+  required_fields:
+    "in_progress -> in_review":
+      - acceptance_criteria
+      - transition_comment
+"#,
+    )
+    .expect("write required-fields policy");
+
+    let missing_comment = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "in_review",
+            "--acceptance-criteria",
+            "- [x] Exercised",
+            "--json",
+        ],
+        "required_fields_missing_comment",
+    );
+    assert!(!missing_comment.status.success());
+    assert_eq!(missing_comment.status.code(), Some(4));
+    let json = parse_error_json(&missing_comment.stdout).expect("structured policy error");
+    assert!(verify_error_structure(&json));
+    assert_eq!(json["error"]["code"], "POLICY_VIOLATION");
+    assert_eq!(json["error"]["context"]["issue_id"], id);
+    let violations = json["error"]["context"]["violations"]
+        .as_array()
+        .expect("violations");
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0]["gate"], "transition_comment_missing");
+    assert_eq!(
+        violations[0]["detail"]["required_field"],
+        "transition_comment"
+    );
+
+    let unchecked = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "in_review",
+            "--acceptance-criteria",
+            "- [ ] Still pending",
+            "--transition-comment",
+            "fresh attempt",
+        ],
+        "required_fields_unchecked_human",
+    );
+    assert!(!unchecked.status.success());
+    assert!(unchecked.stderr.contains("acceptance criteria"));
+    assert!(unchecked.stderr.contains("unchecked"));
+
+    let storage = SqliteStorage::open(&workspace.root.join(".beads").join("beads.db"))
+        .expect("open storage after rejected transitions");
+    let unchanged = storage.get_issue(&id).unwrap().unwrap();
+    assert_eq!(unchanged.status.as_str(), "in_progress");
+    assert!(unchanged.acceptance_criteria.is_none());
+    assert_eq!(storage.get_comments(&id).unwrap().len(), 1);
+    drop(storage);
+
+    let accepted = run_br(
+        &workspace,
+        [
+            "update",
+            &id,
+            "--status",
+            "in_review",
+            "--acceptance-criteria",
+            "- [x] Exercised",
+            "--transition-comment",
+            "fresh attempt",
+        ],
+        "required_fields_accepted",
+    );
+    assert!(
+        accepted.status.success(),
+        "update failed: {}",
+        accepted.stderr
+    );
+    let storage = SqliteStorage::open(&workspace.root.join(".beads").join("beads.db"))
+        .expect("open storage after accepted transition");
+    let transitioned = storage.get_issue(&id).unwrap().unwrap();
+    assert_eq!(transitioned.status.as_str(), "in_review");
+    assert_eq!(
+        transitioned.acceptance_criteria.as_deref(),
+        Some("- [x] Exercised")
+    );
+    let comments = storage.get_comments(&id).unwrap();
+    assert_eq!(comments.len(), 2);
+    assert_eq!(comments[1].body, "fresh attempt");
+}
+
+#[test]
+fn e2e_workflow_capacity_rejection_is_structured_and_atomic() {
+    let _log = common::test_log("e2e_workflow_capacity_rejection_is_structured_and_atomic");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let active = run_br(
+        &workspace,
+        ["create", "Already active"],
+        "capacity_create_active",
+    );
+    assert!(active.status.success(), "create failed: {}", active.stderr);
+    let active_id = parse_created_id(&active.stdout);
+    let activate = run_br(
+        &workspace,
+        ["update", &active_id, "--status", "in_progress"],
+        "capacity_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "initial activation failed: {}",
+        activate.stderr
+    );
+
+    let candidate = run_br(
+        &workspace,
+        ["create", "Candidate"],
+        "capacity_create_candidate",
+    );
+    assert!(
+        candidate.status.success(),
+        "candidate create failed: {}",
+        candidate.stderr
+    );
+    let candidate_id = parse_created_id(&candidate.stdout);
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 1
+",
+    )
+    .expect("write capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        [
+            "update",
+            &candidate_id,
+            "--status",
+            "in_progress",
+            "--title",
+            "must not commit",
+            "--json",
+        ],
+        "capacity_reject",
+    );
+    assert!(!rejected.status.success(), "capacity update must fail");
+    assert_eq!(rejected.status.code(), Some(4));
+    // Global JSON errors use the same clean stdout channel as successful JSON
+    // output (#336); diagnostics remain isolated on stderr.
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    assert!(verify_error_structure(&json));
+    let error = &json["error"];
+    assert_eq!(error["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(error["retryable"], true);
+    assert_eq!(error["context"]["issue_id"], candidate_id);
+    assert_eq!(error["context"]["from_status"], "open");
+    assert_eq!(error["context"]["to_status"], "in_progress");
+    assert_eq!(error["context"]["capacity_kind"], "status");
+    assert_eq!(error["context"]["current"], 1);
+    assert_eq!(error["context"]["prospective"], 2);
+    assert_eq!(error["context"]["hard_limit"], 1);
+
+    let show = run_br(
+        &workspace,
+        ["show", &candidate_id, "--json"],
+        "capacity_show_unchanged",
+    );
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let shown: Value =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+    assert_eq!(shown[0]["status"], "open");
+    assert_eq!(shown[0]["title"], "Candidate");
+}
+
+#[test]
+fn e2e_workflow_capacity_batch_rejection_rolls_back_every_issue() {
+    let _log = common::test_log("e2e_workflow_capacity_batch_rejection_rolls_back_every_issue");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_batch_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let active_id = create_issue_with_description(
+        &workspace,
+        "Already active",
+        None,
+        None,
+        "capacity_batch_active",
+    );
+    let activate = run_br(
+        &workspace,
+        ["update", &active_id, "--status", "in_progress"],
+        "capacity_batch_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "activate failed: {}",
+        activate.stderr
+    );
+
+    let first_id = create_issue_with_description(
+        &workspace,
+        "First candidate",
+        None,
+        None,
+        "capacity_batch_first",
+    );
+    let second_id = create_issue_with_description(
+        &workspace,
+        "Second candidate",
+        None,
+        None,
+        "capacity_batch_second",
+    );
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        hard: 2
+",
+    )
+    .expect("write capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        [
+            "update",
+            &first_id,
+            &second_id,
+            "--status",
+            "in_progress",
+            "--title",
+            "must not commit",
+            "--json",
+        ],
+        "capacity_batch_reject",
+    );
+    assert!(!rejected.status.success(), "batch must fail");
+    assert_eq!(rejected.status.code(), Some(4));
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    assert_eq!(json["error"]["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(json["error"]["context"]["current"], 1);
+    assert_eq!(json["error"]["context"]["prospective"], 3);
+    assert_eq!(json["error"]["context"]["hard_limit"], 2);
+
+    for (id, expected_title, label) in [
+        (&first_id, "First candidate", "capacity_batch_show_first"),
+        (&second_id, "Second candidate", "capacity_batch_show_second"),
+    ] {
+        let show = run_br(&workspace, ["show", id, "--json"], label);
+        assert!(show.status.success(), "show failed: {}", show.stderr);
+        let shown: Value =
+            serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
+        assert_eq!(shown[0]["status"], "open");
+        assert_eq!(shown[0]["title"], expected_title);
+    }
+}
+
+#[test]
+fn e2e_workflow_capacity_soft_limit_emits_structured_batch_warning() {
+    let _log = common::test_log("e2e_workflow_capacity_soft_limit_emits_structured_batch_warning");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_soft_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let first_id = create_issue_with_description(
+        &workspace,
+        "First soft candidate",
+        None,
+        None,
+        "capacity_soft_first",
+    );
+    let second_id = create_issue_with_description(
+        &workspace,
+        "Second soft candidate",
+        None,
+        None,
+        "capacity_soft_second",
+    );
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    statuses:
+      in_progress:
+        soft: 2
+        hard: 3
+",
+    )
+    .expect("write capacity policy");
+
+    let updated = run_br(
+        &workspace,
+        [
+            "update",
+            &first_id,
+            &second_id,
+            "--status",
+            "in_progress",
+            "--json",
+        ],
+        "capacity_soft_update",
+    );
+    assert!(
+        updated.status.success(),
+        "update failed: {}",
+        updated.stderr
+    );
+    let payload: Value = serde_json::from_str(&extract_json_payload(&updated.stdout))
+        .expect("capacity warning json");
+    assert_eq!(payload["updated"].as_array().map(Vec::len), Some(2));
+    let warnings = payload["warnings"].as_array().expect("warnings array");
+    assert_eq!(warnings.len(), 1);
+    let warning = &warnings[0];
+    assert_eq!(warning["issue_id"], first_id);
+    assert_eq!(warning["from_status"], "open");
+    assert_eq!(warning["to_status"], "in_progress");
+    assert_eq!(warning["capacity_kind"], "status");
+    assert_eq!(warning["capacity_name"], "in_progress");
+    assert_eq!(warning["scope"], "repository");
+    assert_eq!(warning["counting_mode"], "all");
+    assert_eq!(warning["current"], 0);
+    assert_eq!(warning["prospective"], 2);
+    assert_eq!(warning["soft_limit"], 2);
+    assert_eq!(warning["hard_limit"], 3);
+    assert_eq!(
+        warning["policy_path"],
+        "workflow.capacity.statuses.in_progress"
+    );
+}
+
+#[test]
+fn e2e_workflow_capacity_create_preserves_legacy_shape_until_warning_exists() {
+    let _log = common::test_log(
+        "e2e_workflow_capacity_create_preserves_legacy_shape_until_warning_exists",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_create_shape_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, closed]
+  capacity:
+    statuses:
+      open:
+        soft: 2
+        hard: 3
+",
+    )
+    .expect("write capacity policy");
+
+    let first = run_br(
+        &workspace,
+        ["create", "Below soft limit", "--json"],
+        "capacity_create_below_soft",
+    );
+    assert!(
+        first.status.success(),
+        "first create failed: {}",
+        first.stderr
+    );
+    let first_payload: Value =
+        serde_json::from_str(&extract_json_payload(&first.stdout)).expect("first create json");
+    assert!(
+        first_payload["id"].is_string(),
+        "below the soft limit, create must retain its legacy direct-issue shape: {}",
+        first.stdout
+    );
+    assert!(first_payload.get("created").is_none());
+    assert!(first_payload.get("warnings").is_none());
+
+    let second = run_br(
+        &workspace,
+        ["create", "Reaches soft limit", "--json"],
+        "capacity_create_at_soft",
+    );
+    assert!(
+        second.status.success(),
+        "second create failed: {}",
+        second.stderr
+    );
+    let second_payload: Value =
+        serde_json::from_str(&extract_json_payload(&second.stdout)).expect("second create json");
+    assert!(second_payload["created"]["id"].is_string());
+    let warnings = second_payload["warnings"]
+        .as_array()
+        .expect("create warnings array");
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["from_status"], Value::Null);
+    assert_eq!(warnings[0]["to_status"], "open");
+    assert_eq!(warnings[0]["current"], 1);
+    assert_eq!(warnings[0]["prospective"], 2);
+    assert_eq!(warnings[0]["soft_limit"], 2);
+    assert!(
+        !second
+            .stderr
+            .contains("has reached or exceeded its soft limit"),
+        "JSON mode must carry capacity evidence structurally rather than duplicate a human warning on stderr: {}",
+        second.stderr
+    );
+}
+
+#[test]
+fn e2e_workflow_capacity_leaf_work_excludes_aggregate_parents_and_reports_rollup() {
+    // GitHub #384 phase 3, end to end: an epic -> parent -> child chain
+    // occupies one leaf_work slot, not three, and `br show` reports the
+    // parent's derived rollup without mutating its explicit status.
+    let _log = common::test_log(
+        "e2e_workflow_capacity_leaf_work_excludes_aggregate_parents_and_reports_rollup",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_leaf_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic_id =
+        create_issue_with_description(&workspace, "Epic", Some("epic"), None, "capacity_leaf_epic");
+    let parent_id =
+        create_issue_with_description(&workspace, "Parent", None, None, "capacity_leaf_parent");
+    let child_id =
+        create_issue_with_description(&workspace, "Child", None, None, "capacity_leaf_child");
+    let fresh_id =
+        create_issue_with_description(&workspace, "Fresh", None, None, "capacity_leaf_fresh");
+
+    for (child, parent, label) in [
+        (&parent_id, &epic_id, "capacity_leaf_dep_parent"),
+        (&child_id, &parent_id, "capacity_leaf_dep_child"),
+    ] {
+        let dep = run_br(
+            &workspace,
+            ["dep", "add", child, parent, "--type", "parent-child"],
+            label,
+        );
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    }
+
+    // Activate the whole chain before the policy exists so the pre-existing
+    // state is what hierarchy counting has to interpret.
+    let activate = run_br(
+        &workspace,
+        [
+            "update",
+            &epic_id,
+            &parent_id,
+            &child_id,
+            "--status",
+            "in_progress",
+        ],
+        "capacity_leaf_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "activate failed: {}",
+        activate.stderr
+    );
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    counting:
+      hierarchy: leaf_work
+    statuses:
+      in_progress:
+        hard: 1
+",
+    )
+    .expect("write hierarchy capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        ["update", &fresh_id, "--status", "in_progress", "--json"],
+        "capacity_leaf_reject",
+    );
+    assert!(
+        !rejected.status.success(),
+        "admitting a fourth active issue must fail"
+    );
+    assert_eq!(rejected.status.code(), Some(4));
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    let error = &json["error"];
+    assert_eq!(error["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(error["context"]["counting_mode"], "leaf_work");
+    // Three issues are in_progress, but the epic and the parent are
+    // aggregates: only the leaf counts.
+    assert_eq!(error["context"]["current"], 1);
+    assert_eq!(error["context"]["prospective"], 2);
+    assert_eq!(error["context"]["aggregate_parents_excluded"], 2);
+
+    // The rejected transition left no trace.
+    let show_fresh = run_br(
+        &workspace,
+        ["show", &fresh_id, "--json"],
+        "capacity_leaf_show_fresh",
+    );
+    let fresh: Value =
+        serde_json::from_str(&extract_json_payload(&show_fresh.stdout)).expect("show fresh json");
+    assert_eq!(fresh[0]["status"], "open");
+
+    // The parent keeps its own status and gains a derived rollup.
+    let show_parent = run_br(
+        &workspace,
+        ["show", &parent_id, "--json"],
+        "capacity_leaf_show_parent",
+    );
+    let parent: Value =
+        serde_json::from_str(&extract_json_payload(&show_parent.stdout)).expect("show parent json");
+    assert_eq!(parent[0]["status"], "in_progress");
+    assert_eq!(parent[0]["rollup"]["status"], "in_progress");
+    assert_eq!(parent[0]["rollup"]["descendants"]["in_progress"], 1);
+
+    // A childless leaf has no rollup key at all.
+    let show_child = run_br(
+        &workspace,
+        ["show", &child_id, "--json"],
+        "capacity_leaf_show_child",
+    );
+    let child: Value =
+        serde_json::from_str(&extract_json_payload(&show_child.stdout)).expect("show child json");
+    assert!(child[0].get("rollup").is_none());
 }
 
 #[test]
@@ -1987,7 +2737,7 @@ fn e2e_structured_error_issue_not_found() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(3), "exit code should be 3");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2026,7 +2776,7 @@ fn e2e_structured_error_cycle_detected() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(5), "exit code should be 5");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2055,7 +2805,7 @@ fn e2e_structured_error_self_dependency() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(5), "exit code should be 5");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2114,7 +2864,7 @@ fn e2e_structured_error_ambiguous_id() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(3), "exit code should be 3");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2150,7 +2900,7 @@ fn e2e_structured_error_jsonl_parse() {
     );
 
     // The error output should be valid JSON
-    let json = parse_error_json(&result.stderr);
+    let json = parse_error_json(&result.stdout);
     if let Some(json) = json {
         assert!(verify_error_structure(&json), "missing required fields");
     }
@@ -2183,7 +2933,7 @@ fn e2e_structured_error_conflict_markers() {
 
     // Should detect conflict markers
     assert!(
-        result.stderr.contains("conflict") || result.stderr.contains("CONFLICT"),
+        result.stdout.contains("conflict") || result.stdout.contains("CONFLICT"),
         "should detect conflict markers"
     );
 }
@@ -2252,9 +3002,9 @@ fn e2e_sync_flush_refuses_to_overwrite_conflict_markers() {
         "conflict-marker flush refusal should be a sync/config error, got {exit_code}"
     );
     assert!(
-        refused_flush.stderr.contains("conflict") || refused_flush.stderr.contains("CONFLICT"),
+        refused_flush.stdout.contains("conflict") || refused_flush.stdout.contains("CONFLICT"),
         "flush error should explain the unresolved conflict markers: {}",
-        refused_flush.stderr
+        refused_flush.stdout
     );
 
     let after_refusal = fs::read_to_string(&issues_path).expect("read refused jsonl");
@@ -2314,7 +3064,7 @@ fn e2e_structured_error_invalid_priority() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2381,7 +3131,7 @@ fn e2e_error_text_vs_json_parity() {
     );
 
     // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
+    let json = parse_error_json(&json_result.stdout).expect("JSON mode should produce valid JSON");
     assert!(
         verify_error_structure(&json),
         "JSON error should have required fields"
@@ -2483,7 +3233,7 @@ fn e2e_structured_error_label_validation() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2518,7 +3268,7 @@ fn e2e_structured_error_label_too_long() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2551,7 +3301,7 @@ fn e2e_structured_error_dependency_target_not_found() {
         "exit code should be 3 (issue not found)"
     );
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -3176,7 +3926,7 @@ fn e2e_error_text_json_parity_validation() {
     );
 
     // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
+    let json = parse_error_json(&json_result.stdout).expect("JSON mode should produce valid JSON");
     assert!(
         verify_error_structure(&json),
         "JSON error should have required fields"
@@ -3235,5 +3985,69 @@ fn e2e_sync_merge_detects_conflict_markers_in_base_snapshot() {
         !lower.contains("invalid json in base snapshot"),
         "merge error should surface the conflict-markers diagnostic rather than the generic JSON parse failure, got stderr: {}",
         merge.stderr
+    );
+}
+
+/// #336: In `--json` mode, the structured error envelope must go to STDOUT
+/// (where success JSON already goes) so robot callers read ONE clean,
+/// parseable stream. Tracing/log lines belong on stderr and must not be
+/// interleaved into the stdout JSON. Human mode keeps errors on stderr.
+#[test]
+fn e2e_json_failure_emits_parseable_json_on_stdout() {
+    let _log = common::test_log("e2e_json_failure_emits_parseable_json_on_stdout");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // A failing command in --json mode: showing a non-existent issue.
+    let show = run_br(
+        &workspace,
+        ["show", "bd-doesnotexist", "--json"],
+        "show_missing_json",
+    );
+    assert!(
+        !show.status.success(),
+        "showing a missing issue should fail: stdout={} stderr={}",
+        show.stdout,
+        show.stderr
+    );
+
+    // The structured error envelope must be on STDOUT and fully parseable.
+    assert!(
+        !show.stdout.trim().is_empty(),
+        "json-mode error must be emitted on stdout, got empty stdout (stderr={})",
+        show.stderr
+    );
+    let payload = extract_json_payload(&show.stdout);
+    let value: Value = serde_json::from_str(&payload).unwrap_or_else(|e| {
+        panic!(
+            "json-mode error stdout must be parseable JSON: {e}\nstdout={}\nstderr={}",
+            show.stdout, show.stderr
+        )
+    });
+    // Sanity-check the structured envelope shape.
+    assert!(
+        value.get("error").is_some()
+            || value.get("code").is_some()
+            || value.get("message").is_some(),
+        "json error envelope should carry an error/code/message field, got: {value}"
+    );
+
+    // The HUMAN-mode counterpart keeps the error on stderr (stdout stays clean).
+    let human = run_br(
+        &workspace,
+        ["show", "bd-doesnotexist"],
+        "show_missing_human",
+    );
+    assert!(!human.status.success());
+    assert!(
+        serde_json::from_str::<Value>(human.stdout.trim()).is_err(),
+        "human mode must not emit JSON on stdout, got: {}",
+        human.stdout
+    );
+    assert!(
+        !human.stderr.trim().is_empty(),
+        "human-mode error should be on stderr"
     );
 }

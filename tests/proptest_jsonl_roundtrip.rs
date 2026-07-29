@@ -113,6 +113,8 @@ fn make_issue(
         external_ref,
         source_system,
         source_repo: Some(".".to_string()),
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -297,12 +299,12 @@ fn jsonl_import_normalizes_mixed_case_known_status_and_issue_type() {
 }
 
 #[test]
-fn jsonl_import_preserves_custom_status_and_issue_type_case() {
+fn jsonl_import_normalizes_custom_status_and_issue_type_case() {
     assert_mixed_case_known_value_round_trip(
         "QaReview",
         "Odd_Type",
-        &Status::Custom("QaReview".to_string()),
-        &IssueType::Custom("Odd_Type".to_string()),
+        &Status::Custom("qareview".to_string()),
+        &IssueType::Custom("odd_type".to_string()),
         "customcase",
     );
 }

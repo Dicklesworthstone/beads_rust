@@ -13,6 +13,7 @@ fn test_backup_stem_collision() {
         enabled: true,
         max_count: 5,
         max_age_days: 30,
+        min_interval_secs: 0,
     };
 
     // 1. Create "issues_archive.jsonl" and back it up
@@ -71,6 +72,7 @@ fn test_backup_stem_collision() {
         enabled: true,
         max_count: 1, // Only keep 1 backup
         max_age_days: 30,
+        min_interval_secs: 0,
     };
 
     // Clean up

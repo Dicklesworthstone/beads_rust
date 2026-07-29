@@ -1107,7 +1107,7 @@ mod tests {
         let current = temp.path().join("current.jsonl");
         let backup = temp.path().join("backup.jsonl");
         fs::write(&current, [0xff, b'{', b'}']).unwrap();
-        fs::write(&backup, [b'{', b'}']).unwrap();
+        fs::write(&backup, b"{}").unwrap();
 
         let (status, diff_available, sizes) = diff_status_for_json(&current, &backup).unwrap();
 
@@ -1169,6 +1169,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
 
@@ -1211,6 +1212,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &external_target).unwrap();
 
@@ -1248,6 +1250,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &external_target).unwrap();
 
@@ -1339,6 +1342,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &nested_target).unwrap();
 
@@ -1378,6 +1382,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
         fs::write(&target_path, "current-state\n").unwrap();
@@ -1421,6 +1426,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
 
@@ -1557,6 +1563,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         history::backup_before_export(&beads_dir, &config, &target_path).unwrap();
         let backup_name = history::list_backups(&history_dir, None)

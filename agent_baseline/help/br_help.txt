@@ -3,46 +3,52 @@ Agent-first issue tracker (SQLite + JSONL)
 Usage: br [OPTIONS] <COMMAND>
 
 Commands:
-  agents       Manage AGENTS.md workflow instructions
-  audit        Record and label agent interactions (append-only JSONL)
-  blocked      List blocked issues
-  changelog    Generate changelog from closed issues
-  close        Close an issue
-  comments     Manage comments
-  completions  Generate shell completions
-  config       Configuration management
-  count        Count issues with optional grouping
-  create       Create a new issue
-  defer        Defer issues (schedule for later)
-  delete       Delete an issue (creates tombstone)
-  dep          Manage dependencies
-  doctor       Run diagnostics and optionally repair issues
-  epic         Epic management commands
-  graph        Visualize dependency graph
-  history      Manage local history backups
-  info         Show diagnostic metadata about the workspace
-  init         Initialize a beads workspace
-  label        Manage labels
-  lint         Check issues for missing template sections
-  list         List issues
-  orphans      List orphan issues (referenced in commits but open)
-  q            Quick capture (create issue, print ID only)
-  query        Manage saved queries
-  ready        List ready issues (open, unblocked, not deferred)
-  reopen       Reopen an issue
-  schema       Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
-  search       Search issues
-  show         Show issue details
-  stale        List stale issues
-  stats        Show project statistics
-  status       Alias for stats
-  sync         Sync database with JSONL file (export or import)
-  undefer      Undefer issues (make ready again)
-  update       Update an issue
-  upgrade      Upgrade br to the latest version
-  version      Show version information
-  where        Show the active .beads directory
-  help         Print this message or the help of the given subcommand(s)
+  agents        Manage AGENTS.md workflow instructions
+  audit         Record and label agent interactions (append-only JSONL)
+  blocked       List blocked issues
+  capabilities  Describe br's machine-readable contracts and safety guarantees
+  capacity      Workflow capacity management: audited issue-specific exemptions (GitHub #384)
+  changelog     Generate changelog from closed issues
+  close         Close an issue
+  comments      Manage comments
+  completions   Generate shell completions
+  config        Configuration management
+  coordination  Diagnose swarm coordination state without mutating claims
+  count         Count issues with optional grouping
+  create        Create a new issue
+  defer         Defer issues (schedule for later)
+  delete        Delete an issue (creates tombstone)
+  dep           Manage dependencies
+  doctor        Run diagnostics and optionally repair issues
+  epic          Epic management commands
+  gate          Workflow gate engine: record and inspect gate results (issue #312)
+  graph         Visualize the dependents graph: what an issue unblocks
+  history       Manage local history backups
+  info          Show diagnostic metadata about the workspace
+  init          Initialize a beads workspace
+  label         Manage labels
+  lint          Check issues for missing template sections
+  list          List issues
+  orphans       List orphan issues (referenced in commits but open)
+  q             Quick capture (create issue, print ID only)
+  query         Manage saved queries
+  ready         List ready issues (open, unblocked, not deferred)
+  reopen        Reopen an issue
+  robot-docs    Print concise in-tool docs for automation agents
+  scheduler     Rank ready work for agent swarms with explainable evidence
+  schema        Emit JSON Schemas and per-command output envelope shapes (for agent/tooling integration)
+  search        Search issues
+  show          Show issue details
+  stale         List stale issues
+  stats         Show project statistics
+  status        Alias for stats
+  sync          Sync database with JSONL file (export or import)
+  undefer       Undefer issues (make ready again)
+  update        Update an issue
+  upgrade       Upgrade br to the latest version
+  version       Show version information
+  where         Show the active .beads directory
+  help          Print this message or the help of the given subcommand(s)
 
 Options:
       --db <DB>                      Database path (auto-discover .beads/*.db if not set)

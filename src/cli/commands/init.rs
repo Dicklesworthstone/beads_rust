@@ -201,8 +201,11 @@ pub fn execute(
 *.db-journal
 *.db-shm
 *.db-wal
+# fsqlite multi-process namespace sidecars (-fsqlite-ns-gate / -fsqlite-ns-use)
+*.db-fsqlite-*
 
 # Lock files
+.write.lock
 *.lock
 
 # Temporary
@@ -651,6 +654,10 @@ mod tests {
         assert!(content.contains("*.db-journal"));
         assert!(content.contains("*.db-wal"));
         assert!(content.contains("*.db-shm"));
+        assert!(
+            content.lines().any(|line| line.trim() == ".write.lock"),
+            "init must emit the canonical write-lock rule expected by doctor: {content}"
+        );
         assert!(content.contains("*.lock"));
         info!("test_gitignore_excludes_db_files: assertions passed");
     }

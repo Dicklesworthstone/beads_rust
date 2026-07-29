@@ -106,21 +106,31 @@ capture_fixture() {
     local description="$2"
     shift 2
     local output_file="$FIXTURE_DIR/${name}.json"
+    local exit_status=0
 
     log "Capturing: $name - $description"
     if "$BR" "$@" > "$output_file" 2>/dev/null; then
-        if jq -e '.' "$output_file" > /dev/null 2>&1; then
-            log "  ✓ Valid JSON captured: $output_file"
-            return 0
-        else
-            log "  ⚠ Output is not valid JSON, keeping for reference"
-            return 0
-        fi
+        exit_status=0
     else
-        log "  ✗ Command failed: br $*"
-        echo "null" > "$output_file"
+        exit_status=$?
+    fi
+
+    if jq -e '.' "$output_file" > /dev/null 2>&1; then
+        if [[ $exit_status -eq 0 ]]; then
+            log "  ✓ Valid JSON captured: $output_file"
+        else
+            log "  ✓ Valid JSON captured despite exit $exit_status: $output_file"
+        fi
         return 0
     fi
+
+    if [[ $exit_status -eq 0 ]]; then
+        log "  ⚠ Output is not valid JSON, keeping for reference"
+    else
+        log "  ✗ Command failed without valid JSON: br $*"
+        echo "null" > "$output_file"
+    fi
+    return 0
 }
 
 # List commands
@@ -169,10 +179,10 @@ INVALID=0
 for f in "$FIXTURE_DIR"/*.json; do
     if jq -e '.' "$f" > /dev/null 2>&1; then
         log "✓ $(basename "$f")"
-        ((VALID++))
+        ((++VALID))
     else
         log "✗ INVALID: $(basename "$f")"
-        ((INVALID++))
+        ((++INVALID))
     fi
 done
 

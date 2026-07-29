@@ -7,6 +7,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::sync::path::validate_sync_path_with_external;
+use crate::sync::{JsonlSourceSnapshot, capture_optional_jsonl_source};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,15 @@ pub struct HistoryConfig {
     pub enabled: bool,
     pub max_count: usize,
     pub max_age_days: u32,
+    /// Minimum interval, in seconds, between successive `.br_history` snapshots
+    /// of the same target. Under bursty mutation, every `br` edit auto-flushes
+    /// the JSONL and previously copied the whole file into a fresh timestamped
+    /// backup each time — O(repo-size) write amplification per edit (#313).
+    /// When the most recent backup is younger than this floor, the snapshot is
+    /// skipped (the export itself still proceeds), collapsing edit bursts into
+    /// at most one snapshot per interval while preserving recent-history
+    /// granularity. `0` disables the throttle (snapshot on every export).
+    pub min_interval_secs: u64,
 }
 
 impl Default for HistoryConfig {
@@ -30,6 +40,7 @@ impl Default for HistoryConfig {
             enabled: true,
             max_count: 100,
             max_age_days: 30,
+            min_interval_secs: 5,
         }
     }
 }
@@ -473,12 +484,22 @@ pub fn backup_before_export(
     if !config.enabled {
         return Ok(());
     }
+    let Some(source) = capture_optional_jsonl_source(target_path)? else {
+        return Ok(());
+    };
+    backup_before_export_snapshot(beads_dir, config, target_path, &source)
+}
 
-    let history_dir = beads_dir.join(".br_history");
-
-    if history_artifact_metadata(target_path, "backup source")?.is_none() {
+pub(crate) fn backup_before_export_snapshot(
+    beads_dir: &Path,
+    config: &HistoryConfig,
+    target_path: &Path,
+    source: &JsonlSourceSnapshot,
+) -> Result<()> {
+    if !config.enabled {
         return Ok(());
     }
+    let history_dir = beads_dir.join(".br_history");
 
     ensure_history_dir_path(&history_dir)?;
 
@@ -489,25 +510,50 @@ pub fn backup_before_export(
         .unwrap_or("issues");
     let target_key = target_key_for_path(beads_dir, target_path);
 
-    // Check if the content is identical to the most recent backup (deduplication)
+    // Skip a new snapshot when the most recent backup is either identical
+    // content (dedup) or younger than the configured throttle floor (#313).
     // We match by full target identity so similarly named exports do not
     // collapse each other's history.
-    if let Some(latest) = get_latest_backup(&history_dir, &target_key)?
-        && files_are_identical(target_path, &latest.path)?
-    {
-        tracing::debug!(
-            "Skipping backup: identical to latest {}",
-            latest.path.display()
-        );
-        return Ok(());
+    if let Some(latest) = get_latest_backup(&history_dir, &target_key)? {
+        if snapshot_and_file_are_identical(source, &latest.path)? {
+            tracing::debug!(
+                "Skipping backup: identical to latest {}",
+                latest.path.display()
+            );
+            return Ok(());
+        }
+
+        // Time-throttle: under bursty mutation every `br` edit auto-flushes the
+        // JSONL, and copying the whole file into a fresh backup each time is
+        // O(repo-size) write amplification. If the latest snapshot is younger
+        // than `min_interval_secs`, skip this one — the export still proceeds,
+        // so the file is current; we just don't keep a near-duplicate snapshot
+        // per edit. A future (older-than-floor) edit takes the next snapshot.
+        if config.min_interval_secs > 0 {
+            // Compare in whole seconds: building a chrono `Duration` from a
+            // possibly-huge `min_interval_secs` could overflow/panic. `age_secs
+            // >= 0` guards against a future-dated latest backup (clock skew): we
+            // never skip based on a backup that appears newer than "now".
+            let age_secs = Utc::now()
+                .signed_duration_since(latest.timestamp)
+                .num_seconds();
+            // `try_from` fails for a negative age (future-dated latest / clock
+            // skew), so we never throttle on a backup that appears newer than now.
+            if u64::try_from(age_secs).is_ok_and(|age| age < config.min_interval_secs) {
+                tracing::debug!(
+                    "Skipping backup: throttled ({age_secs}s since latest < {}s floor)",
+                    config.min_interval_secs
+                );
+                return Ok(());
+            }
+        }
     }
 
     // Create a timestamped backup file with collision resistance and no
     // overwrite race so pre-existing symlinks or files are never clobbered.
     let (backup_path, mut backup_file) = create_backup_file(&history_dir, file_stem)?;
     let mut backup_guard = BackupFileGuard::new(backup_path.clone());
-    let mut source = File::open(target_path).map_err(BeadsError::Io)?;
-    io::copy(&mut source, &mut backup_file).map_err(BeadsError::Io)?;
+    io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
     backup_file.sync_all().map_err(BeadsError::Io)?;
     crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
     write_backup_metadata(beads_dir, target_path, &backup_path)?;
@@ -641,38 +687,32 @@ fn get_latest_backup(history_dir: &Path, target_key: &str) -> Result<Option<Back
         .find(|entry| entry.target_key == target_key))
 }
 
-/// Compare two files by content hash.
-fn files_are_identical(p1: &Path, p2: &Path) -> Result<bool> {
-    let f1 = File::open(p1).map_err(BeadsError::Io)?;
-    let f2 = File::open(p2).map_err(BeadsError::Io)?;
-
-    let len1 = f1.metadata().map_err(BeadsError::Io)?.len();
-    let len2 = f2.metadata().map_err(BeadsError::Io)?.len();
-
-    if len1 != len2 {
+fn snapshot_and_file_are_identical(source: &JsonlSourceSnapshot, path: &Path) -> Result<bool> {
+    let file = File::open(path).map_err(BeadsError::Io)?;
+    if source.size() != file.metadata().map_err(BeadsError::Io)?.len() {
         return Ok(false);
     }
 
-    let mut reader1 = BufReader::new(f1);
-    let mut reader2 = BufReader::new(f2);
+    readers_are_identical(source.reader(), BufReader::new(file))
+}
 
+fn readers_are_identical(mut reader1: impl Read, mut reader2: impl Read) -> Result<bool> {
     let mut buf1 = [0u8; 8192];
     let mut buf2 = [0u8; 8192];
 
     loop {
         let n1 = reader1.read(&mut buf1).map_err(BeadsError::Io)?;
         if n1 == 0 {
-            break;
+            return Ok(reader2.read(&mut buf2[..1]).map_err(BeadsError::Io)? == 0);
         }
 
-        // Fill buffer 2 to match n1
         let mut n2_total = 0;
         while n2_total < n1 {
             let n2 = reader2
                 .read(&mut buf2[n2_total..n1])
                 .map_err(BeadsError::Io)?;
             if n2 == 0 {
-                return Ok(false); // Unexpected EOF
+                return Ok(false);
             }
             n2_total += n2;
         }
@@ -681,8 +721,6 @@ fn files_are_identical(p1: &Path, p2: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
-
-    Ok(true)
 }
 
 /// Prune old backups based on count and age.
@@ -753,6 +791,7 @@ mod tests {
             enabled: true,
             max_count: 2,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
 
         // Manually create 3 backup files with distinct timestamps
@@ -804,6 +843,49 @@ mod tests {
     }
 
     #[test]
+    fn test_backup_before_export_throttles_within_interval() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let history_dir = beads_dir.join(".br_history");
+        let target = beads_dir.join("issues.jsonl");
+
+        // Large floor so the second (immediate) snapshot is always throttled.
+        let config = HistoryConfig {
+            enabled: true,
+            max_count: 100,
+            max_age_days: 30,
+            min_interval_secs: 3600,
+        };
+
+        fs::write(&target, "v1\n").unwrap();
+        backup_before_export(&beads_dir, &config, &target).unwrap();
+        // Changed content, so the identical-content dedup does NOT fire — only
+        // the time-throttle can skip this second snapshot (#313).
+        fs::write(&target, "v2-different\n").unwrap();
+        backup_before_export(&beads_dir, &config, &target).unwrap();
+
+        let backups = list_backups(&history_dir, Some("issues.")).unwrap();
+        assert_eq!(
+            backups.len(),
+            1,
+            "a changed file within the throttle floor must not create a second snapshot (#313)"
+        );
+
+        // With the throttle disabled, the same changed-content export does snapshot.
+        let unthrottled = HistoryConfig {
+            min_interval_secs: 0,
+            ..config.clone()
+        };
+        backup_before_export(&beads_dir, &unthrottled, &target).unwrap();
+        let backups = list_backups(&history_dir, Some("issues.")).unwrap();
+        assert!(
+            backups.len() >= 2,
+            "with the throttle disabled a changed file snapshots again"
+        );
+    }
+
+    #[test]
     fn test_backup_before_export_keeps_same_stem_targets_separate() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
@@ -816,6 +898,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
 
         let internal_target = beads_dir.join("issues.jsonl");
@@ -872,7 +955,7 @@ mod tests {
             return;
         };
         assert!(
-            message.contains("backup source") && message.contains("must not be a symlink"),
+            message.contains("must not be a symlink"),
             "unexpected message: {message}"
         );
         assert!(
@@ -901,7 +984,7 @@ mod tests {
             return;
         };
         assert!(
-            message.contains("backup source") && message.contains("must not be a symlink"),
+            message.contains("must not be a symlink"),
             "unexpected message: {message}"
         );
         assert!(
@@ -929,7 +1012,7 @@ mod tests {
             return;
         };
         assert!(
-            message.contains("backup source") && message.contains("must be a regular file"),
+            message.contains("must be a regular file") || message.contains("is not a regular file"),
             "unexpected message: {message}"
         );
         assert!(
@@ -949,6 +1032,7 @@ mod tests {
             enabled: true,
             max_count: 10,
             max_age_days: 30,
+            min_interval_secs: 0,
         };
         let target = beads_dir.join("issues.jsonl");
         fs::write(&target, "issue\n").unwrap();
@@ -1049,7 +1133,13 @@ mod tests {
         fs::create_dir_all(&beads_dir).unwrap();
 
         let target = beads_dir.join("issues.jsonl");
-        let config = HistoryConfig::default();
+        // Disable the snapshot throttle: this test exercises filename
+        // collision-resistance for two same-second backups, which requires
+        // both snapshots to actually be written (#313).
+        let config = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
 
         File::create(&target)
             .unwrap()

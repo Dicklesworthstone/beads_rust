@@ -45,6 +45,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## CI/Release Workflow Supply-Chain Policy
+
+For any `.github/workflows/` edit, use
+[`docs/CI_SUPPLY_CHAIN.md`](docs/CI_SUPPLY_CHAIN.md) as the canonical policy.
+It defines the immutable external GitHub Action pin inventory, upstream update
+audit, workflow-fragment harnesses, branch-trigger expectations, and proof
+commands for workflow changes.
+
+Important boundaries:
+
+- `br` never performs workflow git operations, releases, pull requests, network
+  dispatches, or upstream lookups automatically.
+- Agents run workflow proof Cargo targets directly through RCH; local shell
+  verifier scripts are operator shortcuts and may call Cargo internally.
+- Whole-crate `cargo check --all-targets` and
+  `cargo clippy --all-targets -- -D warnings` are required when Rust code
+  changes, and must be offloaded through RCH in agent sessions.
+- Run `git diff --check`, `actionlint` when available, the relevant workflow
+  harnesses, and `ubs` on changed workflow-related files before committing.
+
+---
+
 ## Toolchain: Rust & Cargo
 
 We only use **Cargo** in this project, NEVER any other package manager.
@@ -439,7 +461,7 @@ use MCP tools/resources/prompts instead of shelling out. It is optional and only
 exists in binaries built with the `mcp` feature:
 
 ```bash
-MCP_TARGET="${TMPDIR:-/tmp}/rch_target_beads_rust_${AGENT_NAME:-agent}"
+MCP_TARGET="${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}/rch_target_beads_rust_${AGENT_NAME:-agent}"
 rch exec -- env CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
 RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
 ```
@@ -469,6 +491,24 @@ replacement for file reservations.
 Beads provides a lightweight, dependency-aware issue database and CLI (`br` - beads_rust) for selecting "ready work," setting priorities, and tracking status. It complements MCP Agent Mail's messaging and file reservations.
 
 **Important:** `br` is non-invasive—it NEVER runs git commands automatically. You must manually commit changes after `br sync --flush-only`.
+
+### Bead-graph hygiene policy (added 2026-05-09 by `beads_rust-30ci`)
+
+**Don't close beads with `Forced close due to cycle` or similar hedge text in the `close_reason`.** If a dependency cycle is in the way, resolve it first via:
+
+- `br dep remove <issue> <depends-on>` — drop a single edge.
+- `br update <issue> --parent ''` — clear a parent-child edge.
+- Refactor the bead graph itself (split / merge / restructure).
+
+Closing a bead under an unresolved cycle hides architectural debt and produces an audit-suspect close trail.
+
+The doctor check `audit.suspect_close_reasons` (sibling bead `beads_rust-m3mi`) flags this pattern. The only legitimate close-under-cycle is when accompanied by the `audit-historical-cycle-close-<YYYY>-<MM>-<DD>` label, applied via:
+
+```bash
+br update <id> --add-label audit-historical-cycle-close-<DATE>
+```
+
+The label tells the doctor check + future audits that the closure has been triaged. Past triage decisions live in `docs/audit_forced_cycle_close_<DATE>.md`.
 
 ### Conventions
 

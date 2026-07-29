@@ -8,6 +8,7 @@
 
 use chrono::Utc;
 use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tracing::info;
@@ -50,6 +51,8 @@ fn make_issue(title: &str, description: Option<&str>) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -99,40 +102,52 @@ fn optional_text_strategy() -> impl Strategy<Value = Option<String>> {
     proptest::option::of("\\PC{0,80}")
 }
 
-fn go_bd_reference_content_hash(issue: &Issue) -> String {
+fn configured_proptest_cases(default_cases: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|cases| *cases > 0)
+        .unwrap_or(default_cases)
+}
+
+fn length_prefixed_reference_content_hash(issue: &Issue) -> String {
     let mut hasher = Sha256::new();
-    push_go_field(&mut hasher, &issue.title);
-    push_go_field(&mut hasher, issue.description.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, issue.design.as_deref().unwrap_or(""));
-    push_go_field(
+    push_length_prefixed_field(&mut hasher, &issue.title);
+    push_length_prefixed_field(&mut hasher, issue.description.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, issue.design.as_deref().unwrap_or(""));
+    push_length_prefixed_field(
         &mut hasher,
         issue.acceptance_criteria.as_deref().unwrap_or(""),
     );
-    push_go_field(&mut hasher, issue.notes.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, issue.status.as_str());
-    push_go_field(&mut hasher, &issue.priority.0.to_string());
-    push_go_field(&mut hasher, issue.issue_type.as_str());
-    push_go_field(&mut hasher, issue.assignee.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, issue.owner.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, issue.created_by.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, issue.external_ref.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, issue.source_system.as_deref().unwrap_or(""));
-    push_go_field(&mut hasher, if issue.pinned { "pinned" } else { "" });
-    push_go_field(&mut hasher, if issue.is_template { "template" } else { "" });
-    push_go_field(&mut hasher, ""); // quality_score nil
-    push_go_field(&mut hasher, ""); // crystallizes false
-    push_go_field(&mut hasher, ""); // await_type
-    push_go_field(&mut hasher, ""); // await_id
-    push_go_field(&mut hasher, "0"); // timeout duration
+    push_length_prefixed_field(&mut hasher, issue.notes.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, issue.status.as_str());
+    push_length_prefixed_field(&mut hasher, &issue.priority.0.to_string());
+    push_length_prefixed_field(&mut hasher, issue.issue_type.as_str());
+    push_length_prefixed_field(&mut hasher, issue.assignee.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, issue.owner.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, issue.created_by.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, issue.external_ref.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, issue.source_system.as_deref().unwrap_or(""));
+    push_length_prefixed_field(&mut hasher, if issue.pinned { "pinned" } else { "" });
+    push_length_prefixed_field(&mut hasher, if issue.is_template { "template" } else { "" });
+    push_length_prefixed_field(&mut hasher, ""); // quality_score nil
+    push_length_prefixed_field(&mut hasher, ""); // crystallizes false
+    push_length_prefixed_field(&mut hasher, ""); // await_type
+    push_length_prefixed_field(&mut hasher, ""); // await_id
+    push_length_prefixed_field(&mut hasher, "0"); // timeout duration
     for _ in 0..12 {
-        push_go_field(&mut hasher, "");
+        push_length_prefixed_field(&mut hasher, "");
     }
     beads_rust::util::hex_encode(&hasher.finalize())
 }
 
-fn push_go_field(hasher: &mut Sha256, value: &str) {
-    hasher.update(value.as_bytes());
-    hasher.update(b"\x00");
+fn push_length_prefixed_field(hasher: &mut Sha256, value: &str) {
+    let bytes = value.as_bytes();
+    let raw_len = bytes.len().to_le_bytes();
+    let mut encoded = [0_u8; 8];
+    encoded[..raw_len.len()].copy_from_slice(&raw_len);
+    hasher.update(encoded);
+    hasher.update(bytes);
 }
 
 proptest! {
@@ -310,9 +325,9 @@ proptest! {
         prop_assert_eq!(hash1, hash2, "Timestamp changes should not affect hash");
     }
 
-    /// Property: Rust content_hash stays byte-compatible with Go bd for all shared fields.
+    /// Property: Rust content_hash matches the independent length-prefixed reference writer.
     #[test]
-    fn hash_matches_go_bd_reference_for_shared_fields(
+    fn hash_matches_length_prefixed_reference_for_shared_fields(
         title in "\\PC{1,80}",
         description in optional_text_strategy(),
         design in optional_text_strategy(),
@@ -348,10 +363,86 @@ proptest! {
 
         prop_assert_eq!(
             content_hash(&issue),
-            go_bd_reference_content_hash(&issue),
-            "Rust hash must match Go bd canonical field writer"
+            length_prefixed_reference_content_hash(&issue),
+            "Rust hash must match the length-prefixed canonical field writer"
         );
     }
+}
+
+#[test]
+fn hash_distinguishes_structural_pairs_with_embedded_nuls() {
+    init_test_logging();
+    let cases = configured_proptest_cases(10_000);
+    info!(
+        "proptest_hash_structural_nul_pairs: cases={cases}, shape=(title=a, desc=b\\0c) vs (title=a\\0b, desc=c)"
+    );
+
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases,
+        ..Default::default()
+    });
+    let strategy = (
+        "[a-zA-Z0-9 _-]{0,24}",
+        "[a-zA-Z0-9 _-]{0,24}",
+        "[a-zA-Z0-9 _-]{0,24}",
+    );
+
+    let result = runner.run(&strategy, |(prefix, middle, suffix)| {
+        let description_a = format!("{middle}\0{suffix}");
+        let title_b = format!("{prefix}\0{middle}");
+
+        prop_assert_ne!(
+            (prefix.as_str(), description_a.as_str()),
+            (title_b.as_str(), suffix.as_str()),
+            "generated tuples must be structurally different"
+        );
+
+        let hash_a = content_hash_from_parts(
+            &prefix,
+            Some(&description_a),
+            None,
+            None,
+            None,
+            &Status::Open,
+            &Priority::MEDIUM,
+            &IssueType::Task,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        let hash_b = content_hash_from_parts(
+            &title_b,
+            Some(&suffix),
+            None,
+            None,
+            None,
+            &Status::Open,
+            &Priority::MEDIUM,
+            &IssueType::Task,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+
+        prop_assert_ne!(
+            hash_a,
+            hash_b,
+            "length-prefixed content hash must distinguish shifted embedded-NUL field boundaries"
+        );
+        Ok(())
+    });
+    assert!(
+        result.is_ok(),
+        "structural embedded-NUL collision proptest failed: {result:?}"
+    );
 }
 
 /// Property: Low collision rate in batch hashing

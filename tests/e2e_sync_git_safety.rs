@@ -18,11 +18,15 @@
 
 mod common;
 
+#[cfg(unix)]
+use common::cli::{BrRun, extract_json_payload, run_br_with_env};
 use common::cli::{BrWorkspace, run_br};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn visit_dir(dir: &Path, base: &Path, hash_map: &mut BTreeMap<String, String>) {
@@ -139,6 +143,573 @@ fn init_git_repo(workspace: &BrWorkspace) {
         .output()
         .expect("git commit");
     assert!(commit.status.success(), "initial commit failed");
+}
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+enum ExactGitEntry {
+    Directory { mode: u32 },
+    File { bytes: Vec<u8>, mode: u32 },
+    Symlink { target: PathBuf, mode: u32 },
+}
+
+#[cfg(unix)]
+fn snapshot_git_tree(root: &Path) -> BTreeMap<PathBuf, ExactGitEntry> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, ExactGitEntry>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut entries = fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("enumerate {}: {error}", directory.display()));
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("Git entry must remain under .git")
+                .to_path_buf();
+            let metadata = fs::symlink_metadata(&path)
+                .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()));
+            if metadata.file_type().is_symlink() {
+                snapshot.insert(
+                    relative,
+                    ExactGitEntry::Symlink {
+                        target: fs::read_link(&path)
+                            .unwrap_or_else(|error| panic!("readlink {}: {error}", path.display())),
+                        mode: metadata.permissions().mode(),
+                    },
+                );
+            } else if metadata.is_dir() {
+                snapshot.insert(
+                    relative,
+                    ExactGitEntry::Directory {
+                        mode: metadata.permissions().mode(),
+                    },
+                );
+                visit(root, &path, snapshot);
+            } else if metadata.is_file() {
+                snapshot.insert(
+                    relative,
+                    ExactGitEntry::File {
+                        bytes: fs::read(&path)
+                            .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+                        mode: metadata.permissions().mode(),
+                    },
+                );
+            } else {
+                panic!("unsupported .git entry type: {}", path.display());
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    let root_metadata =
+        fs::symlink_metadata(root).unwrap_or_else(|error| panic!("inspect .git root: {error}"));
+    assert!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        ".git root must be a real directory"
+    );
+    snapshot.insert(
+        PathBuf::new(),
+        ExactGitEntry::Directory {
+            mode: root_metadata.permissions().mode(),
+        },
+    );
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[cfg(unix)]
+fn changed_git_entries(
+    before: &BTreeMap<PathBuf, ExactGitEntry>,
+    after: &BTreeMap<PathBuf, ExactGitEntry>,
+) -> Vec<PathBuf> {
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect()
+}
+
+#[cfg(unix)]
+fn guarded_sync(
+    workspace: &BrWorkspace,
+    sentinel_path: &Path,
+    sentinel_dir: &Path,
+    args: &[String],
+    extra_env: &[(OsString, OsString)],
+    label: &str,
+) -> BrRun {
+    assert!(
+        !sentinel_path.exists(),
+        "Git PATH sentinel was already invoked before {label}"
+    );
+    let git_dir = workspace.root.join(".git");
+    let before = snapshot_git_tree(&git_dir);
+    let mut environment = extra_env.to_vec();
+    environment.push((
+        OsString::from("PATH"),
+        sentinel_dir.as_os_str().to_os_string(),
+    ));
+    let result = run_br_with_env(workspace, args.iter(), environment, label);
+    let after = snapshot_git_tree(&git_dir);
+    assert!(
+        !sentinel_path.exists(),
+        "SAFETY VIOLATION: {label} invoked the PATH sentinel named git"
+    );
+    assert!(
+        before == after,
+        "SAFETY VIOLATION: {label} changed byte-exact .git state: {:?}",
+        changed_git_entries(&before, &after)
+    );
+    result
+}
+
+#[cfg(unix)]
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(ToString::to_string).collect()
+}
+
+/// One fail-closed matrix covers every sync operation, both status renderings,
+/// reconciliation plan/apply, and the external-JSONL path. Each invocation
+/// runs with a fake `git` first on PATH to detect ordinary executable-name
+/// dispatch and compares every byte and entry under `.git` before/after with no
+/// index/log/ref/object/config/HEAD exceptions. Static source/dependency guards
+/// cover absolute-path, shell, linked-library, and sibling-adapter authority.
+#[cfg(unix)]
+#[test]
+fn e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _log = common::test_log("e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation");
+    let workspace = BrWorkspace::new();
+    init_git_repo(&workspace);
+    let init = run_br(&workspace, ["init"], "matrix_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(
+        &workspace,
+        ["create", "Sync safety matrix seed"],
+        "matrix_create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let sentinel_dir = workspace.root.join("git-path-sentinel");
+    fs::create_dir(&sentinel_dir).expect("create Git PATH sentinel directory");
+    let sentinel_path = sentinel_dir.join("INVOKED");
+    let fake_git = sentinel_dir.join("git");
+    assert!(
+        !sentinel_path.to_string_lossy().contains('\''),
+        "temporary sentinel path unexpectedly contains a shell quote"
+    );
+    fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 97\n",
+            sentinel_path.to_string_lossy()
+        ),
+    )
+    .expect("write fake git");
+    let mut permissions = fs::metadata(&fake_git)
+        .expect("fake git metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+
+    for (label, args) in [
+        (
+            "matrix_flush",
+            strings(&["sync", "--flush-only", "--force"]),
+        ),
+        (
+            "matrix_import",
+            strings(&["sync", "--import-only", "--force"]),
+        ),
+        (
+            "matrix_import_rebuild",
+            strings(&["sync", "--import-only", "--rebuild"]),
+        ),
+        (
+            "matrix_import_rename_prefix",
+            strings(&["sync", "--import-only", "--force", "--rename-prefix"]),
+        ),
+        (
+            "matrix_import_orphans_strict",
+            strings(&["sync", "--import-only", "--force", "--orphans", "strict"]),
+        ),
+        (
+            "matrix_import_orphans_resurrect",
+            strings(&["sync", "--import-only", "--force", "--orphans", "resurrect"]),
+        ),
+        (
+            "matrix_import_orphans_skip",
+            strings(&["sync", "--import-only", "--force", "--orphans", "skip"]),
+        ),
+        (
+            "matrix_import_orphans_allow",
+            strings(&["sync", "--import-only", "--force", "--orphans", "allow"]),
+        ),
+        (
+            "matrix_flush_manifest",
+            strings(&["sync", "--flush-only", "--force", "--manifest"]),
+        ),
+        (
+            "matrix_flush_policy_strict",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "strict",
+            ]),
+        ),
+        (
+            "matrix_flush_policy_best_effort",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "best-effort",
+            ]),
+        ),
+        (
+            "matrix_flush_policy_partial",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "partial",
+            ]),
+        ),
+        (
+            "matrix_flush_policy_required_core",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "required-core",
+            ]),
+        ),
+        ("matrix_status_human", strings(&["sync", "--status"])),
+        (
+            "matrix_status_json",
+            strings(&["sync", "--status", "--json"]),
+        ),
+        ("matrix_witness", strings(&["sync", "--witness", "--json"])),
+    ] {
+        let result = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            result.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            result.stdout,
+            result.stderr
+        );
+        if label == "matrix_status_human" {
+            assert!(
+                result.stdout.contains("VCS status: not probed"),
+                "human sync status omitted the stable VCS state:\n{}",
+                result.stdout
+            );
+            assert!(
+                result.stdout.contains("br vcs-status --json"),
+                "human sync status omitted the explicit diagnostic pointer:\n{}",
+                result.stdout
+            );
+        }
+    }
+
+    // These modes have distinct, supported JSONL-only implementations. A
+    // reviewed additive reconciliation is deliberately absent: it compares
+    // against and may apply to the durable database, so `--no-db` does not
+    // select another execution path for that mode.
+    for (label, args) in [
+        (
+            "matrix_no_db_flush",
+            strings(&["--no-db", "sync", "--flush-only", "--force"]),
+        ),
+        (
+            "matrix_no_db_import",
+            strings(&["--no-db", "sync", "--import-only"]),
+        ),
+        (
+            "matrix_no_db_status_human",
+            strings(&["--no-db", "sync", "--status"]),
+        ),
+        (
+            "matrix_no_db_status_json",
+            strings(&["--no-db", "sync", "--status", "--json"]),
+        ),
+        (
+            "matrix_no_db_witness",
+            strings(&["--no-db", "sync", "--witness", "--json"]),
+        ),
+    ] {
+        let result = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            result.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            result.stdout,
+            result.stderr
+        );
+        if label == "matrix_no_db_status_human" {
+            assert!(
+                result.stdout.contains("VCS status: not probed"),
+                "no-DB human sync status omitted the stable VCS state:\n{}",
+                result.stdout
+            );
+            assert!(
+                result.stdout.contains("br vcs-status --json"),
+                "no-DB human sync status omitted the explicit diagnostic pointer:\n{}",
+                result.stdout
+            );
+        }
+    }
+
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    fs::copy(&jsonl_path, workspace.root.join(".beads/beads.base.jsonl")).expect("seed merge base");
+    // Merge correctness has dedicated semantic tests. This matrix exercises
+    // every conflict-resolution dispatch policy under the no-process/no-.git
+    // authority sentinel, even when the converged fixture has no conflict.
+    for (label, args) in [
+        (
+            "matrix_merge_manual",
+            strings(&["sync", "--merge", "--json"]),
+        ),
+        (
+            "matrix_merge_force_db",
+            strings(&["sync", "--merge", "--force-db", "--json"]),
+        ),
+        (
+            "matrix_merge_force_jsonl",
+            strings(&["sync", "--merge", "--force-jsonl", "--json"]),
+        ),
+        (
+            "matrix_merge_force_newer",
+            strings(&["sync", "--merge", "--force", "--json"]),
+        ),
+    ] {
+        let merge = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            merge.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            merge.stdout,
+            merge.stderr
+        );
+    }
+    let no_db_merge = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["--no-db", "sync", "--merge", "--json"]),
+        &[],
+        "matrix_no_db_merge",
+    );
+    assert!(
+        no_db_merge.status.success(),
+        "no-DB merge failed\nstdout:\n{}\nstderr:\n{}",
+        no_db_merge.stdout,
+        no_db_merge.stderr
+    );
+
+    let plan = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["sync", "--reconcile-additive", "--json"]),
+        &[],
+        "matrix_reconcile_plan",
+    );
+    assert!(
+        plan.status.success(),
+        "reconcile plan failed\nstdout:\n{}\nstderr:\n{}",
+        plan.stdout,
+        plan.stderr
+    );
+    let plan: serde_json::Value =
+        serde_json::from_str(&extract_json_payload(&plan.stdout)).expect("reconcile plan JSON");
+    let plan_sha256 = plan["plan_sha256"]
+        .as_str()
+        .expect("reconcile plan token")
+        .to_string();
+    let apply_args = vec![
+        "sync".to_string(),
+        "--reconcile-additive".to_string(),
+        "--apply".to_string(),
+        "--expect-plan-sha256".to_string(),
+        plan_sha256,
+        "--json".to_string(),
+    ];
+    let apply = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &apply_args,
+        &[],
+        "matrix_reconcile_apply",
+    );
+    assert!(
+        apply.status.success(),
+        "reconcile apply failed\nstdout:\n{}\nstderr:\n{}",
+        apply.stdout,
+        apply.stderr
+    );
+
+    let external_dir = workspace.root.join("external-jsonl-target");
+    fs::create_dir(&external_dir).expect("create external JSONL directory");
+    let external_jsonl = external_dir.join("issues.jsonl");
+    let external_env = vec![(
+        OsString::from("BEADS_JSONL"),
+        external_jsonl.as_os_str().to_os_string(),
+    )];
+    let external = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["sync", "--flush-only", "--force", "--allow-external-jsonl"]),
+        &external_env,
+        "matrix_external_jsonl",
+    );
+    assert!(
+        external.status.success(),
+        "external JSONL sync failed\nstdout:\n{}\nstderr:\n{}",
+        external.stdout,
+        external.stderr
+    );
+    assert!(external_jsonl.is_file(), "external JSONL was not written");
+
+    for (label, args) in [
+        (
+            "matrix_external_jsonl_import",
+            strings(&["sync", "--import-only", "--force", "--allow-external-jsonl"]),
+        ),
+        (
+            "matrix_external_jsonl_witness",
+            strings(&["sync", "--witness", "--allow-external-jsonl", "--json"]),
+        ),
+        (
+            "matrix_external_jsonl_status",
+            strings(&["sync", "--status", "--allow-external-jsonl", "--json"]),
+        ),
+        (
+            "matrix_no_db_external_jsonl_status",
+            strings(&[
+                "--no-db",
+                "sync",
+                "--status",
+                "--allow-external-jsonl",
+                "--json",
+            ]),
+        ),
+        (
+            "matrix_no_db_external_jsonl_import",
+            strings(&[
+                "--no-db",
+                "sync",
+                "--import-only",
+                "--force",
+                "--allow-external-jsonl",
+            ]),
+        ),
+    ] {
+        let status = guarded_sync(
+            &workspace,
+            &sentinel_path,
+            &sentinel_dir,
+            &args,
+            &external_env,
+            label,
+        );
+        assert!(
+            status.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            status.stdout,
+            status.stderr
+        );
+        if label.contains("status") {
+            let payload: serde_json::Value =
+                serde_json::from_str(&extract_json_payload(&status.stdout))
+                    .expect("external JSONL status JSON");
+            assert_eq!(payload["git_export"]["available"], false, "{payload}");
+            assert_eq!(payload["git_export"]["reason"], "not_probed", "{payload}");
+            assert_eq!(
+                payload["git_export"]["diagnostic_command"], "br vcs-status --json",
+                "{payload}"
+            );
+        }
+    }
+
+    // Invalid combinations are part of the authority boundary too: they must
+    // fail before any future fallback or error-reporting path can delegate to
+    // Git. These cases cover clap-level and dispatch-level rejection.
+    for (label, args) in [
+        ("matrix_reject_no_mode", strings(&["sync"])),
+        (
+            "matrix_reject_force_db_without_merge",
+            strings(&["sync", "--flush-only", "--force-db"]),
+        ),
+        (
+            "matrix_reject_conflicting_merge_winners",
+            strings(&["sync", "--merge", "--force-db", "--force-jsonl"]),
+        ),
+        (
+            "matrix_reject_force_and_force_db",
+            strings(&["sync", "--merge", "--force", "--force-db"]),
+        ),
+        (
+            "matrix_reject_rebuild_flush",
+            strings(&["sync", "--flush-only", "--rebuild"]),
+        ),
+        (
+            "matrix_reject_multiple_modes",
+            strings(&["sync", "--status", "--import-only"]),
+        ),
+        (
+            "matrix_reject_invalid_error_policy",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "invalid",
+            ]),
+        ),
+        (
+            "matrix_reject_invalid_orphan_mode",
+            strings(&["sync", "--import-only", "--force", "--orphans", "invalid"]),
+        ),
+    ] {
+        let rejected = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            !rejected.status.success(),
+            "{label} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+            rejected.stdout,
+            rejected.stderr
+        );
+    }
+
+    let external_without_opt_in = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["sync", "--status", "--json"]),
+        &external_env,
+        "matrix_reject_external_without_opt_in",
+    );
+    assert!(
+        !external_without_opt_in.status.success(),
+        "external status without explicit opt-in unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        external_without_opt_in.stdout,
+        external_without_opt_in.stderr
+    );
 }
 
 /// Regression test: sync export does not create git commits or mutate .git
@@ -633,7 +1204,18 @@ fn regression_sync_never_touches_source_files() {
 // ============================================================================
 
 /// Files that sync is allowed to modify within `.beads/`.
-/// This matches the allowlist in `src/sync/path.rs`.
+///
+/// This matches the allowlist in `src/sync/path.rs` for sync-direct writes,
+/// PLUS recognizes recovery artifacts under `.beads/.br_recovery/` that may
+/// be created as a side effect of storage recovery flows triggered during
+/// sync's invocation (e.g., `br sync --import-only --force` may invoke a
+/// rebuild that backs up the existing DB family to `.br_recovery/<name>.<stamp>.bak`
+/// before overwriting). The recovery flow has its own path validation in
+/// `src/config/mod.rs::backup_database_family_for_recovery`; it does not
+/// flow through `src/sync/path.rs::validate_sync_path`.
+///
+/// See `.beads/SYNC_SAFETY_INVARIANTS.md` invariant **PC-RECOVERY** for the
+/// precise contract.
 fn is_allowed_sync_file(rel_path: &str) -> bool {
     // Must be under .beads/
     if !rel_path.starts_with(".beads/") && !rel_path.starts_with(".beads\\") {
@@ -671,14 +1253,34 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         return true;
     }
 
+    // Allow .br_recovery artifacts created as a side effect of storage
+    // recovery flows triggered during sync invocations. These are written
+    // by `src/config/mod.rs::recovery_backup_filename` (format
+    // `<original-filename>.<stamp>.<suffix>`); recognized suffixes:
+    //   - "bak"             → routine pre-rebuild backup of the DB family
+    //   - "rebuild-failed"  → rollback marker after a failed rebuild
+    //   - "truncated-wal"   → quarantined WAL/SHM sidecar (< 32 bytes)
+    // PC-RECOVERY invariant: any file under .beads/.br_recovery/ ending in
+    // one of these suffixes is allowed; arbitrary other contents are NOT
+    // (so we still catch a regression that scatters non-recovery files into
+    // the recovery dir).
+    if rel_path.contains(".br_recovery/") || rel_path.contains(".br_recovery\\") {
+        const RECOVERY_SUFFIXES: &[&str] = &[".bak", ".rebuild-failed", ".truncated-wal"];
+        if RECOVERY_SUFFIXES.iter().any(|s| filename.ends_with(s)) {
+            return true;
+        }
+    }
+
     // Check extension matches
     const ALLOWED_EXTENSIONS: &[&str] = &[
-        "db",         // SQLite database
-        "db-journal", // SQLite rollback journal
-        "db-wal",     // SQLite WAL
-        "db-shm",     // SQLite shared memory
-        "jsonl",      // JSONL export
-        "jsonl.tmp",  // Atomic write temp files
+        "db",                 // SQLite database
+        "db-journal",         // SQLite rollback journal
+        "db-wal",             // SQLite WAL
+        "db-shm",             // SQLite shared memory
+        "db-fsqlite-ns-gate", // fsqlite multi-process namespace gate
+        "db-fsqlite-ns-use",  // fsqlite multi-process namespace use-count
+        "jsonl",              // JSONL export
+        "jsonl.tmp",          // Atomic write temp files
     ];
 
     for ext in ALLOWED_EXTENSIONS {
@@ -1480,4 +2082,407 @@ fn integration_sync_manifest_only_touches_allowed_files() {
         "[PASS] sync --manifest only touched {} allowed files",
         allowed.len()
     );
+}
+
+// ============================================================================
+// beads_rust-yyxo: additional sync-safety regression tests (added 2026-05-09)
+// Per SYNC_SAFETY_INVARIANTS.md PC-1, PC-3, PC-RECOVERY, NGI-3.
+// Each test emits tracing-style eprintln! lines per phase so the test log
+// alone tells the story.
+// ============================================================================
+
+/// PC-1 + PC-RECOVERY: when a stale `.br_recovery/*.bak` exists at workspace
+/// open time (e.g., from a prior sync invocation), a fresh sync export +
+/// import cycle MUST NOT touch the existing recovery artifact (no rewrite,
+/// no delete). Recovery artifacts are an append-only side-effect surface.
+#[test]
+fn integration_sync_after_recovery_artifact_present_does_not_touch_artifacts() {
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!(
+        "[yyxo TEST] integration_sync_after_recovery_artifact_present_does_not_touch_artifacts"
+    );
+    eprintln!("  Phase 1: init + create issues");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        ["create", "Test issue", "-t", "task", "--no-auto-flush"],
+        "create_test",
+    );
+    let _ = run_br(&workspace, ["sync", "--flush-only"], "initial_flush");
+
+    // Pre-place a fake recovery artifact and capture its hash + mtime
+    eprintln!("  Phase 2: pre-place a stale .br_recovery artifact");
+    let recovery_dir = workspace.root.join(".beads").join(".br_recovery");
+    fs::create_dir_all(&recovery_dir).expect("create recovery dir");
+    let stale_artifact = recovery_dir.join("beads.db.20260101_000000_000000000.bak");
+    let stale_contents = b"STALE_RECOVERY_ARTIFACT_DO_NOT_TOUCH";
+    fs::write(&stale_artifact, stale_contents).expect("write stale artifact");
+    let stale_meta_before = fs::metadata(&stale_artifact).expect("stat stale");
+    let stale_mtime_before = stale_meta_before.modified().expect("mtime stale");
+    eprintln!(
+        "    stale artifact: {} ({} bytes, mtime={:?})",
+        stale_artifact.display(),
+        stale_meta_before.len(),
+        stale_mtime_before
+    );
+
+    // Snapshot before
+    let snapshot_before = FileTreeSnapshot::new(&workspace.root);
+    eprintln!("    files before: {}", snapshot_before.files.len());
+
+    // Run a sync cycle
+    eprintln!("  Phase 3: run sync export + import (should NOT touch the stale artifact)");
+    let _ = run_br(
+        &workspace,
+        ["create", "Another issue", "-t", "task"],
+        "create_2nd",
+    );
+    let _ = run_br(&workspace, ["sync", "--flush-only"], "second_flush");
+    let _ = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "second_import",
+    );
+
+    // Snapshot after
+    let snapshot_after = FileTreeSnapshot::new(&workspace.root);
+    eprintln!("    files after: {}", snapshot_after.files.len());
+
+    // Verify the stale artifact wasn't touched
+    let stale_meta_after = fs::metadata(&stale_artifact).expect("stat stale (post-sync)");
+    let stale_mtime_after = stale_meta_after
+        .modified()
+        .expect("mtime stale (post-sync)");
+    let stale_contents_after = fs::read(&stale_artifact).expect("read stale (post-sync)");
+
+    assert_eq!(
+        stale_contents_after, stale_contents,
+        "PC-RECOVERY: pre-existing recovery artifact contents were modified by sync"
+    );
+    assert_eq!(
+        stale_mtime_before, stale_mtime_after,
+        "PC-RECOVERY: pre-existing recovery artifact mtime was changed by sync"
+    );
+
+    // Verify any NEW recovery artifacts created during the cycle have an
+    // expected suffix (so a regression that scattered random files into
+    // recovery_dir would still trip the test). Use case-insensitive
+    // matching against the final extension for cross-platform safety
+    // (e.g., FAT32 / Windows quirks).
+    if let Ok(entries) = fs::read_dir(&recovery_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let ext_matches =
+                |e: &str| -> bool { path.extension().is_some_and(|x| x.eq_ignore_ascii_case(e)) };
+            // suffix `truncated-wal` and `rebuild-failed` are the trailing
+            // dotted token; for `bak` it's the final extension.
+            let valid =
+                ext_matches("bak") || ext_matches("rebuild-failed") || ext_matches("truncated-wal");
+            assert!(
+                valid,
+                "PC-RECOVERY: unexpected file in .br_recovery/: {name} (must end in .bak/.rebuild-failed/.truncated-wal)"
+            );
+            eprintln!("    recovery dir entry: {name} (valid suffix)");
+        }
+    }
+
+    eprintln!(
+        "  [PASS] stale recovery artifact untouched; new artifacts (if any) have valid suffixes"
+    );
+}
+
+/// PC-1 + NGI-3: a full sync cycle MUST NOT create or modify ANY file at
+/// `.beads/.git/*` or any other `.git/*` path under the workspace.
+/// This is a hard invariant; even an accidental traversal would be a
+/// CRITICAL regression. Note: this is in addition to the sync-touches-source
+/// regressions (regression_full_sync_cycle_does_not_touch_git etc.) and
+/// is paranoid by design — checks both `.git/` directories *adjacent* to
+/// `.beads/` AND any `.git/` *under* `.beads/`.
+#[test]
+fn integration_sync_does_not_create_or_modify_dotgit_anywhere() {
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!("[yyxo TEST] integration_sync_does_not_create_or_modify_dotgit_anywhere");
+    eprintln!("  Phase 1: init + create + initial sync");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        ["create", "T1", "-t", "task", "--no-auto-flush"],
+        "create_1",
+    );
+    let _ = run_br(
+        &workspace,
+        ["create", "T2", "-t", "bug", "--no-auto-flush"],
+        "create_2",
+    );
+
+    // Snapshot dotgit state (none expected)
+    let dotgit_paths_before = collect_all_dotgit_paths(&workspace.root);
+    eprintln!(
+        "    dotgit paths before: {} (expected 0)",
+        dotgit_paths_before.len()
+    );
+    assert!(
+        dotgit_paths_before.is_empty(),
+        "test fixture leaked dotgit paths before sync (test setup bug, not a sync regression): {dotgit_paths_before:?}"
+    );
+
+    // Phase 2: Run a multi-step sync cycle
+    eprintln!("  Phase 2: full sync cycle");
+    let _ = run_br(&workspace, ["sync", "--flush-only"], "flush");
+    let _ = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force"],
+        "import_force",
+    );
+    let _ = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--force"],
+        "flush_force",
+    );
+
+    // Phase 3: Verify still no dotgit paths
+    let dotgit_paths_after = collect_all_dotgit_paths(&workspace.root);
+    eprintln!(
+        "    dotgit paths after: {} (expected 0)",
+        dotgit_paths_after.len()
+    );
+
+    assert!(
+        dotgit_paths_after.is_empty(),
+        "PC-1/NGI-3 VIOLATION: sync created dotgit paths: {dotgit_paths_after:?}"
+    );
+
+    eprintln!("  [PASS] no .git/ paths created or modified by sync cycle");
+}
+
+/// PC-1 + PC-3: when a sync invocation is made from a SUBDIRECTORY of the
+/// project (e.g., `cd src/cli && br sync --flush-only`), the workspace resolution MUST
+/// land on the nearest `.beads/` and not escape via `..` traversal during
+/// canonicalization.
+#[test]
+fn integration_sync_in_subdirectory_only_touches_nearest_beads_dir() {
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!("[yyxo TEST] integration_sync_in_subdirectory_only_touches_nearest_beads_dir");
+    eprintln!("  Phase 1: init + create issues");
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        ["create", "Subdir test", "-t", "task", "--no-auto-flush"],
+        "create_subdir",
+    );
+
+    // Phase 2: Snapshot before
+    let snapshot_before = FileTreeSnapshot::new(&workspace.root);
+    eprintln!("    files before: {}", snapshot_before.files.len());
+
+    // Phase 3: Run sync from a subdirectory
+    eprintln!("  Phase 2: sync from subdir (mimics `cd src/cli && br sync --flush-only`)");
+    let subdir = workspace.root.join("src");
+    if !subdir.exists() {
+        fs::create_dir_all(&subdir).expect("create src/");
+    }
+
+    // Run br sync with cwd=subdir; the binary should auto-discover the
+    // workspace .beads/ via parent-walk
+    let br_path = std::env::var("CARGO_BIN_EXE_br")
+        .or_else(|_| std::env::var("BR_BIN").map(|b| b.trim().to_string()))
+        .unwrap_or_else(|_| "br".to_string());
+    let output = std::process::Command::new(&br_path)
+        .args(["sync", "--flush-only"])
+        .current_dir(&subdir)
+        .env("RUST_LOG", "info")
+        .env("RCH_DISABLED", "1")
+        .output()
+        .expect("spawn br sync from subdir");
+    eprintln!(
+        "    sync exit: {} stderr_len: {}",
+        output.status,
+        output.stderr.len()
+    );
+    assert!(
+        output.status.success() || output.status.code() == Some(2),
+        "sync from subdir should either succeed or surface a clear workspace-discovery error; got status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Phase 4: Snapshot after; verify only the workspace .beads/ was touched
+    let snapshot_after = FileTreeSnapshot::new(&workspace.root);
+    let diff = snapshot_before.diff(&snapshot_after);
+    let (violations, allowed) = diff.check_allowed_changes();
+    eprintln!(
+        "    diff: {} allowed, {} violations",
+        allowed.len(),
+        violations.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "PC-1: sync from subdir touched files outside the nearest .beads/: {:?}",
+        violations
+            .iter()
+            .map(|c| c.format_detail())
+            .collect::<Vec<_>>()
+    );
+
+    eprintln!("  [PASS] sync from subdirectory only touched nearest .beads/");
+}
+
+/// PC-1 + PC-2: when `BEADS_JSONL` env var explicitly authorizes an external
+/// JSONL path, sync MUST only touch (a) `.beads/` of the workspace, AND
+/// (b) the explicitly-authorized external path (and same-directory atomic
+/// temp files). No third party.
+#[test]
+fn integration_sync_with_external_jsonl_path_touches_only_target_and_beads() {
+    use common::cli::run_br_with_env;
+
+    let workspace = BrWorkspace::new();
+    create_realistic_project(&workspace);
+
+    eprintln!(
+        "[yyxo TEST] integration_sync_with_external_jsonl_path_touches_only_target_and_beads"
+    );
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let _ = run_br(
+        &workspace,
+        [
+            "create",
+            "External JSONL test",
+            "-t",
+            "task",
+            "--no-auto-flush",
+        ],
+        "create_for_external",
+    );
+
+    // Set up an external JSONL target
+    let external_dir = workspace.temp_dir.path().join("ext-jsonl-store");
+    fs::create_dir_all(&external_dir).expect("create external dir");
+    let external_jsonl = external_dir.join("custom-issues.jsonl");
+    eprintln!("  external target: {}", external_jsonl.display());
+
+    // Snapshot ALL files (including the workspace root / external dir)
+    let snapshot_before = FileTreeSnapshot::new(workspace.temp_dir.path());
+    eprintln!("  files before sync: {}", snapshot_before.files.len());
+
+    // Run sync with explicit BEADS_JSONL + --allow-external-jsonl --force
+    let env_vars = vec![("BEADS_JSONL", external_jsonl.to_str().unwrap().to_string())];
+    let sync = run_br_with_env(
+        &workspace,
+        ["sync", "--flush-only", "--allow-external-jsonl", "--force"],
+        env_vars,
+        "sync_with_external",
+    );
+    eprintln!(
+        "  sync exit: {} stderr_len: {}",
+        sync.status,
+        sync.stderr.len()
+    );
+
+    // The implementation may either (a) succeed and write the external file
+    // or (b) reject with a clear error. EITHER WAY, no third-party file
+    // should appear (no `.git/`, no random tmpfile in /tmp/, etc).
+    let snapshot_after = FileTreeSnapshot::new(workspace.temp_dir.path());
+    let diff = snapshot_after.files.iter().filter(|(path, _)| {
+        // Allow files in .beads/ (workspace metadata)
+        if path.starts_with(".beads/") || path.contains(".beads\\") {
+            return false;
+        }
+        // Allow files explicitly under the external target's directory
+        if path.contains("ext-jsonl-store/") || path.contains("ext-jsonl-store\\") {
+            return false;
+        }
+        // Allow logs (test-only output)
+        if path.starts_with("logs") || path.starts_with("logs/") {
+            return false;
+        }
+        // Allow the realistic-project files that already existed before the test
+        !snapshot_before.files.contains_key(path.as_str())
+            && !path.starts_with("src/")
+            && !path.starts_with("tests/")
+            && !path.starts_with("docs/")
+            && path.as_str() != "Cargo.toml"
+            && path.as_str() != "README.md"
+    });
+
+    let unexpected: Vec<_> = diff.collect();
+    if !unexpected.is_empty() {
+        eprintln!("  UNEXPECTED FILES TOUCHED OUTSIDE .beads/ AND EXTERNAL TARGET:");
+        for (p, _) in &unexpected {
+            eprintln!("    {p}");
+        }
+    }
+    assert!(
+        unexpected.is_empty(),
+        "PC-1 violation: sync with BEADS_JSONL touched unexpected files outside .beads/ and the external target"
+    );
+
+    // If sync succeeded, the external file must have been created
+    if sync.status.success() {
+        assert!(
+            external_jsonl.exists(),
+            "external JSONL should exist after a successful sync"
+        );
+        eprintln!("  [PASS] external JSONL created; no third-party files touched");
+    } else {
+        // If rejected, error must mention the external path concern
+        let combined = format!("{}{}", sync.stdout, sync.stderr);
+        assert!(
+            combined.contains("external")
+                || combined.contains("outside")
+                || combined.contains("allow"),
+            "sync rejection must mention external/outside/allow context; got:\n{combined}"
+        );
+        eprintln!("  [PASS] sync clearly rejected external path with operator-readable error");
+    }
+}
+
+/// Helper for `integration_sync_does_not_create_or_modify_dotgit_anywhere`:
+/// recursively collects every `.git`-named entry under the given root.
+fn collect_all_dotgit_paths(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == ".git" {
+                out.push(entry.path());
+                continue; // don't descend into dotgit (defensive)
+            }
+            // Skip the test's own logs dir
+            if name == "logs" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
 }

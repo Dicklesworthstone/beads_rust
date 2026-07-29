@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 643
 expression: normalized
 ---
 {
@@ -13,7 +14,8 @@ expression: normalized
       "created_at": "TIMESTAMP",
       "created_by": "ACTOR",
       "updated_at": "TIMESTAMP",
-      "source_repo": ".",
+      "source_repo": "SOURCE_REPO",
+      "source_repo_path": "SOURCE_REPO",
       "compaction_level": 0,
       "original_size": 0,
       "dependency_count": 0,
@@ -28,7 +30,8 @@ expression: normalized
       "created_at": "TIMESTAMP",
       "created_by": "ACTOR",
       "updated_at": "TIMESTAMP",
-      "source_repo": ".",
+      "source_repo": "SOURCE_REPO",
+      "source_repo_path": "SOURCE_REPO",
       "compaction_level": 0,
       "original_size": 0,
       "dependency_count": 0,
@@ -43,7 +46,8 @@ expression: normalized
       "created_at": "TIMESTAMP",
       "created_by": "ACTOR",
       "updated_at": "TIMESTAMP",
-      "source_repo": ".",
+      "source_repo": "SOURCE_REPO",
+      "source_repo_path": "SOURCE_REPO",
       "compaction_level": 0,
       "original_size": 0,
       "dependency_count": 0,
@@ -51,7 +55,7 @@ expression: normalized
     }
   ],
   "total": 3,
-  "limit": 50,
+  "limit": 0,
   "offset": 0,
   "has_more": false
 }

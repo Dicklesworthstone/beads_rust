@@ -44,7 +44,7 @@ fn clear_inherited_br_env(cmd: &mut Command) {
 /// Get the path to the bd (Go beads) binary.
 /// Checks `BD_BINARY` environment variable first, falls back to "bd" for PATH lookup.
 fn bd_binary_path() -> String {
-    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+    super::binary_discovery::bd_binary_name()
 }
 
 /// Global mutex for artifact logging to prevent interleaving
@@ -818,8 +818,11 @@ impl TestWorkspace {
         clear_inherited_br_env(&mut cmd);
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
+        // See tests/common/cli.rs: debug tracing on stderr trips `br doctor`'s
+        // own `rust_log` check and corrupts stderr-matching assertions.
+        cmd.env("RUST_LOG", "error");
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("PATH", super::cli::deduplicated_br_path());
         cmd.env("HOME", &self.root);
 
         if let Some(input) = stdin_input {
@@ -1188,8 +1191,11 @@ impl ConformanceWorkspace {
 
         clear_inherited_br_env(&mut cmd);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
+        // See tests/common/cli.rs: debug tracing on stderr trips `br doctor`'s
+        // own `rust_log` check and corrupts stderr-matching assertions.
+        cmd.env("RUST_LOG", "error");
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("PATH", super::cli::deduplicated_br_path());
         cmd.env("HOME", cwd);
 
         let start = Instant::now();
@@ -1262,8 +1268,11 @@ impl ConformanceWorkspace {
         clear_inherited_br_env(&mut cmd);
         cmd.envs(env_vars);
         cmd.env("NO_COLOR", "1");
-        cmd.env("RUST_LOG", "beads_rust=debug");
+        // See tests/common/cli.rs: debug tracing on stderr trips `br doctor`'s
+        // own `rust_log` check and corrupts stderr-matching assertions.
+        cmd.env("RUST_LOG", "error");
         cmd.env("RUST_BACKTRACE", "1");
+        cmd.env("PATH", super::cli::deduplicated_br_path());
         cmd.env("HOME", cwd);
 
         if let Some(input) = stdin_input {
@@ -1520,7 +1529,7 @@ mod tests {
     fn test_parse_created_id() {
         let stdout = "Created bd-abc123: Test issue\n";
         let id = parse_created_id(stdout);
-        assert_eq!(id, "bd-abc123");
+        assert_eq!(id, "bd-abc123"); // invariant: parser test, not ID-pinning
     }
 
     // ========================================================================

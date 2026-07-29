@@ -47,8 +47,8 @@ UPDATE_AGENT_BASELINE=1 cargo test --test e2e_schema agent_baseline_snapshots_ma
 When emitting TOON, br may "fold" nested keys into dotted keys (safe folding) to save tokens.
 Example: `schemas.IssueDetails` instead of `{ "schemas": { "IssueDetails": ... } }`.
 
-If you need to parse TOON as JSON, decode with `tru`:
+If you need to parse TOON as nested JSON, decode with safe path expansion:
 
 ```bash
-br schema issue-details --format toon | tru --decode | jq .
+br schema issue-details --format toon | tru --decode --expand-paths safe | jq .
 ```

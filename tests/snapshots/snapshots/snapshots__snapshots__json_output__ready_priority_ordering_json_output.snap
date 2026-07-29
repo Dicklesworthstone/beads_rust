@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 696
 expression: normalized
 ---
 [
@@ -8,6 +9,7 @@ expression: normalized
     "created_by": "ACTOR",
     "id": "ISSUE_ID",
     "issue_type": "task",
+    "labels": [],
     "priority": 1,
     "status": "open",
     "title": "Urgent ready task",
@@ -18,6 +20,7 @@ expression: normalized
     "created_by": "ACTOR",
     "id": "ISSUE_ID",
     "issue_type": "task",
+    "labels": [],
     "priority": 3,
     "status": "open",
     "title": "Backlog ready task",
@@ -28,6 +31,7 @@ expression: normalized
     "created_by": "ACTOR",
     "id": "ISSUE_ID",
     "issue_type": "task",
+    "labels": [],
     "priority": 2,
     "status": "open",
     "title": "Normal ready task",

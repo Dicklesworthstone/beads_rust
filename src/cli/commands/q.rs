@@ -118,8 +118,8 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         let count = storage.count_issues()?;
         let existing_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
         id_gen.generate(&title, None, None, now, count, |candidate| {
-            existing_ids.contains(candidate)
-        })
+            Ok(existing_ids.contains(candidate))
+        })?
     };
 
     let mut valid_labels = Vec::new();
@@ -157,6 +157,8 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -182,7 +184,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     if let Some(parent_id) = resolved_parent_id.as_ref() {
         // Double-check cycle even though we are a new issue, to catch logic errors
         // and ensure the storage would_create_cycle works correctly for prospective links
-        if storage.would_create_cycle(&issue.id, parent_id, true)? {
+        if storage.would_create_parent_child_cycle(&issue.id, parent_id, true)? {
             return Err(BeadsError::DependencyCycle {
                 path: format!("{} -> {}", issue.id, parent_id),
             });

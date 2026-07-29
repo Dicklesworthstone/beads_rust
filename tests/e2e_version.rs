@@ -54,7 +54,9 @@ fn e2e_version_json_flag() {
     // Verify fields
     assert!(json.get("version").is_some(), "missing version field");
     assert!(json.get("build").is_some(), "missing build field");
-    assert!(json.get("commit").is_some(), "missing commit field");
+    if option_env!("VERGEN_GIT_SHA").is_some() {
+        assert!(json.get("commit").is_some(), "missing commit field");
+    }
     // The features field is only present when self_update feature is enabled
     #[cfg(feature = "self_update")]
     assert!(json.get("features").is_some(), "missing features field");

@@ -9,17 +9,18 @@ Arguments:
           Which schema to emit
 
           Possible values:
-          - all:               Emit a bundle containing all schemas and the per-command shape map
-          - issue:             Core Issue object (used by many commands)
-          - issue-with-counts: List/search row: Issue + dependency/dependent counts
-          - issue-details:     Show view: Issue + relations/comments/events
-          - ready-issue:       Ready list row
-          - stale-issue:       Stale list row
-          - blocked-issue:     Blocked list row
-          - tree-node:         Dependency tree node
-          - statistics:        Stats output
-          - error:             Structured error envelope (stderr JSON when robot mode or non-TTY)
-          - commands:          Per-command JSON output envelope map (top-level shape + jq filter per command)
+          - all:                 Emit a bundle containing all schemas and the per-command shape map
+          - issue:               Core Issue object (used by many commands)
+          - issue-with-counts:   List/search row: Issue + dependency/dependent counts
+          - issue-details:       Show view: Issue + relations/comments/events
+          - ready-issue:         Ready list row
+          - stale-issue:         Stale list row
+          - blocked-issue:       Blocked list row
+          - tree-node:           Dependency tree node
+          - statistics:          Stats output
+          - coordination-status: Coordination status output
+          - error:               Structured error envelope (stderr JSON when robot mode or non-TTY)
+          - commands:            Per-command JSON output envelope map (top-level shape + jq filter per command)
 
           [default: all]
 

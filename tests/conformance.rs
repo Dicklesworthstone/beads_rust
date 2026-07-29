@@ -26,48 +26,42 @@ use tracing::info;
 /// Get the path to the `bd` (Go beads) binary.
 /// Checks `BD_BINARY` environment variable first, falls back to PATH lookup.
 fn get_bd_binary() -> String {
-    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+    common::bd_binary_name()
 }
 
-/// Check if the `bd` (Go beads) binary is available on the system.
-/// Returns false if `bd` is aliased/symlinked to `br` (detected via version output).
-/// Respects `BD_BINARY` environment variable for custom binary path.
+/// Check if the discovered `bd` is a usable classic conformance reference.
+///
+/// Delegates to the single gate in `common::binary_discovery`, which rejects a
+/// missing binary, a `bd` that is really br, and a post-classic (Dolt-default)
+/// bd that br was never meant to match.
 pub fn bd_available() -> bool {
-    let bd_bin = get_bd_binary();
-    std::process::Command::new(&bd_bin)
-        .arg("version")
-        .output()
-        .is_ok_and(|o| {
-            if !o.status.success() {
-                return false;
-            }
-            // Check that this is actually Go bd, not br aliased as bd.
-            // Go bd outputs "bd version X" or "beads version X".
-            // Rust br outputs "br version X".
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let Some(first_token) = stdout.split_whitespace().next() else {
-                return false;
-            };
-            match first_token.to_ascii_lowercase().as_str() {
-                "bd" | "beads" => true,
-                "br" => false,
-                _ => false,
-            }
-        })
+    common::bd_available()
 }
 
-/// Skip test if bd binary is not available (used in CI where only br is built)
+/// Skip test when `bd` is not a usable classic conformance reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!(
-                "Skipping test: 'bd' binary missing or aliased to br. \
-                 Set BD_BINARY to a Go bd path for conformance runs."
-            );
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping conformance test: {reason}");
             return;
         }
     };
 }
+
+/// Issue ID prefix forced on **both** workspaces at init (`beads_rust-f175`).
+///
+/// Both tools derive a prefix from their working directory when none is given,
+/// and this harness deliberately gives them different directories
+/// (`br_workspace` and `bd_workspace`). Since [`normalize_value`] preserves the
+/// prefix and normalizes only the hash portion, an unprefixed init made every
+/// `id` field compare as `br_workspace-NORMALIZED` against
+/// `bd_workspace-NORMALIZED` — a mismatch no test could ever pass under
+/// `CompareMode::NormalizedJson`.
+///
+/// `tests/conformance_workflows.rs` already avoids this by passing an explicit
+/// prefix; this constant is the same fix for this harness. The value must be a
+/// valid prefix for both tools and must not contain a `-`.
+const CONFORMANCE_PREFIX: &str = "bd";
 
 /// Output from running a command
 #[derive(Debug)]
@@ -87,6 +81,11 @@ pub struct ConformanceWorkspace {
 }
 
 impl ConformanceWorkspace {
+    /// Canonical `init` invocation for both tools. Every init in this file goes
+    /// through this so a later call cannot silently reintroduce a
+    /// directory-derived prefix.
+    const INIT_ARGS: [&'static str; 3] = ["init", "--prefix", CONFORMANCE_PREFIX];
+
     pub fn new() -> Self {
         let temp_dir = TempDir::new().expect("create temp dir");
         let root = temp_dir.path().to_path_buf();
@@ -106,10 +105,14 @@ impl ConformanceWorkspace {
         }
     }
 
-    /// Initialize both br and bd workspaces
+    /// Initialize both br and bd workspaces with the same explicit prefix.
+    ///
+    /// The prefix is not optional: see [`CONFORMANCE_PREFIX`] for why letting
+    /// each tool derive one from its own directory name makes every id
+    /// comparison unsatisfiable.
     pub fn init_both(&self) -> (CmdOutput, CmdOutput) {
-        let br_out = self.run_br(["init"], "init");
-        let bd_out = self.run_bd(["init"], "init");
+        let br_out = self.run_br(Self::INIT_ARGS, "init");
+        let bd_out = self.run_bd(Self::INIT_ARGS, "init");
         (br_out, bd_out)
     }
 
@@ -395,7 +398,7 @@ fn sha256_hex(input: &str) -> String {
 }
 
 #[test]
-fn conformance_content_hash_matches_go_bd_fixture() {
+fn conformance_content_hash_matches_length_prefixed_br_fixture() {
     use beads_rust::model::{IssueType, Priority, Status};
 
     let hash = beads_rust::util::content_hash_from_parts(
@@ -417,8 +420,8 @@ fn conformance_content_hash_matches_go_bd_fixture() {
     );
 
     assert_eq!(
-        hash, "ad16572b6b2e1a60df3520b2b91d181246707390f487a73caa24082dcd24e00e",
-        "content_hash must match the Go bd ComputeContentHash fixture"
+        hash, "ef08b448c7b8eb9a3c3b2facdd9fa8e0b2b420c99725629c6811f019a0a9ab87",
+        "content_hash must match the length-prefixed br fixture"
     );
 }
 
@@ -732,6 +735,46 @@ where
     TimingStats::from_durations(&filtered)
 }
 
+/// Count the issues in a `--json` payload, tolerating both output shapes.
+///
+/// `beads_rust-ecr6`: br and bd do not agree on the envelope. `bd list --json`
+/// and `br ready|blocked|search --json` return a bare array, but
+/// `br list --json` returns `{"issues":[…],"total":…,"limit":…,"offset":…,
+/// "has_more":…}`. The harness compared counts with
+/// `value.as_array().map(|a| a.len()).unwrap_or(0)`, which yields **0 for every
+/// `br list --json` payload regardless of content** — so `br` looked empty
+/// everywhere.
+///
+/// That produced two failure modes: real mismatches wherever bd returned rows
+/// (`br=0, bd=2`), and, worse, *vacuous passes* wherever bd also returned
+/// nothing — and bd v0.46.0 returns an empty list for many filtered queries, a
+/// divergence already documented on a dozen `#[ignore]`d tests here.
+///
+/// Returns 0 for a payload that is neither shape, matching the previous
+/// `unwrap_or(0)` behavior for genuinely unparseable output.
+fn issue_count(value: &Value) -> usize {
+    if let Some(items) = value.as_array() {
+        return items.len();
+    }
+    value
+        .get("issues")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
+}
+
+/// Borrow the issue objects out of a `--json` payload, tolerating both shapes.
+/// See [`issue_count`] for why this is necessary.
+fn issue_items(value: &Value) -> Vec<&Value> {
+    if let Some(items) = value.as_array() {
+        return items.iter().collect();
+    }
+    value
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().collect())
+        .unwrap_or_default()
+}
+
 /// Normalize JSON for comparison by removing/masking volatile fields
 pub fn normalize_json(json_str: &str) -> Result<Value, serde_json::Error> {
     let mut value: Value = serde_json::from_str(json_str)?;
@@ -762,9 +805,17 @@ fn normalize_value(value: &mut Value) {
                         *val = Value::String("NORMALIZED_TIMESTAMP".to_string());
                     }
                 } else if key == "id" || key == "issue_id" || key == "depends_on_id" {
-                    // Keep ID structure but normalize the hash portion
+                    // Keep the prefix, normalize the hash portion.
+                    //
+                    // `rfind` (not `find`) splits on the LAST dash, matching
+                    // the normalizers in `conformance_workflows.rs` and
+                    // `common/scenarios.rs`. Splitting on the first dash
+                    // truncated any prefix that itself contains one — a
+                    // directory-derived prefix like `beads-rust` normalized to
+                    // `beads-NORMALIZED`, silently discarding the rest
+                    // (`beads_rust-f175`).
                     if let Some(s) = val.as_str() {
-                        if let Some(dash_pos) = s.find('-') {
+                        if let Some(dash_pos) = s.rfind('-') {
                             let prefix = &s[..dash_pos];
                             *val = Value::String(format!("{prefix}-NORMALIZED"));
                         }
@@ -1490,8 +1541,8 @@ fn conformance_list_empty() {
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Null);
 
     // Both should be empty arrays or similar
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -1544,8 +1595,8 @@ fn conformance_list_with_issues() {
     let br_val: Value = serde_json::from_str(&br_json).expect("br json");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -1586,8 +1637,8 @@ fn conformance_ready_empty() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -1631,8 +1682,8 @@ fn conformance_ready_with_issues() {
     let br_val: Value = serde_json::from_str(&br_json).expect("br json");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -1709,22 +1760,14 @@ fn conformance_ready_with_deps() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_ids: Vec<&str> = br_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let bd_ids: Vec<&str> = bd_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let br_ids: Vec<&str> = issue_items(&br_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
+    let bd_ids: Vec<&str> = issue_items(&bd_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
 
     assert_eq!(br_ids.len(), bd_ids.len(), "ready lengths differ");
     assert!(
@@ -1782,8 +1825,8 @@ fn conformance_ready_limit() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(br_len, 1, "br ready should honor limit");
     assert_eq!(bd_len, 1, "bd ready should honor limit");
@@ -1839,22 +1882,14 @@ fn conformance_ready_filter_type() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_ids: Vec<&str> = br_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let bd_ids: Vec<&str> = bd_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let br_ids: Vec<&str> = issue_items(&br_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
+    let bd_ids: Vec<&str> = issue_items(&bd_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
 
     assert_eq!(br_ids.len(), 1, "br ready should filter to 1 bug");
     assert_eq!(bd_ids.len(), 1, "bd ready should filter to 1 bug");
@@ -1912,22 +1947,14 @@ fn conformance_ready_filter_assignee() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_ready.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_ids: Vec<&str> = br_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let bd_ids: Vec<&str> = bd_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let br_ids: Vec<&str> = issue_items(&br_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
+    let bd_ids: Vec<&str> = issue_items(&bd_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
 
     assert_eq!(br_ids.len(), 1, "br ready should filter to 1 assignee");
     assert_eq!(bd_ids.len(), 1, "bd ready should filter to 1 assignee");
@@ -2067,7 +2094,21 @@ fn conformance_ready_json_shape() {
     let br_json = extract_json_payload(&br_ready.stdout);
     let bd_json = extract_json_payload(&bd_ready.stdout);
 
-    compare_json(&br_json, &bd_json, &CompareMode::StructureOnly).expect("JSON mismatch");
+    // Every other key matches exactly. The sole shape difference is `labels`:
+    // br emits `"labels": []` for an issue with no labels, bd v0.46.0 omits the
+    // key entirely. Verified against a real bd on 2026-07-25 (`beads_rust-ecr6`).
+    // Excluding just that key keeps the rest of the ready payload shape under
+    // live comparison.
+    let br_val: Value = serde_json::from_str(&br_json).expect("br json");
+    let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
+    let excluded = vec!["labels".to_string()];
+    assert!(
+        structure_matches(
+            &filter_fields(&br_val, &excluded),
+            &filter_fields(&bd_val, &excluded)
+        ),
+        "ready JSON structure mismatch\nbr: {br_json}\nbd: {bd_json}"
+    );
 
     info!("conformance_ready_json_shape passed");
 }
@@ -2101,8 +2142,8 @@ fn conformance_blocked_empty() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(br_len, bd_len, "blocked lengths differ");
     assert_eq!(br_len, 0, "expected no blocked issues");
@@ -2175,22 +2216,14 @@ fn conformance_blocked_with_deps() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_ids: Vec<&str> = br_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let bd_ids: Vec<&str> = bd_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let br_ids: Vec<&str> = issue_items(&br_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
+    let bd_ids: Vec<&str> = issue_items(&bd_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
 
     assert_eq!(br_ids.len(), bd_ids.len(), "blocked lengths differ");
     assert!(
@@ -2512,22 +2545,14 @@ fn conformance_blocked_chain() {
     let bd_val: Value =
         serde_json::from_str(&extract_json_payload(&bd_blocked_out.stdout)).unwrap_or_default();
 
-    let br_ids: Vec<&str> = br_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let bd_ids: Vec<&str> = bd_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let br_ids: Vec<&str> = issue_items(&br_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
+    let bd_ids: Vec<&str> = issue_items(&bd_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
 
     assert!(br_ids.contains(&br_a_id.as_str()));
     assert!(br_ids.contains(&br_b_id.as_str()));
@@ -2806,8 +2831,8 @@ fn conformance_dependency_blocking() {
     let br_val: Value = serde_json::from_str(&br_blocked_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_blocked_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -2826,8 +2851,8 @@ fn conformance_dependency_blocking() {
     let br_ready_val: Value = serde_json::from_str(&br_ready_json).unwrap_or(Value::Array(vec![]));
     let bd_ready_val: Value = serde_json::from_str(&bd_ready_json).unwrap_or(Value::Array(vec![]));
 
-    let br_ready_len = br_ready_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_ready_len = bd_ready_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_ready_len = issue_count(&br_ready_val);
+    let bd_ready_len = issue_count(&bd_ready_val);
 
     assert_eq!(
         br_ready_len, bd_ready_len,
@@ -3130,8 +3155,8 @@ fn conformance_list_by_type() {
     let br_val: Value = serde_json::from_str(&br_json).expect("parse");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("parse");
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -3271,8 +3296,8 @@ fn conformance_search_basic() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -3439,8 +3464,8 @@ fn conformance_dep_list() {
     let br_dep_val: Value = serde_json::from_str(&br_dep_json).unwrap_or(Value::Array(vec![]));
     let bd_dep_val: Value = serde_json::from_str(&bd_dep_json).unwrap_or(Value::Array(vec![]));
 
-    let br_dep_len = br_dep_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_dep_len = bd_dep_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_dep_len = issue_count(&br_dep_val);
+    let bd_dep_len = issue_count(&bd_dep_val);
 
     assert_eq!(
         br_dep_len, bd_dep_len,
@@ -3584,8 +3609,8 @@ fn conformance_delete_issue() {
     let br_list_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_list_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_list_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_list_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_list_val);
+    let bd_len = issue_count(&bd_list_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -3842,12 +3867,12 @@ fn conformance_dep_remove() {
     let bd_before: Value = serde_json::from_str(&bd_before_json).unwrap_or(Value::Array(vec![]));
 
     assert_eq!(
-        br_before.as_array().map(|a| a.len()).unwrap_or(0),
+        issue_count(&br_before),
         1,
         "expected 1 blocked issue before remove"
     );
     assert_eq!(
-        bd_before.as_array().map(|a| a.len()).unwrap_or(0),
+        issue_count(&bd_before),
         1,
         "expected 1 blocked issue before remove"
     );
@@ -3877,8 +3902,8 @@ fn conformance_dep_remove() {
     let br_after: Value = serde_json::from_str(&br_after_json).unwrap_or(Value::Array(vec![]));
     let bd_after: Value = serde_json::from_str(&bd_after_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_after.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_after.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_after);
+    let bd_len = issue_count(&bd_after);
 
     assert_eq!(
         br_len, bd_len,
@@ -3948,8 +3973,8 @@ fn conformance_sync_import() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -4084,8 +4109,8 @@ fn conformance_sync_roundtrip() {
     let br_after_val: Value = serde_json::from_str(&br_after_json).expect("parse");
     let bd_after_val: Value = serde_json::from_str(&bd_after_json).expect("parse");
 
-    let br_after_len = br_after_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_after_len = bd_after_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_after_len = issue_count(&br_after_val);
+    let bd_after_len = issue_count(&bd_after_val);
 
     assert_eq!(
         br_after_len, bd_after_len,
@@ -4510,8 +4535,8 @@ fn conformance_sync_import_empty_jsonl() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -4566,8 +4591,8 @@ fn conformance_sync_import_single_issue() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(br_len, bd_len, "single import counts differ");
     assert_eq!(br_len, 1, "expected 1 issue after single import");
@@ -4626,8 +4651,8 @@ fn conformance_sync_import_many_issues() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -4683,8 +4708,8 @@ fn conformance_sync_import_updates_existing() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(br_len, bd_len, "update existing counts differ");
     assert_eq!(br_len, 1, "expected 1 issue (not duplicated)");
@@ -4759,9 +4784,14 @@ fn conformance_sync_roundtrip_preserves_all_fields() {
     let bd_val: Value =
         serde_json::from_str(&extract_json_payload(&bd_list.stdout)).expect("parse bd");
 
-    // Check fields preserved
-    let br_issue = &br_val[0];
-    let bd_issue = &bd_val[0];
+    // Check fields preserved. `br list --json` wraps its rows in a paginated
+    // object, so index through `issue_items` rather than `[0]`.
+    let br_issues = issue_items(&br_val);
+    let bd_issues = issue_items(&bd_val);
+    assert!(!br_issues.is_empty(), "br returned no issues after import");
+    assert!(!bd_issues.is_empty(), "bd returned no issues after import");
+    let br_issue = &br_issues[0];
+    let bd_issue = &bd_issues[0];
 
     assert_eq!(br_issue["title"], bd_issue["title"], "titles should match");
     assert_eq!(
@@ -4815,8 +4845,12 @@ fn conformance_sync_roundtrip_unicode() {
         serde_json::from_str(&extract_json_payload(&bd_list.stdout)).expect("parse bd");
 
     // Check unicode survived
-    let br_title = br_val[0]["title"].as_str().unwrap_or("");
-    let bd_title = bd_val[0]["title"].as_str().unwrap_or("");
+    let br_issues = issue_items(&br_val);
+    let bd_issues = issue_items(&bd_val);
+    assert!(!br_issues.is_empty(), "br returned no issues after import");
+    assert!(!bd_issues.is_empty(), "bd returned no issues after import");
+    let br_title = br_issues[0]["title"].as_str().unwrap_or("");
+    let bd_title = bd_issues[0]["title"].as_str().unwrap_or("");
 
     assert!(br_title.contains("你好"), "br should preserve Chinese");
     assert!(bd_title.contains("你好"), "bd should preserve Chinese");
@@ -5038,8 +5072,8 @@ fn conformance_init_reinit() {
     workspace.init_both();
 
     // Second init (re-init) - should be idempotent or error gracefully
-    let br_reinit = workspace.run_br(["init"], "reinit");
-    let bd_reinit = workspace.run_bd(["init"], "reinit");
+    let br_reinit = workspace.run_br(ConformanceWorkspace::INIT_ARGS, "reinit");
+    let bd_reinit = workspace.run_bd(ConformanceWorkspace::INIT_ARGS, "reinit");
 
     // Both should have matching behavior (either both succeed or both fail)
     assert_eq!(
@@ -5077,8 +5111,8 @@ fn conformance_init_existing_db() {
     workspace.run_bd(["create", "Test issue"], "create");
 
     // Try init again - should preserve data
-    workspace.run_br(["init"], "init_again");
-    workspace.run_bd(["init"], "init_again");
+    workspace.run_br(ConformanceWorkspace::INIT_ARGS, "init_again");
+    workspace.run_bd(ConformanceWorkspace::INIT_ARGS, "init_again");
 
     // Data should still exist
     let br_list = workspace.run_br(["list", "--json"], "list_after");
@@ -5090,8 +5124,8 @@ fn conformance_init_existing_db() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(br_len, bd_len, "issue counts differ after reinit");
 
@@ -5143,8 +5177,14 @@ fn conformance_init_json_output() {
 
     let workspace = ConformanceWorkspace::new();
 
-    let br_init = workspace.run_br(["init", "--json"], "init_json");
-    let bd_init = workspace.run_bd(["init", "--json"], "init_json");
+    let br_init = workspace.run_br(
+        ["init", "--prefix", CONFORMANCE_PREFIX, "--json"],
+        "init_json",
+    );
+    let bd_init = workspace.run_bd(
+        ["init", "--prefix", CONFORMANCE_PREFIX, "--json"],
+        "init_json",
+    );
 
     assert!(
         br_init.status.success(),
@@ -5815,8 +5855,8 @@ fn conformance_list_filter_status_closed() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -5884,8 +5924,8 @@ fn conformance_list_filter_assignee() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -5936,8 +5976,8 @@ fn conformance_list_limit() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -6005,8 +6045,8 @@ fn conformance_list_filter_status_open() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -6078,8 +6118,8 @@ fn conformance_list_filter_status_in_progress() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -6150,8 +6190,8 @@ fn conformance_list_filter_priority_range() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -6219,8 +6259,8 @@ fn conformance_list_filter_label() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -6318,8 +6358,8 @@ fn conformance_list_filter_multiple() {
     let br_val: Value = serde_json::from_str(&br_list_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_list_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_val);
+    let bd_len = issue_count(&bd_val);
 
     assert_eq!(
         br_len, bd_len,
@@ -8101,8 +8141,8 @@ fn conformance_dep_remove_basic_expanded() {
     let br_deps: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_deps: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_deps.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_deps.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_deps);
+    let bd_len = issue_count(&bd_deps);
 
     assert_eq!(br_len, 0, "br should have 0 deps after remove");
     assert_eq!(bd_len, 0, "bd should have 0 deps after remove");
@@ -8194,16 +8234,8 @@ fn conformance_dep_remove_unblocks_issue() {
     let bd_before: Value = serde_json::from_str(&extract_json_payload(&bd_blocked_before.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    assert_eq!(
-        br_before.as_array().map(|a| a.len()).unwrap_or(0),
-        1,
-        "br should have 1 blocked"
-    );
-    assert_eq!(
-        bd_before.as_array().map(|a| a.len()).unwrap_or(0),
-        1,
-        "bd should have 1 blocked"
-    );
+    assert_eq!(issue_count(&br_before), 1, "br should have 1 blocked");
+    assert_eq!(issue_count(&bd_before), 1, "bd should have 1 blocked");
 
     // Remove dependency
     workspace.run_br(["dep", "remove", &br_blocked_id, &br_blocker_id], "rm_dep");
@@ -8218,16 +8250,8 @@ fn conformance_dep_remove_unblocks_issue() {
     let bd_after: Value = serde_json::from_str(&extract_json_payload(&bd_blocked_after.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    assert_eq!(
-        br_after.as_array().map(|a| a.len()).unwrap_or(0),
-        0,
-        "br should have 0 blocked"
-    );
-    assert_eq!(
-        bd_after.as_array().map(|a| a.len()).unwrap_or(0),
-        0,
-        "bd should have 0 blocked"
-    );
+    assert_eq!(issue_count(&br_after), 0, "br should have 0 blocked");
+    assert_eq!(issue_count(&bd_after), 0, "bd should have 0 blocked");
 
     // Verify now ready
     let br_ready = workspace.run_br(["ready", "--json"], "ready_after");
@@ -8240,8 +8264,8 @@ fn conformance_dep_remove_unblocks_issue() {
 
     // Both issues should now be ready
     assert_eq!(
-        br_ready_val.as_array().map(|a| a.len()).unwrap_or(0),
-        bd_ready_val.as_array().map(|a| a.len()).unwrap_or(0),
+        issue_count(&br_ready_val),
+        issue_count(&bd_ready_val),
         "ready counts should match"
     );
 
@@ -8302,8 +8326,8 @@ fn conformance_dep_remove_preserves_other_deps() {
     let bd_before: Value = serde_json::from_str(&extract_json_payload(&bd_list_before.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    assert_eq!(br_before.as_array().map(|a| a.len()).unwrap_or(0), 2);
-    assert_eq!(bd_before.as_array().map(|a| a.len()).unwrap_or(0), 2);
+    assert_eq!(issue_count(&br_before), 2);
+    assert_eq!(issue_count(&bd_before), 2);
 
     // Remove only A->B
     workspace.run_br(["dep", "remove", &br_a_id, &br_b_id], "rm_a_b");
@@ -8318,16 +8342,8 @@ fn conformance_dep_remove_preserves_other_deps() {
     let bd_after: Value = serde_json::from_str(&extract_json_payload(&bd_list_after.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    assert_eq!(
-        br_after.as_array().map(|a| a.len()).unwrap_or(0),
-        1,
-        "br should have 1 dep left"
-    );
-    assert_eq!(
-        bd_after.as_array().map(|a| a.len()).unwrap_or(0),
-        1,
-        "bd should have 1 dep left"
-    );
+    assert_eq!(issue_count(&br_after), 1, "br should have 1 dep left");
+    assert_eq!(issue_count(&bd_after), 1, "bd should have 1 dep left");
 
     info!("conformance_dep_remove_preserves_other_deps passed");
 }
@@ -8374,8 +8390,8 @@ fn conformance_dep_list_basic_expanded() {
         .unwrap_or(Value::Array(vec![]));
 
     assert_eq!(
-        br_deps.as_array().map(|a| a.len()).unwrap_or(0),
-        bd_deps.as_array().map(|a| a.len()).unwrap_or(0),
+        issue_count(&br_deps),
+        issue_count(&bd_deps),
         "dep list counts should match"
     );
 
@@ -8410,16 +8426,8 @@ fn conformance_dep_list_empty() {
     let bd_deps: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    assert_eq!(
-        br_deps.as_array().map(|a| a.len()).unwrap_or(0),
-        0,
-        "br should have 0 deps"
-    );
-    assert_eq!(
-        bd_deps.as_array().map(|a| a.len()).unwrap_or(0),
-        0,
-        "bd should have 0 deps"
-    );
+    assert_eq!(issue_count(&br_deps), 0, "br should have 0 deps");
+    assert_eq!(issue_count(&bd_deps), 0, "bd should have 0 deps");
 
     info!("conformance_dep_list_empty passed");
 }
@@ -8484,8 +8492,8 @@ fn conformance_dep_list_by_type() {
     let bd_deps: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_len = br_deps.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_len = bd_deps.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_len = issue_count(&br_deps);
+    let bd_len = issue_count(&bd_deps);
 
     assert_eq!(
         br_len, bd_len,
@@ -8842,7 +8850,16 @@ fn conformance_dep_cycles_simple() {
     let br_cycles = workspace.run_br(["dep", "cycles", "--json"], "cycles");
     let bd_cycles = workspace.run_bd(["dep", "cycles", "--json"], "cycles");
 
-    assert!(br_cycles.status.success(), "br dep cycles failed");
+    // #368: `br dep cycles` exits 5 (CycleDetected) when an active cycle is
+    // present so scripted callers can gate on the exit code. This diverges from
+    // bd, which exits 0; the cycle here is a `related` edge that bd's
+    // blocking-only detector ignores, so bd still exits 0. The cycle *data* is
+    // emitted on stdout regardless and is compared below.
+    assert_eq!(
+        br_cycles.status.code(),
+        Some(5),
+        "br dep cycles should exit 5 when an active cycle is present"
+    );
     assert!(bd_cycles.status.success(), "bd dep cycles failed");
 
     let br_json = extract_json_payload(&br_cycles.stdout);
@@ -8927,7 +8944,14 @@ fn conformance_dep_cycles_complex() {
     let br_cycles = workspace.run_br(["dep", "cycles", "--json"], "cycles");
     let bd_cycles = workspace.run_bd(["dep", "cycles", "--json"], "cycles");
 
-    assert!(br_cycles.status.success(), "br dep cycles failed");
+    // #368: active cycle present -> `br dep cycles` exits 5. The `related`
+    // triangular cycle is invisible to bd's blocking-only detector, so bd
+    // exits 0. Cycle data still lands on stdout and is compared below.
+    assert_eq!(
+        br_cycles.status.code(),
+        Some(5),
+        "br dep cycles should exit 5 when an active cycle is present"
+    );
     assert!(bd_cycles.status.success(), "bd dep cycles failed");
 
     let br_json = extract_json_payload(&br_cycles.stdout);
@@ -9031,7 +9055,14 @@ fn conformance_stats_empty() {
     compare_json(
         &br_json,
         &bd_json,
-        &CompareMode::FieldsExcluded(vec!["average_lead_time_hours".to_string()]),
+        // `draft_issues` is a br-only summary field with no bd v0.46.0
+        // counterpart, verified against a real bd on 2026-07-25
+        // (`beads_rust-ecr6`). Excluding just that key keeps every other stats
+        // counter under live comparison, rather than ignoring the whole test.
+        &CompareMode::FieldsExcluded(vec![
+            "average_lead_time_hours".to_string(),
+            "draft_issues".to_string(),
+        ]),
     )
     .expect("JSON mismatch");
 
@@ -9083,7 +9114,14 @@ fn conformance_stats_mixed() {
     compare_json(
         &br_json,
         &bd_json,
-        &CompareMode::FieldsExcluded(vec!["average_lead_time_hours".to_string()]),
+        // `draft_issues` is a br-only summary field with no bd v0.46.0
+        // counterpart, verified against a real bd on 2026-07-25
+        // (`beads_rust-ecr6`). Excluding just that key keeps every other stats
+        // counter under live comparison, rather than ignoring the whole test.
+        &CompareMode::FieldsExcluded(vec![
+            "average_lead_time_hours".to_string(),
+            "draft_issues".to_string(),
+        ]),
     )
     .expect("JSON mismatch");
 
@@ -9129,7 +9167,14 @@ fn conformance_stats_with_deps() {
     compare_json(
         &br_json,
         &bd_json,
-        &CompareMode::FieldsExcluded(vec!["average_lead_time_hours".to_string()]),
+        // `draft_issues` is a br-only summary field with no bd v0.46.0
+        // counterpart, verified against a real bd on 2026-07-25
+        // (`beads_rust-ecr6`). Excluding just that key keeps every other stats
+        // counter under live comparison, rather than ignoring the whole test.
+        &CompareMode::FieldsExcluded(vec![
+            "average_lead_time_hours".to_string(),
+            "draft_issues".to_string(),
+        ]),
     )
     .expect("JSON mismatch");
 
@@ -9162,7 +9207,12 @@ fn conformance_stats_json_shape() {
     let br_val: Value = serde_json::from_str(&br_json).expect("br json");
     let bd_val: Value = serde_json::from_str(&bd_json).expect("bd json");
 
-    let excluded = vec!["average_lead_time_hours".to_string()];
+    // See the sibling stats tests: `draft_issues` is a br-only summary field
+    // with no bd v0.46.0 counterpart (`beads_rust-ecr6`).
+    let excluded = vec![
+        "average_lead_time_hours".to_string(),
+        "draft_issues".to_string(),
+    ];
     let br_filtered = filter_fields(&br_val, &excluded);
     let bd_filtered = filter_fields(&bd_val, &excluded);
 
@@ -11315,7 +11365,21 @@ fn conformance_graph_no_deps() {
     info!("conformance_graph_no_deps passed");
 }
 
+/// INTENTIONAL DIVERGENCE — `br graph <id>` walks the graph in the opposite
+/// direction to `bd graph <id>` (`beads_rust-mf72`).
+///
+/// After `br dep add A B` (A depends on B), `br graph A` returns just A with no
+/// edges, while `br graph B` returns `{"nodes":[B,A],"edges":[["A","B"]]}`. br
+/// traverses *dependents* — "what does closing this unblock?" — where bd
+/// traverses *dependencies*. This is by design and stated in
+/// `src/cli/commands/graph.rs`: "Visualizes dependency graphs with focus on
+/// reverse dependencies (dependents)". `br dep tree` covers the other
+/// direction.
+///
+/// These three tests assert bd's direction and so can never pass. Verified by
+/// hand against a real bd v0.46.0 on 2026-07-25.
 #[test]
+#[ignore = "beads_rust-mf72: br graph shows dependents by design; bd shows dependencies"]
 fn conformance_graph_simple_dep() {
     skip_if_no_bd!();
     common::init_test_logging();
@@ -11359,7 +11423,10 @@ fn conformance_graph_simple_dep() {
     info!("conformance_graph_simple_dep passed");
 }
 
+/// See `conformance_graph_simple_dep` — same direction divergence
+/// (`beads_rust-mf72`).
 #[test]
+#[ignore = "beads_rust-mf72: br graph shows dependents by design; bd shows dependencies"]
 fn conformance_graph_complex_deps() {
     skip_if_no_bd!();
     common::init_test_logging();
@@ -11424,7 +11491,10 @@ fn conformance_graph_complex_deps() {
     info!("conformance_graph_complex_deps passed");
 }
 
+/// See `conformance_graph_simple_dep` — same direction divergence
+/// (`beads_rust-mf72`).
 #[test]
+#[ignore = "beads_rust-mf72: br graph shows dependents by design; bd shows dependencies"]
 fn conformance_graph_all_flag() {
     skip_if_no_bd!();
     common::init_test_logging();
@@ -12097,22 +12167,14 @@ fn conformance_q_id_in_list() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_ids: Vec<&str> = br_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let bd_ids: Vec<&str> = bd_val
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let br_ids: Vec<&str> = issue_items(&br_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
+    let bd_ids: Vec<&str> = issue_items(&bd_val)
+        .into_iter()
+        .filter_map(|v| v.get("id").and_then(|id| id.as_str()))
+        .collect();
 
     assert!(br_ids.contains(&br_id.as_str()));
     assert!(bd_ids.contains(&bd_id.as_str()));
@@ -13100,7 +13162,15 @@ fn conformance_sync_base_snapshot_created_after_sync() {
     info!("conformance_sync_base_snapshot_created_after_sync passed");
 }
 
+/// INTENTIONAL DIVERGENCE, same root cause as
+/// `conformance_sync_base_snapshot_created_after_sync` above: this test drives a
+/// bare `sync`. bd v0.46.0 treats that as "commit to git and write
+/// `beads.base.jsonl`"; br's non-invasive design never runs git and requires an
+/// explicit direction, so it does not write a base snapshot there. The test then
+/// trips its own `(Some, None)` mismatch arm. Verified against a real bd v0.46.0
+/// on 2026-07-25 (`beads_rust-ecr6`).
 #[test]
+#[ignore = "bare `sync` writes beads.base.jsonl on bd via its git-commit path; br is intentionally non-invasive"]
 fn conformance_sync_base_snapshot_content_matches() {
     skip_if_no_bd!();
     common::init_test_logging();
@@ -13221,8 +13291,8 @@ fn conformance_sync_base_snapshot_preserves_issue_state() {
     let br_val: Value = serde_json::from_str(&br_json).unwrap_or(Value::Array(vec![]));
     let bd_val: Value = serde_json::from_str(&bd_json).unwrap_or(Value::Array(vec![]));
 
-    let br_count = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_val);
+    let bd_count = issue_count(&bd_val);
 
     assert_eq!(
         br_count, bd_count,
@@ -13550,8 +13620,8 @@ fn conformance_sync_import_same_prefix_succeeds() {
     let bd_val: Value = serde_json::from_str(&extract_json_payload(&bd_list.stdout))
         .unwrap_or(Value::Array(vec![]));
 
-    let br_count = br_val.as_array().map(|a| a.len()).unwrap_or(0);
-    let bd_count = bd_val.as_array().map(|a| a.len()).unwrap_or(0);
+    let br_count = issue_count(&br_val);
+    let bd_count = issue_count(&bd_val);
 
     assert_eq!(
         br_count, bd_count,
@@ -13597,4 +13667,109 @@ fn conformance_sync_status_shows_prefix_info() {
     assert!(br_val.is_ok(), "br status should produce valid JSON");
 
     info!("conformance_sync_status_shows_prefix_info passed");
+}
+
+// ---------------------------------------------------------------------------
+// Harness self-tests (`beads_rust-f175`, `beads_rust-ywot`)
+//
+// These exercise the comparison machinery itself and need no `bd`, so they run
+// on every host — including the ones where every `conformance_*` test skips.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn issue_count_reads_both_envelope_shapes() {
+    // `beads_rust-ywot`: the bug this guards against is that
+    // `Value::as_array()` returns None for br's paginated object, so every
+    // `br list --json` count read as 0 — failing loudly where bd returned rows
+    // and, worse, passing vacuously where it did not.
+    let bare = serde_json::json!([{ "id": "bd-a" }, { "id": "bd-b" }]);
+    let paginated = serde_json::json!({
+        "issues": [{ "id": "bd-a" }, { "id": "bd-b" }],
+        "total": 2, "limit": 50, "offset": 0, "has_more": false,
+    });
+
+    assert_eq!(issue_count(&bare), 2);
+    assert_eq!(
+        issue_count(&paginated),
+        2,
+        "the shape that used to read as 0"
+    );
+    assert_eq!(issue_count(&bare), issue_count(&paginated));
+
+    // Empty is genuinely empty in both shapes, not conflated with "unreadable".
+    assert_eq!(issue_count(&serde_json::json!([])), 0);
+    assert_eq!(issue_count(&serde_json::json!({ "issues": [] })), 0);
+
+    // Anything else counts as 0, matching the previous `unwrap_or(0)`.
+    assert_eq!(
+        issue_count(&serde_json::json!({ "summary": { "x": 1 } })),
+        0
+    );
+    assert_eq!(issue_count(&serde_json::Value::Null), 0);
+}
+
+#[test]
+fn issue_items_reads_both_envelope_shapes() {
+    let bare = serde_json::json!([{ "id": "bd-a" }]);
+    let paginated = serde_json::json!({ "issues": [{ "id": "bd-a" }], "total": 1 });
+
+    assert_eq!(issue_items(&bare).len(), 1);
+    assert_eq!(issue_items(&paginated).len(), 1);
+    assert_eq!(issue_items(&paginated)[0]["id"], "bd-a");
+    assert!(issue_items(&serde_json::json!({ "summary": {} })).is_empty());
+}
+
+#[test]
+fn init_args_force_the_same_prefix_on_both_tools() {
+    // Both tools derive a prefix from their working directory when none is
+    // given, and this harness deliberately gives them different directories.
+    // If this ever regresses to a bare ["init"], every id comparison under
+    // CompareMode::NormalizedJson becomes unsatisfiable.
+    assert_eq!(
+        ConformanceWorkspace::INIT_ARGS,
+        ["init", "--prefix", CONFORMANCE_PREFIX]
+    );
+    assert!(
+        !CONFORMANCE_PREFIX.contains('-'),
+        "a prefix containing '-' would be split by the id normalizer"
+    );
+}
+
+#[test]
+fn id_normalization_preserves_the_whole_prefix() {
+    let mut value = serde_json::json!({
+        "id": "bd-a1b2c3",
+        "issue_id": "beads-rust-9f8e7d",
+        "depends_on_id": "bd-parent.1",
+        "nested": { "id": "ops-deadbeef" },
+        "items": [{ "id": "api-cafe01" }],
+    });
+    normalize_value(&mut value);
+
+    assert_eq!(value["id"], "bd-NORMALIZED");
+    // The load-bearing case: a prefix that itself contains a dash must survive
+    // intact. Splitting on the first dash yielded "beads-NORMALIZED".
+    assert_eq!(value["issue_id"], "beads-rust-NORMALIZED");
+    // A dotted child id has only one dash, so `find` and `rfind` agree and the
+    // whole `parent.1` suffix is treated as the hash portion.
+    assert_eq!(value["depends_on_id"], "bd-NORMALIZED");
+    assert_eq!(value["nested"]["id"], "ops-NORMALIZED");
+    assert_eq!(value["items"][0]["id"], "api-NORMALIZED");
+}
+
+#[test]
+fn id_normalization_makes_matching_prefixes_compare_equal() {
+    // The whole point: two workspaces initialized with the same prefix produce
+    // ids that normalize to the same value despite different hashes.
+    let mut br = serde_json::json!({ "id": "bd-aaaaaa", "content_hash": "deadbeef" });
+    let mut bd = serde_json::json!({ "id": "bd-zzzzzz", "content_hash": "cafebabe" });
+    normalize_value(&mut br);
+    normalize_value(&mut bd);
+    assert_eq!(br, bd);
+
+    // ...and that differing prefixes still compare unequal, so the fix does not
+    // paper over a real divergence.
+    let mut mismatched = serde_json::json!({ "id": "br-aaaaaa", "content_hash": "deadbeef" });
+    normalize_value(&mut mismatched);
+    assert_ne!(br, mismatched);
 }

@@ -8,6 +8,7 @@ expression: normalize_json(&json)
     "title": "Issue to update",
     "status": "in_progress",
     "priority": 2,
+    "assignee": null,
     "updated_at": "TIMESTAMP"
   }
 ]

@@ -1,0 +1,71 @@
+# Local Cargo build outputs.
+/target/
+/target/**
+/target-gate/
+/target-gate/**
+/.codex-targets/
+/.codex-targets/**
+
+# Local toolchain/cache mirrors. Keep .cargo/config.toml visible because it
+# carries the local frankensqlite/asupersync patch configuration for proof runs.
+/.cargo/registry/
+/.cargo/registry/**
+/.cargo/git/
+/.cargo/git/**
+/.cargo/.global-cache
+/.cargo/.package-cache
+/.cargo/.package-cache-mutate
+/.rustup/
+/.rustup/**
+
+# Local issue databases and coordination sidecars are not Cargo inputs. The
+# tracked .beads/issues.jsonl remains visible unless excluded by a narrower
+# command-specific closure.
+/.beads/*.db
+/.beads/*db-shm
+/.beads/*db-wal
+/.beads/*db-journal
+/.beads/.br_history/
+/.beads/.br_history/**
+/.beads/.br_recovery/
+/.beads/.br_recovery/**
+/.beads.snapshot_*/
+/.beads.snapshot_*/**
+
+# Agent audit/profiling/generated evidence directories.
+/.ub-exorcism/
+/.ub-exorcism/**
+/.unsafe-audit/
+/.unsafe-audit/**
+/beads_compliance_audit/
+/beads_compliance_audit/**
+/refactor/artifacts/
+/refactor/artifacts/**
+/tests/artifacts/
+/tests/artifacts/**
+/fuzz/artifacts/
+/fuzz/artifacts/**
+
+# Local scratch and legacy copies.
+/legacy_beads/
+/legacy_beads/**
+/sample_beads_db_files/
+/sample_beads_db_files/**
+/temp_test/
+/temp_test/**
+/temp_test_2/
+/temp_test_2/**
+
+# Crash dumps and ad hoc local probes.
+/core.*
+/perf.data
+/perf.data.*
+/rustc-ice-*.txt
+/test_*
+/test_*.rs
+/*.db
+/*.db-shm
+/*.db-wal
+/*.sqlite3
+/*.sqlite3-shm
+/*.sqlite3-wal

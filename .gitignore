@@ -187,6 +187,21 @@ report.json
 # without the global entry).
 .ntm/logs/*.log
 
+# NTM agent coordination state (human inbox spool, per-pane rate-limit
+# snapshots, spawn-state cache, robot snapshot summaries) — regenerated
+# on every orchestrator tick.
+.ntm/human_inbox/
+.ntm/rate_limits.json
+.ntm/spawn-state.json
+.ntm/summaries/
+
+# Skill workspaces — per-pass scratch trees written by /harmonize-skills-*,
+# /rust-unsafe-code-exorcist, and the rust-undefined-behavior-exorcist
+# skill. Each is regenerated on the next run.
+.harmonize_workspace/
+.ub-exorcism/
+.unsafe-audit/
+
 # Skill-loop / refactor-pass run artifacts that should NOT be tracked.
 # Each pass's directory under refactor/artifacts/ legitimately contains
 # small markdown ledgers, scoring files, and golden replay JSON which
@@ -213,3 +228,8 @@ tests/artifacts/perf/
 tests/artifacts/perf/**/perf.data
 tests/artifacts/perf/**/*.beads/
 *.perf.data
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
+# br doctor per-run artifacts
+.doctor/

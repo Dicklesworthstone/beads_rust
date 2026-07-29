@@ -220,6 +220,9 @@ where
     }
 
     /// Admit or replace a value with a caller-provided memory weight.
+    #[allow(clippy::needless_pass_by_value)] // `key` clones into `insert_resident`
+    // and is also borrowed by `remove`/`entries.get_mut`; restructuring the
+    // function to take `&K` is a wider API change than this commit warrants.
     pub fn put(&mut self, key: K, value: V, weight: usize) -> S3FifoAdmission {
         if !self.config.enabled || self.config.max_weight == 0 {
             self.stats.admission_rejections += 1;
@@ -233,16 +236,24 @@ where
             return S3FifoAdmission::RejectedOversized;
         }
 
+        let old_entry = self.entries.get(&key).map(|e| (e.segment, e.frequency));
         let replaced = self.remove(&key).is_some();
-        let segment = if self.remove_from_ghost(&key) {
+
+        let (segment, frequency) = if let Some((old_segment, old_frequency)) = old_entry {
+            (old_segment, old_frequency)
+        } else if self.remove_from_ghost(&key) {
             self.stats.ghost_hits += 1;
-            S3FifoSegment::Main
+            (S3FifoSegment::Main, 0)
         } else {
-            S3FifoSegment::Small
+            (S3FifoSegment::Small, 0)
         };
 
         self.evict_to_fit(weight);
-        self.insert_resident(key, value, weight, segment);
+        self.insert_resident(key.clone(), value, weight, segment);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.frequency = frequency;
+        }
+
         self.stats.admissions += 1;
         if replaced {
             S3FifoAdmission::Replaced
@@ -263,7 +274,13 @@ where
                 self.main_weight = self.main_weight.saturating_sub(entry.weight);
             }
         }
+        self.remove_resident_queue_refs(key);
         Some(entry.value)
+    }
+
+    fn remove_resident_queue_refs(&mut self, key: &K) {
+        self.small.retain(|candidate| candidate != key);
+        self.main.retain(|candidate| candidate != key);
     }
 
     fn insert_resident(&mut self, key: K, value: V, weight: usize, segment: S3FifoSegment) {
@@ -548,6 +565,21 @@ mod tests {
         assert_eq!(cache.len(), 8);
         assert_eq!(cache.current_weight(), 8);
         assert!(cache.stats().evictions > 0);
+    }
+
+    #[test]
+    fn replacing_resident_entry_removes_stale_queue_slots() {
+        let mut cache = S3FifoCache::new(2);
+
+        assert_eq!(cache.put("a", "A1", 1), S3FifoAdmission::Stored);
+        assert_eq!(cache.put("b", "B", 1), S3FifoAdmission::Stored);
+        assert_eq!(cache.put("a", "A2", 1), S3FifoAdmission::Replaced);
+        assert_eq!(cache.put("c", "C", 1), S3FifoAdmission::Stored);
+
+        assert_eq!(cache.get(&"a"), Some(&"A2"));
+        assert!(!cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"c"), Some(&"C"));
+        assert!(cache.current_weight() <= cache.config().max_weight);
     }
 
     #[test]

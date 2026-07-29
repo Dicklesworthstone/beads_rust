@@ -50,6 +50,8 @@ fn make_valid_issue(title: &str) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -207,53 +209,40 @@ proptest! {
         prop_assert!(result.is_ok(), "Title with {len} chars should pass");
     }
 
-    /// Property: Description over 100KB fails validation
+    /// Property: long descriptions pass validation cleanly (no size cap).
     #[test]
-    fn large_description_fails(extra_bytes in 1usize..1000usize) {
+    fn large_description_validates(extra_bytes in 1usize..1000usize) {
         init_test_logging();
-        let len = 102_400 + extra_bytes;
+        // Sample size well past the prior 100KB cap to lock in the
+        // unbounded contract.
+        let len = 600_000 + extra_bytes;
         info!("proptest_large_desc: len={len}");
 
         let mut issue = make_valid_issue("Test Issue");
         issue.description = Some("x".repeat(len));
 
         let result = IssueValidator::validate(&issue);
-
-        prop_assert!(result.is_err(), "Description with {len} bytes should fail");
-        let errors = result.unwrap_err();
-        prop_assert!(
-            errors.iter().any(|e| e.field == "description"),
-            "Should have description error"
-        );
+        prop_assert!(result.is_ok(), "Description with {len} bytes must validate (long-text fields are unbounded)");
     }
 
-    /// Property: rich-text issue fields over 100KB fail validation.
+    /// Property: long rich-text fields pass validation cleanly (no size cap).
     #[test]
-    fn large_rich_text_fields_fail(
+    fn large_rich_text_fields_validate(
         field_index in 0usize..3usize,
         extra_bytes in 1usize..1000usize,
     ) {
         init_test_logging();
-        let len = 102_400 + extra_bytes;
+        let len = 600_000 + extra_bytes;
         let payload = "x".repeat(len);
 
         let mut issue = make_valid_issue("Test Issue");
-        let expected_field = match field_index {
-            0 => {
-                issue.design = Some(payload);
-                "design"
-            }
-            1 => {
-                issue.acceptance_criteria = Some(payload);
-                "acceptance_criteria"
-            }
-            _ => {
-                issue.notes = Some(payload);
-                "notes"
-            }
-        };
+        match field_index {
+            0 => issue.design = Some(payload),
+            1 => issue.acceptance_criteria = Some(payload),
+            _ => issue.notes = Some(payload),
+        }
 
-        assert_validation_error_for_field(IssueValidator::validate(&issue), expected_field);
+        IssueValidator::validate(&issue).expect("long rich-text fields must validate cleanly");
     }
 
     /// Property: actor/source metadata over 200 chars fails validation.

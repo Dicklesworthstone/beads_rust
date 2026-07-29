@@ -1,6 +1,6 @@
 {
   "tool": "br",
-  "generated_at": "2026-04-25T00:17:56.060850569Z",
+  "generated_at": "<GENERATED_AT>",
   "schemas": {
     "IssueDetails": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -151,7 +151,21 @@
           ]
         },
         "source_repo": {
-          "description": "Source repository for multi-repo support.",
+          "description": "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_repo_path": {
+          "description": "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent_context": {
+          "description": "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content.",
           "type": [
             "string",
             "null"
@@ -260,13 +274,28 @@
             "string",
             "null"
           ]
+        },
+        "rollup": {
+          "description": "Derived parent-child subtree rollup; present only when the issue has\nlocal parent-child children (GitHub #384 phase 3).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RollupSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
         "id",
         "title",
+        "status",
+        "priority",
+        "issue_type",
         "created_at",
-        "updated_at"
+        "updated_at",
+        "compaction_level"
       ],
       "$defs": {
         "Status": {
@@ -344,7 +373,7 @@
               ]
             },
             "metadata": {
-              "description": "Optional metadata (JSON).",
+              "description": "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`].",
               "type": [
                 "string",
                 "null"
@@ -484,6 +513,27 @@
             "created_at": {
               "type": "string",
               "format": "date-time"
+            },
+            "agent_name": {
+              "description": "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "harness": {
+              "description": "Tier 1 attribution: self-reported harness identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "description": "Tier 1 attribution: self-reported model identifier (capture-only).",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -496,6 +546,29 @@
         },
         "EventType": {
           "type": "string"
+        },
+        "RollupSummary": {
+          "description": "Derived parent-child subtree rollup for a parent issue (GitHub #384\nphase 3: hierarchy observability).\n\nThe rollup reports what a parent's subtree is effectively doing without\nmutating the parent's explicit status: an epic can stay `open` while its\nrollup says `in_progress` because a descendant started.",
+          "type": "object",
+          "properties": {
+            "status": {
+              "description": "Furthest-along non-terminal descendant status in workflow order, or\n`closed` when every descendant is terminal.",
+              "type": "string"
+            },
+            "descendants": {
+              "description": "Count of strict parent-child descendants by stored status.",
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0
+              }
+            }
+          },
+          "required": [
+            "status",
+            "descendants"
+          ]
         }
       }
     }

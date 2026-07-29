@@ -3,7 +3,7 @@
 //! Classic bd-style LIKE search across title/description/id with list-like filters.
 
 use crate::cli::{
-    DEFAULT_LIST_LIMIT, DEFAULT_LIST_OFFSET, ListArgs, OutputFormat, SearchArgs,
+    DEFAULT_LIST_OFFSET, DEFAULT_SEARCH_LIMIT, ListArgs, OutputFormat, SearchArgs,
     resolve_output_format_with_outer_mode,
 };
 use crate::config;
@@ -414,7 +414,10 @@ fn normalize_whitespace(input: &str) -> String {
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     validate_sort_key(args.sort.as_deref())?;
 
-    let statuses = if args.status.is_empty() {
+    // `--status all` is the same meta-value `br lint` accepts: no status
+    // filter, every status included (beads_rust-6ilv).
+    let all_statuses = super::status_filter_requests_all(&args.status);
+    let statuses = if args.status.is_empty() || all_statuses {
         None
     } else {
         Some(
@@ -447,6 +450,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     };
 
     let include_closed = args.all
+        || all_statuses
         || statuses
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
@@ -469,7 +473,9 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         include_deferred,
         include_templates: false,
         title_contains: args.title_contains.clone(),
-        limit: Some(args.limit.unwrap_or(DEFAULT_LIST_LIMIT)),
+        // #349: search stays capped (a broad text query can match a large
+        // fraction of the corpus); list/ready are complete by default.
+        limit: Some(args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT)),
         offset: Some(args.offset.unwrap_or(DEFAULT_LIST_OFFSET)),
         sort: args.sort.clone(),
         reverse: args.reverse,
@@ -750,6 +756,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -847,10 +855,12 @@ mod tests {
     }
 
     #[test]
-    fn test_search_build_filters_applies_list_defaults_when_cli_omits_pagination() {
+    fn test_search_build_filters_applies_search_defaults_when_cli_omits_pagination() {
+        // #349: search stays capped at DEFAULT_SEARCH_LIMIT (50) by default,
+        // even though list/ready became unlimited.
         let filters = build_filters(&ListArgs::default()).expect("build filters");
 
-        assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
+        assert_eq!(filters.limit, Some(DEFAULT_SEARCH_LIMIT));
         assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }
 

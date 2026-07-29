@@ -25,8 +25,9 @@ Default recommendations:
 
 - Prefer `--json` or `--robot` for all machine parsing.
 - Set `RUST_LOG=error` unless debugging `br` internals.
-- Keep mutation commands explicit. `br` does not run git and does not install
-  hooks or daemons.
+- Keep mutation commands explicit. `br sync` does not run Git, and `br` does
+  not install hooks or daemons. Git visibility is an explicit
+  `br vcs-status` request.
 - Use `br sync --status --json` as a cheap pre-commit state check.
 - Use `br sync --flush-only` at the end of a mutation session before staging
   `.beads/issues.jsonl`.
@@ -141,6 +142,54 @@ br comments add <id> --author "$AGENT_NAME" \
 This is an advisory claim, not a lock. Keep the file set small and re-check
 `git status --short` before editing.
 
+## Coordination Console Runbook
+
+Use this runbook when a swarm pane reports no ready work, but the backlog still
+has open or blocked follow-up work. The goal is to distinguish a truly dry queue
+from work hidden behind stale `in_progress` claims.
+
+Manual command shape:
+
+```bash
+RUST_LOG=error br ready --json
+bv --robot-next
+RUST_LOG=error br list --status in_progress --json
+RUST_LOG=error br coordination status --json
+```
+
+Interpretation:
+
+- Empty `br ready --json` plus empty `in_progress` output means the ready queue
+  is actually dry; move to `bv --robot-alerts` or backlog planning.
+- Empty ready output plus `in_progress` claims means inspect claim age,
+  assignee, latest comments, and Agent Mail evidence before reclaiming.
+- `classification: "no_mail_snapshot"` means gather Agent Mail evidence; it is
+  not abandonment proof.
+- `required_human_confirmation: true` means ask the owner or operator before
+  touching the bead.
+
+Manual snapshot correlation, using files exported by the coordination layer
+outside `br`:
+
+```bash
+RUST_LOG=error br coordination status \
+  --reservations reservations.jsonl \
+  --agents agents.jsonl \
+  --json
+```
+
+Safe reclaim remains a two-step manual sequence. Review advisory output first,
+then copy the suggested audit comment and claim command only when policy allows
+it:
+
+```bash
+RUST_LOG=error br coordination status --reservations reservations.jsonl --agents agents.jsonl --json \
+  | jq '.claims[] | select(.reclaim_allowed_by_policy == true) | {id: .issue.id, suggested_commands}'
+```
+
+`br coordination status` is read-only. It does not call Agent Mail, run git,
+create reservations, release reservations, or auto-reclaim work.
+
 ## MCP Serve Topology
 
 `br serve` is optional and requires the `mcp` feature. It runs over stdio, not a
@@ -167,6 +216,9 @@ Topology guidance:
 - Use direct CLI calls for simple scripts and batch shell pipelines.
 - Agent Mail remains the reservation layer. MCP is an API surface, not a lock
   manager.
+- `beads://coordination/status` mirrors `br coordination status --json` for
+  MCP-native agents, but it has no live Agent Mail access; use CLI snapshots for
+  reservation correlation.
 
 ## Evidence Workflow
 

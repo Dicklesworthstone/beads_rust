@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/toon_output.rs
+assertion_line: 113
 expression: normalized
 ---
 [3]:
@@ -8,6 +9,7 @@ expression: normalized
     description: Unblocks dependent work
     id: bd-blocker
     issue_type: task
+    labels[1]: core
     priority: 0
     status: open
     title: "00 Blocking Root"
@@ -16,6 +18,7 @@ expression: normalized
     created_by: fixture
     id: bd-ready-p0
     issue_type: bug
+    labels[2]: agent,ops
     priority: 0
     status: open
     title: "01 Ready Critical Unassigned"
@@ -25,6 +28,7 @@ expression: normalized
     created_by: fixture
     id: bd-ready-p1-assigned
     issue_type: feature
+    labels[1]: frontend
     owner: owner@example.com
     priority: 1
     status: open

@@ -1,11 +1,10 @@
 //! Syntax highlighting for code blocks.
 //!
-//! Provides mode-aware syntax highlighting for code embedded in issue descriptions
-//! and comments. Uses `rich_rust`'s Syntax component when available.
+//! Provides mode-aware code block formatting for issue descriptions and comments.
 //!
 //! # Mode Behavior
 //!
-//! - **Rich**: Full color syntax highlighting via syntect
+//! - **Rich**: Indented code block with no colorized syntax
 //! - **Plain**: Indented code block with no colors
 //! - **JSON**: Raw code string unchanged
 //! - **Quiet**: No output
@@ -22,8 +21,38 @@
 //! ```
 
 use crate::output::{OutputContext, OutputMode};
-use rich_rust::color::ColorSystem;
-use rich_rust::renderables::syntax::{Syntax, SyntaxError};
+const KNOWN_LANGUAGES: &[&str] = &[
+    "bash",
+    "c",
+    "c#",
+    "c++",
+    "css",
+    "docker",
+    "go",
+    "html",
+    "java",
+    "javascript",
+    "json",
+    "kotlin",
+    "markdown",
+    "php",
+    "powershell",
+    "python",
+    "ruby",
+    "rust",
+    "scala",
+    "scss",
+    "sql",
+    "swift",
+    "text",
+    "toml",
+    "typescript",
+    "xml",
+    "yaml",
+    "zsh",
+];
+
+const AVAILABLE_THEMES: &[&str] = &["plain"];
 
 /// Highlight code with syntax-aware coloring based on output mode.
 ///
@@ -35,15 +64,13 @@ use rich_rust::renderables::syntax::{Syntax, SyntaxError};
 ///
 /// # Returns
 ///
-/// A string with the highlighted code. In Rich mode, includes ANSI escape codes.
-/// In Plain mode, returns indented code. In JSON mode, returns raw code.
+/// A string with the formatted code. Rich and Plain modes return an indented
+/// code block. JSON and TOON modes return the raw code.
 ///
 /// # Language Support
 ///
-/// Supported languages include: rust, python, go, typescript, javascript, sql,
-/// bash, yaml, json, toml, html, css, markdown, and 100+ others via syntect.
-///
-/// Unknown languages fall back to plain text rendering without highlighting.
+/// Known language aliases are normalized for stable display and future extension.
+/// Unknown languages fall back to plain text rendering.
 #[must_use]
 pub fn highlight_code(code: &str, language: &str, ctx: &OutputContext) -> String {
     match ctx.mode() {
@@ -62,37 +89,10 @@ fn format_plain_code(code: &str) -> String {
         .join("\n")
 }
 
-/// Highlight code using rich_rust's Syntax component.
-fn highlight_rich(code: &str, language: &str, width: usize) -> String {
-    // Normalize language name for syntect
-    let lang = normalize_language(language);
-
-    // Try to highlight with syntect, fall back to plain text on failure
-    try_highlight(&lang, code, width).unwrap_or_else(|_| format_plain_code(code))
-}
-
-/// Attempt to highlight code, returning the rendered string.
-fn try_highlight(language: &str, code: &str, _width: usize) -> Result<String, SyntaxError> {
-    let line_count = code.lines().count();
-    let show_line_numbers = line_count > 5;
-
-    let syntax = Syntax::new(code, language)
-        .line_numbers(show_line_numbers)
-        .theme("base16-ocean.dark");
-
-    let segments = syntax.render(None)?;
-
-    // Render segments to a string with ANSI codes
-    let mut result = String::new();
-    for segment in segments {
-        if let Some(style) = &segment.style {
-            result.push_str(&style.render(&segment.text, ColorSystem::TrueColor));
-        } else {
-            result.push_str(&segment.text);
-        }
-    }
-
-    Ok(result)
+/// Format code for rich output without pulling in the syntax-highlighting stack.
+fn highlight_rich(code: &str, language: &str, _width: usize) -> String {
+    let _normalized_language = normalize_language(language);
+    format_plain_code(code)
 }
 
 /// Normalize language name to syntect's expected format.
@@ -211,13 +211,19 @@ pub fn detect_language_from_filename(filename: &str) -> String {
 /// Get list of supported language names.
 #[must_use]
 pub fn supported_languages() -> Vec<String> {
-    Syntax::available_languages()
+    KNOWN_LANGUAGES
+        .iter()
+        .map(|language| (*language).to_string())
+        .collect()
 }
 
 /// Get list of available themes.
 #[must_use]
 pub fn available_themes() -> Vec<String> {
-    Syntax::available_themes()
+    AVAILABLE_THEMES
+        .iter()
+        .map(|theme| (*theme).to_string())
+        .collect()
 }
 
 #[cfg(test)]

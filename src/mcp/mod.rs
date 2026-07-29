@@ -15,13 +15,16 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
-use fastmcp_rust::{McpError, McpErrorCode};
+use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
 
-use crate::storage::SqliteStorage;
+use crate::error::StructuredError;
+use crate::model::Issue;
+use crate::storage::sqlite::PendingSyncMergeInspection;
+use crate::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
 use crate::{BeadsError, config};
 
 const MCP_READ_SNAPSHOT_ENV: &str = "BR_MCP_READ_SNAPSHOT";
@@ -33,6 +36,69 @@ const MCP_READ_SNAPSHOT_CACHE_LIMIT: usize = 64;
 /// Tools use the richer `beads_to_mcp` in `tools.rs` instead.
 pub(super) fn to_mcp(err: impl std::fmt::Display) -> McpError {
     McpError::tool_error(err.to_string())
+}
+
+fn shutdown_mcp_error() -> McpError {
+    let err = BeadsError::ShuttingDown;
+    let structured = StructuredError::from_error(&err);
+    let message = structured.message.clone();
+    let mut data = json!({
+        "error_type": structured.code.as_str(),
+        "recoverable": structured.retryable,
+        "message": message,
+    });
+    if let Some(object) = data.as_object_mut() {
+        if let Some(hint) = &structured.hint {
+            object.insert("hint".to_string(), json!(hint));
+        }
+        if let Some(context) = &structured.context {
+            object.insert("context".to_string(), context.clone());
+        }
+    }
+
+    McpError::with_data(McpErrorCode::ToolExecutionError, structured.message, data)
+}
+
+fn ensure_not_shutting_down_with(is_requested: impl FnOnce() -> bool) -> McpResult<()> {
+    if is_requested() {
+        Err(shutdown_mcp_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn ensure_not_shutting_down() -> McpResult<()> {
+    ensure_not_shutting_down_with(crate::shutdown::is_requested)
+}
+
+pub(super) fn mcp_ready_issues(
+    state: &BeadsState,
+    storage: &SqliteStorage,
+) -> fastmcp_rust::McpResult<Vec<Issue>> {
+    let mut ready = storage
+        .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
+        .map_err(to_mcp)?;
+    if ready.is_empty() || !storage.has_external_dependencies(true).map_err(to_mcp)? {
+        return Ok(ready);
+    }
+
+    let config_layer = config::load_config(
+        &state.beads_dir,
+        Some(storage),
+        &config::CliOverrides::default(),
+    )
+    .map_err(to_mcp)?;
+    let external_db_paths = config::external_project_db_paths(&config_layer, &state.beads_dir);
+    let external_statuses = storage
+        .resolve_external_dependency_statuses(&external_db_paths, true)
+        .map_err(to_mcp)?;
+    let external_blockers = storage
+        .external_blockers(&external_statuses)
+        .map_err(to_mcp)?;
+    if !external_blockers.is_empty() {
+        ready.retain(|issue| !external_blockers.contains_key(&issue.id));
+    }
+    Ok(ready)
 }
 
 fn auto_flush_mcp_error(
@@ -82,6 +148,70 @@ fn sync_lock_busy_error(beads_dir: &Path) -> BeadsError {
         "Automatic JSONL export skipped because sync lock at {} is held by another process",
         beads_dir.join(".sync.lock").display()
     ))
+}
+
+fn pending_sync_merge_mcp_error(inspection: &PendingSyncMergeInspection) -> McpError {
+    let (condition, metadata_key) = match inspection {
+        PendingSyncMergeInspection::Absent => ("absent", None),
+        PendingSyncMergeInspection::Valid(_) => (
+            "valid",
+            Some(crate::sync::METADATA_SYNC_MERGE_PENDING.to_string()),
+        ),
+        PendingSyncMergeInspection::Legacy { metadata_key, .. } => {
+            ("legacy", Some(metadata_key.clone()))
+        }
+        PendingSyncMergeInspection::Malformed { metadata_key, .. } => {
+            ("malformed", Some(metadata_key.clone()))
+        }
+    };
+    let message =
+        "MCP mutation refused because a pending sync merge requires explicit reconciliation";
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        message,
+        json!({
+            "error_type": "SYNC_MERGE_PENDING",
+            "recoverable": true,
+            "message": message,
+            "condition": condition,
+            "metadata_key": metadata_key,
+            "diagnostic": inspection.diagnostic(),
+            "recovery": "Run `br sync --merge`, verify that it clears the pending receipt, then retry the MCP operation.",
+        }),
+    )
+}
+
+fn pending_sync_merge_unknown_mcp_error(err: impl std::fmt::Display) -> McpError {
+    let message =
+        "MCP mutation refused because pending sync-merge state could not be proven absent";
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        message,
+        json!({
+            "error_type": "SYNC_MERGE_PENDING_UNKNOWN",
+            "recoverable": false,
+            "message": message,
+            "inspection_error": err.to_string(),
+            "recovery": "Restore current-schema read-only access to the database family, run `br doctor`, and reconcile with `br sync --merge` before retrying.",
+        }),
+    )
+}
+
+fn pending_sync_merge_read_fallback_error(inspection: &PendingSyncMergeInspection) -> BeadsError {
+    BeadsError::SyncConflict {
+        message: format!(
+            "MCP writable read fallback refused because {}. Run `br sync --merge` before retrying",
+            inspection.diagnostic()
+        ),
+    }
+}
+
+fn pending_sync_merge_read_fallback_unknown(err: impl std::fmt::Display) -> BeadsError {
+    BeadsError::SyncConflict {
+        message: format!(
+            "MCP writable read fallback refused because pending sync-merge state could not be proven absent: {err}. Restore current-schema read-only database access, run `br doctor`, and reconcile with `br sync --merge` before retrying"
+        ),
+    }
 }
 
 fn dirty_auto_flush_incomplete_error(remaining_dirty: usize) -> BeadsError {
@@ -296,13 +426,56 @@ impl BeadsState {
         }
     }
 
-    /// Open a fresh writable `SqliteStorage` connection.
+    /// Open a fresh writable `SqliteStorage` connection under an inode-bound
+    /// database-family authority retained by the returned storage handle.
     ///
     /// # Errors
     ///
     /// Returns an error if the database file cannot be opened.
-    pub fn open_storage(&self) -> crate::Result<SqliteStorage> {
-        SqliteStorage::open(&self.db_path)
+    fn open_storage_under_write_authority(
+        &self,
+        write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> crate::Result<SqliteStorage> {
+        if write_authority.bind_database_inode_for_mutation()? {
+            write_authority.install_empty_database_replacement_and_bind()?;
+        }
+        write_authority.verify_database_authority()?;
+        let mut storage = SqliteStorage::open(&self.db_path)?;
+        write_authority.verify_database_authority()?;
+        storage.attach_write_authority(Arc::clone(write_authority));
+        Ok(storage)
+    }
+
+    fn open_storage_with_fresh_write_authority(&self) -> crate::Result<SqliteStorage> {
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &self.beads_dir,
+                &self.db_path,
+                self.write_lock_timeout_ms,
+            )?,
+        );
+        let _sync_lock = crate::sync::try_sync_lock(&self.beads_dir)?
+            .ok_or_else(|| sync_lock_busy_error(&self.beads_dir))?;
+
+        match SqliteStorage::inspect_pending_sync_merge_under_authority(
+            &self.db_path,
+            &write_authority,
+        ) {
+            Ok(PendingSyncMergeInspection::Absent) => {}
+            Ok(inspection) => {
+                return Err(pending_sync_merge_read_fallback_error(&inspection));
+            }
+            Err(err) => {
+                return Err(pending_sync_merge_read_fallback_unknown(err));
+            }
+        }
+
+        let storage = self.open_storage_under_write_authority(&write_authority)?;
+        match storage.inspect_pending_sync_merge() {
+            Ok(PendingSyncMergeInspection::Absent) => Ok(storage),
+            Ok(inspection) => Err(pending_sync_merge_read_fallback_error(&inspection)),
+            Err(err) => Err(pending_sync_merge_read_fallback_unknown(err)),
+        }
     }
 
     /// Open a fresh read-oriented storage connection.
@@ -319,24 +492,14 @@ impl BeadsState {
     pub fn open_read_storage(&self) -> crate::Result<SqliteStorage> {
         match SqliteStorage::open_current_read_only(&self.db_path) {
             Ok(Some(storage)) => Ok(storage),
-            Ok(None) => {
-                let _write_lock = crate::sync::blocking_write_lock_with_timeout(
-                    &self.beads_dir,
-                    self.write_lock_timeout_ms,
-                )?;
-                SqliteStorage::open(&self.db_path)
-            }
+            Ok(None) => self.open_storage_with_fresh_write_authority(),
             Err(err) => {
                 tracing::debug!(
                     error = %err,
                     db_path = %self.db_path.display(),
                     "MCP read-only storage open failed; falling back to locked writable open"
                 );
-                let _write_lock = crate::sync::blocking_write_lock_with_timeout(
-                    &self.beads_dir,
-                    self.write_lock_timeout_ms,
-                )?;
-                SqliteStorage::open(&self.db_path)
+                self.open_storage_with_fresh_write_authority()
             }
         }
     }
@@ -348,11 +511,14 @@ impl BeadsState {
         F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
     {
         // 1. Acquire the cross-process write lock.
-        let _write_lock = crate::sync::blocking_write_lock_with_timeout(
-            &self.beads_dir,
-            self.write_lock_timeout_ms,
-        )
-        .map_err(to_mcp)?;
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &self.beads_dir,
+                &self.db_path,
+                self.write_lock_timeout_ms,
+            )
+            .map_err(to_mcp)?,
+        );
 
         // 2. Acquire the sync lock before committing a mutation. MCP writes
         // should not report success when JSONL export is known to be unguarded
@@ -371,10 +537,30 @@ impl BeadsState {
             }
         };
 
+        // The server can remain alive across an independently committed merge
+        // receipt. Decide under freshly acquired DB + sync authority before a
+        // writable open, then recheck on the opened connection immediately
+        // before invoking the caller's closure.
+        match SqliteStorage::inspect_pending_sync_merge_under_authority(
+            &self.db_path,
+            &write_authority,
+        ) {
+            Ok(PendingSyncMergeInspection::Absent) => {}
+            Ok(inspection) => return Err(pending_sync_merge_mcp_error(&inspection)),
+            Err(err) => return Err(pending_sync_merge_unknown_mcp_error(err)),
+        }
+
         self.clear_read_snapshot_cache();
 
         // 3. Open storage.
-        let mut storage = self.open_storage().map_err(to_mcp)?;
+        let mut storage = self
+            .open_storage_under_write_authority(&write_authority)
+            .map_err(to_mcp)?;
+        match storage.inspect_pending_sync_merge() {
+            Ok(PendingSyncMergeInspection::Absent) => {}
+            Ok(inspection) => return Err(pending_sync_merge_mcp_error(&inspection)),
+            Err(err) => return Err(pending_sync_merge_unknown_mcp_error(err)),
+        }
         let dirty_before_mutation = storage.get_dirty_issue_metadata().map_err(to_mcp)?;
 
         // 4. Execute the mutation.
@@ -457,7 +643,9 @@ mod tests {
             db_path,
             beads_dir,
             jsonl_path,
-            write_lock_timeout_ms: Some(25),
+            // Robust under heavy parallel-test load (a concurrent auto-flush can
+            // hold .write.lock for >25ms); no test asserts the timeout path.
+            write_lock_timeout_ms: Some(5_000),
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
@@ -469,6 +657,84 @@ mod tests {
         let mut state = test_state(temp, jsonl_path);
         state.read_snapshot_cache = Some(Mutex::new(McpReadSnapshotCache::default()));
         state
+    }
+
+    fn install_valid_pending_merge_receipt(
+        state: &BeadsState,
+    ) -> crate::sync::SyncMergePendingReceipt {
+        let mut storage = SqliteStorage::open(&state.db_path).unwrap();
+        let database_before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let intent = crate::sync::SyncMergeIntent {
+            schema_version: 2,
+            database_authority_sha256: "1".repeat(64),
+            jsonl_authority_sha256: "2".repeat(64),
+            jsonl_path_sha256: "3".repeat(64),
+            jsonl_before: crate::sync::JsonlSourceStateWitness::Missing,
+            jsonl_before_content_sha256: None,
+            base_authority_sha256: "4".repeat(64),
+            base_before: crate::sync::JsonlSourceStateWitness::Missing,
+            base_before_content_sha256: None,
+            resolution: "manual".to_string(),
+            actor: "mcp-test".to_string(),
+            event_attribution: crate::storage::EventAttribution::default(),
+            capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            retention_days: None,
+            export_as_of: chrono::DateTime::parse_from_rfc3339("2026-07-27T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            changed_kept_issue_ids: Vec::new(),
+            kept_issue_witnesses: Vec::new(),
+            deleted_issue_ids: Vec::new(),
+            note_witnesses: Vec::new(),
+            database_before,
+        };
+        let database_after = crate::sync::capture_sync_merge_core_witness(&storage).unwrap();
+        let receipt = crate::sync::SyncMergePendingReceipt::new(
+            intent,
+            "2026-07-27T00:00:00Z".to_string(),
+            database_after,
+            "5".repeat(64),
+            0,
+            &[],
+            Vec::new(),
+        )
+        .unwrap();
+        receipt.validate().unwrap();
+        storage
+            .set_metadata(
+                crate::sync::METADATA_SYNC_MERGE_PENDING,
+                &serde_json::to_string(&receipt).unwrap(),
+            )
+            .unwrap();
+        receipt
+    }
+
+    #[test]
+    fn shutdown_guard_allows_handlers_when_no_signal_is_pending() {
+        ensure_not_shutting_down_with(|| false).expect("unsignalled MCP handler should proceed");
+    }
+
+    #[test]
+    fn shutdown_guard_returns_structured_mcp_error() {
+        let err = ensure_not_shutting_down_with(|| true).unwrap_err();
+
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(err.message, "Shutdown requested");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SHUTTING_DOWN")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("context"))
+                .and_then(|context| context.get("shutdown_requested"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
@@ -485,6 +751,66 @@ mod tests {
             .expect("current schema read storage should not wait for write lock");
 
         assert_eq!(storage.count_all_issues().unwrap(), 0);
+    }
+
+    #[test]
+    fn writable_read_fallback_refuses_stale_schema_without_repairing_it() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path.clone());
+        let storage = SqliteStorage::open(&state.db_path).unwrap();
+        storage.execute_test_sql("PRAGMA user_version = 1").unwrap();
+        drop(storage);
+        let database_before = fs::read(&state.db_path).unwrap();
+
+        let err = state.open_read_storage().unwrap_err();
+
+        assert!(
+            err.to_string().contains("could not be proven absent")
+                && err.to_string().contains("br doctor"),
+            "stale-schema fallback must fail closed with remediation: {err}"
+        );
+        assert_eq!(
+            fs::read(&state.db_path).unwrap(),
+            database_before,
+            "writable read fallback must not migrate or repair a stale database"
+        );
+        assert!(
+            SqliteStorage::open_current_read_only(&state.db_path)
+                .unwrap()
+                .is_none(),
+            "failed fallback must leave the stale schema version unchanged"
+        );
+        assert!(
+            !jsonl_path.exists(),
+            "failed read fallback must not create or rewrite JSONL"
+        );
+
+        let called = Rc::new(Cell::new(false));
+        let called_for_closure = Rc::clone(&called);
+        let mutation_err = state
+            .with_mutation(|_| {
+                called_for_closure.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            !called.get(),
+            "unknown pending state must refuse before the mutation closure"
+        );
+        assert_eq!(
+            mutation_err
+                .data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SYNC_MERGE_PENDING_UNKNOWN")
+        );
+        assert_eq!(
+            fs::read(&state.db_path).unwrap(),
+            database_before,
+            "unknown-state mutation refusal must not repair the stale database"
+        );
     }
 
     #[test]
@@ -525,6 +851,10 @@ mod tests {
 
         state
             .with_mutation(|storage| {
+                assert!(
+                    storage.attached_write_authority().is_some(),
+                    "MCP mutation storage must retain database-family authority"
+                );
                 storage
                     .create_issue(
                         &test_issue("br-mcp-cache-clear", "clear stale read cache"),
@@ -545,6 +875,7 @@ mod tests {
         let jsonl_path = beads_dir.join("issues.jsonl");
         let state = test_state(&temp, jsonl_path);
         fs::create_dir(state.beads_dir.join(".sync.lock")).unwrap();
+        let database_before = fs::read(&state.db_path).unwrap();
         let called = Rc::new(Cell::new(false));
         let called_for_closure = Rc::clone(&called);
 
@@ -573,8 +904,187 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("SYNC_LOCK_UNAVAILABLE")
         );
+        assert_eq!(
+            fs::read(&state.db_path).unwrap(),
+            database_before,
+            "sync-lock refusal must occur before writable storage open"
+        );
         let storage = SqliteStorage::open(&state.db_path).unwrap();
         assert!(!storage.id_exists("br-mcp-lock").unwrap());
+    }
+
+    #[test]
+    fn with_mutation_refuses_malformed_pending_state_before_invoking_closure() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path.clone());
+        let mut storage = SqliteStorage::open(&state.db_path).unwrap();
+        storage
+            .set_metadata(crate::sync::METADATA_SYNC_MERGE_PENDING, "{")
+            .unwrap();
+        drop(storage);
+        let database_before = fs::read(&state.db_path).unwrap();
+        let called = Rc::new(Cell::new(false));
+        let called_for_closure = Rc::clone(&called);
+
+        let err = state
+            .with_mutation(|_| {
+                called_for_closure.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(!called.get(), "pending gate must run before the closure");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SYNC_MERGE_PENDING")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("condition"))
+                .and_then(serde_json::Value::as_str),
+            Some("malformed")
+        );
+        assert_eq!(
+            fs::read(&state.db_path).unwrap(),
+            database_before,
+            "refused MCP mutation must not change database core bytes"
+        );
+        assert!(
+            !jsonl_path.exists(),
+            "refused MCP mutation must not create or rewrite JSONL"
+        );
+        let storage = SqliteStorage::open_current_read_only(&state.db_path)
+            .unwrap()
+            .expect("fixture remains current schema");
+        assert_eq!(
+            storage
+                .get_metadata(crate::sync::METADATA_SYNC_MERGE_PENDING)
+                .unwrap()
+                .as_deref(),
+            Some("{"),
+            "refused MCP mutation must preserve pending metadata exactly"
+        );
+    }
+
+    #[test]
+    fn with_mutation_returns_structured_legacy_pending_refusal() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path.clone());
+        let mut storage = SqliteStorage::open(&state.db_path).unwrap();
+        storage
+            .set_metadata(
+                crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY,
+                "legacy-receipt",
+            )
+            .unwrap();
+        drop(storage);
+        let database_before = fs::read(&state.db_path).unwrap();
+        let called = Rc::new(Cell::new(false));
+        let called_for_closure = Rc::clone(&called);
+
+        let err = state
+            .with_mutation(|_| {
+                called_for_closure.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(!called.get(), "legacy gate must precede the closure");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SYNC_MERGE_PENDING")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("condition"))
+                .and_then(serde_json::Value::as_str),
+            Some("legacy")
+        );
+        assert!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("recovery"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|recovery| recovery.contains("br sync --merge")),
+            "legacy refusal must include explicit recovery"
+        );
+        assert_eq!(
+            fs::read(&state.db_path).unwrap(),
+            database_before,
+            "legacy refusal must not change database core bytes"
+        );
+        assert!(!jsonl_path.exists());
+    }
+
+    #[test]
+    fn long_lived_server_refuses_receipt_committed_after_start_before_invoking_closure() {
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join(".beads").join("issues.jsonl");
+        let state = test_state(&temp, jsonl_path.clone());
+        fs::write(&jsonl_path, b"{\"id\":\"br-existing\"}\n").unwrap();
+
+        // `state` represents an already-running server. Commit the receipt
+        // through a separate connection only after that long-lived state exists.
+        let receipt = install_valid_pending_merge_receipt(&state);
+        let database_before = fs::read(&state.db_path).unwrap();
+        let jsonl_before = fs::read(&jsonl_path).unwrap();
+        let called = Rc::new(Cell::new(false));
+        let called_for_closure = Rc::clone(&called);
+
+        let err = state
+            .with_mutation(|_| {
+                called_for_closure.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(
+            !called.get(),
+            "live receipt inspection must precede the mutation closure"
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("error_type"))
+                .and_then(serde_json::Value::as_str),
+            Some("SYNC_MERGE_PENDING")
+        );
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|data| data.get("condition"))
+                .and_then(serde_json::Value::as_str),
+            Some("valid")
+        );
+        assert_eq!(
+            fs::read(&state.db_path).unwrap(),
+            database_before,
+            "refused live MCP mutation must not change database core bytes"
+        );
+        assert_eq!(
+            fs::read(&jsonl_path).unwrap(),
+            jsonl_before,
+            "refused live MCP mutation must not change JSONL bytes"
+        );
+        let storage = SqliteStorage::open_current_read_only(&state.db_path)
+            .unwrap()
+            .expect("fixture remains current schema");
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(receipt),
+            "refused live MCP mutation must preserve the exact receipt"
+        );
     }
 
     #[test]
@@ -673,10 +1183,25 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .lock_timeout
         .or_else(|| config::lock_timeout_from_layer(&merged_layer))
         .or(Some(crate::sync::default_write_lock_timeout_ms()));
-    let write_lock = crate::sync::blocking_write_lock_with_timeout(&beads_dir, lock_timeout)?;
-    let res = config::open_storage_with_startup_config_under_write_lock(startup, overrides, false)?;
+    let write_lock = Arc::new(
+        crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &startup.paths.db_path,
+            lock_timeout,
+        )?,
+    );
+    let res = config::open_storage_with_startup_config_under_write_lock(
+        startup,
+        overrides,
+        false,
+        &write_lock,
+    )?;
 
-    let prefix = res.storage.get_config("issue_prefix")?;
+    let prefix = res
+        .storage
+        .get_config("issue_prefix")?
+        .map(|prefix| crate::util::id::normalize_configured_prefix(&prefix))
+        .transpose()?;
     let db_path = res.paths.db_path.clone();
     let jsonl_path = res.paths.jsonl_path.clone();
     let allow_external_jsonl =
@@ -709,6 +1234,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
              4. Use list_issues to find specific issues\n\n\
              Discovery resources: beads://project/info, beads://schema, \
              beads://labels, beads://issues/ready, beads://issues/blocked, \
+             beads://issues/in_progress, beads://coordination/status, \
              beads://issues/deferred, beads://issues/bottlenecks, \
              beads://graph/health, beads://events/recent\n\n\
              Guided workflows:\n\
@@ -725,7 +1251,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .tool(tools::CloseIssueTool::new(state.clone()))
         .tool(tools::ManageDependenciesTool::new(state.clone()))
         .tool(tools::ProjectOverviewTool::new(state.clone()))
-        // Resources (11)
+        // Resources (12)
         .resource(resources::ProjectInfoResource::new(state.clone()))
         .resource(resources::IssueResource::new(state.clone()))
         .resource(resources::SchemaResource)
@@ -733,6 +1259,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .resource(resources::ReadyIssuesResource::new(state.clone()))
         .resource(resources::BlockedIssuesResource::new(state.clone()))
         .resource(resources::InProgressResource::new(state.clone()))
+        .resource(resources::CoordinationStatusResource::new(state.clone()))
         .resource(resources::EventsResource::new(state.clone()))
         .resource(resources::DeferredIssuesResource::new(state.clone()))
         .resource(resources::GraphHealthResource::new(state.clone()))
@@ -744,5 +1271,6 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .prompt(prompts::PolishBacklogPrompt::new(state))
         .build();
 
-    server.run_stdio();
+    server.run_transport_returning(StdioTransport::stdio());
+    Ok(())
 }

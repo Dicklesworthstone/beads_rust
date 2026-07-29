@@ -54,7 +54,7 @@ These commands should always run one process per lock:
 - `sync --import-only`
 - `sync --merge`
 - `sync --flush-only`
-- `sync --rebuild`
+- `sync --import-only --rebuild`
 - `sync --from`, `sync --to`, or other explicit external path forms
 - `doctor --repair`
 - configuration writes

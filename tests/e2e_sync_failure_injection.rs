@@ -37,7 +37,9 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Test artifacts for failure injection tests.

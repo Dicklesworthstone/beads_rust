@@ -1,22 +1,40 @@
 //! Content hashing for issue deduplication and sync.
 //!
-//! Uses SHA256 over stable ordered fields with null separators.
-//! Matches classic Go bd behavior for export/import compatibility.
+//! Uses SHA-256 over stable ordered fields with length-prefixed serialization.
+//! Each field is encoded as an unsigned 64-bit little-endian byte length
+//! followed by the raw UTF-8 bytes. This prevents the EXP-101 NUL-injection
+//! field-boundary collision and intentionally breaks the old Go bd
+//! NUL-separated `content_hash` byte format; schema v14 rebuilds stored hashes.
 
 use sha2::{Digest, Sha256};
 
 use crate::model::{Issue, IssueType, Priority, Status};
 
+#[cfg(not(any(
+    target_pointer_width = "16",
+    target_pointer_width = "32",
+    target_pointer_width = "64"
+)))]
+compile_error!("content hash field length prefixes require usize to fit in 64 bits");
+
 /// Lowercase hex encoding for digest outputs (sha2 0.11 no longer impls `LowerHex`
 /// on `Array<u8, _>`, so we format bytes directly).
 #[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(&mut s, "{b:02x}").expect("writing to String never fails");
+    for &byte in bytes {
+        s.push(hex_digit(byte >> 4));
+        s.push(hex_digit(byte & 0x0f));
     }
     s
+}
+
+fn hex_digit(nibble: u8) -> char {
+    if nibble < 10 {
+        char::from(b'0' + nibble)
+    } else {
+        char::from(b'a' + (nibble - 10))
+    }
 }
 
 /// Trait for types that can produce a deterministic content hash.
@@ -33,21 +51,27 @@ impl ContentHashable for Issue {
 
 /// Compute SHA256 content hash for an issue.
 ///
-/// Fields included (stable order with null separators):
+/// Fields included (stable order, each length-prefixed):
 /// - title, description, design, `acceptance_criteria`, notes
 /// - status, priority, `issue_type`
 /// - assignee, owner, `created_by`
 /// - `external_ref`, `source_system`
 /// - pinned, `is_template`
-/// - empty/default placeholders for Go bd fields not represented in Rust
+/// - empty/default placeholders for reserved fields not represented in Rust
 ///
 /// Fields excluded:
 /// - id, `content_hash` (circular)
 /// - labels, dependencies, comments, events (separate entities)
 /// - timestamps (`created_at`, `updated_at`, `closed_at`, etc.)
-/// - tombstone fields (`deleted_at`, `deleted_by`, `delete_reason`)
+/// - tombstone metadata (`deleted_at`, `deleted_by`, `delete_reason`)
 /// - `estimated_minutes`, `due_at`, `defer_until`
 /// - `close_reason`, `closed_by_session`
+///
+/// `status` is included, so a live issue and a `Status::Tombstone` issue do
+/// not hash alike solely because deletion metadata is excluded. Tombstone
+/// masking and resurrection protection must still key by `Issue.id`, not by
+/// `content_hash`, because deletion metadata variants of the same tombstone
+/// intentionally share a hash.
 #[must_use]
 pub fn content_hash(issue: &Issue) -> String {
     content_hash_from_parts(
@@ -107,9 +131,8 @@ pub fn content_hash_from_parts(
     writer.field_flag(pinned, "pinned");
     writer.field_flag(is_template, "template");
 
-    // Go bd hashes several newer fields that Rust does not model yet. Hash
-    // their Go zero values so Rust remains byte-for-byte compatible for every
-    // field in the shared schema.
+    // Keep placeholders for reserved fields so the field set remains explicit
+    // and future additions have stable slots.
     writer.field(""); // quality_score nil
     writer.field_flag(false, "crystallizes");
     writer.field(""); // await_type
@@ -143,8 +166,9 @@ impl HashFieldWriter {
     }
 
     fn field(&mut self, value: &str) {
-        self.hasher.update(value.as_bytes());
-        self.hasher.update(b"\x00");
+        let bytes = value.as_bytes();
+        self.hasher.update(field_len_prefix(bytes.len()));
+        self.hasher.update(bytes);
     }
 
     fn field_opt(&mut self, value: Option<&str>) {
@@ -158,6 +182,14 @@ impl HashFieldWriter {
     fn finalize(self) -> String {
         hex_encode(&self.hasher.finalize())
     }
+}
+
+fn field_len_prefix(len: usize) -> [u8; 8] {
+    let mut encoded = [0_u8; 8];
+    for (destination, source) in encoded.iter_mut().zip(len.to_le_bytes()) {
+        *destination = source;
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -190,6 +222,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -233,6 +267,59 @@ mod tests {
         let hash2 = content_hash(&issue);
 
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_content_hash_distinguishes_embedded_nul_boundaries() {
+        let hash_a = content_hash_from_parts(
+            "x",
+            Some("y\0z"),
+            None,
+            None,
+            None,
+            &Status::Open,
+            &Priority::MEDIUM,
+            &IssueType::Task,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+        let hash_b = content_hash_from_parts(
+            "x\0y",
+            Some("z"),
+            None,
+            None,
+            None,
+            &Status::Open,
+            &Priority::MEDIUM,
+            &IssueType::Task,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+        );
+
+        assert_ne!(
+            hash_a, hash_b,
+            "embedded NULs must not let adjacent field boundaries collide"
+        );
+        assert_ne!(
+            hash_a, "76dc81c2dbaddc1cddfa1f8c4674d06e018868f121f8c9385e0693fdf679e624",
+            "old NUL-separated collision hash should not survive"
+        );
+        assert_ne!(
+            hash_b, "76dc81c2dbaddc1cddfa1f8c4674d06e018868f121f8c9385e0693fdf679e624",
+            "old NUL-separated collision hash should not survive"
+        );
+        assert_eq!(hash_a.len(), 64);
+        assert_eq!(hash_b.len(), 64);
     }
 
     #[test]
@@ -301,6 +388,12 @@ mod tests {
             issue.is_template,
         );
         assert_eq!(direct, from_parts);
+    }
+
+    #[test]
+    fn test_field_len_prefix_is_u64_little_endian() {
+        assert_eq!(field_len_prefix(0), [0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(field_len_prefix(0x0102), [0x02, 0x01, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

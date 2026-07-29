@@ -20,19 +20,11 @@ use std::time::{Duration, Instant, SystemTime};
 use tempfile::TempDir;
 use tracing::info;
 
-/// Check if the `bd` (Go beads) binary is available on the system.
-fn bd_available() -> bool {
-    std::process::Command::new("bd")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-/// Skip test if bd binary is not available (used in CI where only br is built)
+/// Skip test when `bd` is not a usable classic conformance reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping conformance test: {reason}");
             return;
         }
     };

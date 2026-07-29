@@ -35,22 +35,29 @@
 
 mod common;
 
+use beads_rust::coordination::{AgentMailAgentSnapshot, AgentMailReservationSnapshot};
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
+use beads_rust::storage::SqliteStorage;
 use beads_rust::util::hex_encode;
 use chrono::Utc;
 use common::binary_discovery::discover_binaries;
 use common::dataset_registry::KnownDataset;
+use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 use tempfile::TempDir;
+use toon_rust::options::ExpandPathsMode;
+use toon_rust::{DecodeOptions, try_decode as parse_toon};
 
 // =============================================================================
 // Configuration
@@ -85,6 +92,13 @@ fn synthetic_evidence_output_dir() -> PathBuf {
     std::env::var_os("BR_SYNTHETIC_EVIDENCE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/benchmark-results"))
+}
+
+fn coordination_evidence_output_dir() -> PathBuf {
+    std::env::var_os("BR_COORDINATION_EVIDENCE_DIR")
+        .or_else(|| std::env::var_os("BR_SYNTHETIC_EVIDENCE_DIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("tests/artifacts/perf/coordination-large-swarm-20260508"))
 }
 
 /// Scale tier for synthetic datasets.
@@ -294,6 +308,8 @@ pub struct GenerationMetrics {
     pub simulated_agent_count: usize,
     /// Number of claimed issues assigned to simulated agents.
     pub claim_count: usize,
+    /// How the generated JSONL was loaded into SQLite for this profile.
+    pub load_strategy: String,
     /// Generation duration
     pub generation_ms: u128,
     /// JSONL file size in bytes
@@ -315,9 +331,9 @@ pub struct GenerationHealth {
     pub jsonl_valid: bool,
     /// Number of valid JSONL issue records.
     pub jsonl_issue_count: usize,
-    /// `br sync --import-only --json` succeeded.
+    /// `br sync --import-only --json` ran and succeeded.
     pub sync_import_ok: bool,
-    /// `br doctor --json` succeeded after import.
+    /// `br doctor --json` ran and succeeded after import.
     pub doctor_ok: bool,
     /// `br sync --status --json` reported no dirty DB/JSONL divergence.
     pub sync_status_clean: bool,
@@ -382,6 +398,9 @@ impl SyntheticDataset {
         let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
             .args(["init"])
             .current_dir(&root)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
+            .env("PATH", common::cli::deduplicated_br_path())
             .output()?;
 
         if !init_output.status.success() {
@@ -398,7 +417,12 @@ impl SyntheticDataset {
             &root,
             "br sync --import-only",
         )?;
-        let doctor_ok = run_br_status(br_path, ["doctor", "--json"], &root, "br doctor")?;
+        let doctor_ok = run_br_status(
+            br_path,
+            ["doctor", "--json", "--no-auto-import", "--no-auto-flush"],
+            &root,
+            "br doctor",
+        )?;
         let sync_status_clean = sync_status_is_clean(br_path, &root)?;
         let jsonl_health = validate_generated_jsonl(&beads_dir.join("issues.jsonl"))?;
 
@@ -413,6 +437,7 @@ impl SyntheticDataset {
             comment_count: generated.comment_count,
             simulated_agent_count: config.simulated_agent_count,
             claim_count: generated.claim_count,
+            load_strategy: "sync_import".to_string(),
             generation_ms,
             jsonl_size_bytes: generated.jsonl_size_bytes,
             expected_jsonl_size_bytes: generated.expected_jsonl_size_bytes,
@@ -434,6 +459,104 @@ impl SyntheticDataset {
             config: SyntheticConfigSnapshot::from(&config),
             metrics: metrics.clone(),
             reproduction_command: reproduction_command_for(&config),
+        };
+        write_json_pretty(&manifest_path, &manifest)?;
+
+        Ok(Self {
+            temp_dir,
+            root,
+            beads_dir,
+            manifest_path,
+            config,
+            metrics,
+        })
+    }
+
+    /// Generate a synthetic dataset and seed SQLite directly from the same
+    /// deterministic JSONL stream.
+    ///
+    /// This keeps coordination-status evidence focused on the read path under
+    /// test instead of spending most of the run inside JSONL import.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary workspace, JSONL generation, or direct
+    /// SQLite load fails.
+    pub fn generate_direct_sqlite(
+        config: SyntheticConfig,
+        br_path: &Path,
+    ) -> std::io::Result<Self> {
+        let start = Instant::now();
+        let temp_dir = TempDir::new()?;
+        let root = temp_dir.path().to_path_buf();
+        let beads_dir = root.join(".beads");
+        let manifest_path = root.join("synthetic-corpus-manifest.json");
+
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
+
+        let init_output = Command::new(br_path) // ubs:ignore - benchmark harness executes only discovered br binaries
+            .args(["init"])
+            .current_dir(&root)
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
+            .env("PATH", common::cli::deduplicated_br_path())
+            .output()?;
+
+        if !init_output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "br init failed: {}",
+                String::from_utf8_lossy(&init_output.stderr)
+            )));
+        }
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let generated = write_synthetic_jsonl(&config, &jsonl_path)?;
+        populate_sqlite_direct(&beads_dir.join("beads.db"), &jsonl_path)?;
+        let storage = sqlite_io(SqliteStorage::open(&beads_dir.join("beads.db")))?;
+        let persisted_issue_count = sqlite_io(storage.count_issues())?;
+        let jsonl_health = validate_generated_jsonl(&jsonl_path)?;
+        if persisted_issue_count != generated.issue_count {
+            return Err(std::io::Error::other(format!(
+                "direct SQLite seed had {persisted_issue_count} issues after reopen, expected {}",
+                generated.issue_count
+            )));
+        }
+
+        let generation_ms = start.elapsed().as_millis();
+        let db_path = beads_dir.join("beads.db");
+        let db_size_bytes = fs::metadata(&db_path).map_or(0, |m| m.len());
+
+        let metrics = GenerationMetrics {
+            issue_count: generated.issue_count,
+            dependency_count: generated.dependency_count,
+            label_assignment_count: generated.label_assignment_count,
+            comment_count: generated.comment_count,
+            simulated_agent_count: config.simulated_agent_count,
+            claim_count: generated.claim_count,
+            load_strategy: "direct_sqlite_seed".to_string(),
+            generation_ms,
+            jsonl_size_bytes: generated.jsonl_size_bytes,
+            expected_jsonl_size_bytes: generated.expected_jsonl_size_bytes,
+            db_size_bytes,
+            content_hash: generated.content_hash,
+            health: GenerationHealth {
+                jsonl_valid: jsonl_health.valid,
+                jsonl_issue_count: jsonl_health.issue_count,
+                sync_import_ok: false,
+                doctor_ok: false,
+                sync_status_clean: false,
+            },
+        };
+
+        let manifest = SyntheticCorpusManifest {
+            schema_version: "br.synthetic-corpus.v1".to_string(),
+            generator: "bench_synthetic_scale::write_synthetic_jsonl+populate_sqlite_direct"
+                .to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            config: SyntheticConfigSnapshot::from(&config),
+            metrics: metrics.clone(),
+            reproduction_command: coordination_evidence_reproduction_command_for(&config),
         };
         write_json_pretty(&manifest_path, &manifest)?;
 
@@ -758,6 +881,159 @@ fn validate_generated_jsonl(jsonl_path: &Path) -> std::io::Result<JsonlHealth> {
     })
 }
 
+fn sqlite_io<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> std::io::Result<T> {
+    result.map_err(|err| std::io::Error::other(err.to_string()))
+}
+
+fn populate_sqlite_direct(db_path: &Path, jsonl_path: &Path) -> std::io::Result<()> {
+    {
+        let _storage = sqlite_io(SqliteStorage::open(db_path))?;
+    }
+    let conn = sqlite_io(Connection::open(db_path.to_string_lossy().into_owned()))?;
+    sqlite_io(conn.execute("PRAGMA synchronous=OFF"))?;
+    sqlite_io(conn.execute("BEGIN IMMEDIATE"))?;
+
+    let file = File::open(jsonl_path)?;
+    let reader = BufReader::new(file);
+    let mut issue_count = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let issue = serde_json::from_str::<Issue>(&line).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("generated JSONL issue line is invalid: {err}"),
+            )
+        })?;
+        insert_issue_direct(&conn, &issue)?;
+        issue_count += 1;
+
+        if issue_count.is_multiple_of(100_000) {
+            eprintln!("  Seeded {issue_count} synthetic issues into SQLite...");
+        }
+    }
+
+    sqlite_io(conn.execute("COMMIT"))?;
+    let row = sqlite_io(conn.query_row("SELECT count(*) FROM issues"))?;
+    let persisted_count = row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0);
+    let persisted_count = usize::try_from(persisted_count).unwrap_or(0);
+    if persisted_count != issue_count {
+        return Err(std::io::Error::other(format!(
+            "direct SQLite seed persisted {persisted_count} issues, expected {issue_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn optional_text(value: Option<&str>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, SqliteValue::from)
+}
+
+fn optional_datetime(value: Option<chrono::DateTime<Utc>>) -> SqliteValue {
+    value.map_or(SqliteValue::Null, |timestamp| {
+        SqliteValue::from(timestamp.to_rfc3339())
+    })
+}
+
+fn insert_issue_direct(conn: &Connection, issue: &Issue) -> std::io::Result<()> {
+    let content_hash = issue
+        .content_hash
+        .clone()
+        .unwrap_or_else(|| issue.compute_content_hash());
+    sqlite_io(conn.execute_with_params(
+        "INSERT INTO issues (
+            id, content_hash, title, description, design, acceptance_criteria, notes,
+            status, priority, issue_type, assignee, owner, estimated_minutes,
+            created_at, created_by, updated_at, closed_at, close_reason,
+            closed_by_session, due_at, defer_until, external_ref, source_system,
+            source_repo, deleted_at, deleted_by, delete_reason, original_type,
+            compaction_level, compacted_at, compacted_at_commit, original_size,
+            sender, ephemeral, pinned, is_template
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            SqliteValue::from(issue.id.as_str()),
+            SqliteValue::from(content_hash.as_str()),
+            SqliteValue::from(issue.title.as_str()),
+            SqliteValue::from(issue.description.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.design.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.status.as_str()),
+            SqliteValue::from(issue.priority.0),
+            SqliteValue::from(issue.issue_type.as_str()),
+            optional_text(issue.assignee.as_deref()),
+            SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
+            issue.estimated_minutes.map_or(SqliteValue::Null, SqliteValue::from),
+            SqliteValue::from(issue.created_at.to_rfc3339()),
+            SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.updated_at.to_rfc3339()),
+            optional_datetime(issue.closed_at),
+            SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
+            optional_datetime(issue.due_at),
+            optional_datetime(issue.defer_until),
+            optional_text(issue.external_ref.as_deref()),
+            SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
+            optional_datetime(issue.deleted_at),
+            SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
+            SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
+            SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
+            optional_datetime(issue.compacted_at),
+            optional_text(issue.compacted_at_commit.as_deref()),
+            SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
+            SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
+            SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
+            SqliteValue::from(i64::from(i32::from(issue.pinned))),
+            SqliteValue::from(i64::from(i32::from(issue.is_template))),
+        ],
+    ))?;
+
+    for label in &issue.labels {
+        sqlite_io(conn.execute_with_params(
+            "INSERT OR IGNORE INTO labels (issue_id, label) VALUES (?, ?)",
+            &[
+                SqliteValue::from(issue.id.as_str()),
+                SqliteValue::from(label.as_str()),
+            ],
+        ))?;
+    }
+
+    for dependency in &issue.dependencies {
+        sqlite_io(conn.execute_with_params(
+            "INSERT OR IGNORE INTO dependencies (
+                issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue.id.as_str()),
+                SqliteValue::from(dependency.depends_on_id.as_str()),
+                SqliteValue::from(dependency.dep_type.as_str()),
+                SqliteValue::from(dependency.created_at.to_rfc3339()),
+                SqliteValue::from(dependency.created_by.as_deref().unwrap_or("synthetic")),
+                SqliteValue::from(dependency.metadata.as_deref().unwrap_or("{}")),
+                SqliteValue::from(dependency.thread_id.as_deref().unwrap_or("")),
+            ],
+        ))?;
+    }
+
+    for comment in &issue.comments {
+        sqlite_io(conn.execute_with_params(
+            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue.id.as_str()),
+                SqliteValue::from(comment.author.as_str()),
+                SqliteValue::from(comment.body.as_str()),
+                SqliteValue::from(comment.created_at.to_rfc3339()),
+            ],
+        ))?;
+    }
+
+    Ok(())
+}
+
 fn run_br_status<const N: usize>(
     br_path: &Path,
     args: [&str; N],
@@ -768,6 +1044,13 @@ fn run_br_status<const N: usize>(
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        // A host with `br` in more than one $PATH directory makes every
+        // spawned `br doctor` emit a `br_path_dupes` WARN, failing corpus
+        // generation for a reason unrelated to the workspace under test.
+        // Mirror tests/e2e_doctor_fixture_suite.rs and drop later
+        // duplicates only.
+        .env("PATH", common::cli::deduplicated_br_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -788,6 +1071,8 @@ fn sync_status_is_clean(br_path: &Path, workspace: &Path) -> std::io::Result<boo
         .args(["sync", "--status", "--json"])
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .env("PATH", common::cli::deduplicated_br_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1067,6 +1352,7 @@ fn run_measured_br_command(
             .args(args)
             .current_dir(workspace)
             .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()?;
@@ -1083,6 +1369,8 @@ fn run_measured_br_command(
         .args(args)
         .current_dir(workspace)
         .env("NO_COLOR", "1")
+        .env("RUST_LOG", "error")
+        .env("PATH", common::cli::deduplicated_br_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;
@@ -1319,6 +1607,513 @@ fn evidence_reproduction_command_for(config: &SyntheticConfig) -> String {
     )
 }
 
+fn coordination_evidence_reproduction_command_for(config: &SyntheticConfig) -> String {
+    format!(
+        "BR_E2E_STRESS=1 BR_SYNTHETIC_SEED={} BR_SYNTHETIC_EVIDENCE_ISSUES={} cargo test --test bench_synthetic_scale stress_coordination_large_swarm_evidence -- --ignored --nocapture",
+        config.seed, config.issue_count
+    )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaimedIssue {
+    id: String,
+    assignee: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoordinationSnapshotMetrics {
+    agents_path: String,
+    reservations_path: String,
+    agent_rows: usize,
+    active_reservation_rows: usize,
+    expired_reservation_rows: usize,
+    agent_snapshot_sha256: String,
+    reservation_snapshot_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoordinationOperationMetrics {
+    operation: String,
+    command: String,
+    duration_ms: u128,
+    peak_rss_bytes: Option<u64>,
+    success: bool,
+    output_size_bytes: usize,
+    stdout_sha256: Option<String>,
+    normalized_stdout_sha256: Option<String>,
+    total_claims: Option<u64>,
+    active_reservation_matches: usize,
+    expired_reservation_matches: usize,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoordinationComparison {
+    json_normalized_sha256: String,
+    toon_normalized_sha256: String,
+    semantic_hashes_match: bool,
+    json_output_size_bytes: usize,
+    toon_output_size_bytes: usize,
+    json_duration_ms: u128,
+    toon_duration_ms: u128,
+    rss_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoordinationGuardrail {
+    latest_comment_limit: usize,
+    bounded_comment_rows_upper_bound: usize,
+    generated_comment_rows: usize,
+    baseline: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoordinationLargeSwarmEvidence {
+    schema_version: String,
+    generated_at: String,
+    br_binary_path: String,
+    reproduction_command: String,
+    config: SyntheticConfigSnapshot,
+    generation: GenerationMetrics,
+    snapshots: CoordinationSnapshotMetrics,
+    operations: Vec<CoordinationOperationMetrics>,
+    comparison: CoordinationComparison,
+    guardrail: CoordinationGuardrail,
+}
+
+fn collect_claimed_issues(jsonl_path: &Path) -> std::io::Result<Vec<ClaimedIssue>> {
+    let file = File::open(jsonl_path)?;
+    let reader = BufReader::new(file);
+    let mut claimed = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let issue = serde_json::from_str::<Issue>(&line).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("generated JSONL issue line is invalid: {err}"),
+            )
+        })?;
+        if issue.status == Status::InProgress
+            && let Some(assignee) = issue
+                .assignee
+                .as_deref()
+                .map(str::trim)
+                .filter(|assignee| !assignee.is_empty())
+        {
+            claimed.push(ClaimedIssue {
+                id: issue.id,
+                assignee: assignee.to_string(),
+            });
+        }
+    }
+
+    Ok(claimed)
+}
+
+fn fixed_utc_timestamp(timestamp: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .expect("fixed timestamp should parse")
+        .with_timezone(&Utc)
+}
+
+fn write_jsonl_rows<T: Serialize>(path: &Path, rows: &[T]) -> std::io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for row in rows {
+        serde_json::to_writer(&mut writer, row)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn file_sha256_hex(path: &Path) -> std::io::Result<String> {
+    let bytes = fs::read(path)?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn write_coordination_snapshots(
+    output_dir: &Path,
+    config: &SyntheticConfig,
+    claimed: &[ClaimedIssue],
+) -> std::io::Result<CoordinationSnapshotMetrics> {
+    let agents_path = output_dir.join("coordination-agents.jsonl");
+    let reservations_path = output_dir.join("coordination-reservations.jsonl");
+    let active_expires = fixed_utc_timestamp("2099-01-01T00:00:00Z");
+    let expired_at = fixed_utc_timestamp("2020-01-01T00:00:00Z");
+    let agent_last_active = fixed_utc_timestamp("2026-05-08T15:00:00Z");
+
+    let agents = (0..config.simulated_agent_count)
+        .map(|index| AgentMailAgentSnapshot {
+            name: synthetic_agent_name(config.seed, index),
+            task_description: format!(
+                "Synthetic coordination evidence agent {index} for seed {}",
+                config.seed
+            ),
+            last_active_ts: agent_last_active,
+            contact_policy: "auto".to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut used_agents = BTreeSet::new();
+    let mut active_claims = Vec::new();
+    for claim in claimed {
+        if used_agents.insert(claim.assignee.clone()) {
+            active_claims.push(claim);
+            if active_claims.len() == 4_000 {
+                break;
+            }
+        }
+    }
+
+    let mut expired_claims = Vec::new();
+    for claim in claimed {
+        if used_agents.contains(&claim.assignee) {
+            continue;
+        }
+        if used_agents.insert(claim.assignee.clone()) {
+            expired_claims.push(claim);
+            if expired_claims.len() == 4_000 {
+                break;
+            }
+        }
+    }
+
+    let mut reservations = Vec::with_capacity(active_claims.len() + expired_claims.len());
+
+    reservations.extend(
+        active_claims
+            .iter()
+            .map(|claim| AgentMailReservationSnapshot {
+                holder: claim.assignee.clone(),
+                path_pattern: "src/coordination.rs".to_string(),
+                exclusive: true,
+                reason: Some(format!("coordination perf active {}", claim.id)),
+                expires_ts: active_expires,
+                released_ts: None,
+                thread_id: Some(claim.id.clone()),
+            }),
+    );
+    reservations.extend(
+        expired_claims
+            .iter()
+            .map(|claim| AgentMailReservationSnapshot {
+                holder: claim.assignee.clone(),
+                path_pattern: "tests/bench_synthetic_scale.rs".to_string(),
+                exclusive: true,
+                reason: Some(format!("coordination perf expired {}", claim.id)),
+                expires_ts: expired_at,
+                released_ts: Some(expired_at),
+                thread_id: Some(claim.id.clone()),
+            }),
+    );
+
+    write_jsonl_rows(&agents_path, &agents)?;
+    write_jsonl_rows(&reservations_path, &reservations)?;
+
+    Ok(CoordinationSnapshotMetrics {
+        agents_path: agents_path.display().to_string(),
+        reservations_path: reservations_path.display().to_string(),
+        agent_rows: agents.len(),
+        active_reservation_rows: active_claims.len(),
+        expired_reservation_rows: expired_claims.len(),
+        agent_snapshot_sha256: file_sha256_hex(&agents_path)?,
+        reservation_snapshot_sha256: file_sha256_hex(&reservations_path)?,
+    })
+}
+
+fn normalize_coordination_output(format: &str, stdout: &[u8]) -> std::io::Result<Value> {
+    let mut value = if format == "toon" {
+        let raw = std::str::from_utf8(stdout).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("coordination TOON output was not UTF-8: {err}"),
+            )
+        })?;
+        let decode_options = DecodeOptions {
+            indent: None,
+            strict: None,
+            expand_paths: Some(ExpandPathsMode::Safe),
+        };
+        Value::from(parse_toon(raw.trim(), Some(decode_options)).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("coordination TOON output did not decode: {err}"),
+            )
+        })?)
+    } else {
+        serde_json::from_slice(stdout).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("coordination JSON output did not parse: {err}"),
+            )
+        })?
+    };
+
+    normalize_coordination_value(&mut value);
+    Ok(value)
+}
+
+#[test]
+fn coordination_normalization_expands_safe_toon_key_folding() {
+    let toon = br#"schema_version: br.coordination.v1
+generated_at: "2026-05-08T00:00:00Z"
+summary:
+  total_claims: 1
+claims[1]:
+  - assessment:
+      updated_age_minutes: 42
+      reservation.state: active
+"#;
+
+    let normalized =
+        normalize_coordination_output("toon", toon).expect("TOON normalization should decode");
+
+    assert_eq!(
+        normalized.pointer("/claims/0/assessment/reservation/state"),
+        Some(&Value::String("active".to_string()))
+    );
+    assert_eq!(reservation_state_count(&normalized, "active"), 1);
+}
+
+fn normalize_coordination_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "generated_at" {
+                    *child = Value::String("<normalized>".to_string());
+                } else if key == "updated_age_minutes" {
+                    *child = Value::Number(0.into());
+                } else {
+                    normalize_coordination_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_coordination_value(item);
+            }
+        }
+        Value::String(text) => {
+            *text = normalize_age_minutes_text(text);
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn normalize_age_minutes_text(text: &str) -> String {
+    let marker = "age_minutes=";
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(index) = rest.find(marker) {
+        let (before, after_before) = rest.split_at(index);
+        output.push_str(before);
+        output.push_str(marker);
+        output.push_str("<normalized>");
+        let Some(after_marker) = after_before.strip_prefix(marker) else {
+            output.push_str(after_before);
+            return output;
+        };
+        let digit_count = after_marker.bytes().take_while(u8::is_ascii_digit).count();
+        rest = after_marker.get(digit_count..).unwrap_or("");
+    }
+
+    output.push_str(rest);
+    output
+}
+
+fn normalized_value_sha256(value: &Value) -> std::io::Result<String> {
+    let bytes = serde_json::to_vec(value)?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn reservation_state_count(value: &Value, state: &str) -> usize {
+    value
+        .get("claims")
+        .and_then(Value::as_array)
+        .map(|claims| {
+            claims
+                .iter()
+                .filter(|claim| {
+                    claim
+                        .pointer("/assessment/reservation/state")
+                        .and_then(Value::as_str)
+                        .is_some_and(|actual| actual == state)
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn coordination_total_claims(value: &Value) -> Option<u64> {
+    value
+        .pointer("/summary/total_claims")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("claims")
+                .and_then(Value::as_array)
+                .and_then(|claims| u64::try_from(claims.len()).ok())
+        })
+}
+
+fn command_line_for(br_path: &Path, args: &[String]) -> String {
+    let mut parts = vec![br_path.display().to_string()];
+    parts.extend(args.iter().cloned());
+    parts.join(" ")
+}
+
+fn run_coordination_status_operation(
+    br_path: &Path,
+    args: &[String],
+    workspace: &Path,
+    operation: &str,
+    format: &str,
+) -> CoordinationOperationMetrics {
+    let start = Instant::now();
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_measured_br_command(br_path, &arg_refs, workspace);
+    let duration_ms = start.elapsed().as_millis();
+    let command = command_line_for(br_path, args);
+
+    match output {
+        Ok(out) => {
+            let stdout_sha256 = out.success.then(|| sha256_hex(&out.stdout));
+            if !out.success {
+                return CoordinationOperationMetrics {
+                    operation: operation.to_string(),
+                    command,
+                    duration_ms,
+                    peak_rss_bytes: out.peak_rss_bytes,
+                    success: false,
+                    output_size_bytes: out.stdout.len(),
+                    stdout_sha256,
+                    normalized_stdout_sha256: None,
+                    total_claims: None,
+                    active_reservation_matches: 0,
+                    expired_reservation_matches: 0,
+                    error: Some(out.stderr),
+                };
+            }
+
+            match normalize_coordination_output(format, &out.stdout)
+                .and_then(|value| normalized_value_sha256(&value).map(|hash| (value, hash)))
+            {
+                Ok((value, normalized_hash)) => CoordinationOperationMetrics {
+                    operation: operation.to_string(),
+                    command,
+                    duration_ms,
+                    peak_rss_bytes: out.peak_rss_bytes,
+                    success: true,
+                    output_size_bytes: out.stdout.len(),
+                    stdout_sha256,
+                    normalized_stdout_sha256: Some(normalized_hash),
+                    total_claims: coordination_total_claims(&value),
+                    active_reservation_matches: reservation_state_count(&value, "active"),
+                    expired_reservation_matches: reservation_state_count(&value, "expired"),
+                    error: None,
+                },
+                Err(err) => CoordinationOperationMetrics {
+                    operation: operation.to_string(),
+                    command,
+                    duration_ms,
+                    peak_rss_bytes: out.peak_rss_bytes,
+                    success: false,
+                    output_size_bytes: out.stdout.len(),
+                    stdout_sha256,
+                    normalized_stdout_sha256: None,
+                    total_claims: None,
+                    active_reservation_matches: 0,
+                    expired_reservation_matches: 0,
+                    error: Some(format!("normalization failed: {err}")),
+                },
+            }
+        }
+        Err(err) => CoordinationOperationMetrics {
+            operation: operation.to_string(),
+            command,
+            duration_ms,
+            peak_rss_bytes: None,
+            success: false,
+            output_size_bytes: 0,
+            stdout_sha256: None,
+            normalized_stdout_sha256: None,
+            total_claims: None,
+            active_reservation_matches: 0,
+            expired_reservation_matches: 0,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn write_coordination_summary_notes(
+    path: &Path,
+    evidence: &CoordinationLargeSwarmEvidence,
+) -> std::io::Result<()> {
+    let json = evidence
+        .operations
+        .iter()
+        .find(|operation| operation.operation == "coordination_status_json")
+        .expect("JSON operation should be recorded");
+    let toon = evidence
+        .operations
+        .iter()
+        .find(|operation| operation.operation == "coordination_status_toon")
+        .expect("TOON operation should be recorded");
+    let summary = format!(
+        "# Coordination Large Swarm Evidence\n\n\
+Generated at: {}\n\n\
+Corpus: {} issues, {} in_progress claims, {} dependencies, {} labels, {} comments, {} simulated agents.\n\n\
+Snapshots: {} agents, {} active reservations, {} expired reservations.\n\n\
+Commands:\n\n\
+- JSON: `{}`\n\
+- TOON: `{}`\n\n\
+Results:\n\n\
+- JSON duration: {} ms; output bytes: {}; raw sha256: {}; normalized sha256: {}; peak RSS bytes: {}\n\
+- TOON duration: {} ms; output bytes: {}; raw sha256: {}; normalized sha256: {}; peak RSS bytes: {}\n\
+- Semantic hashes match: {}\n\n\
+Guardrail: coordination status requested {} latest comment row per in-progress issue. The command-side upper bound was {} comment rows for {} claims, while the generated corpus contained {} total comments. Future changes should keep the command on bounded latest-comment evidence unless they also publish a stronger measured baseline.\n\n\
+Reproduce: `{}`\n",
+        evidence.generated_at,
+        evidence.generation.issue_count,
+        evidence.generation.claim_count,
+        evidence.generation.dependency_count,
+        evidence.generation.label_assignment_count,
+        evidence.generation.comment_count,
+        evidence.generation.simulated_agent_count,
+        evidence.snapshots.agent_rows,
+        evidence.snapshots.active_reservation_rows,
+        evidence.snapshots.expired_reservation_rows,
+        json.command,
+        toon.command,
+        json.duration_ms,
+        json.output_size_bytes,
+        json.stdout_sha256.as_deref().unwrap_or("n/a"),
+        json.normalized_stdout_sha256.as_deref().unwrap_or("n/a"),
+        json.peak_rss_bytes
+            .map_or_else(|| "n/a".to_string(), |rss| rss.to_string()),
+        toon.duration_ms,
+        toon.output_size_bytes,
+        toon.stdout_sha256.as_deref().unwrap_or("n/a"),
+        toon.normalized_stdout_sha256.as_deref().unwrap_or("n/a"),
+        toon.peak_rss_bytes
+            .map_or_else(|| "n/a".to_string(), |rss| rss.to_string()),
+        evidence.comparison.semantic_hashes_match,
+        evidence.guardrail.latest_comment_limit,
+        evidence.guardrail.bounded_comment_rows_upper_bound,
+        evidence.generation.claim_count,
+        evidence.guardrail.generated_comment_rows,
+        evidence.reproduction_command,
+    );
+
+    fs::write(path, summary)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1375,6 +2170,218 @@ fn stress_synthetic_evidence_profile() {
 
     println!("Evidence benchmark written to: {}", result_path.display());
     println!("Corpus manifest written to: {}", manifest_path.display());
+}
+
+/// Coordination status evidence profile for a 100k issue / 10k+ claim swarm.
+/// Env gate: BR_E2E_STRESS=1
+#[test]
+#[ignore = "stress test: BR_E2E_STRESS=1 cargo test --test bench_synthetic_scale stress_coordination_large_swarm_evidence -- --ignored --nocapture"]
+fn stress_coordination_large_swarm_evidence() {
+    if !stress_tests_enabled() {
+        eprintln!("Skipping stress test (set BR_E2E_STRESS=1 to enable)");
+        return;
+    }
+
+    let binaries = discover_binaries().expect("Binary discovery failed");
+    let seed = synthetic_seed_from_env(20_260_508);
+    let issue_count = synthetic_evidence_issue_count_from_env(100_000);
+    let config = SyntheticConfig::ci_profile(seed)
+        .with_issue_count(issue_count)
+        .with_label_distribution(64, 1, 4)
+        .with_comment_distribution(0.25, 3)
+        .with_agent_distribution(10_000, 0.2)
+        .with_dag_skew(1.5);
+
+    eprintln!(
+        "Generating coordination evidence dataset ({} issues, {} simulated agents)...",
+        config.issue_count, config.simulated_agent_count
+    );
+    let dataset = SyntheticDataset::generate_direct_sqlite(config, &binaries.br.path)
+        .expect("Failed to generate coordination evidence dataset");
+    let claimed = collect_claimed_issues(&dataset.beads_dir.join("issues.jsonl"))
+        .expect("collect claimed synthetic issues");
+
+    assert_eq!(dataset.metrics.issue_count, issue_count);
+    if issue_count >= 100_000 {
+        assert!(
+            dataset.metrics.claim_count >= 10_000,
+            "coordination evidence corpus must include at least 10k in_progress claims; got {}",
+            dataset.metrics.claim_count
+        );
+    }
+    assert_eq!(claimed.len(), dataset.metrics.claim_count);
+
+    let output_dir = coordination_evidence_output_dir();
+    fs::create_dir_all(&output_dir).expect("create coordination evidence output dir");
+    let snapshots = write_coordination_snapshots(&output_dir, &dataset.config, &claimed)
+        .expect("write coordination snapshot fixtures");
+    if issue_count >= 100_000 {
+        assert!(
+            snapshots.active_reservation_rows >= 1_000,
+            "snapshot should include thousands of active reservations"
+        );
+        assert!(
+            snapshots.expired_reservation_rows >= 1_000,
+            "snapshot should include thousands of expired reservations"
+        );
+    }
+
+    let latest_comment_limit = 1;
+    let reservations_path = output_dir.join("coordination-reservations.jsonl");
+    let agents_path = output_dir.join("coordination-agents.jsonl");
+    let reservations_arg = fs::canonicalize(&reservations_path)
+        .expect("canonicalize reservation snapshot path")
+        .display()
+        .to_string();
+    let agents_arg = fs::canonicalize(&agents_path)
+        .expect("canonicalize agent snapshot path")
+        .display()
+        .to_string();
+    let json_args = vec![
+        "coordination".to_string(),
+        "status".to_string(),
+        "--json".to_string(),
+        "--no-auto-import".to_string(),
+        "--no-auto-flush".to_string(),
+        "--owner-kind".to_string(),
+        "swarm-agent".to_string(),
+        "--comments".to_string(),
+        latest_comment_limit.to_string(),
+        "--reservations".to_string(),
+        reservations_arg.clone(),
+        "--agents".to_string(),
+        agents_arg.clone(),
+    ];
+    let toon_args = vec![
+        "coordination".to_string(),
+        "status".to_string(),
+        "--format".to_string(),
+        "toon".to_string(),
+        "--no-auto-import".to_string(),
+        "--no-auto-flush".to_string(),
+        "--owner-kind".to_string(),
+        "swarm-agent".to_string(),
+        "--comments".to_string(),
+        latest_comment_limit.to_string(),
+        "--reservations".to_string(),
+        reservations_arg,
+        "--agents".to_string(),
+        agents_arg,
+    ];
+
+    eprintln!("Running coordination status JSON evidence command...");
+    let json_operation = run_coordination_status_operation(
+        &binaries.br.path,
+        &json_args,
+        dataset.workspace_root(),
+        "coordination_status_json",
+        "json",
+    );
+    eprintln!("Running coordination status TOON evidence command...");
+    let toon_operation = run_coordination_status_operation(
+        &binaries.br.path,
+        &toon_args,
+        dataset.workspace_root(),
+        "coordination_status_toon",
+        "toon",
+    );
+
+    for operation in [&json_operation, &toon_operation] {
+        assert!(
+            operation.success,
+            "{} failed: {:?}",
+            operation.operation,
+            operation.error.as_deref()
+        );
+        assert!(
+            operation.output_size_bytes > 0,
+            "{} should emit measurable output",
+            operation.operation
+        );
+        assert_eq!(
+            operation.stdout_sha256.as_deref().map(str::len),
+            Some(64),
+            "{} should include raw stdout hash evidence",
+            operation.operation
+        );
+        assert_eq!(
+            operation.normalized_stdout_sha256.as_deref().map(str::len),
+            Some(64),
+            "{} should include normalized stdout hash evidence",
+            operation.operation
+        );
+        assert_eq!(
+            operation.total_claims,
+            Some(u64::try_from(dataset.metrics.claim_count).unwrap_or(u64::MAX)),
+            "{} should report every in_progress claim",
+            operation.operation
+        );
+        assert!(
+            operation.active_reservation_matches >= snapshots.active_reservation_rows,
+            "{} should match active snapshot reservations",
+            operation.operation
+        );
+        assert!(
+            operation.expired_reservation_matches >= snapshots.expired_reservation_rows,
+            "{} should match expired snapshot reservations",
+            operation.operation
+        );
+    }
+
+    let json_hash = json_operation
+        .normalized_stdout_sha256
+        .clone()
+        .expect("JSON normalized hash");
+    let toon_hash = toon_operation
+        .normalized_stdout_sha256
+        .clone()
+        .expect("TOON normalized hash");
+    let comparison = CoordinationComparison {
+        json_normalized_sha256: json_hash.clone(),
+        toon_normalized_sha256: toon_hash.clone(),
+        semantic_hashes_match: json_hash == toon_hash,
+        json_output_size_bytes: json_operation.output_size_bytes,
+        toon_output_size_bytes: toon_operation.output_size_bytes,
+        json_duration_ms: json_operation.duration_ms,
+        toon_duration_ms: toon_operation.duration_ms,
+        rss_available: json_operation.peak_rss_bytes.is_some()
+            && toon_operation.peak_rss_bytes.is_some(),
+    };
+
+    let evidence = CoordinationLargeSwarmEvidence {
+        schema_version: "br.coordination-large-swarm-evidence.v1".to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        br_binary_path: binaries.br.path.display().to_string(),
+        reproduction_command: coordination_evidence_reproduction_command_for(&dataset.config),
+        config: SyntheticConfigSnapshot::from(&dataset.config),
+        generation: dataset.metrics.clone(),
+        snapshots,
+        operations: vec![json_operation, toon_operation],
+        comparison,
+        guardrail: CoordinationGuardrail {
+            latest_comment_limit,
+            bounded_comment_rows_upper_bound: dataset
+                .metrics
+                .claim_count
+                .saturating_mul(latest_comment_limit),
+            generated_comment_rows: dataset.metrics.comment_count,
+            baseline: "coordination status must keep comment loading bounded to the latest relevant rows per in_progress issue; publish a new measured evidence report before raising the bound or returning full history".to_string(),
+        },
+    };
+
+    let result_path = output_dir.join("coordination_evidence_latest.json");
+    write_json_pretty(&result_path, &evidence).expect("write coordination evidence report");
+    let manifest_path = output_dir.join("synthetic-corpus-manifest.json");
+    fs::copy(&dataset.manifest_path, &manifest_path).expect("persist corpus manifest");
+    let notes_path = output_dir.join("notes.md");
+    write_coordination_summary_notes(&notes_path, &evidence).expect("write coordination notes");
+
+    println!(
+        "Coordination evidence benchmark written to: {}",
+        result_path.display()
+    );
+    println!("Corpus manifest written to: {}", manifest_path.display());
+    println!("Summary notes written to: {}", notes_path.display());
 }
 
 /// Small scale synthetic benchmark (10k issues).
@@ -1737,6 +2744,39 @@ fn sha256_hex_hashes_stdout_for_evidence() {
 }
 
 #[test]
+fn normalize_age_minutes_text_redacts_dynamic_age_values() {
+    assert_eq!(
+        normalize_age_minutes_text(
+            "updated_at=1970-01-01T00:00:00Z, age_minutes=29617984, stale_threshold_minutes=120"
+        ),
+        "updated_at=1970-01-01T00:00:00Z, age_minutes=<normalized>, stale_threshold_minutes=120"
+    );
+}
+
+#[test]
+fn coordination_snapshot_fixture_uses_disjoint_active_and_expired_holders() {
+    let temp_dir = TempDir::new().expect("temp dir");
+    let config = SyntheticConfig::ci_profile(77).with_agent_distribution(16, 1.0);
+    let claimed = (0..16)
+        .map(|index| ClaimedIssue {
+            id: synthetic_issue_id(index),
+            assignee: synthetic_agent_name(config.seed, index),
+        })
+        .collect::<Vec<_>>();
+
+    let metrics = write_coordination_snapshots(temp_dir.path(), &config, &claimed)
+        .expect("write coordination snapshots");
+    assert_eq!(metrics.agent_rows, 16);
+    assert_eq!(metrics.active_reservation_rows, 16);
+    assert_eq!(metrics.expired_reservation_rows, 0);
+
+    let reservations = fs::read_to_string(temp_dir.path().join("coordination-reservations.jsonl"))
+        .expect("read reservations");
+    assert!(reservations.contains("coordination perf active"));
+    assert!(!reservations.contains("coordination perf expired"));
+}
+
+#[test]
 fn synthetic_ci_profile_benchmarks_graph_projection_workloads() {
     let binaries = discover_binaries().expect("Binary discovery failed");
     let config = SyntheticConfig::ci_profile(101)
@@ -1834,6 +2874,7 @@ fn synthetic_ci_profile_generates_valid_reproducible_manifest() {
     assert!(first.metrics.label_assignment_count > 0);
     assert!(first.metrics.comment_count > 0);
     assert!(first.metrics.claim_count > 0);
+    assert_eq!(first.metrics.load_strategy, "sync_import");
     assert_eq!(first.metrics.simulated_agent_count, 16);
 
     let manifest = fs::read_to_string(&first.manifest_path).expect("read corpus manifest");
@@ -1842,9 +2883,34 @@ fn synthetic_ci_profile_generates_valid_reproducible_manifest() {
     assert_eq!(manifest.schema_version, "br.synthetic-corpus.v1");
     assert_eq!(manifest.config.seed, 99);
     assert_eq!(manifest.metrics.content_hash, first.metrics.content_hash);
+    assert_eq!(manifest.metrics.load_strategy, "sync_import");
     assert!(
         manifest
             .reproduction_command
             .contains("BR_SYNTHETIC_SEED=99")
     );
+}
+
+#[test]
+fn direct_sqlite_profile_marks_bypassed_sync_health() {
+    let binaries = discover_binaries().expect("Binary discovery failed");
+    let config = SyntheticConfig::ci_profile(101).with_issue_count(32);
+
+    let dataset = SyntheticDataset::generate_direct_sqlite(config, &binaries.br.path)
+        .expect("generate direct SQLite synthetic corpus");
+
+    assert_eq!(dataset.metrics.issue_count, 32);
+    assert_eq!(dataset.metrics.load_strategy, "direct_sqlite_seed");
+    assert!(dataset.metrics.health.jsonl_valid);
+    assert_eq!(dataset.metrics.health.jsonl_issue_count, 32);
+    assert!(!dataset.metrics.health.sync_import_ok);
+    assert!(!dataset.metrics.health.doctor_ok);
+    assert!(!dataset.metrics.health.sync_status_clean);
+
+    let manifest = fs::read_to_string(&dataset.manifest_path).expect("read corpus manifest");
+    let manifest: SyntheticCorpusManifest =
+        serde_json::from_str(&manifest).expect("parse corpus manifest");
+    assert_eq!(manifest.metrics.load_strategy, "direct_sqlite_seed");
+    assert!(!manifest.metrics.health.sync_import_ok);
+    assert!(!manifest.metrics.health.doctor_ok);
 }

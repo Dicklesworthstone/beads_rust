@@ -6,7 +6,20 @@ use insta::assert_snapshot;
 fn snapshot_error_not_initialized() {
     let workspace = BrWorkspace::new();
     let output = run_br(&workspace, ["list"], "list_without_init");
-    assert!(!output.status.success(), "expected failure");
+    // `br` resolves its workspace by walking up from the current directory, so
+    // this only tests the uninitialized path when no ancestor of the temp root
+    // is itself a beads workspace. Report the resolved workspace on failure —
+    // a bare "expected failure" gives no way to tell a real regression from a
+    // temp root that happens to sit inside one.
+    assert!(
+        !output.status.success(),
+        "expected `br list` to fail in an uninitialized workspace at {}, but it exited {:?}.\n\
+         stdout:\n{}\nstderr:\n{}",
+        workspace.root.display(),
+        output.status.code(),
+        output.stdout,
+        output.stderr
+    );
     assert_snapshot!("error_not_initialized", normalize_output(&output.stderr));
 }
 

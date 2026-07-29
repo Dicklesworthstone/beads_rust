@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.2.6"
+version = "0.2.19"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -37,94 +37,108 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4.5.60", features = ["derive", "env", "unstable-ext"] }
-clap_complete = { version = "4.5.66", features = ["unstable-dynamic"] }
+clap = { version = "4.6.4", features = ["derive", "env", "unstable-ext"] }
+clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.2"
-fsqlite-types = "0.1.2"
-fsqlite-error = "0.1.2"
-fsqlite-core = "0.1.2"
-fsqlite-func = "0.1.2"
-fsqlite-vdbe = "0.1.2"
-fsqlite-vfs = "0.1.3"
-fsqlite-pager = "0.1.2"
-fsqlite-parser = "0.1.2"
-fsqlite-planner = "0.1.2"
-fsqlite-wal = "0.1.2"
-fsqlite-btree = "0.1.2"
-fsqlite-ast = "0.1.2"
-fsqlite-mvcc = "0.1.2"
-fsqlite-observability = "0.1.2"
+fsqlite = "0.1.18"
+fsqlite-types = "0.1.18"
+fsqlite-error = "0.1.18"
+fsqlite-core = "0.1.18"
+fsqlite-func = "0.1.18"
+fsqlite-vdbe = "0.1.18"
+fsqlite-vfs = "0.1.18"
+fsqlite-pager = "0.1.18"
+fsqlite-parser = "0.1.18"
+fsqlite-planner = "0.1.18"
+fsqlite-wal = "0.1.18"
+fsqlite-btree = "0.1.18"
+fsqlite-ast = "0.1.18"
+fsqlite-mvcc = "0.1.18"
+fsqlite-observability = "0.1.18"
 
 # Serialization
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-serde_yml = "0.0.12"
-schemars = { version = "1.0", features = ["derive", "chrono04"] }
-mimalloc = "0.1.50"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yml = { package = "serde_norway", version = "0.9.42" }
+schemars = { version = "1.2", features = ["derive", "chrono04"] }
 
 # Time
-chrono = { version = "0.4.43", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 
 # Hashing
+sha1 = "0.11.0"
 sha2 = "0.11.0"
 
 # Error handling
-anyhow = "1.0.102"
-thiserror = "2.0.18"
+anyhow = "1.0.104"
+thiserror = "2.0.19"
 
 # Logging
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 
 # Terminal
-indicatif = "0.18.4"
+indicatif = "0.18.6"
 crossterm = "0.29"
 
-# Rich terminal output (sibling project)
-rich_rust = { version = "0.2.1", features = ["full"] }
+# Rich terminal output (sibling project). Keep syntax highlighting out of the
+# release build until the upstream syntect stack drops unmaintained transitive
+# crates.
+rich_rust = { version = "0.2.2", features = ["markdown", "json", "backtrace"] }
 
 # TOON format support (sibling project)
-toon_rust = { version = "0.2.2", package = "tru" }
+toon_rust = { version = "0.2.3", package = "tru" }
 
 # Path normalization (strips \\?\ prefix on Windows)
 dunce = "1.0.5"
 
 # Utilities
 once_cell = "1.21"
-regex = "1.12"
+regex = "1.13"
 shell-words = "1.1.1"
-similar = "3.1.0"
-tempfile = "3.25"
+similar = "3.1.1"
+tempfile = "3.27"
 unicode-width = "0.2.2"
 
 # Versioning
-semver = "1.0.27"
+semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.3.0", optional = true }
+fastmcp-rust = { version = "0.3.2", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
-self_update = { version = "0.44", features = ["reqwest", "rustls", "archive-tar", "compression-flate2"], default-features = false, optional = true }
+self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
+self-replace = { version = "1.5.0", optional = true }
 
 # Cooperative shutdown so SIGINT/SIGTERM/SIGHUP unwind through main and let
 # SqliteStorage::Drop flush the WAL instead of stranding frames on disk (#270).
 [target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
+libc = "0.2.185"
+rustix = { version = "1.1.4", features = ["fs"] }
+signal-hook = "0.4.4"
+
+[target.'cfg(windows)'.dependencies]
+# Capability-relative Windows filesystem access. Pin exactly because the
+# no-follow/open-at implementation is part of sync's hostile-path boundary.
+cap-primitives = "=4.0.2"
+
+[target.'cfg(not(windows))'.dependencies]
+mimalloc = "0.1.52"
 
 [build-dependencies]
-vergen-gix = { version = "9.1", features = ["build", "cargo", "rustc"] }
+vergen-gix = { version = "10.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.2"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 walkdir = "2.5"
-insta = { version = "1.46", features = ["json", "yaml"] }
-proptest = "1.10"
+insta = { version = "1.48", features = ["json", "yaml"] }
+proptest = "1.11"
 rand = "0.10"
+toml = "=1.1.2"
 
 [[bench]]
 name = "storage_perf"
@@ -153,19 +167,20 @@ default = ["self_update"]
 mcp = ["dep:fastmcp-rust"]
 self_update = [
     "dep:self_update",
+    "dep:self-replace",
     "self_update/rustls",
     "self_update/archive-tar",
     "self_update/archive-zip",
-    "self_update/compression-flate2",
+    "self_update/compression-tar-gz",
     "self_update/compression-zip-deflate",
 ]
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.1.2+, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.2.1+ — are published on crates.io, so this crate
+# All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.3.1+ — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
-# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git`
+# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`
 # checkouts (issue #250 bug 1).
 #

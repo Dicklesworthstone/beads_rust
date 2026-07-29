@@ -1,0 +1,41 @@
+{
+  "schema_version": "br.synthetic-corpus.v1",
+  "generator": "bench_synthetic_scale::write_synthetic_jsonl+populate_sqlite_direct",
+  "generated_at": "2026-05-08T16:15:27.166763715+00:00",
+  "config": {
+    "issue_count": 100000,
+    "dependency_density": 0.4,
+    "seed": 20260508,
+    "base_dataset": null,
+    "label_pool_size": 64,
+    "min_labels_per_issue": 1,
+    "max_labels_per_issue": 4,
+    "comment_density": 0.25,
+    "max_comments_per_issue": 3,
+    "simulated_agent_count": 10000,
+    "claim_density": 0.2,
+    "dag_skew": 1.5
+  },
+  "metrics": {
+    "issue_count": 100000,
+    "dependency_count": 40065,
+    "label_assignment_count": 250063,
+    "comment_count": 50462,
+    "simulated_agent_count": 10000,
+    "claim_count": 20013,
+    "load_strategy": "direct_sqlite_seed",
+    "generation_ms": 482049,
+    "jsonl_size_bytes": 68547006,
+    "expected_jsonl_size_bytes": 68547006,
+    "db_size_bytes": 195887104,
+    "content_hash": "2bc88279222e392543c7374a9a6e1231fd5bf9ba65c526c707759fce96a4ac8c",
+    "health": {
+      "jsonl_valid": true,
+      "jsonl_issue_count": 100000,
+      "sync_import_ok": false,
+      "doctor_ok": false,
+      "sync_status_clean": false
+    }
+  },
+  "reproduction_command": "BR_E2E_STRESS=1 BR_SYNTHETIC_SEED=20260508 BR_SYNTHETIC_EVIDENCE_ISSUES=100000 cargo test --test bench_synthetic_scale stress_coordination_large_swarm_evidence -- --ignored --nocapture"
+}

@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           components: rustfmt, clippy
@@ -54,10 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@711e1c3275189d76dcc4d34ddea63bf96ac49090  # v2.76.0
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853  # v2.83.2
         with:
           tool: cargo-audit
 
@@ -74,10 +74,10 @@ jobs:
     timeout-minutes: 40
     needs: check
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -101,10 +101,10 @@ jobs:
     timeout-minutes: 60
     needs: check
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -143,16 +143,82 @@ jobs:
           path: target/test-artifacts/
           if-no-files-found: ignore
 
+  audit-gates:
+    name: Audit Guardrails (2026-05-09)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: check
+    # Gates added by beads_rust-6jmq for the audit-driven cleanup EPIC
+    # (beads_rust-ebzi). Each step corresponds to a sibling bead's harness:
+    #   - Snapshot freshness    (l6xl)
+    #   - ID-pinning lint       (s5se) — runs as part of `cargo test`
+    #   - Forced-cycle-close audit (30ci)
+    #   - Sync-safety witness   (yyxo) — Linux only
+    #   - Concurrency witness   (mjmk)
+    # Documented in docs/TESTING_GUIDELINES.md and the per-bead specs.
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
+
+      - name: Install cargo-insta
+        run: cargo install cargo-insta --locked --version 1.46.1
+
+      - name: Build release br binary (used by shell harnesses)
+        run: cargo build --release
+
+      # l6xl: snapshot freshness — fails CI on any *.snap.new alongside *.snap
+      - name: Snapshot freshness gate (beads_rust-l6xl)
+        run: cargo insta test --check --workspace
+        env:
+          RUST_LOG: error
+
+      # 30ci: regression check that no closed bead has audit-suspect close_reason
+      # without an audit-historical-cycle-close-* escape-hatch label
+      - name: Audit suspect close_reasons gate (beads_rust-30ci)
+        run: bash tests/e2e_scripts/forced_cycle_close_audit.sh
+
+      # yyxo: filesystem-witness regression for sync allowlist (PC-1 / PC-RECOVERY)
+      - name: Sync safety witness (beads_rust-yyxo)
+        run: |
+          export BR_BIN="$(pwd)/target/release/br"
+          bash tests/e2e_scripts/sync_safety_witness.sh
+
+      # mjmk: 50-iter concurrency no-flake harness — readers race writer.
+      # Smoke-run 5 iters in CI to keep wall time bounded; full 50-iter
+      # is a local pre-merge check.
+      - name: Concurrency witness 5-iter smoke (beads_rust-mjmk)
+        run: |
+          export BR_BIN="$(pwd)/target/release/br"
+          ITER_OVERRIDE=5 bash tests/e2e_scripts/concurrency_witness_logged.sh
+
+      - name: Upload audit-gate event logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: audit-gate-event-logs
+          path: |
+            /tmp/sync_safety_witness_*.jsonl
+            /tmp/concurrency_witness_*.jsonl
+            /tmp/forced_cycle_close_audit_*.summary.txt
+          if-no-files-found: ignore
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: test
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           components: llvm-tools-preview
@@ -161,7 +227,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@711e1c3275189d76dcc4d34ddea63bf96ac49090  # v2.76.0
+        uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853  # v2.83.2
         with:
           tool: cargo-llvm-cov
 
@@ -170,7 +236,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2  # v6.0.0
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -207,10 +273,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             name: windows-x64
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
@@ -252,10 +318,10 @@ jobs:
     needs: check
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -263,7 +329,7 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
 
       - name: Restore criterion baseline cache
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: target/criterion/
           key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
@@ -344,7 +410,7 @@ jobs:
 
       - name: Save criterion baseline cache
         if: always()
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: target/criterion/
           key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
@@ -356,7 +422,7 @@ jobs:
     timeout-minutes: 10
     needs: build
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Download Linux artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
@@ -386,10 +452,10 @@ jobs:
     timeout-minutes: 10
     needs: check
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 

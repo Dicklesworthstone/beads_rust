@@ -28,14 +28,19 @@ br list --json --limit 5   # JSON always wins
 
 ## stderr vs stdout
 
-- Normal successful outputs go to stdout.
-- Diagnostics/logging go to stderr.
-- Some failures emit a structured JSON error object on stderr (see `docs/agent/ERRORS.md`).
+- In JSON/robot mode, the machine-readable result goes to stdout: success
+  data on exit `0`, the structured JSON error envelope on non-zero exits
+  (see `docs/agent/ERRORS.md`, including the two-document partial-batch
+  contract).
+- Diagnostics/logging (`RUST_LOG`) and non-fatal structured warnings
+  (e.g. `AUTO_FLUSH_FAILED`) go to stderr — never the error envelope.
 
 Practical pattern:
 
 ```bash
-br ready --format json 2>ready.stderr.json | jq .
+br ready --format json 2>/dev/null | jq .
+# On non-zero exit, the envelope is the last JSON document on stdout:
+br show br-NOTEXIST --json 2>/dev/null | jq -s '.[-1].error' || true
 ```
 
 ## Text wrapping (human output)
@@ -44,7 +49,8 @@ When using text output, `--wrap` wraps long lines instead of truncating.
 
 ## TOON decode tool (`tru`)
 
-If you want to decode TOON back into JSON for piping, you need `tru` (the TOON CLI).
+If you want to decode TOON back into nested JSON for piping, you need `tru`
+with safe path expansion because br emits safe folded keys.
 
 If `tru` is not available, prefer `--format json` / `--json` instead.
 

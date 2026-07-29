@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 143
 expression: normalize_json(&json)
 ---
 [
@@ -8,6 +9,7 @@ expression: normalize_json(&json)
     "created_by": "ACTOR",
     "id": "ISSUE_ID",
     "issue_type": "task",
+    "labels": [],
     "priority": 2,
     "status": "open",
     "title": "Ready issue",

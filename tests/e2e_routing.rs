@@ -13,7 +13,7 @@ use std::process::Command;
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env, run_br_with_stdin};
 use serde_json::Value;
 use toon_rust::try_decode as decode_toon;
 
@@ -378,11 +378,11 @@ fn e2e_routing_external_target_lock_blocks_routed_access() {
     );
     assert!(
         routed_show
-            .stderr
+            .stdout
             .contains("Routed external workspace is busy")
-            || routed_show.stderr.contains("target write lock"),
-        "expected target lock diagnostic, got stderr: {}",
-        routed_show.stderr
+            || routed_show.stdout.contains("target write lock"),
+        "expected target lock diagnostic, got stdout: {}",
+        routed_show.stdout
     );
 
     drop(lock_file);
@@ -752,6 +752,81 @@ fn e2e_routing_update_external_issue_via_main_workspace() {
 
     let jsonl_issue = issue_from_jsonl(&external_workspace, &external_id);
     assert_eq!(jsonl_issue["status"].as_str(), Some("in_progress"));
+}
+
+#[test]
+fn e2e_routing_update_description_stdin_is_consumed_once_before_route_fanout() {
+    let _log = common::test_log(
+        "e2e_routing_update_description_stdin_is_consumed_once_before_route_fanout",
+    );
+
+    let main_workspace = BrWorkspace::new();
+    let external_workspace = BrWorkspace::new();
+    init_workspace(&main_workspace, "init_description_stdin_main");
+    init_workspace(&external_workspace, "init_description_stdin_external");
+    configure_external_route(&main_workspace, &external_workspace);
+
+    let local_id = create_issue_and_get_id(
+        &main_workspace,
+        "Local description stdin target",
+        "create_local_description_stdin_target",
+    );
+    let external_id = create_issue_and_get_id(
+        &external_workspace,
+        "External description stdin target",
+        "create_external_description_stdin_target",
+    );
+    let exact_description =
+        "  shared leading spaces\n\n# Shared markdown\n\nroute one\nroute two\n\n";
+
+    let update = run_br_with_stdin(
+        &main_workspace,
+        [
+            "update",
+            &local_id,
+            &external_id,
+            "--description-file",
+            "-",
+            "--json",
+        ],
+        exact_description,
+        "update_mixed_routes_description_stdin",
+    );
+    assert!(
+        update.status.success(),
+        "mixed-route stdin update failed: stdout={} stderr={}",
+        update.stdout,
+        update.stderr
+    );
+    assert!(
+        !update.stdout.contains("No updates specified"),
+        "description stdin must be treated as an update: {}",
+        update.stdout
+    );
+    let updated: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&update.stdout)).expect("update json");
+    assert_eq!(updated.len(), 2);
+    assert_eq!(updated[0]["id"].as_str(), Some(local_id.as_str()));
+    assert_eq!(updated[1]["id"].as_str(), Some(external_id.as_str()));
+
+    let local_after = show_issue_json(
+        &main_workspace,
+        &local_id,
+        "show_local_after_description_stdin",
+    );
+    let external_after = show_issue_json(
+        &external_workspace,
+        &external_id,
+        "show_external_after_description_stdin",
+    );
+    assert_eq!(
+        local_after[0]["description"].as_str(),
+        Some(exact_description)
+    );
+    assert_eq!(
+        external_after[0]["description"].as_str(),
+        Some(exact_description)
+    );
 }
 
 #[test]
@@ -1851,9 +1926,9 @@ fn e2e_routing_dep_add_rejects_direct_cross_project_target() {
         "dep add should reject bare cross-project targets"
     );
     assert!(
-        dep_add.stderr.contains("different projects") && dep_add.stderr.contains("external:"),
-        "unexpected stderr: {}",
-        dep_add.stderr
+        dep_add.stdout.contains("different projects") && dep_add.stdout.contains("external:"),
+        "unexpected stdout: {}",
+        dep_add.stdout
     );
 }
 
@@ -2261,8 +2336,13 @@ fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
         !label_add.status.success(),
         "expected routed label add with missing external issue to fail"
     );
+    // In JSON mode the structured error envelope is the whole of stdout
+    // (issue #336), so "no partial success output" means the payload is an
+    // error rather than a per-issue success list.
+    let label_add_json: Value = serde_json::from_str(label_add.stdout.trim())
+        .expect("failing routed label add should still emit one parseable JSON payload");
     assert!(
-        label_add.stdout.trim().is_empty(),
+        label_add_json.get("error").is_some(),
         "failing routed label add should not emit partial success output: {}",
         label_add.stdout
     );
@@ -3113,13 +3193,13 @@ fn e2e_routing_redirect_missing_target() {
     // Check that error messaging is clear when redirect/route fails
     if !show.status.success() {
         assert!(
-            show.stderr.contains("not found")
-                || show.stderr.contains("Redirect")
-                || show.stderr.contains("redirect")
-                || show.stderr.contains("Issue")
-                || show.stderr.contains("route"),
+            show.stdout.contains("not found")
+                || show.stdout.contains("Redirect")
+                || show.stdout.contains("redirect")
+                || show.stdout.contains("Issue")
+                || show.stdout.contains("route"),
             "Expected clear error about routing/redirect, got: {}",
-            show.stderr
+            show.stdout
         );
     }
     // If it succeeds (by falling back to local), that's also acceptable behavior
@@ -3443,9 +3523,9 @@ fn e2e_routing_not_initialized_error() {
         "Expected failure when not initialized"
     );
     assert!(
-        list.stderr.contains("not initialized")
-            || list.stderr.contains("br init")
-            || list.stderr.contains("NotInitialized"),
+        list.stdout.contains("not initialized")
+            || list.stdout.contains("br init")
+            || list.stdout.contains("NotInitialized"),
         "Expected clear error about initialization, got: {}",
         list.stderr
     );
@@ -3469,10 +3549,10 @@ fn e2e_routing_invalid_beads_dir_env() {
     );
     // Should fall back to discovery and fail with not initialized
     assert!(
-        list.stderr.contains("not initialized")
-            || list.stderr.contains("br init")
-            || list.stderr.contains("NotInitialized")
-            || list.stderr.contains("not found"),
+        list.stdout.contains("not initialized")
+            || list.stdout.contains("br init")
+            || list.stdout.contains("NotInitialized")
+            || list.stdout.contains("not found"),
         "Expected clear error, got: {}",
         list.stderr
     );
@@ -3522,9 +3602,9 @@ fn e2e_routing_show_external_issue_not_found() {
         "Expected failure for nonexistent issue"
     );
     assert!(
-        show.stderr.contains("not found")
-            || show.stderr.contains("Issue")
-            || show.stderr.contains("ext-nonexistent")
+        show.stdout.contains("not found")
+            || show.stdout.contains("Issue")
+            || show.stdout.contains("ext-nonexistent")
             || show.stderr.contains("No issue"),
         "Expected clear error about missing issue, got: {}",
         show.stderr

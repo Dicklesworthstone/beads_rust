@@ -1,6 +1,6 @@
 {
   "tool": "br",
-  "generated_at": "2026-04-25T00:17:56.056176564Z",
+  "generated_at": "<GENERATED_AT>",
   "schemas": {
     "ErrorEnvelope": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -44,7 +44,9 @@
           "required": [
             "code",
             "message",
-            "retryable"
+            "hint",
+            "retryable",
+            "context"
           ]
         }
       }

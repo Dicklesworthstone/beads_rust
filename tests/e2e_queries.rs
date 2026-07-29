@@ -113,14 +113,21 @@ fn e2e_queries_ready_stale_count_search() {
         defer_issue.stderr
     );
 
+    // beads_rust#301: `br update --status closed` is rejected; use the
+    // dedicated `br close` command so close-policy is enforced uniformly.
     let close_issue = run_br(
         &workspace,
-        ["update", &closed_id, "--status", "closed"],
+        [
+            "close",
+            &closed_id,
+            "--reason",
+            "fixture: ready-after-close",
+        ],
         "close_issue",
     );
     assert!(
         close_issue.status.success(),
-        "close update failed: {}",
+        "close failed: {}",
         close_issue.stderr
     );
 

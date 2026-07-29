@@ -1,26 +1,26 @@
 # E2E Coverage Matrix - br CLI Commands
 
 > Single source of truth for CLI command coverage and E2E scenario mapping.
-> Generated for beads_rust-rkuz.
+> Generated for beads_rust-rkuz; refreshed for beads_rust-9ow6.1 on 2026-05-08.
 
 ## Overview
 
 | Category | Total Commands | Covered | Gaps | Coverage % |
 |----------|----------------|---------|------|------------|
-| Core CRUD | 8 | 8 | 0 | 100% |
-| Querying | 7 | 7 | 0 | 100% |
-| Dependencies | 5 | 4 | 1 | 80% |
-| Labels | 5 | 3 | 2 | 60% |
+| Core CRUD | 8 | 7 | 1 | 88% |
+| Querying | 9 | 9 | 0 | 100% |
+| Dependencies | 5 | 5 | 0 | 100% |
+| Labels | 5 | 5 | 0 | 100% |
 | Comments | 2 | 2 | 0 | 100% |
 | Epics | 2 | 2 | 0 | 100% |
 | Sync | 1 | 1 | 0 | 100% |
-| Config | 5 | 2 | 3 | 40% |
-| Diagnostics | 5 | 4 | 1 | 80% |
-| History | 4 | 2 | 2 | 50% |
+| Config | 6 | 6 | 0 | 100% |
+| Diagnostics | 6 | 5 | 1 | 83% |
+| History | 4 | 4 | 0 | 100% |
 | Queries (Saved) | 4 | 4 | 0 | 100% |
 | Audit | 2 | 2 | 0 | 100% |
-| Special | 4 | 3 | 1 | 75% |
-| **TOTAL** | **54** | **44** | **10** | **81%** |
+| Special | 7 | 5 | 2 | 71% |
+| **TOTAL** | **61** | **57** | **4** | **93%** |
 
 ---
 
@@ -50,12 +50,12 @@
 | `update` | `--title`, `--description`, `--design`, `--acceptance-criteria`, `--notes`, `--status`, `--priority`, `--type`, `--assignee`, `--owner`, `--claim`, `--due`, `--defer`, `--estimate`, `--add-label`, `--remove-label`, `--set-labels`, `--parent`, `--external-ref`, `--session` | ✏️ | `e2e_basic_lifecycle.rs` | ✅ |
 | `close` | `--reason`, `--force`, `--suggest-next`, `--session`, `--robot` | ✏️ | `e2e_basic_lifecycle.rs`, `e2e_epic.rs` | ✅ |
 | `reopen` | `--reason`, `--robot` | ✏️ | `e2e_basic_lifecycle.rs` | ✅ |
-| `delete` | `--reason`, `--from-file`, `--cascade`, `--force`, `--hard`, `--dry-run` | ✏️ ⚠️ | `e2e_basic_lifecycle.rs` | ✅ |
+| `delete` | `--reason`, `--from-file`, `--cascade`, `--force`, `--hard`, `--dry-run` | ✏️ ⚠️ | `e2e_basic_lifecycle.rs`, `e2e_errors.rs` | 🔶 |
 | `show` | positional IDs | 📖 | `e2e_basic_lifecycle.rs` | ✅ |
 
 **Notes:**
 - `create --file` (markdown import) tested in `markdown_import.rs`
-- `delete --cascade` needs explicit E2E scenario
+- `delete --cascade` still needs an explicit scenario; dependent safety and dry-run behavior are covered in `e2e_errors.rs`.
 
 ---
 
@@ -70,6 +70,8 @@
 | `count` | `--by`, `--status`, `--type`, `--priority`, `--assignee`, `--unassigned`, `--include-closed`, `--include-templates`, `--title-contains` | 📖 | `conformance.rs` | ✅ |
 | `stale` | `--days`, `--status` | 📖 | `conformance.rs` | ✅ |
 | `graph` | positional ID, `--all`, `--compact` | 📖 | `e2e_graph.rs`, `e2e_graph_ordering.rs` | ✅ |
+| `stats` | `--json`, `--no-activity` | 📖 | `e2e_stats.rs`, `conformance.rs` | ✅ |
+| `status` | alias for `stats` | 📖 | `e2e_concurrency.rs` | ✅ |
 
 ---
 
@@ -80,11 +82,11 @@
 | `dep add` | `--type`, `--metadata` | ✏️ | `e2e_basic_lifecycle.rs`, `storage_deps.rs` | ✅ |
 | `dep remove` | - | ✏️ | `storage_deps.rs` | ✅ |
 | `dep list` | `--direction`, `--type` | 📖 | `storage_deps.rs` | ✅ |
-| `dep tree` | `--max-depth`, `--format` | 📖 | `repro_dep_tree.rs` | 🔶 |
+| `dep tree` | `--max-depth`, `--format` | 📖 | `repro_dep_tree.rs`, `e2e_dep_tree_mermaid.rs`, `e2e_relations.rs` | ✅ |
 | `dep cycles` | `--blocking-only` | 📖 | `storage_deps.rs` | ✅ |
 
-**Gaps:**
-- `dep tree --format=mermaid` needs explicit E2E
+**Notes:**
+- `dep tree --format=mermaid` is covered by `e2e_dep_tree_mermaid.rs`.
 
 ---
 
@@ -95,12 +97,11 @@
 | `label add` | `--label` | ✏️ | `e2e_labels.rs`, `conformance_labels_comments.rs` | ✅ |
 | `label remove` | `--label` | ✏️ | `e2e_labels.rs` | ✅ |
 | `label list` | positional ID | 📖 | `e2e_labels.rs` | ✅ |
-| `label list-all` | - | 📖 | - | ❌ |
-| `label rename` | positional old/new | ✏️ | - | ❌ |
+| `label list-all` | - | 📖 | `e2e_labels.rs`, `conformance_labels_comments.rs`, `snapshots/json_output.rs` | ✅ |
+| `label rename` | positional old/new | ✏️ | `e2e_labels.rs` | ✅ |
 
-**Gaps:**
-- `label list-all` no dedicated E2E
-- `label rename` no E2E
+**Notes:**
+- Both label coverage gaps from the original matrix now have dedicated E2E coverage.
 
 ---
 
@@ -126,7 +127,8 @@
 
 | Command | Key Flags | Mutating | Test File(s) | Status |
 |---------|-----------|----------|--------------|--------|
-| `sync` | `--flush-only`, `--import-only`, `--merge`, `--status`, `--force`, `--allow-external-jsonl`, `--manifest`, `--error-policy`, `--orphans`, `--robot` | ✏️ | `e2e_sync_artifacts.rs`, `e2e_sync_failure_injection.rs`, `e2e_sync_fuzz_edge_cases.rs`, `e2e_sync_git_safety.rs`, `e2e_sync_preflight_integration.rs`, `jsonl_import_export.rs` | ✅ |
+| `sync` | `--flush-only`, `--import-only`, `--merge`, `--status`, `--witness`, `--reconcile-additive`, `--apply`, `--expect-plan-sha256`, `--force`, `--force-db`, `--force-jsonl`, `--rename-prefix`, `--rebuild`, `--allow-external-jsonl`, `--manifest`, `--error-policy`, `--orphans`, `--robot` | ✏️ | `e2e_sync_artifacts.rs`, `e2e_sync_failure_injection.rs`, `e2e_sync_fuzz_edge_cases.rs`, `e2e_sync_git_safety.rs`, `e2e_sync_status_health.rs`, `e2e_sync_preflight_integration.rs`, `e2e_basic_lifecycle.rs`, `jsonl_import_export.rs` | ✅ |
+| `vcs-status` | `--jsonl`, `--allow-external-jsonl`, `--timeout-ms`, `--robot`, global JSON/TOON | 📖 | `e2e_vcs_status.rs`, VCS runner unit tests | ✅ |
 
 **Safety-critical test files:**
 - `e2e_sync_git_safety.rs` - verifies no git operations
@@ -140,13 +142,13 @@
 |---------|-----------|----------|--------------|--------|
 | `config list` | `--project`, `--user` | 📖 | `e2e_config_precedence.rs` | ✅ |
 | `config get` | positional key | 📖 | `e2e_config_precedence.rs` | ✅ |
-| `config set` | positional key=value | ✏️ | - | ❌ |
-| `config delete`/`unset` | positional key | ✏️ | - | ❌ |
-| `config edit` | - | ✏️ | - | ❌ |
-| `config path` | - | 📖 | - | ❌ |
+| `config set` | positional key=value | ✏️ | `e2e_config_precedence.rs`, `e2e_env_overrides.rs`, `e2e_workspace_commands.rs` | ✅ |
+| `config delete`/`unset` | positional key | ✏️ | `e2e_config_precedence.rs`, `e2e_routing.rs` | ✅ |
+| `config edit` | - | ✏️ | `e2e_workspace_commands.rs` | ✅ |
+| `config path` | - | 📖 | `e2e_queries.rs`, `e2e_workspace_scenarios.rs`, `e2e_global_flags.rs` | ✅ |
 
-**Gaps:**
-- `config set/delete/edit/path` no E2E
+**Notes:**
+- Config mutation and path coverage has been added since the original matrix was generated.
 
 ---
 
@@ -154,15 +156,15 @@
 
 | Command | Key Flags | Mutating | Test File(s) | Status |
 |---------|-----------|----------|--------------|--------|
-| `doctor` | - | 📖 | - | ❌ |
-| `info` | `--schema`, `--whats-new`, `--thanks` | 📖 | - | 🔶 |
+| `doctor` | diagnostics, `--repair`, `migrate-schema plan/apply/undo`, migration `--dry-run` | ✏️ | `e2e_basic_lifecycle.rs`, `e2e_doctor_chokepoint.rs`, `conformance.rs`, focused schema-migration unit tests | ✅ |
+| `info` | `--schema`, `--whats-new`, `--thanks` | 📖 | `e2e_workspace_scenarios.rs`, `e2e_env_overrides.rs`, `e2e_global_flags.rs`, `conformance.rs` | 🔶 |
 | `where` | - | 📖 | `e2e_basic_lifecycle.rs` | ✅ |
 | `version` | - | 📖 | `e2e_basic_lifecycle.rs` | ✅ |
 | `lint` | positional IDs, `--type`, `--status` | 📖 | `e2e_lint.rs` | ✅ |
+| `schema` | target, `--format` | 📖 | `e2e_schema.rs`, `snapshots/schema_output.rs` | ✅ |
 
 **Gaps:**
-- `doctor` no dedicated E2E (implicit in other tests)
-- `info --schema/--whats-new/--thanks` variants untested
+- `info --schema` still needs explicit E2E coverage. `--whats-new` and `--thanks` have quiet/JSON/TOON coverage.
 
 ---
 
@@ -172,11 +174,11 @@
 |---------|-----------|----------|--------------|--------|
 | `history list` | - | 📖 | `e2e_history.rs`, `e2e_history_custom_path.rs` | ✅ |
 | `history diff` | positional file | 📖 | `e2e_history.rs` | ✅ |
-| `history restore` | `--force` | ✏️ | - | ❌ |
-| `history prune` | `--keep`, `--older-than` | ✏️ ⚠️ | - | ❌ |
+| `history restore` | `--force` | ✏️ | `e2e_history.rs`, `e2e_history_restore_prune.rs` | ✅ |
+| `history prune` | `--keep`, `--older-than` | ✏️ ⚠️ | `e2e_history.rs`, `e2e_history_restore_prune.rs`, `e2e_env_overrides.rs` | ✅ |
 
-**Gaps:**
-- `history restore/prune` no E2E (destructive)
+**Notes:**
+- Restore and prune now have focused destructive-path coverage in isolated workspaces.
 
 ---
 
@@ -210,40 +212,34 @@
 | `changelog` | `--since`, `--since-tag`, `--since-commit`, `--robot` | 📖 | `e2e_changelog.rs` | ✅ |
 | `completions` | positional shell, `--output` | 📖 | `e2e_completions.rs` | ✅ |
 | `upgrade` | `--check`, `--force`, `--version`, `--dry-run` | 🌐 ⚠️ | `e2e_upgrade.rs` | 🔶 |
+| `agents` | AGENTS.md workflow helpers | 📖/✏️ | - | ❌ |
 
 **Notes:**
 - `upgrade` requires `self_update` feature and network; tests are guarded
-
----
-
-## 14. Defer/Undefer (Soft Defer) ✏️
-
-| Command | Key Flags | Mutating | Test File(s) | Status |
-|---------|-----------|----------|--------------|--------|
-| `defer` | `--until`, `--robot` | ✏️ | `e2e_defer.rs` | ✅ |
-| `undefer` | `--robot` | ✏️ | `e2e_undefer.rs` | ✅ |
+- `agents` is a newer top-level command and needs first-class E2E coverage.
 
 ---
 
 ## Gap Summary
 
-### High Priority (P1)
+### Active Gaps
 
-1. **`doctor`** - No dedicated E2E; diagnostics command
-2. **`config set/delete/edit/path`** - No E2E for mutating config
+1. **`agents`** - Newer top-level AGENTS.md workflow command with no E2E row yet.
+2. **`info --schema`** - `info`, `--whats-new`, and `--thanks` are covered; schema details are not explicit.
+3. **`delete --cascade`** - Dependent safety and dry-run output are covered, but no explicit cascade execution scenario.
 
-### Medium Priority (P2)
+### Guarded Or Partial
 
-3. **`label list-all`** - No E2E
-4. **`label rename`** - No E2E
-5. **`history restore`** - No E2E (destructive, needs careful testing)
-6. **`history prune`** - No E2E (destructive)
-7. **`dep tree --format=mermaid`** - Partial coverage
+4. **`upgrade`** - Guarded by feature/network requirements; current tests cover safe paths.
 
-### Low Priority (P3)
+### Cleared Since beads_rust-rkuz
 
-8. **`info --schema/--whats-new/--thanks`** - Flags not explicitly tested
-9. **`delete --cascade`** - Implied but not explicit test
+- `doctor`
+- `config set/delete/edit/path`
+- `label list-all`
+- `label rename`
+- `history restore/prune`
+- `dep tree --format=mermaid`
 
 ---
 
@@ -264,20 +260,21 @@
 ### Read-Only Commands (Safe for Conformance)
 
 ```
-list, show, ready, blocked, search, count, stale, graph
+list, show, ready, blocked, search, count, stale, graph, stats, status
 dep list, dep tree, dep cycles
 label list, label list-all
 comments list
 epic status
 sync --status
 config list, config get, config path
-doctor, info, where, version, lint
+doctor, info, schema, where, version, lint
 history list, history diff
 query run, query list
 orphans (without --fix)
 changelog
 completions
 upgrade --check
+agents --check
 ```
 
 ### Mutating Commands (Require Isolation)
@@ -296,6 +293,7 @@ audit record, audit label
 defer, undefer
 orphans --fix
 upgrade (full)
+agents --add, agents --remove, agents --update
 ```
 
 ---
@@ -305,8 +303,8 @@ upgrade (full)
 | Variable | Purpose | Test Impact |
 |----------|---------|-------------|
 | `BEADS_DIR` | Override .beads discovery | Tested in `e2e_config_precedence.rs` |
-| `BEADS_JSONL` | Override JSONL path | Needs explicit E2E |
-| `BD_ACTOR` / Actor flag | Audit trail identity | Implicit in tests |
+| `BEADS_JSONL` | Override JSONL path | Tested in `e2e_env_overrides.rs` and `e2e_history_custom_path.rs` |
+| `BD_ACTOR` / Actor flag | Audit trail identity | Tested in `e2e_env_overrides.rs` |
 | `BR_UPGRADE_SKIP` | Skip upgrade tests | Used in CI |
 | `BR_E2E_DESTRUCTIVE` | Enable destructive tests | Guards `history prune`, `delete --hard` |
 
@@ -350,5 +348,6 @@ All commands support `--json` flag. Key shapes validated:
 ---
 
 *Generated: 2026-01-17*
-*Task: beads_rust-rkuz*
-*Agent: SilentFalcon (opus-4.5)*
+*Refreshed: 2026-05-08 for beads_rust-9ow6.1*
+*Original task: beads_rust-rkuz*
+*Original agent: SilentFalcon (opus-4.5)*

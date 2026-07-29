@@ -52,6 +52,80 @@ fn scheduler_json(workspace: &BrWorkspace, args: &[&str], label: &str) -> Value 
     serde_json::from_str(&payload).expect("scheduler json")
 }
 
+fn assert_fresh_scheduler_claim_evidence(fresh: &[Value], assigned: &str, unassigned: &str) {
+    assert_eq!(fresh[0]["issue"]["id"], unassigned);
+    assert_eq!(fresh[0]["evidence"]["fairness"]["unassigned"], true);
+    assert_eq!(
+        fresh[0]["evidence"]["stale_claim"]["classification"],
+        "unassigned"
+    );
+    assert_eq!(
+        fresh[0]["evidence"]["stale_claim"]["recommended_action"],
+        "observe"
+    );
+    assert_eq!(fresh[1]["issue"]["id"], assigned);
+    assert_eq!(fresh[1]["evidence"]["fairness"]["contribution"], -2);
+    assert_eq!(
+        fresh[1]["evidence"]["stale_claim"]["owner_kind"],
+        "swarm_agent"
+    );
+    assert_eq!(
+        fresh[1]["evidence"]["stale_claim"]["reservation_status"],
+        "no_snapshot"
+    );
+    assert_eq!(
+        fresh[1]["evidence"]["stale_claim"]["classification"],
+        "fresh"
+    );
+    assert_eq!(
+        fresh[1]["evidence"]["stale_claim"]["recommended_action"],
+        "observe"
+    );
+    assert_eq!(fresh[1]["evidence"]["stale_claim"]["is_stale"], false);
+    assert!(fresh[1]["evidence"]["stale_claim"]["coordination_status_hint"].is_null());
+}
+
+fn assert_stale_scheduler_claim_evidence(assigned_row: &Value) {
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["assignee"],
+        "agent-a"
+    );
+    assert_eq!(assigned_row["evidence"]["stale_claim"]["is_stale"], true);
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["classification"],
+        "no_mail_snapshot"
+    );
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["recommended_action"],
+        "inspect_mail"
+    );
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["reservation_status"],
+        "no_snapshot"
+    );
+    assert!(
+        assigned_row["evidence"]["stale_claim"]["coordination_status_hint"]
+            .as_str()
+            .expect("coordination hint")
+            .contains("br coordination status")
+    );
+    assert_eq!(assigned_row["evidence"]["stale_claim"]["contribution"], 4);
+    assert_eq!(
+        assigned_row["evidence"]["stale_claim"]["stale_threshold_minutes"],
+        0
+    );
+    assert!(
+        assigned_row["rationale"]
+            .as_array()
+            .expect("rationale")
+            .iter()
+            .any(|line| line
+                .as_str()
+                .unwrap_or("")
+                .contains("not abandonment proof"))
+    );
+}
+
 #[test]
 fn scheduler_json_ranks_ready_bottlenecks_with_evidence() {
     let _log = common::test_log("scheduler_json_ranks_ready_bottlenecks_with_evidence");
@@ -272,11 +346,7 @@ fn scheduler_stale_claim_and_fairness_evidence_are_parseable() {
     let fresh = fresh_json["recommendations"]
         .as_array()
         .expect("fresh recommendations");
-    assert_eq!(fresh[0]["issue"]["id"], unassigned);
-    assert_eq!(fresh[0]["evidence"]["fairness"]["unassigned"], true);
-    assert_eq!(fresh[1]["issue"]["id"], assigned);
-    assert_eq!(fresh[1]["evidence"]["fairness"]["contribution"], -2);
-    assert_eq!(fresh[1]["evidence"]["stale_claim"]["is_stale"], false);
+    assert_fresh_scheduler_claim_evidence(fresh, &assigned, &unassigned);
 
     let stale_json = scheduler_json(
         &workspace,
@@ -297,16 +367,7 @@ fn scheduler_stale_claim_and_fairness_evidence_are_parseable() {
         .iter()
         .find(|row| row["issue"]["id"] == assigned)
         .expect("assigned row");
-    assert_eq!(
-        assigned_row["evidence"]["stale_claim"]["assignee"],
-        "agent-a"
-    );
-    assert_eq!(assigned_row["evidence"]["stale_claim"]["is_stale"], true);
-    assert_eq!(assigned_row["evidence"]["stale_claim"]["contribution"], 4);
-    assert_eq!(
-        assigned_row["evidence"]["stale_claim"]["stale_threshold_minutes"],
-        0
-    );
+    assert_stale_scheduler_claim_evidence(assigned_row);
 }
 
 #[test]
@@ -432,6 +493,10 @@ fn scheduler_robot_output_has_stable_dry_run_shape() {
     assert!(recommendation["issue"]["id"].is_string());
     assert!(recommendation["evidence"]["priority"]["contribution"].is_i64());
     assert!(recommendation["evidence"]["dependency_impact"]["contribution"].is_i64());
+    assert!(recommendation["evidence"]["stale_claim"]["owner_kind"].is_string());
+    assert!(recommendation["evidence"]["stale_claim"]["classification"].is_string());
+    assert!(recommendation["evidence"]["stale_claim"]["recommended_action"].is_string());
+    assert!(recommendation["evidence"]["stale_claim"]["reservation_status"].is_string());
     assert!(recommendation["evidence"]["stale_claim"]["is_stale"].is_boolean());
     assert!(recommendation["evidence"]["fairness"]["reason"].is_string());
     assert!(recommendation["evidence"]["domain_contention"]["domain"].is_string());
@@ -440,7 +505,7 @@ fn scheduler_robot_output_has_stable_dry_run_shape() {
             .as_array()
             .expect("rationale")
             .len()
-            >= 3
+            >= 4
     );
 }
 

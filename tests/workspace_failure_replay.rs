@@ -50,22 +50,6 @@ fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
     }
 }
 
-fn parse_stderr_json(run: &BrRun, context: &str) -> Value {
-    let payload = extract_json_payload(&run.stderr);
-    match serde_json::from_str(&payload) {
-        Ok(value) => value,
-        Err(err) => {
-            assert!(
-                payload.len() == usize::MAX,
-                "{context} should emit structured JSON on stderr: {err}\nstdout={}\nstderr={}",
-                run.stdout,
-                run.stderr
-            );
-            Value::Null
-        }
-    }
-}
-
 fn doctor_check<'a>(doctor_json: &'a Value, name: &str) -> &'a Value {
     let Some(check) = doctor_json["checks"]
         .as_array()
@@ -164,7 +148,7 @@ fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
         run.stdout,
         run.stderr
     );
-    let error_json = parse_stderr_json(run, context);
+    let error_json = parse_stdout_json(run, context);
     assert_eq!(
         error_json["error"]["code"].as_str(),
         Some("CONFIG_ERROR"),
@@ -246,14 +230,6 @@ fn assert_doctor_clean_surface(fixture: &FixtureWorkspace, context: &str, json: 
         "{context} should be clean: {json}"
     );
     assert_doctor_reliability_audit(fixture, context, json);
-    if fixture.metadata.name == "db_jsonl_disagreement" {
-        let counts = doctor_check(json, "counts.db_vs_jsonl");
-        assert_eq!(
-            counts["status"].as_str(),
-            Some("warn"),
-            "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
-        );
-    }
 }
 
 fn reliability_audit_anomalies<'a>(
@@ -361,6 +337,14 @@ fn assert_doctor_reliability_audit(fixture: &FixtureWorkspace, context: &str, js
                 has_code("db_jsonl_count_mismatch"),
                 "{context} should surface DB/JSONL drift diagnostics: {json}"
             );
+            if fixture.metadata.name == "db_jsonl_disagreement" {
+                let counts = doctor_check(json, "counts.db_vs_jsonl");
+                assert_eq!(
+                    counts["status"].as_str(),
+                    Some("warn"),
+                    "db_jsonl_disagreement should warn on DB/JSONL drift: {json}"
+                );
+            }
         }
         "legacy_schema_drift" => {
             assert!(

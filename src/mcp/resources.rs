@@ -6,17 +6,20 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use fastmcp_rust::{
     McpContext, McpError, McpErrorCode, McpResult, Resource, ResourceContent, ResourceHandler,
     ResourceTemplate,
 };
 use serde_json::{Value, json};
 
+use crate::cli::commands::coordination::build_coordination_status_without_snapshots;
+use crate::coordination::ClaimOwnerKind;
 use crate::error::StructuredError;
 use crate::model::{Event, Issue, Status};
-use crate::storage::{ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{ListFilters, SqliteStorage};
 
-use super::{BeadsState, to_mcp};
+use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues, to_mcp};
 
 fn read_project_config(storage: &SqliteStorage) -> McpResult<HashMap<String, String>> {
     storage.get_all_config().map_err(to_mcp)
@@ -83,6 +86,49 @@ fn issue_not_found_resource(storage: &SqliteStorage, id: &str) -> McpResult<McpE
     ))
 }
 
+const COORDINATION_STATUS_URI: &str = "beads://coordination/status";
+
+fn coordination_status_error(message: impl Into<String>) -> McpError {
+    let message = message.into();
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        format!("failed to build coordination status: {message}"),
+        json!({
+            "error_type": "COORDINATION_STATUS_FAILED",
+            "recoverable": true,
+            "message": message,
+            "resource": COORDINATION_STATUS_URI,
+            "suggested_tool_calls": [
+                {"tool": "project_overview", "arguments": {}}
+            ],
+            "suggested_cli_commands": [
+                "br coordination status --json",
+                "br show <id> --json",
+                "br comments list <id> --json"
+            ],
+            "snapshot_hint": "This MCP resource is read-only and does not call Agent Mail. Use the CLI --reservations and --agents flags when reservation evidence is required."
+        }),
+    )
+}
+
+fn coordination_status_resource_json_at(
+    storage: &SqliteStorage,
+    generated_at: DateTime<Utc>,
+) -> McpResult<Value> {
+    let output = build_coordination_status_without_snapshots(
+        storage,
+        ClaimOwnerKind::SwarmAgent,
+        2,
+        generated_at,
+    )
+    .map_err(|err| coordination_status_error(err.to_string()))?;
+    serde_json::to_value(output).map_err(|err| coordination_status_error(err.to_string()))
+}
+
+fn coordination_status_resource_json(storage: &SqliteStorage) -> McpResult<Value> {
+    coordination_status_resource_json_at(storage, Utc::now())
+}
+
 // ---------------------------------------------------------------------------
 // 1. project/info — static project metadata
 // ---------------------------------------------------------------------------
@@ -113,6 +159,8 @@ impl ResourceHandler for ProjectInfoResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://project/info",
@@ -217,6 +265,8 @@ impl ResourceHandler for IssueResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         Err(McpError::invalid_params(
             "Provide an issue ID via the URI template: beads://issues/{id}",
         ))
@@ -228,6 +278,8 @@ impl ResourceHandler for IssueResource {
         uri: &str,
         params: &HashMap<String, String>,
     ) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         let id = params.get("id").ok_or_else(|| {
             McpError::invalid_params("'id' parameter is required in the URI template")
         })?;
@@ -262,6 +314,8 @@ impl ResourceHandler for SchemaResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         let schema = json!({
             "statuses": {
                 "values": ["open", "in_progress", "blocked", "deferred", "draft", "closed", "pinned"],
@@ -379,6 +433,8 @@ impl ResourceHandler for LabelsResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://labels",
@@ -427,28 +483,25 @@ impl ResourceHandler for ReadyIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        cached_resource_json(
-            &self.0,
-            "beads://issues/ready",
-            "resource:issues_ready".to_string(),
-            |storage| {
-                let ready = storage
-                    .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Hybrid)
-                    .map_err(to_mcp)?;
+        ensure_not_shutting_down()?;
 
-                Ok(json!({
-                    "count": ready.len(),
-                    "issues": ready.iter().map(|issue| {
-                        json!({
-                            "id": issue.id,
-                            "title": issue.title,
-                            "priority": issue.priority,
-                            "type": issue.issue_type,
-                        })
-                    }).collect::<Vec<_>>(),
-                }))
-            },
-        )
+        let storage = self.0.open_read_storage().map_err(to_mcp)?;
+        let ready = mcp_ready_issues(&self.0, &storage)?;
+
+        Ok(resource_json(
+            "beads://issues/ready",
+            &json!({
+                "count": ready.len(),
+                "issues": ready.iter().map(|issue| {
+                    json!({
+                        "id": issue.id,
+                        "title": issue.title,
+                        "priority": issue.priority,
+                        "type": issue.issue_type,
+                    })
+                }).collect::<Vec<_>>(),
+            }),
+        ))
     }
 }
 
@@ -483,6 +536,8 @@ impl ResourceHandler for BlockedIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://issues/blocked",
@@ -536,6 +591,8 @@ impl ResourceHandler for InProgressResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://issues/in_progress",
@@ -567,7 +624,50 @@ impl ResourceHandler for InProgressResource {
 }
 
 // ---------------------------------------------------------------------------
-// 8. events/recent — recent audit events
+// 8. coordination/status — hidden in-progress claim diagnosis
+// ---------------------------------------------------------------------------
+
+pub struct CoordinationStatusResource(Arc<BeadsState>);
+impl CoordinationStatusResource {
+    pub fn new(state: Arc<BeadsState>) -> Self {
+        Self(state)
+    }
+}
+
+impl ResourceHandler for CoordinationStatusResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: COORDINATION_STATUS_URI.into(),
+            name: "Coordination Status".into(),
+            description: Some(
+                "Read-only stale-claim diagnosis for in-progress work. Mirrors \
+                 `br coordination status --json` with the br.coordination.v1 \
+                 evidence shape, without network listeners, background daemons, \
+                 or direct Agent Mail calls. Use the CLI snapshot flags when \
+                 reservation or agent-liveness evidence is required."
+                    .into(),
+            ),
+            mime_type: Some("application/json".into()),
+            icon: None,
+            version: None,
+            tags: vec![],
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
+        let storage = self
+            .0
+            .open_read_storage()
+            .map_err(|err| coordination_status_error(err.to_string()))?;
+        let value = coordination_status_resource_json(&storage)?;
+        Ok(resource_json(COORDINATION_STATUS_URI, &value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. events/recent — recent audit events
 // ---------------------------------------------------------------------------
 
 pub struct EventsResource(Arc<BeadsState>);
@@ -597,6 +697,8 @@ impl ResourceHandler for EventsResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://events/recent",
@@ -614,6 +716,11 @@ impl ResourceHandler for EventsResource {
                             "old_value": e.old_value,
                             "new_value": e.new_value,
                             "created_at": e.created_at,
+                            // Tier 1 attribution (issue #312, Layer 3
+                            // capture-only); null when not supplied.
+                            "agent_name": e.agent_name,
+                            "harness": e.harness,
+                            "model": e.model,
                         })
                     }).collect::<Vec<_>>(),
                 }))
@@ -623,7 +730,7 @@ impl ResourceHandler for EventsResource {
 }
 
 // ---------------------------------------------------------------------------
-// 9. issues/deferred — deferred work items
+// 10. issues/deferred — deferred work items
 // ---------------------------------------------------------------------------
 
 pub struct DeferredIssuesResource(Arc<BeadsState>);
@@ -639,8 +746,8 @@ impl ResourceHandler for DeferredIssuesResource {
             uri: "beads://issues/deferred".into(),
             name: "Deferred Issues".into(),
             description: Some(
-                "Issues that have been deferred (status: deferred). Useful for triage — \
-                 review what has been postponed and whether it should be revisited. \
+                "Issues that have been deferred (status: deferred, often with defer_until). \
+                 Useful for triage — review what has been postponed and whether it should be revisited. \
                  Used by: update_issue to change status. Use show_issue for full details."
                     .into(),
             ),
@@ -652,6 +759,8 @@ impl ResourceHandler for DeferredIssuesResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://issues/deferred",
@@ -683,7 +792,7 @@ impl ResourceHandler for DeferredIssuesResource {
 }
 
 // ---------------------------------------------------------------------------
-// 10. graph/health — dependency graph health metrics (bv-inspired)
+// 11. graph/health — dependency graph health metrics (bv-inspired)
 // ---------------------------------------------------------------------------
 
 /// Compute the longest path length in the "blocks" DAG from a given node.
@@ -872,6 +981,8 @@ impl ResourceHandler for GraphHealthResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://graph/health",
@@ -882,7 +993,7 @@ impl ResourceHandler for GraphHealthResource {
 }
 
 // ---------------------------------------------------------------------------
-// 11. issues/bottlenecks — highest-impact blockers (bv-inspired)
+// 12. issues/bottlenecks — highest-impact blockers (bv-inspired)
 // ---------------------------------------------------------------------------
 
 /// Compute bottleneck issues: those that block the most other open issues.
@@ -955,8 +1066,8 @@ impl ResourceHandler for BottlenecksResource {
             name: "Bottleneck Issues".into(),
             description: Some(
                 "Issues that block the most other work, sorted by impact. \
-                 Equivalent to bv's PageRank-based prioritization. Resolve these \
-                 first to maximize throughput. \
+                 Equivalent to bv's PageRank-based prioritization. Payload entries \
+                 include blocks_count so agents can rank downstream impact. Resolve these \
                  Used by: plan_next_work prompt uses this data for recommendations."
                     .into(),
             ),
@@ -968,6 +1079,8 @@ impl ResourceHandler for BottlenecksResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        ensure_not_shutting_down()?;
+
         cached_resource_json(
             &self.0,
             "beads://issues/bottlenecks",
@@ -983,15 +1096,20 @@ mod tests {
     use std::fs;
     use std::sync::Arc;
 
-    use chrono::Utc;
-    use fastmcp_rust::{Cx, McpContext, ResourceContent, ResourceHandler};
+    use chrono::{Duration, TimeZone, Utc};
+    use fastmcp_rust::{Cx, McpContext, Resource, ResourceContent, ResourceHandler};
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
     use super::{
-        IssueResource, ReadyIssuesResource, graph_has_cycle, issue_not_found_resource,
-        issue_resource_json, read_project_config,
+        BlockedIssuesResource, BottlenecksResource, COORDINATION_STATUS_URI,
+        CoordinationStatusResource, DeferredIssuesResource, EventsResource, GraphHealthResource,
+        InProgressResource, IssueResource, LabelsResource, ProjectInfoResource,
+        ReadyIssuesResource, SchemaResource, coordination_status_resource_json_at, graph_has_cycle,
+        issue_not_found_resource, issue_resource_json, read_project_config,
     };
+    use crate::cli::commands::coordination::build_coordination_status_without_snapshots;
+    use crate::coordination::{COORDINATION_SCHEMA_VERSION, ClaimOwnerKind};
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
@@ -1005,7 +1123,9 @@ mod tests {
             db_path,
             beads_dir: beads_dir.clone(),
             jsonl_path: beads_dir.join("issues.jsonl"),
-            write_lock_timeout_ms: Some(25),
+            // Robust under heavy parallel-test load (a concurrent auto-flush can
+            // hold .write.lock for >25ms); no test asserts the timeout path.
+            write_lock_timeout_ms: Some(5_000),
             allow_external_jsonl: false,
             actor: "mcp-resource-test".to_string(),
             issue_prefix: Some("br".to_string()),
@@ -1015,21 +1135,38 @@ mod tests {
     }
 
     fn insert_resource_issue(state: &BeadsState, id: &str, title: &str) {
+        insert_resource_issue_with_status(state, id, title, Status::Open, None, Utc::now());
+    }
+
+    fn insert_resource_issue_with_status(
+        state: &BeadsState,
+        id: &str,
+        title: &str,
+        status: Status,
+        assignee: Option<&str>,
+        updated_at: chrono::DateTime<Utc>,
+    ) {
         let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
-        let now = Utc::now();
         let issue = Issue {
             id: id.to_string(),
             title: title.to_string(),
-            status: Status::Open,
+            status,
             priority: Priority::MEDIUM,
             issue_type: IssueType::Task,
-            created_at: now,
-            updated_at: now,
+            assignee: assignee.map(str::to_string),
+            created_at: updated_at,
+            updated_at,
             ..Issue::default()
         };
         storage
             .create_issue(&issue, "mcp-resource-test")
             .expect("create issue");
+    }
+
+    fn fixed_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 5, 8, 12, 0, 0)
+            .single()
+            .expect("valid timestamp")
     }
 
     fn resource_text_json(contents: &[ResourceContent]) -> Value {
@@ -1043,6 +1180,83 @@ mod tests {
             .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
     }
 
+    fn assert_docs_list_resource(uri: &str) {
+        for (name, document) in [
+            ("README.md", include_str!("../../README.md")),
+            (
+                "docs/AGENT_INTEGRATION.md",
+                include_str!("../../docs/AGENT_INTEGRATION.md"),
+            ),
+            (
+                "docs/CLI_REFERENCE.md",
+                include_str!("../../docs/CLI_REFERENCE.md"),
+            ),
+        ] {
+            assert!(
+                document.contains(uri),
+                "{name} must document MCP resource {uri}"
+            );
+        }
+    }
+
+    fn assert_description_mentions(description: &str, expected_terms: &[&str]) {
+        for term in expected_terms {
+            assert!(
+                description.contains(term),
+                "MCP description must mention {term:?}: {description}"
+            );
+        }
+    }
+
+    fn assert_description_does_not_claim_live_services(description: &str) {
+        let lower = description.to_ascii_lowercase();
+        for forbidden in [
+            "http://",
+            "https://",
+            "network port",
+            "network socket",
+            "network service",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "MCP description implies a live service boundary via {forbidden:?}: {description}"
+            );
+        }
+        if lower.contains("agent mail") {
+            assert!(
+                lower.contains("without")
+                    || lower.contains("does not call")
+                    || lower.contains("cli snapshot"),
+                "Agent Mail mention must be an explicit non-live boundary: {description}"
+            );
+        }
+        if lower.contains("network listener") {
+            assert!(
+                lower.contains("without network listener")
+                    || lower.contains("no network listener")
+                    || lower.contains("does not listen"),
+                "network listener mention must be an explicit non-live boundary: {description}"
+            );
+        }
+    }
+
+    fn assert_resource_definition(
+        definition: &Resource,
+        expected_uri: &str,
+        expected_terms: &[&str],
+    ) {
+        assert_eq!(definition.uri, expected_uri);
+        assert_eq!(definition.mime_type.as_deref(), Some("application/json"));
+        let description = definition
+            .description
+            .as_deref()
+            .expect("MCP resource descriptions are part of the agent contract");
+        assert!(!description.trim().is_empty());
+        assert_description_mentions(description, expected_terms);
+        assert_description_does_not_claim_live_services(description);
+        assert_docs_list_resource(expected_uri);
+    }
+
     fn edge_map(edges: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         edges
             .iter()
@@ -1053,6 +1267,149 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn mcp_contract_resource_metadata_matches_docs_and_local_boundary() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        let definitions: [(Resource, &str, &[&str]); 12] = [
+            (
+                ProjectInfoResource::new(Arc::clone(&state)).definition(),
+                "beads://project/info",
+                &["Workspace metadata", "project_overview"][..],
+            ),
+            (
+                IssueResource::new(Arc::clone(&state)).definition(),
+                "beads://issues/{id}",
+                &["Full issue details", "list_issues", "show_issue"],
+            ),
+            (
+                SchemaResource.definition(),
+                "beads://schema",
+                &["issue fields", "valid statuses", "dependency types"],
+            ),
+            (
+                LabelsResource::new(Arc::clone(&state)).definition(),
+                "beads://labels",
+                &["label values", "list_issues", "update_issue"],
+            ),
+            (
+                ReadyIssuesResource::new(Arc::clone(&state)).definition(),
+                "beads://issues/ready",
+                &["ready for work", "project_overview", "list_issues"],
+            ),
+            (
+                BlockedIssuesResource::new(Arc::clone(&state)).definition(),
+                "beads://issues/blocked",
+                &["blocked", "dependencies"],
+            ),
+            (
+                InProgressResource::new(Arc::clone(&state)).definition(),
+                "beads://issues/in_progress",
+                &["in_progress", "assignee"],
+            ),
+            (
+                CoordinationStatusResource::new(Arc::clone(&state)).definition(),
+                COORDINATION_STATUS_URI,
+                &[
+                    "br coordination status --json",
+                    "br.coordination.v1",
+                    "without network listeners",
+                    "direct Agent Mail calls",
+                    "CLI snapshot flags",
+                ],
+            ),
+            (
+                EventsResource::new(Arc::clone(&state)).definition(),
+                "beads://events/recent",
+                &["audit events", "show_issue"],
+            ),
+            (
+                DeferredIssuesResource::new(Arc::clone(&state)).definition(),
+                "beads://issues/deferred",
+                &["deferred", "defer_until"],
+            ),
+            (
+                BottlenecksResource::new(Arc::clone(&state)).definition(),
+                "beads://issues/bottlenecks",
+                &["block the most", "blocks_count"],
+            ),
+            (
+                GraphHealthResource::new(state).definition(),
+                "beads://graph/health",
+                &["Graph-level health", "cycle"],
+            ),
+        ];
+
+        for (definition, uri, expected_terms) in definitions {
+            assert_resource_definition(&definition, uri, expected_terms);
+        }
+    }
+
+    #[test]
+    fn mcp_contract_core_resource_payloads_match_documented_shapes() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        insert_resource_issue(&state, "br-mcp-contract-ready", "contract ready issue");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+
+        let project_info = resource_text_json(
+            &ProjectInfoResource::new(Arc::clone(&state))
+                .read(&ctx)
+                .expect("read project info"),
+        );
+        assert_eq!(project_info["issue_prefix"], "br");
+        assert_eq!(project_info["actor"], "mcp-resource-test");
+        assert!(project_info["beads_dir"].as_str().is_some_and(|path| {
+            std::path::Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == ".beads")
+        }));
+        assert!(project_info["config"].is_object());
+
+        let schema = resource_text_json(&SchemaResource.read(&ctx).expect("read schema"));
+        assert!(
+            schema["statuses"]["values"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "in_progress"))
+        );
+        assert!(
+            schema["priorities"]["values"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "critical"))
+        );
+        assert!(
+            schema["issue_types"]["values"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "task"))
+        );
+        assert!(
+            schema["dependency_types"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "blocks"))
+        );
+        assert!(schema["issue_fields"]["id"].is_string());
+        assert!(schema["bead_anatomy"]["sections"].is_object());
+
+        let ready = resource_text_json(
+            &ReadyIssuesResource::new(Arc::clone(&state))
+                .read(&ctx)
+                .expect("read ready issues"),
+        );
+        assert_eq!(ready["count"].as_u64(), Some(1));
+        assert_eq!(ready["issues"][0]["id"], "br-mcp-contract-ready");
+        assert_eq!(ready["issues"][0]["title"], "contract ready issue");
+        assert_eq!(ready["issues"][0]["type"], "task");
+
+        let coordination = resource_text_json(
+            &CoordinationStatusResource::new(state)
+                .read(&ctx)
+                .expect("read coordination status"),
+        );
+        assert_eq!(coordination["schema_version"], COORDINATION_SCHEMA_VERSION);
+        assert_eq!(coordination["summary"]["total_claims"].as_u64(), Some(0));
+        assert!(coordination["claims"].as_array().is_some());
     }
 
     #[test]
@@ -1079,6 +1436,36 @@ mod tests {
     }
 
     #[test]
+    fn ready_resource_excludes_unsatisfied_external_blockers() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, true);
+        insert_resource_issue(
+            &state,
+            "br-ready-external-blocked",
+            "externally blocked ready candidate",
+        );
+        insert_resource_issue(&state, "br-ready-local", "local ready candidate");
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        storage
+            .add_dependency(
+                "br-ready-external-blocked",
+                "external:missing:capability",
+                "blocks",
+                "mcp-resource-test",
+            )
+            .expect("add external dependency");
+        drop(storage);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let resource = ReadyIssuesResource::new(Arc::clone(&state));
+        let content = resource.read(&ctx).expect("read ready resource");
+        let ready = resource_text_json(&content);
+
+        assert_eq!(ready["count"].as_u64(), Some(1));
+        assert_eq!(ready["issues"][0]["id"], "br-ready-local");
+    }
+
+    #[test]
     fn issue_resource_snapshot_matches_direct_json() {
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_resource_state(&temp, true);
@@ -1097,6 +1484,79 @@ mod tests {
         };
 
         assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn coordination_status_resource_matches_cli_builder_for_claims() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        let now = fixed_now();
+        insert_resource_issue_with_status(
+            &state,
+            "br-mcp-claim",
+            "resource claim details",
+            Status::InProgress,
+            Some("TopazFox"),
+            now - Duration::minutes(30),
+        );
+
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let resource_value =
+            coordination_status_resource_json_at(&storage, now).expect("resource status");
+        let cli_value = serde_json::to_value(
+            build_coordination_status_without_snapshots(
+                &storage,
+                ClaimOwnerKind::SwarmAgent,
+                2,
+                now,
+            )
+            .expect("cli status"),
+        )
+        .expect("serialize cli status");
+
+        assert_eq!(resource_value, cli_value);
+        assert_eq!(
+            resource_value["schema_version"],
+            COORDINATION_SCHEMA_VERSION
+        );
+        assert_eq!(resource_value["summary"]["total_claims"].as_u64(), Some(1));
+        assert_eq!(
+            resource_value["claims"][0]["assessment"]["classification"],
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn coordination_status_resource_returns_empty_claim_set() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let resource = CoordinationStatusResource::new(Arc::clone(&state));
+
+        let content = resource.read(&ctx).expect("read coordination resource");
+        let value = resource_text_json(&content);
+
+        assert_eq!(content[0].uri, COORDINATION_STATUS_URI);
+        assert_eq!(value["schema_version"], COORDINATION_SCHEMA_VERSION);
+        assert_eq!(value["summary"]["total_claims"].as_u64(), Some(0));
+        assert_eq!(value["claims"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn coordination_status_resource_returns_structured_errors() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .execute_raw("DROP TABLE issues")
+            .expect("drop issues table");
+
+        let err = coordination_status_resource_json_at(&storage, fixed_now())
+            .expect_err("coordination storage failure must be structured");
+        let data = err.data.expect("structured MCP error data");
+
+        assert_eq!(data["error_type"], "COORDINATION_STATUS_FAILED");
+        assert_eq!(data["resource"], COORDINATION_STATUS_URI);
+        assert!(data["suggested_tool_calls"].is_array());
+        assert!(data["suggested_cli_commands"].is_array());
     }
 
     #[test]

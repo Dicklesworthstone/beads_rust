@@ -208,9 +208,9 @@ fn execute_routed(
         let ctx = OutputContext::from_output_format(output_format, quiet, !*use_color);
         if matches!(ctx.mode(), OutputMode::Rich) {
             let panel = IssuePanel::from_details(details, ctx.theme());
-            panel.print(&ctx, args.wrap);
+            panel.print(&ctx, !args.no_wrap);
         } else {
-            print_issue_details(details, *use_color);
+            print_issue_details(details, *use_color, !args.no_wrap);
         }
     }
 
@@ -266,15 +266,54 @@ fn execute_inner(
             ctx.toon_with_stats(&details_list, args.stats);
         }
         crate::cli::OutputFormat::Text | crate::cli::OutputFormat::Csv => {
+            // beads_rust#297: emit inherited governing context for each
+            // bead before its own details, when the project has opted
+            // in. Prefer the caller's preloaded storage; fall back to
+            // opening a transient read connection so the feature works
+            // from both `br show` and `br show --workspace …` paths.
+            // Failure to open is non-fatal — the alternative would be
+            // failing the entire show over an optional feature.
+            let inheritance_enabled = crate::inheritance::is_enabled(beads_dir);
+            let transient_ctx = if inheritance_enabled
+                && preloaded_storage.is_none()
+                && preloaded_storage_ctx.is_none()
+            {
+                config::open_storage_with_cli(beads_dir, cli).ok()
+            } else {
+                None
+            };
+            let inheritance_storage: Option<&SqliteStorage> = preloaded_storage
+                .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
+                .or_else(|| transient_ctx.as_ref().map(|ctx| &ctx.storage));
+            // beads_rust#351: when showing several siblings, each child's
+            // ancestor chain resolves independently, so the same epic/parent
+            // block would be re-rendered once per sibling. Dedup across the
+            // whole invocation: each inherited source is emitted exactly
+            // once, before the first child that references it.
+            let mut emitted_sources: HashSet<String> = HashSet::new();
             for (i, details) in details_list.iter().enumerate() {
                 if i > 0 {
                     println!(); // Separate multiple issues
                 }
+                if inheritance_enabled
+                    && let Some(storage) = inheritance_storage
+                    && let Ok(mut blocks) =
+                        crate::inheritance::collect_inherited_blocks(storage, &details.issue.id)
+                {
+                    blocks.retain(|block| emitted_sources.insert(block.source_id.clone()));
+                    if !blocks.is_empty() {
+                        let rendered = crate::inheritance::render_text(&blocks);
+                        print!("{rendered}");
+                        if !rendered.ends_with('\n') {
+                            println!();
+                        }
+                    }
+                }
                 if matches!(ctx.mode(), OutputMode::Rich) {
                     let panel = IssuePanel::from_details(details, ctx.theme());
-                    panel.print(&ctx, args.wrap);
+                    panel.print(&ctx, !args.no_wrap);
                 } else {
-                    print_issue_details(details, use_color);
+                    print_issue_details(details, use_color, !args.no_wrap);
                 }
             }
         }
@@ -740,6 +779,9 @@ fn build_issue_details_from_exact_jsonl_index(
             .rev()
             .find(|dep| dep.dep_type.as_str() == "parent-child")
             .map(|dep| dep.depends_on_id.clone()),
+        // Rollup derives from the local database; JSONL fallback paths
+        // deliberately omit it.
+        rollup: None,
     })
 }
 
@@ -809,6 +851,9 @@ fn build_issue_details_from_jsonl(
             .rev()
             .find(|dep| dep.dep_type.as_str() == "parent-child")
             .map(|dep| dep.depends_on_id.clone()),
+        // Rollup derives from the local database; JSONL fallback paths
+        // deliberately omit it.
+        rollup: None,
     })
 }
 
@@ -999,14 +1044,76 @@ fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
     Some((project, capability))
 }
 
-fn print_issue_details(details: &IssueDetails, use_color: bool) {
-    let output = format_issue_details(details, use_color);
+fn print_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) {
+    let output = format_issue_details(details, use_color, wrap);
     print!("{output}");
 }
 
+/// Width used to soft-wrap free-text bodies in the non-Rich (piped / no-TTY)
+/// `br show --format text` output. Honors `$COLUMNS` when set to a sane value,
+/// otherwise falls back to a readable 100 columns (#370). The Rich panel path
+/// uses the live terminal width instead.
+fn compact_wrap_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse::<usize>().ok())
+        .filter(|w| *w >= 20)
+        .unwrap_or(100)
+}
+
+/// Soft-wrap `text` to `width` columns on word boundaries (#370). Existing line
+/// breaks are preserved, a line's leading indentation is carried onto wrapped
+/// continuations, and a single over-long word is never split. Passing
+/// `usize::MAX` is a no-op, so callers can disable wrapping cheaply.
+fn wrap_body(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let width = width.max(1);
+    let mut out = String::new();
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            out.push('\n');
+        }
+        if UnicodeWidthStr::width(line) <= width {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = line.len() - line.trim_start().len();
+        let indent = &line[..indent_len];
+        let avail = width.saturating_sub(UnicodeWidthStr::width(indent)).max(1);
+        out.push_str(indent);
+        let mut cur_w = 0usize;
+        let mut started = false;
+        for word in line[indent_len..].split(' ') {
+            let word_w = UnicodeWidthStr::width(word);
+            if !started {
+                out.push_str(word);
+                cur_w = word_w;
+                started = true;
+            } else if cur_w > 0 && cur_w + 1 + word_w > avail {
+                out.push('\n');
+                out.push_str(indent);
+                out.push_str(word);
+                cur_w = word_w;
+            } else {
+                out.push(' ');
+                out.push_str(word);
+                cur_w += 1 + word_w;
+            }
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_lines)]
-fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
+fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> String {
     let mut output = String::new();
+    // `usize::MAX` makes `wrap_body` a no-op, so `--no-wrap` (or any caller that
+    // opts out) keeps the exact pre-#370 unwrapped output.
+    let wrap_width = if wrap {
+        compact_wrap_width()
+    } else {
+        usize::MAX
+    };
     let issue = &details.issue;
     let status_icon = format_status_icon_colored(&issue.status, use_color);
     let priority_label = format_priority_label(&issue.priority, use_color);
@@ -1094,9 +1201,27 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
         );
     }
 
+    if let Some(rollup) = &details.rollup {
+        let breakdown = rollup
+            .descendants
+            .iter()
+            .map(|(status, count)| format!("{count} {}", sanitize_terminal_inline(status)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            output,
+            "Rollup: {} ({breakdown})",
+            sanitize_terminal_inline(&rollup.status)
+        );
+    }
+
     if let Some(desc) = &issue.description {
         output.push('\n');
-        let _ = writeln!(output, "{}", sanitize_terminal_text(desc));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(desc).as_ref(), wrap_width)
+        );
     }
 
     if let Some(design) = &issue.design
@@ -1104,7 +1229,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Design:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(design));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(design).as_ref(), wrap_width)
+        );
     }
 
     if let Some(ac) = &issue.acceptance_criteria
@@ -1112,7 +1241,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Acceptance Criteria:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(ac));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(ac).as_ref(), wrap_width)
+        );
     }
 
     if let Some(notes) = &issue.notes
@@ -1120,7 +1253,11 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
     {
         output.push('\n');
         let _ = writeln!(output, "Notes:");
-        let _ = writeln!(output, "{}", sanitize_terminal_text(notes));
+        let _ = writeln!(
+            output,
+            "{}",
+            wrap_body(sanitize_terminal_text(notes).as_ref(), wrap_width)
+        );
     }
 
     if !details.dependencies.is_empty() {
@@ -1160,7 +1297,7 @@ fn format_issue_details(details: &IssueDetails, use_color: bool) -> String {
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
                 sanitize_terminal_inline(&comment.author),
-                sanitize_terminal_text(&comment.body)
+                wrap_body(sanitize_terminal_text(&comment.body).as_ref(), wrap_width)
             );
         }
     }
@@ -1213,6 +1350,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -1384,6 +1523,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let json = serde_json::to_string_pretty(&vec![details]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1420,8 +1560,9 @@ mod tests {
             }],
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
-        let output = format_issue_details(&details, false);
+        let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
         assert!(output.contains("-> bd-002 (blocks) - Dep"));
         assert!(output.contains("Comments:"));
@@ -1455,9 +1596,10 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
 
-        let output = format_issue_details(&details, false);
+        let output = format_issue_details(&details, false, false);
 
         assert!(!output.contains('\x1b'));
         assert!(!output.contains('\x07'));
@@ -1657,6 +1799,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let local_last = IssueDetails {
             issue: make_test_issue("bd-local-2", "Local last"),
@@ -1666,6 +1809,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
         let external_middle = IssueDetails {
             issue: make_test_issue("ext-middle", "External middle"),
@@ -1675,6 +1819,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            rollup: None,
         };
 
         let ordered = reorder_details_by_requested_inputs(

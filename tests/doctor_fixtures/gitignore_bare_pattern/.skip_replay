@@ -1,0 +1,17 @@
+# Skip the pass-3 idempotence replay gate for this fixture.
+#
+# Rationale: this fixture's post_undo stage asserts that
+# `br doctor undo latest` reverses the FIRST repair and restores
+# the .gitignore corruption. When the replay gate is on, a second
+# --repair creates a no-op run-dir that becomes "latest", causing
+# `undo latest` to undo the no-op rather than the original repair.
+#
+# This is a per-fixture test-harness limitation, NOT a doctor
+# defect. The detector is provably idempotent (the chokepoint's
+# mutate() is a no-op if the file already matches the desired
+# state), so we skip the gate for this fixture's harness flow.
+#
+# To audit idempotence for the gitignore fixers specifically,
+# run a targeted invocation that elides the post_undo stage,
+# or fold the replay assertion into assert.sh's post_repair
+# stage in a future pass.

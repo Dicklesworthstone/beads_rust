@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 203
 expression: normalize_json(&json)
 ---
 {
@@ -13,7 +14,8 @@ expression: normalize_json(&json)
       "created_at": "TIMESTAMP",
       "created_by": "ACTOR",
       "updated_at": "TIMESTAMP",
-      "source_repo": ".",
+      "source_repo": "SOURCE_REPO",
+      "source_repo_path": "SOURCE_REPO",
       "compaction_level": 0,
       "original_size": 0,
       "dependency_count": 0,
@@ -21,7 +23,7 @@ expression: normalize_json(&json)
     }
   ],
   "total": 1,
-  "limit": 50,
+  "limit": 0,
   "offset": 0,
   "has_more": false
 }

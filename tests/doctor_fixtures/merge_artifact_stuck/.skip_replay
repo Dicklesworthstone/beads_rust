@@ -1,0 +1,10 @@
+Pass-4 cycle 1: same interaction as the gitignore fixtures (per
+HANDOFF_pass_3.md). The post_undo stage asserts that `undo latest`
+restores the FIRST repair; under REPLAY_IDEMPOTENCE=1 the second
+no-op --repair creates a newer (empty) run-dir that becomes the new
+"latest", which would break post_undo even though the underlying
+fixer IS idempotent.
+
+The idempotence contract is still enforced by the inline test
+`test_fix_merge_artifacts_is_idempotent_no_op_on_second_call` in
+src/cli/commands/doctor.rs.

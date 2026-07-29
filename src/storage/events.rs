@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS events (
     new_value TEXT,
     comment TEXT,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    -- Tier 1 attribution audit columns (issue #312, Layer 3 capture-only).
+    agent_name TEXT,
+    harness TEXT,
+    model TEXT,
     FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );
 
@@ -358,7 +362,8 @@ pub fn insert_restored_event(
 pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
     let events = conn.query_with_params(
         r"
-            SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+            SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at,
+                   agent_name, harness, model
             FROM events
             WHERE issue_id = ?1
             ",
@@ -400,6 +405,12 @@ fn event_from_row(row: &Row) -> Result<Event> {
     let created_at_str = row.get(7).and_then(|v| v.as_text()).ok_or_else(|| {
         BeadsError::Config(format!("events row missing created_at for {issue_id}"))
     })?;
+    // Tier 1 attribution (issue #312, Layer 3 capture-only). Absent on events
+    // recorded without attribution and on rows from pre-v13 databases; both
+    // coerce to None. These are recorded-only and never gated on.
+    let agent_name = row.get(8).and_then(|v| v.as_text()).map(String::from);
+    let harness = row.get(9).and_then(|v| v.as_text()).map(String::from);
+    let model = row.get(10).and_then(|v| v.as_text()).map(String::from);
 
     // Parse event type
     let event_type = parse_event_type(event_type_str);
@@ -416,6 +427,9 @@ fn event_from_row(row: &Row) -> Result<Event> {
         new_value,
         comment,
         created_at,
+        agent_name,
+        harness,
+        model,
     })
 }
 
@@ -443,7 +457,8 @@ fn parse_event_timestamp(value: &str) -> Result<DateTime<Utc>> {
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
     let rows = conn.query(
         r"
-            SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
+            SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at,
+                   agent_name, harness, model
             FROM events
             ",
     )?;
@@ -475,7 +490,8 @@ pub fn count_events(conn: &Connection, issue_id: &str) -> Result<i64> {
 
 /// Parse event type string to `EventType` enum.
 fn parse_event_type(s: &str) -> EventType {
-    match s {
+    let normalized = s.to_lowercase();
+    match normalized.as_str() {
         "created" => EventType::Created,
         "updated" => EventType::Updated,
         "status_changed" => EventType::StatusChanged,
@@ -535,6 +551,20 @@ mod tests {
             .expect("Failed to insert test issue");
 
         conn
+    }
+
+    #[test]
+    fn test_parse_event_type_normalizes_known_variant_case() {
+        assert_eq!(parse_event_type("CREATED"), EventType::Created);
+        assert_eq!(parse_event_type("Status_Changed"), EventType::StatusChanged);
+    }
+
+    #[test]
+    fn test_parse_event_type_normalizes_custom_case() {
+        assert_eq!(
+            parse_event_type("My_Custom_Event"),
+            EventType::Custom("my_custom_event".to_string())
+        );
     }
 
     #[test]
@@ -715,6 +745,39 @@ mod tests {
     }
 
     #[test]
+    fn test_get_events_normalizes_persisted_event_type_case() {
+        let conn = setup_test_db();
+
+        let rows = [
+            ("CREATED", "known", "2026-04-22T10:00:00Z"),
+            ("My_Custom_Event", "custom", "2026-04-22T11:00:00Z"),
+        ];
+        for (event_type, comment, created_at) in rows {
+            conn.execute_with_params(
+                "INSERT INTO events (issue_id, event_type, actor, comment, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    SqliteValue::from("test-001"),
+                    SqliteValue::from(event_type),
+                    SqliteValue::from("legacy"),
+                    SqliteValue::from(comment),
+                    SqliteValue::from(created_at),
+                ],
+            )
+            .expect("insert event");
+        }
+
+        let events = get_events(&conn, "test-001", 0).expect("events");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            EventType::Custom("my_custom_event".to_string())
+        );
+        assert_eq!(events[1].event_type, EventType::Created);
+    }
+
+    #[test]
     fn test_count_events() {
         let conn = setup_test_db();
 
@@ -815,6 +878,73 @@ mod tests {
         assert_eq!(events[1].event_type, EventType::Commented);
         assert_eq!(events[2].event_type, EventType::StatusChanged);
         assert_eq!(events[3].event_type, EventType::Created);
+    }
+
+    #[test]
+    fn test_event_attribution_round_trips_through_columns() {
+        // Issue #312, Layer 3 capture-only: attribution written to the events
+        // table round-trips back through the read path unchanged.
+        let conn = setup_test_db();
+        conn.execute_with_params(
+            "INSERT INTO events (issue_id, event_type, actor, created_at, agent_name, harness, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            &[
+                SqliteValue::from("test-001"),
+                SqliteValue::from("status_changed"),
+                SqliteValue::from("alice"),
+                SqliteValue::from("2026-06-07T10:00:00Z"),
+                SqliteValue::from("agent-1"),
+                SqliteValue::from("codex-cli"),
+                SqliteValue::from("opus-4"),
+            ],
+        )
+        .expect("insert attributed event");
+
+        let events = get_events(&conn, "test-001", 0).expect("get events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].agent_name.as_deref(), Some("agent-1"));
+        assert_eq!(events[0].harness.as_deref(), Some("codex-cli"));
+        assert_eq!(events[0].model.as_deref(), Some("opus-4"));
+    }
+
+    #[test]
+    fn test_event_without_attribution_reads_as_none() {
+        // Absent attribution (the common case) must coerce to None, never to a
+        // blank string or invalid value.
+        let conn = setup_test_db();
+        conn.execute("BEGIN").expect("begin");
+        insert_created_event(&conn, "test-001", "alice").expect("insert event");
+        conn.execute("COMMIT").expect("commit");
+
+        let events = get_events(&conn, "test-001", 0).expect("get events");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].agent_name.is_none());
+        assert!(events[0].harness.is_none());
+        assert!(events[0].model.is_none());
+    }
+
+    #[test]
+    fn test_partial_attribution_round_trips() {
+        // Only some attribution fields supplied; the others stay None.
+        let conn = setup_test_db();
+        conn.execute_with_params(
+            "INSERT INTO events (issue_id, event_type, actor, created_at, model)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                SqliteValue::from("test-001"),
+                SqliteValue::from("updated"),
+                SqliteValue::from("bob"),
+                SqliteValue::from("2026-06-07T11:00:00Z"),
+                SqliteValue::from("opus-4"),
+            ],
+        )
+        .expect("insert partially-attributed event");
+
+        let events = get_events(&conn, "test-001", 0).expect("get events");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].agent_name.is_none());
+        assert!(events[0].harness.is_none());
+        assert_eq!(events[0].model.as_deref(), Some("opus-4"));
     }
 
     #[test]

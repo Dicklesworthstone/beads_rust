@@ -5,12 +5,13 @@ use crate::error::{BeadsError, Result};
 use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::SqliteStorage;
+use crate::storage::{BulkDependencyInsert, EventAttribution, SqliteStorage};
 use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -26,6 +27,11 @@ pub struct CreateConfig {
     /// to `None` (storage default) when the beads directory has no usable
     /// parent name, e.g. `/.beads`.
     pub source_repo: Option<String>,
+    /// Absolute canonical path of the source repository, populated alongside
+    /// `source_repo` so fleet automation can disambiguate two clones of the
+    /// same repo at different paths on the same machine (beads_rust#289).
+    /// `None` when `canonicalize` of the beads-dir parent failed.
+    pub source_repo_path: Option<String>,
 }
 
 /// Derive a stable `source_repo` value from the beads directory path: the
@@ -57,6 +63,37 @@ pub(crate) fn canonical_source_repo(beads_dir: &Path) -> Option<String> {
     }
 }
 
+/// Derive the absolute canonical path of the source repository (the
+/// parent of `.beads/`) for the `source_repo_path` field on `Issue`.
+/// Distinct from [`canonical_source_repo`], which returns just the
+/// basename. Used by fleet automation to disambiguate two clones of
+/// the same repo at different paths on the same machine (see
+/// beads_rust#289). Falls back to `None` if `canonicalize` fails —
+/// the caller treats the field as optional and leaves it unset, which
+/// matches the schema contract (`source_repo_path TEXT` nullable).
+pub(crate) fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
+    let parent = beads_dir.parent()?;
+    let parent = if parent.as_os_str().is_empty()
+        && beads_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, ".beads" | "_beads"))
+    {
+        Path::new(".")
+    } else if parent.as_os_str().is_empty() {
+        return None;
+    } else {
+        parent
+    };
+    let canonical = parent.canonicalize().ok()?;
+    let path_str = canonical.to_string_lossy().into_owned();
+    if path_str.is_empty() {
+        None
+    } else {
+        Some(path_str)
+    }
+}
+
 struct NewIdInput<'a> {
     title: &'a str,
     description: Option<&'a str>,
@@ -69,6 +106,12 @@ struct NewIdInput<'a> {
 enum ImportReferenceResolution {
     Resolved(String),
     Ambiguous(Vec<String>),
+}
+
+#[derive(Serialize)]
+struct CreateWithCapacityWarnings<'a, T> {
+    created: &'a T,
+    warnings: &'a [crate::close_policy::WorkflowCapacityWarning],
 }
 
 /// Execute the create command.
@@ -105,12 +148,6 @@ pub fn execute_with_storage(
                 "--external-ref is not supported with --file",
             ));
         }
-        if args.dry_run {
-            return Err(BeadsError::validation(
-                "dry_run",
-                "--dry-run is not supported with --file",
-            ));
-        }
         return execute_import(file_path, args, cli, ctx, pre_opened);
     }
 
@@ -123,18 +160,31 @@ pub fn execute_with_storage(
     };
     let layer = storage_ctx.load_config(cli)?;
 
+    // Strict status-workflow enforcement (issue #311). Reject an out-of-set
+    // `--status` before any write when the project configures
+    // `workflow.strict: true`. No-op when the workflow section is absent.
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
+
     let config = CreateConfig {
         id_config: config::id_config_from_layer(&layer),
         default_priority: config::default_priority_from_layer(&layer)?,
         default_issue_type: config::default_issue_type_from_layer(&layer)?,
         actor: config::resolve_actor(&layer),
         source_repo: canonical_source_repo(&storage_ctx.paths.beads_dir),
+        source_repo_path: canonical_source_repo_path(&storage_ctx.paths.beads_dir),
     };
+
+    // Resolve the description up front — before the retry closure — so the
+    // verbatim `--description-file` content (or `-` stdin, which can only be
+    // read once) is captured a single time and reused across any
+    // JSONL-recovery retry.
+    let description = resolve_create_description(args)?;
 
     let issue =
         retry_mutation_with_jsonl_recovery(&mut storage_ctx, true, "create", None, |storage| {
-            create_issue_impl(storage, args, &config)
+            create_issue_impl(storage, args, &config, description.clone())
         })?;
+    let capacity_warnings = storage_ctx.storage.take_capacity_warnings();
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;
@@ -159,7 +209,7 @@ pub fn execute_with_storage(
                 .ok_or_else(|| BeadsError::IssueNotFound {
                     id: issue.id.clone(),
                 })?;
-            ctx.toon(&full_issue);
+            emit_created_with_capacity_warnings(&full_issue, &capacity_warnings, ctx);
         }
     } else if ctx.is_json() {
         if args.dry_run {
@@ -171,7 +221,7 @@ pub fn execute_with_storage(
                 .ok_or_else(|| BeadsError::IssueNotFound {
                     id: issue.id.clone(),
                 })?;
-            ctx.json_pretty(&full_issue);
+            emit_created_with_capacity_warnings(&full_issue, &capacity_warnings, ctx);
         }
     } else if args.dry_run {
         ctx.info(&format!(
@@ -208,8 +258,50 @@ pub fn execute_with_storage(
             sanitize_terminal_inline(&issue.title)
         ));
     }
+    if !ctx.is_json() && !ctx.is_toon() {
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
+    }
     auto_flush_after_create(&mut storage_ctx, ctx);
     Ok(())
+}
+
+/// Enforce the project's strict status-workflow policy (issue #311) against a
+/// caller-supplied `--status`. A `None` status (default `open`) is always
+/// permitted: an empty allowed set already forbids enforcement, and a strict
+/// set that omits `open` would otherwise make `br create` unusable. Returns
+/// `Ok(())` when the workflow section is absent or non-strict.
+///
+/// The *effective* starting status is validated — the explicit `--status` when
+/// given, otherwise the create default (`open`, matching the default applied
+/// below). Validating the default too keeps `br create`, `br create --status
+/// open`, and `br update --status open` consistent: if a strict workflow omits
+/// the starting status, `br create` must name a valid one rather than silently
+/// producing a bead whose status `br doctor` will immediately flag.
+///
+/// # Errors
+///
+/// Returns a validation error when strict enforcement is configured and the
+/// effective status is not in the allowed set.
+fn enforce_workflow_status(beads_dir: &Path, raw_status: Option<&str>) -> Result<()> {
+    let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    if !policy.workflow.is_enforced() && !policy.workflow.transitions_enforced() {
+        return Ok(());
+    }
+    // Parse to the canonical string so a custom-cased config entry and the
+    // canonical name (`In_Progress` vs `in_progress`) compare equal. When
+    // `--status` is omitted the effective status is the create default, `Open`.
+    let parsed: Status = match raw_status {
+        Some(raw) => raw.parse()?,
+        None => Status::Open,
+    };
+    // Status-set enforcement (issue #311).
+    policy.workflow.validate_status(parsed.as_str())?;
+    // Initial-transition enforcement (issue #312, layer 1): a create has no
+    // prior status, so the effective starting status is validated against the
+    // reserved `initial` key (no-op when `transitions`/`initial` is absent).
+    policy.workflow.validate_transition(None, parsed.as_str())
 }
 
 fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &OutputContext) {
@@ -225,6 +317,27 @@ fn auto_flush_after_create(storage_ctx: &mut config::OpenStorageResult, ctx: &Ou
 
 fn create_display_text(value: &str) -> String {
     sanitize_terminal_inline(value).into_owned()
+}
+
+fn emit_created_with_capacity_warnings<T: Serialize>(
+    created: &T,
+    warnings: &[crate::close_policy::WorkflowCapacityWarning],
+    ctx: &OutputContext,
+) {
+    if warnings.is_empty() {
+        if ctx.is_toon() {
+            ctx.toon(created);
+        } else {
+            ctx.json_pretty(created);
+        }
+    } else {
+        let payload = CreateWithCapacityWarnings { created, warnings };
+        if ctx.is_toon() {
+            ctx.toon(&payload);
+        } else {
+            ctx.json_pretty(&payload);
+        }
+    }
 }
 
 fn create_display_list<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
@@ -247,6 +360,50 @@ fn create_issue_summary_line(id: &str, title: &str) -> String {
     )
 }
 
+/// Read a description body verbatim from a file, or from stdin when `path`
+/// is `-`. The full content is returned unchanged from disk (no paragraph
+/// truncation, no trimming), so callers get exactly the bytes on disk as a
+/// UTF-8 string. Shared by `br create --description-file` and
+/// `br update --description-file`.
+pub(crate) fn read_description_file(path: &Path) -> Result<String> {
+    if path.as_os_str() == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer).map_err(|err| {
+            BeadsError::validation(
+                "description_file",
+                format!("failed to read description from stdin: {err}"),
+            )
+        })?;
+        return Ok(buffer);
+    }
+    std::fs::read_to_string(path).map_err(|err| {
+        BeadsError::validation(
+            "description_file",
+            format!(
+                "failed to read description file '{}': {err}",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Resolve the effective description for `br create`, preferring
+/// `--description-file` (read verbatim) over inline `-d/--description`.
+/// The two are mutually exclusive; clap enforces this at parse time, and
+/// this guard re-checks it so programmatic callers cannot smuggle both.
+pub(crate) fn resolve_create_description(args: &CreateArgs) -> Result<Option<String>> {
+    if let Some(path) = &args.description_file {
+        if args.description.is_some() {
+            return Err(BeadsError::validation(
+                "description_file",
+                "cannot be combined with --description",
+            ));
+        }
+        return Ok(Some(read_description_file(path)?));
+    }
+    Ok(args.description.clone())
+}
+
 /// Core logic for creating an issue.
 ///
 /// Handles ID generation, validation, and storage insertion.
@@ -264,7 +421,15 @@ pub fn create_issue_impl(
     storage: &mut SqliteStorage,
     args: &CreateArgs,
     config: &CreateConfig,
+    description: Option<String>,
 ) -> Result<Issue> {
+    // Real callers pass the pre-resolved `--description-file`/`-d` value
+    // (resolved once at the call site so `-` stdin is read exactly once,
+    // before the JSONL-recovery retry closure). When a caller passes `None`,
+    // fall back to the description carried on `args` so arg-based descriptions
+    // still apply. `description_file` conflicts with `-d`, so this never
+    // double-counts.
+    let description = description.or_else(|| args.description.clone());
     // 1. Resolve title
     let title = args
         .title
@@ -313,7 +478,7 @@ pub fn create_issue_impl(
 
         let id_input = NewIdInput {
             title,
-            description: args.description.as_deref(),
+            description: description.as_deref(),
             creator: Some(&config.actor),
             now,
             issue_count: count,
@@ -343,7 +508,7 @@ pub fn create_issue_impl(
         let mut issue = Issue {
             id: id.clone(),
             title: title.clone(),
-            description: args.description.clone(),
+            description: description.clone(),
             status: status.clone(),
             priority,
             issue_type: issue_type.clone(),
@@ -367,6 +532,8 @@ pub fn create_issue_impl(
             closed_by_session: None,
             source_system: None,
             source_repo: config.source_repo.clone(),
+            source_repo_path: config.source_repo_path.clone(),
+            agent_context: None,
             deleted_at,
             deleted_by: if deleted_at.is_some() {
                 Some(config.actor.clone())
@@ -409,6 +576,17 @@ pub fn create_issue_impl(
         if args.dry_run {
             return Ok(issue);
         }
+
+        // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) so the
+        // creation audit event records the self-reported agent identity. This
+        // is recorded ONLY — it never gates or alters the create. Re-staged on
+        // every loop iteration because `mutate()` consumes it on each attempt.
+        storage.set_pending_event_attribution(EventAttribution::new(
+            args.agent_name.as_deref(),
+            args.harness.as_deref(),
+            args.model.as_deref(),
+            super::session_attribution_from_env().as_deref(),
+        ));
 
         // 8. Create (atomic)
         match storage.create_issue(&issue, &config.actor) {
@@ -468,15 +646,13 @@ fn generate_new_id(
                     ));
                 }
             }
-        } else {
-            Ok(candidate)
         }
+
+        Ok(candidate)
     } else {
         // Standard ID generation for non-child issues
         let id_gen = IdGenerator::new(input.id_config.clone());
-        let id_check_err: std::cell::RefCell<Option<BeadsError>> = std::cell::RefCell::new(None);
-
-        let generated_id = match slug {
+        match slug {
             Some(s) if !s.trim().is_empty() => id_gen.generate_with_slug(
                 IdGenerationInput {
                     title: input.title,
@@ -486,13 +662,7 @@ fn generate_new_id(
                     issue_count: input.issue_count,
                 },
                 s,
-                |id| match storage.id_exists(id) {
-                    Ok(exists) => exists,
-                    Err(e) => {
-                        id_check_err.replace(Some(e));
-                        true
-                    }
-                },
+                |id| storage.id_exists(id),
             ),
             _ => id_gen.generate(
                 input.title,
@@ -500,21 +670,9 @@ fn generate_new_id(
                 input.creator,
                 input.now,
                 input.issue_count,
-                |id| match storage.id_exists(id) {
-                    Ok(exists) => exists,
-                    Err(e) => {
-                        id_check_err.replace(Some(e));
-                        // Treat as "exists" to force retry with a different ID
-                        true
-                    }
-                },
+                |id| storage.id_exists(id),
             ),
-        };
-
-        if let Some(err) = id_check_err.into_inner() {
-            return Err(err);
         }
-        Ok(generated_id)
     }
 }
 
@@ -566,44 +724,50 @@ fn validate_relations(args: &CreateArgs, issue_id: &str) -> Result<()> {
 
     // Validate Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if dep_str.starts_with("external:") {
-            ("blocks", dep_str.as_str())
-        } else if let Some((t, i)) = dep_str.split_once(':') {
-            (t, i)
-        } else {
-            ("blocks", dep_str.as_str())
-        };
+        let (_, dep_id) = parse_create_dependency(dep_str)?;
 
         if dep_id == issue_id {
             return Err(BeadsError::validation("deps", "cannot depend on itself"));
         }
-
-        // Accept "blocked-by" as alias for "blocks" (consistent with import path)
-        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
-            "blocks"
-        } else {
-            type_str
-        };
-
-        // Strict dependency type validation
-        // Note: DependencyType::from_str always returns Ok, so map_err is for clarity
-        let dep_type: DependencyType = normalized_type.parse().expect("from_str is infallible");
-
-        // Disallow accidental custom types from typos
-        if let DependencyType::Custom(_) = dep_type {
-            return Err(BeadsError::Validation {
-                field: "deps".to_string(),
-                reason: format!(
-                    "Unknown dependency type: '{type_str}'. \
-                     Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
-                     related, discovered-from, replies-to, relates-to, duplicates, \
-                     supersedes, caused-by"
-                ),
-            });
-        }
     }
 
     Ok(())
+}
+
+fn parse_create_dependency(dep_str: &str) -> Result<(DependencyType, String)> {
+    // Match markdown import semantics: a colon only means `type:id` when the
+    // prefix is a known dependency type; otherwise it can be part of a title.
+    let (mut type_str, dep_id, valid) = parse_dependency(dep_str);
+    if !valid {
+        return Err(BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{type_str}'. \
+                 Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    if type_str.eq_ignore_ascii_case("blocked-by") {
+        type_str = "blocks".to_string();
+    }
+
+    let dep_type = DependencyType::from_str(&type_str)?;
+    if let DependencyType::Custom(_) = dep_type {
+        return Err(BeadsError::Validation {
+            field: "deps".to_string(),
+            reason: format!(
+                "Unknown dependency type: '{type_str}'. \
+                 Allowed types: blocks, blocked-by, parent-child, conditional-blocks, waits-for, \
+                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 supersedes, caused-by"
+            ),
+        });
+    }
+
+    Ok((dep_type, dep_id))
 }
 
 struct RelationContext<'a> {
@@ -644,25 +808,9 @@ fn populate_relations(
 
     // Dependencies
     for dep_str in &args.deps {
-        let (type_str, dep_id) = if dep_str.starts_with("external:") {
-            ("blocks", dep_str.as_str())
-        } else if let Some((t, i)) = dep_str.split_once(':') {
-            (t, i)
-        } else {
-            ("blocks", dep_str.as_str())
-        };
+        let (dep_type, dep_id) = parse_create_dependency(dep_str)?;
+        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, &dep_id)?;
 
-        // Normalize "blocked-by" to "blocks" (consistent with validation and import)
-        let normalized_type = if type_str.eq_ignore_ascii_case("blocked-by") {
-            "blocks"
-        } else {
-            type_str
-        };
-
-        let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, dep_id)?;
-
-        // from_str is infallible - Custom types are rejected by validate_relations above
-        let dep_type: DependencyType = normalized_type.parse().expect("validated above");
         issue.dependencies.push(Dependency {
             issue_id: issue.id.clone(),
             depends_on_id: resolved_dep_id,
@@ -704,11 +852,15 @@ fn execute_import(
     };
     let layer = storage_ctx.load_config(cli)?;
 
+    // Strict status-workflow enforcement (issue #311); see `execute`.
+    enforce_workflow_status(&storage_ctx.paths.beads_dir, args.status.as_deref())?;
+
     let id_config = config::id_config_from_layer(&layer);
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
     let actor = config::resolve_actor(&layer);
     let import_source_repo = canonical_source_repo(&storage_ctx.paths.beads_dir);
+    let import_source_repo_path = canonical_source_repo_path(&storage_ctx.paths.beads_dir);
     let now = Utc::now();
     let _json_mode = cli.json.unwrap_or(false);
     let due_at = parse_optional_date(args.due.as_deref())?;
@@ -740,6 +892,7 @@ fn execute_import(
 
     let mut created_ids = Vec::new();
     let mut created_issues = Vec::new();
+    let mut capacity_warnings = Vec::new();
 
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix.clone()));
 
@@ -785,6 +938,7 @@ fn execute_import(
         let assignee = parsed.assignee.or_else(|| args.assignee.clone());
         let design = parsed.design.clone();
         let acceptance_criteria = parsed.acceptance_criteria.clone();
+        let agent_context = parsed.agent_context.clone();
 
         // Resolve parent (item-specific header or CLI global fallback)
         let parent_candidate = parsed.parent.as_deref().or(args.parent.as_deref());
@@ -808,7 +962,17 @@ fn execute_import(
                 deferred_parent_ref = Some(p_trimmed.to_string());
                 None
             } else {
-                Some(resolve_issue_id(storage, &id_resolver, p)?)
+                match resolve_issue_id(storage, &id_resolver, p) {
+                    Ok(id) => Some(id),
+                    Err(err) => {
+                        eprintln!(
+                            "✗ Failed to resolve parent for {}: {}",
+                            create_display_text(&title),
+                            err
+                        );
+                        continue;
+                    }
+                }
             }
         } else {
             None
@@ -887,6 +1051,8 @@ fn execute_import(
                 closed_by_session: None,
                 source_system: None,
                 source_repo: import_source_repo.clone(),
+                source_repo_path: import_source_repo_path.clone(),
+                agent_context: agent_context.clone(),
                 deleted_at: import_deleted_at,
                 deleted_by: if import_deleted_at.is_some() {
                     Some(actor.clone())
@@ -950,8 +1116,25 @@ fn execute_import(
                 });
             }
 
+            if args.dry_run {
+                // Skip persistence: dry-run validates the bulk file and reports what
+                // would be created without writing to storage or JSONL.
+                created_issues.push(issue.clone());
+                final_id = id;
+                created = true;
+                break;
+            }
+            // Stage Tier 1 attribution (issue #312, Layer 3 capture-only) for
+            // the bulk-import creation audit event. Recorded only; never gated.
+            storage.set_pending_event_attribution(EventAttribution::new(
+                args.agent_name.as_deref(),
+                args.harness.as_deref(),
+                args.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
+            ));
             match storage.create_issue(&issue, &actor) {
                 Ok(()) => {
+                    capacity_warnings.extend(storage.take_capacity_warnings());
                     final_id = id;
                     created = true;
                     break;
@@ -1016,6 +1199,10 @@ fn execute_import(
     // Phase 2: Resolve and wire up deferred dependencies.
     // Now that all issues exist in storage, we can resolve intra-file references
     // by title or stand-in ID, as well as references to pre-existing issues.
+    let mut resolved_import_deps = Vec::new();
+    // #368: count declared edges we fail to resolve so the command can exit
+    // non-zero for scripted callers instead of silently reporting success.
+    let mut dropped_import_edges = 0usize;
     if !deferred_parent_deps.is_empty() && !args.dry_run {
         for (issue_id, parent_ref) in &deferred_parent_deps {
             let parent_id =
@@ -1031,6 +1218,7 @@ fn execute_import(
                             create_display_text(parent_ref),
                             create_display_text(issue_id)
                         );
+                        dropped_import_edges += 1;
                         continue;
                     }
                 };
@@ -1041,13 +1229,11 @@ fn execute_import(
                 );
                 continue;
             }
-            if let Err(err) = storage.add_dependency(issue_id, &parent_id, "parent-child", &actor) {
-                eprintln!(
-                    "warning: failed to add parent {} → {}: {err}",
-                    create_display_text(issue_id),
-                    create_display_text(&parent_id)
-                );
-            }
+            resolved_import_deps.push(BulkDependencyInsert {
+                issue_id: issue_id.clone(),
+                depends_on_id: parent_id,
+                dep_type: "parent-child".to_string(),
+            });
         }
     }
 
@@ -1110,6 +1296,7 @@ fn execute_import(
                                     create_display_text(&dep_id),
                                     create_display_text(issue_id)
                                 );
+                                dropped_import_edges += 1;
                                 continue;
                             }
                         }
@@ -1133,17 +1320,62 @@ fn execute_import(
                     continue;
                 }
 
-                if let Err(err) =
-                    storage.add_dependency(issue_id, &resolved_dep_id, &type_str, &actor)
-                {
-                    eprintln!(
-                        "warning: failed to add dependency {} → {}: {err}",
-                        create_display_text(issue_id),
-                        create_display_text(&resolved_dep_id)
+                resolved_import_deps.push(BulkDependencyInsert {
+                    issue_id: issue_id.clone(),
+                    depends_on_id: resolved_dep_id,
+                    dep_type: type_str,
+                });
+            }
+        }
+    }
+
+    if !resolved_import_deps.is_empty() && !args.dry_run {
+        match storage.add_dependencies_bulk_for_import(&resolved_import_deps, &actor) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: bulk dependency import failed ({err}); retrying dependencies one by one"
+                );
+                let mut dropped_edges = 0usize;
+                for dep in &resolved_import_deps {
+                    if let Err(err) = storage.add_dependency(
+                        &dep.issue_id,
+                        &dep.depends_on_id,
+                        &dep.dep_type,
+                        &actor,
+                    ) {
+                        dropped_edges += 1;
+                        eprintln!(
+                            "warning: failed to add dependency {} → {}: {err}",
+                            create_display_text(&dep.issue_id),
+                            create_display_text(&dep.depends_on_id)
+                        );
+                    }
+                }
+                // #368: The transactional bulk insert detected a cycle (or other
+                // constraint) and the per-edge fallback then silently dropped the
+                // offending edge(s). The issues are still created and the graph is
+                // persisted, but it differs from the declared spec — surface that
+                // to scripted callers via a non-zero exit code once output and
+                // auto-flush have completed, rather than reporting success.
+                if dropped_edges > 0 {
+                    crate::output::record_pending_exit_code(
+                        crate::error::ErrorCode::CycleDetected.exit_code(),
                     );
                 }
             }
         }
+    }
+
+    // #368: declared dependency edges that couldn't be resolved during Phase 2
+    // (a referenced parent/dependency that doesn't exist) were dropped above
+    // with only an eprintln warning. The issues are still created, but the
+    // persisted graph is missing intended edges — surface that to scripted
+    // callers via a non-zero exit code rather than reporting a false success.
+    if dropped_import_edges > 0 {
+        crate::output::record_pending_exit_code(
+            crate::error::ErrorCode::DependencyNotFound.exit_code(),
+        );
     }
 
     if ctx.is_json() || ctx.is_toon() {
@@ -1197,10 +1429,8 @@ fn execute_import(
         for (id, _) in created_ids {
             println!("{id}");
         }
-    } else if ctx.is_toon() {
-        ctx.toon(&created_issues);
-    } else if ctx.is_json() {
-        ctx.json_pretty(&created_issues);
+    } else if ctx.is_toon() || ctx.is_json() {
+        emit_created_with_capacity_warnings(&created_issues, &capacity_warnings, ctx);
     } else if !created_ids.is_empty() {
         if args.dry_run {
             ctx.info(&format!(
@@ -1217,6 +1447,11 @@ fn execute_import(
         }
         for (id, title) in created_ids {
             ctx.print_line(&create_issue_summary_line(&id, &title));
+        }
+    }
+    if !ctx.is_json() && !ctx.is_toon() {
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
         }
     }
     auto_flush_after_create(&mut storage_ctx, ctx);
@@ -1250,12 +1485,9 @@ fn lookup_import_reference(
     standin_to_ids
         .get(&key)
         .or_else(|| title_to_ids.get(&key))
-        .map(|ids| {
-            if ids.len() == 1 {
-                ImportReferenceResolution::Resolved(ids[0].clone())
-            } else {
-                ImportReferenceResolution::Ambiguous(ids.clone())
-            }
+        .map(|ids| match ids.as_slice() {
+            [id] => ImportReferenceResolution::Resolved(id.clone()),
+            _ => ImportReferenceResolution::Ambiguous(ids.clone()),
         })
 }
 
@@ -1297,6 +1529,7 @@ mod tests {
             slug: None,
             priority: None,
             description: None,
+            description_file: None,
             assignee: None,
             owner: None,
             labels: vec![],
@@ -1311,6 +1544,9 @@ mod tests {
             dry_run: false,
             silent: false,
             file: None,
+            agent_name: None,
+            harness: None,
+            model: None,
         }
     }
 
@@ -1326,6 +1562,7 @@ mod tests {
             default_issue_type: IssueType::Task,
             actor: "test_user".to_string(),
             source_repo: None,
+            source_repo_path: None,
         }
     }
 
@@ -1371,7 +1608,7 @@ mod tests {
         config.source_repo = canonical_source_repo(&beads_dir);
         let args = default_args();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create");
         assert_eq!(
             issue.source_repo.as_deref(),
             Some("source_repo_probe"),
@@ -1410,7 +1647,7 @@ mod tests {
         let args = default_args();
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         assert_eq!(issue.title, "Test Issue");
         assert_eq!(issue.priority, Priority::MEDIUM);
@@ -1433,7 +1670,7 @@ mod tests {
         args.title = None;
         let config = default_config();
 
-        let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
+        let err = create_issue_impl(&mut storage, &args, &config, None).unwrap_err();
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "title"));
         info!("test_create_issue_validation_empty_title: assertions passed");
     }
@@ -1447,7 +1684,7 @@ mod tests {
         parent.title = Some("Parent".to_string());
         let config = default_config();
         let created_parent =
-            create_issue_impl(&mut storage, &parent, &config).expect("create parent");
+            create_issue_impl(&mut storage, &parent, &config, None).expect("create parent");
 
         storage
             .execute_raw("DROP TABLE issues")
@@ -1456,7 +1693,7 @@ mod tests {
         let mut child = default_args();
         child.parent = Some(created_parent.id);
 
-        let err = create_issue_impl(&mut storage, &child, &config).unwrap_err();
+        let err = create_issue_impl(&mut storage, &child, &config, None).unwrap_err();
         assert!(
             matches!(err, BeadsError::Database(_)),
             "expected database error, got: {err:?}"
@@ -1473,7 +1710,7 @@ mod tests {
         args.dry_run = true;
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         // Should return issue but not verify existence in DB
         assert_eq!(issue.title, "Test Issue");
@@ -1493,7 +1730,7 @@ mod tests {
         args.description = Some("Desc".to_string());
         let config = default_config();
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         assert_eq!(issue.priority, Priority::CRITICAL);
         assert_eq!(issue.issue_type, IssueType::Bug);
@@ -1513,14 +1750,15 @@ mod tests {
             title: Some("Target".to_string()),
             ..default_args()
         };
-        let target = create_issue_impl(&mut storage, &target_args, &config).expect("create target");
+        let target =
+            create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
 
         // Create issue with label and dep
         let mut args = default_args();
         args.labels = vec!["backend".to_string()];
         args.deps = vec![target.id.clone()];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         // Verify labels
         let labels = storage.get_labels(&issue.id).expect("get labels");
@@ -1534,6 +1772,31 @@ mod tests {
     }
 
     #[test]
+    fn test_create_issue_dep_title_with_colon_resolves_as_title() {
+        init_test_logging();
+        info!("test_create_issue_dep_title_with_colon_resolves_as_title: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+
+        let target_args = CreateArgs {
+            title: Some("Step 1: Setup Database".to_string()),
+            ..default_args()
+        };
+        let target =
+            create_issue_impl(&mut storage, &target_args, &config, None).expect("create target");
+
+        let mut args = default_args();
+        args.deps = vec!["Step 1: Setup Database".to_string()];
+
+        let issue =
+            create_issue_impl(&mut storage, &args, &config, None).expect("create dependent");
+
+        let deps = storage.get_dependencies(&issue.id).expect("get deps");
+        assert_eq!(deps, vec![target.id]);
+        info!("test_create_issue_dep_title_with_colon_resolves_as_title: assertions passed");
+    }
+
+    #[test]
     fn test_create_issue_with_missing_dependency_fails() {
         init_test_logging();
         info!("test_create_issue_with_missing_dependency_fails: starting");
@@ -1542,7 +1805,7 @@ mod tests {
         let mut args = default_args();
         args.deps = vec!["bd-missing".to_string()];
 
-        let err = create_issue_impl(&mut storage, &args, &config).unwrap_err();
+        let err = create_issue_impl(&mut storage, &args, &config, None).unwrap_err();
 
         assert!(matches!(err, BeadsError::IssueNotFound { id } if id == "bd-missing"));
         info!("test_create_issue_with_missing_dependency_fails: assertions passed");
@@ -1556,12 +1819,13 @@ mod tests {
         let config = default_config();
 
         // Parent
-        let parent = create_issue_impl(&mut storage, &default_args(), &config).expect("parent");
+        let parent =
+            create_issue_impl(&mut storage, &default_args(), &config, None).expect("parent");
 
         // Child
         let mut args = default_args();
         args.parent = Some(parent.id.clone());
-        let child = create_issue_impl(&mut storage, &args, &config).expect("child");
+        let child = create_issue_impl(&mut storage, &args, &config, None).expect("child");
 
         let deps = storage.get_dependencies(&child.id).expect("get deps");
         assert_eq!(deps.len(), 1);
@@ -1579,13 +1843,13 @@ mod tests {
         // Create parent (epic)
         let mut parent_args = default_args();
         parent_args.title = Some("Epic Parent".to_string());
-        let parent = create_issue_impl(&mut storage, &parent_args, &config).expect("parent");
+        let parent = create_issue_impl(&mut storage, &parent_args, &config, None).expect("parent");
 
         // Create first child - should get parent.1
         let mut child1_args = default_args();
         child1_args.title = Some("First Child".to_string());
         child1_args.parent = Some(parent.id.clone());
-        let child1 = create_issue_impl(&mut storage, &child1_args, &config).expect("child1");
+        let child1 = create_issue_impl(&mut storage, &child1_args, &config, None).expect("child1");
 
         // Verify child ID has the correct format: parent_id.1
         let expected_child1_id = format!("{}.1", parent.id);
@@ -1599,7 +1863,7 @@ mod tests {
         let mut child2_args = default_args();
         child2_args.title = Some("Second Child".to_string());
         child2_args.parent = Some(parent.id.clone());
-        let child2 = create_issue_impl(&mut storage, &child2_args, &config).expect("child2");
+        let child2 = create_issue_impl(&mut storage, &child2_args, &config, None).expect("child2");
 
         let expected_child2_id = format!("{}.2", parent.id);
         assert_eq!(
@@ -1631,7 +1895,7 @@ mod tests {
         let mut args = default_args();
         args.parent = Some("bd-nonexistent".to_string());
 
-        let result = create_issue_impl(&mut storage, &args, &config);
+        let result = create_issue_impl(&mut storage, &args, &config, None);
         assert!(result.is_err(), "Should fail when parent doesn't exist");
 
         if let Err(BeadsError::IssueNotFound { id }) = result {
@@ -1653,7 +1917,7 @@ mod tests {
         args.type_ = Some("custom_type".to_string());
         let config = default_config();
 
-        let result = create_issue_impl(&mut storage, &args, &config);
+        let result = create_issue_impl(&mut storage, &args, &config, None);
         assert!(result.is_ok(), "create should succeed with custom type");
         let issue = result.unwrap();
         assert_eq!(
@@ -1816,7 +2080,7 @@ mod tests {
         let mut args = default_args();
         args.labels = vec!["  trimmed  ".to_string()];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         let labels = storage.get_labels(&issue.id).expect("get labels");
         assert_eq!(labels, vec!["trimmed"]);
@@ -1836,7 +2100,7 @@ mod tests {
             "  backend  ".to_string(),
         ];
 
-        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+        let issue = create_issue_impl(&mut storage, &args, &config, None).expect("create failed");
 
         let labels = storage.get_labels(&issue.id).expect("get labels");
         assert_eq!(labels, vec!["backend"]);

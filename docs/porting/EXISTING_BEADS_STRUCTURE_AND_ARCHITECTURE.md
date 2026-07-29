@@ -4489,7 +4489,7 @@ Porting note:
 
 **Sync-branch setup**:
 - `--branch` sets sync branch (writes both config.yaml and DB).
-- No auto-detection of current branch to avoid main/master worktree conflicts.
+- No auto-detection of current branch to avoid default-branch worktree conflicts.
 
 **Import on init**:
 - Default: scan git history for `.beads/issues.jsonl`, import if found.
@@ -4625,7 +4625,8 @@ Porting note:
 1) `BEADS_SYNC_BRANCH` env var  
 2) `sync-branch` in config.yaml  
 3) `sync.branch` in DB  
-- `sync.branch` cannot be `main` or `master` (worktree conflict prevention).
+- `sync.branch` cannot point at the primary working branch (`main`) or any mirror
+  branch (worktree conflict prevention).
 
 ---
 

@@ -260,7 +260,8 @@ fn run_contention_lab(profile: ContentionProfile) -> io::Result<ContentionRun> {
     }
     events.sort_by_key(|event| event.event_index);
 
-    let doctor_ok = run_br_command(&root, ["doctor", "--json"])?.exit_code == 0;
+    let doctor_run = run_br_command(&root, ["doctor", "--json"])?;
+    let doctor_ok = doctor_reports_no_errors(&doctor_run);
     let sync_status = run_br_command(&root, ["sync", "--status", "--json"])?;
     let sync_status_clean = sync_status.exit_code == 0 && sync_status_is_clean(&sync_status.stdout);
 
@@ -637,6 +638,32 @@ fn sync_status_is_clean(stdout: &[u8]) -> bool {
             .get("db_newer")
             .and_then(serde_json::Value::as_bool)
             .is_some_and(|db_newer| !db_newer)
+}
+
+/// Decide whether `br doctor --json` reports a workspace that is healthy
+/// *enough* for the contention-replay assertion.
+///
+/// `br doctor` intentionally exits `1` (`DoctorExitCode::FindingsPresent`)
+/// whenever **any** finding is present, including benign `warn`-level ones
+/// that are purely operator-environment conditions (duplicate `br` on
+/// `$PATH`, unset `RUST_LOG`, expected frankensqlite WAL/SHM sidecar shape,
+/// missing post-flush anchor, etc.). The exit-code contract is correct and
+/// must not change — but the assertion here only cares that forced write
+/// contention left no *error*-level integrity/sync damage. So we parse the
+/// structured report and treat the run as ok unless a check is `error`.
+///
+/// Falls back to the raw exit code if the JSON cannot be parsed, so a hard
+/// failure (panic, non-doctor error) still surfaces.
+fn doctor_reports_no_errors(run: &CommandRun) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&run.stdout) else {
+        return run.exit_code == 0;
+    };
+    let Some(checks) = value.get("checks").and_then(serde_json::Value::as_array) else {
+        return run.exit_code == 0;
+    };
+    checks
+        .iter()
+        .all(|check| check.get("status").and_then(serde_json::Value::as_str) != Some("error"))
 }
 
 fn create_title_from_command(command: &[String]) -> Option<&str> {

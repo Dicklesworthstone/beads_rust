@@ -44,6 +44,8 @@ fn make_issue(id: &str, title: &str) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -62,67 +64,177 @@ fn make_issue(id: &str, title: &str) -> Issue {
     }
 }
 
+// ----------------------------------------------------------------------------
+// beads_rust-uelt: 2026-05-09 audit-driven rewrite
+//
+// The original test (`test_rebuild_blocked_cache_crash_with_multiple_parents`)
+// was written for an API that allowed multiple parent-child edges per issue.
+// Commit `6ccbc3d6 fix(storage): reject second parent-child parent` (2026-05-07)
+// tightened the validator to enforce single-parent semantics; the old
+// scenario now panics on the second `add_dependency(..., "parent-child", ...)`
+// call.
+//
+// Replaced with three split tests below that preserve the original intent
+// (stress-test repeated incremental blocked-cache rebuilds around parent-child
+// mutations) under the new contract:
+//
+//   1. test_rebuild_blocked_cache_after_parent_replace
+//   2. test_rebuild_blocked_cache_after_parent_clear
+//   3. test_dep_add_second_parent_returns_validation_error_with_clear_message
+//
+// Fixture IDs migrated from `bd-` to `br-` per beads_rust-6plg sibling work.
+// ----------------------------------------------------------------------------
+
+/// uelt #1: child A has parent B; replace parent with C; rebuild blocked cache;
+/// verify cache reflects the NEW parent (A→C, not A→B).
 #[test]
-fn test_rebuild_blocked_cache_crash_with_multiple_parents() {
+fn test_rebuild_blocked_cache_after_parent_replace() {
     let mut storage = SqliteStorage::open_memory().unwrap();
 
-    // Create blockers D and E (open status)
+    // Setup: blocker E + parents B, C + child A
     storage
-        .create_issue(&make_issue("bd-d", "Blocker D"), "test")
+        .create_issue(&make_issue("br-e", "Blocker E"), "test")
         .unwrap();
     storage
-        .create_issue(&make_issue("bd-e", "Blocker E"), "test")
-        .unwrap();
-
-    // Create parents B and C
-    storage
-        .create_issue(&make_issue("bd-b", "Parent B"), "test")
+        .create_issue(&make_issue("br-b", "Parent B"), "test")
         .unwrap();
     storage
-        .create_issue(&make_issue("bd-c", "Parent C"), "test")
+        .create_issue(&make_issue("br-c", "Parent C"), "test")
+        .unwrap();
+    storage
+        .create_issue(&make_issue("br-a", "Child A"), "test")
         .unwrap();
 
-    // Create child A
+    // C blocked by E (so A→C path also makes A blocked)
     storage
-        .create_issue(&make_issue("bd-a", "Child A"), "test")
+        .add_dependency("br-c", "br-e", "blocks", "test")
         .unwrap();
 
-    // Make B blocked by D
-    storage
-        .add_dependency("bd-b", "bd-d", "blocks", "test")
-        .unwrap();
+    // Set initial parent A→B
+    storage.set_parent("br-a", Some("br-b"), "test").unwrap();
     storage
         .rebuild_blocked_cache(true)
-        .expect("incremental rebuild after B -> D should not crash");
+        .expect("rebuild after parent set should not crash");
 
-    // Make C blocked by E
-    storage
-        .add_dependency("bd-c", "bd-e", "blocks", "test")
-        .unwrap();
+    // Replace parent: A→C
+    storage.set_parent("br-a", Some("br-c"), "test").unwrap();
     storage
         .rebuild_blocked_cache(true)
-        .expect("incremental rebuild after C -> E should not crash");
+        .expect("rebuild after parent replace should not crash");
 
-    // Make A child of B AND C (diamond dependency / multiple inheritance).
-    // This intentionally stress-tests repeated incremental blocked-cache rebuilds
-    // around the same mutations that `br dep add` triggers through storage-owned
-    // cache invalidation.
+    // Verify A's parent is now C (not B)
+    let parents = storage.get_dependencies("br-a").unwrap();
+    assert_eq!(
+        parents.len(),
+        1,
+        "single-parent contract: A must have exactly 1 parent edge; got {parents:?}"
+    );
+    assert_eq!(parents[0], "br-c", "A's parent should now be C, not B");
+
+    // A should be blocked because C is blocked by E
+    assert!(
+        storage.is_blocked("br-a").unwrap(),
+        "A should be blocked transitively through new parent C"
+    );
+}
+
+/// uelt #2: child A has parent B; clear parent; rebuild blocked cache;
+/// verify A is no longer in B's blocked set and is not blocked.
+#[test]
+fn test_rebuild_blocked_cache_after_parent_clear() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+
     storage
-        .add_dependency("bd-a", "bd-b", "parent-child", "test")
+        .create_issue(&make_issue("br-d", "Blocker D"), "test")
         .unwrap();
     storage
-        .rebuild_blocked_cache(true)
-        .expect("incremental rebuild after A -> B should not crash");
+        .create_issue(&make_issue("br-b", "Parent B"), "test")
+        .unwrap();
     storage
-        .add_dependency("bd-a", "bd-c", "parent-child", "test")
+        .create_issue(&make_issue("br-a", "Child A"), "test")
         .unwrap();
 
+    // B blocked by D, A child of B → A is transitively blocked
+    storage
+        .add_dependency("br-b", "br-d", "blocks", "test")
+        .unwrap();
+    storage.set_parent("br-a", Some("br-b"), "test").unwrap();
+    storage.rebuild_blocked_cache(true).expect("rebuild");
+    assert!(
+        storage.is_blocked("br-a").unwrap(),
+        "A should be blocked initially via parent B"
+    );
+
+    // Clear A's parent
+    storage.set_parent("br-a", None, "test").unwrap();
     storage
         .rebuild_blocked_cache(true)
-        .expect("incremental rebuild after A -> C should not crash");
+        .expect("rebuild after parent clear should not crash");
 
-    assert!(storage.is_blocked("bd-a").unwrap(), "A should be blocked");
-    println!("Test finished successfully");
+    let parents = storage.get_dependencies("br-a").unwrap();
+    assert_eq!(parents.len(), 0, "A should have no parent after clear");
+    assert!(
+        !storage.is_blocked("br-a").unwrap(),
+        "A should no longer be blocked after parent cleared"
+    );
+}
+
+/// uelt #3: trying to add a second `parent-child` dep MUST return a clear
+/// validation error naming the existing parent. This is the explicit
+/// negative-path contract test for commit `6ccbc3d6`.
+#[test]
+fn test_dep_add_second_parent_returns_validation_error_with_clear_message() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+
+    storage
+        .create_issue(&make_issue("br-b", "Parent B"), "test")
+        .unwrap();
+    storage
+        .create_issue(&make_issue("br-c", "Parent C"), "test")
+        .unwrap();
+    storage
+        .create_issue(&make_issue("br-a", "Child A"), "test")
+        .unwrap();
+
+    // First parent succeeds
+    storage
+        .add_dependency("br-a", "br-b", "parent-child", "test")
+        .expect("first parent-child must succeed");
+
+    // Second parent MUST fail with a clear, structured error
+    let err = storage
+        .add_dependency("br-a", "br-c", "parent-child", "test")
+        .expect_err("second parent-child must fail");
+
+    let err_str = err.to_string();
+    eprintln!("[uelt] validator rejection message: {err_str}");
+
+    // Operator-readable expectations:
+    // 1. Names the issue receiving the new parent (br-a)
+    // 2. Names the existing parent (br-b)
+    // 3. Names the attempted new parent (br-c)
+    // 4. Offers a path forward (clear / replace)
+    assert!(
+        err_str.contains("br-a"),
+        "error must name child issue 'br-a'; got: {err_str}"
+    );
+    assert!(
+        err_str.contains("br-b"),
+        "error must name existing parent 'br-b'; got: {err_str}"
+    );
+    assert!(
+        err_str.contains("br-c") || err_str.contains("parent"),
+        "error must name attempted parent or 'parent' context; got: {err_str}"
+    );
+
+    // Verify the validator did NOT mutate state — A still has only B
+    let parents = storage.get_dependencies("br-a").unwrap();
+    assert_eq!(
+        parents.len(),
+        1,
+        "validator must not partially mutate state"
+    );
+    assert_eq!(parents[0], "br-b");
 }
 
 #[test]

@@ -12,19 +12,21 @@
 //! reading source code. The CLI surface marks `br schema` as
 //! not-yet-stable; agents should re-call across release boundaries.
 
+use crate::cli::commands::vcs::VcsExportStatus;
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
+use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
-    BlockedIssue, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
+    BlockedIssueOutput, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
+use crate::sync::AdditiveReconcileReceipt;
 use crate::{config, output};
 use chrono::{DateTime, Utc};
-use schemars::Schema;
-use schemars::schema_for;
+use schemars::{JsonSchema, Schema, generate::SchemaSettings};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -70,6 +72,17 @@ struct TreeNode {
     truncated: bool,
 }
 
+/// Row emitted inside `br count --by <field> --json` under `groups[]`.
+///
+/// Keep this in sync with `cli::commands::count::CountGroup`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct CountGroup {
+    /// Group label, for example a status, priority, type, assignee, or label.
+    group: String,
+    /// Number of matching issues in this group.
+    count: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct SchemaOutput {
     tool: &'static str,
@@ -86,7 +99,7 @@ struct SchemaOutput {
 /// not the per-row schema (which lives in `schemas`). Agents can use the
 /// `jq_filter` to extract individual items uniformly across commands without
 /// hard-coding per-command knowledge.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 struct CommandShape {
     /// Top-level JSON shape: "array" | "object" | "scalar".
     shape: &'static str,
@@ -106,8 +119,10 @@ struct CommandShape {
     /// the `schemas` map (e.g. `"Issue"`, `"IssueWithCounts"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     item_schema: Option<&'static str>,
-    /// On error, the same command writes an `ErrorEnvelope` to stderr.
-    /// True for commands that may fail per-call (e.g. lookups that miss).
+    /// Whether machine-mode failures write an `ErrorEnvelope` to stderr.
+    /// False means callers must consult the command notes for the actual
+    /// stream; the current top-level CLI handler emits structured errors on
+    /// stdout for the two safety command shapes below.
     error_envelope_on_stderr: bool,
     /// Free-form notes describing quirks of the envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,42 +188,79 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
 
     match target {
         SchemaTarget::All => {
-            schemas.insert("Issue", schema_for!(Issue));
-            schemas.insert("IssueWithCounts", schema_for!(IssueWithCounts));
-            schemas.insert("IssueDetails", schema_for!(IssueDetails));
-            schemas.insert("ReadyIssue", schema_for!(ReadyIssue));
-            schemas.insert("StaleIssue", schema_for!(StaleIssue));
-            schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
-            schemas.insert("TreeNode", schema_for!(TreeNode));
-            schemas.insert("Statistics", schema_for!(Statistics));
-            schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
+            schemas.insert("Issue", schema_for_output::<Issue>());
+            schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
+            schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
+            schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
+            schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
+            schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+            schemas.insert("TreeNode", schema_for_output::<TreeNode>());
+            schemas.insert("CountGroup", schema_for_output::<CountGroup>());
+            schemas.insert("Statistics", schema_for_output::<Statistics>());
+            schemas.insert(
+                "CoordinationStatusOutput",
+                schema_for_output::<CoordinationStatusOutput>(),
+            );
+            schemas.insert(
+                "CoordinationClaimRow",
+                schema_for_output::<CoordinationClaimRow>(),
+            );
+            schemas.insert(
+                "SyncReconcileReceipt",
+                schema_for_output::<crate::cli::commands::sync::SyncReconcileReceipt>(),
+            );
+            schemas.insert(
+                "AdditiveReconcileReceipt",
+                schema_for_output::<AdditiveReconcileReceipt>(),
+            );
+            schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+            schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Issue => {
-            schemas.insert("Issue", schema_for!(Issue));
+            schemas.insert("Issue", schema_for_output::<Issue>());
         }
         SchemaTarget::IssueWithCounts => {
-            schemas.insert("IssueWithCounts", schema_for!(IssueWithCounts));
+            schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
         }
         SchemaTarget::IssueDetails => {
-            schemas.insert("IssueDetails", schema_for!(IssueDetails));
+            schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
         }
         SchemaTarget::ReadyIssue => {
-            schemas.insert("ReadyIssue", schema_for!(ReadyIssue));
+            schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
         }
         SchemaTarget::StaleIssue => {
-            schemas.insert("StaleIssue", schema_for!(StaleIssue));
+            schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
         }
         SchemaTarget::BlockedIssue => {
-            schemas.insert("BlockedIssue", schema_for!(BlockedIssue));
+            schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
         }
         SchemaTarget::TreeNode => {
-            schemas.insert("TreeNode", schema_for!(TreeNode));
+            schemas.insert("TreeNode", schema_for_output::<TreeNode>());
         }
         SchemaTarget::Statistics => {
-            schemas.insert("Statistics", schema_for!(Statistics));
+            schemas.insert("Statistics", schema_for_output::<Statistics>());
+        }
+        SchemaTarget::CoordinationStatus => {
+            schemas.insert(
+                "CoordinationStatusOutput",
+                schema_for_output::<CoordinationStatusOutput>(),
+            );
+            schemas.insert(
+                "CoordinationClaimRow",
+                schema_for_output::<CoordinationClaimRow>(),
+            );
+        }
+        SchemaTarget::AdditiveReconciliation => {
+            schemas.insert(
+                "AdditiveReconcileReceipt",
+                schema_for_output::<AdditiveReconcileReceipt>(),
+            );
+        }
+        SchemaTarget::VcsStatus => {
+            schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
         }
         SchemaTarget::Error => {
-            schemas.insert("ErrorEnvelope", schema_for!(ErrorEnvelope));
+            schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Commands => {
             // Only the command-shape map is requested; no per-row schemas.
@@ -216,6 +268,13 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
     }
 
     schemas
+}
+
+fn schema_for_output<T: JsonSchema>() -> Schema {
+    SchemaSettings::default()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<T>()
 }
 
 /// Build the per-command output-envelope map.
@@ -236,6 +295,38 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     insert_dependency_command_shapes(&mut commands);
     insert_aggregate_command_shapes(&mut commands);
     insert_label_command_shapes(&mut commands);
+    commands.insert(
+        "sync --reconcile-additive",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("AdditiveReconcileReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Dry-run by default. Apply requires the exact plan_sha256 from an \
+                 identically configured reviewed dry-run via --expect-plan-sha256. \
+                 Structured machine-mode errors are currently emitted on stdout.",
+            ),
+        },
+    );
+    commands.insert(
+        "vcs-status",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("VcsExportStatus"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Explicit bounded read-only Git diagnostic. It is isolated from sync, \
+                 retains HEAD/index evidence when worktree comparison is unavailable, \
+                 never executes Git content filters, and reports sequential evidence with \
+                 observation_atomic=false. Structured machine-mode errors are currently \
+                 emitted on stdout.",
+            ),
+        },
+    );
 
     commands
 }
@@ -385,7 +476,24 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             items_at: None,
             item_schema: None,
             error_envelope_on_stderr: false,
-            notes: Some("Scalar count under `.count`."),
+            notes: Some(
+                "Ungrouped `br count --json`; scalar count under `.count`. \
+                 Grouped variants use the `count --by` entry.",
+            ),
+        },
+    );
+    commands.insert(
+        "count --by",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".groups[]",
+            items_at: Some(".groups"),
+            item_schema: Some("CountGroup"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "For `br count --by <status|priority|type|assignee|label> --json`. \
+                 The wrapper object also includes `total`.",
+            ),
         },
     );
     commands.insert(
@@ -397,6 +505,46 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             item_schema: None,
             error_envelope_on_stderr: false,
             notes: Some("Workspace info object (paths, mode, config snapshot)."),
+        },
+    );
+    commands.insert(
+        "capabilities",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Machine-readable command, feature, safety, exit-code, and env-var inventory.",
+            ),
+        },
+    );
+    commands.insert(
+        "robot-docs guide",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: None,
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly.",
+            ),
+        },
+    );
+    commands.insert(
+        "coordination status",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".claims[]",
+            items_at: Some(".claims"),
+            item_schema: Some("CoordinationClaimRow"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only object with workspace summary and `claims[]` rows. The \
+                 full envelope schema is `CoordinationStatusOutput`.",
+            ),
         },
     );
 }
@@ -418,6 +566,7 @@ fn insert_label_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ValueEnum;
 
     #[test]
     fn schema_generation_is_json_serializable() {
@@ -443,11 +592,64 @@ mod tests {
     }
 
     #[test]
+    fn vcs_status_schema_and_command_shape_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::VcsStatus);
+        assert!(schemas.contains_key("VcsExportStatus"));
+
+        let commands = build_commands(SchemaTarget::Commands);
+        let shape = commands
+            .get("vcs-status")
+            .expect("vcs-status command shape");
+        assert_eq!(shape.shape, "object");
+        assert_eq!(shape.jq_filter, ".");
+        assert_eq!(shape.item_schema, Some("VcsExportStatus"));
+        assert!(
+            !shape.error_envelope_on_stderr,
+            "top-level structured CLI errors are emitted on stdout"
+        );
+    }
+
+    #[test]
     fn all_target_emits_both_schemas_and_commands() {
         let schemas = build_schemas(SchemaTarget::All);
         let commands = build_commands(SchemaTarget::All);
         assert!(!schemas.is_empty(), "All target must include schemas");
         assert!(!commands.is_empty(), "All target must include commands");
+    }
+
+    #[test]
+    fn all_schema_target_covers_every_named_schema_target() {
+        let all_schemas = build_schemas(SchemaTarget::All);
+
+        for target in SchemaTarget::value_variants().iter().copied() {
+            if matches!(target, SchemaTarget::All | SchemaTarget::Commands) {
+                continue;
+            }
+
+            let target_schemas = build_schemas(target);
+            assert!(
+                !target_schemas.is_empty(),
+                "{target:?} should emit at least one schema"
+            );
+
+            for schema_name in target_schemas.keys() {
+                assert!(
+                    all_schemas.contains_key(schema_name),
+                    "SchemaTarget::{target:?} emits {schema_name:?}, but \
+                     SchemaTarget::All omits it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_and_commands_targets_emit_identical_command_maps() {
+        assert_eq!(
+            build_commands(SchemaTarget::All),
+            build_commands(SchemaTarget::Commands),
+            "SchemaTarget::All and SchemaTarget::Commands must describe the \
+             same command envelopes"
+        );
     }
 
     #[test]
@@ -552,5 +754,29 @@ mod tests {
             stats.error_envelope_on_stderr,
             status.error_envelope_on_stderr
         );
+    }
+
+    #[test]
+    fn count_command_shapes_cover_ungrouped_and_grouped_envelopes() {
+        let schemas = build_schemas(SchemaTarget::All);
+        assert!(
+            schemas.contains_key("CountGroup"),
+            "schema all must include grouped count rows"
+        );
+
+        let commands = build_commands(SchemaTarget::Commands);
+        let count = commands
+            .get("count")
+            .expect("ungrouped count entry must exist");
+        assert_eq!(count.jq_filter, ".count");
+        assert_eq!(count.items_at, None);
+        assert_eq!(count.item_schema, None);
+
+        let grouped = commands
+            .get("count --by")
+            .expect("grouped count entry must exist");
+        assert_eq!(grouped.jq_filter, ".groups[]");
+        assert_eq!(grouped.items_at, Some(".groups"));
+        assert_eq!(grouped.item_schema, Some("CountGroup"));
     }
 }

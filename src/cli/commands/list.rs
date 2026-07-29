@@ -436,8 +436,10 @@ fn issue_with_batched_relation_metadata(
 
 /// Convert CLI args to storage filter.
 fn build_filters(args: &ListArgs) -> Result<ListFilters> {
-    // Parse status strings to Status enums
-    let statuses = if args.status.is_empty() {
+    // Parse status strings to Status enums. `--status all` is the same
+    // meta-value `br lint` accepts: no status filter, every status included.
+    let all_statuses = super::status_filter_requests_all(&args.status);
+    let statuses = if args.status.is_empty() || all_statuses {
         None
     } else {
         Some(
@@ -473,6 +475,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
     };
 
     let include_closed = args.all
+        || all_statuses
         || statuses
             .as_ref()
             .is_some_and(|parsed| parsed.iter().any(Status::is_terminal));
@@ -752,6 +755,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_filters_status_all_matches_every_status() {
+        init_logging();
+        // `--status all` must never silently parse as the custom status
+        // literal `Custom("all")` and match nothing (beads_rust-6ilv).
+        for value in ["all", "ALL", " All "] {
+            let args = cli::ListArgs {
+                status: vec![value.to_string()],
+                ..Default::default()
+            };
+            let filters = build_filters(&args).expect("build filters");
+            assert!(filters.statuses.is_none(), "'{value}' clears the filter");
+            assert!(filters.include_closed, "'{value}' includes closed");
+            assert!(filters.include_deferred, "'{value}' includes deferred");
+        }
+
+        // Mixed with explicit statuses, `all` still wins.
+        let args = cli::ListArgs {
+            status: vec!["all".to_string(), "open".to_string()],
+            ..Default::default()
+        };
+        let filters = build_filters(&args).expect("build filters");
+        assert!(filters.statuses.is_none());
+    }
+
+    #[test]
     fn test_build_filters_parses_priorities() {
         init_logging();
         info!("test_build_filters_parses_priorities: starting");
@@ -772,6 +800,10 @@ mod tests {
         init_logging();
         let filters = build_filters(&ListArgs::default()).expect("build filters");
 
+        // #349: list is COMPLETE by default — the default limit is unlimited
+        // (`0`), not a silent cap. `Some(0)` is the query layer's "no LIMIT".
+        assert_eq!(DEFAULT_LIST_LIMIT, 0, "list default must be unlimited");
+        assert_eq!(filters.limit, Some(0));
         assert_eq!(filters.limit, Some(DEFAULT_LIST_LIMIT));
         assert_eq!(filters.offset, Some(DEFAULT_LIST_OFFSET));
     }

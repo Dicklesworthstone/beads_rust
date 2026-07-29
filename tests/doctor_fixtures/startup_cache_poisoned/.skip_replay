@@ -1,0 +1,10 @@
+Pass-4 cycle 2: same post_undo interaction as merge_artifact_stuck and
+gitignore_* fixtures (per HANDOFF_pass_3.md). The post_undo stage
+asserts that `undo latest` restores the FIRST repair; under
+REPLAY_IDEMPOTENCE=1 the second no-op --repair creates a newer
+(empty) run-dir that becomes the new "latest", breaking post_undo.
+
+The idempotence contract for this fixer IS enforced — by the inline
+test `test_fix_startup_cache_quarantines_poisoned_files_via_chokepoint`
+in src/cli/commands/doctor.rs (re-running the fixer after success
+finds no poisoned files and is a no-op).

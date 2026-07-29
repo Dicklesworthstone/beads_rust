@@ -10,9 +10,12 @@ use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -41,6 +44,11 @@ fn main() {
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
         eprintln!("Failed to initialize logging: {e}");
     }
+    if let Commands::Sync(args) = &cli.command
+        && let Err(error) = beads_rust::cli::commands::sync::validate_sync_mode_args(args)
+    {
+        handle_error(&error, json_error_mode, color_error_mode);
+    }
 
     let mut overrides = build_cli_overrides(&cli);
 
@@ -56,13 +64,54 @@ fn main() {
     };
 
     let storage_enabled = ctx.is_initialized() && !ctx.no_db();
-    let should_auto_import_now =
+    let mut should_auto_import_now =
         command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
     let should_auto_flush_now = is_mutating && !ctx.no_auto_flush();
     let needs_preopened_storage_context = should_auto_import_now || should_auto_flush_now;
-    let should_preopen_storage =
+    let mut should_preopen_storage =
         should_preopen_storage(storage_enabled, needs_preopened_storage_context);
     let command_needs_write_lock = needs_write_lock(&cli.command);
+    let no_db_jsonl_write = ctx.no_db() && no_db_jsonl_write_intent(&cli.command);
+
+    // A committed merge is a durable multi-artifact saga. This pre-lock check
+    // is advisory only: it can conservatively disable automatic sync early,
+    // but the permitting decision is repeated below under inode-bound
+    // database-family authority immediately before any storage open. The merge
+    // command itself is the sole mutation allowed to resume that state; doctor
+    // owns a richer dedicated finding/refusal surface.
+    let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
+    let mut pending_merge_warning_emitted = false;
+    if ctx.is_initialized()
+        && !ctx.no_db()
+        && (command_needs_write_lock || should_preopen_storage)
+        && pending_merge_disposition == PendingMergeStartupDisposition::ReadOnlyNoAutoSync
+        && !matches!(cli.command, Commands::Doctor(_))
+        && let Some(paths) = ctx.paths.as_ref()
+    {
+        match commands::doctor::inspect_pending_sync_merge_at_path(&paths.db_path) {
+            Ok(Some(state)) => {
+                emit_pending_sync_merge_warning(&state, json_error_mode);
+                pending_merge_warning_emitted = true;
+                // Read-only commands remain available, but their convenience
+                // auto-import and every command-local storage fallback must
+                // not advance either side of the saga. Force current-schema
+                // read-only storage even when the user did not pass the
+                // normal explicit stale/flush opt-outs.
+                should_auto_import_now = false;
+                force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+                should_preopen_storage =
+                    storage_enabled && supports_read_only_fast_open(&cli.command);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                emit_pending_sync_merge_inspection_warning(&error, json_error_mode);
+                should_auto_import_now = false;
+                force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+                should_preopen_storage =
+                    storage_enabled && supports_read_only_fast_open(&cli.command);
+            }
+        }
+    }
 
     // Phase 1.5: Acquire exclusive write lock before any DB-family open that
     // may apply schema, recover, quarantine sidecars, write metadata, or read
@@ -72,35 +121,216 @@ fn main() {
     // concurrent writes to the same database file. Serialize all mutating
     // operations through a blocking flock on `.beads/.write.lock`. Normal
     // storage open is not guaranteed read-only in recovery/schema paths, so
-    // DB-family commands keep the advisory lock unless they can first use the
-    // current-schema read-only fast-open path. Fast-open misses reacquire the
-    // same write lock inside config before any recovery or writable fallback.
-    let write_lock = if should_acquire_startup_write_lock(
+    // DB-family commands hold authority even when they first try the
+    // current-schema read-only fast-open path. That keeps the pending-saga
+    // verdict stable and prevents a fast-open miss from entering writable
+    // recovery without a definitive gate.
+    let ordinary_database_authority_required = should_acquire_startup_write_lock(
         command_needs_write_lock,
         should_preopen_storage,
         ctx.overrides.read_only_fast_open,
-    ) && ctx.is_initialized()
-    {
-        let lock_timeout = ctx.write_lock_timeout();
-        match ctx.beads_dir.as_deref().map(|beads_dir| {
-            beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
-        }) {
+    );
+    let pending_merge_mutation_gate_required =
+        pending_merge_disposition == PendingMergeStartupDisposition::Refuse;
+    let startup_database_authority_required = startup_database_authority_required(
+        ctx.no_db(),
+        ordinary_database_authority_required,
+        no_db_jsonl_write,
+        pending_merge_mutation_gate_required,
+    );
+    let write_lock = if startup_database_authority_required && ctx.is_initialized() {
+        let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
+        match ctx
+            .beads_dir
+            .as_deref()
+            .zip(ctx.paths.as_ref())
+            .map(|(beads_dir, paths)| {
+                beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                    beads_dir,
+                    &paths.db_path,
+                    lock_timeout,
+                )
+                .map(Arc::new)
+            }) {
             Some(Ok(lock)) => Some(lock),
-            Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
+            Some(Err(e)) => {
+                // Round-3 fresh-eyes (`beads_rust-sexc`): when the
+                // contended command is `br doctor --repair`, surface the
+                // structured `ConcurrencyLost` (exit code 5) documented
+                // in `doctor_subsystems::exit_codes` instead of the
+                // generic `BeadsError::Config` exit code. Other commands
+                // still flow through `handle_error` unchanged.
+                if let Commands::Doctor(doctor_args) = &cli.command {
+                    let lock_path = ctx
+                        .beads_dir
+                        .as_ref()
+                        .map(|d| d.join(".write.lock"))
+                        .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
+                    let lock_display = lock_path.display().to_string();
+                    if doctor_args.repair || doctor_args.repair_indexes {
+                        let command_name = if doctor_args.repair_indexes {
+                            "--repair-indexes"
+                        } else {
+                            "--repair"
+                        };
+                        if json_error_mode {
+                            let payload = serde_json::json!({
+                                "ok": false,
+                                "exit_code": beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32(),
+                                "code": beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_str(),
+                                "message": format!(
+                                    "Refusing {command_name}: workspace write lock at {lock_display} is held by another process",
+                                ),
+                                "detail": e.to_string(),
+                                "lock_path": lock_display,
+                            });
+                            // #336: structured JSON errors go to STDOUT in json
+                            // mode so robot callers get one clean parseable stream.
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&payload)
+                                    .unwrap_or_else(|_| payload.to_string())
+                            );
+                        } else {
+                            eprintln!(
+                                "Refusing {command_name}: workspace write lock at {lock_display} is held by another process. \
+                                 Wait for the other br invocation to finish or pass --lock-timeout to wait longer. \
+                                 Underlying error: {e}",
+                            );
+                        }
+                        std::process::exit(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
+                    }
+                    if doctor_args.subcommand.is_none()
+                        && !doctor_args.robot_triage
+                        && is_unwritable_write_lock_open_error(&lock_path, &e)
+                    {
+                        emit_read_only_doctor_write_lock_diagnostic(
+                            ctx.beads_dir.as_deref(),
+                            &e,
+                            json_error_mode,
+                        );
+                    }
+                }
+                handle_error(&e, json_error_mode, color_error_mode)
+            }
             None => None,
         }
     } else {
         None
     };
-    if write_lock.is_some() {
-        overrides
-            .held_write_lock_beads_dir
-            .clone_from(&ctx.beads_dir);
+    // Every non-merge DB-family caller inspects only after startup has obtained
+    // its database-family write lock. This prevents a concurrent merge from
+    // changing the receipt between the gate decision and storage open. Read
+    // commands may continue on a classified pending receipt, but only in
+    // current-schema read-only mode with automatic sync disabled. Inspection
+    // uncertainty fails closed because a fast-open fallback could otherwise
+    // recover or migrate the database before the command executes.
+    if ctx.is_initialized()
+        && ctx.no_db()
+        && (no_db_jsonl_write || pending_merge_mutation_gate_required)
+        && let Some(paths) = ctx.paths.as_ref()
+    {
+        let authority = write_lock.as_ref().unwrap_or_else(|| {
+            handle_error(
+                &BeadsError::SyncConflict {
+                    message:
+                        "Refusing no-DB mutation because no database-family authority is available for the pending sync-merge gate"
+                            .to_string(),
+                },
+                json_error_mode,
+                color_error_mode,
+            )
+        });
+        match inspect_pending_sync_merge_for_no_db_write(&paths.db_path, authority) {
+            Ok(Some(state)) => handle_error(
+                &pending_sync_merge_no_db_refusal_error(&state),
+                json_error_mode,
+                color_error_mode,
+            ),
+            Ok(None) => {}
+            Err(error @ BeadsError::SchemaMismatch { .. }) => {
+                let routed = reviewed_schema_migration_required(error);
+                handle_error(&routed, json_error_mode, color_error_mode)
+            }
+            Err(error) => handle_error(
+                &BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing no-DB mutation because pending sync-merge state could not be inspected under database-family authority: {error}"
+                    ),
+                },
+                json_error_mode,
+                color_error_mode,
+            ),
+        }
+    } else if ctx.is_initialized()
+        && !ctx.no_db()
+        && (command_needs_write_lock
+            || should_preopen_storage
+            || pending_merge_mutation_gate_required)
+        && pending_merge_disposition != PendingMergeStartupDisposition::Resume
+        && !matches!(cli.command, Commands::Doctor(_))
+        && let Some(paths) = ctx.paths.as_ref()
+    {
+        let authority = write_lock.as_ref().unwrap_or_else(|| {
+            handle_error(
+                &BeadsError::SyncConflict {
+                    message:
+                        "Refusing storage open because no database-family authority is available for the live pending sync-merge gate"
+                            .to_string(),
+                },
+                json_error_mode,
+                color_error_mode,
+            )
+        });
+        match commands::doctor::inspect_pending_sync_merge_under_authority(
+            &paths.db_path,
+            authority,
+        ) {
+            Ok(Some(state))
+                if pending_merge_disposition == PendingMergeStartupDisposition::Refuse =>
+            {
+                handle_error(
+                    &pending_sync_merge_refusal_error(&state),
+                    json_error_mode,
+                    color_error_mode,
+                )
+            }
+            Ok(Some(state)) => {
+                if !pending_merge_warning_emitted {
+                    emit_pending_sync_merge_warning(&state, json_error_mode);
+                }
+                should_auto_import_now = false;
+                force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+                should_preopen_storage =
+                    storage_enabled && supports_read_only_fast_open(&cli.command);
+            }
+            Ok(None) => {}
+            Err(error @ BeadsError::SchemaMismatch { .. }) => {
+                let routed = reviewed_schema_migration_required(error);
+                handle_error(&routed, json_error_mode, color_error_mode);
+            }
+            Err(error) => {
+                handle_error(
+                    &BeadsError::SyncConflict {
+                        message: format!(
+                            "Refusing storage open because pending sync-merge state could not be inspected under database-family authority: {error}"
+                        ),
+                    },
+                    json_error_mode,
+                    color_error_mode,
+                );
+            }
+        }
+    }
+    if let Some(write_lock) = write_lock.as_ref() {
+        if let Some(beads_dir) = ctx.beads_dir.as_deref() {
+            overrides.mark_database_family_lock_held(beads_dir, write_lock);
+        }
     }
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
-        match open_storage_from_ctx(&mut ctx, write_lock.is_some()) {
+        match open_storage_from_ctx(&mut ctx, write_lock.as_ref()) {
             Ok(res) => Some(res),
             Err(e) => {
                 if should_auto_import_now {
@@ -130,7 +360,12 @@ fn main() {
         if !ctx.overrides.read_only_fast_open && write_lock.is_none() {
             let lock_timeout = ctx.write_lock_timeout();
             auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
-                beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+                beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                    beads_dir,
+                    &paths.db_path,
+                    lock_timeout,
+                )
+                .map(Arc::new)
             }) {
                 Some(Ok(lock)) => Some(lock),
                 Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
@@ -161,7 +396,12 @@ fn main() {
             if ctx.overrides.read_only_fast_open && write_lock.is_none() {
                 let lock_timeout = ctx.write_lock_timeout();
                 auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
-                    beads_rust::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout)
+                    beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                        beads_dir,
+                        &paths.db_path,
+                        lock_timeout,
+                    )
+                    .map(Arc::new)
                 }) {
                     Some(Ok(lock)) => Some(lock),
                     Some(Err(e)) => handle_error(&e, json_error_mode, color_error_mode),
@@ -172,6 +412,9 @@ fn main() {
             if ctx.overrides.read_only_fast_open {
                 let mut writable_overrides = ctx.overrides.clone();
                 writable_overrides.read_only_fast_open = false;
+                if let Some(authority) = auto_import_write_lock.as_ref().or(write_lock.as_ref()) {
+                    writable_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
+                }
                 drop(storage_result.take());
                 match config::open_storage_with_cli(&paths.beads_dir, &writable_overrides) {
                     Ok(writable_res) => storage_result = Some(writable_res),
@@ -329,6 +572,10 @@ fn main() {
                 commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Gate { command } => commands::gate::execute(&command, &overrides, &output_ctx),
+        Commands::Capacity { command } => {
+            commands::capacity::execute(&command, &overrides, &output_ctx)
+        }
         Commands::Label { command } => {
             if let Some(res) = storage_result.as_ref() {
                 match commands::label::execute_with_storage(
@@ -347,6 +594,23 @@ fn main() {
                 commands::label::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Coordination { command } => match command {
+            beads_rust::cli::CoordinationCommands::Status(args) => {
+                if let (Some(res), Some(beads_dir)) =
+                    (storage_result.as_ref(), ctx.beads_dir.as_ref())
+                {
+                    commands::coordination::execute_status_with_storage_ctx(
+                        &args,
+                        &overrides,
+                        &output_ctx,
+                        beads_dir,
+                        res,
+                    )
+                } else {
+                    commands::coordination::execute_status(&args, &overrides, &output_ctx)
+                }
+            }
+        },
         Commands::Count(args) => {
             if let Some(res) = storage_result.as_ref() {
                 commands::count::execute_with_storage(&args, &output_ctx, &res.storage)
@@ -354,6 +618,7 @@ fn main() {
                 commands::count::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Capabilities(args) => commands::capabilities::execute(&args, &output_ctx),
         Commands::Stale(args) => storage_result.as_ref().map_or_else(
             || commands::stale::execute(&args, &overrides, &output_ctx),
             |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
@@ -383,6 +648,7 @@ fn main() {
                 commands::ready::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::RobotDocs { command } => commands::robot_docs::execute(&command, &output_ctx),
         Commands::Scheduler(args) => {
             if let (Some(res), Some(beads_dir)) = (storage_result.as_ref(), ctx.beads_dir.as_ref())
             {
@@ -418,6 +684,7 @@ fn main() {
             &output_ctx,
             write_lock.is_some(),
         ),
+        Commands::VcsStatus(args) => commands::vcs::execute(&args, &overrides, &output_ctx),
         Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
@@ -603,6 +870,17 @@ fn main() {
     if let Some(err) = beads_rust::output::take_output_serialization_failure() {
         std::process::exit(err.exit_code());
     }
+
+    // A command emitted its normal output and any auto-flush has now completed,
+    // but detected a condition that must surface to scripted callers via a
+    // non-zero exit code (e.g. `dep cycles` with cycles present, or `create -f`
+    // that dropped declared dependency edges) — see #368. Drop storage first so
+    // `SqliteStorage::Drop` checkpoints the WAL before the process exits (#270).
+    if let Some(exit_code) = beads_rust::output::take_pending_exit_code() {
+        drop(storage_result);
+        drop(write_lock);
+        std::process::exit(exit_code);
+    }
 }
 
 struct StartupContext {
@@ -667,21 +945,60 @@ impl StartupContext {
             .unwrap_or(false)
     }
 
-    fn write_lock_timeout(&self) -> Option<u64> {
+    fn configured_write_lock_timeout(&self) -> Option<u64> {
         self.config
             .as_ref()
             .and_then(config::lock_timeout_from_layer)
+            .or(self.overrides.lock_timeout)
+    }
+
+    fn write_lock_timeout(&self) -> Option<u64> {
+        self.configured_write_lock_timeout()
             .or(Some(beads_rust::sync::default_write_lock_timeout_ms()))
+    }
+
+    fn startup_write_lock_timeout(&self, command: &Commands) -> Option<u64> {
+        if command_is_doctor_repair(command) {
+            self.configured_write_lock_timeout().or(Some(0))
+        } else {
+            self.write_lock_timeout()
+        }
+    }
+}
+
+fn command_is_doctor_repair(command: &Commands) -> bool {
+    matches!(command, Commands::Doctor(args) if (args.repair || args.repair_indexes) && !args.robot_triage)
+}
+
+const fn doctor_subcommand_needs_write_lock(args: &beads_rust::cli::DoctorArgs) -> bool {
+    match &args.subcommand {
+        None
+        | Some(
+            beads_rust::cli::DoctorSubcommand::Undo(_)
+            | beads_rust::cli::DoctorSubcommand::MigrateSchema(_),
+        ) => true,
+        Some(
+            beads_rust::cli::DoctorSubcommand::Capabilities(_)
+            | beads_rust::cli::DoctorSubcommand::RobotDocs(_)
+            | beads_rust::cli::DoctorSubcommand::Health(_)
+            | beads_rust::cli::DoctorSubcommand::Ls(_)
+            | beads_rust::cli::DoctorSubcommand::Explain(_),
+        ) => false,
     }
 }
 
 fn open_storage_from_ctx(
     ctx: &mut StartupContext,
-    write_lock_already_held: bool,
+    write_authority: Option<&Arc<beads_rust::sync::DatabaseFamilyWriteLock>>,
 ) -> Result<config::OpenStorageResult> {
     let startup = ctx.startup.take().ok_or(BeadsError::NotInitialized)?;
-    if write_lock_already_held {
-        config::open_storage_with_startup_config_under_write_lock(startup, &ctx.overrides, false)
+    if let Some(write_authority) = write_authority {
+        config::open_storage_with_startup_config_under_write_lock(
+            startup,
+            &ctx.overrides,
+            false,
+            write_authority,
+        )
     } else {
         config::open_storage_with_startup_config(startup, &ctx.overrides, false)
     }
@@ -711,12 +1028,32 @@ const fn should_preopen_storage(
     storage_enabled && needs_preopened_storage_context
 }
 
+const fn sync_mode_opens_storage(args: &beads_rust::cli::SyncArgs) -> bool {
+    args.flush_only || args.import_only || args.merge || args.reconcile || args.status
+}
+
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
-    read_only_fast_open: bool,
+    _read_only_fast_open: bool,
 ) -> bool {
-    !read_only_fast_open && (command_needs_write_lock || should_preopen_storage)
+    command_needs_write_lock || should_preopen_storage
+}
+
+const fn startup_database_authority_required(
+    no_db: bool,
+    ordinary_database_authority_required: bool,
+    no_db_jsonl_write: bool,
+    pending_merge_mutation_gate_required: bool,
+) -> bool {
+    if pending_merge_mutation_gate_required {
+        return true;
+    }
+    if no_db {
+        no_db_jsonl_write
+    } else {
+        ordinary_database_authority_required
+    }
 }
 
 /// Determine if a command potentially mutates data and triggers auto-flush.
@@ -732,7 +1069,9 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Undefer(_) => true,
         Commands::Dep { command } => matches!(
             command,
-            beads_rust::cli::DepCommands::Add(_) | beads_rust::cli::DepCommands::Remove(_)
+            beads_rust::cli::DepCommands::Add(_)
+                | beads_rust::cli::DepCommands::Import(_)
+                | beads_rust::cli::DepCommands::Remove(_)
         ),
         Commands::Label { command } => matches!(
             command,
@@ -753,6 +1092,213 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
     }
 }
 
+const fn command_is_sync_merge(cmd: &Commands) -> bool {
+    matches!(cmd, Commands::Sync(args) if args.merge)
+}
+
+/// Return true for every command that can mutate tracker or workspace state
+/// while a committed sync merge is awaiting artifact reconciliation.
+///
+/// This is deliberately broader than [`is_mutating_command`], which only
+/// controls the ordinary post-command auto-flush. Explicit sync modes, saved
+/// queries, gate reports, doctor recovery, history/config maintenance, and
+/// append-only audit commands mutate without using that auto-flush path.
+const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
+    if is_mutating_command(cmd) {
+        return true;
+    }
+    match cmd {
+        Commands::Init { .. } => true,
+        Commands::Sync(args) => {
+            args.flush_only || args.import_only || (args.reconcile_additive && args.apply)
+        }
+        Commands::Doctor(args) => {
+            ((!args.robot_triage && (args.repair || args.repair_indexes)) && !args.dry_run)
+                || matches!(
+                    args.subcommand.as_ref(),
+                    Some(beads_rust::cli::DoctorSubcommand::Undo(undo)) if !undo.dry_run
+                )
+                || matches!(
+                    args.subcommand.as_ref(),
+                    Some(beads_rust::cli::DoctorSubcommand::MigrateSchema(_))
+                )
+        }
+        Commands::Gate { command } => {
+            matches!(command, beads_rust::cli::GateCommands::Report(_))
+        }
+        Commands::Query { command } => matches!(
+            command,
+            beads_rust::cli::QueryCommands::Save(_) | beads_rust::cli::QueryCommands::Delete(_)
+        ),
+        Commands::Config { command } => matches!(
+            command,
+            beads_rust::cli::ConfigCommands::Set { .. }
+                | beads_rust::cli::ConfigCommands::Delete { .. }
+                | beads_rust::cli::ConfigCommands::Edit
+        ),
+        Commands::History(args) => matches!(
+            args.command,
+            Some(
+                beads_rust::cli::HistoryCommands::Restore { .. }
+                    | beads_rust::cli::HistoryCommands::Prune { .. }
+            )
+        ),
+        Commands::Audit { command } => matches!(
+            command,
+            beads_rust::cli::AuditCommands::Record(_)
+                | beads_rust::cli::AuditCommands::Coordination(_)
+                | beads_rust::cli::AuditCommands::Label(_)
+        ),
+        Commands::Agents(args) => !args.dry_run && (args.add || args.remove || args.update),
+        #[cfg(feature = "mcp")]
+        Commands::Serve(_) => true,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMergeStartupDisposition {
+    /// The dedicated merge command owns receipt validation and saga resume.
+    Resume,
+    /// A tracker/workspace mutation must fail before storage open.
+    Refuse,
+    /// A read-only command may run, but automatic import/export is disabled.
+    ReadOnlyNoAutoSync,
+}
+
+const fn pending_merge_startup_disposition(cmd: &Commands) -> PendingMergeStartupDisposition {
+    if command_is_sync_merge(cmd) {
+        PendingMergeStartupDisposition::Resume
+    } else if command_must_refuse_during_pending_merge(cmd) {
+        PendingMergeStartupDisposition::Refuse
+    } else {
+        PendingMergeStartupDisposition::ReadOnlyNoAutoSync
+    }
+}
+
+fn force_pending_merge_read_only_mode(
+    overrides: &mut config::CliOverrides,
+    ctx: &mut StartupContext,
+) {
+    overrides.no_auto_import = Some(true);
+    overrides.no_auto_flush = Some(true);
+    overrides.read_only_fast_open = true;
+    ctx.overrides.no_auto_import = Some(true);
+    ctx.overrides.no_auto_flush = Some(true);
+    ctx.overrides.read_only_fast_open = true;
+}
+
+fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeState) -> BeadsError {
+    let phase = state.phase.as_deref().unwrap_or("unknown");
+    let receipt = state.receipt_id.as_deref().unwrap_or("unvalidated");
+    BeadsError::SyncConflict {
+        message: format!(
+            "Refusing non-merge mutation while pending sync-merge state is {} (phase={phase}, receipt={receipt}): {}. Run `br sync --merge` to resume and verify artifact reconciliation first",
+            state.condition_name(),
+            state.diagnostic
+        ),
+    }
+}
+
+fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {
+    BeadsError::WithContext {
+        context: "ordinary commands never migrate an existing tracker database; run \
+                  `br doctor migrate-schema plan` and review its receipt before applying the \
+                  explicit migration"
+            .to_string(),
+        source: Box::new(source),
+    }
+}
+
+fn pending_sync_merge_no_db_refusal_error(
+    state: &commands::doctor::PendingSyncMergeState,
+) -> BeadsError {
+    BeadsError::SyncConflict {
+        message: format!(
+            "Refusing no-DB JSONL mutation while pending sync-merge state is {}: {}. The database saga owns this JSONL generation; rerun `br sync --merge` without `--no-db` to reconcile it first",
+            state.condition_name(),
+            state.diagnostic
+        ),
+    }
+}
+
+fn inspect_pending_sync_merge_for_no_db_write(
+    db_path: &Path,
+    authority: &Arc<beads_rust::sync::DatabaseFamilyWriteLock>,
+) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
+    if authority.bind_database_inode_for_mutation()? {
+        authority.verify_database_authority()?;
+        return Ok(None);
+    }
+    commands::doctor::inspect_pending_sync_merge_under_authority(db_path, authority)
+}
+
+fn emit_pending_sync_merge_warning(
+    state: &commands::doctor::PendingSyncMergeState,
+    json_mode: bool,
+) {
+    if json_mode {
+        let payload = serde_json::json!({
+            "level": "warning",
+            "code": "sync_merge_pending",
+            "message": "Read-only command is proceeding with auto-import and auto-flush disabled because a sync merge is pending",
+            "pending_sync_merge": state,
+            "remediation": "Run `br sync --merge` before any tracker mutation."
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+    } else {
+        eprintln!(
+            "warning: pending sync merge is {} (phase={}, receipt={}): {}. \
+             Read-only command will proceed with automatic sync disabled; run `br sync --merge` before mutating.",
+            state.condition_name(),
+            state.phase.as_deref().unwrap_or("unknown"),
+            state.receipt_id.as_deref().unwrap_or("unvalidated"),
+            state.diagnostic
+        );
+    }
+}
+
+fn emit_pending_sync_merge_inspection_warning(error: &BeadsError, json_mode: bool) {
+    if json_mode {
+        let payload = serde_json::json!({
+            "level": "warning",
+            "code": "sync_merge_pending_unknown",
+            "message": "Read-only command is proceeding with automatic sync disabled because pending merge state could not be inspected",
+            "inspection_error": error.to_string(),
+            "remediation": "Run `br doctor --json` and restore read-only database-family access before mutating."
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+    } else {
+        eprintln!(
+            "warning: could not prove that no sync merge is pending ({error}). \
+             Read-only command will proceed with automatic sync disabled; do not mutate until `br doctor` succeeds."
+        );
+    }
+}
+
+/// Determine whether a no-DB command can rewrite the resolved JSONL family.
+///
+/// This is intentionally separate from [`is_mutating_command`]: explicit sync
+/// modes suppress the normal post-command auto-flush, but `--flush-only` and
+/// `--merge` still publish JSONL themselves. They must therefore acquire the
+/// JSONL-family authority before loading their in-memory snapshot, not only
+/// inside the eventual exporter after an ABA window has already opened.
+const fn no_db_jsonl_write_intent(cmd: &Commands) -> bool {
+    if is_mutating_command(cmd) {
+        return true;
+    }
+    matches!(
+        cmd,
+        Commands::Sync(args) if args.flush_only || args.merge
+    )
+}
+
 /// Determine if a command must hold `.write.lock` for its whole execution.
 const fn needs_write_lock(cmd: &Commands) -> bool {
     if is_mutating_command(cmd) {
@@ -764,7 +1310,8 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         // `--no-auto-import`, and direct command-local open paths do not bypass
         // the startup lock that protects recovery/schema/default metadata work.
         //
-        // Every sync mode must open storage inside `sync::execute`.
+        // Every explicit DB-backed sync mode must open storage inside
+        // `sync::execute`.
         // `--flush-only` looks like a "just rewrite JSONL" path but also calls
         // `finalize_export` inside a `with_write_transaction`, updating dirty
         // flags, export hashes, and metadata (jsonl_content_hash,
@@ -775,12 +1322,17 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         // to prevent (issue #243). `--status` only renders status after open,
         // but opening storage can still apply schema/runtime defaults or
         // recover the DB family, so it must also serialize before open.
+        // `br sync --witness` hashes JSONL and returns before opening SQLite, so
+        // it also should not block behind DB writers. Bare `br sync` is invalid
+        // and fails validation before storage open, so it should not block on
+        // `.write.lock` just to report an argument error.
         // Doctor inspects a live SQLite DB family via snapshot copy + rollback
         // write probe, so it must serialize with writers — merged into this arm
         // (identical body as Sync/Init) to satisfy clippy::match_same_arms.
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -800,9 +1352,9 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Info(_)
         | Commands::Where
-        | Commands::Sync(_)
-        | Commands::Init { .. }
-        | Commands::Doctor(_) => true,
+        | Commands::Init { .. } => true,
+        Commands::Doctor(args) => doctor_subcommand_needs_write_lock(args),
+        Commands::Sync(args) => sync_mode_opens_storage(args),
         Commands::Config { command } => !matches!(
             command,
             beads_rust::cli::ConfigCommands::Path | beads_rust::cli::ConfigCommands::Edit
@@ -823,6 +1375,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
+        | Commands::Coordination { .. }
         | Commands::Ready(_)
         | Commands::Scheduler(_)
         | Commands::Blocked(_)
@@ -845,15 +1398,20 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
+        | Commands::Gate { .. }
+        | Commands::Capacity { .. }
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }
         | Commands::Sync(_)
         | Commands::Doctor(_)
         | Commands::Info(_)
+        | Commands::Capabilities(_)
+        | Commands::RobotDocs { .. }
         | Commands::Schema(_)
         | Commands::Where
         | Commands::Version(_)
+        | Commands::VcsStatus(_)
         | Commands::Completions(_)
         | Commands::Audit { .. }
         | Commands::Orphans(_)
@@ -871,9 +1429,12 @@ const fn should_auto_import(cmd: &Commands) -> bool {
 
 const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     match cmd {
-        Commands::Sync(args) => args.status,
+        // `--reconcile --dry-run` is read-only by contract: it plans without
+        // opening a write transaction, so it may share the status fast path.
+        Commands::Sync(args) => args.status || (args.reconcile && args.dry_run),
         Commands::Stats(_)
         | Commands::Status(_)
+        | Commands::Coordination { .. }
         | Commands::List(_)
         | Commands::Show(_)
         | Commands::Search(_)
@@ -900,42 +1461,14 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
     }
 }
 
-const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
-    match cmd {
-        Commands::List(_)
-        | Commands::Show(_)
-        | Commands::Search(_)
-        | Commands::Ready(_)
-        | Commands::Scheduler(_)
-        | Commands::Blocked(_)
-        | Commands::Count(_)
-        | Commands::Stale(_)
-        | Commands::Changelog(_)
-        | Commands::Graph(_)
-        | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
-        | Commands::Comments(beads_rust::cli::CommentsArgs {
-            command: None | Some(beads_rust::cli::CommentCommands::List(_)),
-            ..
-        })
-        | Commands::Epic {
-            command: beads_rust::cli::EpicCommands::Status(_),
-        } => true,
-        Commands::Lint(args) => args.ids.is_empty(),
-        Commands::Label { command } => is_read_only_label_listing(command),
-        Commands::Dep { command } => is_read_only_dep_command(command),
-        Commands::Query { command } => is_read_only_query_command(command),
-        Commands::Sync(args) => args.status,
-        Commands::Stats(args) | Commands::Status(args) => args.no_activity,
-        _ => false,
-    }
-}
-
 const fn is_read_only_dep_command(command: &beads_rust::cli::DepCommands) -> bool {
     match command {
         beads_rust::cli::DepCommands::List(_)
         | beads_rust::cli::DepCommands::Tree(_)
         | beads_rust::cli::DepCommands::Cycles(_) => true,
-        beads_rust::cli::DepCommands::Add(_) | beads_rust::cli::DepCommands::Remove(_) => false,
+        beads_rust::cli::DepCommands::Add(_)
+        | beads_rust::cli::DepCommands::Import(_)
+        | beads_rust::cli::DepCommands::Remove(_) => false,
     }
 }
 
@@ -966,6 +1499,13 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
         Commands::List(args) => args.format,
         Commands::Search(args) => args.filters.format,
         Commands::Show(args) => args.format.map(Into::into),
+        Commands::Coordination { command } => match command {
+            beads_rust::cli::CoordinationCommands::Status(args) => args.format.map(Into::into),
+        },
+        Commands::Capabilities(args) => args.format.map(Into::into),
+        Commands::RobotDocs { command } => match command {
+            beads_rust::cli::RobotDocsCommands::Guide(args) => args.format.map(Into::into),
+        },
         Commands::Ready(args) => args.format.map(Into::into),
         Commands::Scheduler(args) => args.format.map(Into::into),
         Commands::Blocked(args) => args.format.map(Into::into),
@@ -975,6 +1515,7 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
             beads_rust::cli::DepCommands::List(args) => args.format.map(Into::into),
             beads_rust::cli::DepCommands::Tree(_)
             | beads_rust::cli::DepCommands::Add(_)
+            | beads_rust::cli::DepCommands::Import(_)
             | beads_rust::cli::DepCommands::Remove(_)
             | beads_rust::cli::DepCommands::Cycles(_) => None,
         },
@@ -1026,44 +1567,173 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
     let exit_code = structured.code.exit_code();
 
     if json_mode {
+        // #336: In `--json` mode, route the structured JSON error envelope to
+        // STDOUT (where success JSON already goes) so robot callers read ONE
+        // clean, parseable stream. tracing/log lines stay on stderr (see
+        // `logging::init_logging`, which writes to `std::io::stderr`), so the
+        // stdout JSON is never interleaved with diagnostic noise.
         let json = structured.to_json();
-        eprintln!(
+        println!(
             "{}",
             serde_json::to_string_pretty(&json).unwrap_or_else(|_| json.to_string())
         );
     } else {
+        // Human mode: errors stay on stderr so stdout remains usable for the
+        // command's normal (non-error) output and pipelines.
         eprintln!("{}", structured.to_human(color_mode));
     }
 
     std::process::exit(exit_code);
 }
 
+fn emit_read_only_doctor_write_lock_diagnostic(
+    beads_dir: Option<&Path>,
+    err: &BeadsError,
+    json_mode: bool,
+) -> ! {
+    let lock_path = beads_dir
+        .map(|dir| dir.join(".write.lock"))
+        .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
+    let lock_display = lock_path.display().to_string();
+    let remediation =
+        format!("`chmod u+w {lock_display}` or remove the file (the next br call recreates it)");
+    let message = format!(
+        "{lock_display} is not writable by owner; br doctor cannot acquire the startup workspace lock for live inspection"
+    );
+    let exit_code =
+        beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::FindingsPresent;
+
+    if json_mode {
+        let payload = read_only_doctor_write_lock_payload(
+            &lock_path,
+            &message,
+            &remediation,
+            &err.to_string(),
+        );
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+    } else {
+        eprintln!(
+            "br doctor found an issue before live inspection could start:\n\
+             permissions.write_lock: warn\n\
+             {message}\n\
+             Remediation: {remediation}\n\
+             Underlying error: {err}",
+        );
+    }
+
+    std::process::exit(exit_code.as_i32());
+}
+
+fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bool {
+    let BeadsError::Config(message) = err else {
+        return false;
+    };
+    message.contains("Failed to open write lock") && write_lock_lacks_owner_write(lock_path)
+}
+
+#[cfg(unix)]
+fn write_lock_lacks_owner_write(lock_path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = fs::symlink_metadata(lock_path) else {
+        return false;
+    };
+    meta.is_file() && !meta.file_type().is_symlink() && (meta.permissions().mode() & 0o200) == 0
+}
+
+#[cfg(not(unix))]
+fn write_lock_lacks_owner_write(_lock_path: &Path) -> bool {
+    false
+}
+
+fn read_only_doctor_write_lock_payload(
+    lock_path: &Path,
+    message: &str,
+    remediation: &str,
+    startup_error: &str,
+) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "path": lock_path.display().to_string(),
+        "remediation": remediation,
+        "startup_error": startup_error,
+        "finding_id": "fm-state_files-orphaned-write-lock",
+    });
+    if let Some(mode) = lock_mode_octal(lock_path)
+        && let Some(map) = details.as_object_mut()
+    {
+        map.insert("mode_octal".to_string(), serde_json::json!(mode));
+    }
+
+    serde_json::json!({
+        "ok": false,
+        "workspace_health": "degraded",
+        "reliability_audit": {
+            "source": "doctor.startup",
+            "health": "degraded",
+            "anomaly_count": 1,
+            "anomalies": [{
+                "code": "permissions.write_lock",
+                "severity": "degraded",
+                "message": message,
+            }],
+        },
+        "checks": [{
+            "name": "permissions.write_lock",
+            "status": "warn",
+            "message": message,
+            "details": details,
+        }],
+    })
+}
+
+#[cfg(unix)]
+fn lock_mode_octal(lock_path: &Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(lock_path)
+        .ok()
+        .map(|meta| format!("{:o}", meta.permissions().mode() & 0o777))
+}
+
+#[cfg(not(unix))]
+fn lock_mode_octal(_lock_path: &Path) -> Option<String> {
+    None
+}
+
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
+    // `--lock-timeout` deliberately does NOT disable the fast path. The
+    // timeout governs how long to wait *when a lock is required*, and a
+    // read-only fast open acquires none; on a fast-open miss the fallback
+    // still takes the write lock and honors the timeout. Gating on it meant
+    // any scripted caller that passed `--lock-timeout` silently lost lock-free
+    // reads and serialized every read command behind an exclusive flock,
+    // which shows up as spurious lock-timeout failures under parallel reads.
     let read_only_fast_open = !cli.no_db
         && !read_only_fast_open_disabled_for_cli()
         && supports_read_only_fast_open(&cli.command)
-        && ((cli.no_auto_import && cli.no_auto_flush)
-            || supports_auto_import_read_only_probe(&cli.command));
+        && cli.no_auto_import
+        && cli.no_auto_flush;
 
-    config::CliOverrides {
-        db: cli.db.clone(),
-        actor: cli.actor.clone(),
-        identity: None,
-        // Only set bool overrides when the CLI flag was explicitly provided.
-        // Eagerly setting Some(false) would override config-file values with the
-        // CLI default, preventing users from setting these via config.
-        json: cli.json.then_some(true),
-        display_color: if cli.no_color { Some(false) } else { None },
-        quiet: cli.quiet.then_some(true),
-        allow_stale: if cli.allow_stale { Some(true) } else { None },
-        no_db: if cli.no_db { Some(true) } else { None },
-        no_daemon: if cli.no_daemon { Some(true) } else { None },
-        no_auto_flush: if cli.no_auto_flush { Some(true) } else { None },
-        no_auto_import: if cli.no_auto_import { Some(true) } else { None },
-        lock_timeout: cli.lock_timeout,
-        held_write_lock_beads_dir: None,
-        read_only_fast_open,
-    }
+    let mut overrides = config::CliOverrides::default();
+    overrides.db.clone_from(&cli.db);
+    overrides.actor.clone_from(&cli.actor);
+    // Only set bool overrides when the CLI flag was explicitly provided.
+    // Eagerly setting Some(false) would override config-file values with the
+    // CLI default, preventing users from setting these via config.
+    overrides.json = cli.json.then_some(true);
+    overrides.display_color = if cli.no_color { Some(false) } else { None };
+    overrides.quiet = cli.quiet.then_some(true);
+    overrides.allow_stale = cli.allow_stale.then_some(true);
+    overrides.no_db = cli.no_db.then_some(true);
+    overrides.no_daemon = cli.no_daemon.then_some(true);
+    overrides.no_auto_flush = cli.no_auto_flush.then_some(true);
+    overrides.no_auto_import = cli.no_auto_import.then_some(true);
+    overrides.lock_timeout = cli.lock_timeout;
+    overrides.mark_no_db_write_intent(no_db_jsonl_write_intent(&cli.command));
+    overrides.read_only_fast_open = read_only_fast_open;
+    overrides
 }
 
 #[cfg(not(test))]
@@ -1100,6 +1770,7 @@ mod tests {
             slug: None,
             priority: None,
             description: None,
+            description_file: None,
             assignee: None,
             owner: None,
             labels: Vec::new(),
@@ -1114,6 +1785,9 @@ mod tests {
             dry_run: false,
             silent: false,
             file: None,
+            agent_name: None,
+            harness: None,
+            model: None,
         }
     }
 
@@ -1197,9 +1871,124 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_supports_explicit_suppression_and_safe_list_probe() {
+    fn doctor_repair_startup_write_lock_fails_fast_by_default() {
+        let ctx = StartupContext::empty(config::CliOverrides::default());
+        let doctor_repair = Cli::parse_from(["br", "doctor", "--repair", "--dry-run"]);
+        let doctor_read_only = Cli::parse_from(["br", "doctor"]);
+
+        assert_eq!(
+            ctx.startup_write_lock_timeout(&doctor_repair.command),
+            Some(0),
+            "doctor repair should try-lock by default so contention returns concurrency_lost quickly"
+        );
+        assert_eq!(
+            ctx.startup_write_lock_timeout(&doctor_read_only.command),
+            Some(beads_rust::sync::default_write_lock_timeout_ms()),
+            "plain doctor should keep the normal startup lock timeout"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_startup_write_lock_honors_explicit_timeout() {
+        let cli = Cli::parse_from([
+            "br",
+            "--lock-timeout",
+            "2500",
+            "doctor",
+            "--repair",
+            "--dry-run",
+        ]);
+        let overrides = build_cli_overrides(&cli);
+        let mut ctx = StartupContext::empty(overrides.clone());
+        ctx.config = Some(overrides.as_layer());
+
+        assert_eq!(ctx.startup_write_lock_timeout(&cli.command), Some(2500));
+    }
+
+    #[test]
+    fn read_only_doctor_write_lock_payload_matches_detector_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let lock = temp.path().join(".beads/.write.lock");
+        fs::create_dir_all(lock.parent().expect("lock parent")).expect("mkdir");
+        fs::write(&lock, b"").expect("write lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("chmod");
+        }
+
+        let payload = read_only_doctor_write_lock_payload(
+            &lock,
+            "lock is not writable",
+            "chmod u+w",
+            "Failed to open write lock",
+        );
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["workspace_health"], "degraded");
+        assert_eq!(payload["checks"][0]["name"], "permissions.write_lock");
+        assert_eq!(payload["checks"][0]["status"], "warn");
+        assert_eq!(
+            payload["checks"][0]["details"]["finding_id"],
+            "fm-state_files-orphaned-write-lock"
+        );
+        assert_eq!(
+            payload["checks"][0]["details"]["startup_error"],
+            "Failed to open write lock"
+        );
+        #[cfg(unix)]
+        assert_eq!(payload["checks"][0]["details"]["mode_octal"], "444");
+    }
+
+    #[test]
+    fn read_only_doctor_write_lock_diagnostic_only_catches_unwritable_regular_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("mkdir");
+        let lock = beads_dir.join(".write.lock");
+        fs::write(&lock, b"").expect("write lock");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("chmod");
+        }
+        let open_err = BeadsError::Config(format!(
+            "Failed to open write lock at {}: Permission denied",
+            lock.display()
+        ));
+        let timeout_err = BeadsError::Config(format!(
+            "Timed out after 1ms waiting for write lock at {}",
+            lock.display()
+        ));
+
+        #[cfg(unix)]
+        assert!(is_unwritable_write_lock_open_error(&lock, &open_err));
+        #[cfg(not(unix))]
+        assert!(!is_unwritable_write_lock_open_error(&lock, &open_err));
+        assert!(
+            !is_unwritable_write_lock_open_error(&lock, &timeout_err),
+            "lock contention must not be reported as permissions.write_lock"
+        );
+        assert!(
+            !is_unwritable_write_lock_open_error(&beads_dir.join("missing.lock"), &open_err),
+            "missing lock path must fall back to the original startup error"
+        );
+
+        let directory_lock = beads_dir.join("directory.lock");
+        fs::create_dir(&directory_lock).expect("directory lock");
+        assert!(
+            !is_unwritable_write_lock_open_error(&directory_lock, &open_err),
+            "non-file lock path belongs to the original startup error, not permissions.write_lock"
+        );
+    }
+
+    #[test]
+    fn read_only_fast_open_requires_explicit_stale_and_flush_opt_out() {
         let list = Cli::parse_from(["br", "list"]);
-        assert!(build_cli_overrides(&list).read_only_fast_open);
+        assert!(!build_cli_overrides(&list).read_only_fast_open);
+
+        let list_with_lock_timeout = Cli::parse_from(["br", "--lock-timeout", "50", "list"]);
+        assert!(!build_cli_overrides(&list_with_lock_timeout).read_only_fast_open);
 
         let stats = Cli::parse_from(["br", "stats"]);
         assert!(!build_cli_overrides(&stats).read_only_fast_open);
@@ -1208,7 +1997,7 @@ mod tests {
         assert!(build_cli_overrides(&stats_no_auto).read_only_fast_open);
 
         let stats_no_activity = Cli::parse_from(["br", "stats", "--no-activity"]);
-        assert!(build_cli_overrides(&stats_no_activity).read_only_fast_open);
+        assert!(!build_cli_overrides(&stats_no_activity).read_only_fast_open);
 
         let status = Cli::parse_from(["br", "status"]);
         assert!(!build_cli_overrides(&status).read_only_fast_open);
@@ -1218,10 +2007,10 @@ mod tests {
         assert!(build_cli_overrides(&status_no_auto).read_only_fast_open);
 
         let status_no_activity = Cli::parse_from(["br", "status", "--no-activity"]);
-        assert!(build_cli_overrides(&status_no_activity).read_only_fast_open);
+        assert!(!build_cli_overrides(&status_no_activity).read_only_fast_open);
 
         let sync_status = Cli::parse_from(["br", "sync", "--status"]);
-        assert!(build_cli_overrides(&sync_status).read_only_fast_open);
+        assert!(!build_cli_overrides(&sync_status).read_only_fast_open);
 
         let sync_flush = Cli::parse_from(["br", "sync", "--flush-only"]);
         assert!(!build_cli_overrides(&sync_flush).read_only_fast_open);
@@ -1261,13 +2050,13 @@ mod tests {
         assert!(build_cli_overrides(&comments_shorthand).read_only_fast_open);
 
         let label_list_all = Cli::parse_from(["br", "label", "list-all"]);
-        assert!(build_cli_overrides(&label_list_all).read_only_fast_open);
+        assert!(!build_cli_overrides(&label_list_all).read_only_fast_open);
 
         let label_list_unique = Cli::parse_from(["br", "label", "list"]);
-        assert!(build_cli_overrides(&label_list_unique).read_only_fast_open);
+        assert!(!build_cli_overrides(&label_list_unique).read_only_fast_open);
 
         let count = Cli::parse_from(["br", "count", "--by", "status"]);
-        assert!(build_cli_overrides(&count).read_only_fast_open);
+        assert!(!build_cli_overrides(&count).read_only_fast_open);
 
         let label_list_issue = Cli::parse_from([
             "br",
@@ -1281,7 +2070,7 @@ mod tests {
 
         let comments_no_auto_import =
             Cli::parse_from(["br", "--no-auto-import", "comments", "list", "bd-abc"]);
-        assert!(build_cli_overrides(&comments_no_auto_import).read_only_fast_open);
+        assert!(!build_cli_overrides(&comments_no_auto_import).read_only_fast_open);
 
         let mutating = Cli::parse_from([
             "br",
@@ -1334,57 +2123,57 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_auto_probe_covers_preopened_commands() {
+    fn default_read_commands_do_not_fast_open_for_auto_import_probe() {
         let ready = Cli::parse_from(["br", "ready"]);
-        assert!(build_cli_overrides(&ready).read_only_fast_open);
+        assert!(!build_cli_overrides(&ready).read_only_fast_open);
 
         let blocked = Cli::parse_from(["br", "blocked"]);
-        assert!(build_cli_overrides(&blocked).read_only_fast_open);
+        assert!(!build_cli_overrides(&blocked).read_only_fast_open);
 
         let show = Cli::parse_from(["br", "show", "br-123"]);
-        assert!(build_cli_overrides(&show).read_only_fast_open);
+        assert!(!build_cli_overrides(&show).read_only_fast_open);
 
         let comments_list = Cli::parse_from(["br", "comments", "list", "br-123"]);
-        assert!(build_cli_overrides(&comments_list).read_only_fast_open);
+        assert!(!build_cli_overrides(&comments_list).read_only_fast_open);
 
         let search = Cli::parse_from(["br", "search", "needle"]);
-        assert!(build_cli_overrides(&search).read_only_fast_open);
+        assert!(!build_cli_overrides(&search).read_only_fast_open);
 
         let stale = Cli::parse_from(["br", "stale"]);
-        assert!(build_cli_overrides(&stale).read_only_fast_open);
+        assert!(!build_cli_overrides(&stale).read_only_fast_open);
 
         let lint = Cli::parse_from(["br", "lint"]);
-        assert!(build_cli_overrides(&lint).read_only_fast_open);
+        assert!(!build_cli_overrides(&lint).read_only_fast_open);
 
         let lint_issue = Cli::parse_from(["br", "lint", "br-123"]);
         assert!(!build_cli_overrides(&lint_issue).read_only_fast_open);
 
         let changelog = Cli::parse_from(["br", "changelog"]);
-        assert!(build_cli_overrides(&changelog).read_only_fast_open);
+        assert!(!build_cli_overrides(&changelog).read_only_fast_open);
 
         let graph = Cli::parse_from(["br", "graph", "--all"]);
-        assert!(build_cli_overrides(&graph).read_only_fast_open);
+        assert!(!build_cli_overrides(&graph).read_only_fast_open);
 
         let orphans = Cli::parse_from(["br", "orphans"]);
-        assert!(build_cli_overrides(&orphans).read_only_fast_open);
+        assert!(!build_cli_overrides(&orphans).read_only_fast_open);
 
         let epic_status = Cli::parse_from(["br", "epic", "status"]);
-        assert!(build_cli_overrides(&epic_status).read_only_fast_open);
+        assert!(!build_cli_overrides(&epic_status).read_only_fast_open);
 
         let dep_tree = Cli::parse_from(["br", "dep", "tree", "br-123"]);
-        assert!(build_cli_overrides(&dep_tree).read_only_fast_open);
+        assert!(!build_cli_overrides(&dep_tree).read_only_fast_open);
 
         let dep_list = Cli::parse_from(["br", "dep", "list", "br-123"]);
-        assert!(build_cli_overrides(&dep_list).read_only_fast_open);
+        assert!(!build_cli_overrides(&dep_list).read_only_fast_open);
 
         let dep_cycles = Cli::parse_from(["br", "dep", "cycles"]);
-        assert!(build_cli_overrides(&dep_cycles).read_only_fast_open);
+        assert!(!build_cli_overrides(&dep_cycles).read_only_fast_open);
 
         let query_run = Cli::parse_from(["br", "query", "run", "mine", "--format", "json"]);
-        assert!(build_cli_overrides(&query_run).read_only_fast_open);
+        assert!(!build_cli_overrides(&query_run).read_only_fast_open);
 
         let query_list = Cli::parse_from(["br", "query", "list"]);
-        assert!(build_cli_overrides(&query_list).read_only_fast_open);
+        assert!(!build_cli_overrides(&query_list).read_only_fast_open);
     }
 
     #[test]
@@ -1407,7 +2196,7 @@ mod tests {
 
         let no_auto_import_only =
             Cli::parse_from(["br", "--no-auto-import", "query", "run", "mine"]);
-        assert!(build_cli_overrides(&no_auto_import_only).read_only_fast_open);
+        assert!(!build_cli_overrides(&no_auto_import_only).read_only_fast_open);
 
         let query_save = Cli::parse_from([
             "br",
@@ -1501,6 +2290,16 @@ mod tests {
             "bd-def",
         ]);
         assert!(!build_cli_overrides(&dep_add).read_only_fast_open);
+
+        let dep_import = Cli::parse_from([
+            "br",
+            "--no-auto-import",
+            "--no-auto-flush",
+            "dep",
+            "import",
+            "edges.jsonl",
+        ]);
+        assert!(!build_cli_overrides(&dep_import).read_only_fast_open);
     }
 
     #[test]
@@ -1528,19 +2327,160 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_defers_startup_write_lock_until_fallback() {
+    fn read_only_fast_open_holds_authority_before_any_fallback() {
         assert!(
-            !should_acquire_startup_write_lock(true, false, true),
-            "read-only fast-open commands should try the current-schema read-only DB before joining the writer lock path"
+            should_acquire_startup_write_lock(true, false, true),
+            "read-only fast-open commands need authority before the live pending-saga gate"
         );
         assert!(
-            !should_acquire_startup_write_lock(true, true, true),
-            "auto-import probes can use read-only fast-open first; stale probes reacquire the lock before writable fallback"
+            should_acquire_startup_write_lock(true, true, true),
+            "fast-open misses must not reach writable fallback without preexisting authority"
         );
         assert!(
             should_acquire_startup_write_lock(false, true, false),
             "non-fast-open DB-family commands must keep the startup lock"
         );
+    }
+
+    #[test]
+    fn initialized_non_database_command_skips_startup_authority_and_pending_gate() {
+        let command = Cli::parse_from(["br", "completions", "bash"]).command;
+
+        assert!(
+            !needs_write_lock(&command),
+            "completion generation never opens the workspace database"
+        );
+        assert!(
+            !should_acquire_startup_write_lock(
+                needs_write_lock(&command),
+                should_preopen_storage(true, false),
+                false,
+            ),
+            "an initialized cwd must not make a non-database command enter the live DB gate"
+        );
+    }
+
+    #[test]
+    fn read_only_no_db_command_remains_database_lock_free() {
+        let command = Cli::parse_from(["br", "--no-db", "list"]).command;
+        let jsonl_write = no_db_jsonl_write_intent(&command);
+
+        assert!(
+            !jsonl_write,
+            "read-only list must not claim JSONL write intent"
+        );
+        assert!(
+            !startup_database_authority_required(
+                true,
+                should_acquire_startup_write_lock(needs_write_lock(&command), false, false),
+                jsonl_write,
+                false,
+            ),
+            "read-only no-DB commands must not join the database writer lock path"
+        );
+    }
+
+    #[test]
+    fn file_only_pending_mutation_still_acquires_database_authority_for_gate() {
+        let command = Cli::parse_from(["br", "config", "edit"]).command;
+        assert!(
+            !needs_write_lock(&command),
+            "config edit does not ordinarily open the database"
+        );
+        let gate_required =
+            pending_merge_startup_disposition(&command) == PendingMergeStartupDisposition::Refuse;
+        assert!(gate_required, "config edit can redirect merge-owned paths");
+        for no_db in [false, true] {
+            assert!(
+                startup_database_authority_required(no_db, false, false, gate_required),
+                "pending-state refusal must acquire authority even when no_db={no_db}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_db_write_inspector_allows_exact_missing_database_without_creating_it() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            inspect_pending_sync_merge_for_no_db_write(&db_path, &authority)
+                .unwrap()
+                .is_none(),
+            "an exact missing DB cannot contain a pending receipt"
+        );
+        assert!(
+            !db_path.exists(),
+            "inspection must not initialize a database in genuine no-DB mode"
+        );
+
+        fs::write(&jsonl_path, b"{\"id\":\"br-no-db\"}\n").unwrap();
+        assert_eq!(
+            fs::read(&jsonl_path).unwrap(),
+            b"{\"id\":\"br-no-db\"}\n",
+            "missing-DB classification must permit ordinary no-DB JSONL work"
+        );
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn no_db_write_inspector_refuses_legacy_and_malformed_receipts_without_writes() {
+        for (key, value, expected_condition) in [
+            ("sync_merge_pending_v1", "legacy-receipt", "legacy"),
+            ("sync_merge_pending_v2", "{", "malformed"),
+        ] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir_all(&beads_dir).unwrap();
+            let db_path = beads_dir.join("beads.db");
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            let mut storage = beads_rust::storage::SqliteStorage::open(&db_path).unwrap();
+            storage.set_metadata(key, value).unwrap();
+            drop(storage);
+            fs::write(&jsonl_path, b"{\"id\":\"br-existing\"}\n").unwrap();
+            let database_before = fs::read(&db_path).unwrap();
+            let jsonl_before = fs::read(&jsonl_path).unwrap();
+            let authority = Arc::new(
+                beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                    &beads_dir,
+                    &db_path,
+                    Some(1_000),
+                )
+                .unwrap(),
+            );
+
+            let state = inspect_pending_sync_merge_for_no_db_write(&db_path, &authority)
+                .unwrap()
+                .expect("pending state must refuse no-DB writer");
+            let err = pending_sync_merge_no_db_refusal_error(&state);
+
+            assert_eq!(state.condition_name(), expected_condition);
+            assert!(
+                err.to_string().contains("without `--no-db`"),
+                "refusal must direct the caller to DB-backed merge recovery: {err}"
+            );
+            assert_eq!(
+                fs::read(&db_path).unwrap(),
+                database_before,
+                "{expected_condition} inspection changed database bytes"
+            );
+            assert_eq!(
+                fs::read(&jsonl_path).unwrap(),
+                jsonl_before,
+                "{expected_condition} inspection changed JSONL bytes"
+            );
+        }
     }
 
     #[test]
@@ -1551,10 +2491,20 @@ mod tests {
             "--no-auto-flush",
             "list",
         ]));
-        let beads_dir = PathBuf::from("/tmp/beads/.beads");
-        let other_dir = PathBuf::from("/tmp/other/.beads");
-
-        overrides.held_write_lock_beads_dir = Some(beads_dir.clone());
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join("one").join(".beads");
+        let other_dir = temp.path().join("two").join(".beads");
+        std::fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let database_path = beads_dir.join("beads.db");
+        let guard = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &database_path,
+                Some(0),
+            )
+            .expect("lock database family"),
+        );
+        overrides.mark_database_family_lock_held(&beads_dir, &guard);
 
         assert!(overrides.holds_write_lock_for(&beads_dir));
         assert!(!overrides.holds_write_lock_for(&other_dir));
@@ -1613,6 +2563,135 @@ mod tests {
     }
 
     #[test]
+    fn pending_merge_guard_allows_only_merge_resume_among_sync_mutations() {
+        let merge = Cli::parse_from(["br", "sync", "--merge"]).command;
+        let force_db = Cli::parse_from(["br", "sync", "--merge", "--force-db"]).command;
+        let force_jsonl = Cli::parse_from(["br", "sync", "--merge", "--force-jsonl"]).command;
+        for command in [&merge, &force_db, &force_jsonl] {
+            assert!(command_is_sync_merge(command));
+            assert!(
+                !command_must_refuse_during_pending_merge(command),
+                "dedicated merge resume must remain available: {command:?}"
+            );
+            assert_eq!(
+                pending_merge_startup_disposition(command),
+                PendingMergeStartupDisposition::Resume
+            );
+        }
+
+        let mutations = vec![
+            Cli::parse_from(["br", "sync", "--flush-only"]).command,
+            Cli::parse_from(["br", "sync", "--import-only"]).command,
+            Cli::parse_from(["br", "sync", "--reconcile-additive", "--apply"]).command,
+        ];
+        for command in &mutations {
+            assert!(!command_is_sync_merge(command), "{command:?}");
+            assert!(
+                command_must_refuse_during_pending_merge(command),
+                "non-merge sync mutation must fail closed: {command:?}"
+            );
+            assert_eq!(
+                pending_merge_startup_disposition(command),
+                PendingMergeStartupDisposition::Refuse
+            );
+        }
+    }
+
+    #[test]
+    fn pending_merge_guard_covers_every_non_sync_mutation_family() {
+        let mutations = vec![
+            Cli::parse_from(["br", "create", "fixture"]).command,
+            Cli::parse_from(["br", "update", "bd-one", "--title", "changed"]).command,
+            Cli::parse_from(["br", "delete", "bd-one"]).command,
+            Cli::parse_from(["br", "dep", "add", "bd-one", "bd-two"]).command,
+            Cli::parse_from(["br", "label", "add", "bd-one", "--label", "p0"]).command,
+            Cli::parse_from([
+                "br",
+                "gate",
+                "report",
+                "bd-one",
+                "--gate",
+                "ci",
+                "--provider",
+                "test",
+                "--status",
+                "pass",
+            ])
+            .command,
+            Cli::parse_from(["br", "query", "save", "mine"]).command,
+            Cli::parse_from(["br", "config", "set", "sync.auto_flush=true"]).command,
+            Cli::parse_from(["br", "config", "edit"]).command,
+            Cli::parse_from(["br", "history", "restore", "fixture.jsonl", "--force"]).command,
+            Cli::parse_from(["br", "audit", "record", "--kind", "tool_call"]).command,
+            Cli::parse_from(["br", "doctor", "--repair"]).command,
+            Cli::parse_from(["br", "doctor", "--repair-indexes"]).command,
+            Cli::parse_from(["br", "doctor", "undo", "latest"]).command,
+            Cli::parse_from(["br", "agents", "--add", "--force"]).command,
+        ];
+
+        for command in &mutations {
+            assert!(
+                command_must_refuse_during_pending_merge(command),
+                "pending receipt must refuse mutation before command execution: {command:?}"
+            );
+            assert_eq!(
+                pending_merge_startup_disposition(command),
+                PendingMergeStartupDisposition::Refuse
+            );
+        }
+    }
+
+    #[test]
+    fn pending_merge_guard_preserves_read_only_commands() {
+        let read_only = vec![
+            Cli::parse_from(["br", "list"]).command,
+            Cli::parse_from(["br", "show", "bd-one"]).command,
+            Cli::parse_from(["br", "sync", "--status"]).command,
+            Cli::parse_from(["br", "sync", "--witness"]).command,
+            Cli::parse_from(["br", "sync", "--reconcile-additive"]).command,
+            Cli::parse_from(["br", "gate", "list", "bd-one"]).command,
+            Cli::parse_from(["br", "query", "list"]).command,
+            Cli::parse_from(["br", "config", "list"]).command,
+            Cli::parse_from(["br", "history", "list"]).command,
+            Cli::parse_from(["br", "audit", "summary"]).command,
+            Cli::parse_from(["br", "doctor", "--repair", "--dry-run"]).command,
+            Cli::parse_from(["br", "doctor", "undo", "latest", "--dry-run"]).command,
+            Cli::parse_from(["br", "agents", "--add", "--dry-run"]).command,
+        ];
+
+        for command in &read_only {
+            assert!(
+                !command_must_refuse_during_pending_merge(command),
+                "read-only command must remain usable: {command:?}"
+            );
+            assert_eq!(
+                pending_merge_startup_disposition(command),
+                PendingMergeStartupDisposition::ReadOnlyNoAutoSync,
+                "read-only command must disable automatic import/export while pending"
+            );
+        }
+    }
+
+    #[test]
+    fn no_db_sync_write_intent_covers_jsonl_rewriters_only() {
+        let flush = Cli::parse_from(["br", "sync", "--flush-only"]).command;
+        let merge = Cli::parse_from(["br", "sync", "--merge"]).command;
+        let force_merge = Cli::parse_from(["br", "sync", "--merge", "--force-jsonl"]).command;
+        let import = Cli::parse_from(["br", "sync", "--import-only"]).command;
+        let status = Cli::parse_from(["br", "sync", "--status"]).command;
+        let witness = Cli::parse_from(["br", "sync", "--witness"]).command;
+        let additive_plan = Cli::parse_from(["br", "sync", "--reconcile-additive"]).command;
+
+        assert!(no_db_jsonl_write_intent(&flush));
+        assert!(no_db_jsonl_write_intent(&merge));
+        assert!(no_db_jsonl_write_intent(&force_merge));
+        assert!(!no_db_jsonl_write_intent(&import));
+        assert!(!no_db_jsonl_write_intent(&status));
+        assert!(!no_db_jsonl_write_intent(&witness));
+        assert!(!no_db_jsonl_write_intent(&additive_plan));
+    }
+
+    #[test]
     fn sync_modes_require_write_lock_before_storage_open() {
         // Regression: `br sync --flush-only` calls `finalize_export` inside a
         // `with_write_transaction` (clears dirty flags, updates
@@ -1629,8 +2708,12 @@ mod tests {
         // sidecars. It must therefore serialize before entering `sync::execute`.
         let flush_only = Cli::parse_from(["br", "sync", "--flush-only"]).command;
         let status = Cli::parse_from(["br", "sync", "--status"]).command;
+        let witness = Cli::parse_from(["br", "sync", "--witness"]).command;
         let merge = Cli::parse_from(["br", "sync", "--merge"]).command;
         let import_only = Cli::parse_from(["br", "sync", "--import-only"]).command;
+        let reconcile_plan = Cli::parse_from(["br", "sync", "--reconcile-additive"]).command;
+        let reconcile_apply =
+            Cli::parse_from(["br", "sync", "--reconcile-additive", "--apply"]).command;
         let default_sync = Cli::parse_from(["br", "sync"]).command;
 
         assert!(
@@ -1641,27 +2724,76 @@ mod tests {
             needs_write_lock(&status),
             "`br sync --status` opens storage and must serialize before recovery/schema work"
         );
+        assert!(
+            !needs_write_lock(&witness),
+            "`br sync --witness` reads JSONL without opening SQLite and should not wait on .write.lock"
+        );
         assert!(needs_write_lock(&merge));
         assert!(needs_write_lock(&import_only));
-        assert!(needs_write_lock(&default_sync));
+        assert!(
+            !needs_write_lock(&reconcile_plan),
+            "additive dry-run opens the current database read-only and must not acquire the writer lock"
+        );
+        assert!(
+            !needs_write_lock(&reconcile_apply),
+            "additive apply owns redirect-aware resolution and its exact terminal workspace lock inside the hardened reviewed-apply wrapper"
+        );
+        assert!(
+            !needs_write_lock(&default_sync),
+            "bare `br sync` fails validation before storage open and should not wait on .write.lock"
+        );
     }
 
     #[test]
     fn doctor_requires_write_lock_before_live_inspection() {
         let inspect = Cli::parse_from(["br", "doctor"]).command;
         let repair = Cli::parse_from(["br", "doctor", "--repair"]).command;
+        let repair_indexes = Cli::parse_from(["br", "doctor", "--repair-indexes"]).command;
+        let capabilities =
+            Cli::parse_from(["br", "doctor", "capabilities", "--format", "json"]).command;
+        let robot_docs =
+            Cli::parse_from(["br", "doctor", "robot-docs", "--format", "json"]).command;
+        let health = Cli::parse_from(["br", "doctor", "health", "--json"]).command;
+        let ls = Cli::parse_from(["br", "doctor", "ls", "--json"]).command;
+        let explain =
+            Cli::parse_from(["br", "doctor", "explain", "permissions.write_lock"]).command;
+        let undo = Cli::parse_from(["br", "doctor", "undo", "latest"]).command;
 
         assert!(
             needs_write_lock(&inspect),
             "`br doctor` copies/probes the live DB family and must serialize via .write.lock"
         );
         assert!(needs_write_lock(&repair));
+        assert!(needs_write_lock(&repair_indexes));
+        assert!(needs_write_lock(&undo));
+        assert!(
+            !needs_write_lock(&capabilities),
+            "capabilities is a pure contract surface and must not depend on workspace lock health"
+        );
+        assert!(
+            !needs_write_lock(&robot_docs),
+            "robot-docs is a pure help surface and must not depend on workspace lock health"
+        );
+        assert!(
+            !needs_write_lock(&health),
+            "health is read-only filesystem liveness and must not acquire the DB write lock"
+        );
+        assert!(
+            !needs_write_lock(&ls),
+            "ls only reads .doctor/runs and must not acquire the DB write lock"
+        );
+        assert!(
+            !needs_write_lock(&explain),
+            "explain is a read-only diagnostic surface and must not acquire the DB write lock"
+        );
     }
 
     #[test]
     fn diagnostic_and_config_commands_skip_auto_import() {
         let cases: &[&[&str]] = &[
             &["br", "doctor"],
+            &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
             &["br", "where"],
             &["br", "schema"],
             &["br", "config", "path"],
@@ -1714,7 +2846,12 @@ mod tests {
 
     #[test]
     fn config_path_and_edit_do_not_require_db_write_lock() {
-        let cases: &[&[&str]] = &[&["br", "config", "path"], &["br", "config", "edit"]];
+        let cases: &[&[&str]] = &[
+            &["br", "config", "path"],
+            &["br", "config", "edit"],
+            &["br", "capabilities"],
+            &["br", "robot-docs", "guide"],
+        ];
 
         for argv in cases {
             let command = Cli::parse_from(*argv).command;
@@ -1766,11 +2903,9 @@ mod tests {
         )
         .expect("write initial metadata");
 
-        let overrides = config::CliOverrides {
-            db: Some(beads_dir.join("beads.db")),
-            no_db: Some(true),
-            ..config::CliOverrides::default()
-        };
+        let mut overrides = config::CliOverrides::default();
+        overrides.db = Some(beads_dir.join("beads.db"));
+        overrides.no_db = Some(true);
         let mut ctx = StartupContext::init(&overrides).expect("startup context");
 
         fs::write(
@@ -1779,7 +2914,7 @@ mod tests {
         )
         .expect("rewrite metadata");
 
-        let storage_ctx = open_storage_from_ctx(&mut ctx, false).expect("preopened storage");
+        let storage_ctx = open_storage_from_ctx(&mut ctx, None).expect("preopened storage");
 
         assert_eq!(storage_ctx.paths.jsonl_path, first_jsonl);
         assert_ne!(storage_ctx.paths.jsonl_path, second_jsonl);
@@ -1903,8 +3038,8 @@ mod tests {
         assert!(should_acquire_startup_write_lock(true, false, false));
         assert!(should_acquire_startup_write_lock(true, true, false));
         assert!(!should_acquire_startup_write_lock(false, false, false));
-        assert!(!should_acquire_startup_write_lock(false, true, true));
-        assert!(!should_acquire_startup_write_lock(true, false, true));
-        assert!(!should_acquire_startup_write_lock(true, true, true));
+        assert!(should_acquire_startup_write_lock(false, true, true));
+        assert!(should_acquire_startup_write_lock(true, false, true));
+        assert!(should_acquire_startup_write_lock(true, true, true));
     }
 }

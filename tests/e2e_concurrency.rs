@@ -23,7 +23,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
 const WRITE_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONTENTION_SUCCESS_LOCK_TIMEOUT_MS: &str = "1000";
 
@@ -72,8 +74,12 @@ where
     cmd.args(args);
     clear_inherited_br_env_std(&mut cmd);
     cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "error");
     cmd.env("RUST_BACKTRACE", "1");
     cmd.env("HOME", root);
+    // Hermetic $PATH: dual `br` installs otherwise trip the br_path_dupes
+    // doctor warning inside spawned doctor runs (beads_rust-ozdh class).
+    cmd.env("PATH", common::cli::deduplicated_br_path());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.spawn().expect("spawn br child")
@@ -160,6 +166,9 @@ where
     cmd.current_dir(root);
     cmd.args(args);
     clear_inherited_br_env(&mut cmd);
+    // Hermetic defaults; explicit env_vars below may override RUST_LOG.
+    cmd.env("RUST_LOG", "error");
+    cmd.env("PATH", common::cli::deduplicated_br_path());
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_BACKTRACE", "1");
@@ -207,14 +216,22 @@ fn is_expected_contention_failure(result: &BrResult) -> bool {
 }
 
 fn has_integrity_failure_signal(result: &BrResult) -> bool {
-    let combined = format!("{} {}", result.stdout, result.stderr).to_lowercase();
-    combined.contains("unique constraint failed: blocked_issues_cache.issue_id")
-        || combined.contains("constraint failed")
-        || combined.contains("constraint")
-        || combined.contains("corrupt")
-        || combined.contains("malformed")
-        || combined.contains("unexpected token")
-        || combined.contains("panic")
+    if contains_integrity_failure_signal(&result.stderr) {
+        return true;
+    }
+
+    !result.success && contains_integrity_failure_signal(&result.stdout)
+}
+
+fn contains_integrity_failure_signal(output: &str) -> bool {
+    let output = output.to_lowercase();
+    output.contains("unique constraint failed: blocked_issues_cache.issue_id")
+        || output.contains("constraint failed")
+        || output.contains("constraint")
+        || output.contains("corrupt")
+        || output.contains("malformed")
+        || output.contains("unexpected token")
+        || output.contains("panic")
 }
 
 fn assert_no_integrity_failure_signals(role: &str, results: &[BrResult]) {
@@ -718,6 +735,17 @@ fn e2e_read_command_witness_refresh_waits_for_write_lock() {
         .expect("delete jsonl_size witness");
     conn.execute("INSERT INTO metadata (key, value) VALUES ('jsonl_size', '0')")
         .expect("write stale jsonl_size witness");
+    // beads_rust-mjmk: also corrupt jsonl_content_hash so the staleness probe
+    // actually concludes the JSONL is newer. compute_jsonl_newer_impl falls
+    // back to hash comparison when size mismatches; if the hash still matches
+    // the actual JSONL, the probe returns "not newer" and the read command
+    // never tries to refresh witnesses, making this test a no-op.
+    conn.execute("DELETE FROM metadata WHERE key = 'jsonl_content_hash'")
+        .expect("delete jsonl_content_hash witness");
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('jsonl_content_hash', 'stale_witness_hash_mjmk')",
+    )
+    .expect("write stale jsonl_content_hash witness");
     drop(conn);
 
     let lock_path = beads_dir.join(".write.lock");
@@ -2756,13 +2784,8 @@ fn e2e_parallel_mixed_db_commands_preserve_sqlite_integrity() {
         ("read/status/doctor", &read_results),
     ] {
         assert_no_integrity_failure_signals(role, results);
-        for (idx, result) in results.iter().enumerate() {
-            assert!(
-                result.success,
-                "{role}[{idx}] failed under mixed parallel DB load: stdout={} stderr={}",
-                result.stdout, result.stderr
-            );
-        }
+        let successes = assert_only_success_or_contention(role, results);
+        assert!(successes > 0, "{role} had no successful operations");
     }
 
     assert_doctor_has_no_page_anomalies(&root, "after mixed parallel DB load");

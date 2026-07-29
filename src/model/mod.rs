@@ -28,6 +28,30 @@ where
     serializer.serialize_i32(value.unwrap_or(0))
 }
 
+/// Deserialize an optional metadata string, coercing a degenerate empty (or
+/// whitespace-only) string to `None`.
+///
+/// Legacy JSONL written by older `br`/`bd` versions serialized absent
+/// dependency metadata as `"metadata":""` rather than omitting the field or
+/// writing `"{}"`. The empty string is not valid JSON, so downstream consumers
+/// that parse `metadata` as JSON (e.g. the JSONL → SQLite rebuild/import path)
+/// would reject such records with an opaque `EOF while parsing` error.
+///
+/// Treating `""` as absent is lossless: a present-but-empty metadata field
+/// carries no information, and the import path already materializes `None` as
+/// the empty JSON object `"{}"`. Genuine metadata (any non-blank string) is
+/// preserved verbatim so real data is never discarded.
+fn deserialize_optional_metadata<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(s) if s.trim().is_empty() => None,
+        other => other,
+    })
+}
+
 /// Issue lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -52,7 +76,7 @@ impl<'de> Deserialize<'de> for Status {
         let value = String::deserialize(deserializer)?;
         Ok(match Self::known_value(&value) {
             Some(status) => status,
-            None => Self::Custom(value),
+            None => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -114,7 +138,7 @@ impl FromStr for Status {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_lowercase())))
     }
 }
 
@@ -185,7 +209,7 @@ impl<'de> Deserialize<'de> for IssueType {
         let value = String::deserialize(deserializer)?;
         Ok(match Self::known_value(&value) {
             Some(issue_type) => issue_type,
-            None => Self::Custom(value),
+            None => Self::Custom(value.to_lowercase()),
         })
     }
 }
@@ -236,7 +260,7 @@ impl FromStr for IssueType {
     type Err = crate::error::BeadsError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_string())))
+        Ok(Self::known_value(s).unwrap_or_else(|| Self::Custom(s.to_lowercase())))
     }
 }
 
@@ -262,7 +286,8 @@ pub enum DependencyType {
 impl<'de> Deserialize<'de> for DependencyType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        Ok(match value.to_lowercase().as_str() {
+        let normalized = value.to_lowercase();
+        Ok(match normalized.as_str() {
             "blocks" => Self::Blocks,
             "parent-child" => Self::ParentChild,
             "conditional-blocks" => Self::ConditionalBlocks,
@@ -274,7 +299,7 @@ impl<'de> Deserialize<'de> for DependencyType {
             "duplicates" => Self::Duplicates,
             "supersedes" => Self::Supersedes,
             "caused-by" => Self::CausedBy,
-            _ => Self::Custom(value),
+            _ => Self::Custom(normalized),
         })
     }
 }
@@ -396,7 +421,8 @@ impl Serialize for EventType {
 impl<'de> Deserialize<'de> for EventType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        let event_type = match value.as_str() {
+        let normalized = value.to_lowercase();
+        let event_type = match normalized.as_str() {
             "created" => Self::Created,
             "updated" => Self::Updated,
             "status_changed" => Self::StatusChanged,
@@ -412,7 +438,7 @@ impl<'de> Deserialize<'de> for EventType {
             "compacted" => Self::Compacted,
             "deleted" => Self::Deleted,
             "restored" => Self::Restored,
-            _ => Self::Custom(value),
+            _ => Self::Custom(normalized),
         };
         Ok(event_type)
     }
@@ -520,9 +546,43 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_system: Option<String>,
 
-    /// Source repository for multi-repo support.
+    /// Source repository for multi-repo support — basename of the
+    /// canonicalized parent of `.beads/`. Stable across clones of the
+    /// same repo on different machines (different absolute paths
+    /// produce the same basename). See [`canonical_source_repo`] in
+    /// `cli::commands::create`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<String>,
+
+    /// Absolute canonical path of the source repository. Distinct from
+    /// `source_repo`: this field uniquely identifies the workspace on
+    /// the machine that produced the issue, which is what multi-repo
+    /// fleet automation needs to route beads back to the right
+    /// directory (see beads_rust#289). Two clones of the same repo
+    /// under `~/Developer/foo` vs `~/Developer/scratch/foo` collide on
+    /// `source_repo` but disagree here. Optional — older databases and
+    /// hand-edited JSONL records without this field are valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_repo_path: Option<String>,
+
+    /// Canonical-JSON governing instructions inherited by descendant
+    /// beads (beads_rust#297). When set on an ancestor and the project
+    /// has `inherited_context.enabled = true` in `.beads/config.yaml`,
+    /// `br update --status in_progress` / `--claim` and `br show` emit
+    /// the ancestor's `agent_context` alongside the child's normal
+    /// output so the working agent sees the constraints regardless of
+    /// context compaction or cold-start lookups.
+    ///
+    /// Storage: TEXT column holding a JSON document (typically an
+    /// object with `skills`, `constraints`, `references`, `workflow`,
+    /// `metadata` fields, but the schema is intentionally open).
+    /// `None` means "no inherited context"; emission for descendants
+    /// silently skips ancestors with `None` (no error, no noise).
+    ///
+    /// Not displayed in `br list` / `br search` — this is per-bead
+    /// governance metadata, not browsable content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_context: Option<String>,
 
     // Tombstone fields
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -593,6 +653,8 @@ impl Default for Issue {
             defer_until: None,
             external_ref: None,
             source_system: None,
+            source_repo_path: None,
+            agent_context: None,
             source_repo: None,
             deleted_at: None,
             deleted_by: None,
@@ -616,7 +678,8 @@ impl Default for Issue {
 impl Issue {
     /// Compute the deterministic content hash for this issue.
     ///
-    /// Uses the Go bd canonical field order for cross-tool deduplication.
+    /// Uses br's canonical field order with length-prefixed field encoding for
+    /// unambiguous deduplication.
     /// Excludes IDs, timestamps, relations, and tombstone metadata.
     ///
     /// Delegates to [`crate::util::hash::content_hash`] for the canonical implementation.
@@ -654,6 +717,7 @@ impl Issue {
             || self.external_ref != other.external_ref
             || self.source_system != other.source_system
             || self.source_repo != other.source_repo
+            || self.source_repo_path != other.source_repo_path
             || self.deleted_at != other.deleted_at
             || self.deleted_by != other.deleted_by
             || self.delete_reason != other.delete_reason
@@ -748,6 +812,21 @@ impl Issue {
     /// Check if this issue is a tombstone that has exceeded its TTL.
     #[must_use]
     pub fn is_expired_tombstone(&self, retention_days: Option<u64>) -> bool {
+        self.is_expired_tombstone_at(retention_days, Utc::now())
+    }
+
+    /// Check if this issue is a tombstone that has exceeded its TTL at a
+    /// caller-supplied cutoff.
+    ///
+    /// Supplying the cutoff lets one logical export apply a single retention
+    /// decision to every issue, even when serial and parallel preparation take
+    /// different amounts of time.
+    #[must_use]
+    pub fn is_expired_tombstone_at(
+        &self,
+        retention_days: Option<u64>,
+        as_of: DateTime<Utc>,
+    ) -> bool {
         if self.status != Status::Tombstone {
             return false;
         }
@@ -769,8 +848,14 @@ impl Issue {
         // something extremely safe for an issue tracker (e.g., 1000 years).
         let max_safe_days = 365_u64 * 1000;
         let days_i64 = i64::try_from(days.min(max_safe_days)).unwrap_or(365_000);
-        let expiration_time = deleted_at + chrono::Duration::days(days_i64);
-        Utc::now() > expiration_time
+        let Some(expiration_time) = deleted_at.checked_add_signed(chrono::Duration::days(days_i64))
+        else {
+            // A positive retention period that extends beyond chrono's maximum
+            // representable timestamp has not expired at any representable
+            // cutoff, so retain the tombstone.
+            return false;
+        };
+        as_of > expiration_time
     }
 }
 
@@ -804,7 +889,15 @@ pub struct Dependency {
     pub created_by: Option<String>,
 
     /// Optional metadata (JSON).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// A degenerate empty (or whitespace-only) string is coerced to `None` on
+    /// deserialization to tolerate legacy JSONL that wrote `"metadata":""`
+    /// instead of omitting the field. See [`deserialize_optional_metadata`].
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub metadata: Option<String>,
 
     /// Thread ID for conversation linking.
@@ -837,6 +930,17 @@ pub struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Tier 1 attribution: self-reported agent name (issue #312, Layer 3
+    /// capture-only). Recorded as an audit trail; never gated/enforced on.
+    /// `None` when the mutating command supplied no attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Tier 1 attribution: self-reported harness identifier (capture-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Tier 1 attribution: self-reported model identifier (capture-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[cfg(test)]
@@ -852,13 +956,19 @@ mod tests {
         assert_eq!(serialized, "\"custom_status\"");
 
         let mixed_case: Status = serde_json::from_str("\"QaReview\"").unwrap();
-        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+        assert_eq!(mixed_case, Status::Custom("qareview".to_string()));
     }
 
     #[test]
-    fn issue_type_custom_deserialize_preserves_spelling() {
+    fn issue_type_custom_deserialize_normalizes_spelling() {
         let issue_type: IssueType = serde_json::from_str("\"Odd_Type\"").unwrap();
-        assert_eq!(issue_type, IssueType::Custom("Odd_Type".to_string()));
+        assert_eq!(issue_type, IssueType::Custom("odd_type".to_string()));
+    }
+
+    #[test]
+    fn dependency_type_custom_deserialize_normalizes_spelling() {
+        let dep_type: DependencyType = serde_json::from_str("\"Odd-Dep\"").unwrap();
+        assert_eq!(dep_type, DependencyType::Custom("odd-dep".to_string()));
     }
 
     #[test]
@@ -911,6 +1021,8 @@ mod tests {
             due_at: None,
             defer_until: None,
             external_ref: None,
+            source_repo_path: None,
+            agent_context: None,
             source_system: None,
             source_repo: None,
             deleted_at: None,
@@ -1026,7 +1138,7 @@ mod tests {
         assert_eq!(result, Status::Custom("invalid_status".to_string()));
 
         let mixed_case = Status::from_str("QaReview").unwrap();
-        assert_eq!(mixed_case, Status::Custom("QaReview".to_string()));
+        assert_eq!(mixed_case, Status::Custom("qareview".to_string()));
     }
 
     #[test]
@@ -1194,7 +1306,7 @@ mod tests {
         );
 
         let mixed_case = IssueType::from_str("Odd_Type").unwrap();
-        assert_eq!(mixed_case, IssueType::Custom("Odd_Type".to_string()));
+        assert_eq!(mixed_case, IssueType::Custom("odd_type".to_string()));
     }
 
     #[test]
@@ -1285,6 +1397,12 @@ mod tests {
     fn test_dependency_type_from_str_custom() {
         let result = DependencyType::from_str("my-custom-dep").unwrap();
         assert_eq!(result, DependencyType::Custom("my-custom-dep".to_string()));
+
+        let mixed_case = DependencyType::from_str("My-Custom-Dep").unwrap();
+        assert_eq!(
+            mixed_case,
+            DependencyType::Custom("my-custom-dep".to_string())
+        );
     }
 
     #[test]
@@ -1371,6 +1489,8 @@ mod tests {
             closed_by_session: None,
             due_at: None,
             defer_until: None,
+            source_repo_path: None,
+            agent_context: None,
             external_ref: None,
             source_system: None,
             source_repo: None,
@@ -1552,6 +1672,19 @@ mod tests {
     }
 
     #[test]
+    fn test_issue_sync_equals_detects_source_repo_path_changes() {
+        let mut issue1 = create_test_issue();
+        issue1.source_repo = Some("widget_engine".to_string());
+        issue1.source_repo_path = Some("/data/projects/widget_engine".to_string());
+
+        let mut issue2 = issue1.clone();
+        issue2.source_repo_path = Some("/data/projects/alternate/widget_engine".to_string());
+
+        assert!(!issue1.sync_equals(&issue2));
+        assert!(!issue2.sync_equals(&issue1));
+    }
+
+    #[test]
     fn test_issue_sync_equals_treats_duplicate_labels_as_equivalent() {
         let mut issue1 = create_test_issue();
         issue1.labels = vec![
@@ -1616,6 +1749,60 @@ mod tests {
         assert!(issue.is_expired_tombstone(Some(30)));
     }
 
+    #[test]
+    fn test_is_expired_tombstone_at_uses_strict_ttl_boundary() {
+        let as_of = DateTime::parse_from_rfc3339("2026-07-27T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(as_of - chrono::Duration::days(30));
+
+        assert!(
+            !issue.is_expired_tombstone_at(Some(30), as_of),
+            "a tombstone is retained at the exact TTL boundary"
+        );
+        assert!(
+            issue.is_expired_tombstone_at(Some(30), as_of + chrono::Duration::nanoseconds(1)),
+            "a tombstone expires immediately after the strict TTL boundary"
+        );
+    }
+
+    #[test]
+    fn test_is_expired_tombstone_at_retains_unrepresentable_expiration() {
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(DateTime::<Utc>::MAX_UTC);
+
+        assert!(
+            !issue.is_expired_tombstone_at(Some(1), DateTime::<Utc>::MAX_UTC),
+            "an expiration beyond chrono's maximum timestamp must retain the tombstone"
+        );
+    }
+
+    #[test]
+    fn test_is_expired_tombstone_at_clamps_maximum_retention() {
+        let deleted_at = DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let clamped_expiration = deleted_at + chrono::Duration::days(365_000);
+        let mut issue = create_test_issue();
+        issue.status = Status::Tombstone;
+        issue.deleted_at = Some(deleted_at);
+
+        assert!(
+            !issue.is_expired_tombstone_at(Some(u64::MAX), clamped_expiration),
+            "maximum retention is clamped and remains live at the strict boundary"
+        );
+        assert!(
+            issue.is_expired_tombstone_at(
+                Some(u64::MAX),
+                clamped_expiration + chrono::Duration::nanoseconds(1),
+            ),
+            "maximum retention expires immediately after the clamped boundary"
+        );
+    }
+
     // ========================================================================
     // EVENT TYPE TESTS
     // ========================================================================
@@ -1673,6 +1860,18 @@ mod tests {
     fn test_event_type_deserialize_custom() {
         let result: EventType = serde_json::from_str("\"my_custom_event\"").unwrap();
         assert_eq!(result, EventType::Custom("my_custom_event".to_string()));
+
+        let mixed_case: EventType = serde_json::from_str("\"My_Custom_Event\"").unwrap();
+        assert_eq!(mixed_case, EventType::Custom("my_custom_event".to_string()));
+    }
+
+    #[test]
+    fn test_event_type_deserialize_normalizes_case() {
+        let result: EventType = serde_json::from_str("\"CREATED\"").unwrap();
+        assert_eq!(result, EventType::Created);
+
+        let result: EventType = serde_json::from_str("\"Status_Changed\"").unwrap();
+        assert_eq!(result, EventType::StatusChanged);
     }
 
     // ========================================================================
@@ -1731,6 +1930,49 @@ mod tests {
         assert_eq!(dep.dep_type, DependencyType::Blocks);
     }
 
+    #[test]
+    fn dependency_empty_string_metadata_coerced_to_none() {
+        // Regression for issue #323: legacy JSONL serialized absent dependency
+        // metadata as `"metadata":""`, which is not valid JSON. Deserialization
+        // must tolerate it by coercing the degenerate empty string to `None`
+        // (lossless: the import path materializes `None` as `"{}"`).
+        let json = r#"{
+            "issue_id": "example-1",
+            "depends_on_id": "example-0",
+            "type": "blocks",
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "user",
+            "metadata": "",
+            "thread_id": ""
+        }"#;
+        let dep: Dependency = serde_json::from_str(json).expect("empty metadata must deserialize");
+        assert_eq!(
+            dep.metadata, None,
+            "empty-string metadata should become None"
+        );
+        // thread_id intentionally has no coercion: only `metadata` is parsed as
+        // JSON downstream, so only it needs the empty-string tolerance.
+    }
+
+    #[test]
+    fn dependency_whitespace_metadata_coerced_to_none() {
+        let json = r#"{"issue_id":"a","depends_on_id":"b","type":"blocks","created_at":"2026-01-01T00:00:00Z","metadata":"   "}"#;
+        let dep: Dependency = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.metadata, None);
+    }
+
+    #[test]
+    fn dependency_real_metadata_preserved() {
+        // Genuine JSON metadata must round-trip unchanged (no data loss).
+        let json = r#"{"issue_id":"a","depends_on_id":"b","type":"blocks","created_at":"2026-01-01T00:00:00Z","metadata":"{\"k\":\"v\"}"}"#;
+        let dep: Dependency = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.metadata.as_deref(), Some(r#"{"k":"v"}"#));
+        // And it survives a serialize round-trip.
+        let reser = serde_json::to_string(&dep).unwrap();
+        let dep2: Dependency = serde_json::from_str(&reser).unwrap();
+        assert_eq!(dep, dep2);
+    }
+
     // ========================================================================
     // EVENT TESTS
     // ========================================================================
@@ -1746,6 +1988,9 @@ mod tests {
             new_value: Some("closed".to_string()),
             comment: None,
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            agent_name: Some("agent-1".to_string()),
+            harness: Some("codex-cli".to_string()),
+            model: Some("opus-4".to_string()),
         };
 
         let json = serde_json::to_string(&event).unwrap();

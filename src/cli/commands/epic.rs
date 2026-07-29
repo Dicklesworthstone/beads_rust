@@ -4,12 +4,11 @@ use crate::cli::{EpicCloseEligibleArgs, EpicCommands, EpicStatusArgs};
 use crate::config;
 use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
-use crate::model::{EpicStatus, EventType, IssueType};
+use crate::model::{EpicStatus, IssueType, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::storage::{ListFilters, SqliteStorage};
+use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use chrono::Utc;
 use crossterm::style::Stylize;
-use fsqlite_types::value::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;
 
@@ -115,6 +114,8 @@ fn execute_status_with_storage_ctx(
 struct CloseEligibleResult {
     closed: Vec<String>,
     count: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
 
 fn execute_close_eligible(
@@ -157,12 +158,14 @@ fn execute_close_eligible(
             let result = CloseEligibleResult {
                 closed: Vec::new(),
                 count: 0,
+                warnings: Vec::new(),
             };
             ctx.toon(&result);
         } else if ctx.is_json() {
             let result = CloseEligibleResult {
                 closed: Vec::new(),
                 count: 0,
+                warnings: Vec::new(),
             };
             ctx.json_pretty(&result);
         } else if ctx.is_quiet() {
@@ -175,35 +178,17 @@ fn execute_close_eligible(
         return Ok(());
     }
 
-    let mut closed_ids = Vec::new();
     let now = Utc::now();
-    let now_str = now.to_rfc3339();
     let reason = "All children completed";
-
-    // Use a single transaction for efficiency and atomicity
-    storage.mutate("close_eligible_epics", &actor, |conn, ctx| {
-        for epic_status in &epics {
-            let id = &epic_status.epic.id;
-
-            let rows = conn.execute_with_params(
-                "UPDATE issues SET status = 'closed', updated_at = ?, closed_at = ?, close_reason = ? WHERE id = ? AND status != 'closed'",
-                &[
-                    SqliteValue::from(now_str.as_str()),
-                    SqliteValue::from(now_str.as_str()),
-                    SqliteValue::from(reason),
-                    SqliteValue::from(id.as_str()),
-                ],
-            )?;
-
-            if rows > 0 {
-                closed_ids.push(id.clone());
-                ctx.record_event(EventType::Closed, id, Some(reason.to_string()));
-                ctx.mark_dirty(id);
-            }
-        }
-        ctx.invalidate_cache();
-        Ok(())
-    })?;
+    let closed_ids = close_eligible_epics_atomically(
+        storage,
+        &epics,
+        &actor,
+        now,
+        reason,
+        args.transition_comment.as_deref(),
+    )?;
+    let capacity_warnings = storage.take_capacity_warnings();
 
     storage_ctx.flush_no_db_if_dirty()?;
 
@@ -211,25 +196,65 @@ fn execute_close_eligible(
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),
+            warnings: capacity_warnings.clone(),
         };
         ctx.toon(&result);
     } else if ctx.is_json() {
         let result = CloseEligibleResult {
             closed: closed_ids.clone(),
             count: closed_ids.len(),
+            warnings: capacity_warnings.clone(),
         };
         ctx.json_pretty(&result);
     } else if ctx.is_quiet() {
         return Ok(());
     } else if matches!(ctx.mode(), OutputMode::Rich) {
         render_close_result_rich(&closed_ids, ctx);
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     } else {
         println!("✓ Closed {} epic(s)", closed_ids.len());
         for id in &closed_ids {
             println!("  - {}", format_epic_id(id, false));
         }
+        for warning in &capacity_warnings {
+            ctx.warning(&warning.to_string());
+        }
     }
     Ok(())
+}
+
+fn close_eligible_epics_atomically(
+    storage: &mut SqliteStorage,
+    epics: &[EpicStatus],
+    actor: &str,
+    now: chrono::DateTime<Utc>,
+    reason: &str,
+    transition_comment: Option<&str>,
+) -> Result<Vec<String>> {
+    let updates = epics
+        .iter()
+        .map(|epic_status| {
+            (
+                epic_status.epic.id.clone(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    closed_at: Some(Some(now)),
+                    close_reason: Some(Some(reason.to_string())),
+                    transition_comment: transition_comment.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    // The shared storage chokepoint preflights required fields, transition
+    // gates, and final-state capacity for the entire batch before mutating any
+    // epic. It then records comments, status/close events, and dirty markers in
+    // that same transaction.
+    storage.update_issues_atomically(&updates, actor)?;
+    Ok(updates.into_iter().map(|(id, _)| id).collect())
 }
 
 fn load_epic_statuses(storage: &SqliteStorage) -> Result<Vec<EpicStatus>> {
@@ -570,6 +595,8 @@ mod tests {
             external_ref: None,
             source_system: None,
             source_repo: None,
+            source_repo_path: None,
+            agent_context: None,
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -653,6 +680,95 @@ mod tests {
         assert_eq!(epic_status.total_children, 0);
         assert_eq!(epic_status.closed_children, 0);
         assert!(!epic_status.eligible_for_close);
+    }
+
+    #[test]
+    fn close_eligible_epics_rolls_back_entire_batch_on_capacity_failure() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for suffix in ["a", "b"] {
+            let epic_id = format!("bd-epic-cap-{suffix}");
+            let child_id = format!("bd-child-cap-{suffix}");
+            storage
+                .create_issue(
+                    &base_issue(&epic_id, "Epic", IssueType::Epic, Status::Open),
+                    "tester",
+                )
+                .unwrap();
+            let mut child = base_issue(&child_id, "Child", IssueType::Task, Status::Closed);
+            child.closed_at = Some(Utc::now());
+            child.close_reason = Some("Done".to_string());
+            storage.create_issue(&child, "tester").unwrap();
+            storage
+                .add_dependency(&child_id, &epic_id, "parent-child", "tester")
+                .unwrap();
+        }
+
+        let epics: Vec<EpicStatus> = load_epic_statuses(&storage)
+            .unwrap()
+            .into_iter()
+            .filter(|epic| epic.eligible_for_close)
+            .collect();
+        assert_eq!(epics.len(), 2);
+
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "closed".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(3),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let error = close_eligible_epics_atomically(
+            &mut storage,
+            &epics,
+            "tester",
+            Utc::now(),
+            "All children completed",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::BeadsError::WorkflowCapacityExceeded { .. }
+        ));
+        for id in ["bd-epic-cap-a", "bd-epic-cap-b"] {
+            assert_eq!(storage.get_issue(id).unwrap().unwrap().status, Status::Open);
+        }
+
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "closed".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: Some(3),
+                hard: Some(5),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let closed = close_eligible_epics_atomically(
+            &mut storage,
+            &epics,
+            "tester",
+            Utc::now(),
+            "All children completed",
+            None,
+        )
+        .unwrap();
+        assert_eq!(closed.len(), 2);
+
+        let warnings = storage.take_capacity_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one final-state warning is emitted per affected capacity"
+        );
+        assert_eq!(warnings[0].capacity_kind, "status");
+        assert_eq!(warnings[0].capacity_name, "closed");
+        assert_eq!(warnings[0].current, 2);
+        assert_eq!(warnings[0].prospective, 4);
+        assert_eq!(warnings[0].soft_limit, 3);
     }
 
     #[test]

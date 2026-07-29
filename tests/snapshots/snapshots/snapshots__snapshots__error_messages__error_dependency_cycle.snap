@@ -1,7 +1,6 @@
 ---
 source: tests/snapshots/error_messages.rs
-assertion_line: 59
 expression: normalize_output(&output.stderr)
 ---
-Error: Cycle detected in dependencies: ID-REDACTED -> ID-REDACTED
+Error: Cycle detected in dependencies: Adding dependency ID-REDACTED -> ID-REDACTED would create a cycle
 Hint: Remove one dependency to break the cycle

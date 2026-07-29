@@ -13,6 +13,7 @@
 //! - [`sync`] - JSONL import/export operations
 //! - [`config`] - Configuration management
 //! - [`cache`] - Pure cache policies for high-RAM acceleration
+//! - [`coordination`] - Pure swarm coordination evidence contracts
 //! - [`error`] - Error types and handling
 //! - [`format`] - Output formatting (text, JSON)
 //! - [`util`] - Utility functions (hashing, time, paths)
@@ -26,9 +27,11 @@ pub mod cache;
 pub mod cli;
 pub mod close_policy;
 pub mod config;
+pub mod coordination;
 pub mod error;
 pub mod format;
 pub mod health;
+pub mod inheritance;
 pub mod logging;
 pub mod model;
 pub mod output;

@@ -8,12 +8,10 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_stdin};
 use common::harness::parse_created_id;
 use serde_json::Value;
 use std::fs;
-use std::io::Write;
-use std::process::{Command, Stdio};
 use tracing::info;
 
 /// Read and parse the interactions.jsonl file.
@@ -153,7 +151,7 @@ fn e2e_audit_record_with_all_optional_fields() {
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["kind"], "llm_call");
-    assert_eq!(entries[0]["issue_id"], "bd-test123");
+    assert_eq!(entries[0]["issue_id"], "bd-test123"); // invariant: fixture round-trip
     assert_eq!(entries[0]["model"], "claude-3-opus");
     assert_eq!(entries[0]["prompt"], "What is 2+2?");
     assert_eq!(entries[0]["response"], "The answer is 4.");
@@ -559,30 +557,17 @@ fn e2e_audit_record_via_stdin() {
     // Create JSON input
     let json_input = r#"{"kind": "llm_call", "model": "gpt-4", "prompt": "stdin test"}"#;
 
-    // Run br with stdin
-    let br_path = assert_cmd::cargo::cargo_bin!("br");
-    let mut child = Command::new(br_path)
-        .args(["audit", "record", "--stdin"])
-        .current_dir(&workspace.root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("NO_COLOR", "1")
-        .spawn()
-        .expect("spawn br");
-
-    {
-        let stdin = child.stdin.as_mut().expect("stdin");
-        stdin.write_all(json_input.as_bytes()).expect("write stdin");
-    }
-
-    let output = child.wait_with_output().expect("wait for br");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
+    let output = run_br_with_stdin(
+        &workspace,
+        ["audit", "record", "--stdin"],
+        json_input,
+        "record_stdin",
+    );
     assert!(
         output.status.success(),
-        "stdin record failed: stdout={stdout}, stderr={stderr}"
+        "stdin record failed: stdout={}, stderr={}",
+        output.stdout,
+        output.stderr
     );
 
     let entries = read_interactions(&workspace);
@@ -591,6 +576,170 @@ fn e2e_audit_record_via_stdin() {
     assert_eq!(entries[0]["model"], "gpt-4");
     assert_eq!(entries[0]["prompt"], "stdin test");
     info!("e2e_audit_record_via_stdin: done");
+}
+
+#[test]
+fn e2e_audit_coordination_records_and_labels_incident() {
+    common::init_test_logging();
+    info!("e2e_audit_coordination_records_and_labels_incident: start");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(&workspace, ["create", "Coordination incident"], "create");
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let issue_id = parse_created_id(&create.stdout);
+    let snapshot = serde_json::json!({
+        "schema_version": "br.coordination.v1",
+        "claims": [{
+            "issue": {
+                "id": issue_id
+            },
+            "assessment": {
+                "classification": "no_mail_snapshot",
+                "recommended_action": "inspect_mail"
+            },
+            "evidence_summary": "updated_at=2026-05-08T00:00:00Z, assignee=agent-a, reservation_status=no_snapshot"
+        }]
+    });
+
+    let record = run_br_with_stdin(
+        &workspace,
+        [
+            "--actor",
+            "coord-agent",
+            "audit",
+            "coordination",
+            "--stdin",
+            "--command",
+            "br coordination status --json",
+            "--json",
+        ],
+        &snapshot.to_string(),
+        "audit_coordination_record",
+    );
+    assert!(
+        record.status.success(),
+        "coordination audit failed: {}",
+        record.stderr
+    );
+    let output: Value =
+        serde_json::from_str(&extract_json_payload(&record.stdout)).expect("coordination output");
+    let record_id = output["ids"]
+        .as_array()
+        .and_then(|ids| ids.first())
+        .and_then(Value::as_str)
+        .expect("record id");
+    assert_eq!(output["recorded"], 1);
+    assert_eq!(
+        output["snapshot_hash"]
+            .as_str()
+            .expect("snapshot hash")
+            .len(),
+        64
+    );
+
+    let entries = read_interactions(&workspace);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], record_id);
+    assert_eq!(entries[0]["kind"], "coordination_incident");
+    assert_eq!(entries[0]["actor"], "coord-agent");
+    assert_eq!(entries[0]["issue_id"], issue_id);
+    assert_eq!(entries[0]["extra"]["classification"], "no_mail_snapshot");
+    assert_eq!(entries[0]["extra"]["suggested_action"], "inspect_mail");
+    assert_eq!(
+        entries[0]["extra"]["command"],
+        "br coordination status --json"
+    );
+
+    let label = run_br(
+        &workspace,
+        ["audit", "label", record_id, "--label", "reviewed", "--json"],
+        "audit_coordination_label",
+    );
+    assert!(
+        label.status.success(),
+        "coordination audit label failed: {}",
+        label.stderr
+    );
+    let entries = read_interactions(&workspace);
+    assert_eq!(entries.len(), 2);
+    let label_entry = entries
+        .iter()
+        .find(|entry| entry["kind"] == "label")
+        .expect("label audit entry");
+    assert_eq!(label_entry["parent_id"], record_id);
+    assert_eq!(label_entry["label"], "reviewed");
+
+    let log = run_br(
+        &workspace,
+        ["audit", "log", &issue_id, "--json"],
+        "audit_log_json",
+    );
+    assert!(log.status.success(), "audit log failed: {}", log.stderr);
+    let log_json: Value =
+        serde_json::from_str(&extract_json_payload(&log.stdout)).expect("audit log JSON");
+    assert_eq!(log_json["issue_id"], issue_id);
+    assert!(
+        !log_json["events"].as_array().expect("events").is_empty(),
+        "issue audit log should remain visible"
+    );
+
+    info!("e2e_audit_coordination_records_and_labels_incident: done");
+}
+
+#[test]
+fn e2e_audit_coordination_rejects_malformed_snapshot_without_partial_write() {
+    common::init_test_logging();
+    info!("e2e_audit_coordination_rejects_malformed_snapshot_without_partial_write: start");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let snapshot = serde_json::json!({
+        "schema_version": "br.coordination.v1",
+        "claims": [
+            {
+                "issue": {
+                    "id": "br-good"
+                },
+                "assessment": {
+                    "classification": "no_mail_snapshot",
+                    "recommended_action": "inspect_mail"
+                },
+                "evidence_summary": "updated_at=2026-05-08T00:00:00Z"
+            },
+            {
+                "issue": {
+                    "id": "br-bad"
+                },
+                "assessment": {
+                    "classification": "no_mail_snapshot"
+                },
+                "evidence_summary": "missing recommended action"
+            }
+        ]
+    });
+
+    let record = run_br_with_stdin(
+        &workspace,
+        ["audit", "coordination", "--stdin", "--json"],
+        &snapshot.to_string(),
+        "audit_coordination_malformed",
+    );
+
+    assert!(
+        !record.status.success(),
+        "malformed coordination audit should fail"
+    );
+    assert!(
+        read_interactions(&workspace).is_empty(),
+        "malformed snapshots must not partially append audit rows"
+    );
+
+    info!("e2e_audit_coordination_rejects_malformed_snapshot_without_partial_write: done");
 }
 
 #[test]
@@ -775,7 +924,7 @@ fn e2e_audit_with_actor_override() {
 
     let entries = read_interactions(&workspace);
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["actor"], "test-agent");
+    assert_eq!(entries[0]["actor"], "test-agent"); // invariant: hardcoded actor name, not an issue ID
     info!("e2e_audit_with_actor_override: done");
 }
 

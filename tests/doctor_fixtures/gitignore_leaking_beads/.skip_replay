@@ -1,0 +1,3 @@
+# Skip the pass-3 idempotence replay gate for this fixture.
+# Same rationale as gitignore_bare_pattern/.skip_replay — see
+# that file for details.

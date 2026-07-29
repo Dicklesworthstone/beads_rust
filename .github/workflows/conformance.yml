@@ -31,10 +31,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
           toolchain: nightly
 
@@ -42,40 +42,56 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
 
       - name: Install Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
-          go-version: '1.23'
+          # bd v0.46.0 declares `go 1.24.0` in its go.mod.
+          go-version: '1.24'
           cache: false
 
       - name: Build br
         run: cargo build --release
 
-      - name: Clone and build bd (Go beads)
-        id: build_bd
-        continue-on-error: true
+      # br is a port of *classic* beads: SQLite as primary storage with a JSONL
+      # export. bd v0.50.0 moved to a Dolt default and made JSONL-only `no-db` the
+      # default for `bd init`, so only the classic line is a valid parity
+      # reference. tests/common/binary_discovery.rs enforces the same version
+      # window and skips loudly when it is not met.
+      #
+      # This step must not be `continue-on-error`: if the reference binary is
+      # unavailable the parity gate did not run, and reporting success would be
+      # false assurance.
+      - name: Build classic bd (Go beads) conformance reference
         run: |
-          git clone --depth 1 https://github.com/Dicklesworthstone/beads.git ../beads-go
+          set -euo pipefail
+          git clone --depth 1 --branch "$BD_REF" https://github.com/steveyegge/beads.git ../beads-go
           cd ../beads-go
-          go build -o bd ./cmd/beads
-          echo "BD_BINARY=$(pwd)/bd" >> $GITHUB_ENV
+          actual_sha="$(git rev-parse HEAD)"
+          if [ "$actual_sha" != "$BD_COMMIT" ]; then
+            echo "::error::bd $BD_REF resolved to $actual_sha, expected $BD_COMMIT"
+            exit 1
+          fi
+          go build -o bd ./cmd/bd
+          echo "BD_BINARY=$(pwd)/bd" >> "$GITHUB_ENV"
+        env:
+          BD_REF: v0.46.0
+          # Immutable commit for the tag above; tags are mutable, this is not.
+          BD_COMMIT: 812f4e529795df94b680912c996ac9a2ea8e39c6
 
       - name: Verify binaries
-        if: steps.build_bd.outcome == 'success'
         run: |
           echo "=== br version ==="
           ./target/release/br --version
           echo ""
           echo "=== bd version ==="
-          $BD_BINARY version || true
+          "$BD_BINARY" version
 
       - name: Run conformance tests
-        if: steps.build_bd.outcome == 'success'
         run: |
-          VERBOSE_FLAG=""
+          ARGS=()
           if [ "${{ inputs.verbose }}" = "true" ]; then
-            VERBOSE_FLAG="--verbose"
+            ARGS+=(--verbose)
           fi
-          scripts/conformance.sh $VERBOSE_FLAG
+          scripts/conformance.sh "${ARGS[@]}"
         env:
           BD_BINARY: ${{ env.BD_BINARY }}
           CONFORMANCE_STRICT: ${{ inputs.strict_mode && '1' || '0' }}

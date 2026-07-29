@@ -1,0 +1,164 @@
+name: Doctor
+
+# Doctor surface integration (Phase 8 of the world-class-doctor-mode skill).
+#
+# Runs `br doctor health --json` against the repo's own `.beads/` and
+# fails the job if the workspace reports anything non-healthy. Also
+# runs `br doctor capabilities --format json` to lock the contract
+# shape and emits a regression-check stub for `scorecard_history.jsonl`.
+#
+# Action pin policy: every action is sha-pinned (per
+# docs/CI_SUPPLY_CHAIN.md) and matches the pin set already used by
+# .github/workflows/ci.yml so workflow-fragment harnesses can audit
+# them together.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LOG: error
+  BR_NO_AUTOFLUSH: 1
+
+permissions:
+  contents: read
+
+jobs:
+  doctor-health:
+    name: Doctor Health Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2.9.1
+
+      - name: Build br (release)
+        run: cargo build --release
+
+      - name: Doctor health (own .beads/)
+        id: health
+        run: |
+          set -euo pipefail
+          # `br doctor health` exits 1 when findings are present
+          # (DoctorExitCode::FindingsPresent). Under `set -euo pipefail` that
+          # exit propagates through the pipe and kills the step BEFORE the
+          # informational `::warning::` branch below has a chance to fire.
+          # Tolerate the non-zero exit so the conditional can run; the JSON
+          # payload still gets tee'd to /tmp for the uploaded artifact and
+          # the downstream `jq` step.
+          ./target/release/br doctor health --json | tee /tmp/doctor_health.json || true
+          status="$(jq -r '.status // empty' /tmp/doctor_health.json)"
+          echo "status=$status" >>"$GITHUB_OUTPUT"
+          if [ "$status" != "healthy" ]; then
+            echo "::warning::br doctor health reported status=$status"
+            # Non-healthy is informational on this repo for now; the
+            # pre-commit guard blocks at the commit boundary. Once the
+            # repo is consistently clean we can flip this to a hard
+            # failure via:
+            #   exit 1
+          fi
+
+      - name: Doctor capabilities (contract sanity)
+        run: |
+          set -euo pipefail
+          ./target/release/br doctor capabilities --format json | tee /tmp/doctor_caps.json
+          # Lock the contract shape: schema_version must match the
+          # br.doctor.capabilities.v1 envelope and every documented
+          # exit-code variant must be present.
+          jq -e '.schema_version == "br.doctor.capabilities.v1"' /tmp/doctor_caps.json
+          jq -e '(.exit_codes | length) >= 11' /tmp/doctor_caps.json
+          jq -e '.ops_supported | length >= 5' /tmp/doctor_caps.json
+
+      - name: Doctor robot-docs (parseable)
+        run: |
+          set -euo pipefail
+          ./target/release/br doctor robot-docs --format json | tee /tmp/doctor_docs.json
+          jq -e '.schema_version == "br.doctor.robot_docs.v1"' /tmp/doctor_docs.json
+          jq -e '.line_count > 20' /tmp/doctor_docs.json
+
+      - name: Doctor --robot-triage (mega-envelope)
+        run: |
+          set -euo pipefail
+          ./target/release/br doctor --robot-triage --json | tee /tmp/doctor_triage.json
+          jq -e '.schema_version == "br.doctor.triage.v1"' /tmp/doctor_triage.json
+          jq -e 'has("summary") and has("findings") and has("quick_ref")' /tmp/doctor_triage.json
+
+      - name: Fixture suite (default mode)
+        env:
+          TOOL_BIN: ${{ github.workspace }}/target/release/br
+        run: |
+          set -euo pipefail
+          # Default run_all.sh: corrupt → detect → --repair → post_repair
+          # → undo latest → post_undo. Every fixture must pass.
+          bash tests/doctor_fixtures/run_all.sh
+
+      - name: Fixture suite (idempotence replay gate, opt-in)
+        env:
+          TOOL_BIN: ${{ github.workspace }}/target/release/br
+          REPLAY_IDEMPOTENCE: "1"
+        run: |
+          set -euo pipefail
+          # Pass-3: run --repair twice per fixture and assert the
+          # second invocation is a no-op (zero non-empty
+          # actions.jsonl lines in the new run-dir). Fixtures with
+          # .skip_replay markers are honored. Closes the
+          # idempotence-replay gap from the pass-2 scorecard.
+          bash tests/doctor_fixtures/run_all.sh
+
+      - name: Scorecard regression check
+        run: |
+          set -euo pipefail
+          history=".doctor/runs/scorecard_history.jsonl"
+          if [ ! -f "$history" ]; then
+            echo "::notice::no scorecard_history.jsonl yet; skipping regression check"
+            exit 0
+          fi
+          # Take the last two scorecard rows and check that no
+          # dimension regressed by more than 50 points between them.
+          # The skill's diff-scorecards.py lives outside the repo, so
+          # the CI step uses jq only.
+          tail -n 2 "$history" | jq -s '
+            if length < 2 then
+              "ok: history too short, no regression to compare"
+            else
+              .[0].dimensions as $prev
+              | .[1].dimensions as $next
+              | [
+                  $prev | to_entries[] | .key as $k
+                  | ($next[$k] // 0) - .value
+                ]
+              | map(select(. < -50))
+              | length
+              | if . == 0 then "ok: no regression > 50 pts" else
+                  error("regression > 50 pts detected; investigate before merge")
+                end
+            end
+          '
+
+      - name: Upload doctor artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: doctor-envelopes
+          path: |
+            /tmp/doctor_health.json
+            /tmp/doctor_caps.json
+            /tmp/doctor_docs.json
+            /tmp/doctor_triage.json
+          retention-days: 7

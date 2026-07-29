@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — opt-in doctor pre-commit guard for beads_rust.
+#
+# Enable by running once in this repo:
+#   git config core.hooksPath .githooks
+# Disable by either unsetting that config or skipping a single commit:
+#   BR_DOCTOR_SKIP_PRECOMMIT=1 git commit ...
+#
+# What it does:
+#   1. If a `.beads/` workspace exists in the repo root, runs
+#      `br doctor --quick --json` and inspects the result.
+#   2. If `br` is missing, or the workspace has no `.beads/`, or the
+#      environment override is set, the hook exits 0 and lets the
+#      commit through.
+#   3. If `br doctor --quick` returns non-zero AND the JSON envelope
+#      reports a non-healthy workspace_health, the hook BLOCKS the
+#      commit with a one-line summary and the recommended next step.
+#
+# The hook is intentionally fail-open on missing tooling so checking
+# out a stale branch on a fresh machine doesn't strand the developer.
+
+set -u
+
+# --- 0. Bypasses ---------------------------------------------------------------
+
+if [ "${BR_DOCTOR_SKIP_PRECOMMIT:-0}" = "1" ]; then
+    echo "br doctor pre-commit: skipped (BR_DOCTOR_SKIP_PRECOMMIT=1)" >&2
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+if [ -z "$repo_root" ]; then
+    exit 0
+fi
+
+if [ ! -d "$repo_root/.beads" ]; then
+    # No beads workspace; nothing for the doctor to inspect.
+    exit 0
+fi
+
+if ! command -v br >/dev/null 2>&1; then
+    echo "br doctor pre-commit: br not on PATH — skipping" >&2
+    exit 0
+fi
+
+# --- 1. Run the doctor fast path ----------------------------------------------
+
+# `--quick` runs only the cheap detectors and is expected to return in
+# well under a second on a healthy workspace.
+out="$(cd "$repo_root" && RUST_LOG=error BR_NO_AUTOFLUSH=1 br doctor --quick --json 2>/dev/null)"
+status=$?
+
+# --- 2. Decide outcome -------------------------------------------------------
+
+if [ "$status" -eq 0 ]; then
+    exit 0
+fi
+
+# Try to extract workspace_health for a precise diagnosis. If jq is not
+# available or the JSON is malformed, fall back to a generic block.
+health=""
+if command -v jq >/dev/null 2>&1; then
+    health="$(printf '%s' "$out" | jq -r '.workspace_health // empty' 2>/dev/null)"
+fi
+
+cat >&2 <<EOF
+br doctor pre-commit: BLOCKED (exit $status${health:+, workspace_health=$health})
+
+Recommended next step:
+    br doctor --repair --dry-run   # preview the plan (chokepoint-audited)
+    br doctor --repair             # apply with backups + actions.jsonl + undo
+
+Bypass (use sparingly):
+    BR_DOCTOR_SKIP_PRECOMMIT=1 git commit ...
+EOF
+exit 1

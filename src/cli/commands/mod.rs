@@ -7,24 +7,29 @@ use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub mod agents;
 pub mod audit;
 pub mod blocked;
+pub mod capabilities;
+pub mod capacity;
 pub mod changelog;
 pub mod close;
 pub mod comments;
 pub mod completions;
 pub mod config;
+pub mod coordination;
 pub mod count;
 pub mod create;
 pub mod defer;
 pub mod delete;
 pub mod dep;
 pub mod doctor;
+pub mod doctor_subsystems;
 pub mod epic;
+pub mod gate;
 pub mod graph;
 pub mod history;
 pub mod info;
@@ -37,6 +42,7 @@ pub mod q;
 pub mod query;
 pub mod ready;
 pub mod reopen;
+pub mod robot_docs;
 pub mod scheduler;
 pub mod schema;
 pub mod search;
@@ -45,6 +51,7 @@ pub mod stale;
 pub mod stats;
 pub mod sync;
 pub mod update;
+pub mod vcs;
 pub mod version;
 pub mod r#where;
 
@@ -272,21 +279,38 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
     }
 }
 
-pub(super) fn update_issue_with_recovery(
+/// Whether a CLI status filter contains the `all` meta-value
+/// (case-insensitive), meaning "every status" — the same convention
+/// `br lint --status all` uses. Without this, `all` would parse as the
+/// custom status literal `Custom("all")` and silently match nothing
+/// (beads_rust-6ilv).
+pub(super) fn status_filter_requests_all(statuses: &[String]) -> bool {
+    statuses
+        .iter()
+        .any(|status| status.trim().eq_ignore_ascii_case("all"))
+}
+
+/// Self-reported session identity for capacity occupancy and the `session`
+/// capacity scope (GitHub #384 phase 5). Env-only (`BR_SESSION`): a CLI flag
+/// would collide with `br close --session`, which records close metadata,
+/// and session identity is a harness-level property anyway.
+pub(super) fn session_attribution_from_env() -> Option<String> {
+    std::env::var("BR_SESSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(super) fn update_issues_atomically_with_recovery(
     storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,
     command: &str,
-    issue_id: &str,
-    update: &IssueUpdate,
+    updates: &[(String, IssueUpdate)],
     actor: &str,
-) -> crate::Result<Issue> {
-    retry_mutation_with_jsonl_recovery(
-        storage_ctx,
-        allow_recovery,
-        command,
-        Some(issue_id),
-        |storage| storage.update_issue(issue_id, update, actor),
-    )
+) -> crate::Result<Vec<Issue>> {
+    retry_mutation_with_jsonl_recovery(storage_ctx, allow_recovery, command, None, |storage| {
+        storage.update_issues_atomically(updates, actor)
+    })
 }
 
 fn should_attempt_mutation_jsonl_recovery(
@@ -446,7 +470,7 @@ pub(super) fn external_project_db_paths_after_auto_import_if_needed(
 }
 
 pub(super) struct RoutedWorkspaceWriteLock {
-    _lock: Option<File>,
+    _lock: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     beads_dir: Option<PathBuf>,
 }
 
@@ -460,8 +484,8 @@ impl RoutedWorkspaceWriteLock {
     }
 
     pub(super) fn mark_cli_write_lock_held(&self, cli: &mut crate::config::CliOverrides) {
-        if let Some(beads_dir) = &self.beads_dir {
-            cli.held_write_lock_beads_dir = Some(beads_dir.clone());
+        if let (Some(beads_dir), Some(lock)) = (&self.beads_dir, &self._lock) {
+            cli.mark_database_family_lock_held(beads_dir, lock);
         }
     }
 }
@@ -475,16 +499,21 @@ pub(super) fn acquire_routed_workspace_write_lock(
         return Ok(RoutedWorkspaceWriteLock::local());
     }
 
+    let startup = crate::config::load_startup_config_with_paths(beads_dir, None)?;
     let lock_path = beads_dir.join(".write.lock");
-    let file =
-        crate::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout_ms).map_err(|err| {
+    let lock = crate::sync::blocking_database_family_write_lock_with_timeout(
+        beads_dir,
+        &startup.paths.db_path,
+        lock_timeout_ms,
+    )
+    .map_err(|err| {
             BeadsError::Config(format!(
                 "Routed external workspace is busy: target write lock at {} could not be acquired: {err}",
                 lock_path.display()
             ))
         })?;
     Ok(RoutedWorkspaceWriteLock {
-        _lock: Some(file),
+        _lock: Some(Arc::new(lock)),
         beads_dir: Some(beads_dir.to_path_buf()),
     })
 }
@@ -819,6 +848,69 @@ mod tests {
                 .expect("load issue")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn retry_preserves_staged_attribution_across_jsonl_recovery() {
+        // #312 hardening (F1): attribution staged ONCE before the retry helper
+        // must survive a recoverable first-attempt failure and still be stamped
+        // by the post-recovery retry. The attribution is staged exactly once,
+        // OUTSIDE the operation closure, so this genuinely exercises the
+        // take-after-commit fix (not a re-stage workaround).
+        let (_temp, mut storage_ctx) = storage_ctx_with_exported_issue();
+        let mut attempts = 0;
+
+        storage_ctx
+            .storage
+            .set_pending_event_attribution(crate::storage::EventAttribution::new(
+                Some("agent-recovered"),
+                None,
+                Some("opus-4"),
+                None,
+            ));
+
+        retry_mutation_with_jsonl_recovery(
+            &mut storage_ctx,
+            true,
+            "update_issue",
+            Some("bd-1"),
+            |storage| {
+                attempts += 1;
+                if attempts == 1 {
+                    // First attempt: a recoverable corruption error that does NOT
+                    // commit. The staged attribution must NOT be consumed.
+                    Err(BeadsError::Database(FrankenError::DatabaseCorrupt {
+                        detail: "synthetic corruption".to_string(),
+                    }))
+                } else {
+                    // Post-recovery retry: a real committing mutation that should
+                    // stamp the still-staged attribution onto its event.
+                    let update = crate::storage::IssueUpdate {
+                        status: Some(crate::model::Status::InProgress),
+                        ..Default::default()
+                    };
+                    storage.update_issue("bd-1", &update, "tester").map(|_| ())
+                }
+            },
+        )
+        .expect("recovered mutation should stamp staged attribution");
+
+        assert_eq!(attempts, 2, "should recover and retry exactly once");
+
+        let events = storage_ctx
+            .storage
+            .get_events("bd-1", 0)
+            .expect("load events");
+        let status_event = events
+            .iter()
+            .find(|e| e.event_type == crate::model::EventType::StatusChanged)
+            .expect("status_changed event present after recovery");
+        assert_eq!(
+            status_event.agent_name.as_deref(),
+            Some("agent-recovered"),
+            "attribution must survive the JSONL-recovery retry (F1)"
+        );
+        assert_eq!(status_event.model.as_deref(), Some("opus-4"));
     }
 
     #[test]

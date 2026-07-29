@@ -59,8 +59,14 @@ fn e2e_version_json_output() {
     // Check expected fields
     assert!(json.get("version").is_some(), "missing 'version' field");
     assert!(json.get("build").is_some(), "missing 'build' field");
-    assert!(json.get("commit").is_some(), "missing 'commit' field");
-    assert!(json.get("branch").is_some(), "missing 'branch' field");
+    for optional_vcs_field in ["commit", "branch"] {
+        if let Some(value) = json.get(optional_vcs_field) {
+            assert!(
+                value.as_str().is_some_and(|s| !s.trim().is_empty()),
+                "'{optional_vcs_field}' field must be a non-empty string when present"
+            );
+        }
+    }
 }
 
 #[test]

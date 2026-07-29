@@ -23,7 +23,7 @@ Executable implementation: `src/health.rs`.
 | `DatabaseCorrupt` | Recoverable | fsqlite open / integrity_check | Rebuild from JSONL |
 | `DuplicateSchemaRows` | Recoverable | sqlite_master GROUP BY HAVING | Rebuild from JSONL |
 | `DuplicateConfigKeys` | Recoverable | Config table duplicate probe | DELETE+INSERT dedup |
-| `DuplicateMetadataKeys` | Recoverable | Metadata table duplicate probe | DELETE+INSERT dedup |
+| `DuplicateMetadataKeys` | Recoverable | Metadata table duplicate probe | Harmonize rows on metadata write; doctor rebuild collapses duplicates |
 | `NullInNotNullColumn` | Degraded | Schema-aware NULL scan | Backfill or rebuild |
 | `WriteProbeFailed` | Recoverable | Rollback-only doctor write probe | Rebuild from JSONL before writes continue |
 
@@ -43,7 +43,7 @@ Executable implementation: `src/health.rs`.
 | Anomaly | Severity | Detection | Recovery |
 |---------|----------|-----------|----------|
 | `WalCorrupt` | Recoverable | WAL header validation | Delete WAL, rebuild |
-| `SidecarMismatch` | Degraded | WAL exists without SHM or vice versa | Delete orphan |
+| `SidecarMismatch` | Degraded | SHM exists without WAL, a sidecar is not a regular file, or sidecars exist without a database | Quarantine the invalid or dangling sidecar |
 | `TruncatedWal` | Recoverable | WAL file < 32 bytes | Delete truncated WAL |
 | `JournalSidecarPresent` | Degraded | File existence check | Delete journal (incomplete txn) |
 | `StaleRecoveryArtifacts` | Degraded | Recovery temp files present | Clean up |
@@ -85,6 +85,26 @@ Each row is a workspace component; columns indicate which subsystem owns and val
 
 - `report.reliability_audit`: workspace classification evidence derived from `AnomalyClass`.
 - `recovery_audit`: repair action, outcome, applied local actions, quarantine artifacts, and JSONL rebuild counts.
+
+`br sync --status --json` carries the same write-gate fields (beads_rust#334):
+
+- `workspace_health`: the same `healthy`/`degraded`/`recoverable`/`unsafe`
+  vocabulary doctor emits, computed from the cheap signals available in
+  sync-status context only — the shared file-state probes
+  (`classify_file_state`: DB header, WAL/SHM/journal sidecars, JSONL
+  conflict markers, orphaned locks) plus the DB↔JSONL drift booleans
+  (`jsonl_newer` → `jsonl_newer`, `db_newer` → `db_newer`). It does NOT
+  run the full doctor checklist, so doctor-only anomaly codes (count
+  mismatches, integrity-check corruption, write-probe failures, …) never
+  appear here; absence of a code means "not evaluated", not "passed".
+- `reliability_audit`: the matching anomaly evidence record
+  (`source: "sync.status"`, `anomalies[].code/severity/message`), in the
+  same shape as `report.reliability_audit` from doctor.
+- `git_export`: a compatibility slot, not a health probe. Sync always emits
+  `{available:false, reason:"not_probed", diagnostic_command:"br vcs-status --json"}`
+  and omits the former optional observation fields. Consumers that need
+  tracked/worktree/index/hash visibility must explicitly run the isolated,
+  bounded `br vcs-status --json` diagnostic.
 
 The same records are emitted through `tracing` with target `br::reliability` so field logs can be correlated with doctor JSON, quarantined artifacts, and replay fixtures.
 

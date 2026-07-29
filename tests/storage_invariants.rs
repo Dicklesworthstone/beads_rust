@@ -30,6 +30,68 @@ fn issue_ids(issues: &[Issue]) -> HashSet<String> {
     issues.iter().map(|issue| issue.id.clone()).collect()
 }
 
+/// Column assertions for the v16 capacity-exemption tables (GitHub #384
+/// phase 4).
+fn assert_capacity_exemption_schema(conn: &Connection) {
+    let exemption_columns = column_names(conn, "capacity_exemptions");
+    for column in [
+        "issue_id",
+        "capacity_kind",
+        "capacity_name",
+        "provider",
+        "reason",
+        "granted_by",
+        "granted_at",
+        "expires_at",
+        "ended_at",
+        "ended_action",
+        "ended_by",
+    ] {
+        assert!(
+            exemption_columns.contains(column),
+            "missing capacity_exemptions.{column}"
+        );
+    }
+
+    let exemption_history_columns = column_names(conn, "capacity_exemption_history");
+    for column in [
+        "id",
+        "issue_id",
+        "capacity_kind",
+        "capacity_name",
+        "action",
+        "provider",
+        "reason",
+        "actor",
+        "expires_at",
+        "recorded_at",
+    ] {
+        assert!(
+            exemption_history_columns.contains(column),
+            "missing capacity_exemption_history.{column}"
+        );
+    }
+}
+
+/// Column assertions for the v17 capacity-occupancy table (GitHub #384
+/// phase 5).
+fn assert_capacity_occupancy_schema(conn: &Connection) {
+    let occupancy_columns = column_names(conn, "capacity_occupancy");
+    for column in [
+        "issue_id",
+        "actor",
+        "agent_name",
+        "harness",
+        "session",
+        "recorded_at",
+    ] {
+        assert!(
+            occupancy_columns.contains(column),
+            "missing capacity_occupancy.{column}"
+        );
+    }
+}
+
 #[test]
 fn schema_tables_and_columns_exist() {
     let (storage, dir) = test_db_with_dir();
@@ -51,6 +113,12 @@ fn schema_tables_and_columns_exist() {
         "export_hashes",
         "blocked_issues_cache",
         "child_counters",
+        "close_metadata",
+        "gate_result_history",
+        "gate_results",
+        "capacity_exemptions",
+        "capacity_exemption_history",
+        "capacity_occupancy",
     ] {
         assert!(tables.contains(table), "missing table: {table}");
     }
@@ -76,6 +144,27 @@ fn schema_tables_and_columns_exist() {
             "missing blocked_issues_cache.{column}"
         );
     }
+
+    let gate_history_columns = column_names(&conn, "gate_result_history");
+    for column in [
+        "id",
+        "issue_id",
+        "from_status",
+        "to_status",
+        "status_revision",
+        "gate",
+        "provider",
+        "passed",
+        "recorded_at",
+    ] {
+        assert!(
+            gate_history_columns.contains(column),
+            "missing gate_result_history.{column}"
+        );
+    }
+
+    assert_capacity_exemption_schema(&conn);
+    assert_capacity_occupancy_schema(&conn);
 }
 
 #[test]

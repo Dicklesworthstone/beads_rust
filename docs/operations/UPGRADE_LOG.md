@@ -84,9 +84,9 @@ cargo test --lib
 - **Files changed:** `Cargo.toml`, `src/model/mod.rs`, `src/cli/commands/schema.rs`
 - **Tests:** Pass
 
-### serde_yaml 0.9 -> serde_yml 0.0.12 (REPLACED)
-- **Reason:** `serde_yaml` is deprecated and unmaintained; `serde_yml` is a maintained fork with compatible API
-- **Migration:** Renamed all `serde_yaml::` references to `serde_yml::` across 4 source files. Fixed a `match_same_arms` clippy lint exposed by the reformatting
+### serde_yaml 0.9 -> serde_yml crate alias backed by serde_norway 0.9.42 (REPLACED, UPDATED)
+- **Reason:** `serde_yaml` is deprecated and unmaintained. The first replacement used `serde_yml`, but the `serde_yml` package was later archived after unsoundness reports. The current manifest keeps the local `serde_yml` crate alias for compatibility while backing it with the maintained `serde_norway` package.
+- **Migration:** Renamed all `serde_yaml::` references to `serde_yml::` across 4 source files, then repointed the alias from package `serde_yml` to package `serde_norway`. Fixed a `match_same_arms` clippy lint exposed by the reformatting.
 - **Files changed:** `Cargo.toml`, `src/error/mod.rs`, `src/config/mod.rs`, `src/cli/commands/config.rs`, `tests/conformance.rs`
 - **Tests:** Pass
 

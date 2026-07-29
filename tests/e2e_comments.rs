@@ -167,7 +167,7 @@ fn e2e_comments_list_json_structure() {
         "comment should have id"
     );
     assert_eq!(comment["text"], "JSON structure comment");
-    assert_eq!(comment["author"], "test-user");
+    assert_eq!(comment["author"], "test-user"); // invariant: hardcoded actor name, not an issue ID
     assert!(
         comment["created_at"].is_string(),
         "comment should have created_at"

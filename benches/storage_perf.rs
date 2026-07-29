@@ -66,6 +66,8 @@ fn create_test_issue(i: usize) -> Issue {
         external_ref: None,
         source_system: None,
         source_repo: None,
+        source_repo_path: None,
+        agent_context: None,
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -345,28 +347,7 @@ fn bench_update_issue(c: &mut Criterion) {
             let update = IssueUpdate {
                 title: Some(format!("Updated title {counter}")),
                 priority: Some(Priority(((counter % 4) + 1) as i32)),
-                status: None,
-                description: None,
-                design: None,
-                acceptance_criteria: None,
-                notes: None,
-                issue_type: None,
-                assignee: None,
-                owner: None,
-                estimated_minutes: None,
-                due_at: None,
-                defer_until: None,
-                external_ref: None,
-                closed_at: None,
-                close_reason: None,
-                closed_by_session: None,
-                deleted_at: None,
-                deleted_by: None,
-                delete_reason: None,
-                skip_cache_rebuild: false,
-                expect_unassigned: false,
-                claim_exclusive: false,
-                claim_actor: None,
+                ..IssueUpdate::default()
             };
             let _ = storage.update_issue(black_box(&id), black_box(&update), "benchmark");
             counter += 1;
@@ -926,13 +907,16 @@ fn bench_generate_id(c: &mut Criterion) {
     group.bench_function("single", |b| {
         let bench_name = "id/generate/single";
         let bench_start = log_bench_start(bench_name);
-        let generator = IdGenerator::new(IdConfig::with_prefix("bench"));
+        let generator =
+            IdGenerator::new(IdConfig::with_prefix("bench").expect("valid benchmark prefix"));
         let now = Utc::now();
         let mut counter = 0usize;
 
         b.iter(|| {
             let title = format!("Benchmark issue {counter}");
-            let id = generator.generate(black_box(&title), None, None, now, counter, |_| false);
+            let id = generator
+                .generate(black_box(&title), None, None, now, counter, |_| Ok(false))
+                .expect("in-memory collision lookup succeeds");
             counter += 1;
             black_box(id)
         });
@@ -943,16 +927,19 @@ fn bench_generate_id(c: &mut Criterion) {
     group.bench_function("with_collision_check", |b| {
         let bench_name = "id/generate/with_collision_check";
         let bench_start = log_bench_start(bench_name);
-        let generator = IdGenerator::new(IdConfig::with_prefix("bench"));
+        let generator =
+            IdGenerator::new(IdConfig::with_prefix("bench").expect("valid benchmark prefix"));
         let now = Utc::now();
         let mut existing: HashSet<String> = HashSet::new();
         let mut counter = 0usize;
 
         b.iter(|| {
             let title = format!("Benchmark issue {counter}");
-            let id = generator.generate(black_box(&title), None, None, now, counter, |id| {
-                existing.contains(id)
-            });
+            let id = generator
+                .generate(black_box(&title), None, None, now, counter, |id| {
+                    Ok(existing.contains(id))
+                })
+                .expect("in-memory collision lookup succeeds");
             existing.insert(id.clone());
             counter += 1;
             black_box(id)

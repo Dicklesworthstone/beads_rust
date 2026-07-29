@@ -7,129 +7,101 @@ generated_at: "GENERATED_AT"
 schemas:
   BlockedIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
-    title: BlockedIssue
-    description: Blocked issue for blocked view.
+    title: BlockedIssueOutput
+    description: "Minimal issue output for blocked command (bd parity).\n\nContains only the fields that bd's blocked command outputs, plus `blocked_by` info.\nDoes NOT include: `compaction_level`, `original_size`"
     type: object
     properties:
-      id:
-        description: "Unique ID (e.g., \"bd-abc123\")."
-        type: string
-      title:
-        description: Title (1-500 chars).
-        type: string
-      description:
-        description: Detailed description.
-        type[2]: string,"null"
-      design:
-        description: Technical design notes.
-        type[2]: string,"null"
-      acceptance_criteria:
-        description: Acceptance criteria.
-        type[2]: string,"null"
-      notes:
-        description: Additional notes.
-        type[2]: string,"null"
-      status:
-        description: Workflow status.
-        "$ref": #/$defs/Status
-        default: open
-      priority:
-        description: "Priority (0=Critical, 4=Backlog)."
-        "$ref": #/$defs/Priority
-        default: 2
-      issue_type:
-        description: "Issue type (bug, feature, etc.)."
-        "$ref": #/$defs/IssueType
-        default: task
-      assignee:
-        description: Assigned user.
-        type[2]: string,"null"
-      owner:
-        description: Issue owner.
-        type[2]: string,"null"
-      estimated_minutes:
-        description: Estimated effort in minutes.
-        type[2]: integer,"null"
-        format: int32
-      created_at:
-        description: Creation timestamp.
-        type: string
-        format: date-time
-      created_by:
-        description: Creator username.
-        type[2]: string,"null"
-      updated_at:
-        description: Last update timestamp.
-        type: string
-        format: date-time
-      closed_at:
-        description: Closure timestamp.
-        type[2]: string,"null"
-        format: date-time
-      close_reason:
-        description: Reason for closure.
-        type[2]: string,"null"
-      closed_by_session:
-        description: Session ID that closed this issue.
-        type[2]: string,"null"
-      due_at:
-        description: Due date.
-        type[2]: string,"null"
-        format: date-time
-      defer_until:
-        description: Defer until date.
-        type[2]: string,"null"
-        format: date-time
-      external_ref:
-        description: "External reference (e.g., JIRA-123)."
-        type[2]: string,"null"
-      source_system:
-        description: Source system for imported issues.
-        type[2]: string,"null"
-      source_repo:
-        description: Source repository for multi-repo support.
-        type[2]: string,"null"
-      deleted_at:
-        type[2]: string,"null"
-        format: date-time
-      deleted_by.type[2]: string,"null"
-      delete_reason.type[2]: string,"null"
-      original_type.type[2]: string,"null"
-      compaction_level:
-        type[2]: integer,"null"
-        format: int32
-        default: 0
-      compacted_at:
-        type[2]: string,"null"
-        format: date-time
-      compacted_at_commit.type[2]: string,"null"
-      original_size:
-        type[2]: integer,"null"
-        format: int32
-      sender.type[2]: string,"null"
-      ephemeral.type: boolean
-      pinned.type: boolean
-      is_template.type: boolean
-      labels:
+      blocked_by:
         type: array
         items.type: string
-      dependencies:
-        type: array
-        items:
-          "$ref": #/$defs/Dependency
-      comments:
-        type: array
-        items:
-          "$ref": #/$defs/Comment
       blocked_by_count:
         type: integer
         format: uint
         minimum: 0
-      blocked_by:
-        type: array
-        items.type: string
-    required[6]: id,title,created_at,updated_at,blocked_by_count,blocked_by
+      created_at:
+        type: string
+        format: date-time
+      created_by.type[2]: string,"null"
+      description.type[2]: string,"null"
+      id.type: string
+      issue_type:
+        "$ref": #/$defs/IssueType
+      priority:
+        "$ref": #/$defs/Priority
+      status:
+        "$ref": #/$defs/Status
+      title.type: string
+      updated_at:
+        type: string
+        format: date-time
+    required[9]: blocked_by,blocked_by_count,created_at,id,issue_type,priority,status,title,updated_at
     "$defs":
+      IssueType:
+        description: Issue type category.
+        anyOf[2]:
+          - type: string
+            enum[7]: task,bug,feature,epic,chore,docs,question
+          - type: string
+      Priority:
+        description: "Issue priority (0=Critical, 4=Backlog)."
+        type: integer
+        format: int32
+      Status:
+        description: Issue lifecycle status.
+        anyOf[2]:
+          - type: string
+            enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - type: string
+  CoordinationClaimRow:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: CoordinationClaimRow
+    description: One in-progress issue plus its deterministic coordination assessment.
+    type: object
+    properties:
+      issue:
+        "$ref": #/$defs/CoordinationIssueRow
+      agent.anyOf[2]:
+        - "$ref": #/$defs/AgentMailAgentSnapshot
+        - type: "null"
+      assessment:
+        "$ref": #/$defs/ClaimAssessment
+      reclaim_allowed_by_policy.type: boolean
+      required_human_confirmation.type: boolean
+      evidence_summary.type: string
+      suggested_commands:
+        type: array
+        items:
+          "$ref": #/$defs/CoordinationSuggestedCommand
+    required[6]: issue,assessment,reclaim_allowed_by_policy,required_human_confirmation,evidence_summary,suggested_commands
+    "$defs":
+      CoordinationIssueRow:
+        description: Issue context attached to one coordination claim row.
+        type: object
+        properties:
+          id.type: string
+          title.type: string
+          status:
+            "$ref": #/$defs/Status
+          priority:
+            "$ref": #/$defs/Priority
+          issue_type:
+            "$ref": #/$defs/IssueType
+          labels:
+            type: array
+            items.type: string
+          dependency_count:
+            type: integer
+            format: uint
+            minimum: 0
+          dependent_count:
+            type: integer
+            format: uint
+            minimum: 0
+          latest_comments:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationComment
+        required[9]: id,title,status,priority,issue_type,labels,dependency_count,dependent_count,latest_comments
       Status:
         description: Issue lifecycle status.
         anyOf[2]:
@@ -146,53 +118,595 @@ schemas:
           - type: string
             enum[7]: task,bug,feature,epic,chore,docs,question
           - type: string
-      Dependency:
-        description: Relationship between two issues.
+      CoordinationComment:
+        description: Bounded comment excerpt included with a coordination claim row.
         type: object
         properties:
-          issue_id:
-            description: The issue that has the dependency (source).
-            type: string
-          depends_on_id:
-            description: The issue being depended on (target).
-            type: string
-          type:
-            description: Type of dependency.
-            "$ref": #/$defs/DependencyType
-          created_at:
-            description: Creation timestamp.
-            type: string
-            format: date-time
-          created_by:
-            description: Creator.
-            type[2]: string,"null"
-          metadata:
-            description: Optional metadata (JSON).
-            type[2]: string,"null"
-          thread_id:
-            description: Thread ID for conversation linking.
-            type[2]: string,"null"
-        required[4]: issue_id,depends_on_id,type,created_at
-      DependencyType:
-        description: Dependency relationship type.
-        anyOf[2]:
-          - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
-          - type: string
-      Comment:
-        description: A comment on an issue.
-        type: object
-        properties:
-          id:
-            type: integer
-            format: int64
-          issue_id.type: string
           author.type: string
           text.type: string
           created_at:
             type: string
             format: date-time
-        required[5]: id,issue_id,author,text,created_at
+        required[3]: author,text,created_at
+      AgentMailAgentSnapshot:
+        description: Minimal offline agent-liveness snapshot row exported from Agent Mail.
+        type: object
+        properties:
+          name.type: string
+          task_description.type: string
+          last_active_ts:
+            type: string
+            format: date-time
+          contact_policy.type: string
+        required[4]: name,task_description,last_active_ts,contact_policy
+      ClaimAssessment:
+        description: Deterministic assessment for one in-progress claim.
+        type: object
+        properties:
+          assignee.type[2]: string,"null"
+          owner_kind:
+            "$ref": #/$defs/ClaimOwnerKind
+          updated_at:
+            type: string
+            format: date-time
+          updated_age_minutes:
+            type: integer
+            format: int64
+          stale_threshold_minutes:
+            type: integer
+            format: int64
+          abandoned_threshold_minutes:
+            type: integer
+            format: int64
+          reservation:
+            "$ref": #/$defs/ReservationEvidence
+          classification:
+            "$ref": #/$defs/ClaimClassification
+          recommended_action:
+            "$ref": #/$defs/RecommendedAction
+          evidence_sources:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationEvidenceSource
+        required[9]: owner_kind,updated_at,updated_age_minutes,stale_threshold_minutes,abandoned_threshold_minutes,reservation,classification,recommended_action,evidence_sources
+      ClaimOwnerKind:
+        description: Who appears to own the current claim.
+        oneOf[3]{description,type,const}:
+          A named coding-agent swarm participant.,string,swarm_agent
+          A human assignee or operator-owned claim.,string,human
+          Ownership cannot be confidently classified.,string,unknown
+      ReservationEvidence:
+        description: Optional Agent Mail reservation evidence supplied by the caller.
+        oneOf[5]:
+          - description: "No Agent Mail snapshot was supplied, so absence of reservations is not\nevidence of abandonment."
+            type: object
+            properties.state:
+              type: string
+              const: no_snapshot
+            required[1]: state
+          - description: A snapshot was supplied and no matching reservation was found.
+            type: object
+            properties.state:
+              type: string
+              const: no_reservation
+            required[1]: state
+          - description: A matching active reservation exists.
+            type: object
+            properties:
+              state:
+                type: string
+                const: active
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  expires_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: A matching reservation exists but is no longer active.
+            type: object
+            properties:
+              state:
+                type: string
+                const: expired
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  released_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: Snapshot data was supplied but could not be trusted.
+            type: object
+            properties:
+              state:
+                type: string
+                const: invalid_snapshot
+              detail:
+                type: object
+                properties.reason.type: string
+                required[1]: reason
+            required[2]: state,detail
+      ReservationEvidenceProvenance:
+        description: Provenance copied from a matching reservation snapshot.
+        type: object
+        properties:
+          path_pattern.type: string
+          exclusive.type: boolean
+          reason.type[2]: string,"null"
+          expires_ts:
+            type: string
+            format: date-time
+          released_ts:
+            type[2]: string,"null"
+            format: date-time
+          thread_id.type[2]: string,"null"
+          matched_on:
+            type: array
+            items:
+              "$ref": #/$defs/ReservationSnapshotMatchReason
+        required[4]: path_pattern,exclusive,expires_ts,matched_on
+      ReservationSnapshotMatchReason:
+        description: Why an Agent Mail reservation snapshot was associated with an issue.
+        oneOf[3]{description,type,const}:
+          Reservation holder matches the issue assignee.,string,holder_matches_assignee
+          Reservation reason or thread id names the issue id.,string,issue_id
+          A recent issue comment names the reservation path pattern.,string,comment_path
+      ClaimClassification:
+        description: Stable claim classifications used by coordination-aware surfaces.
+        oneOf[7]{description,type,const}:
+          The issue is in progress but has no meaningful assignee.,string,unassigned
+          The claim is still within the owner-specific freshness window.,string,fresh
+          "A live reservation exists, so the claim must not be treated as abandoned.",string,blocked_by_active_reservation
+          "The claim has crossed the stale threshold and no active reservation was\nfound in a supplied snapshot.",string,stale_candidate
+          The claim has crossed a more conservative abandoned threshold.,string,abandoned_likely
+          "The claim is old enough to inspect, but no Agent Mail snapshot was\nsupplied.",string,no_mail_snapshot
+          Evidence conflicts or cannot be trusted.,string,ambiguous
+      RecommendedAction:
+        description: Suggested next action for an operator or agent.
+        oneOf[5]{description,type,const}:
+          Do nothing except continue normal observation.,string,observe
+          Ask the assignee or human operator before touching the claim.,string,ask_owner
+          Inspect Agent Mail reservations or capture a fresh snapshot.,string,inspect_mail
+          "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",string,reclaim_candidate
+          Leave the claim alone because evidence says work may still be active.,string,leave_active
+      CoordinationEvidenceSource:
+        description: Evidence categories present in a claim assessment.
+        oneOf[4]{description,type,const}:
+          "Issue status, assignee, and updated timestamp.",string,issue_metadata
+          Owner-specific stale and abandoned thresholds.,string,policy_threshold
+          A caller-supplied Agent Mail snapshot.,string,agent_mail_snapshot
+          Explicit absence of an Agent Mail snapshot.,string,no_agent_mail_snapshot
+      CoordinationSuggestedCommand:
+        description: A command suggestion emitted for an operator to review and run manually.
+        type: object
+        properties:
+          purpose:
+            "$ref": #/$defs/CoordinationSuggestedCommandPurpose
+          command.type: string
+        required[2]: purpose,command
+      CoordinationSuggestedCommandPurpose:
+        description: Role for a suggested coordination command.
+        oneOf[2]{description,type,const}:
+          Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
+          Claim the issue after the audit comment is recorded.,string,claim_issue
+  CoordinationStatusOutput:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: CoordinationStatusOutput
+    description: Top-level machine-readable coordination status shape.
+    type: object
+    properties:
+      schema_version.type: string
+      generated_at:
+        type: string
+        format: date-time
+      summary:
+        "$ref": #/$defs/CoordinationSummary
+      claims:
+        type: array
+        items:
+          "$ref": #/$defs/CoordinationClaimRow
+      capacity:
+        description: "Workflow capacity occupancy (GitHub #384 phase 6). Absent when no\ncapacity is configured, preserving the pre-capacity\n`br.coordination.v1` payload shape."
+        type: array
+        items:
+          "$ref": #/$defs/CapacityStat
+    required[4]: schema_version,generated_at,summary,claims
+    "$defs":
+      CoordinationSummary:
+        description: Count summary for coordination status output.
+        type: object
+        properties:
+          total_claims:
+            type: integer
+            format: uint
+            minimum: 0
+          workspace:
+            "$ref": #/$defs/CoordinationWorkspaceCounts
+          unassigned:
+            type: integer
+            format: uint
+            minimum: 0
+          fresh:
+            type: integer
+            format: uint
+            minimum: 0
+          blocked_by_active_reservation:
+            type: integer
+            format: uint
+            minimum: 0
+          stale_candidate:
+            type: integer
+            format: uint
+            minimum: 0
+          abandoned_likely:
+            type: integer
+            format: uint
+            minimum: 0
+          no_mail_snapshot:
+            type: integer
+            format: uint
+            minimum: 0
+          ambiguous:
+            type: integer
+            format: uint
+            minimum: 0
+        required[9]: total_claims,workspace,unassigned,fresh,blocked_by_active_reservation,stale_candidate,abandoned_likely,no_mail_snapshot,ambiguous
+      CoordinationWorkspaceCounts:
+        description: Workspace context counts shown next to hidden-claim diagnosis.
+        type: object
+        properties:
+          open:
+            type: integer
+            format: uint
+            minimum: 0
+          ready:
+            type: integer
+            format: uint
+            minimum: 0
+          blocked:
+            type: integer
+            format: uint
+            minimum: 0
+          in_progress:
+            type: integer
+            format: uint
+            minimum: 0
+          deferred:
+            type: integer
+            format: uint
+            minimum: 0
+          closed:
+            type: integer
+            format: uint
+            minimum: 0
+        required[6]: open,ready,blocked,in_progress,deferred,closed
+      CoordinationClaimRow:
+        description: One in-progress issue plus its deterministic coordination assessment.
+        type: object
+        properties:
+          issue:
+            "$ref": #/$defs/CoordinationIssueRow
+          agent.anyOf[2]:
+            - "$ref": #/$defs/AgentMailAgentSnapshot
+            - type: "null"
+          assessment:
+            "$ref": #/$defs/ClaimAssessment
+          reclaim_allowed_by_policy.type: boolean
+          required_human_confirmation.type: boolean
+          evidence_summary.type: string
+          suggested_commands:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationSuggestedCommand
+        required[6]: issue,assessment,reclaim_allowed_by_policy,required_human_confirmation,evidence_summary,suggested_commands
+      CoordinationIssueRow:
+        description: Issue context attached to one coordination claim row.
+        type: object
+        properties:
+          id.type: string
+          title.type: string
+          status:
+            "$ref": #/$defs/Status
+          priority:
+            "$ref": #/$defs/Priority
+          issue_type:
+            "$ref": #/$defs/IssueType
+          labels:
+            type: array
+            items.type: string
+          dependency_count:
+            type: integer
+            format: uint
+            minimum: 0
+          dependent_count:
+            type: integer
+            format: uint
+            minimum: 0
+          latest_comments:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationComment
+        required[9]: id,title,status,priority,issue_type,labels,dependency_count,dependent_count,latest_comments
+      Status:
+        description: Issue lifecycle status.
+        anyOf[2]:
+          - type: string
+            enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
+          - type: string
+      Priority:
+        description: "Issue priority (0=Critical, 4=Backlog)."
+        type: integer
+        format: int32
+      IssueType:
+        description: Issue type category.
+        anyOf[2]:
+          - type: string
+            enum[7]: task,bug,feature,epic,chore,docs,question
+          - type: string
+      CoordinationComment:
+        description: Bounded comment excerpt included with a coordination claim row.
+        type: object
+        properties:
+          author.type: string
+          text.type: string
+          created_at:
+            type: string
+            format: date-time
+        required[3]: author,text,created_at
+      AgentMailAgentSnapshot:
+        description: Minimal offline agent-liveness snapshot row exported from Agent Mail.
+        type: object
+        properties:
+          name.type: string
+          task_description.type: string
+          last_active_ts:
+            type: string
+            format: date-time
+          contact_policy.type: string
+        required[4]: name,task_description,last_active_ts,contact_policy
+      ClaimAssessment:
+        description: Deterministic assessment for one in-progress claim.
+        type: object
+        properties:
+          assignee.type[2]: string,"null"
+          owner_kind:
+            "$ref": #/$defs/ClaimOwnerKind
+          updated_at:
+            type: string
+            format: date-time
+          updated_age_minutes:
+            type: integer
+            format: int64
+          stale_threshold_minutes:
+            type: integer
+            format: int64
+          abandoned_threshold_minutes:
+            type: integer
+            format: int64
+          reservation:
+            "$ref": #/$defs/ReservationEvidence
+          classification:
+            "$ref": #/$defs/ClaimClassification
+          recommended_action:
+            "$ref": #/$defs/RecommendedAction
+          evidence_sources:
+            type: array
+            items:
+              "$ref": #/$defs/CoordinationEvidenceSource
+        required[9]: owner_kind,updated_at,updated_age_minutes,stale_threshold_minutes,abandoned_threshold_minutes,reservation,classification,recommended_action,evidence_sources
+      ClaimOwnerKind:
+        description: Who appears to own the current claim.
+        oneOf[3]{description,type,const}:
+          A named coding-agent swarm participant.,string,swarm_agent
+          A human assignee or operator-owned claim.,string,human
+          Ownership cannot be confidently classified.,string,unknown
+      ReservationEvidence:
+        description: Optional Agent Mail reservation evidence supplied by the caller.
+        oneOf[5]:
+          - description: "No Agent Mail snapshot was supplied, so absence of reservations is not\nevidence of abandonment."
+            type: object
+            properties.state:
+              type: string
+              const: no_snapshot
+            required[1]: state
+          - description: A snapshot was supplied and no matching reservation was found.
+            type: object
+            properties.state:
+              type: string
+              const: no_reservation
+            required[1]: state
+          - description: A matching active reservation exists.
+            type: object
+            properties:
+              state:
+                type: string
+                const: active
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  expires_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: A matching reservation exists but is no longer active.
+            type: object
+            properties:
+              state:
+                type: string
+                const: expired
+              detail:
+                type: object
+                properties:
+                  holder.type: string
+                  released_at:
+                    type[2]: string,"null"
+                    format: date-time
+                  provenance.anyOf[2]:
+                    - "$ref": #/$defs/ReservationEvidenceProvenance
+                    - type: "null"
+                required[1]: holder
+            required[2]: state,detail
+          - description: Snapshot data was supplied but could not be trusted.
+            type: object
+            properties:
+              state:
+                type: string
+                const: invalid_snapshot
+              detail:
+                type: object
+                properties.reason.type: string
+                required[1]: reason
+            required[2]: state,detail
+      ReservationEvidenceProvenance:
+        description: Provenance copied from a matching reservation snapshot.
+        type: object
+        properties:
+          path_pattern.type: string
+          exclusive.type: boolean
+          reason.type[2]: string,"null"
+          expires_ts:
+            type: string
+            format: date-time
+          released_ts:
+            type[2]: string,"null"
+            format: date-time
+          thread_id.type[2]: string,"null"
+          matched_on:
+            type: array
+            items:
+              "$ref": #/$defs/ReservationSnapshotMatchReason
+        required[4]: path_pattern,exclusive,expires_ts,matched_on
+      ReservationSnapshotMatchReason:
+        description: Why an Agent Mail reservation snapshot was associated with an issue.
+        oneOf[3]{description,type,const}:
+          Reservation holder matches the issue assignee.,string,holder_matches_assignee
+          Reservation reason or thread id names the issue id.,string,issue_id
+          A recent issue comment names the reservation path pattern.,string,comment_path
+      ClaimClassification:
+        description: Stable claim classifications used by coordination-aware surfaces.
+        oneOf[7]{description,type,const}:
+          The issue is in progress but has no meaningful assignee.,string,unassigned
+          The claim is still within the owner-specific freshness window.,string,fresh
+          "A live reservation exists, so the claim must not be treated as abandoned.",string,blocked_by_active_reservation
+          "The claim has crossed the stale threshold and no active reservation was\nfound in a supplied snapshot.",string,stale_candidate
+          The claim has crossed a more conservative abandoned threshold.,string,abandoned_likely
+          "The claim is old enough to inspect, but no Agent Mail snapshot was\nsupplied.",string,no_mail_snapshot
+          Evidence conflicts or cannot be trusted.,string,ambiguous
+      RecommendedAction:
+        description: Suggested next action for an operator or agent.
+        oneOf[5]{description,type,const}:
+          Do nothing except continue normal observation.,string,observe
+          Ask the assignee or human operator before touching the claim.,string,ask_owner
+          Inspect Agent Mail reservations or capture a fresh snapshot.,string,inspect_mail
+          "The issue is a candidate for the documented audit-comment plus claim\nsequence. This is still advisory, not an automatic mutation.",string,reclaim_candidate
+          Leave the claim alone because evidence says work may still be active.,string,leave_active
+      CoordinationEvidenceSource:
+        description: Evidence categories present in a claim assessment.
+        oneOf[4]{description,type,const}:
+          "Issue status, assignee, and updated timestamp.",string,issue_metadata
+          Owner-specific stale and abandoned thresholds.,string,policy_threshold
+          A caller-supplied Agent Mail snapshot.,string,agent_mail_snapshot
+          Explicit absence of an Agent Mail snapshot.,string,no_agent_mail_snapshot
+      CoordinationSuggestedCommand:
+        description: A command suggestion emitted for an operator to review and run manually.
+        type: object
+        properties:
+          purpose:
+            "$ref": #/$defs/CoordinationSuggestedCommandPurpose
+          command.type: string
+        required[2]: purpose,command
+      CoordinationSuggestedCommandPurpose:
+        description: Role for a suggested coordination command.
+        oneOf[2]{description,type,const}:
+          Record the reclaim evidence before touching ownership.,string,add_reclaim_audit_comment
+          Claim the issue after the audit comment is recorded.,string,claim_issue
+      CapacityStat:
+        description: "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included)."
+        type: object
+        properties:
+          name:
+            description: The status or group name.
+            type: string
+          kind:
+            description: `status` or `group`.
+            type: string
+          scope:
+            description: "Scope partition dimension (`repository`, `actor`, ...)."
+            type: string
+          scope_key:
+            description: Partition key within a non-repository scope.
+            type[2]: string,"null"
+          counted:
+            description: Occupancy excluding exemptions (and hierarchy aggregates).
+            type: integer
+            format: uint32
+            minimum: 0
+          aggregate_parents_excluded:
+            description: Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          exempt:
+            description: "Occupancy excluded by active, authorized exemptions."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          soft_limit:
+            description: "Advisory threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          hard_limit:
+            description: "Enforced threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          remaining:
+            description: "`hard_limit - counted`, clamped at zero; absent without a hard limit."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          state:
+            description: `healthy` | `soft-limit` | `at-hard` | `over-hard`.
+            type: string
+          counting_mode:
+            description: Counting mode the numbers were computed under.
+            type: string
+          policy_path:
+            description: Policy location of the limit.
+            type: string
+        required[7]: name,kind,scope,counted,state,counting_mode,policy_path
+  CountGroup:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: CountGroup
+    description: "Row emitted inside `br count --by <field> --json` under `groups[]`.\n\nKeep this in sync with `cli::commands::count::CountGroup`."
+    type: object
+    properties:
+      group:
+        description: "Group label, for example a status, priority, type, assignee, or label."
+        type: string
+      count:
+        description: Number of matching issues in this group.
+        type: integer
+        format: uint
+        minimum: 0
+    required[2]: group,count
   ErrorEnvelope:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: ErrorEnvelope
@@ -218,7 +732,7 @@ schemas:
             description: Whether the operation can be retried
             type: boolean
           context.description: Additional context for debugging (arbitrary JSON)
-        required[3]: code,message,retryable
+        required[5]: code,message,hint,retryable,context
   Issue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: Issue
@@ -301,7 +815,13 @@ schemas:
         description: Source system for imported issues.
         type[2]: string,"null"
       source_repo:
-        description: Source repository for multi-repo support.
+        description: "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`."
+        type[2]: string,"null"
+      source_repo_path:
+        description: "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid."
+        type[2]: string,"null"
+      agent_context:
+        description: "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content."
         type[2]: string,"null"
       deleted_at:
         type[2]: string,"null"
@@ -335,7 +855,7 @@ schemas:
         type: array
         items:
           "$ref": #/$defs/Comment
-    required[4]: id,title,created_at,updated_at
+    required[8]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level
     "$defs":
       Status:
         description: Issue lifecycle status.
@@ -374,7 +894,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -482,7 +1002,13 @@ schemas:
         description: Source system for imported issues.
         type[2]: string,"null"
       source_repo:
-        description: Source repository for multi-repo support.
+        description: "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`."
+        type[2]: string,"null"
+      source_repo_path:
+        description: "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid."
+        type[2]: string,"null"
+      agent_context:
+        description: "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content."
         type[2]: string,"null"
       deleted_at:
         type[2]: string,"null"
@@ -525,7 +1051,12 @@ schemas:
         items:
           "$ref": #/$defs/Event
       parent.type[2]: string,"null"
-    required[4]: id,title,created_at,updated_at
+      rollup:
+        description: "Derived parent-child subtree rollup; present only when the issue has\nlocal parent-child children (GitHub #384 phase 3)."
+        anyOf[2]:
+          - "$ref": #/$defs/RollupSummary
+          - type: "null"
+    required[8]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level
     "$defs":
       Status:
         description: Issue lifecycle status.
@@ -564,7 +1095,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -618,8 +1149,32 @@ schemas:
           created_at:
             type: string
             format: date-time
+          agent_name:
+            description: "Tier 1 attribution: self-reported agent name (issue #312, Layer 3\ncapture-only). Recorded as an audit trail; never gated/enforced on.\n`None` when the mutating command supplied no attribution."
+            type[2]: string,"null"
+          harness:
+            description: "Tier 1 attribution: self-reported harness identifier (capture-only)."
+            type[2]: string,"null"
+          model:
+            description: "Tier 1 attribution: self-reported model identifier (capture-only)."
+            type[2]: string,"null"
         required[5]: id,issue_id,event_type,actor,created_at
       EventType.type: string
+      RollupSummary:
+        description: "Derived parent-child subtree rollup for a parent issue (GitHub #384\nphase 3: hierarchy observability).\n\nThe rollup reports what a parent's subtree is effectively doing without\nmutating the parent's explicit status: an epic can stay `open` while its\nrollup says `in_progress` because a descendant started."
+        type: object
+        properties:
+          status:
+            description: "Furthest-along non-terminal descendant status in workflow order, or\n`closed` when every descendant is terminal."
+            type: string
+          descendants:
+            description: Count of strict parent-child descendants by stored status.
+            type: object
+            additionalProperties:
+              type: integer
+              format: uint32
+              minimum: 0
+        required[2]: status,descendants
   IssueWithCounts:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: IssueWithCounts
@@ -702,7 +1257,13 @@ schemas:
         description: Source system for imported issues.
         type[2]: string,"null"
       source_repo:
-        description: Source repository for multi-repo support.
+        description: "Source repository for multi-repo support — basename of the\ncanonicalized parent of `.beads/`. Stable across clones of the\nsame repo on different machines (different absolute paths\nproduce the same basename). See [`canonical_source_repo`] in\n`cli::commands::create`."
+        type[2]: string,"null"
+      source_repo_path:
+        description: "Absolute canonical path of the source repository. Distinct from\n`source_repo`: this field uniquely identifies the workspace on\nthe machine that produced the issue, which is what multi-repo\nfleet automation needs to route beads back to the right\ndirectory (see beads_rust#289). Two clones of the same repo\nunder `~/Developer/foo` vs `~/Developer/scratch/foo` collide on\n`source_repo` but disagree here. Optional — older databases and\nhand-edited JSONL records without this field are valid."
+        type[2]: string,"null"
+      agent_context:
+        description: "Canonical-JSON governing instructions inherited by descendant\nbeads (beads_rust#297). When set on an ancestor and the project\nhas `inherited_context.enabled = true` in `.beads/config.yaml`,\n`br update --status in_progress` / `--claim` and `br show` emit\nthe ancestor's `agent_context` alongside the child's normal\noutput so the working agent sees the constraints regardless of\ncontext compaction or cold-start lookups.\n\nStorage: TEXT column holding a JSON document (typically an\nobject with `skills`, `constraints`, `references`, `workflow`,\n`metadata` fields, but the schema is intentionally open).\n`None` means \"no inherited context\"; emission for descendants\nsilently skips ancestors with `None` (no error, no noise).\n\nNot displayed in `br list` / `br search` — this is per-bead\ngovernance metadata, not browsable content."
         type[2]: string,"null"
       deleted_at:
         type[2]: string,"null"
@@ -744,7 +1305,7 @@ schemas:
         type: integer
         format: uint
         minimum: 0
-    required[6]: id,title,created_at,updated_at,dependency_count,dependent_count
+    required[10]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level,dependency_count,dependent_count
     "$defs":
       Status:
         description: Issue lifecycle status.
@@ -783,7 +1344,7 @@ schemas:
             description: Creator.
             type[2]: string,"null"
           metadata:
-            description: Optional metadata (JSON).
+            description: "Optional metadata (JSON).\n\nA degenerate empty (or whitespace-only) string is coerced to `None` on\ndeserialization to tolerate legacy JSONL that wrote `\"metadata\":\"\"`\ninstead of omitting the field. See [`deserialize_optional_metadata`]."
             type[2]: string,"null"
           thread_id:
             description: Thread ID for conversation linking.
@@ -828,6 +1389,10 @@ schemas:
       id.type: string
       issue_type:
         "$ref": #/$defs/IssueType
+      labels:
+        description: "Labels attached to the issue.\n\nAlways emitted (as `[]` when empty) so downstream consumers can filter\n`br ready --json` output on labels the same way they filter\n`br list --json` (#309)."
+        type: array
+        items.type: string
       notes.type[2]: string,"null"
       owner.type[2]: string,"null"
       priority:
@@ -838,7 +1403,7 @@ schemas:
       updated_at:
         type: string
         format: date-time
-    required[7]: created_at,id,issue_type,priority,status,title,updated_at
+    required[8]: created_at,id,issue_type,labels,priority,status,title,updated_at
     "$defs":
       IssueType:
         description: Issue type category.
@@ -910,7 +1475,12 @@ schemas:
       recent_activity.anyOf[2]:
         - "$ref": #/$defs/RecentActivity
         - type: "null"
-    required[2]: summary,breakdowns
+      capacity:
+        description: "Workflow capacity occupancy (GitHub #384). Absent when no capacity\nis configured, preserving the pre-capacity payload shape."
+        type: array
+        items:
+          "$ref": #/$defs/CapacityStat
+    required[1]: summary
     "$defs":
       StatsSummary:
         description: Summary statistics for the project.
@@ -1017,6 +1587,269 @@ schemas:
             format: uint
             minimum: 0
         required[7]: hours_tracked,commit_count,issues_created,issues_closed,issues_updated,issues_reopened,total_changes
+      CapacityStat:
+        description: "Observed occupancy of one workflow capacity (GitHub #384 phase 6).\n\nOne row per repository capacity plus one row per occupied partition of\neach scoped capacity, mirroring the enforcement engine's counting\n(exemptions and hierarchy modes included)."
+        type: object
+        properties:
+          name:
+            description: The status or group name.
+            type: string
+          kind:
+            description: `status` or `group`.
+            type: string
+          scope:
+            description: "Scope partition dimension (`repository`, `actor`, ...)."
+            type: string
+          scope_key:
+            description: Partition key within a non-repository scope.
+            type[2]: string,"null"
+          counted:
+            description: Occupancy excluding exemptions (and hierarchy aggregates).
+            type: integer
+            format: uint32
+            minimum: 0
+          aggregate_parents_excluded:
+            description: Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          exempt:
+            description: "Occupancy excluded by active, authorized exemptions."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          soft_limit:
+            description: "Advisory threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          hard_limit:
+            description: "Enforced threshold, if configured."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          remaining:
+            description: "`hard_limit - counted`, clamped at zero; absent without a hard limit."
+            type[2]: integer,"null"
+            format: uint32
+            minimum: 0
+          state:
+            description: `healthy` | `soft-limit` | `at-hard` | `over-hard`.
+            type: string
+          counting_mode:
+            description: Counting mode the numbers were computed under.
+            type: string
+          policy_path:
+            description: Policy location of the limit.
+            type: string
+        required[7]: name,kind,scope,counted,state,counting_mode,policy_path
+  SyncReconcileReceipt:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: SyncReconcileReceipt
+    description: "Versioned receipt for `br sync --reconcile` (`br.sync.reconcile.v1`).\n\nEmitted by both `--dry-run` (plan only, `applied: false`) and apply\n(`applied: true`, with the `apply` block present). Deletion is impossible\nin this mode, so `plan.deleted` is a constant `0`."
+    type: object
+    properties:
+      schema_version:
+        description: Receipt schema identifier (`br.sync.reconcile.v1`).
+        type: string
+      mode:
+        description: "`\"dry_run\"` or `\"apply\"`."
+        type: string
+      applied:
+        description: True when the plan was applied to the database.
+        type: boolean
+      jsonl_path:
+        description: Resolved JSONL path the plan was computed against.
+        type: string
+      source:
+        description: Source (JSONL) witness the plan is bound to.
+        "$ref": #/$defs/ReconcileSourceWitness
+      target:
+        description: Target (database) witness the plan is bound to.
+        "$ref": #/$defs/ReconcileTargetWitness
+      plan:
+        description: Row classification counts.
+        "$ref": #/$defs/ReconcilePlanCounts
+      previews:
+        description: Bounded id previews for the classified sets.
+        "$ref": #/$defs/ReconcileIdPreviews
+      relations:
+        description: Relation rows carried by planned create/update rows.
+        "$ref": #/$defs/ReconcileRelationCounts
+      events_before:
+        description: Event rows before the operation.
+        type: integer
+        format: uint64
+        minimum: 0
+      events_after:
+        description: "Event rows after the operation (always equals `events_before`; the\napply transaction rolls back otherwise)."
+        type: integer
+        format: uint64
+        minimum: 0
+      apply:
+        description: Apply-only details; absent in dry-run receipts.
+        anyOf[2]:
+          - "$ref": #/$defs/ReconcileApplyReceipt
+          - type: "null"
+    required[11]: schema_version,mode,applied,jsonl_path,source,target,plan,previews,relations,events_before,events_after
+    "$defs":
+      ReconcileSourceWitness:
+        description: JSONL-side witness in a reconcile receipt.
+        type: object
+        properties:
+          record_count:
+            description: Non-empty JSONL rows parsed (including ephemeral rows).
+            type: integer
+            format: uint
+            minimum: 0
+          ephemeral_skipped:
+            description: Ephemeral (`-wisp-`) rows excluded from planning.
+            type: integer
+            format: uint
+            minimum: 0
+          content_hash:
+            description: Whitespace-normalized SHA-256 of the JSONL content.
+            type: string
+          mtime:
+            description: RFC3339 mtime of the JSONL file at plan time.
+            type: string
+          size_bytes:
+            description: Byte size of the JSONL file at plan time.
+            type: integer
+            format: uint64
+            minimum: 0
+        required[5]: record_count,ephemeral_skipped,content_hash,mtime,size_bytes
+      ReconcileTargetWitness:
+        description: Database-side witness in a reconcile receipt.
+        type: object
+        properties:
+          db_issue_count:
+            description: Total issue rows at plan time (including tombstones).
+            type: integer
+            format: uint
+            minimum: 0
+          stored_hash_matches_jsonl:
+            description: "Whether the stored `jsonl_content_hash` metadata already matched the\nfile at plan time. True alongside nonzero `created`/`updated` counts\nis the false-equal state this mode repairs."
+            type: boolean
+        required[2]: db_issue_count,stored_hash_matches_jsonl
+      ReconcilePlanCounts:
+        description: Row classification counts in a reconcile receipt.
+        type: object
+        properties:
+          created:
+            description: JSONL rows with no DB counterpart (inserted on apply).
+            type: integer
+            format: uint
+            minimum: 0
+          updated:
+            description: JSONL rows strictly newer than their DB counterpart (updated on apply).
+            type: integer
+            format: uint
+            minimum: 0
+          skipped_equal:
+            description: Rows skipped because timestamps are equal.
+            type: integer
+            format: uint
+            minimum: 0
+          skipped_older:
+            description: Rows skipped because the DB copy is strictly newer.
+            type: integer
+            format: uint
+            minimum: 0
+          skipped_tombstone:
+            description: Rows skipped by tombstone protection.
+            type: integer
+            format: uint
+            minimum: 0
+          deleted:
+            description: "Always 0: additive reconciliation cannot delete."
+            type: integer
+            format: uint
+            minimum: 0
+          db_only:
+            description: Exportable DB issues absent from the JSONL row set (never touched).
+            type: integer
+            format: uint
+            minimum: 0
+        required[7]: created,updated,skipped_equal,skipped_older,skipped_tombstone,deleted,db_only
+      ReconcileIdPreviews:
+        description: Bounded id previews in a reconcile receipt.
+        type: object
+        properties:
+          created_ids:
+            description: First ids (sorted) that would be / were created.
+            type: array
+            items.type: string
+          updated_ids:
+            description: First ids (sorted) that would be / were updated.
+            type: array
+            items.type: string
+          db_only_ids:
+            description: First exportable DB-only ids (sorted).
+            type: array
+            items.type: string
+          preview_limit:
+            description: Per-list truncation cap; counts in `plan` reflect true totals.
+            type: integer
+            format: uint
+            minimum: 0
+        required[4]: created_ids,updated_ids,db_only_ids,preview_limit
+      ReconcileRelationCounts:
+        description: Relation rows carried by planned create/update rows.
+        type: object
+        properties:
+          labels:
+            description: Label rows.
+            type: integer
+            format: uint
+            minimum: 0
+          dependencies:
+            description: Dependency rows.
+            type: integer
+            format: uint
+            minimum: 0
+          comments:
+            description: Comment rows.
+            type: integer
+            format: uint
+            minimum: 0
+        required[3]: labels,dependencies,comments
+      ReconcileApplyReceipt:
+        description: Apply-only block of a reconcile receipt.
+        type: object
+        properties:
+          export_hashes_recorded:
+            description: Export-hash rows recorded for rows whose DB copy now matches JSONL.
+            type: integer
+            format: uint
+            minimum: 0
+          uncertified_local_wins:
+            description: "Skipped rows whose DB copy still differs from JSONL (local wins that\nneed a future flush)."
+            type: integer
+            format: uint
+            minimum: 0
+          orphan_dependencies_cleaned:
+            description: Dangling dependency rows removed from just-written issues.
+            type: integer
+            format: uint
+            minimum: 0
+          blocked_cache_entries:
+            description: Blocked-cache rows after rebuild (0 when no row changed).
+            type: integer
+            format: uint
+            minimum: 0
+          child_counter_entries:
+            description: Child-counter rows after rebuild (0 when no row changed).
+            type: integer
+            format: uint
+            minimum: 0
+          needs_flush_set:
+            description: "Whether `needs_flush` was set because local state still diverges from\nJSONL (db-only rows or uncertified local wins)."
+            type: boolean
+          metadata_repaired:
+            description: "Whether import metadata (content hash + stat witness + import time)\nwas repaired in the apply transaction."
+            type: boolean
+        required[7]: export_hashes_recorded,uncertified_local_wins,orphan_dependencies_cleaned,blocked_cache_entries,child_counter_entries,needs_flush_set,metadata_repaired
   TreeNode:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: TreeNode
@@ -1047,7 +1880,7 @@ schemas:
       truncated:
         description: True when the node has children omitted by `--max-depth`.
         type: boolean
-    required[6]: id,title,depth,priority,status,truncated
+    required[7]: id,title,depth,parent_id,priority,status,truncated
 commands:
   blocked:
     shape: array
@@ -1055,17 +1888,36 @@ commands:
     items_at: .
     item_schema: BlockedIssue
     error_envelope_on_stderr: false
+  capabilities:
+    shape: object
+    jq_filter: .
+    error_envelope_on_stderr: false
+    notes: "Machine-readable command, feature, safety, exit-code, and env-var inventory."
   "comments list":
     shape: array
     jq_filter: ".[]"
     items_at: .
     error_envelope_on_stderr: true
     notes: Empty array if no comments. ErrorEnvelope on stderr if the issue id cannot be resolved.
+  "coordination status":
+    shape: object
+    jq_filter: ".claims[]"
+    items_at: .claims
+    item_schema: CoordinationClaimRow
+    error_envelope_on_stderr: false
+    notes: "Read-only object with workspace summary and `claims[]` rows. The full envelope schema is `CoordinationStatusOutput`."
   count:
     shape: object
     jq_filter: .count
     error_envelope_on_stderr: false
-    notes: Scalar count under `.count`.
+    notes: Ungrouped `br count --json`; scalar count under `.count`. Grouped variants use the `count --by` entry.
+  "count --by":
+    shape: object
+    jq_filter: ".groups[]"
+    items_at: .groups
+    item_schema: CountGroup
+    error_envelope_on_stderr: false
+    notes: For `br count --by <status|priority|type|assignee|label> --json`. The wrapper object also includes `total`.
   "dep list":
     shape: array
     jq_filter: ".[]"
@@ -1101,6 +1953,11 @@ commands:
     items_at: .
     item_schema: ReadyIssue
     error_envelope_on_stderr: false
+  "robot-docs guide":
+    shape: object
+    jq_filter: .
+    error_envelope_on_stderr: false
+    notes: JSON/TOON modes wrap the concise agent guide; text mode prints the guide directly.
   search:
     shape: array
     jq_filter: ".[]"

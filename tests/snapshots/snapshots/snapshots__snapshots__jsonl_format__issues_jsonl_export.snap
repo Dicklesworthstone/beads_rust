@@ -2,5 +2,5 @@
 source: tests/snapshots/jsonl_format.rs
 expression: normalized
 ---
-{"id":"ISSUE_ID","title":"JSONL issue one","status":"open","priority":2,"issue_type":"task","created_at":"TIMESTAMP","created_by":"ACTOR","updated_at":"TIMESTAMP","source_repo":".","compaction_level":0,"original_size":0}
-{"id":"ISSUE_ID","title":"JSONL issue two","status":"open","priority":2,"issue_type":"task","created_at":"TIMESTAMP","created_by":"ACTOR","updated_at":"TIMESTAMP","source_repo":".","compaction_level":0,"original_size":0}
+{"id":"ISSUE_ID","title":"JSONL issue one","status":"open","priority":2,"issue_type":"task","created_at":"TIMESTAMP","created_by":"ACTOR","updated_at":"TIMESTAMP","source_repo":"SOURCE_REPO","source_repo_path":"SOURCE_REPO","compaction_level":0,"original_size":0}
+{"id":"ISSUE_ID","title":"JSONL issue two","status":"open","priority":2,"issue_type":"task","created_at":"TIMESTAMP","created_by":"ACTOR","updated_at":"TIMESTAMP","source_repo":"SOURCE_REPO","source_repo_path":"SOURCE_REPO","compaction_level":0,"original_size":0}

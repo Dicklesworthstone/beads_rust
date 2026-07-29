@@ -63,7 +63,7 @@ br sync --flush-only
   - Use `--format json` or `--format toon` when the command supports it.
   - `--json` always forces JSON.
   - For mutation commands such as `update` and `close`, prefer global `--json`; do not assume every mutation command has command-local `--format`.
-- When scripting, route stderr separately; errors may be emitted as structured JSON on stderr.
+- When scripting with `--json`, parse stdout for BOTH success data and the structured error envelope (selected by exit code); stderr carries human diagnostics, `RUST_LOG` output, and non-fatal structured warnings — never the envelope. See `docs/agent/ERRORS.md`.
 
 ## Agent smoke test
 

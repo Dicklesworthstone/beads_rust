@@ -935,6 +935,9 @@ mod tests {
         );
         let expected_tables = vec![
             "blocked_issues_cache".to_string(),
+            "capacity_exemption_history".to_string(),
+            "capacity_exemptions".to_string(),
+            "capacity_occupancy".to_string(),
             "child_counters".to_string(),
             "close_metadata".to_string(),
             "comments".to_string(),
@@ -943,6 +946,8 @@ mod tests {
             "dirty_issues".to_string(),
             "events".to_string(),
             "export_hashes".to_string(),
+            "gate_result_history".to_string(),
+            "gate_results".to_string(),
             "issues".to_string(),
             "labels".to_string(),
             "metadata".to_string(),

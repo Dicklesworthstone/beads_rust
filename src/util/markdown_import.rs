@@ -8,7 +8,7 @@
 //! - Per-issue sections are H3 lines: `### Section Name`
 //! - Recognized sections (case-insensitive):
 //!   - ID, Priority, Type, Description, Design, Acceptance Criteria (alias Acceptance),
-//!     Assignee, Labels, Dependencies (alias Deps)
+//!     Assignee, Labels, Dependencies (alias Deps), Agent Context (alias Agent-Context)
 //! - Unknown sections are ignored
 //!
 //! # Intra-file Dependency References
@@ -63,6 +63,9 @@ pub struct ParsedIssue {
     pub labels: Vec<String>,
     /// Dependencies list (format: "type:id" or "id").
     pub dependencies: Vec<String>,
+    /// Agent-context governance text (opaque, same semantics as
+    /// `br update --agent-context`). beads_rust#304.
+    pub agent_context: Option<String>,
 }
 
 /// Section types recognized in the markdown.
@@ -80,6 +83,7 @@ enum Section {
     Assignee,
     Labels,
     Dependencies,
+    AgentContext,
     Unknown,
 }
 
@@ -97,6 +101,7 @@ impl Section {
             "assignee" => Self::Assignee,
             "labels" => Self::Labels,
             "dependencies" | "deps" => Self::Dependencies,
+            "agent context" | "agent-context" | "agent_context" => Self::AgentContext,
             _ => Self::Unknown,
         }
     }
@@ -315,6 +320,10 @@ fn apply_section_to_issue(issue: &mut ParsedIssue, section: Section, lines: &[St
         }
         Section::Dependencies => {
             issue.dependencies = split_dependency_content(&content);
+        }
+        Section::AgentContext => {
+            // Opaque text, same semantics as `br update --agent-context`.
+            issue.agent_context = Some(content);
         }
         Section::Unknown => {
             // Ignore unknown sections
@@ -879,6 +888,79 @@ Explicit description content
             issues[0].description,
             Some("Explicit description content".to_string())
         );
+    }
+
+    #[test]
+    fn test_agent_context_section_parsing() {
+        let content = r"## Epic With Context
+### Agent Context
+Use the porting-to-rust skill. Constraints: no rusqlite; fsqlite only.
+### Type
+epic
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].agent_context.as_deref(),
+            Some("Use the porting-to-rust skill. Constraints: no rusqlite; fsqlite only.")
+        );
+    }
+
+    #[test]
+    fn test_agent_context_section_is_opaque_multiline() {
+        let content = r#"## Issue
+### Agent Context
+{"skills": ["porting-to-rust"], "constraints": ["no rusqlite"]}
+second line of opaque text
+"#;
+        let issues = parse_markdown_content(content).unwrap();
+        let ctx = issues[0].agent_context.as_deref().unwrap();
+        assert!(ctx.contains("porting-to-rust"));
+        assert!(ctx.contains("second line of opaque text"));
+    }
+
+    #[test]
+    fn test_agent_context_aliases() {
+        for header in [
+            "Agent Context",
+            "agent-context",
+            "AGENT CONTEXT",
+            "agent_context",
+        ] {
+            let content = format!("## Issue\n### {header}\nopaque body\n");
+            let issues = parse_markdown_content(&content).unwrap();
+            assert_eq!(
+                issues[0].agent_context.as_deref(),
+                Some("opaque body"),
+                "header `{header}` should map to agent_context"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_context_absent_when_section_missing() {
+        let content = r"## Issue
+### Description
+just a description
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues[0].agent_context, None);
+        assert_eq!(issues[0].description.as_deref(), Some("just a description"));
+    }
+
+    #[test]
+    fn test_unknown_h3_section_still_ignored_alongside_agent_context() {
+        let content = r"## Issue
+### Totally Unknown Section
+ignored content
+### Agent Context
+kept content
+";
+        let issues = parse_markdown_content(content).unwrap();
+        assert_eq!(issues[0].agent_context.as_deref(), Some("kept content"));
+        // The unknown section did not leak into any recognized field.
+        assert_eq!(issues[0].description, None);
+        assert_eq!(issues[0].design, None);
     }
 
     #[test]

@@ -80,6 +80,43 @@ pub fn take_output_serialization_failure() -> Option<crate::BeadsError> {
     })
 }
 
+/// Deferred process exit code for commands that must still emit their normal
+/// (success-shaped) output and persist state, yet signal a detected problem to
+/// scripted callers via a non-zero exit code.
+///
+/// Returning an `Err` from a command handler is not usable for this: it routes
+/// through `handle_error`, which (a) prints a second, structured error payload
+/// — corrupting the single-stream `--json` contract that already carried the
+/// command's real output — and (b) short-circuits *before* the Phase-5
+/// auto-flush, so a mutating command's changes would never reach the JSONL.
+///
+/// Instead, the command prints its output normally, records the intended exit
+/// code here, and `main` applies it after auto-flush and storage teardown.
+/// Used by `br dep cycles` (cycles present) and `br create -f` (declared
+/// dependency edges dropped by cycle detection) — see #368.
+static PENDING_EXIT_CODE: Mutex<Option<i32>> = Mutex::new(None);
+
+/// Record a non-zero exit code to be applied by `main` once the command has
+/// finished emitting output and any auto-flush has completed. The first
+/// recorded code wins; later calls are ignored so the earliest-detected
+/// condition is preserved.
+pub fn record_pending_exit_code(code: i32) {
+    if let Ok(mut recorded) = PENDING_EXIT_CODE.lock()
+        && recorded.is_none()
+    {
+        *recorded = Some(code);
+    }
+}
+
+/// Take the deferred exit code recorded by a command, if any.
+#[must_use]
+pub fn take_pending_exit_code() -> Option<i32> {
+    PENDING_EXIT_CODE
+        .lock()
+        .ok()
+        .and_then(|mut recorded| recorded.take())
+}
+
 #[derive(Default)]
 struct CountingWriter {
     bytes: usize,
@@ -365,6 +402,12 @@ fn write_toon_issue_source_fields<W: Write>(
         issue.source_system.as_deref(),
     )?;
     write_optional_toon_string_field(writer, line, "source_repo", issue.source_repo.as_deref())?;
+    write_optional_toon_string_field(
+        writer,
+        line,
+        "source_repo_path",
+        issue.source_repo_path.as_deref(),
+    )?;
     write_optional_toon_datetime_field(writer, line, "deleted_at", issue.deleted_at.as_ref())?;
     write_optional_toon_string_field(writer, line, "deleted_by", issue.deleted_by.as_deref())?;
     write_optional_toon_string_field(
@@ -442,6 +485,11 @@ fn issue_counts_toon_fields(row: &IssueWithCounts) -> Option<Vec<&'static str>> 
     push_optional_toon_field(&mut fields, issue.external_ref.as_ref(), "external_ref");
     push_optional_toon_field(&mut fields, issue.source_system.as_ref(), "source_system");
     push_optional_toon_field(&mut fields, issue.source_repo.as_ref(), "source_repo");
+    push_optional_toon_field(
+        &mut fields,
+        issue.source_repo_path.as_ref(),
+        "source_repo_path",
+    );
     push_optional_toon_field(&mut fields, issue.deleted_at.as_ref(), "deleted_at");
     push_optional_toon_field(&mut fields, issue.deleted_by.as_ref(), "deleted_by");
     push_optional_toon_field(&mut fields, issue.delete_reason.as_ref(), "delete_reason");
@@ -528,6 +576,9 @@ fn push_toon_issue_counts_field(out: &mut String, row: &IssueWithCounts, field: 
             push_toon_string_value(out, issue.source_system.as_deref().unwrap_or(""));
         }
         "source_repo" => push_toon_string_value(out, issue.source_repo.as_deref().unwrap_or("")),
+        "source_repo_path" => {
+            push_toon_string_value(out, issue.source_repo_path.as_deref().unwrap_or(""));
+        }
         "deleted_at" => push_optional_toon_datetime_value(out, issue.deleted_at.as_ref()),
         "deleted_by" => push_toon_string_value(out, issue.deleted_by.as_deref().unwrap_or("")),
         "delete_reason" => {

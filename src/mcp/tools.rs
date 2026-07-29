@@ -17,10 +17,10 @@ use serde_json::{Value, json};
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
-use crate::storage::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
-use super::BeadsState;
+use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues};
 
 // ---------------------------------------------------------------------------
 // Constants — pre-computed sets for O(1) placeholder detection
@@ -241,33 +241,20 @@ fn generate_issue_id_with_checked_lookup<F>(
     actor: &str,
     now: chrono::DateTime<chrono::Utc>,
     prefix: &str,
+    issue_count: usize,
     id_exists: F,
 ) -> McpResult<String>
 where
     F: Fn(&str) -> Result<bool, BeadsError>,
 {
-    let id_gen = crate::util::id::IdGenerator::new(crate::util::id::IdConfig::with_prefix(prefix));
-    let lookup_error = std::cell::RefCell::new(None);
-    let id = id_gen.generate(
-        title,
-        None,
-        Some(actor),
-        now,
-        0,
-        |candidate| match id_exists(candidate) {
-            Ok(exists) => exists,
-            Err(err) => {
-                *lookup_error.borrow_mut() = Some(err);
-                true
-            }
-        },
+    let id_gen = crate::util::id::IdGenerator::new(
+        crate::util::id::IdConfig::with_prefix(prefix).map_err(beads_to_mcp)?,
     );
-
-    if let Some(err) = lookup_error.into_inner() {
-        return Err(id_lookup_failed("hash ID generation", &err));
+    match id_gen.generate(title, None, Some(actor), now, issue_count, id_exists) {
+        Ok(id) => Ok(id),
+        Err(err @ BeadsError::IdCollision { .. }) => Err(beads_to_mcp(err)),
+        Err(err) => Err(id_lookup_failed("hash ID generation", &err)),
     }
-
-    Ok(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +278,9 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
         // Issue / dependency / operational errors → tool execution error
         ErrorCode::IssueNotFound
         | ErrorCode::AmbiguousId
+        | ErrorCode::ShuttingDown
         | ErrorCode::NothingToDo
+        | ErrorCode::CloseIncomplete
         | ErrorCode::CycleDetected
         | ErrorCode::DependencyNotFound
         | ErrorCode::HasDependents
@@ -347,6 +336,14 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
             data["available_options"] = json!(["critical", "high", "medium", "low", "backlog"]);
             data["fix_hint"] =
                 json!("Aliases also accepted: urgent, important, normal, minor, someday");
+        }
+        ErrorCode::ShuttingDown => {
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "recovery".to_string(),
+                    json!("Retry after starting a fresh br serve process"),
+                );
+            }
         }
         _ => {
             data["discovery_hint"] =
@@ -1190,7 +1187,7 @@ impl ToolHandler for ListIssuesTool {
             name: "list_issues".into(),
             description: Some(
                 "List issues matching filters, or run multiple filtered list queries in one batch. Returns JSON issue summaries.\n\n\
-                 Discovery: Use beads://labels resource to see valid label values.\n\
+                 Discovery: Use beads://schema for accepted status/type/priority values and beads://labels for valid label values.\n\
                  When to use: Exploring the backlog, finding issues by status/type/priority/label.\n\
                  NOT for: Getting full details on one issue — use show_issue instead.\n\
                  Do: Start broad (no filters) then narrow down. Use limit to cap output, or pass queries[] for a per-item batch envelope.\n\
@@ -1283,6 +1280,8 @@ impl ToolHandler for ListIssuesTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(queries) = list_issues_batch_items(&args)? {
             let key = format!("tool:list_issues_batch:{}", json!(&queries));
             let result = cached_read_json(&self.0, key, |storage| {
@@ -1370,7 +1369,13 @@ fn show_issue_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
                             "actor": e.actor,
                             "old_value": e.old_value,
                             "new_value": e.new_value,
-                            "created_at": e.created_at
+                            "created_at": e.created_at,
+                            // Tier 1 attribution (issue #312, Layer 3
+                            // capture-only); null when not supplied. Recorded
+                            // only — never gated on.
+                            "agent_name": e.agent_name,
+                            "harness": e.harness,
+                            "model": e.model
                         })
                     })
                     .collect::<Vec<_>>()
@@ -1510,6 +1515,8 @@ impl ToolHandler for ShowIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(ids) = show_issue_batch_ids(&args)? {
             let key = format!("tool:show_issue_batch:{}", json!(&ids));
             let result = cached_read_json(&self.0, key, |storage| {
@@ -1616,9 +1623,15 @@ fn create_issue_json(
         let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
         next_available_child_id(pid, next_num, |candidate| storage.id_exists(candidate))?
     } else {
-        generate_issue_id_with_checked_lookup(&title, &state.actor, now, prefix, |candidate| {
-            storage.id_exists(candidate)
-        })?
+        let issue_count = storage.count_issues().map_err(beads_to_mcp)?;
+        generate_issue_id_with_checked_lookup(
+            &title,
+            &state.actor,
+            now,
+            prefix,
+            issue_count,
+            |candidate| storage.id_exists(candidate),
+        )?
     };
 
     let issue = Issue {
@@ -1841,6 +1854,8 @@ impl ToolHandler for CreateIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(items) = create_issue_batch_items(&args)? {
             let result = self
                 .0
@@ -2160,6 +2175,8 @@ impl ToolHandler for UpdateIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(items) = update_issue_batch_items(&args)? {
             let result = self
                 .0
@@ -2396,6 +2413,8 @@ impl ToolHandler for CloseIssueTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         let reason = optional_str_arg(&args, "reason")?;
         if let Some(ids) = close_issue_batch_ids(&args)? {
             let result = self.0.with_mutation(|storage| {
@@ -2505,13 +2524,29 @@ fn manage_dependencies_add_json(
         .map_err(beads_to_mcp)?;
 
     require_valid_issue(storage, id)?;
-    require_valid_issue(storage, depends_on)?;
+    if depends_on.starts_with("external:") {
+        if let Some(err) = detect_placeholder(depends_on) {
+            return Err(err);
+        }
+    } else {
+        require_valid_issue(storage, depends_on)?;
+    }
 
-    if dep_type.is_blocking()
-        && storage
-            .would_create_cycle(id, depends_on, true)
-            .map_err(beads_to_mcp)?
-    {
+    let would_create_cycle = if dep_type.is_blocking() && !depends_on.starts_with("external:") {
+        if dep_type == DependencyType::ParentChild {
+            storage
+                .would_create_parent_child_cycle(id, depends_on, true)
+                .map_err(beads_to_mcp)?
+        } else {
+            storage
+                .would_create_cycle(id, depends_on, true)
+                .map_err(beads_to_mcp)?
+        }
+    } else {
+        false
+    };
+
+    if would_create_cycle {
         return Err(manage_dependency_cycle_error(id, depends_on));
     }
 
@@ -2710,7 +2745,7 @@ impl ToolHandler for ManageDependenciesTool {
                     },
                     "depends_on": {
                         "type": "string",
-                        "description": "Target issue ID (required for add/remove). Must be a real ID."
+                        "description": "Target issue ID or external:<project>:<capability> reference (required for add/remove)."
                     },
                     "dep_type": {
                         "type": "string",
@@ -2763,6 +2798,8 @@ impl ToolHandler for ManageDependenciesTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         if let Some(items) = manage_dependencies_batch_items(&args)? {
             let result = if manage_dependencies_batch_is_read_only(&items) {
                 let mut storage = open(&self.0)?;
@@ -2825,10 +2862,7 @@ fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResu
     let blocked = storage.get_blocked_issues().map_err(beads_to_mcp)?;
     let dirty = storage.get_dirty_issue_count().map_err(beads_to_mcp)?;
 
-    let ready_filters = ReadyFilters::default();
-    let ready = storage
-        .get_ready_issues(&ready_filters, ReadySortPolicy::Hybrid)
-        .map_err(beads_to_mcp)?;
+    let ready = mcp_ready_issues(state, storage)?;
 
     // In-progress and deferred counts
     let in_progress_filters = ListFilters {
@@ -2892,6 +2926,7 @@ fn project_overview_json(state: &BeadsState, storage: &SqliteStorage) -> McpResu
                 "beads://labels — all labels with counts",
                 "beads://issues/ready — actionable work",
                 "beads://issues/blocked — stuck items with blockers",
+                "beads://coordination/status — stale-claim diagnosis using br.coordination.v1",
                 "beads://issues/bottlenecks — highest-impact blockers (bv-style)",
                 "beads://graph/health — dependency graph health metrics",
                 "beads://issues/in_progress — current work",
@@ -2927,10 +2962,13 @@ impl ToolHandler for ProjectOverviewTool {
             name: "project_overview".into(),
             description: Some(
                 "Get a high-level project summary: counts by status, top labels, blocked/ready work.\n\n\
+                 Discovery: Pairs with beads://project/info, beads://schema, beads://issues/ready, \
+                 and beads://coordination/status for the documented MCP orientation surface.\n\
                  When to use: Starting a session, getting oriented, understanding project health.\n\
                  NOT for: Detailed filtering — use list_issues with filters instead.\n\
                  Do: Call this first when you connect to understand the project state.\n\
                  Don't: Call repeatedly — the data doesn't change unless you mutate issues.\n\
+                 Boundary: local SQLite/JSONL state only; no git, no network listener, and no live Agent Mail call.\n\
                  Idempotency: Safe to retry; read-only."
                     .into(),
             ),
@@ -2953,10 +2991,11 @@ impl ToolHandler for ProjectOverviewTool {
     }
 
     fn call(&self, _ctx: &McpContext, args: serde_json::Value) -> McpResult<Vec<Content>> {
+        ensure_not_shutting_down()?;
+
         let _ = args;
-        let result = cached_read_json(&self.0, "tool:project_overview".to_string(), |storage| {
-            project_overview_json(&self.0, storage)
-        })?;
+        let storage = self.0.open_read_storage().map_err(beads_to_mcp)?;
+        let result = project_overview_json(&self.0, &storage)?;
         Ok(vec![Content::text(result.to_string())])
     }
 }
@@ -2976,7 +3015,7 @@ mod tests {
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::{IssueUpdate, SqliteStorage};
     use chrono::{TimeZone, Utc};
-    use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, ToolHandler};
+    use fastmcp_rust::{Content, Cx, McpContext, McpErrorCode, Tool, ToolHandler};
     use serde_json::{Value, json};
     use std::{cell::Cell, fs, sync::Arc, time::Instant};
     use tempfile::TempDir;
@@ -2994,7 +3033,11 @@ mod tests {
             db_path,
             beads_dir: beads_dir.clone(),
             jsonl_path: beads_dir.join("issues.jsonl"),
-            write_lock_timeout_ms: Some(25),
+            // Generous enough to ride out a concurrent auto-flush holding
+            // .write.lock under heavy parallel-test load; no test here asserts
+            // the timeout path, so a short value only produces spurious
+            // "Timed out waiting for write lock" flakiness.
+            write_lock_timeout_ms: Some(5_000),
             allow_external_jsonl: false,
             actor: "mcp-test".to_string(),
             issue_prefix: Some("br".to_string()),
@@ -3029,10 +3072,250 @@ mod tests {
             .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
     }
 
+    fn assert_docs_list_mcp_term(term: &str) {
+        for (document_name, document) in [
+            ("README.md", include_str!("../../README.md")),
+            (
+                "docs/AGENT_INTEGRATION.md",
+                include_str!("../../docs/AGENT_INTEGRATION.md"),
+            ),
+            (
+                "docs/CLI_REFERENCE.md",
+                include_str!("../../docs/CLI_REFERENCE.md"),
+            ),
+        ] {
+            assert!(
+                document.contains(term),
+                "{document_name} must document MCP term {term}"
+            );
+        }
+    }
+
+    fn assert_tool_description_mentions(tool: &Tool, expected_terms: &[&str]) {
+        let description = tool
+            .description
+            .as_deref()
+            .expect("MCP tool descriptions are part of the agent contract");
+        assert!(!description.trim().is_empty());
+        for term in expected_terms {
+            assert!(
+                description.contains(term),
+                "MCP tool {} description must mention {term:?}: {description}",
+                tool.name
+            );
+        }
+    }
+
+    fn assert_tool_description_does_not_claim_live_services(tool: &Tool) {
+        let description = tool.description.as_deref().unwrap_or_default();
+        let lower = description.to_ascii_lowercase();
+        for forbidden in [
+            "http://",
+            "https://",
+            "network port",
+            "network socket",
+            "network service",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "MCP tool {} description implies a live service boundary via {forbidden:?}: {description}",
+                tool.name
+            );
+        }
+        if lower.contains("agent mail") {
+            assert!(
+                lower.contains("no live agent mail")
+                    || lower.contains("does not call")
+                    || lower.contains("without"),
+                "Agent Mail mention must be an explicit non-live boundary for {}: {description}",
+                tool.name
+            );
+        }
+        if lower.contains("network listener") {
+            assert!(
+                lower.contains("without network listener")
+                    || lower.contains("no network listener")
+                    || lower.contains("does not listen"),
+                "network listener mention must be an explicit non-live boundary for {}: {description}",
+                tool.name
+            );
+        }
+    }
+
+    fn assert_tool_input_schema_object(tool: &Tool) {
+        assert_eq!(
+            tool.input_schema["type"].as_str(),
+            Some("object"),
+            "MCP tool {} must expose an object input schema",
+            tool.name
+        );
+        assert!(
+            tool.input_schema.get("properties").is_some(),
+            "MCP tool {} must expose input properties",
+            tool.name
+        );
+        assert!(
+            tool.input_schema.get("additionalProperties").is_some(),
+            "MCP tool {} must make extra-argument behavior explicit",
+            tool.name
+        );
+    }
+
+    fn overview_resource_entries(overview: &Value) -> Vec<&str> {
+        overview["discovery"]["resources"]
+            .as_array()
+            .expect("project_overview discovery.resources")
+            .iter()
+            .map(|value| value.as_str().expect("discovery resource entry"))
+            .collect()
+    }
+
     fn assert_batch_counts(batch: &serde_json::Value, count: u64, ok: u64, errors: u64) {
         assert_eq!(batch["count"].as_u64(), Some(count));
         assert_eq!(batch["ok_count"].as_u64(), Some(ok));
         assert_eq!(batch["error_count"].as_u64(), Some(errors));
+    }
+
+    #[test]
+    fn mcp_contract_tool_metadata_matches_docs_and_discovery_contract() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        let tools = vec![
+            ListIssuesTool::new(Arc::clone(&state)).definition(),
+            ShowIssueTool::new(Arc::clone(&state)).definition(),
+            CreateIssueTool::new(Arc::clone(&state)).definition(),
+            UpdateIssueTool::new(Arc::clone(&state)).definition(),
+            CloseIssueTool::new(Arc::clone(&state)).definition(),
+            ManageDependenciesTool::new(Arc::clone(&state)).definition(),
+            ProjectOverviewTool::new(state).definition(),
+        ];
+
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_issues",
+                "show_issue",
+                "create_issue",
+                "update_issue",
+                "close_issue",
+                "manage_dependencies",
+                "project_overview",
+            ]
+        );
+
+        for tool in &tools {
+            assert_docs_list_mcp_term(&tool.name);
+            assert_tool_input_schema_object(tool);
+            assert_tool_description_does_not_claim_live_services(tool);
+        }
+
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "list_issues")
+                .expect("list_issues tool"),
+            &["beads://schema", "beads://labels", "project_overview"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "show_issue")
+                .expect("show_issue tool"),
+            &["list_issues", "project_overview"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "create_issue")
+                .expect("create_issue tool"),
+            &["beads://schema", "beads://labels", "list_issues"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "update_issue")
+                .expect("update_issue tool"),
+            &["list_issues", "beads://schema"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "close_issue")
+                .expect("close_issue tool"),
+            &["list_issues", "update_issue"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "manage_dependencies")
+                .expect("manage_dependencies tool"),
+            &["list_issues", "beads://schema", "beads://issues/blocked"],
+        );
+        assert_tool_description_mentions(
+            tools
+                .iter()
+                .find(|tool| tool.name == "project_overview")
+                .expect("project_overview tool"),
+            &[
+                "beads://project/info",
+                "beads://schema",
+                "beads://issues/ready",
+                "beads://coordination/status",
+                "local SQLite/JSONL",
+            ],
+        );
+    }
+
+    #[test]
+    fn mcp_contract_project_overview_payload_advertises_documented_resources() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(
+            &state,
+            "br-mcp-contract-overview",
+            "overview contract issue",
+        );
+        let storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let overview = project_overview_json(&state, &storage).expect("project overview");
+        let resources = overview_resource_entries(&overview);
+        let overview_tool = ProjectOverviewTool::new(Arc::clone(&state)).definition();
+        let description = overview_tool
+            .description
+            .as_deref()
+            .expect("project_overview description");
+
+        assert_eq!(overview["counts"]["total"].as_u64(), Some(1));
+        assert_eq!(overview["counts"]["ready"].as_u64(), Some(1));
+        assert_eq!(
+            overview["ready_issues"][0]["id"].as_str(),
+            Some("br-mcp-contract-overview")
+        );
+
+        for expected in [
+            "beads://project/info",
+            "beads://schema",
+            "beads://issues/ready",
+            "beads://coordination/status",
+        ] {
+            assert!(
+                resources.iter().any(|entry| entry.starts_with(expected)),
+                "project_overview discovery resources must advertise {expected}: {resources:?}"
+            );
+            assert!(
+                description.contains(expected),
+                "project_overview description must mention payload resource {expected}"
+            );
+            assert_docs_list_mcp_term(expected);
+        }
+
+        assert!(
+            overview["discovery"]["prompts"]
+                .as_array()
+                .is_some_and(|prompts| prompts.iter().any(|prompt| prompt
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("triage"))))
+        );
     }
 
     #[test]
@@ -3062,6 +3345,36 @@ mod tests {
             .expect("fresh project overview after witness mismatch");
         let second = content_json(&second_content);
         assert_eq!(second["counts"]["total"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn project_overview_excludes_unsatisfied_external_blockers_from_ready() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(
+            &state,
+            "br-mcp-external-blocked-ready",
+            "externally blocked overview candidate",
+        );
+        insert_test_issue(&state, "br-mcp-local-ready", "local overview candidate");
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        storage
+            .add_dependency(
+                "br-mcp-external-blocked-ready",
+                "external:missing:capability",
+                "blocks",
+                "mcp-test",
+            )
+            .expect("add external dependency");
+        drop(storage);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ProjectOverviewTool::new(Arc::clone(&state));
+        let content = tool.call(&ctx, json!({})).expect("project overview");
+        let overview = content_json(&content);
+
+        assert_eq!(overview["counts"]["ready"].as_u64(), Some(1));
+        assert_eq!(overview["ready_issues"][0]["id"], "br-mcp-local-ready");
     }
 
     #[test]
@@ -3698,6 +4011,10 @@ mod tests {
 
     #[test]
     fn update_issue_batch_rejects_invalid_comment_before_item_field_mutation() {
+        // Per-item transactional pre-flight: an invalid comment in a batch
+        // update must reject that item without applying its field mutation.
+        // Comment size is no longer a validation axis (long-form bodies are
+        // explicitly supported); use NUL-byte poison to stay invariant.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         insert_test_issue(&state, "br-mcp-update-invalid-comment", "comment original");
@@ -3711,7 +4028,7 @@ mod tests {
                     "updates": [{
                         "id": "br-mcp-update-invalid-comment",
                         "title": "should not mutate",
-                        "comment": "x".repeat(51_201)
+                        "comment": "valid prefix\0NUL byte poisons this comment"
                     }]
                 }),
             )
@@ -3723,7 +4040,7 @@ mod tests {
         assert!(
             batch["items"][0]["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("content") && message.contains("50KB"))
+                .is_some_and(|message| message.contains("content") && message.contains("NUL"))
         );
 
         let storage = SqliteStorage::open(&state.db_path).expect("open storage");
@@ -4464,33 +4781,36 @@ mod tests {
     }
 
     #[test]
-    fn create_issue_rejects_description_over_validator_limit_without_persisting() {
+    fn create_issue_accepts_long_description_through_mcp() {
+        // Long-text issue fields are explicitly unbounded — spec write-ups,
+        // RFC text, etc. routinely exceed the prior 100KB cap. Verify the
+        // MCP path accepts and persists them.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let tool = CreateIssueTool::new(Arc::clone(&state));
         let ctx = McpContext::new(Cx::for_testing(), 1);
-        let description = "x".repeat(102_401);
+        let description = "x".repeat(600_000);
 
-        let err = tool
-            .call(
-                &ctx,
-                json!({
-                    "title": "MCP validator parity",
-                    "description": description
-                }),
-            )
-            .expect_err("MCP create must enforce full issue validation");
-
-        assert_eq!(err.code, McpErrorCode::InvalidParams);
-        assert!(
-            err.message.contains("description") && err.message.contains("exceeds 100KB"),
-            "unexpected MCP error: {err:?}"
-        );
+        tool.call(
+            &ctx,
+            json!({
+                "title": "MCP long-description acceptance",
+                "description": description
+            }),
+        )
+        .expect("MCP create must accept long descriptions");
 
         let storage = SqliteStorage::open(&state.db_path).expect("open storage");
-        assert!(
-            storage.get_all_ids().expect("ids").is_empty(),
-            "invalid MCP issue should not be persisted"
+        let ids = storage.get_all_ids().expect("ids");
+        assert_eq!(ids.len(), 1, "long-description issue must be persisted");
+        let issue = storage
+            .get_issue(&ids[0])
+            .expect("lookup")
+            .expect("issue present");
+        assert_eq!(
+            issue.description.as_deref().map(str::len),
+            Some(600_000),
+            "long description preserved verbatim"
         );
     }
 
@@ -4603,6 +4923,69 @@ mod tests {
                 dep.depends_on_id == second && dep.dep_type == DependencyType::Related
             })
         );
+    }
+
+    #[test]
+    fn manage_dependencies_allows_external_targets() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        insert_test_issue(&state, "br-mcp-external-src", "external dependency source");
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let tool = ManageDependenciesTool::new(Arc::clone(&state));
+
+        let add = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "add",
+                        "id": "br-mcp-external-src",
+                        "depends_on": "external:api:auth",
+                        "dep_type": "blocks"
+                    }),
+                )
+                .expect("add external dependency"),
+        );
+        assert_eq!(add["added"].as_bool(), Some(true));
+        assert_eq!(add["to"].as_str(), Some("external:api:auth"));
+
+        let list = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "list",
+                        "id": "br-mcp-external-src",
+                    }),
+                )
+                .expect("list dependencies"),
+        );
+        let depends_on = list["depends_on"]
+            .as_array()
+            .expect("depends_on should be array");
+        assert!(
+            depends_on.iter().any(|dep| {
+                dep["id"]
+                    .as_str()
+                    .is_some_and(|id| id.eq("external:api:auth"))
+                    && dep["dep_type"].as_str() == Some("blocks")
+            }),
+            "MCP list should include external dependency: {list}"
+        );
+
+        let remove = content_json(
+            &tool
+                .call(
+                    &ctx,
+                    json!({
+                        "action": "remove",
+                        "id": "br-mcp-external-src",
+                        "depends_on": "external:api:auth",
+                    }),
+                )
+                .expect("remove external dependency"),
+        );
+        assert_eq!(remove["removed"].as_bool(), Some(true));
     }
 
     #[test]
@@ -4831,6 +5214,11 @@ mod tests {
 
     #[test]
     fn update_issue_rejects_invalid_comment_before_field_mutation() {
+        // The transactional pre-flight invariant: when an UpdateIssue MCP call
+        // bundles a comment and a field mutation, an invalid comment must
+        // reject the entire call (no partial application). Comment size is
+        // no longer a validation axis, so this test uses an embedded NUL byte
+        // — still rejected by `reject_nul` for SQLite compatibility.
         let temp = TempDir::new().expect("tempdir");
         let state = mcp_test_state(&temp);
         let ctx = McpContext::new(Cx::for_testing(), 1);
@@ -4852,14 +5240,14 @@ mod tests {
                 json!({
                     "id": ids[0],
                     "title": "Mutated despite comment error",
-                    "comment": "x".repeat(51_201)
+                    "comment": "valid prefix\0NUL byte poisons this comment"
                 }),
             )
-            .expect_err("oversized comment must reject the whole MCP update");
+            .expect_err("NUL-byte comment must reject the whole MCP update");
 
         assert_eq!(err.code, McpErrorCode::InvalidParams);
         assert!(
-            err.message.contains("content") && err.message.contains("exceeds 50KB"),
+            err.message.contains("content") && err.message.contains("NUL"),
             "unexpected MCP error: {err:?}"
         );
 
@@ -4916,6 +5304,7 @@ mod tests {
             "mcp-test",
             now,
             "br",
+            0,
             |_| {
                 let call = calls.get();
                 calls.set(call + 1);
@@ -4943,6 +5332,33 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("hash ID generation")
         );
+    }
+
+    #[test]
+    fn hash_id_generation_uses_mcp_database_issue_count() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 11, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let issue_count = 100_000;
+        let expected_length = crate::util::id::IdGenerator::new(
+            crate::util::id::IdConfig::with_prefix("br").expect("valid prefix"),
+        )
+        .optimal_length(issue_count);
+
+        let id = generate_issue_id_with_checked_lookup(
+            "MCP adaptive length",
+            "mcp-test",
+            now,
+            "br",
+            issue_count,
+            |_| Ok(false),
+        )
+        .expect("empty registry produces an ID");
+        let parsed = crate::util::id::parse_id(&id).expect("generated ID parses");
+
+        assert!(expected_length > 3, "test count must widen the hash");
+        assert_eq!(parsed.hash.len(), expected_length);
     }
 
     #[test]

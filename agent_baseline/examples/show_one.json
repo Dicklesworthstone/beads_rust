@@ -1,14 +1,15 @@
 [
   {
-    "id": "bd-azy",
+    "id": "<ISSUE_ID>",
     "title": "Two",
     "status": "open",
     "priority": 0,
     "issue_type": "bug",
-    "created_at": "2026-04-25T00:17:56.149697780Z",
-    "created_by": "ubuntu",
-    "updated_at": "2026-04-25T00:17:56.149697780Z",
-    "source_repo": ".",
+    "created_at": "<TIMESTAMP>",
+    "created_by": "<ACTOR>",
+    "updated_at": "<TIMESTAMP>",
+    "source_repo": "<SOURCE_REPO>",
+    "source_repo_path": "<SOURCE_REPO>",
     "compaction_level": 0,
     "original_size": 0
   }

@@ -1,1 +1,9 @@
-{"version":"0.2.5","build":"dev","commit":"5177042","branch":"main","rust_version":"1.95.0-nightly","target":"x86_64-unknown-linux-gnu","features":["self_update"]}
+{
+  "version": "0.2.19",
+  "build": "<build>",
+  "target": "<target>",
+  "features": [
+    "self_update"
+  ],
+  "rust_version": "<rust_version>"
+}

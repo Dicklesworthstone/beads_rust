@@ -13,8 +13,7 @@ use std::fmt::Write as _;
 use tracing::info;
 
 use beads_rust::util::id::{
-    IdConfig, IdGenerator, compute_id_hash, generate_id, generate_id_seed, is_valid_id_format,
-    parse_id,
+    IdConfig, IdGenerator, compute_id_hash, generate_id_seed, is_valid_id_format, parse_id,
 };
 
 /// Initialize test logging for proptest (called once per test)
@@ -23,6 +22,17 @@ fn init_test_logging() {
         .with_env_filter("info")
         .with_test_writer()
         .try_init();
+}
+
+fn generate_without_registry(
+    title: &str,
+    description: Option<&str>,
+    creator: Option<&str>,
+    created_at: chrono::DateTime<Utc>,
+) -> String {
+    IdGenerator::with_defaults()
+        .generate(title, description, creator, created_at, 0, |_| Ok(false))
+        .expect("infallible empty registry")
 }
 
 proptest! {
@@ -41,7 +51,7 @@ proptest! {
         );
 
         let now = Utc::now();
-        let id = generate_id(&title, None, None, now);
+        let id = generate_without_registry(&title, None, None, now);
 
         info!("proptest_id_valid: output_id={id}");
 
@@ -79,8 +89,8 @@ proptest! {
 
         let now = Utc::now();
 
-        let id1 = generate_id(&title, desc.as_deref(), creator.as_deref(), now);
-        let id2 = generate_id(&title, desc.as_deref(), creator.as_deref(), now);
+        let id1 = generate_without_registry(&title, desc.as_deref(), creator.as_deref(), now);
+        let id2 = generate_without_registry(&title, desc.as_deref(), creator.as_deref(), now);
 
         prop_assert_eq!(id1, id2, "Same inputs must produce same ID");
     }
@@ -98,8 +108,8 @@ proptest! {
 
         let now = Utc::now();
 
-        let id1 = generate_id(&title1, None, None, now);
-        let id2 = generate_id(&title2, None, None, now);
+        let id1 = generate_without_registry(&title1, None, None, now);
+        let id2 = generate_without_registry(&title2, None, None, now);
 
         // Note: This is probabilistic - collisions are possible but rare
         // We just verify IDs are generated (format validation already tested above)
@@ -173,6 +183,15 @@ proptest! {
         prop_assert_eq!(id, reconstructed, "Roundtrip should preserve ID");
     }
 
+    /// Property: arbitrary external input never panics, and every accepted ID
+    /// round-trips through the canonical formatter.
+    #[test]
+    fn arbitrary_id_parse_is_total_and_roundtrips(input in any::<String>()) {
+        if let Ok(parsed) = parse_id(&input) {
+            prop_assert_eq!(parsed.to_id_string(), input);
+        }
+    }
+
     /// Property: Child IDs parse correctly with depth
     #[test]
     fn child_id_depth(
@@ -214,16 +233,35 @@ proptest! {
         init_test_logging();
         info!("proptest_prefix: prefix={prefix}");
 
-        let config = IdConfig::with_prefix(&prefix);
+        let config = IdConfig::with_prefix(&prefix).expect("generated prefix is valid");
         let generator = IdGenerator::new(config);
         let now = Utc::now();
 
-        let id = generator.generate(&title, None, None, now, 0, |_| false);
+        let id = generator
+            .generate(&title, None, None, now, 0, |_| Ok(false))
+            .expect("infallible empty registry");
 
         prop_assert!(
             id.starts_with(&format!("{prefix}-")),
             "ID {id} should start with {prefix}-"
         );
+    }
+
+    /// Property: generation uses the adaptive length selected from the real
+    /// issue count whenever the first candidate is free.
+    #[test]
+    fn generated_hash_uses_adaptive_length(
+        title in "\\PC{1,100}",
+        issue_count in 0usize..=1_000_000usize,
+    ) {
+        let generator = IdGenerator::with_defaults();
+        let expected_length = generator.optimal_length(issue_count);
+        let id = generator
+            .generate(&title, None, None, Utc::now(), issue_count, |_| Ok(false))
+            .expect("infallible empty registry");
+        let parsed = parse_id(&id).expect("generated ID parses");
+
+        prop_assert_eq!(parsed.hash.len(), expected_length);
     }
 }
 
@@ -240,7 +278,9 @@ fn id_no_collisions_batch() {
     // Generate 100 unique IDs with the collision checker
     for i in 0..100 {
         let title = format!("Test Issue Number {i}");
-        let id = generator.generate(&title, None, None, now, i, |id| generated.contains(id));
+        let id = generator
+            .generate(&title, None, None, now, i, |id| Ok(generated.contains(id)))
+            .expect("collision lookup succeeds");
 
         assert!(
             !generated.contains(&id),

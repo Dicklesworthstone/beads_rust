@@ -1,0 +1,96 @@
+{
+  "schema_version": "br.coordination-large-swarm-evidence.v1",
+  "generated_at": "2026-05-08T16:26:50.995844467+00:00",
+  "br_binary_path": "/data/projects/beads_rust/.rch-target/debug/br",
+  "reproduction_command": "BR_E2E_STRESS=1 BR_SYNTHETIC_SEED=20260508 BR_SYNTHETIC_EVIDENCE_ISSUES=100000 cargo test --test bench_synthetic_scale stress_coordination_large_swarm_evidence -- --ignored --nocapture",
+  "config": {
+    "issue_count": 100000,
+    "dependency_density": 0.4,
+    "seed": 20260508,
+    "base_dataset": null,
+    "label_pool_size": 64,
+    "min_labels_per_issue": 1,
+    "max_labels_per_issue": 4,
+    "comment_density": 0.25,
+    "max_comments_per_issue": 3,
+    "simulated_agent_count": 10000,
+    "claim_density": 0.2,
+    "dag_skew": 1.5
+  },
+  "generation": {
+    "issue_count": 100000,
+    "dependency_count": 40065,
+    "label_assignment_count": 250063,
+    "comment_count": 50462,
+    "simulated_agent_count": 10000,
+    "claim_count": 20013,
+    "load_strategy": "direct_sqlite_seed",
+    "generation_ms": 482049,
+    "jsonl_size_bytes": 68547006,
+    "expected_jsonl_size_bytes": 68547006,
+    "db_size_bytes": 195887104,
+    "content_hash": "2bc88279222e392543c7374a9a6e1231fd5bf9ba65c526c707759fce96a4ac8c",
+    "health": {
+      "jsonl_valid": true,
+      "jsonl_issue_count": 100000,
+      "sync_import_ok": false,
+      "doctor_ok": false,
+      "sync_status_clean": false
+    }
+  },
+  "snapshots": {
+    "agents_path": "tests/artifacts/perf/coordination-large-swarm-20260508/coordination-agents.jsonl",
+    "reservations_path": "tests/artifacts/perf/coordination-large-swarm-20260508/coordination-reservations.jsonl",
+    "agent_rows": 10000,
+    "active_reservation_rows": 4000,
+    "expired_reservation_rows": 4000,
+    "agent_snapshot_sha256": "0735f47d4f455fee885ee5abe0081af9fbd3dc04a437a1426207182ac97fac85",
+    "reservation_snapshot_sha256": "49a77b615654c692e6836330f7cb4c2df68d82c04f7c68ab9007d995e27d9294"
+  },
+  "operations": [
+    {
+      "operation": "coordination_status_json",
+      "command": "/data/projects/beads_rust/.rch-target/debug/br coordination status --json --no-auto-import --no-auto-flush --owner-kind swarm-agent --comments 1 --reservations /data/projects/beads_rust/tests/artifacts/perf/coordination-large-swarm-20260508/coordination-reservations.jsonl --agents /data/projects/beads_rust/tests/artifacts/perf/coordination-large-swarm-20260508/coordination-agents.jsonl",
+      "duration_ms": 340507,
+      "peak_rss_bytes": 345931776,
+      "success": true,
+      "output_size_bytes": 37634197,
+      "stdout_sha256": "492c0ab428d3818af08bfaefbaa393deafdd557b296ae712ea913e418e5bd659",
+      "normalized_stdout_sha256": "f58ecdef548280fcc272ef9673ca6c75c27dc9a7cec8823e92b2cf619cbff737",
+      "total_claims": 20013,
+      "active_reservation_matches": 11092,
+      "expired_reservation_matches": 8181,
+      "error": null
+    },
+    {
+      "operation": "coordination_status_toon",
+      "command": "/data/projects/beads_rust/.rch-target/debug/br coordination status --format toon --no-auto-import --no-auto-flush --owner-kind swarm-agent --comments 1 --reservations /data/projects/beads_rust/tests/artifacts/perf/coordination-large-swarm-20260508/coordination-reservations.jsonl --agents /data/projects/beads_rust/tests/artifacts/perf/coordination-large-swarm-20260508/coordination-agents.jsonl",
+      "duration_ms": 340980,
+      "peak_rss_bytes": 355753984,
+      "success": true,
+      "output_size_bytes": 41191574,
+      "stdout_sha256": "7809f42060876649518e80f85ff98bb4c077e9f7006a6651157d2d87413a051d",
+      "normalized_stdout_sha256": "ae3157cbc13319fc4021fea45c895348c1c35d8b72238a08a2b874e7cbf4775f",
+      "total_claims": 20013,
+      "active_reservation_matches": 11092,
+      "expired_reservation_matches": 8181,
+      "error": null
+    }
+  ],
+  "comparison": {
+    "json_normalized_sha256": "f58ecdef548280fcc272ef9673ca6c75c27dc9a7cec8823e92b2cf619cbff737",
+    "toon_normalized_sha256": "ae3157cbc13319fc4021fea45c895348c1c35d8b72238a08a2b874e7cbf4775f",
+    "semantic_hashes_match": false,
+    "json_output_size_bytes": 37634197,
+    "toon_output_size_bytes": 41191574,
+    "json_duration_ms": 340507,
+    "toon_duration_ms": 340980,
+    "rss_available": true
+  },
+  "guardrail": {
+    "latest_comment_limit": 1,
+    "bounded_comment_rows_upper_bound": 20013,
+    "generated_comment_rows": 50462,
+    "baseline": "coordination status must keep comment loading bounded to the latest relevant rows per in_progress issue; publish a new measured evidence report before raising the bound or returning full history"
+  }
+}

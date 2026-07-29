@@ -1008,3 +1008,319 @@ fn ready_cli_priority_p_format() {
     assert_eq!(issues.len(), 1);
     assert_eq!(issues[0]["priority"].as_u64().unwrap(), 0);
 }
+
+// ============================================================================
+// beads_rust-jsgu: invariant-based e2e ordering tests (added 2026-05-09)
+// Pairs with the unit-level rewrite in tests/storage_ready.rs::ready_sort_*
+// (those exercise the storage API directly; these exercise the full CLI).
+// ============================================================================
+
+/// jsgu AC: full CLI round-trip for the priority-ordering contract. Creates
+/// issues at P0/P1/P2/P3 in REVERSE priority order, runs `br ready --json`,
+/// asserts hybrid ordering invariant (high-tier P0/P1 before low-tier P2+).
+#[test]
+fn e2e_ready_with_mixed_priority_high_tier_first() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    eprintln!("[jsgu TEST] e2e_ready_with_mixed_priority_high_tier_first");
+
+    // Create issues in REVERSE priority order to guard against accidental
+    // creation-order pass-through.
+    for (title, prio) in [
+        ("Low", "3"),
+        ("Critical", "0"),
+        ("Medium", "2"),
+        ("High", "1"),
+    ] {
+        let create = run_br(
+            &workspace,
+            ["create", title, "-t", "task", "-p", prio, "--no-auto-flush"],
+            &format!("create_{title}"),
+        );
+        assert!(
+            create.status.success(),
+            "create {title} failed: {}",
+            create.stderr
+        );
+    }
+
+    let out = run_br(&workspace, ["ready", "--json"], "ready");
+    assert!(out.status.success(), "br ready failed: {}", out.stderr);
+    let issues: Vec<Value> =
+        serde_json::from_str(out.stdout.trim()).expect("ready json must parse");
+
+    eprintln!(
+        "  ready order: {:?}",
+        issues
+            .iter()
+            .map(|i| (
+                i["title"].as_str().unwrap_or(""),
+                i["priority"].as_u64().unwrap_or(99)
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    assert_eq!(issues.len(), 4, "expected 4 ready issues");
+
+    // Hybrid invariant: no high-tier (priority ≤ 1) issue appears AFTER any
+    // low-tier (priority > 1) issue.
+    let mut low_seen = false;
+    for issue in &issues {
+        let prio = issue["priority"].as_u64().unwrap_or(99);
+        let title = issue["title"].as_str().unwrap_or("");
+        if prio <= 1 {
+            assert!(
+                !low_seen,
+                "P{prio} issue '{title}' appears after low-tier; full order: {:?}",
+                issues
+                    .iter()
+                    .map(|i| (
+                        i["title"].as_str().unwrap_or(""),
+                        i["priority"].as_u64().unwrap_or(99)
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        } else {
+            low_seen = true;
+        }
+    }
+
+    eprintln!("  [PASS] hybrid ordering invariant holds via CLI");
+}
+
+/// jsgu AC: invariant — `br ready --json` MUST NEVER return duplicate IDs,
+/// regardless of how many fixtures share priority/created_at.
+#[test]
+fn e2e_ready_returns_no_duplicate_ids() {
+    let workspace = BrWorkspace::new();
+    run_br(&workspace, ["init"], "init");
+
+    eprintln!("[jsgu TEST] e2e_ready_returns_no_duplicate_ids");
+
+    // Create 6 issues all at the same priority — id-tiebreak path is exercised
+    for i in 0..6 {
+        let title = format!("issue {i}");
+        let create = run_br(
+            &workspace,
+            ["create", &title, "-t", "task", "-p", "2", "--no-auto-flush"],
+            &format!("c_{i}"),
+        );
+        assert!(create.status.success(), "create failed");
+    }
+
+    let out = run_br(&workspace, ["ready", "--json"], "ready");
+    assert!(out.status.success(), "br ready failed");
+    let issues: Vec<Value> = serde_json::from_str(out.stdout.trim()).expect("must parse");
+    assert_eq!(issues.len(), 6, "all 6 should be ready");
+
+    let mut seen = std::collections::HashSet::new();
+    for issue in &issues {
+        let id = issue["id"].as_str().expect("id field present");
+        assert!(
+            seen.insert(id.to_string()),
+            "duplicate ID {id} in ready output; got: {:?}",
+            issues.iter().map(|i| i["id"].as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    eprintln!("  [PASS] all 6 IDs unique");
+}
+
+/// #354: write a `.beads/policy.yaml` ready group and assert `br ready --json`
+/// honors it end-to-end (config surface → CLI → query → JSON parity).
+fn write_policy(workspace: &BrWorkspace, yaml: &str) {
+    let policy_path = workspace.root.join(".beads").join("policy.yaml");
+    fs::write(&policy_path, yaml).expect("write policy.yaml");
+}
+
+#[test]
+fn ready_default_group_is_open_only_e2e() {
+    let _log = common::test_log("ready_default_group_is_open_only_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let open = run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
+    let open_id = parse_created_id(&open.stdout);
+    let rework = run_br(
+        &workspace,
+        ["create", "Rework work", "-t", "task"],
+        "c_rework",
+    );
+    let rework_id = parse_created_id(&rework.stdout);
+    let set = run_br(
+        &workspace,
+        ["update", &rework_id, "--status", "rework"],
+        "to_rework",
+    );
+    assert!(
+        set.status.success(),
+        "update to rework failed: {}",
+        set.stderr
+    );
+
+    // No policy configured → default ready group is [open].
+    let result = run_br(&workspace, ["ready", "--json"], "ready_default");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert!(
+        issue_list_contains_id(&issues, &open_id),
+        "open issue must be ready by default"
+    );
+    assert!(
+        !issue_list_contains_id(&issues, &rework_id),
+        "rework issue must NOT be ready under the default [open] group"
+    );
+}
+
+#[test]
+fn ready_configured_group_surfaces_rework_e2e() {
+    let _log = common::test_log("ready_configured_group_surfaces_rework_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let open = run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
+    let open_id = parse_created_id(&open.stdout);
+    let rework = run_br(
+        &workspace,
+        ["create", "Rework work", "-t", "task"],
+        "c_rework",
+    );
+    let rework_id = parse_created_id(&rework.stdout);
+    run_br(
+        &workspace,
+        ["update", &rework_id, "--status", "rework"],
+        "to_rework",
+    );
+
+    write_policy(
+        &workspace,
+        "workflow:\n  status_groups:\n    ready: [open, rework]\n",
+    );
+
+    let result = run_br(&workspace, ["ready", "--json"], "ready_configured");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert!(
+        issue_list_contains_id(&issues, &open_id),
+        "open issue must still be ready"
+    );
+    assert!(
+        issue_list_contains_id(&issues, &rework_id),
+        "rework issue must surface under the configured [open, rework] group"
+    );
+    // Status parity: the rework issue keeps its real status in JSON output.
+    let rework_issue = issues
+        .iter()
+        .find(|i| i["id"].as_str() == Some(rework_id.as_str()))
+        .expect("rework issue present");
+    assert_eq!(
+        rework_issue["status"].as_str(),
+        Some("rework"),
+        "returned issue must preserve its real status"
+    );
+}
+
+#[test]
+fn ready_strict_rejects_out_of_vocab_group_e2e() {
+    let _log = common::test_log("ready_strict_rejects_out_of_vocab_group_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    run_br(&workspace, ["create", "Open work", "-t", "task"], "c_open");
+
+    // strict statuses do NOT include `rework`, but the ready group lists it.
+    write_policy(
+        &workspace,
+        "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  status_groups:\n    ready: [open, rework]\n",
+    );
+
+    let result = run_br(&workspace, ["ready", "--json"], "ready_strict_reject");
+    assert!(
+        !result.status.success(),
+        "strict out-of-vocab ready group must be rejected; stdout: {} stderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    // In --json mode the structured error envelope is emitted on stdout; in
+    // human mode it goes to stderr. Accept either so the assertion is robust.
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("rework") && combined.contains("workflow.status_groups.ready"),
+        "error must name the offending status and config key; stdout: {} stderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+#[test]
+fn ready_cli_text_truncation_emits_showing_note() {
+    // #356: when `br ready --limit N` hides ready rows, the text surface must
+    // print a "Showing N of M" note (on stderr) instead of silently truncating
+    // — mirroring `br list` and the MCP ready surface (issue #91).
+    let _log = common::test_log("ready_cli_text_truncation_emits_showing_note");
+    let (workspace, _ids) = setup_workspace_with_issues(); // 5 ready issues
+
+    let result = run_br(&workspace, ["ready", "--limit", "2"], "ready_limit_note");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+
+    // Exactly 2 rows shown on stdout (lines starting with "1." and "2.").
+    let shown = result
+        .stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("1. ") || l.trim_start().starts_with("2. "))
+        .count();
+    assert_eq!(shown, 2, "expected 2 ready rows; stdout: {}", result.stdout);
+
+    assert!(
+        result
+            .stderr
+            .contains("Showing 2 of 5 ready issues. Use --limit 0 for all results."),
+        "expected truncation note on stderr; stderr: {}",
+        result.stderr
+    );
+}
+
+#[test]
+fn ready_cli_no_note_when_limit_covers_all() {
+    // No "Showing N of M" note when the limit does not actually truncate.
+    let _log = common::test_log("ready_cli_no_note_when_limit_covers_all");
+    let (workspace, _ids) = setup_workspace_with_issues(); // 5 ready issues
+
+    let result = run_br(
+        &workspace,
+        ["ready", "--limit", "10"],
+        "ready_limit_no_note",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        !result.stderr.contains("Showing") && !result.stderr.contains("Use --limit 0"),
+        "no truncation note expected when limit >= total; stderr: {}",
+        result.stderr
+    );
+}
+
+#[test]
+fn ready_cli_quiet_suppresses_truncation_note() {
+    // `--quiet` must suppress the truncation note, matching `br list`.
+    let _log = common::test_log("ready_cli_quiet_suppresses_truncation_note");
+    let (workspace, _ids) = setup_workspace_with_issues(); // 5 ready issues
+
+    let result = run_br(
+        &workspace,
+        ["--quiet", "ready", "--limit", "2"],
+        "ready_limit_quiet",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        !result.stderr.contains("Showing 2 of"),
+        "quiet ready should not emit truncation note; stderr: {}",
+        result.stderr
+    );
+}
