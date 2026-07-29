@@ -194,7 +194,7 @@ impl<'a> IssueTable<'a> {
             reserved += 10 + 3;
         }
         if self.columns.age {
-            reserved += 9 + 3;
+            reserved += 7 + 3;
         }
         if self.columns.context {
             reserved += 20 + 3;
@@ -248,7 +248,7 @@ impl<'a> IssueTable<'a> {
             // "created/updated" compact ages, e.g. `5d/2h` — up to
             // ~7-8 chars in the common case, matching the padded
             // width used by the plain-text line.
-            table = table.with_column(Column::new("Age").width(9));
+            table = table.with_column(Column::new("Age").width(7));
         }
         if self.columns.context {
             table = table.with_column(Column::new("Context").min_width(20).max_width(60));
