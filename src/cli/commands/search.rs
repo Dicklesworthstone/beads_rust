@@ -311,6 +311,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         priorities,
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
+        created_by: None,
         include_closed,
         include_deferred,
         include_templates: false,

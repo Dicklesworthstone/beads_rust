@@ -104,6 +104,45 @@ pub fn resolve_agent_identity_with_storage(storage: &SqliteStorage) -> Result<St
     }
 }
 
+/// Resolve the calling agent's identity the same way as
+/// [`resolve_agent_identity_with_storage`], but for write paths that
+/// must never hard-fail and must never print the "identity: inferred"
+/// stderr note.
+///
+/// Two differences from the loud/strict variant:
+/// - Every non-authoritative outcome (`BD_AGENT_ID` unset and no
+///   process-ancestry match, an ambiguous match, or a storage error
+///   reading the `watchers` table) collapses to `None` instead of an
+///   `Err`. Falling back further (to `$USER`, then `"unknown"`) is the
+///   *normal* case here — most callers run from a plain human shell
+///   with no `BD_AGENT_ID` and no live watch, and that must keep
+///   working.
+/// - No stderr note is printed on a successful inference match. The
+///   note in [`resolve_agent_identity_with_storage`] exists so
+///   messaging/watch identity misattribution is caught immediately;
+///   printing it on every `bd create` (or any other write) would be
+///   noise for a value that's merely recorded as provenance, not acted
+///   on synchronously. Callers that want the loud note (messaging,
+///   `bd watch`) should keep calling the strict function instead.
+///
+/// Used by `created_by` / actor-provenance resolution (see
+/// [`super::resolve_actor_with_storage`]).
+pub fn resolve_agent_identity_quiet(storage: &SqliteStorage) -> Option<String> {
+    let raw = env::var("BD_AGENT_ID").ok();
+    if !raw.as_deref().unwrap_or("").trim().is_empty() {
+        return resolve_agent_identity_from(raw.as_deref()).ok();
+    }
+
+    let rows = storage.list_all_watchers().ok()?;
+    let reader = proc::ProcChainReader;
+    let caller_pid = i64::from(std::process::id());
+
+    match resolve_via_watchers(&reader, caller_pid, &rows, Utc::now(), WATCHER_TTL_SECONDS) {
+        InferenceResult::Matched(identity) => Some(identity.prefix),
+        InferenceResult::Ambiguous(_) | InferenceResult::NoMatch => None,
+    }
+}
+
 /// A live watcher's ancestor chain, keyed by prefix, as plain data.
 type WatcherChain = (String, Vec<i64>);
 

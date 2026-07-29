@@ -156,6 +156,7 @@ pub fn execute(
                         issue_type: true,
                         title: true,
                         assignee: true,
+                        created_by: true,
                         created: true,
                         updated: true,
                         ..Default::default()
@@ -250,6 +251,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         priorities,
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
+        created_by: args.created_by.clone(),
         include_closed,
         include_deferred,
         include_templates: false,

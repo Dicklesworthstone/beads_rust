@@ -166,6 +166,7 @@ pub fn execute(
             title: true,
             assignee: false,
             labels: false,
+            created_by: false,
             created: false,
             updated: false,
             context: args.details,

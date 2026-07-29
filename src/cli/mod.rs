@@ -1652,6 +1652,11 @@ pub struct ListArgs {
     #[arg(long)]
     pub unassigned: bool,
 
+    /// Filter by creator (the agent identity, or fallback user, that
+    /// created the issue — the `created_by` field)
+    #[arg(long)]
+    pub created_by: Option<String>,
+
     /// Filter by specific IDs (can be repeated)
     #[arg(long, add = ArgValueCompleter::new(issue_id_completer))]
     pub id: Vec<String>,

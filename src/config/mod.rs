@@ -12,7 +12,7 @@
 mod identity;
 pub mod routing;
 
-pub use identity::resolve_agent_identity_with_storage;
+pub use identity::{resolve_agent_identity_quiet, resolve_agent_identity_with_storage};
 
 use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority};
@@ -1044,6 +1044,39 @@ pub fn resolve_actor(layer: &ConfigLayer) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Resolve actor with agent identity spliced in ahead of `$USER` (see
+/// [`resolve_actor`] for the plain version).
+///
+/// Falls back through `BD_AGENT_ID` / live-`bd watch`-ancestry
+/// inference (via [`resolve_agent_identity_quiet`]) between the
+/// explicit config override and the `$USER` fallback.
+///
+/// Precedence (highest wins):
+/// 1. explicit config `actor` key — a deliberate operator override,
+///    kept ahead of identity so it can still force a specific value.
+/// 2. resolved agent identity, when one can be determined.
+/// 3. `$USER`, then `"unknown"` — unchanged from [`resolve_actor`].
+///
+/// This is what `created_by` and mutation `actor` (and therefore the
+/// `events.actor` column) should use, since it is the only variant
+/// that reflects which *agent* acted rather than which unix user ran
+/// the process. It never hard-errors: identity resolution here uses
+/// the non-fatal [`resolve_agent_identity_quiet`], so a plain human
+/// shell with no `BD_AGENT_ID` and no live watch still falls all the
+/// way through to `$USER` / `"unknown"` exactly as before.
+#[must_use]
+pub fn resolve_actor_with_storage(layer: &ConfigLayer, storage: &SqliteStorage) -> String {
+    actor_from_layer(layer)
+        .or_else(|| resolve_agent_identity_quiet(storage))
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .map(|value| value.trim().to_string())
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Read the `claim-exclusive` config key.
 ///
 /// When true, `--claim` rejects re-claims even by the same actor.
@@ -1927,6 +1960,67 @@ routing:
         let actor = resolve_actor(&layer);
         // Should be either USER env value or "unknown"
         assert!(!actor.is_empty());
+    }
+
+    /// `created_by` / `events.actor` provenance: an explicit config
+    /// `actor` override must win over agent-identity resolution, even
+    /// when an identity *would* be resolvable. This is precedence #1
+    /// in the task brief and must never regress — an operator setting
+    /// `actor` explicitly is a deliberate choice.
+    ///
+    /// This test can't inject `BD_AGENT_ID` itself (env mutation is
+    /// `unsafe` under edition 2024 and this crate forbids unsafe code
+    /// — see the e2e tests in `tests/e2e_created_by_provenance.rs` for
+    /// the full env-var-driven precedence coverage instead), but it
+    /// still locks in the *shape* of the precedence: with no watchers
+    /// registered, `resolve_agent_identity_quiet` can only return
+    /// `None`, so the explicit actor is the only thing that could ever
+    /// produce this value — proving the config-actor branch is reached
+    /// and wins before falling through to identity/$USER.
+    #[test]
+    fn resolve_actor_with_storage_prefers_explicit_config_actor() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        let mut layer = ConfigLayer::default();
+        layer
+            .startup
+            .insert("actor".to_string(), "explicit-actor".to_string());
+
+        let actor = resolve_actor_with_storage(&layer, &storage);
+        assert_eq!(actor, "explicit-actor");
+    }
+
+    /// No config `actor` override and no live watchers registered in
+    /// this fresh in-memory storage — `resolve_agent_identity_quiet`
+    /// can only produce a result via `BD_AGENT_ID` itself at that
+    /// point (never errors either way). This test doesn't assume
+    /// `BD_AGENT_ID` is unset in the ambient environment (it may well
+    /// be set here, e.g. under an agent harness); instead it computes
+    /// the same precedence the implementation does and asserts
+    /// `resolve_actor_with_storage` matches it exactly, covering both
+    /// the "identity present" and "no identity -> falls back to
+    /// resolve_actor" shapes depending on the ambient env. The e2e
+    /// tests in `tests/e2e_created_by_provenance.rs` pin down the
+    /// concrete env-var-controlled cases (identity present vs. not).
+    #[test]
+    fn resolve_actor_with_storage_falls_back_like_resolve_actor_when_no_identity() {
+        let storage = SqliteStorage::open_memory().expect("storage");
+        let layer = ConfigLayer::default();
+
+        let with_storage = resolve_actor_with_storage(&layer, &storage);
+
+        let ambient_identity = std::env::var("BD_AGENT_ID")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case(OPERATOR_PREFIX));
+        let expected = ambient_identity.unwrap_or_else(|| resolve_actor(&layer));
+
+        assert_eq!(
+            with_storage, expected,
+            "with no config actor override, resolve_actor_with_storage must equal \
+             BD_AGENT_ID when set (this test's ambient env), else fall back exactly \
+             like resolve_actor"
+        );
+        assert!(!with_storage.is_empty());
     }
 
     #[test]

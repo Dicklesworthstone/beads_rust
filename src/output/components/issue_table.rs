@@ -28,6 +28,10 @@ pub struct IssueTableColumns {
     pub title: bool,
     pub assignee: bool,
     pub labels: bool,
+    /// Creator (the agent, or fallback user, that created the issue).
+    /// Additive column, off by default; wired only into `bd list --long`
+    /// (see `list.rs`) to avoid disturbing the default column set.
+    pub created_by: bool,
     pub created: bool,
     pub updated: bool,
     pub context: bool,
@@ -68,6 +72,7 @@ impl IssueTableColumns {
             title: true,
             assignee: true,
             labels: true,
+            created_by: true,
             created: true,
             updated: true,
             context: false,
@@ -177,6 +182,9 @@ impl<'a> IssueTable<'a> {
         if self.columns.labels {
             table = table.with_column(Column::new("Labels").max_width(30));
         }
+        if self.columns.created_by {
+            table = table.with_column(Column::new("Creator").max_width(14));
+        }
         if self.columns.created {
             table = table.with_column(Column::new("Created").width(10));
         }
@@ -230,6 +238,12 @@ impl<'a> IssueTable<'a> {
             if self.columns.labels {
                 cells.push(
                     Cell::new(Text::new(issue.labels.join(", "))).style(self.theme.label.clone()),
+                );
+            }
+            if self.columns.created_by {
+                cells.push(
+                    Cell::new(Text::new(issue.created_by.clone().unwrap_or_default()))
+                        .style(self.theme.username.clone()),
                 );
             }
             if self.columns.created {

@@ -42,6 +42,8 @@ pub struct SavedFilters {
     pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub unassigned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -87,6 +89,7 @@ impl From<&ListArgs> for SavedFilters {
             type_: args.type_.clone(),
             assignee: args.assignee.clone(),
             unassigned: args.unassigned,
+            created_by: args.created_by.clone(),
             id: args.id.clone(),
             label: args.label.clone(),
             label_any: args.label_any.clone(),
@@ -115,6 +118,7 @@ impl SavedFilters {
             type_: self.type_.clone(),
             assignee: self.assignee.clone(),
             unassigned: self.unassigned,
+            created_by: self.created_by.clone(),
             id: self.id.clone(),
             label: self.label.clone(),
             label_any: self.label_any.clone(),
@@ -179,6 +183,7 @@ impl SavedFilters {
             },
             // Option fields: CLI overrides if Some
             assignee: cli.assignee.clone().or(base.assignee),
+            created_by: cli.created_by.clone().or(base.created_by),
             priority_min: cli.priority_min.or(base.priority_min),
             priority_max: cli.priority_max.or(base.priority_max),
             title_contains: cli.title_contains.clone().or(base.title_contains),
@@ -832,6 +837,7 @@ mod tests {
             type_: vec!["bug".to_string(), "feature".to_string()],
             assignee: Some("charlie".to_string()),
             unassigned: false,
+            created_by: Some("agent-x".to_string()),
             id: vec!["id1".to_string(), "id2".to_string()],
             label: vec!["urgent".to_string(), "backend".to_string()],
             label_any: vec!["optional".to_string()],
@@ -856,6 +862,7 @@ mod tests {
         assert_eq!(parsed.type_, filters.type_);
         assert_eq!(parsed.assignee, filters.assignee);
         assert_eq!(parsed.unassigned, filters.unassigned);
+        assert_eq!(parsed.created_by, filters.created_by);
         assert_eq!(parsed.id, filters.id);
         assert_eq!(parsed.label, filters.label);
         assert_eq!(parsed.label_any, filters.label_any);
