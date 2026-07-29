@@ -1,0 +1,14 @@
+{
+  "name": "br",
+  "version": "1.0.0",
+  "description": "Official beads_rust / br issue tracker skills for Claude Code and Codex.",
+  "author": {
+    "name": "Dicklesworthstone"
+  },
+  "homepage": "https://github.com/Dicklesworthstone/beads_rust",
+  "repository": "https://github.com/Dicklesworthstone/beads_rust",
+  "license": "MIT",
+  "skills": [
+    "./.claude/skills"
+  ]
+}

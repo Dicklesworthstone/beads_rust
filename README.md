@@ -339,6 +339,26 @@ cargo build --release --no-default-features
 cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked --no-default-features
 ```
 
+### Claude Code and Codex Skills
+
+The repository also publishes the `br` agent skills as a GitHub-backed plugin
+for Claude Code and Codex. This installs the agent instructions only; install
+the `br` CLI separately with one of the commands above.
+
+For Codex:
+
+```bash
+codex plugin marketplace add Dicklesworthstone/beads_rust
+codex plugin add br@beads-rust
+```
+
+For Claude Code:
+
+```bash
+claude plugin marketplace add Dicklesworthstone/beads_rust
+claude plugin install br@beads-rust
+```
+
 ### Enable MCP Server Support
 
 `br serve` is optional and is not built by the default feature set. Build with

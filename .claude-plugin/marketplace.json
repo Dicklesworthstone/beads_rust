@@ -1,0 +1,22 @@
+{
+  "name": "beads-rust",
+  "owner": {
+    "name": "Dicklesworthstone"
+  },
+  "description": "beads_rust / br issue tracker skills for Claude Code and Codex.",
+  "plugins": [
+    {
+      "name": "br",
+      "source": "./",
+      "description": "Official beads_rust / br issue tracker skills.",
+      "category": "productivity",
+      "keywords": [
+        "br",
+        "beads",
+        "beads-rust",
+        "issue-tracker",
+        "tasks"
+      ]
+    }
+  ]
+}
