@@ -113,20 +113,25 @@ fn harness_stdin_input() {
     let init = ws.run_br(["init"], "init");
     init.assert_success();
 
-    // Create an issue first
-    let create = ws.run_br(["create", "Issue for comment"], "create");
-    create.assert_success();
-
-    let id = parse_created_id(&create.stdout);
-    assert!(!id.is_empty(), "missing created id");
-
-    // Add comment via stdin
-    let comment = ws.run_br_stdin(
-        ["comments", "add", &id, "-"],
-        "This is a comment from stdin",
-        "add_comment_stdin",
+    // NOTE: originally demonstrated stdin piping via `comments add -`, but
+    // the `comments` subcommand was removed from the CLI entirely (no
+    // replacement). `msg <to>` reads its body from stdin when no BODY
+    // words are given, so it is used here instead to exercise the same
+    // `run_br_stdin` harness plumbing.
+    let msg = ws.run_br_stdin(
+        ["msg", "other-prefix", "--force"],
+        "This is a message from stdin",
+        "msg_stdin",
     );
-    comment.assert_success();
+    msg.assert_success();
+
+    let outbox = ws.run_br(["outbox", "--json"], "outbox");
+    outbox.assert_success();
+    assert!(
+        outbox.stdout.contains("This is a message from stdin"),
+        "outbox should contain the stdin-supplied message body: {}",
+        outbox.stdout
+    );
 
     ws.finish(true);
 }
