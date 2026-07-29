@@ -1931,14 +1931,6 @@ impl SqliteStorage {
     }
 
     fn upsert_metadata_key_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
-<<<<<<< HEAD
-        if Self::metadata_key_exists(conn, key)? {
-            conn.execute_with_params(
-                "UPDATE metadata SET value = ? WHERE key = ?",
-                &[SqliteValue::from(value), SqliteValue::from(key)],
-            )?;
-        } else {
-=======
         let updated = conn.execute_with_params(
             "UPDATE metadata SET value = ? WHERE key = ? AND value != ?",
             &[
@@ -1948,7 +1940,6 @@ impl SqliteStorage {
             ],
         )?;
         if updated == 0 && !Self::metadata_key_exists(conn, key)? {
->>>>>>> origin/main
             conn.execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[SqliteValue::from(key), SqliteValue::from(value)],
@@ -31644,11 +31635,7 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
-    fn test_metadata_updates_harmonize_duplicate_rows() {
-=======
     fn test_metadata_duplicate_rows_read_latest_and_harmonize_on_write() {
->>>>>>> origin/main
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("metadata-duplicates.db");
         let mut storage = SqliteStorage::open(&db_path).unwrap();
@@ -31658,13 +31645,8 @@ mod tests {
             .execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[
-<<<<<<< HEAD
-                    SqliteValue::from("last_import_time"),
-                    SqliteValue::from("2026-06-05T07:15:43Z"),
-=======
                     SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
                     SqliteValue::from("stale-hash"),
->>>>>>> origin/main
                 ],
             )
             .unwrap();
@@ -31673,26 +31655,13 @@ mod tests {
             .execute_with_params(
                 "INSERT INTO metadata (key, value) VALUES (?, ?)",
                 &[
-<<<<<<< HEAD
-                    SqliteValue::from("last_import_time"),
-                    SqliteValue::from("2026-06-07T05:10:12Z"),
-=======
                     SqliteValue::from(METADATA_JSONL_CONTENT_HASH),
                     SqliteValue::from("latest-hash"),
->>>>>>> origin/main
                 ],
             )
             .unwrap();
 
         assert_eq!(
-<<<<<<< HEAD
-            storage.get_metadata("last_import_time").unwrap(),
-            Some("2026-06-07T05:10:12Z".to_string())
-        );
-
-        storage
-            .set_metadata("last_import_time", "2026-06-07T05:22:00Z")
-=======
             storage.get_metadata(METADATA_JSONL_CONTENT_HASH).unwrap(),
             Some("latest-hash".to_string()),
             "metadata reads must use the latest duplicate row"
@@ -31700,32 +31669,17 @@ mod tests {
 
         storage
             .set_metadata(METADATA_JSONL_CONTENT_HASH, "rewritten-hash")
->>>>>>> origin/main
             .unwrap();
 
         let rows = storage
             .conn
             .query_with_params(
                 "SELECT value FROM metadata WHERE key = ? ORDER BY rowid ASC",
-<<<<<<< HEAD
-                &[SqliteValue::from("last_import_time")],
-=======
                 &[SqliteValue::from(METADATA_JSONL_CONTENT_HASH)],
->>>>>>> origin/main
             )
             .unwrap();
         let values: Vec<String> = rows
             .iter()
-<<<<<<< HEAD
-            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
-            .collect();
-
-        assert_eq!(values.len(), 2);
-        assert!(values.iter().all(|value| value == "2026-06-07T05:22:00Z"));
-        assert_eq!(
-            storage.get_metadata("last_import_time").unwrap(),
-            Some("2026-06-07T05:22:00Z".to_string())
-=======
             .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
             .collect();
 
@@ -31780,7 +31734,6 @@ mod tests {
         assert!(
             !readiness.blocked_cache_stale,
             "an older duplicate stale marker must not force the ready path to bypass the cache"
->>>>>>> origin/main
         );
     }
 

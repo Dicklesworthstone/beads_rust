@@ -10863,47 +10863,9 @@ fn check_sync_metadata(
     checks: &mut Vec<CheckResult>,
 ) {
     // Get metadata for diagnostic details
-<<<<<<< HEAD
-    let last_import: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'last_import_time' ORDER BY rowid DESC LIMIT 1",
-        )
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-
-    let last_export: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'last_export_time' ORDER BY rowid DESC LIMIT 1",
-        )
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-
-    let jsonl_hash: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'jsonl_content_hash' ORDER BY rowid DESC LIMIT 1",
-        )
-        .ok()
-        .and_then(|row| {
-            row.get(0)
-                .and_then(SqliteValue::as_text)
-                .filter(|value| !value.is_empty())
-                .map(String::from)
-        });
-=======
     let last_import = latest_metadata_value(conn, "last_import_time");
     let last_export = latest_metadata_value(conn, "last_export_time");
     let jsonl_hash = latest_metadata_value(conn, "jsonl_content_hash");
->>>>>>> origin/main
 
     // Check dirty issues count
     let dirty_count: i64 = conn

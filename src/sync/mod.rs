@@ -9007,14 +9007,6 @@ pub fn count_issues_in_jsonl(path: &Path) -> Result<usize> {
 }
 
 fn verify_exported_jsonl_integrity(path: &Path, expected_ids: &[String]) -> Result<()> {
-<<<<<<< HEAD
-    let file = File::open(path)?;
-    path::validate_jsonl_fd_metadata(&file, path)?;
-
-    let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
-    let mut observed = HashSet::with_capacity(expected_ids.len());
-    let mut reader = BufReader::new(file);
-=======
     let source = capture_jsonl_source_snapshot(path)?;
     verify_exported_jsonl_snapshot_integrity(&source, expected_ids)
 }
@@ -9026,7 +9018,6 @@ fn verify_exported_jsonl_snapshot_integrity(
     let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
     let mut observed = HashSet::with_capacity(expected_ids.len());
     let mut reader = source.reader();
->>>>>>> origin/main
     let mut line_buf = String::new();
     let mut line_num = 0;
     let mut issue_count = 0;
@@ -9962,9 +9953,6 @@ fn export_to_jsonl_with_policy_expected_authority(
     let content_hash = hex_encode(&hasher.finalize());
 
     // Verify staged export integrity before replacing the live JSONL.
-<<<<<<< HEAD
-    verify_exported_jsonl_integrity(&temp_path, &exported_ids)?;
-=======
     let staged_source = pinned_temp.capture()?;
     verify_exported_jsonl_snapshot_integrity(&staged_source, &exported_ids)?;
     if staged_source.content_sha256() != content_hash {
@@ -9993,7 +9981,6 @@ fn export_to_jsonl_with_policy_expected_authority(
             });
         }
     }
->>>>>>> origin/main
 
     if let Some(ref beads_dir) = config.beads_dir {
         require_safe_sync_overwrite_path(
@@ -17737,14 +17724,10 @@ mod tests {
 
         let cases = [
             ("collapsed adjacent records", format!("{json1}{json2}\n")),
-<<<<<<< HEAD
-            ("stray issue prefix", "{\"i{\"id\":\"bd-001\"}\n".to_string()),
-=======
             (
                 "stray issue prefix",
                 "{\"i{\"id\":\"bd-001\"}\n".to_string(),
             ),
->>>>>>> origin/main
             (
                 "missing comments array closure",
                 "{\"id\":\"bd-001\",\"title\":\"Broken\",\"comments\":[{\"id\":1}\n".to_string(),
@@ -17784,19 +17767,10 @@ mod tests {
         )
         .unwrap();
 
-<<<<<<< HEAD
-        let err = verify_exported_jsonl_integrity(
-            &path,
-            &["bd-001".to_string(), "bd-002".to_string()],
-        )
-        .unwrap_err()
-        .to_string();
-=======
         let err =
             verify_exported_jsonl_integrity(&path, &["bd-001".to_string(), "bd-002".to_string()])
                 .unwrap_err()
                 .to_string();
->>>>>>> origin/main
         assert!(
             err.contains("expected 2 issues, JSONL has 1 valid issue lines"),
             "unexpected error: {err}"
