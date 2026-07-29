@@ -430,6 +430,70 @@ fn assignee_filter_is_case_sensitive() {
 }
 
 // ============================================================================
+// CREATED_BY FILTER TESTS
+// ============================================================================
+
+/// `--created-by` (storage-level `ListFilters::created_by`) must select
+/// issues by their creator/provenance field, mirroring the `assignee`
+/// filter's plumbing (storage-level WHERE clause, not client-side).
+#[test]
+fn filter_by_created_by() {
+    let mut storage = test_db();
+
+    let agent_issue = IssueBuilder::new("created-by-agent")
+        .with_created_by("agent-x")
+        .build();
+    let human_issue = IssueBuilder::new("created-by-human")
+        .with_created_by("toad")
+        .build();
+    let unset_issue = IssueBuilder::new("created-by-none").build();
+
+    storage.create_issue(&agent_issue, "tester").unwrap();
+    storage.create_issue(&human_issue, "tester").unwrap();
+    storage.create_issue(&unset_issue, "tester").unwrap();
+
+    let filters = ListFilters {
+        created_by: Some("agent-x".to_string()),
+        ..Default::default()
+    };
+
+    let results = storage.list_issues(&filters).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, agent_issue.id);
+    assert_eq!(results[0].created_by, Some("agent-x".to_string()));
+}
+
+/// `created_by` filtering composes with other filters (WHERE clause,
+/// not a post-filter) — combine with an assignee filter to lock this
+/// in.
+#[test]
+fn created_by_filter_composes_with_assignee_filter() {
+    let mut storage = test_db();
+
+    let matches_both = IssueBuilder::new("created-by-both")
+        .with_created_by("agent-x")
+        .with_assignee("alice")
+        .build();
+    let matches_creator_only = IssueBuilder::new("created-by-creator-only")
+        .with_created_by("agent-x")
+        .with_assignee("bob")
+        .build();
+
+    storage.create_issue(&matches_both, "tester").unwrap();
+    storage.create_issue(&matches_creator_only, "tester").unwrap();
+
+    let filters = ListFilters {
+        created_by: Some("agent-x".to_string()),
+        assignee: Some("alice".to_string()),
+        ..Default::default()
+    };
+
+    let results = storage.list_issues(&filters).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, matches_both.id);
+}
+
+// ============================================================================
 // TITLE CONTAINS FILTER TESTS
 // ============================================================================
 

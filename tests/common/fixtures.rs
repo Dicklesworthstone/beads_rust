@@ -98,6 +98,11 @@ impl IssueBuilder {
         self
     }
 
+    pub fn with_created_by(mut self, created_by: &str) -> Self {
+        self.issue.created_by = Some(created_by.to_string());
+        self
+    }
+
     pub fn with_description(mut self, description: &str) -> Self {
         self.issue.description = Some(description.to_string());
         self

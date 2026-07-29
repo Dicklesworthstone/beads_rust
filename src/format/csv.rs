@@ -35,6 +35,7 @@ pub const ALL_FIELDS: &[&str] = &[
     "defer_until",
     "notes",
     "external_ref",
+    "created_by",
 ];
 
 /// Escape a CSV field value.
@@ -77,6 +78,7 @@ pub fn get_field_value(issue: &Issue, field: &str) -> String {
             .map_or_else(String::new, |dt| dt.to_rfc3339()),
         "notes" => issue.notes.clone().unwrap_or_default(),
         "external_ref" => issue.external_ref.clone().unwrap_or_default(),
+        "created_by" => issue.created_by.clone().unwrap_or_default(),
         _ => String::new(),
     }
 }

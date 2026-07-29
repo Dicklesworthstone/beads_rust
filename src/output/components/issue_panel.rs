@@ -56,6 +56,20 @@ impl<'a> IssuePanel<'a> {
         self
     }
 
+    /// Appends the "Creator: <agent>" line — the agent (or fallback
+    /// user) that created the issue. Only rendered when present:
+    /// historical issues predating this field have no value here, and
+    /// "unknown" would just be noise. Split out of `print` to keep
+    /// that function from growing further (it's already long).
+    fn append_creator_line(content: &mut Text, issue: &Issue, theme: &Theme) {
+        if let Some(ref created_by) = issue.created_by {
+            if !created_by.is_empty() {
+                content.append_styled("Creator:  ", theme.dimmed.clone());
+                content.append_styled(&format!("{}\n", created_by), theme.username.clone());
+            }
+        }
+    }
+
     pub fn print(&self, ctx: &OutputContext, wrap: bool) {
         let mut content = Text::new("");
 
@@ -114,6 +128,8 @@ impl<'a> IssuePanel<'a> {
             content.append_styled("Owner:    ", self.theme.dimmed.clone());
             content.append_styled(&format!("{}\n", owner), self.theme.username.clone());
         }
+
+        Self::append_creator_line(&mut content, self.issue, self.theme);
 
         // Labels
         let labels = self

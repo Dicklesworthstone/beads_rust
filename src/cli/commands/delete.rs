@@ -172,7 +172,7 @@ pub fn execute(
     }
 
     // 7. Get actor
-    let actor = config::resolve_actor(&config_layer);
+    let actor = config::resolve_actor_with_storage(&config_layer, storage);
 
     // 8. Perform deletion
     let mut result = DeleteResult::new();

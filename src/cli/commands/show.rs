@@ -118,6 +118,16 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
         issue.issue_type.as_str()
     );
 
+    // Creator: the agent (or fallback user) that created the issue.
+    // Only rendered when present; historical issues predating this
+    // field, or beads created before agent-identity resolution
+    // existed, simply omit the line rather than showing "unknown".
+    if let Some(created_by) = issue.created_by.as_deref() {
+        if !created_by.is_empty() {
+            let _ = writeln!(output, "Creator: {created_by}");
+        }
+    }
+
     // Created/Updated line
     let _ = writeln!(
         output,

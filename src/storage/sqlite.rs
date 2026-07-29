@@ -1050,6 +1050,11 @@ impl SqliteStorage {
             sql.push_str(" AND assignee IS NULL");
         }
 
+        if let Some(ref created_by) = filters.created_by {
+            sql.push_str(" AND created_by = ?");
+            params.push(Box::new(created_by.clone()));
+        }
+
         if !filters.include_closed {
             if filters.include_deferred {
                 sql.push_str(" AND status NOT IN ('closed', 'tombstone')");
@@ -1233,6 +1238,11 @@ impl SqliteStorage {
 
         if filters.unassigned {
             sql.push_str(" AND assignee IS NULL");
+        }
+
+        if let Some(ref created_by) = filters.created_by {
+            sql.push_str(" AND created_by = ?");
+            params.push(Box::new(created_by.clone()));
         }
 
         if !filters.include_closed {
@@ -3471,6 +3481,8 @@ pub struct ListFilters {
     pub priorities: Option<Vec<Priority>>,
     pub assignee: Option<String>,
     pub unassigned: bool,
+    /// Filter by the agent/user that created the issue (`created_by`).
+    pub created_by: Option<String>,
     pub include_closed: bool,
     pub include_deferred: bool,
     pub include_templates: bool,

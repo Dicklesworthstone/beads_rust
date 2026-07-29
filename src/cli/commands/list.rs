@@ -179,6 +179,11 @@ pub fn execute(
                     // the default and --long views to give the Title
                     // column the space back.
                     assignee: false,
+                    // Creator (the agent identity that opened the bead)
+                    // in --long only: the default view stays lean and
+                    // title-focused, but --long is where you go to ask
+                    // "who opened this?".
+                    created_by: args.long,
                     // Combined compact age column (created/updated),
                     // same presentation as the plain-text line's age
                     // field — in both default and --long views, since
@@ -268,6 +273,7 @@ fn build_filters(args: &ListArgs) -> Result<ListFilters> {
         priorities,
         assignee: args.assignee.clone(),
         unassigned: args.unassigned,
+        created_by: args.created_by.clone(),
         include_closed,
         include_deferred,
         include_templates: false,

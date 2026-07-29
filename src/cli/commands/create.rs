@@ -88,7 +88,7 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         id_config,
         default_priority: config::default_priority_from_layer(&layer)?,
         default_issue_type: config::default_issue_type_from_layer(&layer)?,
-        actor: config::resolve_actor(&layer),
+        actor: config::resolve_actor_with_storage(&layer, &storage_ctx.storage),
         sender,
     };
 
@@ -463,7 +463,7 @@ fn execute_import(
     config::assert_writable_prefix(&id_config.prefix)?;
     let default_priority = config::default_priority_from_layer(&layer)?;
     let default_issue_type = config::default_issue_type_from_layer(&layer)?;
-    let actor = config::resolve_actor(&layer);
+    let actor = config::resolve_actor_with_storage(&layer, &storage_ctx.storage);
     let now = Utc::now();
     let _json_mode = cli.json.unwrap_or(false);
     let due_at = parse_optional_date(args.due.as_deref())?;
@@ -551,7 +551,7 @@ fn execute_import(
             acceptance_criteria: parsed.acceptance_criteria,
             content_hash: None,
             notes: None,
-            created_by: None,
+            created_by: Some(actor.clone()),
             closed_at: import_closed_at,
             close_reason: None,
             closed_by_session: None,

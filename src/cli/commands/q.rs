@@ -130,7 +130,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let mut issue = build_quick_issue(id, title, priority, issue_type, now);
 
     // Resolve actor and set created_by
-    let actor = config::resolve_actor(&layer);
+    let actor = config::resolve_actor_with_storage(&layer, storage);
     issue.created_by = Some(actor.clone());
 
     // Compute content hash

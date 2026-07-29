@@ -55,7 +55,7 @@ pub fn execute(
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
 
     let config_layer = config::load_config(&beads_dir, Some(&storage_ctx.storage), cli)?;
-    let actor = config::resolve_actor(&config_layer);
+    let actor = config::resolve_actor_with_storage(&config_layer, &storage_ctx.storage);
     let resolver = IdResolver::with_defaults();
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let storage = &mut storage_ctx.storage;

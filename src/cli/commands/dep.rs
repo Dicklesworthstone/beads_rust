@@ -37,7 +37,7 @@ pub fn execute(
     let all_ids = storage_ctx.storage.get_all_ids()?;
     let storage = &mut storage_ctx.storage;
 
-    let actor = config::resolve_actor(&config_layer);
+    let actor = config::resolve_actor_with_storage(&config_layer, storage);
 
     let external_db_paths = config::external_project_db_paths(&config_layer, &beads_dir);
 

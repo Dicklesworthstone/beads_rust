@@ -53,7 +53,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // `--reprefix` (below) is the flag that actually moves an issue between
     // prefix namespaces.
 
-    let actor = config::resolve_actor(&config_layer);
+    let actor = config::resolve_actor_with_storage(&config_layer, &storage_ctx.storage);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, &beads_dir, &resolver, &storage_ctx.storage)?;
 
