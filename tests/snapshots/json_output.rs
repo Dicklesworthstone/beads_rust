@@ -272,87 +272,10 @@ fn snapshot_stale_json() {
     assert_json_snapshot!("stale_json_output", normalize_json(&json));
 }
 
-#[test]
-fn snapshot_comments_json() {
-    let workspace = init_workspace();
-    let id = create_issue(&workspace, "Commented issue", "create_commented");
-
-    let add = run_br(
-        &workspace,
-        ["comments", "add", &id, "First comment", "--json"],
-        "comments_add_json",
-    );
-    assert!(
-        add.status.success(),
-        "comments add json failed: {}",
-        add.stderr
-    );
-
-    let add_json: Value = serde_json::from_str(&add.stdout).expect("parse json");
-    assert_json_snapshot!("comments_add_json_output", normalize_json(&add_json));
-
-    let list = run_br(
-        &workspace,
-        ["comments", "list", &id, "--json"],
-        "comments_list_json",
-    );
-    assert!(
-        list.status.success(),
-        "comments list json failed: {}",
-        list.stderr
-    );
-
-    let list_json: Value = serde_json::from_str(&list.stdout).expect("parse json");
-    assert_json_snapshot!("comments_list_json_output", normalize_json(&list_json));
-}
-
-#[test]
-fn snapshot_label_json() {
-    let workspace = init_workspace();
-    let id = create_issue(&workspace, "Labeled issue", "create_labeled");
-
-    let add = run_br(
-        &workspace,
-        ["label", "add", &id, "backend", "--json"],
-        "label_add_json",
-    );
-    assert!(
-        add.status.success(),
-        "label add json failed: {}",
-        add.stderr
-    );
-
-    let add_json: Value = serde_json::from_str(&add.stdout).expect("parse json");
-    assert_json_snapshot!("label_add_json_output", normalize_json(&add_json));
-
-    let list = run_br(
-        &workspace,
-        ["label", "list", &id, "--json"],
-        "label_list_json",
-    );
-    assert!(
-        list.status.success(),
-        "label list json failed: {}",
-        list.stderr
-    );
-
-    let list_json: Value = serde_json::from_str(&list.stdout).expect("parse json");
-    assert_json_snapshot!("label_list_json_output", normalize_json(&list_json));
-
-    let list_all = run_br(
-        &workspace,
-        ["label", "list-all", "--json"],
-        "label_list_all_json",
-    );
-    assert!(
-        list_all.status.success(),
-        "label list-all json failed: {}",
-        list_all.stderr
-    );
-
-    let list_all_json: Value = serde_json::from_str(&list_all.stdout).expect("parse json");
-    assert_json_snapshot!("label_list_all_json_output", normalize_json(&list_all_json));
-}
+// NOTE: `snapshot_comments_json` and `snapshot_label_json` were removed.
+// The `comments` subcommand was deleted from the CLI entirely (no
+// replacement), and `label` (add/list/list-all/rename) likewise has no
+// surviving CLI surface, so there is nothing left to snapshot for either.
 
 #[test]
 fn snapshot_orphans_json() {

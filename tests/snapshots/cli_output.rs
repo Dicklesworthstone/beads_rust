@@ -188,26 +188,6 @@ fn snapshot_count_output() {
     assert_snapshot!("count_output", normalize_output(&output.stdout));
 }
 
-#[test]
-fn snapshot_label_add_list_output() {
-    let workspace = init_workspace();
-
-    // Create an issue and add labels
-    let id = create_issue(&workspace, "Issue with labels", "create_label");
-
-    // Add labels
-    let add1 = run_br(&workspace, ["label", "add", &id, "urgent"], "label_add1");
-    assert!(add1.status.success(), "label add failed: {}", add1.stderr);
-
-    let add2 = run_br(&workspace, ["label", "add", &id, "backend"], "label_add2");
-    assert!(add2.status.success(), "label add failed: {}", add2.stderr);
-
-    // List labels
-    let output = run_br(&workspace, ["label", "list", &id], "label_list");
-    assert!(
-        output.status.success(),
-        "label list failed: {}",
-        output.stderr
-    );
-    assert_snapshot!("label_list_output", normalize_output(&output.stdout));
-}
+// NOTE: `snapshot_label_add_list_output` was removed. The `label`
+// subcommand (add/remove/list/list-all/rename) was deleted from the CLI
+// with no replacement surface, so there is nothing left to snapshot here.
