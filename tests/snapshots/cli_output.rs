@@ -1,5 +1,5 @@
 use super::common::cli::{BrWorkspace, run_br};
-use super::{create_issue, init_workspace, normalize_output};
+use super::{create_issue, init_workspace, normalize_output, normalize_output_with_age_masking};
 use insta::assert_snapshot;
 
 #[cfg(feature = "self_update")]
@@ -59,7 +59,13 @@ fn snapshot_list_with_issues() {
 
     let output = run_br(&workspace, ["list"], "list_with_issues");
     assert!(output.status.success(), "list failed: {}", output.stderr);
-    assert_snapshot!("list_with_issues", normalize_output(&output.stdout));
+    // Issues are created and immediately listed, so the rendered age
+    // (`0s`, occasionally `1s` under load) is inherently time-
+    // dependent — masked rather than asserted on literally.
+    assert_snapshot!(
+        "list_with_issues",
+        normalize_output_with_age_masking(&output.stdout)
+    );
 }
 
 #[test]
@@ -153,7 +159,12 @@ fn snapshot_search_output() {
     // Search for "login"
     let output = run_br(&workspace, ["search", "login"], "search_login");
     assert!(output.status.success(), "search failed: {}", output.stderr);
-    assert_snapshot!("search_output", normalize_output(&output.stdout));
+    // Same age-masking rationale as snapshot_list_with_issues above:
+    // `bd search`'s plain-text path shares `format_issue_line_with`.
+    assert_snapshot!(
+        "search_output",
+        normalize_output_with_age_masking(&output.stdout)
+    );
 }
 
 #[test]

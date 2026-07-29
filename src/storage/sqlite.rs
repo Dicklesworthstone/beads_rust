@@ -985,6 +985,13 @@ impl SqliteStorage {
 
     /// List issues with optional filters.
     ///
+    /// Default ordering (no `--sort` given): `created_at DESC, id ASC`
+    /// — newest first, with `id` as a deterministic tiebreak for
+    /// issues sharing a timestamp. `--reverse` flips both keys
+    /// (`created_at ASC, id DESC`) so applying it twice is a no-op.
+    /// An explicit `--sort` (priority/created_at/updated_at/title)
+    /// overrides this entirely; see the match below.
+    ///
     /// # Errors
     ///
     /// Returns an error if the database query fails.
@@ -1118,14 +1125,23 @@ impl SqliteStorage {
                     let _ = write!(sql, " ORDER BY title COLLATE NOCASE {order}");
                 }
                 _ => {
-                    // Default fallback
-                    sql.push_str(" ORDER BY priority ASC, created_at DESC");
+                    // Unrecognized --sort value: fall through to the
+                    // same default as "no --sort given" below.
+                    if filters.reverse {
+                        sql.push_str(" ORDER BY created_at ASC, id DESC");
+                    } else {
+                        sql.push_str(" ORDER BY created_at DESC, id ASC");
+                    }
                 }
             }
         } else if filters.reverse {
-            sql.push_str(" ORDER BY priority DESC, created_at ASC");
+            // `--reverse` with no explicit --sort: flip both keys of
+            // the default so applying it twice is a no-op.
+            sql.push_str(" ORDER BY created_at ASC, id DESC");
         } else {
-            sql.push_str(" ORDER BY priority ASC, created_at DESC");
+            // Default (bd list, no --sort): newest first, with `id`
+            // as a deterministic tiebreak for same-timestamp issues.
+            sql.push_str(" ORDER BY created_at DESC, id ASC");
         }
 
         if let Some(limit) = filters.limit {
@@ -5185,6 +5201,15 @@ mod tests {
 
     #[test]
     fn test_list_issues_reverse_default_sort() {
+        // Default (no --sort): `created_at DESC, id ASC` — newest
+        // first. `--reverse` flips both keys: `created_at ASC, id
+        // DESC` — oldest first, ties broken by id descending.
+        //
+        // `bd-a` and `bd-c` deliberately share `t1` so this also
+        // covers the id tiebreak: with `id DESC`, "bd-c" sorts before
+        // "bd-a" among same-timestamp issues. Priority is varied here
+        // only to make sure it plays no role in the ordering (it's
+        // reachable via `--sort priority`, not the default anymore).
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
@@ -5205,7 +5230,35 @@ mod tests {
         let issues = storage.list_issues(&filters).unwrap();
         let ids: Vec<_> = issues.iter().map(|i| i.id.as_str()).collect();
 
+        // t1 issues (bd-a, bd-c) before t2 (bd-b); within t1, id DESC
+        // puts bd-c before bd-a.
         assert_eq!(ids, vec!["bd-c", "bd-a", "bd-b"]);
+    }
+
+    #[test]
+    fn test_list_issues_default_sort_is_newest_first_with_id_tiebreak() {
+        // No --sort, no --reverse: `created_at DESC, id ASC`.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 8, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 8, 2, 0, 0, 0).unwrap();
+
+        // bd-a and bd-c share t1 (older); bd-b is t2 (newer).
+        let issue_a = make_issue("bd-a", "A", Status::Open, 4, None, t1, None);
+        let issue_b = make_issue("bd-b", "B", Status::Open, 0, None, t2, None);
+        let issue_c = make_issue("bd-c", "C", Status::Open, 2, None, t1, None);
+
+        storage.create_issue(&issue_a, "tester").unwrap();
+        storage.create_issue(&issue_b, "tester").unwrap();
+        storage.create_issue(&issue_c, "tester").unwrap();
+
+        let issues = storage.list_issues(&ListFilters::default()).unwrap();
+        let ids: Vec<_> = issues.iter().map(|i| i.id.as_str()).collect();
+
+        // t2 (bd-b) first (newest); within tied t1, id ASC puts bd-a
+        // before bd-c. Priorities (P4, P0, P2) are deliberately
+        // scrambled relative to id order to prove priority plays no
+        // part in the default ordering anymore.
+        assert_eq!(ids, vec!["bd-b", "bd-a", "bd-c"]);
     }
 
     #[test]

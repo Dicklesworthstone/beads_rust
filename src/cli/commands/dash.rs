@@ -11,6 +11,7 @@ use crate::output::OutputContext;
 use crate::storage::presence::{PresenceRow, PresenceState};
 use crate::storage::{ListFilters, SqliteStorage};
 use crate::util::id::split_prefix_remainder;
+pub(crate) use crate::util::time::format_age_compact;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -296,31 +297,6 @@ fn parse_closed_within(raw: &str) -> Result<Option<chrono::Duration>> {
         }
     };
     Ok(Some(dur))
-}
-
-/// Render a relative age without an "ago" suffix — for the in-bracket
-/// presence badge where the surrounding context implies "now."
-pub(crate) fn format_age_compact(secs: i64) -> String {
-    if secs < 0 {
-        return "now".to_string();
-    }
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let m = secs / 60;
-    if m < 60 {
-        return format!("{m}m");
-    }
-    let h = m / 60;
-    if h < 24 {
-        return format!("{h}h");
-    }
-    let d = h / 24;
-    if d < 7 {
-        return format!("{d}d");
-    }
-    let w = d / 7;
-    format!("{w}w")
 }
 
 /// Render a relative age as a terse string.

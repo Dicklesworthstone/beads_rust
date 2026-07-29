@@ -409,6 +409,12 @@ fn snapshot_count_empty_json() {
 
 #[test]
 fn snapshot_list_priority_ordering_json() {
+    // `bd list`'s bare default (no --sort) is newest-first
+    // (`created_at DESC`), not priority order — priority ordering is
+    // reachable via `--sort priority`. This test's whole point is
+    // verifying priority ordering, so it asks for that explicitly
+    // rather than relying on the default (which used to be
+    // priority-first, but isn't anymore).
     let workspace = init_workspace();
 
     // Create issues with different priorities (lower number = higher priority)
@@ -432,7 +438,11 @@ fn snapshot_list_priority_ordering_json() {
         "set_crit_prio",
     );
 
-    let output = run_br(&workspace, ["list", "--json"], "list_priority_order_json");
+    let output = run_br(
+        &workspace,
+        ["list", "--sort", "priority", "--json"],
+        "list_priority_order_json",
+    );
     assert!(
         output.status.success(),
         "list priority ordering json failed: {}",
@@ -458,6 +468,62 @@ fn snapshot_list_priority_ordering_json() {
             );
         }
     }
+}
+
+#[test]
+fn snapshot_list_default_ordering_is_newest_first_json() {
+    // Bare `bd list --json` (no --sort): newest-first by created_at,
+    // with id as a deterministic tiebreak. Priorities are assigned in
+    // the *opposite* order from creation here specifically to prove
+    // priority plays no part: if the default were still
+    // priority-first, this would come out sorted by priority instead
+    // of reversed-creation-order, and the assertion below would fail.
+    let workspace = init_workspace();
+
+    let id_first = create_issue(&workspace, "Created first", "create_ord_1");
+    let id_second = create_issue(&workspace, "Created second", "create_ord_2");
+    let id_third = create_issue(&workspace, "Created third", "create_ord_3");
+
+    // Ascending priority in creation order — if this leaked into the
+    // default ordering, the id order below would come out unchanged
+    // instead of reversed.
+    let _ = run_br(
+        &workspace,
+        ["update", &id_first, "--priority", "0"],
+        "set_p0",
+    );
+    let _ = run_br(
+        &workspace,
+        ["update", &id_second, "--priority", "2"],
+        "set_p2",
+    );
+    let _ = run_br(
+        &workspace,
+        ["update", &id_third, "--priority", "4"],
+        "set_p4",
+    );
+
+    let output = run_br(&workspace, ["list", "--json"], "list_default_order_json");
+    assert!(
+        output.status.success(),
+        "list default ordering json failed: {}",
+        output.stderr
+    );
+
+    let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    let ids: Vec<String> = json
+        .as_array()
+        .expect("array")
+        .iter()
+        .map(|item| item["id"].as_str().expect("id").to_string())
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![id_third, id_second, id_first],
+        "default `bd list --json` order should be newest-created first, \
+         regardless of priority"
+    );
 }
 
 // ============================================================================

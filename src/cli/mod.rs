@@ -712,6 +712,12 @@ pub enum Commands {
     Search(SearchArgs),
 
     /// List issues
+    ///
+    /// Default ordering (no --sort): newest first (created_at DESC),
+    /// with id as a deterministic tiebreak for issues sharing a
+    /// timestamp. Use --sort priority for the old priority-first
+    /// behavior, or --sort updated_at/title. --reverse flips whatever
+    /// ordering is in effect.
     List(ListArgs),
 
     /// Show issue details
@@ -1702,11 +1708,15 @@ pub struct ListArgs {
     #[arg(long)]
     pub limit: Option<usize>,
 
-    /// Sort field (`priority`, `created_at`, `updated_at`, `title`)
+    /// Sort field (`priority`, `created_at`, `updated_at`, `title`).
+    /// Default (no --sort given): newest first — `created_at DESC`,
+    /// tied timestamps broken by `id` ascending. `--sort priority`
+    /// restores the old priority-first ordering.
     #[arg(long, add = ArgValueCompleter::new(sort_key_completer))]
     pub sort: Option<String>,
 
-    /// Reverse sort order
+    /// Reverse sort order (also flips the default newest-first order
+    /// to oldest-first)
     #[arg(long, short = 'r')]
     pub reverse: bool,
 

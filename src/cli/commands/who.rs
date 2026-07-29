@@ -21,6 +21,7 @@ use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::messages::MessageFilter;
 use crate::storage::watchers::{WATCHER_TTL_SECONDS, WatcherRow};
+use crate::util::time::format_age_compact;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::io::Write;
@@ -344,29 +345,6 @@ fn tail_path(path: &str, max: usize) -> String {
         return format!("…{suffix}");
     }
     format!("…/{acc}")
-}
-
-fn format_age_compact(secs: i64) -> String {
-    if secs < 0 {
-        return "now".to_string();
-    }
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let m = secs / 60;
-    if m < 60 {
-        return format!("{m}m");
-    }
-    let h = m / 60;
-    if h < 24 {
-        return format!("{h}h");
-    }
-    let d = h / 24;
-    if d < 7 {
-        return format!("{d}d");
-    }
-    let w = d / 7;
-    format!("{w}w")
 }
 
 #[cfg(test)]

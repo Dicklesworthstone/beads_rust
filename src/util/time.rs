@@ -150,6 +150,36 @@ pub fn parse_relative_time(s: &str) -> Option<DateTime<Utc>> {
     }
 }
 
+/// Render a relative age as a compact string with no "ago" suffix —
+/// e.g. `45s`, `12m`, `3h`, `5d`, `2w`. Negative durations (clock
+/// skew) render as `now`.
+///
+/// Shared by `bd dash`, `bd who`, `bd admin watch`, and `bd list` so
+/// there is exactly one implementation of the unit thresholds.
+#[must_use]
+pub fn format_age_compact(secs: i64) -> String {
+    if secs < 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let m = secs / 60;
+    if m < 60 {
+        return format!("{m}m");
+    }
+    let h = m / 60;
+    if h < 24 {
+        return format!("{h}h");
+    }
+    let d = h / 24;
+    if d < 7 {
+        return format!("{d}d");
+    }
+    let w = d / 7;
+    format!("{w}w")
+}
+
 /// Format a duration as a human-readable "time ago" string.
 ///
 /// Returns strings like "3s ago", "5m ago", "2h ago", "1d ago".
@@ -214,5 +244,16 @@ mod tests {
     fn test_parse_relative_time_invalid() {
         assert!(parse_relative_time("invalid").is_none());
         assert!(parse_relative_time("2025-01-15").is_none());
+    }
+
+    #[test]
+    fn test_format_age_compact_units() {
+        assert_eq!(format_age_compact(-5), "now");
+        assert_eq!(format_age_compact(0), "0s");
+        assert_eq!(format_age_compact(45), "45s");
+        assert_eq!(format_age_compact(60), "1m");
+        assert_eq!(format_age_compact(3600), "1h");
+        assert_eq!(format_age_compact(86_400), "1d");
+        assert_eq!(format_age_compact(7 * 86_400), "1w");
     }
 }

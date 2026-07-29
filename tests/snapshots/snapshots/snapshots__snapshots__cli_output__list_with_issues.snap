@@ -1,7 +1,7 @@
 ---
 source: tests/snapshots/cli_output.rs
-expression: normalize_output(&output.stdout)
+expression: normalize_output_with_age_masking(&output.stdout)
 ---
-○ ID-REDACTED [● P2] [task] - Task: Update docs
-○ ID-REDACTED [● P2] [task] - Feature: Add dark mode
-○ ID-REDACTED [● P2] [task] - Bug: Fix login
+○ ID-REDACTED [● P2] [task] AGE       - Task: Update docs
+○ ID-REDACTED [● P2] [task] AGE       - Feature: Add dark mode
+○ ID-REDACTED [● P2] [task] AGE       - Bug: Fix login

@@ -47,10 +47,10 @@ pub use output::{
     TreeNode,
 };
 pub use text::{
-    TextFormatOptions, format_issue_line, format_issue_line_with, format_priority,
-    format_priority_badge, format_priority_label, format_status_icon, format_status_icon_colored,
-    format_status_label, format_type_badge, format_type_badge_colored, terminal_width,
-    truncate_title,
+    TextFormatOptions, format_issue_age_field, format_issue_line, format_issue_line_with,
+    format_priority, format_priority_badge, format_priority_label, format_status_icon,
+    format_status_icon_colored, format_status_label, format_type_badge, format_type_badge_colored,
+    terminal_width, truncate_title,
 };
 
 // Rich output support
