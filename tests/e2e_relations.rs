@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, create_via_markdown, extract_json_payload, run_br};
 use serde_json::Value;
 use std::fs;
 use tracing::info;
@@ -20,6 +20,11 @@ fn parse_created_id(stdout: &str) -> String {
 
 #[test]
 fn e2e_relations_labels_comments() {
+    // NOTE: the `comments` CLI subcommand was removed entirely (no
+    // replacement surface), so the comments half of this test has been
+    // dropped. The labels half survives (labels are still real,
+    // filterable, exported data — only the mutation CLI moved to
+    // markdown bulk-import), so this test is ported to exercise that.
     common::init_test_logging();
     info!("e2e_relations_labels_comments: starting");
     let workspace = BrWorkspace::new();
@@ -35,13 +40,17 @@ fn e2e_relations_labels_comments() {
     );
     let parent_id = parse_created_id(&parent.stdout);
 
-    let child = run_br(&workspace, ["create", "Child issue"], "create_child");
-    assert!(
-        child.status.success(),
-        "child create failed: {}",
-        child.stderr
+    // Child issue is created with the "backend" label via markdown
+    // bulk-import, since `update --add-label` no longer exists.
+    let child_id = create_via_markdown(
+        &workspace,
+        "create_child",
+        "Child issue",
+        None,
+        None,
+        None,
+        &["backend"],
     );
-    let child_id = parse_created_id(&child.stdout);
 
     let parent_args = vec![
         "update".to_string(),
@@ -56,19 +65,6 @@ fn e2e_relations_labels_comments() {
         parent_update.stderr
     );
 
-    let label_args = vec![
-        "update".to_string(),
-        child_id.clone(),
-        "--add-label".to_string(),
-        "backend".to_string(),
-    ];
-    let label_update = run_br(&workspace, label_args, "add_label");
-    assert!(
-        label_update.status.success(),
-        "label update failed: {}",
-        label_update.stderr
-    );
-
     let list = run_br(
         &workspace,
         ["list", "--label", "backend", "--json"],
@@ -81,34 +77,6 @@ fn e2e_relations_labels_comments() {
         list_json.iter().any(|item| item["id"] == child_id),
         "labeled issue missing in list"
     );
-
-    let comment_args = vec![
-        "comments".to_string(),
-        "add".to_string(),
-        child_id.clone(),
-        "First comment".to_string(),
-    ];
-    let comment = run_br(&workspace, comment_args, "add_comment");
-    assert!(
-        comment.status.success(),
-        "comment add failed: {}",
-        comment.stderr
-    );
-
-    let list_comments = run_br(
-        &workspace,
-        ["comments", "list", &child_id, "--json"],
-        "list_comments",
-    );
-    assert!(
-        list_comments.status.success(),
-        "comment list failed: {}",
-        list_comments.stderr
-    );
-    let comments_payload = extract_json_payload(&list_comments.stdout);
-    let comments_json: Vec<Value> = serde_json::from_str(&comments_payload).expect("comments json");
-    assert_eq!(comments_json.len(), 1);
-    assert_eq!(comments_json[0]["text"], "First comment");
     info!("e2e_relations_labels_comments: assertions passed");
 }
 
@@ -266,22 +234,19 @@ fn e2e_dep_tree_external_nodes() {
         "external node should show pending marker"
     );
 
-    let provider = run_br(&external, ["create", "Provide auth"], "ext_create");
-    assert!(
-        provider.status.success(),
-        "external create failed: {}",
-        provider.stderr
-    );
-    let provider_id = parse_created_id(&provider.stdout);
-    let label = run_br(
+    // NOTE: labels can no longer be attached via `update --add-label` (the
+    // CLI flag was removed; only markdown bulk-import can set labels at
+    // creation time now). The "provides:auth" label is load-bearing here
+    // (external dep resolution in src/storage/sqlite.rs matches on it), so
+    // it must actually be set, not just decorative test setup.
+    let provider_id = create_via_markdown(
         &external,
-        ["update", &provider_id, "--add-label", "provides:auth"],
-        "ext_label",
-    );
-    assert!(
-        label.status.success(),
-        "external label failed: {}",
-        label.stderr
+        "ext_create",
+        "Provide auth",
+        None,
+        None,
+        None,
+        &["provides:auth"],
     );
     let close = run_br(&external, ["close", &provider_id], "ext_close");
     assert!(
@@ -381,22 +346,19 @@ fn e2e_dep_list_external_nodes() {
         "external dep should show pending marker"
     );
 
-    let provider = run_br(&external, ["create", "Provide auth"], "ext_create");
-    assert!(
-        provider.status.success(),
-        "external create failed: {}",
-        provider.stderr
-    );
-    let provider_id = parse_created_id(&provider.stdout);
-    let label = run_br(
+    // NOTE: labels can no longer be attached via `update --add-label` (the
+    // CLI flag was removed; only markdown bulk-import can set labels at
+    // creation time now). The "provides:auth" label is load-bearing here
+    // (external dep resolution in src/storage/sqlite.rs matches on it), so
+    // it must actually be set, not just decorative test setup.
+    let provider_id = create_via_markdown(
         &external,
-        ["update", &provider_id, "--add-label", "provides:auth"],
-        "ext_label",
-    );
-    assert!(
-        label.status.success(),
-        "external label failed: {}",
-        label.stderr
+        "ext_create",
+        "Provide auth",
+        None,
+        None,
+        None,
+        &["provides:auth"],
     );
     let close = run_br(&external, ["close", &provider_id], "ext_close");
     assert!(
@@ -529,9 +491,20 @@ fn e2e_close_blocked_requires_force() {
         ["close", &blocked_id, "--json"],
         "close_blocked_skip",
     );
+    // NOTE: `close` intentionally returns a non-zero exit code (with the
+    // `NOTHING_TO_DO` error envelope on stderr) when every requested issue
+    // was skipped, while still printing the (empty) closed-issues array on
+    // stdout (see src/cli/commands/close.rs, commit e727f6c "add
+    // NothingToDo exit code"). This is deliberate design, not a
+    // regression, so the test asserts on that behavior instead of a
+    // successful exit code.
     assert!(
-        close_skip.status.success(),
-        "close blocked failed: {}",
+        !close_skip.status.success(),
+        "close of a blocked issue (no --force) should now fail with NOTHING_TO_DO"
+    );
+    assert!(
+        close_skip.stderr.contains("NOTHING_TO_DO"),
+        "expected NOTHING_TO_DO error on stderr, got: {}",
         close_skip.stderr
     );
     let payload = extract_json_payload(&close_skip.stdout);

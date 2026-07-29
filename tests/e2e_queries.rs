@@ -1,6 +1,6 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, create_via_markdown, extract_json_payload, run_br};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -23,17 +23,19 @@ fn e2e_queries_blocked_stale_count_search() {
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let blocker = run_br(
+    // NOTE: labels can no longer be attached via `update --add-label` (the
+    // CLI flag was removed; only markdown bulk-import can set labels at
+    // creation time now), so the "core" label is applied at creation via
+    // `create_via_markdown`.
+    let blocker_id = create_via_markdown(
         &workspace,
-        ["create", "Blocker issue", "-p", "1"],
         "create_blocker",
+        "Blocker issue",
+        None,
+        Some("1"),
+        None,
+        &["core"],
     );
-    assert!(
-        blocker.status.success(),
-        "blocker create failed: {}",
-        blocker.stderr
-    );
-    let blocker_id = parse_created_id(&blocker.stdout);
 
     let blocked = run_br(
         &workspace,
@@ -70,17 +72,6 @@ fn e2e_queries_blocked_stale_count_search() {
         closed.stderr
     );
     let closed_id = parse_created_id(&closed.stdout);
-
-    let label_blocker = run_br(
-        &workspace,
-        ["update", &blocker_id, "--add-label", "core"],
-        "label_blocker",
-    );
-    assert!(
-        label_blocker.status.success(),
-        "label update failed: {}",
-        label_blocker.stderr
-    );
 
     let dep_add = run_br(
         &workspace,

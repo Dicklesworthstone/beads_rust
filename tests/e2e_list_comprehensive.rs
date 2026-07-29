@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, create_via_markdown, extract_json_payload, run_br};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -39,63 +39,42 @@ fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {
     let mut ids = Vec::new();
 
     // Issue 1: Open task, P1, labeled "core"
-    let issue1 = run_br(
+    //
+    // NOTE: labels can no longer be attached via `update --add-label` (the
+    // CLI flag was removed; only markdown bulk-import can set labels at
+    // creation time now), so these fixtures use `create_via_markdown`.
+    let id1 = create_via_markdown(
         &workspace,
-        ["create", "Core task", "-t", "task", "-p", "1"],
         "create_task1",
-    );
-    assert!(issue1.status.success());
-    let id1 = parse_created_id(&issue1.stdout);
-    run_br(
-        &workspace,
-        ["update", &id1, "--add-label", "core"],
-        "label_task1",
+        "Core task",
+        Some("task"),
+        Some("1"),
+        None,
+        &["core"],
     );
     ids.push(id1);
 
     // Issue 2: Open bug, P0, labeled "urgent", assigned to "alice"
-    let issue2 = run_br(
+    let id2 = create_via_markdown(
         &workspace,
-        ["create", "Critical bug", "-t", "bug", "-p", "0"],
         "create_bug1",
-    );
-    assert!(issue2.status.success());
-    let id2 = parse_created_id(&issue2.stdout);
-    run_br(
-        &workspace,
-        [
-            "update",
-            &id2,
-            "--add-label",
-            "urgent",
-            "--assignee",
-            "alice",
-        ],
-        "update_bug1",
+        "Critical bug",
+        Some("bug"),
+        Some("0"),
+        Some("alice"),
+        &["urgent"],
     );
     ids.push(id2);
 
     // Issue 3: Open feature, P2, labeled "core" and "frontend", assigned to "bob"
-    let issue3 = run_br(
+    let id3 = create_via_markdown(
         &workspace,
-        ["create", "New feature", "-t", "feature", "-p", "2"],
         "create_feature1",
-    );
-    assert!(issue3.status.success());
-    let id3 = parse_created_id(&issue3.stdout);
-    run_br(
-        &workspace,
-        [
-            "update",
-            &id3,
-            "--add-label",
-            "core",
-            "--add-label",
-            "frontend",
-            "--assignee",
-            "bob",
-        ],
-        "update_feature1",
+        "New feature",
+        Some("feature"),
+        Some("2"),
+        Some("bob"),
+        &["core", "frontend"],
     );
     ids.push(id3);
 

@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, create_via_markdown, extract_json_payload, run_br};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -105,35 +105,28 @@ fn q_with_priority_flag() {
 #[test]
 fn q_with_all_flags() {
     let _log = common::test_log("q_with_all_flags");
-    // Combine type + priority + labels
+    // Combine type + priority + labels.
+    //
+    // NOTE: `q -l`/`--labels` was removed from the CLI (the field is
+    // `#[arg(skip)]`); the only surviving way to set labels at creation
+    // time is markdown bulk-import, so this exercises `create --file`
+    // instead of `q` for the label part while still verifying type +
+    // priority + labels end up on the created issue.
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    let quick = run_br(
+    let id = create_via_markdown(
         &workspace,
-        [
-            "q",
-            "Critical bug",
-            "-t",
-            "bug",
-            "-p",
-            "0",
-            "-l",
-            "urgent",
-            "-l",
-            "regression",
-        ],
         "quick_all",
+        "Critical bug",
+        Some("bug"),
+        Some("0"),
+        None,
+        &["urgent", "regression"],
     );
-    assert!(
-        quick.status.success(),
-        "q with all flags failed: {}",
-        quick.stderr
-    );
-
-    let id = quick.stdout.trim();
+    let id = id.as_str();
 
     // Verify all fields
     let show = run_br(&workspace, ["show", id, "--json"], "show");
@@ -161,25 +154,27 @@ fn q_with_all_flags() {
 #[test]
 fn q_with_labels() {
     let _log = common::test_log("q_with_labels");
-    // Test label functionality including comma-separated values
+    // Test label functionality including multiple values.
+    //
+    // NOTE: `q -l`/`--labels` was removed from the CLI (the field is
+    // `#[arg(skip)]`); the only surviving way to set labels at creation
+    // time is markdown bulk-import, so this exercises `create --file`
+    // instead of `q` for the label-bearing creation.
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
 
-    // Test comma-separated labels
-    let quick = run_br(
+    let id = create_via_markdown(
         &workspace,
-        ["q", "Labeled issue", "-l", "frontend,backend,api"],
         "quick_labels",
+        "Labeled issue",
+        None,
+        None,
+        None,
+        &["frontend", "backend", "api"],
     );
-    assert!(
-        quick.status.success(),
-        "q with labels failed: {}",
-        quick.stderr
-    );
-
-    let id = quick.stdout.trim();
+    let id = id.as_str();
 
     let show = run_br(&workspace, ["show", id, "--json"], "show");
     assert!(show.status.success(), "show failed: {}", show.stderr);
