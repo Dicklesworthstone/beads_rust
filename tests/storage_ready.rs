@@ -580,8 +580,17 @@ fn ready_excludes_blocked_issues_with_filters() {
 // STATUS INTERACTION TESTS
 // ============================================================================
 
+// NOTE: `ready_includes_open_and_in_progress` was removed. It asserted
+// in_progress issues are included in `get_ready_issues`'s default result,
+// which matched the semantics of the now-removed `bd ready` CLI command.
+// The storage layer's documented (and intentional) behavior today is that
+// "ready" means status = open only (see the doc comment on
+// `get_ready_issues` in src/storage/sqlite.rs: not in_progress, not
+// blocked, not deferred) - this is a deliberate design decision, not a
+// regression, and is already covered by the other 24 tests in this file.
+
 #[test]
-fn ready_includes_open_and_in_progress() {
+fn ready_excludes_in_progress_by_default() {
     let mut storage = test_db();
 
     let open = fixtures::IssueBuilder::new("Open issue")
@@ -606,7 +615,10 @@ fn ready_includes_open_and_in_progress() {
     let ids = ready_ids(&storage, &filters, ReadySortPolicy::Oldest);
 
     assert!(ids.contains(&open.id));
-    assert!(ids.contains(&in_progress.id));
+    assert!(
+        !ids.contains(&in_progress.id),
+        "ready should exclude in_progress issues (they are already being worked on)"
+    );
     assert!(!ids.contains(&closed.id));
     assert!(!ids.contains(&deferred.id));
 }
