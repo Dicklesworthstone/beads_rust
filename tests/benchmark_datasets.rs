@@ -275,11 +275,12 @@ where
         .into_iter()
         .map(|a| a.as_ref().to_string_lossy().to_string())
         .collect();
-    let args_vec = if binary == "br" {
-        common::apply_default_test_prefix_shim(args_vec)
-    } else {
-        args_vec
-    };
+    // Apply the --prefix auto-injection shim regardless of which binary
+    // is being invoked: the second binary just refers to whatever the
+    // BD_BINARY/PATH resolution points at, and it enforces the same
+    // mandatory --prefix validation as br (there is no longer a separate
+    // implementation with different defaults).
+    let args_vec = common::apply_default_test_prefix_shim(args_vec);
 
     let output = if binary == "br" {
         let br_bin = assert_cmd::cargo::cargo_bin!("br");
@@ -1203,6 +1204,13 @@ fn benchmark_dataset_quick() {
     init_test_logging();
 
     info!("benchmark_dataset_quick: starting");
+
+    if !DatasetRegistry::new().is_available(KnownDataset::BeadsRust) {
+        eprintln!(
+            "Skipping benchmark_dataset_quick: beads_rust dataset not available (no .beads/beads.db in this checkout)"
+        );
+        return;
+    }
 
     let config = BenchConfig {
         warmup_runs: 1,
