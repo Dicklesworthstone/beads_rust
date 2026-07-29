@@ -7,6 +7,8 @@
 //! - Issue line formatting
 
 use crate::model::{Issue, IssueType, Priority, Status};
+use crate::util::time::format_age_compact;
+use chrono::Utc;
 use crossterm::style::Stylize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -233,18 +235,50 @@ fn visible_len(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
+/// Fixed padded width of the age field in `format_issue_line_with`,
+/// so the ` - title` column lines up across rows regardless of how
+/// long any individual row's age string is. Sized to comfortably fit
+/// the common dual form `NNw/NNw` (7 chars) with a little slack.
+const AGE_FIELD_WIDTH: usize = 8;
+
+/// Compute the compact "created/updated" age field for an issue —
+/// e.g. `5d/2h` (created 5 days ago, updated 2 hours ago).
+///
+/// When the created and updated ages render to the *same* compact
+/// string (the issue has never been meaningfully updated since
+/// creation, at the resolution of the compact units), only that one
+/// age is shown instead of a redundant `5d/5d`.
+///
+/// Shared with the rich `IssueTable`'s combined Age column so the
+/// two views present ages identically.
+#[must_use]
+pub fn format_issue_age_field(issue: &Issue) -> String {
+    let now = Utc::now();
+    let created = format_age_compact((now - issue.created_at).num_seconds().max(0));
+    let updated = format_age_compact((now - issue.updated_at).num_seconds().max(0));
+    if created == updated {
+        created
+    } else {
+        format!("{created}/{updated}")
+    }
+}
+
 /// Format a single-line issue summary with options.
 ///
-/// Format: `{icon} {id} [● {priority}] [{type}] - {title}`
-/// (matches bd text output format)
+/// Format: `{icon} {id} [● {priority}] [{type}] {age} - {title}`
+/// where `{age}` is the compact created/updated age field (see
+/// [`format_issue_age_field`]), left-padded to a fixed width so
+/// titles line up across rows.
 #[must_use]
 pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> String {
     let status_icon_plain = format_status_icon(&issue.status);
     // Account for the bullet in priority badge: [● P2]
     let priority_badge_plain = format!("[● {}]", format_priority(&issue.priority));
     let type_badge_plain = format_type_badge(&issue.issue_type);
+    let age_plain = format_issue_age_field(issue);
+    let age_padded = format!("{age_plain:<AGE_FIELD_WIDTH$}");
 
-    // Add 3 for " - " separator between type badge and title
+    // Add 3 for " - " separator between age field and title
     let prefix_len = visible_len(status_icon_plain)
         + 1
         + visible_len(&issue.id)
@@ -252,6 +286,8 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
         + visible_len(&priority_badge_plain)
         + 1
         + visible_len(&type_badge_plain)
+        + 1
+        + visible_len(&age_padded)
         + 3; // " - " separator
 
     let title = if options.wrap {
@@ -266,9 +302,14 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
     let status_icon = format_status_icon_colored(&issue.status, options.use_color);
     let priority_badge = format_priority_badge(&issue.priority, options.use_color);
     let type_badge = format_type_badge_colored(&issue.issue_type, options.use_color);
+    let age = if options.use_color {
+        age_padded.grey().to_string()
+    } else {
+        age_padded
+    };
 
     format!(
-        "{status_icon} {} {priority_badge} {type_badge} - {title}",
+        "{status_icon} {} {priority_badge} {type_badge} {age} - {title}",
         issue.id
     )
 }
@@ -371,10 +412,78 @@ mod tests {
 
     #[test]
     fn test_format_issue_line_open() {
-        let issue = make_test_issue();
+        // Fixed offsets (rather than `Utc::now()` for both fields)
+        // avoid flakiness: a same-instant pair could round to "0s" or
+        // "1s" depending on scheduling jitter between the two
+        // `Utc::now()` calls in `make_test_issue`.
+        let mut issue = make_test_issue();
+        issue.created_at = Utc::now() - chrono::Duration::days(5);
+        issue.updated_at = issue.created_at;
         let line = format_issue_line(&issue);
-        // Format matches bd: {icon} {id} [● {priority}] [{type}] - {title}
-        assert_eq!(line, "○ bd-test [● P2] [task] - Test title");
+        // Format: {icon} {id} [● {priority}] [{type}] {age (padded)} - {title}
+        // created == updated (same rendered unit) -> single "5d" age, not "5d/5d".
+        assert_eq!(line, "○ bd-test [● P2] [task] 5d       - Test title");
+    }
+
+    #[test]
+    fn test_format_issue_age_field_dedupes_equal_units() {
+        let mut issue = make_test_issue();
+        issue.created_at = Utc::now() - chrono::Duration::days(5);
+        issue.updated_at = issue.created_at;
+        assert_eq!(format_issue_age_field(&issue), "5d");
+    }
+
+    #[test]
+    fn test_format_issue_age_field_shows_both_when_units_differ() {
+        let mut issue = make_test_issue();
+        issue.created_at = Utc::now() - chrono::Duration::days(5);
+        issue.updated_at = Utc::now() - chrono::Duration::hours(2);
+        assert_eq!(format_issue_age_field(&issue), "5d/2h");
+    }
+
+    #[test]
+    fn test_format_issue_line_age_is_padded_for_alignment() {
+        let mut short = make_test_issue();
+        short.created_at = Utc::now() - chrono::Duration::minutes(5);
+        short.updated_at = short.created_at;
+        short.title = "Short-age title".to_string();
+
+        let mut long = make_test_issue();
+        long.created_at = Utc::now() - chrono::Duration::weeks(3);
+        long.updated_at = Utc::now() - chrono::Duration::hours(6);
+        long.title = "Long-age title".to_string();
+
+        let short_line = format_issue_line(&short);
+        let long_line = format_issue_line(&long);
+        // Both lines' " - " title separator should land at the same
+        // column, since the age field is padded to a fixed width.
+        let short_dash = short_line.find(" - ").expect("dash in short line");
+        let long_dash = long_line.find(" - ").expect("dash in long line");
+        assert_eq!(short_dash, long_dash);
+    }
+
+    #[test]
+    fn test_format_issue_line_age_colored_when_color_on() {
+        let mut issue = make_test_issue();
+        issue.created_at = Utc::now() - chrono::Duration::days(5);
+        issue.updated_at = issue.created_at;
+        let options = TextFormatOptions {
+            use_color: true,
+            max_width: None,
+            wrap: false,
+        };
+        let line = format_issue_line_with(&issue, options);
+        // Grey ANSI SGR code wraps the age text when color is on.
+        assert!(line.contains("\x1b["));
+    }
+
+    #[test]
+    fn test_format_issue_line_age_plain_when_color_off() {
+        let mut issue = make_test_issue();
+        issue.created_at = Utc::now() - chrono::Duration::days(5);
+        issue.updated_at = issue.created_at;
+        let line = format_issue_line(&issue);
+        assert!(!line.contains("\x1b["));
     }
 
     #[test]
@@ -442,9 +551,12 @@ mod tests {
     fn test_format_issue_line_with_truncation() {
         let mut issue = make_test_issue();
         issue.title = "A very long issue title".to_string();
+        // max_width must clear the (larger, now age-inclusive) prefix
+        // with some budget left over for the title, or truncate_title
+        // has 0 columns to work with and can't add "...".
         let options = TextFormatOptions {
             use_color: false,
-            max_width: Some(30),
+            max_width: Some(50),
             wrap: false,
         };
         let line = format_issue_line_with(&issue, options);

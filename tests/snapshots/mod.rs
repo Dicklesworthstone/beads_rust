@@ -80,6 +80,17 @@ static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DURATION_MS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*(ms|µs|ns|s)").expect("duration regex"));
+/// Matches `bd list`/`bd search`'s compact relative-age field, e.g.
+/// `0s`, `5d`, `3w`, or the combined `created/updated` form `5d/2h`.
+/// Distinct from `DURATION_MS_RE` (which is scoped to ms/µs/ns/s
+/// timing output): ages also use m/h/d/w and the `A/B` combined form,
+/// and unlike a timing duration an issue's age is inherently
+/// time-dependent (relative to "now" at test-run time), so tests that
+/// create an issue and immediately list it need this masked rather
+/// than asserting on a literal "0s" that would flake under load.
+static AGE_FIELD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b\d+(?:mo|s|m|h|d|w)(?:/\d+(?:mo|s|m|h|d|w))?\b").expect("age field regex")
+});
 
 /// Configuration for text normalization.
 ///
@@ -117,6 +128,14 @@ pub struct TextNormConfig {
     pub mask_usernames: bool,
     /// Mask version numbers (e.g., "version 0.1.7" → "version X.Y.Z")
     pub mask_version_numbers: bool,
+    /// Mask `bd list`/`bd search`'s compact relative-age field (e.g.
+    /// `0s`, `5d/2h`) — see [`AGE_FIELD_RE`]. Off by default in
+    /// [`Self::golden`] since most golden snapshots don't render
+    /// ages; opt in via [`Self::with_age_masking`] for the ones that
+    /// do, rather than asserting a literal age that's only stable
+    /// because the fixture and the assertion run within the same
+    /// second.
+    pub mask_ages: bool,
 }
 
 impl TextNormConfig {
@@ -140,6 +159,7 @@ impl TextNormConfig {
             mask_durations: false, // Keep durations by default
             mask_usernames: true,
             mask_version_numbers: true,
+            mask_ages: false,
         }
     }
 
@@ -161,6 +181,17 @@ impl TextNormConfig {
     pub const fn with_duration_masking() -> Self {
         Self {
             mask_durations: true,
+            ..Self::golden()
+        }
+    }
+
+    /// Configuration for snapshots of `bd list`/`bd search` output
+    /// where an issue was just created and immediately listed, so its
+    /// rendered age (`0s`, or occasionally `1s` under load) is
+    /// otherwise a source of snapshot flakiness.
+    pub const fn with_age_masking() -> Self {
+        Self {
+            mask_ages: true,
             ..Self::golden()
         }
     }
@@ -433,6 +464,12 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("durations".to_string());
     }
 
+    // 11b. Mask compact relative ages (bd list/search's age column)
+    if config.mask_ages && AGE_FIELD_RE.is_match(&normalized) {
+        normalized = AGE_FIELD_RE.replace_all(&normalized, "AGE").to_string();
+        log.push("ages".to_string());
+    }
+
     // 12. Mask owner/usernames
     if config.mask_usernames && OWNER_RE.is_match(&normalized) {
         normalized = OWNER_RE
@@ -479,6 +516,14 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
 /// Uses golden configuration for full normalization.
 pub fn normalize_output(output: &str) -> String {
     let (normalized, _) = normalize_text_with_log(output, &TextNormConfig::golden());
+    normalized
+}
+
+/// Like [`normalize_output`], but additionally masks the compact
+/// relative-age field so snapshots of freshly-created-then-listed
+/// issues don't embed a time-dependent `0s`/`1s`.
+pub fn normalize_output_with_age_masking(output: &str) -> String {
+    let (normalized, _) = normalize_text_with_log(output, &TextNormConfig::with_age_masking());
     normalized
 }
 

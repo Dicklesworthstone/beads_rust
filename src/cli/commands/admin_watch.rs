@@ -18,6 +18,13 @@ use crate::model::Message;
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::storage::messages::{MessageFilter, generate_message_id};
+use crate::util::time::format_age_compact;
+use chrono::{DateTime, Local, Utc};
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
 /// Tighter freshness window for the single-instance check than the
 /// `bd msg` typo guard's 60s. Heartbeat lands every
 /// `POLL_INTERVAL_SECS`, so 10s leaves room for one missed beat plus
@@ -25,11 +32,6 @@ use crate::storage::messages::{MessageFilter, generate_message_id};
 /// — Drop guards don't run on signal-kill, so we'd otherwise lock the
 /// operator out for 60s after every untidy exit.
 const SINGLE_INSTANCE_TTL_SECS: i64 = 10;
-use chrono::{DateTime, Local, Utc};
-use std::io::{BufRead, Write};
-use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
 
 /// Config key that persists the operator's read-cursor across runs.
 /// Stores an RFC3339 timestamp; messages with `sent_at > cursor`
@@ -373,29 +375,6 @@ fn write_cursor(storage: &mut SqliteStorage, value: DateTime<Utc>) -> Result<()>
 
 fn seconds_since(t: DateTime<Utc>) -> i64 {
     Utc::now().signed_duration_since(t).num_seconds()
-}
-
-fn format_age_compact(secs: i64) -> String {
-    if secs < 0 {
-        return "now".to_string();
-    }
-    if secs < 60 {
-        return format!("{secs}s");
-    }
-    let m = secs / 60;
-    if m < 60 {
-        return format!("{m}m");
-    }
-    let h = m / 60;
-    if h < 24 {
-        return format!("{h}h");
-    }
-    let d = h / 24;
-    if d < 7 {
-        return format!("{d}d");
-    }
-    let w = d / 7;
-    format!("{w}w")
 }
 
 #[cfg(test)]

@@ -148,27 +148,45 @@ pub fn execute(
         }
         OutputFormat::Text => {
             if matches!(ctx.mode(), OutputMode::Rich) {
-                let columns = if args.long {
-                    IssueTableColumns {
-                        id: true,
-                        priority: true,
-                        status: true,
-                        issue_type: true,
-                        title: true,
-                        assignee: true,
-                        created: true,
-                        updated: true,
-                        ..Default::default()
-                    }
-                } else {
-                    IssueTableColumns {
-                        id: true,
-                        priority: true,
-                        status: true,
-                        issue_type: true,
-                        title: true,
-                        ..Default::default()
-                    }
+                // `bd list`'s rich table is only ever built in
+                // `OutputMode::Rich`, which (see `OutputContext::
+                // detect_mode`/`from_output_format`) requires color to
+                // be enabled and stdout to be a tty — `NO_COLOR` or a
+                // non-tty always falls back to the plain-text line
+                // path below instead. `color_available` documents that
+                // invariant at the call site rather than assuming it
+                // silently: if it's ever false here, the Type column
+                // comes back (see below) so type information isn't
+                // lost just because the ID color can't carry it.
+                let color_available = matches!(ctx.mode(), OutputMode::Rich);
+                let columns = IssueTableColumns {
+                    id: true,
+                    priority: true,
+                    status: true,
+                    // Default: the Type column is dropped and its
+                    // signal is instead carried by coloring the ID
+                    // cell (see `color_id_by_type` below) — but only
+                    // when color is actually available; otherwise the
+                    // column comes back so nothing is silently lost.
+                    // `--long`: always show it textually regardless of
+                    // color, which is also what keeps `--long` a
+                    // meaningful distinct view now that Assignee is
+                    // gone from it too and both views share the same
+                    // Age column.
+                    issue_type: args.long || !color_available,
+                    title: true,
+                    // Assignee is empty in practice; dropped from both
+                    // the default and --long views to give the Title
+                    // column the space back.
+                    assignee: false,
+                    // Combined compact age column (created/updated),
+                    // same presentation as the plain-text line's age
+                    // field — in both default and --long views, since
+                    // %Y-%m-%d costs ~2x the width for less-legible
+                    // information ("2024-03-01" vs "5d/2h").
+                    age: true,
+                    color_id_by_type: color_available,
+                    ..Default::default()
                 };
                 let mut table = IssueTable::new(&issues, ctx.theme())
                     .columns(columns)

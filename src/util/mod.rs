@@ -21,6 +21,7 @@ pub use id::{
     find_matching_ids, id_depth, is_child_id, is_valid_id_format, normalize_id, parse_id,
     resolve_id, validate_prefix,
 };
+pub use time::format_age_compact;
 
 use std::env;
 use std::fs::{self, OpenOptions};

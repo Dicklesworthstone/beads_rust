@@ -1,4 +1,4 @@
-use crate::format::truncate_title;
+use crate::format::{format_issue_age_field, truncate_title};
 use crate::model::Issue;
 use crate::output::Theme;
 use regex::{Regex, RegexBuilder};
@@ -28,9 +28,28 @@ pub struct IssueTableColumns {
     pub title: bool,
     pub assignee: bool,
     pub labels: bool,
+    /// Absolute `Created`/`Updated` date columns (`%Y-%m-%d`, one
+    /// column each). Superseded by `age` for `bd list`, which uses a
+    /// single combined compact-age column instead; kept here for
+    /// other callers that still want absolute dates.
     pub created: bool,
     pub updated: bool,
+    /// Combined compact age column, e.g. `5d/2h` (created/updated) —
+    /// same presentation and dedupe rule as
+    /// [`crate::format::format_issue_age_field`], so the rich table
+    /// and the plain-text line agree. Mutually exclusive with
+    /// `created`/`updated` in practice (nothing stops enabling both,
+    /// but no caller does).
+    pub age: bool,
     pub context: bool,
+    /// When set (and `id` is enabled), color the ID cell by issue
+    /// type ([`Theme::type_style`]) instead of the flat
+    /// [`Theme::issue_id`] color, and skip the separate `Type`
+    /// column — the color itself carries the type signal. Only
+    /// meaningful when color is actually going to render (callers
+    /// should gate this on their own "is color available" check;
+    /// `IssueTable` doesn't second-guess it).
+    pub color_id_by_type: bool,
 }
 
 impl IssueTableColumns {
@@ -70,7 +89,9 @@ impl IssueTableColumns {
             labels: true,
             created: true,
             updated: true,
+            age: false,
             context: false,
+            color_id_by_type: false,
         }
     }
 }
@@ -139,8 +160,48 @@ impl<'a> IssueTable<'a> {
             .as_deref()
             .and_then(build_highlight_regex);
 
-        // Reserve ~100 chars for other columns (conservative) or min 60.
-        let title_max_width = self.width.map_or(60, |w| w.saturating_sub(100).max(60));
+        // Reserve space for whichever other columns are actually
+        // enabled (their min/fixed width plus ~3 chars of border and
+        // padding each), so the Title column gets whatever's left —
+        // dropping a column (e.g. Type, Assignee) or shrinking one
+        // (e.g. two 10-wide date columns collapsed into one 9-wide
+        // Age column) now visibly hands that space back to titles
+        // instead of it sitting reserved-but-unused behind a fixed
+        // budget tuned for the old, wider column set.
+        let mut reserved = 4; // outer table border/padding
+        if self.columns.id {
+            reserved += 10 + 3;
+        }
+        if self.columns.priority {
+            reserved += 3 + 3;
+        }
+        if self.columns.status {
+            reserved += 8 + 3;
+        }
+        if self.columns.issue_type {
+            reserved += 7 + 3;
+        }
+        if self.columns.assignee {
+            reserved += 20 + 3;
+        }
+        if self.columns.labels {
+            reserved += 15 + 3;
+        }
+        if self.columns.created {
+            reserved += 10 + 3;
+        }
+        if self.columns.updated {
+            reserved += 10 + 3;
+        }
+        if self.columns.age {
+            reserved += 9 + 3;
+        }
+        if self.columns.context {
+            reserved += 20 + 3;
+        }
+        let title_max_width = self
+            .width
+            .map_or(60, |w| w.saturating_sub(reserved).max(20));
 
         let mut table = Table::new()
             .box_style(self.theme.box_style)
@@ -183,6 +244,12 @@ impl<'a> IssueTable<'a> {
         if self.columns.updated {
             table = table.with_column(Column::new("Updated").width(10));
         }
+        if self.columns.age {
+            // "created/updated" compact ages, e.g. `5d/2h` — up to
+            // ~7-8 chars in the common case, matching the padded
+            // width used by the plain-text line.
+            table = table.with_column(Column::new("Age").width(9));
+        }
         if self.columns.context {
             table = table.with_column(Column::new("Context").min_width(20).max_width(60));
         }
@@ -192,7 +259,15 @@ impl<'a> IssueTable<'a> {
             let mut cells: Vec<Cell> = vec![];
 
             if self.columns.id {
-                cells.push(Cell::new(Text::new(&issue.id)).style(self.theme.issue_id.clone()));
+                // When the Type column is dropped in favor of coloring
+                // the ID by issue type, the ID cell carries that
+                // signal; otherwise it gets the theme's flat ID color.
+                let id_style = if self.columns.color_id_by_type {
+                    self.theme.type_style(&issue.issue_type)
+                } else {
+                    self.theme.issue_id.clone()
+                };
+                cells.push(Cell::new(Text::new(&issue.id)).style(id_style));
             }
             if self.columns.priority {
                 cells.push(
@@ -241,6 +316,12 @@ impl<'a> IssueTable<'a> {
             if self.columns.updated {
                 cells.push(
                     Cell::new(Text::new(issue.updated_at.format("%Y-%m-%d").to_string()))
+                        .style(self.theme.timestamp.clone()),
+                );
+            }
+            if self.columns.age {
+                cells.push(
+                    Cell::new(Text::new(format_issue_age_field(issue)))
                         .style(self.theme.timestamp.clone()),
                 );
             }

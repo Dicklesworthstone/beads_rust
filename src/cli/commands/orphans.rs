@@ -168,7 +168,9 @@ pub fn execute(
             labels: false,
             created: false,
             updated: false,
+            age: false,
             context: args.details,
+            color_id_by_type: false,
         };
 
         let mut table = IssueTable::new(&orphan_issues, ctx.theme())
