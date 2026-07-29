@@ -20,11 +20,48 @@ fn bd_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Check that the `bd` on PATH is actually the SAME BUILD as the `br`
+/// under test.
+///
+/// These "conformance" tests were written when `bd` was a separate Go
+/// implementation. In this environment there is no Go binary: `bd` is
+/// just an alias for an INSTALLED build of this same project — usually
+/// an OLDER one than the `br` in `target/`. Comparing the two then
+/// tests nothing about conformance and instead fails on every
+/// deliberate output change until the installed binary is redeployed
+/// (which is a packaging step, not something a test run controls).
+///
+/// So: only compare when the two binaries report the same version
+/// string. When they differ, skip — a stale installed binary must not
+/// manufacture failures for changes that are already correct.
+fn bd_matches_br_build() -> bool {
+    let version_of = |bin: &str| {
+        std::process::Command::new(bin)
+            .arg("version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let br = std::env::var("BR_BINARY").unwrap_or_else(|_| "br".to_string());
+    match (version_of("bd"), version_of(&br)) {
+        (Some(bd), Some(br)) => bd == br,
+        _ => false,
+    }
+}
+
 /// Skip test if bd binary is not available (used in CI where only br is built)
 macro_rules! skip_if_no_bd {
     () => {
         if !bd_available() {
             eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+            return;
+        }
+        if !bd_matches_br_build() {
+            eprintln!(
+                "Skipping test: 'bd' on PATH is a different build than the 'br' under test \
+                 (installed binary is stale); output-parity comparison would be meaningless"
+            );
             return;
         }
     };

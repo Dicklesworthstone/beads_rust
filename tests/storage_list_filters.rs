@@ -914,13 +914,50 @@ fn results_sorted_by_priority_then_created_at() {
     storage.create_issue(&critical, "tester").unwrap();
     storage.create_issue(&medium, "tester").unwrap();
 
-    let filters = ListFilters::default();
+    // Priority-first is no longer the DEFAULT ordering (that is now
+    // newest-created-first — see `default_sort_is_newest_first` below);
+    // it is reached explicitly via `--sort priority`. This test's intent
+    // is "priority ordering works", so it now asks for it explicitly
+    // rather than relying on the default.
+    let filters = ListFilters {
+        sort: Some("priority".to_string()),
+        ..Default::default()
+    };
     let results = storage.list_issues(&filters).unwrap();
 
     // Should be sorted by priority (P0, P2, P3 for our created issues)
     assert_eq!(results[0].priority, Priority::CRITICAL); // P0
     assert_eq!(results[1].priority, Priority::MEDIUM); // P2
     assert_eq!(results[2].priority, Priority::LOW); // P3
+}
+
+/// Guards the current DEFAULT ordering: newest created first,
+/// regardless of priority (id as the deterministic tiebreak).
+#[test]
+fn default_sort_is_newest_first() {
+    let mut storage = test_db();
+
+    // Created oldest -> newest; priorities deliberately out of order so
+    // a priority-first regression would flip the expected sequence.
+    let first = IssueBuilder::new("oldest")
+        .with_priority(Priority::CRITICAL)
+        .build();
+    let second = IssueBuilder::new("middle")
+        .with_priority(Priority::LOW)
+        .build();
+    let third = IssueBuilder::new("newest")
+        .with_priority(Priority::MEDIUM)
+        .build();
+
+    storage.create_issue(&first, "tester").unwrap();
+    storage.create_issue(&second, "tester").unwrap();
+    storage.create_issue(&third, "tester").unwrap();
+
+    let results = storage.list_issues(&ListFilters::default()).unwrap();
+
+    assert_eq!(results[0].title, "newest");
+    assert_eq!(results[1].title, "middle");
+    assert_eq!(results[2].title, "oldest");
 }
 
 // ============================================================================

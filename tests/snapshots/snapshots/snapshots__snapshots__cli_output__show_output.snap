@@ -4,4 +4,5 @@ expression: normalize_output(&output.stdout)
 ---
 ○ ID-REDACTED · Test issue with description   [● P2 · OPEN]
 Owner: USERNAME · Type: task
+Creator: USERNAME
 Created: YYYY-MM-DD · Updated: YYYY-MM-DD

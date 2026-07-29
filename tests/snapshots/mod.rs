@@ -70,6 +70,11 @@ static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
+/// `bd show`'s creator line carries the resolving agent identity (or
+/// the unix user when no agent identity is available), so it varies by
+/// whoever/whatever runs the suite — mask it exactly like `Owner:`.
+static CREATOR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"Creator: [a-zA-Z0-9_-]+").expect("creator regex"));
 static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
@@ -488,6 +493,15 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
             .replace_all(&normalized, "Owner: USERNAME")
             .to_string();
         log.push("usernames".to_string());
+    }
+
+    // 12b. Mask the creator line the same way (same rationale: the
+    // value is whoever ran the suite, agent identity or unix user).
+    if config.mask_usernames && CREATOR_RE.is_match(&normalized) {
+        normalized = CREATOR_RE
+            .replace_all(&normalized, "Creator: USERNAME")
+            .to_string();
+        log.push("creator".to_string());
     }
 
     // 13. Mask version numbers
