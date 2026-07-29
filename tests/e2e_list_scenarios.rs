@@ -19,7 +19,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, create_via_markdown, extract_json_payload, run_br};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -43,90 +43,54 @@ fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {
     let mut ids = Vec::new();
 
     // Issue 1: P0 bug assigned to alice with "critical" label
-    let issue1 = run_br(
+    //
+    // NOTE: labels can no longer be attached via `update --add-label` (the
+    // CLI flag was removed; only markdown bulk-import can set labels at
+    // creation time now), so these fixtures use `create_via_markdown`.
+    let id1 = create_via_markdown(
         &workspace,
-        ["create", "Critical login bug", "-p", "0", "-t", "bug"],
         "create_bug_p0",
-    );
-    assert!(issue1.status.success());
-    let id1 = parse_created_id(&issue1.stdout);
-    run_br(
-        &workspace,
-        [
-            "update",
-            &id1,
-            "--assignee",
-            "alice",
-            "--add-label",
-            "critical",
-        ],
-        "update_bug_p0",
+        "Critical login bug",
+        Some("bug"),
+        Some("0"),
+        Some("alice"),
+        &["critical"],
     );
     ids.push(id1);
 
     // Issue 2: P1 feature assigned to bob with "backend" label
-    let issue2 = run_br(
+    let id2 = create_via_markdown(
         &workspace,
-        ["create", "Add user dashboard", "-p", "1", "-t", "feature"],
         "create_feature_p1",
-    );
-    assert!(issue2.status.success());
-    let id2 = parse_created_id(&issue2.stdout);
-    run_br(
-        &workspace,
-        [
-            "update",
-            &id2,
-            "--assignee",
-            "bob",
-            "--add-label",
-            "backend",
-        ],
-        "update_feature_p1",
+        "Add user dashboard",
+        Some("feature"),
+        Some("1"),
+        Some("bob"),
+        &["backend"],
     );
     ids.push(id2);
 
     // Issue 3: P2 task assigned to alice with "frontend" label
-    let issue3 = run_br(
+    let id3 = create_via_markdown(
         &workspace,
-        ["create", "Update documentation", "-p", "2", "-t", "task"],
         "create_task_p2",
-    );
-    assert!(issue3.status.success());
-    let id3 = parse_created_id(&issue3.stdout);
-    run_br(
-        &workspace,
-        [
-            "update",
-            &id3,
-            "--assignee",
-            "alice",
-            "--add-label",
-            "frontend",
-        ],
-        "update_task_p2",
+        "Update documentation",
+        Some("task"),
+        Some("2"),
+        Some("alice"),
+        &["frontend"],
     );
     ids.push(id3);
 
     // Issue 4: P1 bug unassigned with "backend" and "api" labels
-    let issue4 = run_br(
+    let id4 = create_via_markdown(
         &workspace,
-        ["create", "API rate limiting bug", "-p", "1", "-t", "bug"],
         "create_bug_p1",
-    );
-    assert!(issue4.status.success());
-    let id4 = parse_created_id(&issue4.stdout);
-    run_br(
-        &workspace,
-        [
-            "update",
-            &id4,
-            "--add-label",
-            "backend",
-            "--add-label",
-            "api",
-        ],
-        "update_bug_p1",
+        "API rate limiting bug",
+        Some("bug"),
+        Some("1"),
+        None,
+        &["backend", "api"],
     );
     ids.push(id4);
 

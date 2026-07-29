@@ -1195,6 +1195,11 @@ mod tests {
 
     #[test]
     fn test_run_with_integrity() {
+        if !beads_rust_available() {
+            eprintln!("Skipping test_run_with_integrity: beads_rust dataset not available");
+            return;
+        }
+
         let (result, provenance) = run_with_integrity(KnownDataset::BeadsRust, |isolated| {
             // Verify we have a valid isolated dataset
             assert!(isolated.beads_dir.exists());
@@ -1219,6 +1224,13 @@ mod tests {
 
     #[test]
     fn test_metadata_includes_source_commit() {
+        if !beads_rust_available() {
+            eprintln!(
+                "Skipping test_metadata_includes_source_commit: beads_rust dataset not available"
+            );
+            return;
+        }
+
         let isolated =
             IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("should copy beads_rust");
 
@@ -1231,6 +1243,13 @@ mod tests {
 
     #[test]
     fn test_metadata_to_json_includes_new_fields() {
+        if !beads_rust_available() {
+            eprintln!(
+                "Skipping test_metadata_to_json_includes_new_fields: beads_rust dataset not available"
+            );
+            return;
+        }
+
         let isolated =
             IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("should copy beads_rust");
 

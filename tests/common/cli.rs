@@ -143,6 +143,25 @@ where
         args_vec
     };
     cmd.args(&args_vec);
+    // Clear ambient BD_*/BEADS_* identity and routing env vars before
+    // applying any test-specific overrides below. Without this, a
+    // `BD_AGENT_ID` set in the *outer* shell (e.g. an agent's own identity
+    // when running this suite interactively) leaks into fixtures via the
+    // cross-prefix "sender" provenance field, making snapshots/tests
+    // non-hermetic and dependent on who happens to run them.
+    for key in [
+        "BD_AGENT_ID",
+        "BD_ISSUE_PREFIX",
+        "BEADS_DIR",
+        "BEADS_JSONL",
+        "BEADS_AUTO_START_DAEMON",
+        "BEADS_FLUSH_DEBOUNCE",
+        "BEADS_REMOTE_SYNC_INTERVAL",
+        "BR_OUTPUT_FORMAT",
+        "TOON_DEFAULT_FORMAT",
+    ] {
+        cmd.env_remove(key);
+    }
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "beads_rust=debug");
@@ -192,4 +211,91 @@ pub fn extract_json_payload(stdout: &str) -> String {
         }
     }
     stdout.trim().to_string()
+}
+
+/// Create an issue via markdown bulk import (`create --file`).
+///
+/// `create --labels` / `update --add-label` etc. were removed from the CLI
+/// (the fields are `#[arg(skip)]`, kept only for back-compat); the only
+/// surviving way to attach labels at creation time is the markdown
+/// bulk-import grammar (a `### Labels` section). This helper builds a
+/// one-issue markdown file and imports it, returning the created issue's ID
+/// so callers can keep using the plain CLI for everything else (filtering,
+/// updates that don't touch labels, etc).
+///
+/// `issue_type`/`priority`/`assignee` are optional convenience fields since
+/// bulk import supports setting them in the same pass; pass `None` to leave
+/// them at their defaults.
+pub fn create_via_markdown(
+    workspace: &BrWorkspace,
+    label: &str,
+    title: &str,
+    issue_type: Option<&str>,
+    priority: Option<&str>,
+    assignee: Option<&str>,
+    labels: &[&str],
+) -> String {
+    create_via_markdown_with_description(workspace, label, title, issue_type, priority, assignee, None, labels)
+}
+
+/// Like [`create_via_markdown`] but also allows setting a description, for
+/// fixtures that need both labels and searchable description text.
+#[allow(clippy::too_many_arguments)]
+pub fn create_via_markdown_with_description(
+    workspace: &BrWorkspace,
+    label: &str,
+    title: &str,
+    issue_type: Option<&str>,
+    priority: Option<&str>,
+    assignee: Option<&str>,
+    description: Option<&str>,
+    labels: &[&str],
+) -> String {
+    let mut md = format!("## {title}\n");
+    if let Some(t) = issue_type {
+        md.push_str(&format!("### Type\n{t}\n"));
+    }
+    if let Some(p) = priority {
+        md.push_str(&format!("### Priority\n{p}\n"));
+    }
+    if let Some(a) = assignee {
+        md.push_str(&format!("### Assignee\n{a}\n"));
+    }
+    if let Some(d) = description {
+        md.push_str(&format!("### Description\n{d}\n"));
+    }
+    if !labels.is_empty() {
+        md.push_str("### Labels\n");
+        md.push_str(&labels.join(", "));
+        md.push('\n');
+    }
+
+    let file_path = workspace.root.join(format!("{label}.md"));
+    fs::write(&file_path, md).expect("write markdown fixture");
+
+    let run = run_br(
+        workspace,
+        [
+            "create".to_string(),
+            "--file".to_string(),
+            file_path.to_string_lossy().to_string(),
+            "--json".to_string(),
+        ],
+        label,
+    );
+    assert!(
+        run.status.success(),
+        "create --file (markdown import) failed for '{title}': {}",
+        run.stderr
+    );
+
+    let payload = extract_json_payload(&run.stdout);
+    let created: serde_json::Value =
+        serde_json::from_str(&payload).expect("markdown import JSON parse");
+    created
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|issue| issue["id"].as_str())
+        .expect("markdown import should return created issue with id")
+        .to_string()
 }

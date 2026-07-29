@@ -465,7 +465,16 @@ where
 {
     let mut cmd = std::process::Command::new("bd");
     cmd.current_dir(cwd);
-    cmd.args(args);
+    let args_vec: Vec<String> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_string_lossy().to_string())
+        .collect();
+    // Apply the same --prefix auto-injection shim used for br: "bd" here
+    // enforces the same mandatory --prefix validation (there is no longer
+    // a separate implementation with different defaults), so create/q
+    // calls need it too.
+    let args_vec = common::apply_default_test_prefix_shim(args_vec);
+    cmd.args(&args_vec);
     cmd.env("NO_COLOR", "1");
     cmd.env("HOME", cwd);
 

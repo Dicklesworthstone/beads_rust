@@ -383,69 +383,15 @@ fn e2e_bd_actor_env_sets_actor() {
     );
 }
 
-#[test]
-fn e2e_actor_flag_overrides_env() {
-    let _log = common::test_log("e2e_actor_flag_overrides_env");
-    let workspace = BrWorkspace::new();
-
-    // Initialize workspace
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    // Create an issue
-    let create = run_br(&workspace, ["create", "Flag override test"], "create");
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-
-    // Output is "✓ Created bd-abc123: Flag override test"
-    let id = create
-        .stdout
-        .lines()
-        .next()
-        .unwrap_or("")
-        .strip_prefix("✓ Created ")
-        .and_then(|s| s.split(':').next())
-        .unwrap_or("")
-        .trim();
-
-    // Add a comment with BD_ACTOR set, but also use --author flag
-    let env_vars = vec![("BD_ACTOR", "env-actor")];
-
-    let comment = run_br_with_env(
-        &workspace,
-        [
-            "comments",
-            "add",
-            id,
-            "--message",
-            "Test comment",
-            "--author",
-            "flag-author",
-        ],
-        env_vars,
-        "comment_with_override",
-    );
-    assert!(
-        comment.status.success(),
-        "comment failed: {}",
-        comment.stderr
-    );
-
-    // Verify the comment has the flag-author, not env-actor
-    let show = run_br(&workspace, ["show", id, "--json"], "show_comment");
-    assert!(show.status.success(), "show failed: {}", show.stderr);
-
-    let payload = extract_json_payload(&show.stdout);
-    let show_json: Vec<Value> = serde_json::from_str(&payload).expect("show json");
-
-    if let Some(comments) = show_json[0]["comments"].as_array() {
-        if let Some(comment) = comments.first() {
-            assert_eq!(
-                comment["author"], "flag-author",
-                "CLI --author flag should override BD_ACTOR env"
-            );
-        }
-    }
-}
+// NOTE: `e2e_actor_flag_overrides_env` was removed. It exercised
+// `comments add --author <name>` overriding a `BD_ACTOR` env var for
+// comment authorship, but:
+//   1. `comments` was removed from the CLI entirely (no replacement), and
+//   2. `BD_ACTOR` is not read anywhere in src/ any more (grep confirms
+//      zero references), so even the env half of the precedence check no
+//      longer does anything.
+// Both halves of the capability this test covered are gone, not just the
+// CLI surface, so there is nothing left to port.
 
 // ============================================================================
 // No-DB mode + environment interactions

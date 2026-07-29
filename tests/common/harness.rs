@@ -1311,6 +1311,15 @@ impl ConformanceWorkspace {
             .into_iter()
             .map(|a| a.as_ref().to_string_lossy().to_string())
             .collect();
+        // NOTE: `create`/`q` need an explicit `--prefix` now (no config or
+        // env default any more); apply the same auto-injection shim used
+        // for the `br` side so the `bd` side doesn't silently fail
+        // validation on every create call (previously this ran bare,
+        // meaning `bd create` errored out with no id, `bd list`
+        // legitimately showed nothing, and downstream `bd show ""` calls
+        // failed with INVALID_ID — not a real behavioral difference, just
+        // an unshimmed harness call).
+        let args_vec = super::apply_default_test_prefix_shim(args_vec);
         cmd.args(&args_vec);
 
         cmd.env("NO_COLOR", "1");

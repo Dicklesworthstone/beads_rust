@@ -93,6 +93,11 @@ fn test_create_positional_vs_title_flag() {
 
 #[test]
 fn test_create_json_output_includes_labels_and_deps() {
+    // NOTE: `create --labels` / `--add-label` were removed from the CLI
+    // (fields are `#[arg(skip)]`, kept only for back-compat). The only
+    // surviving way to attach labels at creation time is the markdown
+    // bulk-import path (`create -f file.md` with a `### Labels` section),
+    // so this test is ported to use that surface instead.
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();
 
@@ -124,17 +129,21 @@ fn test_create_json_output_includes_labels_and_deps() {
     let blocker_json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let blocker_id = blocker_json["id"].as_str().unwrap();
 
-    // Create issue with label and dep
+    // Create issue with label and dep via markdown bulk import.
+    let md_path = path.join("import.md");
+    std::fs::write(
+        &md_path,
+        format!("## My Issue\n### Labels\nbug\n### Dependencies\nblocks:{blocker_id}\n"),
+    )
+    .unwrap();
+
     let output = Command::new(bin.as_os_str())
         .current_dir(path)
         .arg("create")
-        .arg("My Issue")
+        .arg("--file")
+        .arg(&md_path)
         .arg("--prefix")
         .arg("bd")
-        .arg("--labels")
-        .arg("bug")
-        .arg("--deps")
-        .arg(blocker_id)
         .arg("--json")
         .output()
         .expect("Failed to run create issue");
@@ -144,7 +153,12 @@ fn test_create_json_output_includes_labels_and_deps() {
         "Failed to create issue with label and dep: {output:?}"
     );
 
-    let issue_json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let issue_json = created
+        .as_array()
+        .and_then(|arr| arr.first())
+        .expect("bulk import JSON should be a non-empty array");
+
     // Verify fields
     let labels = issue_json["labels"]
         .as_array()

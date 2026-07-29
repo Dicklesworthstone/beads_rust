@@ -1,9 +1,17 @@
-//! E2E tests for the --wrap flag across various commands.
+//! E2E tests for wrapping behavior across various commands.
+//!
+//! NOTE: `--wrap` was removed as an opt-in flag. Wrapping to the terminal
+//! width is now the DEFAULT behavior for `list`/`show`/`search`/`blocked`;
+//! the surviving flag is `--no-wrap`, which opts OUT of wrapping (truncates
+//! long lines instead). This file has been ported accordingly: tests that
+//! previously passed `--wrap` now rely on the (new) default, and tests that
+//! previously exercised "no flag = truncate" now pass `--no-wrap` to get
+//! truncation.
 //!
 //! Tests verify that:
-//! - --wrap flag is accepted by show, list, comments, search, blocked
-//! - Default behavior (no --wrap) still truncates text
-//! - With --wrap, long content is not truncated
+//! - `--no-wrap` is accepted by show, list, search, blocked
+//! - Default behavior now wraps (does not truncate) long content
+//! - With `--no-wrap`, long content is truncated
 //! - Different terminal widths are respected
 
 mod common;
@@ -47,17 +55,22 @@ fn init_workspace_with_long_issues(workspace: &BrWorkspace) {
 }
 
 // =============================================================================
-// BR LIST --WRAP TESTS
+// BR LIST WRAP/NO-WRAP TESTS
 // =============================================================================
 
 #[test]
-fn e2e_list_without_wrap_truncates() {
+fn e2e_list_no_wrap_truncates() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
-    // List without --wrap at narrow width
-    let output = run_br_with_env(&workspace, ["list"], [("COLUMNS", "60")], "list_no_wrap");
-    assert!(output.status.success(), "list failed");
+    // `--no-wrap` at narrow width should truncate long lines.
+    let output = run_br_with_env(
+        &workspace,
+        ["list", "--no-wrap"],
+        [("COLUMNS", "60")],
+        "list_no_wrap",
+    );
+    assert!(output.status.success(), "list --no-wrap failed");
 
     // Should contain truncation indicator (...)
     let _has_ellipsis = output.stdout.contains("...");
@@ -67,20 +80,15 @@ fn e2e_list_without_wrap_truncates() {
 }
 
 #[test]
-fn e2e_list_with_wrap_shows_full_content() {
+fn e2e_list_default_shows_full_content() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
-    // List with --wrap
-    let output = run_br_with_env(
-        &workspace,
-        ["list", "--wrap"],
-        [("COLUMNS", "60")],
-        "list_with_wrap",
-    );
-    assert!(output.status.success(), "list --wrap failed");
+    // Wrapping is the default now, so no flag is needed.
+    let output = run_br_with_env(&workspace, ["list"], [("COLUMNS", "60")], "list_with_wrap");
+    assert!(output.status.success(), "list failed");
 
-    // With wrap, content should not be truncated
+    // With (default) wrap, content should not be truncated
     assert!(output.stdout.contains("wrap-"), "Should show issue IDs");
 }
 
@@ -89,34 +97,34 @@ fn e2e_list_wrap_json_unchanged() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
-    // --wrap should not affect --json output
-    let output_no_wrap = run_br(&workspace, ["list", "--json"], "list_json");
-    let output_wrap = run_br(&workspace, ["list", "--wrap", "--json"], "list_json_wrap");
+    // Wrapping (default vs --no-wrap) should not affect --json output.
+    let output_default = run_br(&workspace, ["list", "--json"], "list_json");
+    let output_no_wrap = run_br(&workspace, ["list", "--no-wrap", "--json"], "list_json_no_wrap");
 
+    assert!(output_default.status.success());
     assert!(output_no_wrap.status.success());
-    assert!(output_wrap.status.success());
 
     // JSON output should be identical (wrap is text-only feature)
     // Both should be valid JSON with the same structure
+    let json_default: serde_json::Value =
+        serde_json::from_str(&output_default.stdout).expect("parse json");
     let json_no_wrap: serde_json::Value =
         serde_json::from_str(&output_no_wrap.stdout).expect("parse json");
-    let json_wrap: serde_json::Value =
-        serde_json::from_str(&output_wrap.stdout).expect("parse json");
 
+    assert!(json_default.is_array());
     assert!(json_no_wrap.is_array());
-    assert!(json_wrap.is_array());
     assert_eq!(
-        json_no_wrap.as_array().unwrap().len(),
-        json_wrap.as_array().unwrap().len()
+        json_default.as_array().unwrap().len(),
+        json_no_wrap.as_array().unwrap().len()
     );
 }
 
 // =============================================================================
-// BR SHOW --WRAP TESTS
+// BR SHOW WRAP/NO-WRAP TESTS
 // =============================================================================
 
 #[test]
-fn e2e_show_without_wrap() {
+fn e2e_show_no_wrap() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
@@ -133,16 +141,16 @@ fn e2e_show_without_wrap() {
 
     let output = run_br_with_env(
         &workspace,
-        ["show", long_issue_id],
+        ["show", long_issue_id, "--no-wrap"],
         [("COLUMNS", "60")],
         "show_no_wrap",
     );
-    assert!(output.status.success(), "show failed");
+    assert!(output.status.success(), "show --no-wrap failed");
     assert!(output.stdout.contains(long_issue_id));
 }
 
 #[test]
-fn e2e_show_with_wrap() {
+fn e2e_show_default_wraps() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
@@ -157,13 +165,14 @@ fn e2e_show_with_wrap() {
         .as_str()
         .unwrap();
 
+    // Wrapping is the default now, so no flag is needed.
     let output = run_br_with_env(
         &workspace,
-        ["show", long_issue_id, "--wrap"],
+        ["show", long_issue_id],
         [("COLUMNS", "60")],
         "show_with_wrap",
     );
-    assert!(output.status.success(), "show --wrap failed");
+    assert!(output.status.success(), "show failed");
     assert!(output.stdout.contains(long_issue_id));
 
     // The full description should be present
@@ -174,97 +183,61 @@ fn e2e_show_with_wrap() {
 }
 
 // =============================================================================
-// BR SEARCH --WRAP TESTS
+// BR SEARCH WRAP/NO-WRAP TESTS
 // =============================================================================
 
 #[test]
-fn e2e_search_without_wrap() {
+fn e2e_search_no_wrap() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
+    let output = run_br_with_env(
+        &workspace,
+        ["search", "long", "--no-wrap"],
+        [("COLUMNS", "60")],
+        "search_no_wrap",
+    );
+    assert!(output.status.success(), "search --no-wrap failed");
+}
+
+#[test]
+fn e2e_search_default_wraps() {
+    let workspace = BrWorkspace::new();
+    init_workspace_with_long_issues(&workspace);
+
+    // Wrapping is the default now, so no flag is needed.
     let output = run_br_with_env(
         &workspace,
         ["search", "long"],
         [("COLUMNS", "60")],
-        "search_no_wrap",
+        "search_with_wrap",
     );
     assert!(output.status.success(), "search failed");
 }
 
-#[test]
-fn e2e_search_with_wrap() {
-    let workspace = BrWorkspace::new();
-    init_workspace_with_long_issues(&workspace);
-
-    let output = run_br_with_env(
-        &workspace,
-        ["search", "long", "--wrap"],
-        [("COLUMNS", "60")],
-        "search_with_wrap",
-    );
-    assert!(output.status.success(), "search --wrap failed");
-}
-
 // =============================================================================
-// BR COMMENTS --WRAP TESTS
+// BR BLOCKED WRAP/NO-WRAP TESTS
+//
+// NOTE: `e2e_comments_with_wrap` was removed. It exercised `comments add` /
+// `comments <id>`, and the `comments` subcommand has been removed from the
+// CLI entirely (no replacement surface), so there is nothing left of it to
+// port.
 // =============================================================================
 
 #[test]
-fn e2e_comments_with_wrap() {
+fn e2e_blocked_default_wraps() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
-    // Get an issue ID
-    let list_output = run_br(&workspace, ["list", "--json"], "list_for_comments");
-    let issues: Vec<serde_json::Value> =
-        serde_json::from_str(&list_output.stdout).expect("parse json");
-    let issue_id = issues[0]["id"].as_str().unwrap();
-
-    // Add a long comment
-    let long_comment = "This is a very long comment that contains lots of detailed information about the progress of this issue and should demonstrate the wrapping behavior when the wrap flag is enabled.";
-    let output = run_br(
-        &workspace,
-        ["comments", "add", issue_id, long_comment],
-        "add_comment",
-    );
-    assert!(output.status.success(), "add comment failed");
-
-    // List comments without --wrap
+    // Wrapping is the default now; the blocked command should still work
+    // fine even with no blocked issues.
     let output = run_br_with_env(
         &workspace,
-        ["comments", issue_id],
-        [("COLUMNS", "60")],
-        "comments_no_wrap",
-    );
-    assert!(output.status.success(), "comments failed");
-
-    // List comments with --wrap
-    let output = run_br_with_env(
-        &workspace,
-        ["comments", issue_id, "--wrap"],
-        [("COLUMNS", "60")],
-        "comments_with_wrap",
-    );
-    assert!(output.status.success(), "comments --wrap failed");
-}
-
-// =============================================================================
-// BR BLOCKED --WRAP TESTS
-// =============================================================================
-
-#[test]
-fn e2e_blocked_with_wrap() {
-    let workspace = BrWorkspace::new();
-    init_workspace_with_long_issues(&workspace);
-
-    // The blocked command should accept --wrap even if there are no blocked issues
-    let output = run_br_with_env(
-        &workspace,
-        ["blocked", "--wrap"],
+        ["blocked"],
         [("COLUMNS", "60")],
         "blocked_with_wrap",
     );
-    assert!(output.status.success(), "blocked --wrap failed");
+    assert!(output.status.success(), "blocked failed");
     // Either "No blocked issues" or actual blocked issues
     assert!(
         output.stdout.contains("blocked") || output.stdout.contains("No blocked"),
@@ -292,14 +265,14 @@ fn e2e_blocked_with_dependencies() {
     let output = run_br(&workspace, ["dep", "add", child_id, parent_id], "add_dep");
     assert!(output.status.success(), "dep add failed: {}", output.stderr);
 
-    // Test blocked with --wrap
+    // Test blocked with (default) wrap
     let output = run_br_with_env(
         &workspace,
-        ["blocked", "--wrap"],
+        ["blocked"],
         [("COLUMNS", "60")],
         "blocked_with_wrap_deps",
     );
-    assert!(output.status.success(), "blocked --wrap failed");
+    assert!(output.status.success(), "blocked failed");
 }
 
 // =============================================================================
@@ -311,13 +284,8 @@ fn e2e_wrap_very_narrow_terminal() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
-    // Very narrow terminal (20 columns)
-    let output = run_br_with_env(
-        &workspace,
-        ["list", "--wrap"],
-        [("COLUMNS", "20")],
-        "list_narrow",
-    );
+    // Very narrow terminal (20 columns), default (wrap) behavior.
+    let output = run_br_with_env(&workspace, ["list"], [("COLUMNS", "20")], "list_narrow");
     assert!(output.status.success(), "list at narrow width failed");
 }
 
@@ -326,13 +294,8 @@ fn e2e_wrap_very_wide_terminal() {
     let workspace = BrWorkspace::new();
     init_workspace_with_long_issues(&workspace);
 
-    // Very wide terminal (200 columns)
-    let output = run_br_with_env(
-        &workspace,
-        ["list", "--wrap"],
-        [("COLUMNS", "200")],
-        "list_wide",
-    );
+    // Very wide terminal (200 columns), default (wrap) behavior.
+    let output = run_br_with_env(&workspace, ["list"], [("COLUMNS", "200")], "list_wide");
     assert!(output.status.success(), "list at wide width failed");
 }
 
@@ -355,14 +318,14 @@ fn e2e_wrap_with_unicode_content() {
     );
     assert!(output.status.success(), "create unicode failed");
 
-    // Test with --wrap
+    // Test with default (wrap) behavior
     let output = run_br_with_env(
         &workspace,
-        ["list", "--wrap"],
+        ["list"],
         [("COLUMNS", "40")],
         "list_unicode_wrap",
     );
-    assert!(output.status.success(), "list unicode with wrap failed");
+    assert!(output.status.success(), "list unicode failed");
     // Should contain the unicode content
     assert!(output.stdout.contains("🐛") || output.stdout.contains("bug"));
 }
@@ -375,17 +338,13 @@ fn e2e_wrap_empty_database() {
     let output = run_br(&workspace, ["init"], "init_empty");
     assert!(output.status.success());
 
-    // Test all wrap commands on empty database
-    let output = run_br(&workspace, ["list", "--wrap"], "list_empty_wrap");
+    // Test all commands (default wrap behavior) on empty database
+    let output = run_br(&workspace, ["list"], "list_empty_wrap");
     assert!(output.status.success());
 
-    let output = run_br(&workspace, ["blocked", "--wrap"], "blocked_empty_wrap");
+    let output = run_br(&workspace, ["blocked"], "blocked_empty_wrap");
     assert!(output.status.success());
 
-    let output = run_br(
-        &workspace,
-        ["search", "nothing", "--wrap"],
-        "search_empty_wrap",
-    );
+    let output = run_br(&workspace, ["search", "nothing"], "search_empty_wrap");
     assert!(output.status.success());
 }

@@ -57,8 +57,17 @@ static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static DATE_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}").expect("date regex"));
-static VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\((main|master|HEAD)@[a-f0-9]+\)").expect("version regex"));
+static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Matches the `(branch@shorthash)` suffix `br version` emits, e.g.
+    // `(feat-testclean@f050a2a)` or `(main@abc1234)`. Previously this only
+    // matched the literal branch names `main`/`master`/`HEAD`, so running
+    // the suite from any feature branch (the normal case for a dev
+    // workflow, and the ONLY case in this environment) left the real
+    // branch name and commit hash unmasked, which then got mangled by the
+    // generic issue-ID redaction pass instead of being cleanly replaced by
+    // `(BRANCH@GIT_HASH)`. Widened to match any branch-like token.
+    Regex::new(r"\([^\s@()]+@[0-9a-f]{4,40}\)").expect("version regex")
+});
 static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
 static VERSION_NUM_RE: LazyLock<Regex> =
@@ -389,13 +398,24 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("temp_paths".to_string());
     }
 
-    // 6. Redact issue IDs
+    // 6. Mask git hashes (must run BEFORE issue-ID redaction below: the
+    // generic `[a-zA-Z0-9_-]+-[a-z0-9]{3,}` issue-ID pattern would
+    // otherwise mistake a branch name like `feat-testclean` for an issue
+    // ID and mangle it before this pass ever sees it).
+    if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
+        normalized = VERSION_RE
+            .replace_all(&normalized, "(BRANCH@GIT_HASH)")
+            .to_string();
+        log.push("git_hashes".to_string());
+    }
+
+    // 7. Redact issue IDs
     if config.redact_ids && ID_RE.is_match(&normalized) {
         normalized = ID_RE.replace_all(&normalized, "ID-REDACTED").to_string();
         log.push("issue_ids".to_string());
     }
 
-    // 7. Mask full timestamps
+    // 8. Mask full timestamps
     if config.mask_timestamps && TS_FULL_RE.is_match(&normalized) {
         normalized = TS_FULL_RE
             .replace_all(&normalized, "YYYY-MM-DDTHH:MM:SS")
@@ -403,18 +423,10 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("timestamps".to_string());
     }
 
-    // 8. Mask dates (after timestamps to avoid double-masking)
+    // 9. Mask dates (after timestamps to avoid double-masking)
     if config.mask_dates && DATE_RE.is_match(&normalized) {
         normalized = DATE_RE.replace_all(&normalized, "YYYY-MM-DD").to_string();
         log.push("dates".to_string());
-    }
-
-    // 9. Mask git hashes
-    if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
-        normalized = VERSION_RE
-            .replace_all(&normalized, "(BRANCH@GIT_HASH)")
-            .to_string();
-        log.push("git_hashes".to_string());
     }
 
     // 10. Normalize line numbers

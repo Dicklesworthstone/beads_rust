@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, create_via_markdown_with_description, extract_json_payload, run_br};
 use serde_json::Value;
 
 fn parse_created_id(stdout: &str) -> String {
@@ -36,46 +36,33 @@ fn setup_search_workspace() -> (BrWorkspace, Vec<String>) {
     let mut ids = Vec::new();
 
     // Issue 1: Authentication related bug
-    let issue1 = run_br(
+    //
+    // NOTE: labels can no longer be attached via `update --add-label` (the
+    // CLI flag was removed; only markdown bulk-import can set labels at
+    // creation time now), so these fixtures use
+    // `create_via_markdown_with_description`.
+    let id1 = create_via_markdown_with_description(
         &workspace,
-        [
-            "create",
-            "Authentication bug in login flow",
-            "-t",
-            "bug",
-            "-d",
-            "Users cannot log in when using OAuth providers",
-        ],
         "create_auth_bug",
-    );
-    assert!(issue1.status.success());
-    let id1 = parse_created_id(&issue1.stdout);
-    run_br(
-        &workspace,
-        ["update", &id1, "--add-label", "auth"],
-        "label_auth",
+        "Authentication bug in login flow",
+        Some("bug"),
+        None,
+        None,
+        Some("Users cannot log in when using OAuth providers"),
+        &["auth"],
     );
     ids.push(id1);
 
     // Issue 2: Authentication feature
-    let issue2 = run_br(
+    let id2 = create_via_markdown_with_description(
         &workspace,
-        [
-            "create",
-            "Add two-factor authentication",
-            "-t",
-            "feature",
-            "-d",
-            "Implement 2FA using TOTP for improved security",
-        ],
         "create_auth_feature",
-    );
-    assert!(issue2.status.success());
-    let id2 = parse_created_id(&issue2.stdout);
-    run_br(
-        &workspace,
-        ["update", &id2, "--add-label", "auth"],
-        "label_auth2",
+        "Add two-factor authentication",
+        Some("feature"),
+        None,
+        None,
+        Some("Implement 2FA using TOTP for improved security"),
+        &["auth"],
     );
     ids.push(id2);
 
@@ -112,26 +99,15 @@ fn setup_search_workspace() -> (BrWorkspace, Vec<String>) {
     ids.push(parse_created_id(&issue4.stdout));
 
     // Issue 5: API bug
-    let issue5 = run_br(
+    let id5 = create_via_markdown_with_description(
         &workspace,
-        [
-            "create",
-            "API returns 500 error",
-            "-t",
-            "bug",
-            "-p",
-            "0",
-            "-d",
-            "The /api/users endpoint throws Internal Server Error",
-        ],
         "create_api_bug",
-    );
-    assert!(issue5.status.success());
-    let id5 = parse_created_id(&issue5.stdout);
-    run_br(
-        &workspace,
-        ["update", &id5, "--add-label", "api"],
-        "label_api",
+        "API returns 500 error",
+        Some("bug"),
+        Some("0"),
+        None,
+        Some("The /api/users endpoint throws Internal Server Error"),
+        &["api"],
     );
     ids.push(id5);
 
