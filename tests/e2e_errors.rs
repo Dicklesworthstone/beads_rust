@@ -1018,69 +1018,17 @@ fn e2e_error_exit_code_categories() {
 }
 
 // === Additional Validation + Error Parity Tests ===
-
-#[test]
-fn e2e_structured_error_label_validation() {
-    let _log = common::test_log("e2e_structured_error_label_validation");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    let create = run_br(&workspace, ["create", "Test issue"], "create");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    // Test label with invalid characters (spaces not allowed)
-    let result = run_br(
-        &workspace,
-        ["update", &id, "--add-label", "bad label", "--json"],
-        "update_bad_label_json",
-    );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-
-    let error = &json["error"];
-    assert_eq!(error["code"], "VALIDATION_FAILED");
-    assert!(error["retryable"].as_bool().unwrap());
-    assert!(
-        error["message"].as_str().unwrap().contains("label")
-            || error["hint"].as_str().unwrap_or("").contains("label"),
-        "error should mention label"
-    );
-}
-
-#[test]
-fn e2e_structured_error_label_too_long() {
-    let _log = common::test_log("e2e_structured_error_label_too_long");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    let create = run_br(&workspace, ["create", "Test issue"], "create");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    // Create a label that exceeds 50 characters
-    let long_label = "a".repeat(60);
-    let result = run_br(
-        &workspace,
-        ["update", &id, "--add-label", &long_label, "--json"],
-        "update_long_label_json",
-    );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
-    assert!(verify_error_structure(&json), "missing required fields");
-
-    let error = &json["error"];
-    assert_eq!(error["code"], "VALIDATION_FAILED");
-}
+//
+// NOTE: `e2e_structured_error_label_validation` and
+// `e2e_structured_error_label_too_long` were removed. Both exercised
+// `update --add-label` to trigger a VALIDATION_FAILED error, but that flag
+// was removed from the CLI (`#[arg(skip)]`, back-compat field only). The
+// only surviving label-write surface, markdown bulk-import, treats invalid
+// labels as a non-fatal warning-and-skip rather than a hard error (see
+// `execute_import` in src/cli/commands/create.rs), so there is currently no
+// reachable CLI path that produces a label VALIDATION_FAILED error at all.
+// This is a real (if narrow) coverage gap worth flagging, not something to
+// paper over by deleting silently.
 
 #[test]
 fn e2e_structured_error_dependency_target_not_found() {
@@ -1212,79 +1160,21 @@ fn e2e_delete_with_dependents_preview() {
     );
 }
 
-#[test]
-fn e2e_validation_error_empty_label() {
-    let _log = common::test_log("e2e_validation_error_empty_label");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    let create = run_br(&workspace, ["create", "Test issue"], "create");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    // Empty label should fail validation
-    let result = run_br(
-        &workspace,
-        ["update", &id, "--add-label", "", "--json"],
-        "update_empty_label_json",
-    );
-    assert!(!result.status.success());
-    assert_eq!(result.status.code(), Some(4), "exit code should be 4");
-}
-
-#[test]
-fn e2e_validation_special_characters_in_label() {
-    let _log = common::test_log("e2e_validation_special_characters_in_label");
-    let workspace = BrWorkspace::new();
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success());
-
-    let create = run_br(&workspace, ["create", "Test issue"], "create");
-    assert!(create.status.success());
-    let id = parse_created_id(&create.stdout);
-
-    // Valid labels (alphanumeric, hyphen, underscore, colon)
-    let valid_labels = ["bug", "feat-1", "scope:subsystem", "test_case"];
-    for label in valid_labels {
-        let result = run_br(
-            &workspace,
-            ["update", &id, "--add-label", label],
-            &format!("add_label_{}", label.replace(':', "_")),
-        );
-        assert!(
-            result.status.success(),
-            "label '{}' should be valid: {}",
-            label,
-            result.stderr
-        );
-    }
-
-    // Create a new issue for testing invalid labels (to avoid label conflict)
-    let create2 = run_br(&workspace, ["create", "Test issue 2"], "create2");
-    assert!(create2.status.success());
-    let id2 = parse_created_id(&create2.stdout);
-
-    // Invalid labels (special characters not allowed)
-    let invalid_labels = ["@mention", "has/slash", "with.dot", "emoji🎉"];
-    for label in invalid_labels {
-        let result = run_br(
-            &workspace,
-            ["update", &id2, "--add-label", label, "--json"],
-            &format!("add_invalid_label_{}", label.len()),
-        );
-        assert!(
-            !result.status.success(),
-            "label '{}' should be invalid",
-            label
-        );
-    }
-}
+// NOTE: `e2e_validation_error_empty_label` and
+// `e2e_validation_special_characters_in_label` were removed for the same
+// reason as above: both exercised `update --add-label`, which no longer
+// exists as a CLI surface, and the only surviving label-write path
+// (markdown bulk-import) doesn't hard-fail on invalid labels.
 
 #[test]
 fn e2e_error_text_json_parity_validation() {
+    // NOTE: originally used `update --add-label` to trigger a validation
+    // error, but that flag was removed from the CLI (labels can now only
+    // be set via markdown bulk-import, which treats invalid labels as a
+    // non-fatal warning rather than a hard error, so it can't reach this
+    // path either). Ported to use an invalid `--status` value instead,
+    // which still exercises the same text/JSON error-parity behavior this
+    // test is actually about.
     let _log = common::test_log("e2e_error_text_json_parity_validation");
     let workspace = BrWorkspace::new();
 
@@ -1298,16 +1188,16 @@ fn e2e_error_text_json_parity_validation() {
     // Same validation error in text mode
     let text_result = run_br(
         &workspace,
-        ["update", &id, "--add-label", "bad label", "--no-color"],
-        "label_error_text",
+        ["update", &id, "--status", "done", "--no-color"],
+        "status_error_text",
     );
     assert!(!text_result.status.success());
 
     // Same validation error in JSON mode
     let json_result = run_br(
         &workspace,
-        ["update", &id, "--add-label", "bad label", "--json"],
-        "label_error_json",
+        ["update", &id, "--status", "done", "--json"],
+        "status_error_json",
     );
     assert!(!json_result.status.success());
 
