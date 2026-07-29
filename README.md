@@ -349,14 +349,14 @@ For Codex:
 
 ```bash
 codex plugin marketplace add Dicklesworthstone/beads_rust
-codex plugin add br@beads-rust
+codex plugin add beads-rust@beads-rust
 ```
 
 For Claude Code:
 
 ```bash
 claude plugin marketplace add Dicklesworthstone/beads_rust
-claude plugin install br@beads-rust
+claude plugin install beads-rust@beads-rust
 ```
 
 ### Enable MCP Server Support
