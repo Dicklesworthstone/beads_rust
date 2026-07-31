@@ -4,6 +4,7 @@
 //! base36 lowercase (0-9, a-z) with adaptive length based on DB size.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MAX_ID_PREFIX_LEN: usize = 64;
@@ -11,6 +12,106 @@ pub const MAX_ID_HASH_LEN: usize = 40;
 pub const MAX_ID_LENGTH: usize = MAX_ID_PREFIX_LEN + 1 + MAX_ID_HASH_LEN;
 const FALLBACK_HASH_LENGTH: usize = 12;
 const MAX_FALLBACK_NONCE: u32 = 2000;
+const DEFAULT_ID_TEMPLATE: &str = "{prefix}-{hash}";
+
+/// Positive, repository-local shorthand attached to an issue ID.
+///
+/// The full issue ID remains authoritative. This type keeps sequence values
+/// positive at every in-memory boundary while serializing as a JSON integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "i64", into = "i64")]
+pub struct IssueSequenceNumber(i64);
+
+impl IssueSequenceNumber {
+    /// Construct a validated issue sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `value` is not positive.
+    pub fn new(value: i64) -> Result<Self> {
+        Self::try_from(value).map_err(|message| BeadsError::validation("sequence_number", message))
+    }
+
+    /// Return the SQLite/JSON integer representation.
+    #[must_use]
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+
+    /// Return the next counter value after this assigned sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sequence counter is exhausted.
+    pub fn checked_successor(self) -> Result<Self> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or_else(|| BeadsError::Config("issue sequence counter exhausted".to_string()))
+    }
+}
+
+impl TryFrom<i64> for IssueSequenceNumber {
+    type Error = &'static str;
+
+    fn try_from(value: i64) -> std::result::Result<Self, Self::Error> {
+        if value > 0 {
+            Ok(Self(value))
+        } else {
+            Err("expected positive integer")
+        }
+    }
+}
+
+impl From<IssueSequenceNumber> for i64 {
+    fn from(value: IssueSequenceNumber) -> Self {
+        value.get()
+    }
+}
+
+/// Resolve an exact issue ID or a positive numeric sequence shorthand.
+///
+/// Exact IDs always win, including IDs made entirely of digits. Callers retain
+/// control of legacy/hash fallback by handling `None` after this shared policy
+/// boundary.
+///
+/// # Errors
+///
+/// Returns an error when the existence lookup fails, a numeric shorthand is
+/// not a positive sequence number, the sequence lookup fails, or the shorthand
+/// matches more than one full ID.
+pub fn resolve_exact_or_sequence_fallible<FExists, FSequence>(
+    input: &str,
+    exact_candidate: &str,
+    mut exists: FExists,
+    mut find_sequence_ids: FSequence,
+) -> Result<Option<String>>
+where
+    FExists: FnMut(&str) -> Result<bool>,
+    FSequence: FnMut(IssueSequenceNumber) -> Result<Vec<String>>,
+{
+    if !exact_candidate.is_empty() && exists(exact_candidate)? {
+        return Ok(Some(exact_candidate.to_string()));
+    }
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|character| character.is_ascii_digit()) {
+        return Ok(None);
+    }
+
+    let raw_sequence = trimmed.parse::<i64>().map_err(|_| {
+        BeadsError::validation("id", format!("invalid sequence number '{trimmed}'"))
+    })?;
+    let sequence = IssueSequenceNumber::new(raw_sequence)?;
+    match find_sequence_ids(sequence)?.as_slice() {
+        [id] => Ok(Some(id.clone())),
+        [] => Ok(None),
+        matches => Err(BeadsError::AmbiguousId {
+            partial: input.to_string(),
+            matches: matches.to_vec(),
+        }),
+    }
+}
 
 /// Default ID generation configuration.
 #[derive(Debug, Clone)]
@@ -23,6 +124,9 @@ pub struct IdConfig {
     pub max_hash_length: usize,
     /// Maximum collision probability before increasing length.
     pub max_collision_prob: f64,
+    /// Optional templated ID generation mode. When disabled, the historical
+    /// `<prefix>-<hash>` and `<prefix>-<slug>-<hash>` formats are preserved.
+    pub generation: IdGenerationConfig,
 }
 
 impl Default for IdConfig {
@@ -32,6 +136,52 @@ impl Default for IdConfig {
             min_hash_length: 3,
             max_hash_length: 8,
             max_collision_prob: 0.25,
+            generation: IdGenerationConfig::default(),
+        }
+    }
+}
+
+/// Issue ID generation strategy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdGenerationConfig {
+    pub mode: IdGenerationMode,
+    pub template: String,
+    pub require_slug: bool,
+    pub allow_non_unique_template: bool,
+}
+
+impl Default for IdGenerationConfig {
+    fn default() -> Self {
+        Self {
+            mode: IdGenerationMode::Generated,
+            template: DEFAULT_ID_TEMPLATE.to_string(),
+            require_slug: false,
+            allow_non_unique_template: false,
+        }
+    }
+}
+
+/// Whether new issue IDs use the historical generator or an explicit template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdGenerationMode {
+    Generated,
+    Templated,
+}
+
+impl IdGenerationMode {
+    /// Parse a config value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for unsupported modes.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "generated" | "default" => Ok(Self::Generated),
+            "templated" | "template" => Ok(Self::Templated),
+            other => Err(BeadsError::validation(
+                "id_generation.mode",
+                format!("unsupported ID generation mode '{other}'"),
+            )),
         }
     }
 }
@@ -202,6 +352,155 @@ impl IdGenerator {
         }
     }
 
+    /// Generate an ID from a configured template.
+    ///
+    /// Supported tokens are `{prefix}`, `{seq}`, `{seq:03}`, `{slug}`, and
+    /// `{hash}`. Unknown tokens fail closed. `{hash}` is required unless the
+    /// caller explicitly allowed a non-unique template.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for malformed templates, missing required
+    /// slug values, or exhausted collision attempts.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    pub fn generate_with_template<F>(
+        &self,
+        input: IdGenerationInput<'_>,
+        sequence: Option<IssueSequenceNumber>,
+        slug: Option<&str>,
+        mut exists: F,
+    ) -> Result<String>
+    where
+        F: FnMut(&str) -> Result<bool>,
+    {
+        self.validate_template_config()?;
+        let normalized_slug = slug.map(normalize_slug).filter(|value| !value.is_empty());
+        if self.config.generation.require_slug && normalized_slug.is_none() {
+            return Err(BeadsError::validation(
+                "slug",
+                "id_generation.require_slug is true but no slug or title-derived slug was available",
+            ));
+        }
+        if self.config.generation.template.contains("{seq") && sequence.is_none() {
+            return Err(BeadsError::validation(
+                "id_generation.template",
+                "template uses {seq} but no sequence was allocated",
+            ));
+        }
+
+        let mut length = self.optimal_length(input.issue_count);
+        loop {
+            for nonce in 0..10 {
+                let seed = generate_id_seed(
+                    input.title,
+                    input.description,
+                    input.creator,
+                    input.created_at,
+                    nonce,
+                );
+                let hash = compute_id_hash(&seed, length);
+                let id = render_id_template(
+                    &self.config.generation.template,
+                    &self.config.prefix,
+                    sequence,
+                    normalized_slug.as_deref(),
+                    &hash,
+                )?;
+                if !exists(&id)? {
+                    return Ok(id);
+                }
+            }
+            if length < self.config.max_hash_length {
+                length += 1;
+            } else if self.config.generation.template.contains("{hash}") {
+                for nonce in 0..MAX_FALLBACK_NONCE {
+                    let seed = generate_id_seed(
+                        input.title,
+                        input.description,
+                        input.creator,
+                        input.created_at,
+                        nonce,
+                    );
+                    let hash = compute_id_hash(&seed, FALLBACK_HASH_LENGTH);
+                    let id = render_id_template(
+                        &self.config.generation.template,
+                        &self.config.prefix,
+                        sequence,
+                        normalized_slug.as_deref(),
+                        &hash,
+                    )?;
+                    if !exists(&id)? {
+                        return Ok(id);
+                    }
+                }
+                return Err(BeadsError::IdCollision {
+                    id: render_id_template(
+                        &self.config.generation.template,
+                        &self.config.prefix,
+                        sequence,
+                        normalized_slug.as_deref(),
+                        &compute_id_hash(
+                            &generate_id_seed(
+                                input.title,
+                                input.description,
+                                input.creator,
+                                input.created_at,
+                                MAX_FALLBACK_NONCE,
+                            ),
+                            FALLBACK_HASH_LENGTH,
+                        ),
+                    )?,
+                });
+            } else {
+                let id = render_id_template(
+                    &self.config.generation.template,
+                    &self.config.prefix,
+                    sequence,
+                    normalized_slug.as_deref(),
+                    "",
+                )?;
+                return if exists(&id)? {
+                    Err(BeadsError::IdCollision { id })
+                } else {
+                    Ok(id)
+                };
+            }
+        }
+    }
+
+    /// Validate the configured template generation settings without rendering an ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for unsupported template tokens or unsafe
+    /// missing hash suffixes.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    pub fn validate_template_config(&self) -> Result<()> {
+        validate_id_template(&self.config.generation)?;
+        let sequence = self
+            .config
+            .generation
+            .template
+            .contains("{seq")
+            .then_some(IssueSequenceNumber::new(1)?);
+        let slug = self
+            .config
+            .generation
+            .template
+            .contains("{slug}")
+            .then_some("slug");
+        let hash = "z".repeat(self.config.max_hash_length.max(FALLBACK_HASH_LENGTH));
+        let sample = render_id_template(
+            &self.config.generation.template,
+            &self.config.prefix,
+            sequence,
+            slug,
+            &hash,
+        )?;
+        parse_id(&sample)?;
+        Ok(())
+    }
+
     /// Generate an ID, checking for collisions with the provided checker.
     ///
     /// The checker function should return `true` if the ID already exists.
@@ -266,6 +565,102 @@ impl IdGenerator {
             }
         }
     }
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+fn validate_id_template(config: &IdGenerationConfig) -> Result<()> {
+    if !config.allow_non_unique_template && !config.template.contains("{hash}") {
+        return Err(BeadsError::validation(
+            "id_generation.template",
+            "templated IDs must include {hash} unless allow_non_unique_template is true",
+        ));
+    }
+    let mut rest = config.template.as_str();
+    while let Some(start) = rest.find('{') {
+        if rest[..start].contains('}') {
+            return Err(BeadsError::validation(
+                "id_generation.template",
+                "unmatched closing brace",
+            ));
+        }
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            return Err(BeadsError::validation(
+                "id_generation.template",
+                "unclosed template token",
+            ));
+        };
+        let token = &after_start[..end];
+        if !matches!(token, "prefix" | "seq" | "seq:03" | "slug" | "hash") {
+            return Err(BeadsError::validation(
+                "id_generation.template",
+                format!("unknown template token '{{{token}}}'"),
+            ));
+        }
+        rest = &after_start[end + 1..];
+    }
+    if rest.contains('}') {
+        return Err(BeadsError::validation(
+            "id_generation.template",
+            "unmatched closing brace",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+fn render_id_template(
+    template: &str,
+    prefix: &str,
+    sequence: Option<IssueSequenceNumber>,
+    slug: Option<&str>,
+    hash: &str,
+) -> Result<String> {
+    let mut rendered = template.to_string();
+    rendered = rendered.replace("{prefix}", prefix);
+    rendered = rendered.replace("{hash}", hash);
+    if rendered.contains("{slug}") {
+        let slug = slug.ok_or_else(|| {
+            BeadsError::validation(
+                "slug",
+                "id_generation.template uses {slug} but no slug was available",
+            )
+        })?;
+        rendered = rendered.replace("{slug}", slug);
+    }
+    if rendered.contains("{seq:03}") {
+        let sequence = sequence.ok_or_else(|| {
+            BeadsError::validation(
+                "id_generation.template",
+                "template uses {seq:03} but no sequence was allocated",
+            )
+        })?;
+        rendered = rendered.replace("{seq:03}", &format!("{:03}", sequence.get()));
+    }
+    if rendered.contains("{seq}") {
+        let sequence = sequence.ok_or_else(|| {
+            BeadsError::validation(
+                "id_generation.template",
+                "template uses {seq} but no sequence was allocated",
+            )
+        })?;
+        rendered = rendered.replace("{seq}", &sequence.get().to_string());
+    }
+    if rendered.is_empty() || rendered.len() > MAX_ID_LENGTH {
+        return Err(BeadsError::InvalidId { id: rendered });
+    }
+    if !rendered.chars().all(|c| {
+        c.is_ascii_lowercase()
+            || c.is_ascii_digit()
+            || c == '_'
+            || c == '-'
+            || c == '.'
+            || c == ':'
+            || c == '#'
+    }) {
+        return Err(BeadsError::InvalidId { id: rendered });
+    }
+    Ok(rendered)
 }
 
 /// Generate the seed string for ID generation.
@@ -1560,6 +1955,7 @@ mod tests {
             min_hash_length: 3,
             max_hash_length: 3,
             max_collision_prob: 0.25,
+            generation: IdGenerationConfig::default(),
         });
         let calls = std::cell::Cell::new(0_u32);
 
@@ -1849,5 +2245,183 @@ mod tests {
                 "hash-only fallback must include hash; got {id}"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn templated_id_renders_sequence_slug_and_hash() {
+        let id_gen = IdGenerator::new(IdConfig {
+            generation: IdGenerationConfig {
+                mode: IdGenerationMode::Templated,
+                template: "{seq:03}-{slug}-{hash}".to_string(),
+                require_slug: true,
+                allow_non_unique_template: false,
+            },
+            ..IdConfig::default()
+        });
+        let id = id_gen
+            .generate_with_template(
+                IdGenerationInput {
+                    title: "Improve tests speed",
+                    description: None,
+                    creator: None,
+                    created_at: Utc::now(),
+                    issue_count: 1,
+                },
+                Some(IssueSequenceNumber::new(1).unwrap()),
+                Some("Improve tests speed"),
+                |_| Ok(false),
+            )
+            .expect("templated ID");
+
+        assert!(id.starts_with("001-improve-tests-speed-"), "got {id}");
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn templated_id_rejects_unknown_tokens_and_missing_hash_by_default() {
+        let input = IdGenerationInput {
+            title: "Title",
+            description: None,
+            creator: None,
+            created_at: Utc::now(),
+            issue_count: 1,
+        };
+        let unknown = IdGenerator::new(IdConfig {
+            generation: IdGenerationConfig {
+                mode: IdGenerationMode::Templated,
+                template: "{seq:03}-{unknown}-{hash}".to_string(),
+                require_slug: false,
+                allow_non_unique_template: false,
+            },
+            ..IdConfig::default()
+        });
+        assert!(
+            unknown
+                .generate_with_template(
+                    input,
+                    Some(IssueSequenceNumber::new(1).unwrap()),
+                    Some("slug"),
+                    |_| Ok(false),
+                )
+                .is_err()
+        );
+
+        let unmatched_closing = IdGenerator::new(IdConfig {
+            generation: IdGenerationConfig {
+                mode: IdGenerationMode::Templated,
+                template: "bad}{hash}".to_string(),
+                require_slug: false,
+                allow_non_unique_template: false,
+            },
+            ..IdConfig::default()
+        });
+        assert!(
+            unmatched_closing
+                .generate_with_template(input, None, None, |_| Ok(false))
+                .is_err()
+        );
+
+        let invalid_shape = IdGenerator::new(IdConfig {
+            generation: IdGenerationConfig {
+                mode: IdGenerationMode::Templated,
+                template: "{prefix}_{hash}".to_string(),
+                require_slug: false,
+                allow_non_unique_template: false,
+            },
+            ..IdConfig::default()
+        });
+        assert!(invalid_shape.validate_template_config().is_err());
+
+        let missing_hash = IdGenerator::new(IdConfig {
+            generation: IdGenerationConfig {
+                mode: IdGenerationMode::Templated,
+                template: "{seq:03}-{slug}".to_string(),
+                require_slug: true,
+                allow_non_unique_template: false,
+            },
+            ..IdConfig::default()
+        });
+        assert!(
+            missing_hash
+                .generate_with_template(
+                    input,
+                    Some(IssueSequenceNumber::new(1).unwrap()),
+                    Some("slug"),
+                    |_| Ok(false),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn templated_id_allows_explicitly_unsafe_hashless_template() {
+        let id_gen = IdGenerator::new(IdConfig {
+            generation: IdGenerationConfig {
+                mode: IdGenerationMode::Templated,
+                template: "{seq:03}-{slug}".to_string(),
+                require_slug: true,
+                allow_non_unique_template: true,
+            },
+            ..IdConfig::default()
+        });
+        let id = id_gen
+            .generate_with_template(
+                IdGenerationInput {
+                    title: "Unsafe template",
+                    description: None,
+                    creator: None,
+                    created_at: Utc::now(),
+                    issue_count: 1,
+                },
+                Some(IssueSequenceNumber::new(9).unwrap()),
+                Some("Unsafe template"),
+                |_| Ok(false),
+            )
+            .expect("explicit unsafe escape hatch");
+
+        assert_eq!(id, "009-unsafe-template");
+    }
+
+    #[test]
+    fn issue_sequence_number_is_positive_integer_on_the_wire() {
+        let sequence = IssueSequenceNumber::new(42).expect("positive sequence");
+        assert_eq!(serde_json::to_string(&sequence).unwrap(), "42");
+        assert_eq!(
+            serde_json::from_str::<IssueSequenceNumber>("42").unwrap(),
+            sequence
+        );
+        for invalid in ["0", "-1"] {
+            let error = serde_json::from_str::<IssueSequenceNumber>(invalid)
+                .expect_err("non-positive sequence must be rejected");
+            assert!(error.to_string().contains("expected positive integer"));
+        }
+    }
+
+    #[test]
+    fn exact_or_sequence_resolution_prefers_exact_and_rejects_zero() {
+        let exact = resolve_exact_or_sequence_fallible(
+            "001",
+            "001",
+            |candidate| Ok(candidate == "001"),
+            |_| panic!("exact IDs must not consult sequence metadata"),
+        )
+        .unwrap();
+        assert_eq!(exact.as_deref(), Some("001"));
+
+        let error =
+            resolve_exact_or_sequence_fallible("000", "000", |_| Ok(false), |_| Ok(Vec::new()))
+                .expect_err("zero is not a valid issue sequence");
+        assert!(error.to_string().contains("expected positive integer"));
+    }
+
+    #[test]
+    fn issue_sequence_number_successor_fails_at_i64_max() {
+        let maximum = IssueSequenceNumber::new(i64::MAX).expect("positive maximum");
+        let error = maximum
+            .checked_successor()
+            .expect_err("maximum sequence has no successor");
+        assert!(error.to_string().contains("sequence counter exhausted"));
     }
 }

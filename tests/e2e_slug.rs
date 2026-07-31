@@ -94,6 +94,179 @@ fn e2e_create_with_slug_then_show_renders_slug_in_id() {
     eprintln!("  [PASS] slug round-trip via CLI");
 }
 
+#[test]
+fn e2e_templated_id_derives_slug_and_resolves_numeric_short_id() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "bd"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    std::fs::write(
+        workspace.root.join(".beads").join("config.yaml"),
+        r#"
+issue_prefix: bd
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+"#,
+    )
+    .expect("write templated ID config");
+
+    let dry_run = run_br(
+        &workspace,
+        ["create", "Preview sequence", "--dry-run"],
+        "dry_run_templated_id",
+    );
+    assert!(
+        dry_run.status.success(),
+        "templated dry run failed: {}\nstdout: {}",
+        dry_run.stderr,
+        dry_run.stdout
+    );
+    assert!(
+        dry_run.stdout.contains("001-preview-sequence-"),
+        "dry run should preview sequence 001: {}",
+        dry_run.stdout
+    );
+
+    let create = run_br(
+        &workspace,
+        ["create", "Improve tests speed", "-t", "task"],
+        "create_templated_id",
+    );
+    assert!(
+        create.status.success(),
+        "templated create failed: {}\nstdout: {}",
+        create.stderr,
+        create.stdout
+    );
+    let id = extract_id_from_create_stdout(&create.stdout)
+        .unwrap_or_else(|| panic!("could not extract ID from stdout: {:?}", create.stdout));
+    assert!(
+        id.starts_with("001-improve-tests-speed-"),
+        "expected taskmd-like sequence + slug; got {id}"
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", "001", "--json"],
+        "show_numeric_short_id",
+    );
+    assert!(
+        show.status.success(),
+        "show numeric short ID failed: {}\nstdout: {}",
+        show.stderr,
+        show.stdout
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(show.stdout.trim()).expect("show output must be valid JSON");
+    let returned_id = if let Some(arr) = json.as_array() {
+        arr.first()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        json.get("id").and_then(|v| v.as_str()).map(String::from)
+    };
+    assert_eq!(returned_id.as_deref(), Some(id.as_str()));
+
+    let child = run_br(
+        &workspace,
+        ["q", "Child from numeric parent", "--parent", "001"],
+        "quick_child_numeric_parent",
+    );
+    assert!(
+        child.status.success(),
+        "quick child numeric parent failed: {}\nstdout: {}",
+        child.stderr,
+        child.stdout
+    );
+    assert!(
+        child.stdout.contains(".1"),
+        "quick child should use parent-derived child ID; stdout: {}",
+        child.stdout
+    );
+
+    std::fs::write(
+        workspace.root.join(".beads").join("config.yaml"),
+        r#"
+issue_prefix: bd
+id_generation:
+  mode: templated
+  template: "{prefix}-{seq:03}-{slug}-{hash}"
+  require_slug: true
+"#,
+    )
+    .expect("change template for future issues");
+    let second = run_br(
+        &workspace,
+        ["create", "Future template only"],
+        "create_after_template_change",
+    );
+    assert!(
+        second.status.success(),
+        "create after template change failed: {}\nstdout: {}",
+        second.stderr,
+        second.stdout
+    );
+    let second_id = extract_id_from_create_stdout(&second.stdout)
+        .unwrap_or_else(|| panic!("could not extract second ID: {:?}", second.stdout));
+    assert!(second_id.starts_with("bd-002-future-template-only-"));
+
+    let first_still_exists = run_br(
+        &workspace,
+        ["show", &id, "--json"],
+        "show_first_after_template_change",
+    );
+    assert!(first_still_exists.status.success());
+    assert!(first_still_exists.stdout.contains(&id));
+}
+
+#[test]
+fn e2e_three_way_merge_preserves_sequence_only_jsonl_change() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init", "--prefix", "bd"], "merge_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(
+        &workspace,
+        ["create", "Merge sequence metadata"],
+        "merge_create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let id = extract_id_from_create_stdout(&create.stdout).expect("created ID");
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "merge_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let mut value: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&jsonl_path).unwrap().trim()).unwrap();
+    value["sequence_number"] = serde_json::Value::from(1);
+    std::fs::write(
+        &jsonl_path,
+        format!("{}\n", serde_json::to_string(&value).unwrap()),
+    )
+    .unwrap();
+
+    let merge = run_br(
+        &workspace,
+        ["sync", "--merge", "--force-jsonl"],
+        "merge_sequence_only",
+    );
+    assert!(
+        merge.status.success(),
+        "sequence-only merge failed: {}\nstdout: {}",
+        merge.stderr,
+        merge.stdout
+    );
+    let show = run_br(&workspace, ["show", "001", "--json"], "merge_show_numeric");
+    assert!(
+        show.status.success(),
+        "merged numeric sequence did not resolve: {}\nstdout: {}",
+        show.stderr,
+        show.stdout
+    );
+    assert!(show.stdout.contains(&id));
+}
+
 /// l6xl AC: orphans command must find references to slugged IDs in commit
 /// messages (verifies that `f454486f fix(sync): accept slugged IDs in
 /// prefix guard` and `52ff1722 feat(orphans): scan all candidate-issue

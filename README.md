@@ -570,6 +570,13 @@ br uses layered configuration:
 id:
   prefix: "proj"
 
+# Optional taskmd-like issue IDs for new issues. Default mode remains
+# generated (`<prefix>-<hash>` or `<prefix>-<slug>-<hash>`).
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+
 # Default values for new issues
 defaults:
   priority: 2

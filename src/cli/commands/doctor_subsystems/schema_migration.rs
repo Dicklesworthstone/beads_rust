@@ -327,9 +327,9 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 .to_string(),
         });
     }
-    if !matches!(from, 13 | 14) {
+    if !matches!(from, 13 | 14 | 17) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only for 13->{target} and 14->{target}; \
+            "reviewed schema migration is available only for 13->{target}, 14->{target}, and 17->{target}; \
              observed unsupported source version {from}"
         )));
     }

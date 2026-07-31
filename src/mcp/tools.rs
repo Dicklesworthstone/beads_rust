@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 
 use crate::error::{BeadsError, ErrorCode, StructuredError};
 use crate::model::{Comment, DependencyType, Issue, IssueType, Priority, Status};
-use crate::storage::{IssueUpdate, ListFilters, SqliteStorage};
+use crate::storage::{IssueSequenceAllocation, IssueUpdate, ListFilters, SqliteStorage};
+use crate::util::id::{IdGenerationInput, IdGenerationMode};
 use crate::validation::{CommentValidator, IssueValidator, LabelValidator};
 
 use super::{BeadsState, ensure_not_shutting_down, mcp_ready_issues};
@@ -168,20 +169,38 @@ fn tombstone_issue_err(id: &str) -> McpError {
     )
 }
 
-/// Check for placeholder and validate that ID exists as an active issue.
-/// Returns fuzzy suggestions with `suggested_tool_calls` if not found.
-fn require_valid_issue(storage: &SqliteStorage, id: &str) -> McpResult<()> {
-    // Check DB first: if the ID exists, it's real regardless of name.
-    if let Some(issue) = storage.get_issue(id).map_err(beads_to_mcp)? {
-        if issue.status == Status::Tombstone {
-            return Err(tombstone_issue_err(id));
-        }
-        return Ok(());
+/// Resolve an exact or numeric shorthand issue ID.
+pub(super) fn resolve_mcp_issue_id(storage: &SqliteStorage, id: &str) -> McpResult<String> {
+    let resolved = crate::util::id::resolve_exact_or_sequence_fallible(
+        id,
+        id,
+        |candidate| storage.id_exists(candidate),
+        |sequence| storage.find_ids_by_sequence(sequence),
+    )
+    .map_err(beads_to_mcp)?
+    .unwrap_or_else(|| id.to_string());
+
+    if storage
+        .get_issue(&resolved)
+        .map_err(beads_to_mcp)?
+        .is_some()
+    {
+        return Ok(resolved);
     }
-    // ID not found — give a more helpful placeholder error if the ID looks
-    // hallucinated, otherwise give a standard not-found error.
     if let Some(err) = detect_placeholder(id) {
         return Err(err);
+    }
+    Err(issue_not_found_err(storage, id)?)
+}
+
+/// Resolve an exact or numeric shorthand ID and require an active issue.
+fn require_valid_issue(storage: &SqliteStorage, id: &str) -> McpResult<String> {
+    let resolved = resolve_mcp_issue_id(storage, id)?;
+    if let Some(issue) = storage.get_issue(&resolved).map_err(beads_to_mcp)? {
+        if issue.status == Status::Tombstone {
+            return Err(tombstone_issue_err(&resolved));
+        }
+        return Ok(resolved);
     }
     Err(issue_not_found_err(storage, id)?)
 }
@@ -1308,11 +1327,12 @@ impl ShowIssueTool {
 }
 
 fn show_issue_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
+    let id = resolve_mcp_issue_id(storage, id)?;
     let maybe_details = storage
-        .get_issue_details(id, true, true, 20)
+        .get_issue_details(&id, true, true, 20)
         .map_err(beads_to_mcp)?;
     let Some(details) = maybe_details else {
-        return Err(issue_not_found_err(storage, id)?);
+        return Err(issue_not_found_err(storage, &id)?);
     };
 
     let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
@@ -1607,32 +1627,45 @@ fn create_issue_json(
         coercions.push(w);
     }
 
-    let parent_id = optional_str_arg(args, "parent")?;
+    let mut parent_id = optional_str_arg(args, "parent")?;
     let description = optional_str_arg(args, "description")?;
     let assignee = optional_str_arg(args, "assignee")?;
     let labels_to_add = optional_label_array_arg(args, "labels")?;
 
     let now = chrono::Utc::now();
-    let prefix = state.issue_prefix.as_deref().unwrap_or("br");
-
-    if let Some(ref pid) = parent_id {
-        require_valid_issue(storage, pid)?;
+    if let Some(pid) = parent_id.as_deref() {
+        parent_id = Some(require_valid_issue(storage, pid)?);
     }
 
-    let id = if let Some(ref pid) = parent_id {
-        let next_num = storage.next_child_number(pid).map_err(beads_to_mcp)?;
-        next_available_child_id(pid, next_num, |candidate| storage.id_exists(candidate))?
+    let layer = crate::config::load_config(
+        &state.beads_dir,
+        Some(storage),
+        &crate::config::CliOverrides::default(),
+    )
+    .map_err(beads_to_mcp)?;
+    let id_config = crate::config::id_config_from_layer(&layer);
+    let id_description = if id_config.generation.mode == IdGenerationMode::Templated {
+        description.as_deref()
     } else {
-        let issue_count = storage.count_issues().map_err(beads_to_mcp)?;
-        generate_issue_id_with_checked_lookup(
-            &title,
-            &state.actor,
-            now,
-            prefix,
-            issue_count,
-            |candidate| storage.id_exists(candidate),
-        )?
+        None
     };
+    let generated_id = storage
+        .generate_issue_id(
+            &id_config,
+            IdGenerationInput {
+                title: &title,
+                description: id_description,
+                creator: Some(&state.actor),
+                created_at: now,
+                issue_count: storage.count_issues().map_err(beads_to_mcp)?,
+            },
+            parent_id.as_deref(),
+            None,
+            IssueSequenceAllocation::Allocate,
+        )
+        .map_err(beads_to_mcp)?;
+    let id = generated_id.id;
+    let sequence_number = generated_id.sequence_number;
 
     let issue = Issue {
         id: id.clone(),
@@ -1653,7 +1686,7 @@ fn create_issue_json(
         .map_err(beads_to_mcp)?;
 
     storage
-        .create_issue(&issue, &state.actor)
+        .create_issue_with_sequence(&issue, &state.actor, sequence_number)
         .map_err(beads_to_mcp)?;
 
     for label in &labels_to_add {
@@ -1904,7 +1937,8 @@ fn apply_update_issue_json(
     state: &BeadsState,
     args: &Value,
 ) -> McpResult<Value> {
-    let id = required_str_arg(args, "id")?;
+    let requested_id = required_str_arg(args, "id")?;
+    let id = require_valid_issue(storage, &requested_id)?;
 
     let (updates, coercions) = parse_update_fields(&id, args)?;
     let labels_to_add = optional_label_array_arg(args, "labels_add")?;
@@ -1916,9 +1950,6 @@ fn apply_update_issue_json(
     {
         validate_mcp_comment(&id, &state.actor, comment)?;
     }
-
-    // Validate ID exists before attempting update (placeholder + existence check).
-    require_valid_issue(storage, &id)?;
 
     let has_field_updates = UPDATE_FIELD_KEYS.iter().any(|k| args.get(k).is_some());
     let has_side_effects = !labels_to_add.is_empty()
@@ -2209,11 +2240,11 @@ fn close_issue_json(
     reason: Option<&str>,
 ) -> McpResult<Value> {
     // Validate ID exists (with placeholder detection + fuzzy suggestions).
-    require_valid_issue(storage, id)?;
+    let id = require_valid_issue(storage, id)?;
 
     // Idempotency: if already closed, return existing state without error.
     if let Some(details) = storage
-        .get_issue_details(id, false, false, 0)
+        .get_issue_details(&id, false, false, 0)
         .map_err(beads_to_mcp)?
         && details.issue.status == Status::Closed
     {
@@ -2238,13 +2269,13 @@ fn close_issue_json(
     };
 
     let issue = storage
-        .update_issue(id, &close_update, &state.actor)
+        .update_issue(&id, &close_update, &state.actor)
         .map_err(beads_to_mcp)?;
 
     let mut warnings = Vec::new();
 
     // Check for blockers this issue had (warn about closing a blocked issue).
-    let our_blockers = match storage.get_blockers(id) {
+    let our_blockers = match storage.get_blockers(&id) {
         Ok(blockers) => Some(blockers),
         Err(err) => {
             warnings.push(storage_read_warning("get_blockers", &err));
@@ -2253,7 +2284,7 @@ fn close_issue_json(
     };
 
     // Check what this issue was blocking (now potentially unblocked).
-    let dependents = match storage.get_blocked_issue_ids(id) {
+    let dependents = match storage.get_blocked_issue_ids(&id) {
         Ok(dependents) => Some(dependents),
         Err(err) => {
             warnings.push(storage_read_warning("get_blocked_issue_ids", &err));
@@ -2476,9 +2507,9 @@ fn invalid_dependency_action_error(action: &str) -> McpError {
 }
 
 fn manage_dependencies_list_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
-    require_valid_issue(storage, id)?;
-    let deps = storage.get_dependencies_full(id).map_err(beads_to_mcp)?;
-    let dependents = storage.get_dependents(id).map_err(beads_to_mcp)?;
+    let id = require_valid_issue(storage, id)?;
+    let deps = storage.get_dependencies_full(&id).map_err(beads_to_mcp)?;
+    let dependents = storage.get_dependents(&id).map_err(beads_to_mcp)?;
 
     Ok(json!({
         "id": id,
@@ -2523,23 +2554,24 @@ fn manage_dependencies_add_json(
         .parse::<DependencyType>()
         .map_err(beads_to_mcp)?;
 
-    require_valid_issue(storage, id)?;
-    if depends_on.starts_with("external:") {
+    let id = require_valid_issue(storage, id)?;
+    let depends_on = if depends_on.starts_with("external:") {
         if let Some(err) = detect_placeholder(depends_on) {
             return Err(err);
         }
+        depends_on.to_string()
     } else {
-        require_valid_issue(storage, depends_on)?;
-    }
+        require_valid_issue(storage, depends_on)?
+    };
 
     let would_create_cycle = if dep_type.is_blocking() && !depends_on.starts_with("external:") {
         if dep_type == DependencyType::ParentChild {
             storage
-                .would_create_parent_child_cycle(id, depends_on, true)
+                .would_create_parent_child_cycle(&id, &depends_on, true)
                 .map_err(beads_to_mcp)?
         } else {
             storage
-                .would_create_cycle(id, depends_on, true)
+                .would_create_cycle(&id, &depends_on, true)
                 .map_err(beads_to_mcp)?
         }
     } else {
@@ -2547,11 +2579,11 @@ fn manage_dependencies_add_json(
     };
 
     if would_create_cycle {
-        return Err(manage_dependency_cycle_error(id, depends_on));
+        return Err(manage_dependency_cycle_error(&id, &depends_on));
     }
 
     let added = storage
-        .add_dependency(id, depends_on, &dep_type_str, &state.actor)
+        .add_dependency(&id, &depends_on, &dep_type_str, &state.actor)
         .map_err(beads_to_mcp)?;
 
     let mut result = json!({
@@ -2577,10 +2609,15 @@ fn manage_dependencies_remove_json(
         return Err(err);
     }
 
-    require_valid_issue(storage, id)?;
+    let id = require_valid_issue(storage, id)?;
+    let depends_on = if depends_on.starts_with("external:") {
+        depends_on.to_string()
+    } else {
+        require_valid_issue(storage, depends_on)?
+    };
 
     let removed = storage
-        .remove_dependency(id, depends_on, &state.actor)
+        .remove_dependency(&id, &depends_on, &state.actor)
         .map_err(beads_to_mcp)?;
 
     Ok(json!({
@@ -3004,11 +3041,11 @@ impl ToolHandler for ProjectOverviewTool {
 mod tests {
     use super::{
         CloseIssueTool, CreateIssueTool, ListIssuesTool, ManageDependenciesTool,
-        ProjectOverviewTool, ShowIssueTool, UpdateIssueTool, build_list_filters,
-        generate_issue_id_with_checked_lookup, issue_not_found_err, list_issues_batch_json,
-        list_issues_json, next_available_child_id, optional_label_array_arg,
-        optional_string_array_arg, parse_update_fields, project_overview_json,
-        show_issue_batch_json, show_issue_json, storage_read_warning,
+        ProjectOverviewTool, ShowIssueTool, UpdateIssueTool, apply_update_issue_json,
+        build_list_filters, create_issue_json, generate_issue_id_with_checked_lookup,
+        issue_not_found_err, list_issues_batch_json, list_issues_json, next_available_child_id,
+        optional_label_array_arg, optional_string_array_arg, parse_update_fields,
+        project_overview_json, show_issue_batch_json, show_issue_json, storage_read_warning,
     };
     use crate::error::BeadsError;
     use crate::mcp::{BeadsState, McpReadSnapshotCache};
@@ -3070,6 +3107,40 @@ mod tests {
         };
         serde_json::from_str(text)
             .unwrap_or_else(|err| json!({"parse_error": err.to_string(), "text": text}))
+    }
+
+    #[test]
+    fn mcp_create_honors_templated_id_config_and_numeric_resolution() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_test_state(&temp);
+        fs::write(
+            state.beads_dir.join("config.yaml"),
+            "issue_prefix: br\nid_generation:\n  mode: templated\n  template: \"{seq:03}-{slug}-{hash}\"\n  require_slug: true\n",
+        )
+        .expect("write templated config");
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+
+        let created = create_issue_json(
+            &mut storage,
+            &state,
+            &json!({"title": "MCP templated issue"}),
+        )
+        .expect("create templated MCP issue");
+        let id = created["id"].as_str().expect("created ID");
+        assert!(id.starts_with("001-mcp-templated-issue-"), "got {id}");
+        assert_eq!(
+            storage.issue_sequence_number(id).unwrap(),
+            Some(crate::util::id::IssueSequenceNumber::new(1).unwrap())
+        );
+
+        let shown = show_issue_json(&storage, "001").expect("show numeric MCP ID");
+        assert_eq!(shown["id"], id);
+
+        let updated =
+            apply_update_issue_json(&mut storage, &state, &json!({"id": "001", "priority": "1"}))
+                .expect("update numeric MCP ID");
+        assert_eq!(updated["id"], id);
+        assert_eq!(updated["priority"], 1);
     }
 
     fn assert_docs_list_mcp_term(term: &str) {

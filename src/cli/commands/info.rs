@@ -948,6 +948,8 @@ mod tests {
             "export_hashes".to_string(),
             "gate_result_history".to_string(),
             "gate_results".to_string(),
+            "id_counters".to_string(),
+            "issue_sequences".to_string(),
             "issues".to_string(),
             "labels".to_string(),
             "metadata".to_string(),

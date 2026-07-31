@@ -1,4 +1,4 @@
-use beads_rust::util::id::{IdConfig, IdGenerator};
+use beads_rust::util::id::{IdConfig, IdGenerationConfig, IdGenerator};
 use chrono::Utc;
 
 #[test]
@@ -8,6 +8,7 @@ fn test_id_generator_fallback_collision() {
         min_hash_length: 3,
         max_hash_length: 3, // Force max length quickly
         max_collision_prob: 0.0,
+        generation: IdGenerationConfig::default(),
     };
     let generator = IdGenerator::new(config);
 

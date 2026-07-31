@@ -254,6 +254,34 @@ Three commits made `--slug` end-to-end:
 
 The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
 
+#### Optional templated issue IDs
+
+By default, `br create` preserves the historical generated ID shapes:
+`<prefix>-<hash>` and, with `--slug`, `<prefix>-<slug>-<hash>`.
+Projects that prefer taskmd-like local shorthand can opt into templated IDs in
+`.beads/config.yaml`:
+
+```yaml
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+```
+
+Supported template tokens are `{prefix}`, `{seq}`, `{seq:03}`, `{slug}`, and
+`{hash}`. Unknown tokens are rejected when creating an issue. `{hash}` is
+required unless `id_generation.allow_non_unique_template: true` is set
+explicitly. When `{slug}` is present and no `--slug` is supplied, `br create`
+derives the slug from the issue title.
+
+Sequence values come from a repository-local counter, are not reused, and are
+retained in JSONL as `sequence_number`. Imports advance the local counter past
+imported sequence values. Numeric issue arguments such as `br show 001` resolve
+to the unique issue with sequence number `1`; if multiple issues share a
+sequence number, use the full issue ID. `br q` and MCP `create_issue` use the
+same configured generation policy, and CLI/MCP issue operations plus
+`beads://issues/{id}` accept unambiguous numeric sequence shorthand.
+
 ---
 
 ### q (quick capture)
@@ -1434,7 +1462,7 @@ br sync [OPTIONS]
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
 **Additive reconciliation semantics:**
-- `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.
+- `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v3` receipt plus a `plan_sha256` review token.
 - The planner preserves SQLite-only issues, audit events, close metadata, gate-result history, runtime config, and every unmodified relation row. It never performs content-hash identity merges, physical deletes, JSONL writes, base-snapshot writes, or merge-note writes.
 - JSONL-only IDs are created. For a shared ID, only an `open`/`in_progress` to `closed` transition whose scalar diff is limited to `status`, `updated_at`, `closed_at`, and `close_reason` is accepted automatically. Other drift is a conflict. Exact-ID `--resolve-source-id` is limited to the documented non-lifecycle scalar whitelist and is rejected when JSONL is older than SQLite.
 - Explicit resolution never authorizes relation drift, tombstone resurrection, live-to-tombstone conversion, external-reference collision, orphan dependencies, or a newly introduced blocking cycle. Superfluous, duplicate, blank, and unknown resolution IDs are rejected.

@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+pub const CURRENT_SCHEMA_VERSION: i32 = 18;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -171,6 +171,7 @@ const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
     "idx_issues_status_priority_created",
     "idx_issues_tombstone",
     "idx_issues_updated_at",
+    "idx_issue_sequences_number",
     "idx_labels_issue",
     "idx_labels_label",
     "idx_metadata_key",
@@ -179,7 +180,7 @@ const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
 /// Effects produced by one explicit reviewed schema migration.
 ///
 /// The reviewed migration surface is intentionally narrow: this binary only
-/// accepts schema 13 or 14 as input and always migrates to
+/// accepts schema 13, 14, or 17 as input and always migrates to
 /// [`CURRENT_SCHEMA_VERSION`]. Callers use these counts to compare the
 /// transaction result with their reviewed plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,6 +429,19 @@ pub const SCHEMA_SQL: &str = r"
         last_child INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (parent_id) REFERENCES issues(id) ON DELETE CASCADE
     );
+
+    -- ID Counters (for optional templated top-level issue IDs).
+    CREATE TABLE IF NOT EXISTS id_counters (
+        name TEXT PRIMARY KEY,
+        next_value INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS issue_sequences (
+        issue_id TEXT PRIMARY KEY,
+        sequence_number INTEGER NOT NULL CHECK(sequence_number > 0),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_issue_sequences_number
+        ON issue_sequences(sequence_number);
 
     -- Close metadata (issue #274 — closure-time policy gates Phase 1).
     --
@@ -823,10 +837,11 @@ fn validate_reviewed_schema_migration(
              ({supported_target}), got {target_version}"
         )));
     }
-    if !matches!(from, 13 | 14) {
+    if !matches!(from, 13 | 14 | 17) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — only reviewed migrations 13->{supported_target} and \
-             14->{supported_target} are supported (got {from}->{target_version})"
+             14->{supported_target}, and 17->{supported_target} are supported \
+             (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -844,15 +859,15 @@ fn validate_reviewed_schema_migration(
     Ok(())
 }
 
-/// Apply the reviewed v14/v15 migration steps inside the caller's transaction.
+/// Apply the reviewed migration steps inside the caller's transaction.
 ///
 /// This function never starts, commits, or rolls back a transaction. The caller
 /// must hold the database-family write authority and an active
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Only `13 -> CURRENT_SCHEMA_VERSION` and
-/// `14 -> CURRENT_SCHEMA_VERSION` are accepted. `marked_at` is written
+/// Only `13 -> CURRENT_SCHEMA_VERSION`, `14 -> CURRENT_SCHEMA_VERSION`, and
+/// `17 -> CURRENT_SCHEMA_VERSION` are accepted. `marked_at` is written
 /// verbatim to every v14 `dirty_issues` row, making the bookkeeping timestamp
 /// explicit and reviewable.
 ///
@@ -880,6 +895,24 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
     apply_gate_result_history_migration_in_transaction(conn)?;
 
+    tracing::info!("Migrating database to schema version 18 (templated issue sequences)");
+    execute_batch(
+        conn,
+        r"
+            CREATE TABLE IF NOT EXISTS id_counters (
+                name TEXT PRIMARY KEY,
+                next_value INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS issue_sequences (
+                issue_id TEXT PRIMARY KEY,
+                sequence_number INTEGER NOT NULL CHECK(sequence_number > 0),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_sequences_number
+                ON issue_sequences(sequence_number);
+        ",
+    )?;
+
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
 
@@ -901,7 +934,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
 /// Compatibility wrapper for the existing doctor migration hook.
 ///
 /// The two reviewed paths supported by
-/// [`run_reviewed_schema_migration_steps_in_transaction`] (13/14 →
+/// [`run_reviewed_schema_migration_steps_in_transaction`] (13/14/17 →
 /// `CURRENT_SCHEMA_VERSION`) run genuinely atomically in one
 /// `BEGIN IMMEDIATE` transaction and cannot stamp an arbitrary target after
 /// running newer migrations. Every other version pair falls back to the
@@ -925,7 +958,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
              ({supported_target}), got {target_version}"
         )));
     }
-    if matches!(from, 13 | 14) {
+    if matches!(from, 13 | 14 | 17) {
         let marked_at = Utc::now().to_rfc3339();
         validate_reviewed_schema_migration(conn, from, target_version, &marked_at)?;
 
@@ -1711,6 +1744,9 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     );
     let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
+    let id_counters_ok = table_has_columns(conn, "id_counters", &["name", "next_value"]);
+    let issue_sequences_ok =
+        table_has_columns(conn, "issue_sequences", &["issue_id", "sequence_number"]);
     let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
     let indexes_ok = REQUIRED_RUNTIME_INDEXES
         .iter()
@@ -1729,6 +1765,8 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && export_hashes_ok
         && blocked_cache_ok
         && child_counters_ok
+        && id_counters_ok
+        && issue_sequences_ok
         && gate_history_ok
         && indexes_ok;
 
@@ -1747,6 +1785,8 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             export_hashes_ok,
             blocked_cache_ok,
             child_counters_ok,
+            id_counters_ok,
+            issue_sequences_ok,
             gate_history_ok,
             indexes_ok,
             "runtime schema compatibility check failed"
@@ -2125,6 +2165,28 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
                 ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
                 ON capacity_occupancy(session) WHERE session IS NOT NULL;
+        ",
+        )?;
+    }
+
+    // v18: opt-in templated issue IDs use a global allocation counter and
+    // preserve the allocated sequence separately from the authoritative ID.
+    if user_version < 18 {
+        tracing::info!("Migrating database to schema version 18 (templated issue sequences)");
+        execute_batch(
+            conn,
+            r"
+            CREATE TABLE IF NOT EXISTS id_counters (
+                name TEXT PRIMARY KEY,
+                next_value INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS issue_sequences (
+                issue_id TEXT PRIMARY KEY,
+                sequence_number INTEGER NOT NULL CHECK(sequence_number > 0),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_issue_sequences_number
+                ON issue_sequences(sequence_number);
         ",
         )?;
     }

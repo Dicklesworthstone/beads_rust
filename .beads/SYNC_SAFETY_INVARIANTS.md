@@ -78,7 +78,7 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 
 | ID | Risk | Invariant | Test Strategy |
 |----|------|-----------|---------------|
-| AR-1 | CRITICAL | Planning is read-only and emits a deterministic v2 plan token | Snapshot the complete DB family and JSONL bytes before/after repeated plans |
+| AR-1 | CRITICAL | Planning is read-only and emits a deterministic v3 plan token | Snapshot the complete DB family and JSONL bytes before/after repeated plans |
 | AR-2 | CRITICAL | Apply requires the exact token from an identically configured reviewed plan | Reject missing, malformed, mismatched, stale-source, stale-DB, and resolution-set-drift tokens |
 | AR-3 | CRITICAL | No authoritative issue, relation, child-evidence, config, event, JSONL, base, or merge-note row is deleted; only token-bound export/dirty/metadata bookkeeping and independently projected derived caches may be replaced | Seed every table; compare complete typed-row SHA-256 witnesses before/after and require exact projected bookkeeping/cache state |
 | AR-4 | CRITICAL | Shared scalar drift fails closed except a field-bounded monotonic closure or exact-ID source resolution | Unit-test newer/equal/older drift, closure field boundaries, redundant/unknown resolution IDs |
@@ -87,6 +87,19 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | AR-7 | HIGH | Derived blocked cache and child counters equal an independent issue-graph projection | Seed stale/corrupt caches; plan, rebuild, compare exact maps and digests |
 | AR-8 | HIGH | Strict source parsing rejects unknown or silently normalized fields | Unknown-field, enum-alias, blank optional, ignored content-hash, and omitted-option round-trip tests |
 | AR-9 | HIGH | Receipt JSON Schema and command envelope are discoverable through `br schema` | Schema catalog and enum-domain tests |
+
+### 2.7 Issue Sequence Metadata Invariants
+
+The full issue ID is always authoritative. Sequence numbers are optional,
+repository-local shorthand and are never used to merge rows by identity.
+
+| ID | Risk | Invariant | Test Strategy |
+|----|------|-----------|---------------|
+| IS-1 | HIGH | Every persisted or imported `sequence_number` is a positive signed 64-bit integer; zero, negative, and successor-overflow values fail before commit | Model/unit deserialization plus import rollback tests |
+| IS-2 | HIGH | A successful local allocation advances `id_counters` in its own transaction, so allocated values are not reused when later issue creation fails | Storage allocation and templated-create tests |
+| IS-3 | HIGH | Import/export preserves `issue_sequences`, and every observed imported value advances `id_counters` past that value, including rows whose issue mutation is skipped | JSONL round-trip and skipped-import tests |
+| IS-4 | MEDIUM | Duplicate sequence numbers may be retained on different exact IDs, but numeric lookup fails as ambiguous until the caller supplies a full ID | Import and CLI/MCP resolution tests |
+| IS-5 | CRITICAL | `id_counters` and `issue_sequences` are included in additive and merge database witnesses; reviewed apply binds sequence changes to the source/database generation and rolls back on mismatch | Additive reconcile witness/rollback tests and three-way sequence-only merge E2E |
 
 ---
 
@@ -147,6 +160,9 @@ All safety-critical logs MUST include:
 | AW-1 | Temp file pattern | `sync/mod.rs:590-646` |
 | AW-2 | `flush()` + `sync_all()` calls | `sync/mod.rs:638-643` |
 | DL-3 | Tombstone check in import | `sync/mod.rs` import logic |
+| IS-1 | `IssueSequenceNumber` validation | `util/id.rs`, JSONL record deserialization |
+| IS-2 / IS-3 | Counter advancement and sequence recording | `storage/sqlite.rs`, `sync/mod.rs` |
+| IS-5 | Sequence table witnesses and merge intent | `sync/mod.rs`, `cli/commands/sync.rs` |
 
 ---
 
@@ -159,6 +175,7 @@ All safety-critical logs MUST include:
 | Data Loss Prevention | ✓ Required | ✓ Required | ○ Recommended |
 | Input Validation | ✓ Required | ✓ Required | ✓ Required |
 | No Git Operations | ✓ Required (fail-closed) | ✓ Required (all modes) | N/A |
+| Issue Sequence Metadata | ✓ Required | ✓ Required | ○ Recommended |
 | Logging | ✓ Required | ○ Optional | N/A |
 
 ---

@@ -26,8 +26,8 @@ use crate::sync::{
     tombstones_missing_from_jsonl_tombstones, verify_jsonl_source_snapshot_current,
 };
 use crate::util::id::{
-    IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
-    split_prefix_remainder,
+    IdConfig, IdGenerationConfig, IdGenerationMode, abbreviate_prefix, normalize_configured_prefix,
+    normalize_prefix, parse_id, split_prefix_remainder,
 };
 use chrono::Utc;
 use fsqlite_error::FrankenError;
@@ -1550,10 +1550,12 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
     write_authority.verify_database_authority()?;
     jsonl_authority.verify_jsonl_authority()?;
     let prefix = resolve_bootstrap_issue_prefix_snapshot(bootstrap_layer, beads_dir, source)?;
+    let expected_prefix = import_expected_prefix(bootstrap_layer, &prefix);
 
     let mut preflight_config = import_config.clone();
     preflight_config.skip_prefix_validation = true;
-    preflight_import_snapshot(source, &preflight_config, Some(&prefix))?.into_result()?;
+    preflight_import_snapshot(source, &preflight_config, expected_prefix.as_deref())?
+        .into_result()?;
     let current_source = crate::sync::capture_jsonl_source_snapshot(source.display_path())?;
     if current_source.state_witness() != source.state_witness() {
         return Err(BeadsError::SyncConflict {
@@ -1580,6 +1582,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
                 source,
                 &import_config,
                 &prefix,
+                expected_prefix.as_deref(),
                 write_authority,
             )?;
             jsonl_authority.verify_jsonl_authority()?;
@@ -1972,6 +1975,7 @@ fn rebuild_database_family(
     source: &JsonlSourceSnapshot,
     import_config: &ImportConfig,
     prefix: &str,
+    expected_prefix: Option<&str>,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> Result<(SqliteStorage, ImportResult)> {
     write_authority.verify_database_authority()?;
@@ -1980,7 +1984,7 @@ fn rebuild_database_family(
     write_authority.verify_database_authority()?;
     storage.set_config("issue_prefix", prefix)?;
     let import_result =
-        import_from_jsonl_snapshot(&mut storage, source, import_config, Some(prefix))?;
+        import_from_jsonl_snapshot(&mut storage, source, import_config, expected_prefix)?;
 
     // Drain the WAL to the main DB file so the follow-up maintenance (VACUUM,
     // REINDEX, VACUUM INTO) operates against what is actually on disk.
@@ -4005,6 +4009,25 @@ fn validate_configured_issue_prefix(layer: &ConfigLayer) -> Result<()> {
     Ok(())
 }
 
+fn validate_configured_id_generation(layer: &ConfigLayer) -> Result<()> {
+    let mode = get_value(layer, &["id_generation.mode", "id-generation.mode"])
+        .map_or(Ok(IdGenerationMode::Generated), |value| {
+            IdGenerationMode::parse(value)
+        })?;
+    if mode == IdGenerationMode::Templated {
+        crate::util::id::IdGenerator::new(id_config_from_layer(layer))
+            .validate_template_config()?;
+    }
+    Ok(())
+}
+
+fn import_expected_prefix(layer: &ConfigLayer, configured_prefix: &str) -> Option<String> {
+    let id_config = id_config_from_layer(layer);
+    let template_owns_full_id_shape = id_config.generation.mode == IdGenerationMode::Templated
+        && !id_config.generation.template.contains("{prefix}");
+    (!template_owns_full_id_shape).then(|| configured_prefix.to_string())
+}
+
 fn first_prefix_from_resolved_jsonl(
     beads_dir: &Path,
     jsonl_path: &Path,
@@ -4617,6 +4640,7 @@ fn load_config_from_startup_layers(
 
     let merged = ConfigLayer::merge_layers(&layers);
     validate_configured_issue_prefix(&merged)?;
+    validate_configured_id_generation(&merged)?;
     Ok(merged)
 }
 
@@ -5129,12 +5153,40 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
     let max_collision_prob =
         parse_f64(layer, &["max_collision_prob", "max-collision-prob"]).unwrap_or(0.25);
+    let generation_mode = get_value(layer, &["id_generation.mode", "id-generation.mode"])
+        .and_then(|value| IdGenerationMode::parse(value).ok())
+        .unwrap_or(IdGenerationMode::Generated);
+    let generation_template =
+        get_value(layer, &["id_generation.template", "id-generation.template"])
+            .cloned()
+            .unwrap_or_else(|| "{prefix}-{hash}".to_string());
+    let require_slug = get_value(
+        layer,
+        &["id_generation.require_slug", "id-generation.require-slug"],
+    )
+    .and_then(|value| parse_bool(value))
+    .unwrap_or(false);
+    let allow_non_unique_template = get_value(
+        layer,
+        &[
+            "id_generation.allow_non_unique_template",
+            "id-generation.allow-non-unique-template",
+        ],
+    )
+    .and_then(|value| parse_bool(value))
+    .unwrap_or(false);
 
     IdConfig {
         prefix,
         min_hash_length,
         max_hash_length,
         max_collision_prob,
+        generation: IdGenerationConfig {
+            mode: generation_mode,
+            template: generation_template,
+            require_slug,
+            allow_non_unique_template,
+        },
     }
 }
 
@@ -5791,6 +5843,38 @@ labels:
         assert_eq!(config.min_hash_length, 4);
         assert_eq!(config.max_hash_length, 10);
         assert!((config.max_collision_prob - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn id_config_parses_templated_generation_options() {
+        let yaml = r#"
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+  allow_non_unique_template: false
+"#;
+        let value: serde_yml::Value = serde_yml::from_str(yaml).expect("parse yaml");
+        let layer = layer_from_yaml_value(&value);
+        let config = id_config_from_layer(&layer);
+
+        assert_eq!(config.generation.mode, IdGenerationMode::Templated);
+        assert_eq!(config.generation.template, "{seq:03}-{slug}-{hash}");
+        assert!(config.generation.require_slug);
+        assert!(!config.generation.allow_non_unique_template);
+    }
+
+    #[test]
+    fn configured_id_generation_rejects_unknown_mode() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("id_generation.mode".to_string(), "surprising".to_string());
+
+        let error =
+            validate_configured_id_generation(&layer).expect_err("unknown mode must be rejected");
+        assert!(error.to_string().contains("unsupported ID generation mode"));
     }
 
     #[test]
@@ -7427,6 +7511,38 @@ routing:
             .expect("query reopened issue")
             .expect("issue should remain readable after reopening");
         assert_eq!(reopened_issue.title, "Recovered from JSONL");
+    }
+
+    #[test]
+    fn open_storage_recovers_prefixless_templated_id_from_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(
+            beads_dir.join("config.yaml"),
+            r#"
+issue_prefix: bd
+id_generation:
+  mode: templated
+  template: "{slug}-{hash}"
+"#,
+        )
+        .expect("write templated ID config");
+        fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
+        write_single_issue_jsonl(&jsonl_path, "fix-login-abc", "Fix login");
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("recover storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("fix-login-abc")
+            .expect("query recovered issue")
+            .expect("prefixless templated ID should survive recovery");
+
+        assert_eq!(issue.id, "fix-login-abc");
+        assert_eq!(issue.title, "Fix login");
     }
 
     #[test]

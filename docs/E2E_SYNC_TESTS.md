@@ -13,6 +13,7 @@ The e2e sync test suite verifies several critical safety properties:
 5. **No Partial Writes** - Failed operations leave state unchanged
 6. **Lossless Additive Recovery** - Dry-run is read-only; token-bound apply preserves DB-only rows, audit/close/gate evidence, JSONL bytes, and relation identity
 7. **Fail-Closed Review** - Mismatched/stale plan tokens, unreviewed scalar drift, lossy JSON, and relation drift roll back without partial state
+8. **Sequence Metadata Integrity** - Optional positive sequence numbers round-trip, advance the non-reusing local counter, remain exact-ID metadata, and participate in merge/reconcile witnesses
 
 ## Test Files
 
@@ -26,6 +27,8 @@ The e2e sync test suite verifies several critical safety properties:
 | `tests/e2e_sync_preflight_integration.rs` | Preflight checks catch safety issues before writes |
 | `tests/e2e_sync_reconcile.rs` | Additive `--reconcile`: false-equal repair, event preservation, dry-run zero-mutation, witness rollback |
 | `tests/e2e_basic_lifecycle.rs` | Additive dry-run/apply/idempotency receipt, event preservation, and unchanged-source coverage |
+| `tests/e2e_slug.rs` | Templated ID creation, numeric shorthand, and sequence-only three-way merge |
+| `tests/jsonl_import_export.rs` | Sequence validation, duplicate ambiguity, counter advancement, JSONL round-trip, and reconcile preservation |
 
 ## Running the Tests
 
@@ -348,6 +351,26 @@ Tests the additive `br sync --reconcile` mode (beads_rust-3r45):
 - Plan/apply witness rollback on concurrent DB or JSONL change
 - Write-lock contention fails apply cleanly; read-only dry-run proceeds
 - External JSONL path policy, read-only JSONL, empty DB/JSONL, 2K+ row bulk
+
+### 7. Issue Sequence Metadata Tests
+
+`tests/jsonl_import_export.rs` verifies that `sequence_number` remains a JSON
+integer, round-trips through `issue_sequences`, and advances `id_counters`
+without reuse. It also covers non-positive rejection, successor overflow,
+skipped imports, additive reconciliation, and duplicate values. Duplicate
+values are valid metadata on distinct exact IDs, but numeric lookup must report
+ambiguity.
+
+`tests/e2e_slug.rs::e2e_three_way_merge_preserves_sequence_only_jsonl_change`
+proves a reviewed merge can apply a sequence-only JSONL change and subsequently
+resolve its unique numeric shorthand. The merge intent and database witnesses
+include `issue_sequences` and `id_counters`; the sequence never replaces the
+full ID as merge identity.
+
+These witness additions are published as additive receipt schema
+`br.sync.additive-reconciliation.v3`. Apply rejects v2, future, or otherwise
+mismatched receipt schemas before checking the plan token or opening a write
+transaction.
 
 ## Troubleshooting
 

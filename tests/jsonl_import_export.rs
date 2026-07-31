@@ -1,11 +1,12 @@
 mod common;
 
-use beads_rust::model::{Comment, DependencyType, Issue, Priority, Status};
+use beads_rust::model::{Comment, DependencyType, Issue, IssueRecord, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 use beads_rust::sync::{
-    ExportConfig, ImportConfig, export_to_jsonl, finalize_export, import_from_jsonl,
-    read_issues_from_jsonl,
+    ExportConfig, ImportConfig, apply_sync_reconcile, export_to_jsonl, finalize_export,
+    import_from_jsonl, plan_sync_reconcile, read_issues_from_jsonl,
 };
+use beads_rust::util::id::IssueSequenceNumber;
 use chrono::{Duration, TimeZone, Utc};
 use common::fixtures;
 use std::fs;
@@ -75,6 +76,172 @@ fn export_import_roundtrip_preserves_relationships() {
     let comments = imported.get_comments(&alpha.id).unwrap();
     assert_eq!(comments.len(), 1);
     assert_eq!(comments[0].body, "first comment");
+}
+
+#[test]
+fn export_import_roundtrip_preserves_issue_sequence_numbers() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let issue = issue_with_id("007-sequenced-abc", "Sequenced issue");
+    storage.create_issue(&issue, "tester").unwrap();
+    storage
+        .record_issue_sequence_number(&issue.id, IssueSequenceNumber::new(7).unwrap())
+        .expect("record sequence");
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    export_to_jsonl(&storage, &path, &ExportConfig::default()).unwrap();
+    let jsonl = fs::read_to_string(&path).expect("read jsonl");
+    assert!(
+        jsonl.contains("\"sequence_number\":7"),
+        "exported JSONL should carry sequence_number: {jsonl}"
+    );
+
+    let mut imported = SqliteStorage::open_memory().unwrap();
+    import_from_jsonl(&mut imported, &path, &ImportConfig::default(), Some("bd")).unwrap();
+    assert_eq!(
+        imported
+            .find_ids_by_sequence(IssueSequenceNumber::new(7).unwrap())
+            .unwrap(),
+        vec![issue.id.clone()]
+    );
+    assert_eq!(
+        imported.allocate_issue_sequence_number().unwrap().get(),
+        8,
+        "import must advance local sequence counter past imported sequence"
+    );
+}
+
+#[test]
+fn import_allows_duplicate_sequence_numbers_but_numeric_lookup_is_ambiguous() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let mut first = serde_json::to_value(issue_with_id("007-first-abc", "First")).unwrap();
+    let mut second =
+        serde_json::to_value(issue_with_id("prefix-007-second-def", "Second")).unwrap();
+    first["sequence_number"] = serde_json::Value::from(7);
+    second["sequence_number"] = serde_json::Value::from(7);
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), None).unwrap();
+
+    assert_eq!(
+        storage
+            .find_ids_by_sequence(IssueSequenceNumber::new(7).unwrap())
+            .unwrap(),
+        vec![
+            "007-first-abc".to_string(),
+            "prefix-007-second-def".to_string()
+        ]
+    );
+    assert_eq!(storage.allocate_issue_sequence_number().unwrap().get(), 8);
+}
+
+#[test]
+fn import_rejects_non_positive_sequence_number_without_writing() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let mut value =
+        serde_json::to_value(issue_with_id("bad-sequence-abc", "Bad sequence")).unwrap();
+    value["sequence_number"] = serde_json::Value::from(0);
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&value).unwrap()),
+    )
+    .unwrap();
+
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let error = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), None)
+        .expect_err("zero sequence must be rejected");
+
+    assert!(error.to_string().contains("expected positive integer"));
+    assert!(storage.get_issue("bad-sequence-abc").unwrap().is_none());
+}
+
+#[test]
+fn import_rejects_exhausted_sequence_number_without_reuse() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let record = IssueRecord {
+        issue: issue_with_id("max-sequence-abc", "Max sequence"),
+        sequence_number: Some(IssueSequenceNumber::new(i64::MAX).unwrap()),
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let error = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), None)
+        .expect_err("exhausted sequence must be rejected");
+
+    assert!(error.to_string().contains("sequence counter exhausted"));
+    assert!(storage.get_issue("max-sequence-abc").unwrap().is_none());
+}
+
+#[test]
+fn reconcile_preserves_sequence_metadata_for_an_existing_issue() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let issue = issue_with_id("existing-sequence-abc", "Existing sequence");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let record = IssueRecord {
+        issue: issue.clone(),
+        sequence_number: Some(IssueSequenceNumber::new(11).unwrap()),
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    let config = ImportConfig::default();
+    let plan = plan_sync_reconcile(&storage, &path, &config).unwrap();
+    apply_sync_reconcile(&mut storage, &path, &config, &plan).unwrap();
+
+    assert_eq!(
+        storage.issue_sequence_number(&issue.id).unwrap(),
+        Some(IssueSequenceNumber::new(11).unwrap())
+    );
+    assert_eq!(storage.allocate_issue_sequence_number().unwrap().get(), 12);
+}
+
+#[test]
+fn skipped_import_attaches_sequence_metadata_to_existing_issue() {
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let issue = issue_with_id("existing-skip-abc", "Existing skip");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    let record = IssueRecord {
+        issue: issue.clone(),
+        sequence_number: Some(IssueSequenceNumber::new(13).unwrap()),
+    };
+    fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .unwrap();
+
+    import_from_jsonl(&mut storage, &path, &ImportConfig::default(), None).unwrap();
+
+    assert_eq!(
+        storage.issue_sequence_number(&issue.id).unwrap(),
+        Some(IssueSequenceNumber::new(13).unwrap())
+    );
+    assert_eq!(storage.allocate_issue_sequence_number().unwrap().get(), 14);
 }
 
 #[test]

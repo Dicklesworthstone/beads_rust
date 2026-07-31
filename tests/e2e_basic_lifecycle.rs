@@ -2882,7 +2882,7 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
     );
     let plan_json: Value = serde_json::from_str(&extract_json_payload(&plan.stdout))
         .expect("parse additive dry-run receipt");
-    assert_eq!(plan_json["schema"], "br.sync.additive-reconciliation.v2");
+    assert_eq!(plan_json["schema"], "br.sync.additive-reconciliation.v3");
     assert_eq!(plan_json["status"], "ready");
     assert_eq!(plan_json["source_issues"].as_u64(), Some(2));
     assert_eq!(plan_json["created"].as_u64(), Some(1));

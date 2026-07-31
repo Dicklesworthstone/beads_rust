@@ -192,11 +192,12 @@ impl IssueResource {
 }
 
 fn issue_resource_json(storage: &SqliteStorage, id: &str) -> McpResult<Value> {
+    let id = super::tools::resolve_mcp_issue_id(storage, id)?;
     let maybe_details = storage
-        .get_issue_details(id, true, true, 20)
+        .get_issue_details(&id, true, true, 20)
         .map_err(to_mcp)?;
     let Some(details) = maybe_details else {
-        return Err(issue_not_found_resource(storage, id)?);
+        return Err(issue_not_found_resource(storage, &id)?);
     };
 
     let mut result = serde_json::to_value(&details.issue).unwrap_or_default();
@@ -1484,6 +1485,28 @@ mod tests {
         };
 
         assert_eq!(cached, direct);
+    }
+
+    #[test]
+    fn issue_resource_resolves_numeric_sequence_id() {
+        let temp = TempDir::new().expect("tempdir");
+        let state = mcp_resource_state(&temp, false);
+        let mut storage = SqliteStorage::open(&state.db_path).expect("open storage");
+        let issue = Issue {
+            id: "001-resource-sequence-abc".to_string(),
+            title: "resource sequence".to_string(),
+            ..Issue::default()
+        };
+        storage
+            .create_issue_with_sequence(
+                &issue,
+                "mcp-resource-test",
+                Some(crate::util::id::IssueSequenceNumber::new(1).unwrap()),
+            )
+            .expect("create sequenced resource issue");
+
+        let value = issue_resource_json(&storage, "001").expect("numeric issue resource");
+        assert_eq!(value["id"], issue.id);
     }
 
     #[test]

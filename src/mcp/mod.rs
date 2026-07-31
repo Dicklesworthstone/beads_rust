@@ -686,6 +686,7 @@ mod tests {
             kept_issue_witnesses: Vec::new(),
             deleted_issue_ids: Vec::new(),
             note_witnesses: Vec::new(),
+            sequence_numbers: Vec::new(),
             database_before,
         };
         let database_after = crate::sync::capture_sync_merge_core_witness(&storage).unwrap();

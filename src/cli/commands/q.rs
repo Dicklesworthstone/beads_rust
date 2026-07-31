@@ -4,11 +4,11 @@ use crate::error::{BeadsError, Result};
 use crate::format::sanitize_terminal_inline;
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::util::id::{IdGenerator, IdResolver, ResolverConfig, child_id};
+use crate::storage::IssueSequenceAllocation;
+use crate::util::id::{IdGenerationInput, IdGenerationMode, IdResolver, ResolverConfig};
 use crate::validation::{IssueValidator, LabelValidator};
 use chrono::Utc;
 use rich_rust::prelude::*;
-use std::collections::HashSet;
 use std::str::FromStr;
 
 fn split_labels(values: &[String]) -> Vec<String> {
@@ -75,52 +75,29 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let resolved_parent_id = args
         .parent
         .as_deref()
-        .map(|parent_input| {
-            resolver
-                .resolve_fallible(
-                    parent_input,
-                    |id| storage.id_exists(id),
-                    |hash| storage.find_ids_by_hash(hash),
-                )
-                .map(|resolved| resolved.id)
-        })
+        .map(|parent_input| super::resolve_issue_id(storage, &resolver, parent_input))
         .transpose()?;
 
-    // When a parent is specified, generate a child ID (parent.1, parent.2, etc.)
-    let id = if let Some(parent_id) = resolved_parent_id.as_deref() {
-        if !storage.id_exists(parent_id)? {
-            return Err(BeadsError::IssueNotFound {
-                id: parent_id.to_string(),
-            });
-        }
-        let next_num = storage.next_child_number(parent_id)?;
-        let candidate = child_id(parent_id, next_num);
-        if storage.id_exists(&candidate)? {
-            let mut num = next_num + 1;
-            loop {
-                let alt = child_id(parent_id, num);
-                if !storage.id_exists(&alt)? {
-                    break alt;
-                }
-                num += 1;
-                if num > next_num.saturating_add(100) {
-                    return Err(BeadsError::validation(
-                        "parent",
-                        "could not find available child ID",
-                    ));
-                }
-            }
-        } else {
-            candidate
-        }
+    let id_description = if id_config.generation.mode == IdGenerationMode::Templated {
+        args.description.as_deref()
     } else {
-        let id_gen = IdGenerator::new(id_config);
-        let count = storage.count_issues()?;
-        let existing_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
-        id_gen.generate(&title, None, None, now, count, |candidate| {
-            Ok(existing_ids.contains(candidate))
-        })?
+        None
     };
+    let generated_id = storage.generate_issue_id(
+        &id_config,
+        IdGenerationInput {
+            title: &title,
+            description: id_description,
+            creator: None,
+            created_at: now,
+            issue_count: storage.count_issues()?,
+        },
+        resolved_parent_id.as_deref(),
+        None,
+        IssueSequenceAllocation::Allocate,
+    )?;
+    let id = generated_id.id;
+    let sequence_number = generated_id.sequence_number;
 
     let mut valid_labels = Vec::new();
     let labels = split_labels(&args.labels);
@@ -206,7 +183,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
 
     IssueValidator::validate(&issue).map_err(BeadsError::from_validation_errors)?;
 
-    storage.create_issue(&issue, &actor)?;
+    storage.create_issue_with_sequence(&issue, &actor, sequence_number)?;
     let created_id = issue.id.clone();
     let last_touched_dir = storage_ctx.paths.beads_dir.clone();
     let update_last_touched_after_flush = storage_ctx.no_db;

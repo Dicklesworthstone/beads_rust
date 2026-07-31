@@ -14,8 +14,11 @@ use crate::format::{
 use crate::model::{Dependency, Issue, Priority, Status};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
-use crate::sync::{path as sync_path, read_issues_from_jsonl};
-use crate::util::id::{IdResolver, ResolverConfig, normalize_id};
+use crate::sync::{path as sync_path, read_issue_records_from_jsonl};
+use crate::util::id::{
+    IdResolver, IssueSequenceNumber, ResolverConfig, normalize_id,
+    resolve_exact_or_sequence_fallible,
+};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as FmtWrite;
@@ -469,14 +472,10 @@ fn load_issue_details_from_storage(
     let mut details_list = Vec::with_capacity(target_ids.len());
 
     for id_input in target_ids {
-        let resolution = resolver.resolve_fallible(
-            id_input,
-            |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
-        )?;
+        let resolved_id = super::resolve_issue_id(storage, resolver, id_input)?;
 
-        let Some(mut details) = storage.get_issue_details(&resolution.id, true, false, 10)? else {
-            return Err(BeadsError::IssueNotFound { id: resolution.id });
+        let Some(mut details) = storage.get_issue_details(&resolved_id, true, false, 10)? else {
+            return Err(BeadsError::IssueNotFound { id: resolved_id });
         };
 
         if issue_details_have_external_dependencies(&details) {
@@ -517,23 +516,47 @@ fn load_issue_details_from_jsonl_materialized(
     jsonl_path: &Path,
     external_db_paths: &HashMap<String, PathBuf>,
 ) -> Result<Vec<IssueDetails>> {
-    let issues = read_issues_from_jsonl(jsonl_path)?;
-    let mut issues_by_id = HashMap::with_capacity(issues.len());
-    for issue in issues {
-        issues_by_id.insert(issue.id.clone(), issue);
+    let records = read_issue_records_from_jsonl(jsonl_path)?;
+    let mut issues_by_id = HashMap::with_capacity(records.len());
+    let mut sequence_ids: HashMap<IssueSequenceNumber, Vec<String>> = HashMap::new();
+    for record in records {
+        if let Some(sequence_number) = record.sequence_number {
+            sequence_ids
+                .entry(sequence_number)
+                .or_default()
+                .push(record.issue.id.clone());
+        }
+        issues_by_id.insert(record.issue.id.clone(), record.issue);
+    }
+    for ids in sequence_ids.values_mut() {
+        ids.sort();
     }
 
     let mut details_list = Vec::with_capacity(target_ids.len());
     for id_input in target_ids {
-        let resolution = resolver.resolve_fallible(
+        let normalized = normalize_id(id_input.trim());
+        let resolved_id = resolve_exact_or_sequence_fallible(
             id_input,
+            &normalized,
             |id| Ok(issues_by_id.contains_key(id)),
-            |hash| Ok(find_ids_by_hash_in_memory(&issues_by_id, hash)),
+            |sequence| Ok(sequence_ids.get(&sequence).cloned().unwrap_or_default()),
+        )?
+        .map_or_else(
+            || {
+                resolver
+                    .resolve_fallible(
+                        id_input,
+                        |id| Ok(issues_by_id.contains_key(id)),
+                        |hash| Ok(find_ids_by_hash_in_memory(&issues_by_id, hash)),
+                    )
+                    .map(|resolution| resolution.id)
+            },
+            Ok,
         )?;
         let issue = issues_by_id
-            .get(&resolution.id)
+            .get(&resolved_id)
             .ok_or_else(|| BeadsError::IssueNotFound {
-                id: resolution.id.clone(),
+                id: resolved_id.clone(),
             })?;
         details_list.push(build_issue_details_from_jsonl(issue, &issues_by_id)?);
     }

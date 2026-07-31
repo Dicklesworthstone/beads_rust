@@ -5,8 +5,10 @@ use crate::error::{BeadsError, Result};
 use crate::format::{format_type_label, sanitize_terminal_inline};
 use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::OutputContext;
-use crate::storage::{BulkDependencyInsert, EventAttribution, SqliteStorage};
-use crate::util::id::{IdGenerationInput, IdGenerator, IdResolver, ResolverConfig, child_id};
+use crate::storage::{
+    BulkDependencyInsert, EventAttribution, IssueSequenceAllocation, SqliteStorage,
+};
+use crate::util::id::{IdGenerationInput, IdResolver, ResolverConfig};
 use crate::util::markdown_import::{parse_dependency, parse_markdown_file};
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::{IssueValidator, LabelValidator};
@@ -92,15 +94,6 @@ pub(crate) fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
     } else {
         Some(path_str)
     }
-}
-
-struct NewIdInput<'a> {
-    title: &'a str,
-    description: Option<&'a str>,
-    creator: Option<&'a str>,
-    now: DateTime<Utc>,
-    issue_count: usize,
-    id_config: &'a crate::util::id::IdConfig,
 }
 
 enum ImportReferenceResolution {
@@ -476,20 +469,25 @@ pub fn create_issue_impl(
         // 2. Generate ID
         let now = Utc::now();
 
-        let id_input = NewIdInput {
+        let id_input = IdGenerationInput {
             title,
             description: description.as_deref(),
             creator: Some(&config.actor),
-            now,
+            created_at: now,
             issue_count: count,
-            id_config: &config.id_config,
         };
-        let id = generate_new_id(
-            storage,
+        let generated_id = storage.generate_issue_id(
+            &config.id_config,
+            id_input,
             resolved_parent.as_deref(),
-            &id_input,
             args.slug.as_deref(),
+            if args.dry_run {
+                IssueSequenceAllocation::Preview
+            } else {
+                IssueSequenceAllocation::Allocate
+            },
         )?;
+        let id = generated_id.id;
 
         // Set closed_at if status is Closed
         let closed_at = if matches!(status, Status::Closed) {
@@ -589,7 +587,11 @@ pub fn create_issue_impl(
         ));
 
         // 8. Create (atomic)
-        match storage.create_issue(&issue, &config.actor) {
+        match storage.create_issue_with_sequence(
+            &issue,
+            &config.actor,
+            generated_id.sequence_number,
+        ) {
             Ok(()) => return Ok(issue),
             Err(BeadsError::IdCollision { .. }) => {
                 if retries >= 10 {
@@ -599,79 +601,6 @@ pub fn create_issue_impl(
                 std::thread::sleep(std::time::Duration::from_millis(10 * retries));
             }
             Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Generate a new ID, supporting both hierarchical and hash-based formats.
-///
-/// When `slug` is `Some(non-empty)` and the issue is non-hierarchical, the
-/// resulting ID embeds the normalized slug between the prefix and the hash:
-/// `<prefix>-<slug>-<hash>`. Hierarchical (parent-anchored) IDs ignore the
-/// slug — child IDs use the parent ID + child number scheme and have no slug
-/// segment. An empty / non-`Some` slug falls back to the historical
-/// hash-only behavior.
-fn generate_new_id(
-    storage: &SqliteStorage,
-    parent_id: Option<&str>,
-    input: &NewIdInput<'_>,
-    slug: Option<&str>,
-) -> Result<String> {
-    if let Some(parent_id) = parent_id {
-        // Verify parent exists
-        if !storage.id_exists(parent_id)? {
-            return Err(BeadsError::IssueNotFound {
-                id: parent_id.to_string(),
-            });
-        }
-
-        // Find next available child number
-        let next_num = storage.next_child_number(parent_id)?;
-        let candidate = child_id(parent_id, next_num);
-
-        // Double-check the ID doesn't exist (race condition safety)
-        if storage.id_exists(&candidate)? {
-            // Extremely unlikely, but handle by incrementing
-            let mut num = next_num + 1;
-            loop {
-                let alt = child_id(parent_id, num);
-                if !storage.id_exists(&alt)? {
-                    return Ok(alt);
-                }
-                num += 1;
-                if num > next_num.saturating_add(100) {
-                    return Err(BeadsError::validation(
-                        "parent",
-                        "could not find available child ID",
-                    ));
-                }
-            }
-        }
-
-        Ok(candidate)
-    } else {
-        // Standard ID generation for non-child issues
-        let id_gen = IdGenerator::new(input.id_config.clone());
-        match slug {
-            Some(s) if !s.trim().is_empty() => id_gen.generate_with_slug(
-                IdGenerationInput {
-                    title: input.title,
-                    description: input.description,
-                    creator: input.creator,
-                    created_at: input.now,
-                    issue_count: input.issue_count,
-                },
-                s,
-                |id| storage.id_exists(id),
-            ),
-            _ => id_gen.generate(
-                input.title,
-                input.description,
-                input.creator,
-                input.now,
-                input.issue_count,
-                |id| storage.id_exists(id),
-            ),
         }
     }
 }
@@ -983,21 +912,31 @@ fn execute_import(
         let mut created = false;
 
         loop {
-            let id_input = NewIdInput {
+            let id_input = IdGenerationInput {
                 title: &title,
                 description: description.as_deref(),
                 creator: None,
-                now,
+                created_at: now,
                 issue_count: count,
-                id_config: &id_config,
             };
-            let id = match generate_new_id(storage, resolved_parent.as_deref(), &id_input, None) {
+            let generated_id = match storage.generate_issue_id(
+                &id_config,
+                id_input,
+                resolved_parent.as_deref(),
+                None,
+                if args.dry_run {
+                    IssueSequenceAllocation::Preview
+                } else {
+                    IssueSequenceAllocation::Allocate
+                },
+            ) {
                 Ok(id) => id,
                 Err(err) => {
                     eprintln!("✗ Failed to create {}: {err}", create_display_text(&title));
                     break;
                 }
             };
+            let id = generated_id.id.clone();
 
             let priority = if let Some(ref p) = priority_override {
                 match Priority::from_str(p) {
@@ -1132,7 +1071,7 @@ fn execute_import(
                 args.model.as_deref(),
                 super::session_attribution_from_env().as_deref(),
             ));
-            match storage.create_issue(&issue, &actor) {
+            match storage.create_issue_with_sequence(&issue, &actor, generated_id.sequence_number) {
                 Ok(()) => {
                     capacity_warnings.extend(storage.take_capacity_warnings());
                     final_id = id;
@@ -1557,6 +1496,7 @@ mod tests {
                 min_hash_length: 3,
                 max_hash_length: 8,
                 max_collision_prob: 0.25,
+                generation: crate::util::id::IdGenerationConfig::default(),
             },
             default_priority: Priority::MEDIUM,
             default_issue_type: IssueType::Task,

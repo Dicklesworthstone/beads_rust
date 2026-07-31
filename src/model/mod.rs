@@ -8,6 +8,7 @@
 //! - `Comment` - Issue comments
 //! - `Event` - Audit log entries
 
+use crate::util::id::IssueSequenceNumber;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};
@@ -627,6 +628,27 @@ pub struct Issue {
     pub comments: Vec<Comment>,
 }
 
+/// Serialized issue record with optional human-facing sequence metadata.
+///
+/// The issue ID remains the primary identity. `sequence_number` is an
+/// optional repository-local shorthand carried through SQLite and JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueRecord {
+    #[serde(flatten)]
+    pub issue: Issue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<IssueSequenceNumber>,
+}
+
+/// Borrowed form of [`IssueRecord`] used by JSONL export.
+#[derive(Debug, Serialize)]
+pub struct IssueRecordRef<'a> {
+    #[serde(flatten)]
+    pub issue: &'a Issue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<IssueSequenceNumber>,
+}
+
 impl Default for Issue {
     fn default() -> Self {
         Self {
@@ -1053,6 +1075,37 @@ mod tests {
         assert!(!json.contains("content_hash"));
         assert!(!json.contains("design"));
         assert!(!json.contains("labels")); // empty vec skipped
+    }
+
+    #[test]
+    fn issue_record_roundtrips_optional_sequence_number() {
+        let record = IssueRecord {
+            issue: Issue {
+                id: "001-model-record-abc".to_string(),
+                title: "Model record".to_string(),
+                ..Issue::default()
+            },
+            sequence_number: Some(IssueSequenceNumber::new(1).unwrap()),
+        };
+
+        let json = serde_json::to_string(&record).expect("serialize issue record");
+        assert!(json.contains("\"sequence_number\":1"));
+        let decoded: IssueRecord = serde_json::from_str(&json).expect("deserialize issue record");
+        assert_eq!(decoded.issue.id, record.issue.id);
+        assert_eq!(decoded.issue.title, record.issue.title);
+        assert_eq!(decoded.sequence_number, record.sequence_number);
+    }
+
+    #[test]
+    fn issue_record_rejects_non_positive_sequence_numbers() {
+        for value in [0, -1] {
+            let json = format!(
+                r#"{{"id":"bad-sequence","title":"Bad sequence","sequence_number":{value}}}"#
+            );
+            let error = serde_json::from_str::<IssueRecord>(&json)
+                .expect_err("non-positive sequence must fail deserialization");
+            assert!(error.to_string().contains("expected positive integer"));
+        }
     }
 
     #[test]

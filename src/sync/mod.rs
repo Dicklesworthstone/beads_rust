@@ -23,10 +23,10 @@ pub(crate) use path::{
 };
 
 use crate::error::{BeadsError, Result};
-use crate::model::{Comment, Dependency, DependencyType, Issue};
+use crate::model::{Comment, Dependency, DependencyType, Issue, IssueRecord, IssueRecordRef};
 use crate::storage::{EventAttribution, SqliteStorage};
 use crate::sync::history::HistoryConfig;
-use crate::util::id::{IdConfig, IdGenerator, parse_id};
+use crate::util::id::{IdConfig, IdGenerator, IssueSequenceNumber, parse_id};
 use crate::util::progress::{create_progress_bar, create_spinner};
 use crate::validation::{CommentValidator, IssueValidator};
 use chrono::{DateTime, Utc};
@@ -2337,7 +2337,7 @@ pub struct ImportResult {
 }
 
 /// Versioned receipt schema for lossless additive JSONL reconciliation.
-pub const ADDITIVE_RECONCILE_SCHEMA: &str = "br.sync.additive-reconciliation.v2";
+pub const ADDITIVE_RECONCILE_SCHEMA: &str = "br.sync.additive-reconciliation.v3";
 const ADDITIVE_RECONCILE_ALGORITHM: &str =
     "exact-id-additive-create-monotonic-closure-explicit-scalar-v2";
 
@@ -2415,6 +2415,8 @@ pub struct AdditiveDatabaseWitness {
     pub blocked_cache_payload_sha256: String,
     pub child_counter_entries: usize,
     pub child_counter_payload_sha256: String,
+    pub id_counters: AdditiveTableWitness,
+    pub issue_sequences: AdditiveTableWitness,
     pub config: AdditiveTableWitness,
     pub close_metadata: AdditiveTableWitness,
     pub gate_results: AdditiveTableWitness,
@@ -2454,6 +2456,8 @@ pub(crate) struct SyncMergeDatabaseCoreWitness {
     pub blocked_cache_payload_sha256: String,
     pub child_counter_entries: usize,
     pub child_counter_payload_sha256: String,
+    pub id_counters: AdditiveTableWitness,
+    pub issue_sequences: AdditiveTableWitness,
     pub config: AdditiveTableWitness,
     pub close_metadata: AdditiveTableWitness,
     pub gate_results: AdditiveTableWitness,
@@ -2480,6 +2484,8 @@ impl From<AdditiveDatabaseWitness> for SyncMergeDatabaseCoreWitness {
             blocked_cache_payload_sha256: witness.blocked_cache_payload_sha256,
             child_counter_entries: witness.child_counter_entries,
             child_counter_payload_sha256: witness.child_counter_payload_sha256,
+            id_counters: witness.id_counters,
+            issue_sequences: witness.issue_sequences,
             config: witness.config,
             close_metadata: witness.close_metadata,
             gate_results: witness.gate_results,
@@ -2540,6 +2546,9 @@ pub(crate) struct SyncMergeIntent {
     pub kept_issue_witnesses: Vec<SyncMergeKeptIssueWitness>,
     pub deleted_issue_ids: Vec<String>,
     pub note_witnesses: Vec<SyncMergeNoteWitness>,
+    /// Sequence metadata approved for kept rows, sorted by issue ID.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequence_numbers: Vec<(String, IssueSequenceNumber)>,
     pub database_before: AdditiveDatabaseWitness,
 }
 
@@ -3323,6 +3332,7 @@ pub struct AdditiveContentHashRepairWitness {
 /// Complete hash-bound result for additive reconciliation planning/apply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AdditiveReconcileReceipt {
+    /// Receipt schema identifier (`br.sync.additive-reconciliation.v3`).
     pub schema: String,
     pub algorithm: String,
     pub tool_version: String,
@@ -4064,6 +4074,7 @@ struct AdditiveSourceWitness {
 struct AdditiveSourceSnapshot {
     witness: AdditiveSourceWitness,
     issues: BTreeMap<String, Issue>,
+    sequence_numbers: BTreeMap<String, IssueSequenceNumber>,
     record_count: usize,
 }
 
@@ -4615,7 +4626,7 @@ impl<'de> Deserialize<'de> for DuplicateKeyRejectingJson {
     }
 }
 
-fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
+fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<IssueRecord> {
     const ISSUE_FIELDS: &[&str] = &[
         "id",
         "title",
@@ -4657,6 +4668,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         "labels",
         "dependencies",
         "comments",
+        "sequence_number",
         "content_hash",
     ];
     const DEPENDENCY_FIELDS: &[&str] = &[
@@ -4685,9 +4697,10 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
         )));
     }
 
-    let issue: Issue = serde_json::from_value(value.clone()).map_err(|error| {
+    let record: IssueRecord = serde_json::from_value(value.clone()).map_err(|error| {
         BeadsError::Config(format!("Invalid issue at line {line_num}: {error}"))
     })?;
+    let issue = &record.issue;
     if let Some(raw_status) = strict_additive_string_field(object, "status", line_num)?
         && raw_status != issue.status.as_str()
     {
@@ -4812,7 +4825,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
             reject_unknown_additive_fields(comment, COMMENT_FIELDS, "comment", line_num)?;
         }
     }
-    if let Err(errors) = IssueValidator::validate(&issue) {
+    if let Err(errors) = IssueValidator::validate(issue) {
         let details = errors
             .iter()
             .map(ToString::to_string)
@@ -4823,7 +4836,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
             issue.id
         )));
     }
-    Ok(issue)
+    Ok(record)
 }
 
 fn additive_source_snapshot(
@@ -4894,6 +4907,7 @@ fn additive_source_snapshot(
     let mut canonical_hasher = Sha256::new();
     let mut line = String::new();
     let mut issues = BTreeMap::new();
+    let mut sequence_numbers = BTreeMap::new();
     let mut record_count = 0usize;
     let mut line_num = 0usize;
     while reader.read_line(&mut line)? > 0 {
@@ -4912,15 +4926,18 @@ fn additive_source_snapshot(
                     "Invalid UTF-8 in additive reconciliation source at line {line_num}: {error}"
                 ))
             })?;
-            let mut issue = parse_strict_additive_issue(trimmed, line_num)?;
+            let mut record = parse_strict_additive_issue(trimmed, line_num)?;
             record_count = record_count.checked_add(1).ok_or_else(|| {
                 BeadsError::Config(
                     "JSONL record count overflow during additive reconciliation".to_string(),
                 )
             })?;
-            canonicalize_additive_issue_for_storage(&mut issue);
-            let issue_id = issue.id.clone();
-            if issues.insert(issue_id.clone(), issue).is_some() {
+            canonicalize_additive_issue_for_storage(&mut record.issue);
+            let issue_id = record.issue.id.clone();
+            if let Some(sequence_number) = record.sequence_number {
+                sequence_numbers.insert(issue_id.clone(), sequence_number);
+            }
+            if issues.insert(issue_id.clone(), record.issue).is_some() {
                 return Err(BeadsError::Config(format!(
                     "Duplicate issue id '{issue_id}' in additive reconciliation source at line {line_num}"
                 )));
@@ -4970,6 +4987,7 @@ fn additive_source_snapshot(
             mtime: path_after.mtime_witness,
         },
         issues,
+        sequence_numbers,
         record_count,
     })
 }
@@ -5153,6 +5171,15 @@ fn additive_database_witness(
         "SELECT parent_id, last_child FROM child_counters \
          ORDER BY parent_id, last_child",
     )?;
+    let id_counter_rows = additive_raw_rows(
+        storage,
+        "SELECT name, next_value FROM id_counters ORDER BY name, next_value",
+    )?;
+    let issue_sequence_rows = additive_raw_rows(
+        storage,
+        "SELECT issue_id, sequence_number FROM issue_sequences \
+         ORDER BY issue_id, sequence_number",
+    )?;
     let config_rows =
         additive_raw_rows(storage, "SELECT key, value FROM config ORDER BY key, value")?;
     let close_metadata_rows = additive_raw_rows(
@@ -5232,6 +5259,8 @@ fn additive_database_witness(
             &child_counter_rows,
             "database child counters",
         )?,
+        id_counters: additive_table_witness(&id_counter_rows, "database ID counters")?,
+        issue_sequences: additive_table_witness(&issue_sequence_rows, "database issue sequences")?,
         config: additive_table_witness(&config_rows, "database config")?,
         close_metadata: additive_table_witness(&close_metadata_rows, "database close metadata")?,
         gate_results: additive_table_witness(&gate_result_rows, "database legacy gate results")?,
@@ -6819,6 +6848,51 @@ fn plan_additive_reconcile_in_snapshot(
         .collect::<Vec<_>>();
     let expected_blocked_cache = additive_expected_blocked_cache(&expected_issues);
     let expected_child_counters = additive_expected_child_counters(&expected_issues);
+    let expected_issue_ids = expected_issues.keys().cloned().collect::<Vec<_>>();
+    let mut expected_issue_sequences =
+        storage.issue_sequence_numbers_for_ids(&expected_issue_ids)?;
+    for (issue_id, sequence_number) in &source.sequence_numbers {
+        expected_issue_sequences.insert(issue_id.clone(), *sequence_number);
+    }
+    let sequence_metadata_update_planned =
+        source
+            .sequence_numbers
+            .iter()
+            .any(|(issue_id, sequence_number)| {
+                target_before.issue_sequences.rows == 0
+                    || storage.issue_sequence_number(issue_id).ok().flatten()
+                        != Some(*sequence_number)
+            });
+    let expected_issue_sequence_rows = expected_issue_sequences
+        .iter()
+        .map(|(issue_id, sequence_number)| {
+            vec![
+                additive_sqlite_value_witness(SqliteValue::from(issue_id.as_str())),
+                additive_sqlite_value_witness(SqliteValue::from(sequence_number.get())),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut expected_id_counter_rows = additive_raw_rows_by_text_key(
+        additive_raw_rows(
+            storage,
+            "SELECT name, next_value FROM id_counters ORDER BY name",
+        )?,
+        "id_counters",
+    )?;
+    if let Some(maximum_sequence) = source.sequence_numbers.values().max().copied() {
+        let minimum_next_value = maximum_sequence.checked_successor()?;
+        let current_next_value = storage.peek_issue_sequence_number()?;
+        expected_id_counter_rows.insert(
+            "issue".to_string(),
+            vec![
+                additive_sqlite_value_witness(SqliteValue::from("issue")),
+                additive_sqlite_value_witness(SqliteValue::from(
+                    current_next_value.max(minimum_next_value).get(),
+                )),
+            ],
+        );
+    }
+    let expected_id_counter_rows = expected_id_counter_rows.into_values().collect::<Vec<_>>();
     let mut expected_sqlite_sequence = additive_sqlite_sequence(storage)?;
     if let Some(maximum_inserted_comment_id) = mutations
         .iter()
@@ -6908,7 +6982,8 @@ fn plan_additive_reconcile_in_snapshot(
     let bookkeeping_update_planned = metadata_update_planned
         || cache_rebuild_planned
         || dirty_markers_clear_planned != 0
-        || export_hash_updates_planned != 0;
+        || export_hash_updates_planned != 0
+        || sequence_metadata_update_planned;
 
     let mut expected_label_rows = additive_raw_rows(
         storage,
@@ -7048,6 +7123,10 @@ fn plan_additive_reconcile_in_snapshot(
     expected_target_after.child_counter_entries = expected_child_counter_rows.len();
     expected_target_after.child_counter_payload_sha256 =
         additive_sha256(&expected_child_counter_rows, "expected raw child counters")?;
+    expected_target_after.id_counters =
+        additive_table_witness(&expected_id_counter_rows, "expected ID counters")?;
+    expected_target_after.issue_sequences =
+        additive_table_witness(&expected_issue_sequence_rows, "expected issue sequences")?;
     expected_target_after.sqlite_sequence =
         additive_table_witness(&expected_sqlite_sequence_rows, "expected sqlite sequence")?;
     expected_target_after.stored_jsonl_content_hash = Some(source.witness.content_sha256.clone());
@@ -7468,6 +7547,14 @@ pub(crate) fn apply_additive_reconcile(
     plan: &AdditiveReconcilePlan,
     expected_plan_sha256: &str,
 ) -> Result<AdditiveReconcileReceipt> {
+    if plan.receipt.schema != ADDITIVE_RECONCILE_SCHEMA {
+        return Err(BeadsError::SyncConflict {
+            message: format!(
+                "Unsupported additive reconciliation receipt schema '{}'; required '{ADDITIVE_RECONCILE_SCHEMA}'",
+                plan.receipt.schema
+            ),
+        });
+    }
     if expected_plan_sha256 != plan.receipt.plan_sha256 {
         tracing::warn!(
             reviewed_plan_sha256_prefix = %expected_plan_sha256.get(..12).unwrap_or("<invalid>"),
@@ -7541,12 +7628,19 @@ pub(crate) fn apply_additive_reconcile(
                     .to_string(),
             });
         }
+        let sequence_metadata_needed = source_before
+            .sequence_numbers
+            .iter()
+            .any(|(issue_id, sequence_number)| {
+                storage.issue_sequence_number(issue_id).ok().flatten() != Some(*sequence_number)
+            });
         if plan.mutations.is_empty()
             && plan.content_hash_repairs.is_empty()
             && !plan.receipt.metadata_update_planned
             && !plan.receipt.cache_rebuild_planned
             && plan.receipt.export_hash_updates_planned == 0
             && plan.receipt.dirty_markers_clear_planned == 0
+            && !sequence_metadata_needed
         {
             let source_after = additive_source_snapshot(input_path, config)?;
             if !additive_source_matches_receipt(&source_after, &plan.receipt) {
@@ -7616,6 +7710,14 @@ pub(crate) fn apply_additive_reconcile(
                 )));
             }
             storage.insert_new_issue_relations_for_import_in_tx(issue)?;
+        }
+        for (issue_id, sequence_number) in &source_before.sequence_numbers {
+            if storage.id_exists(issue_id)? {
+                storage.record_issue_sequence_number_in_tx(issue_id, *sequence_number)?;
+            } else {
+                let minimum_next_value = sequence_number.checked_successor()?;
+                storage.advance_issue_sequence_counter_in_tx(minimum_next_value)?;
+            }
         }
         #[cfg(test)]
         additive_test_fail_at(AdditiveTestFailPhase::AfterIssueAndRelationWrites)?;
@@ -9319,12 +9421,13 @@ fn populate_export_issue_relations(
 fn write_export_issue_jsonl<W: Write>(
     writer: &mut W,
     issue: &Issue,
+    sequence_number: Option<IssueSequenceNumber>,
     hasher: &mut Sha256,
     buffer: &mut Vec<u8>,
     ctx: &mut ExportContext,
 ) -> Result<bool> {
     buffer.clear();
-    if let Err(err) = serde_json::to_writer(&mut *buffer, issue) {
+    if let Err(err) = write_issue_jsonl_value(&mut *buffer, issue, sequence_number) {
         ctx.handle_error(ExportError::new(
             ExportEntityType::Issue,
             issue.id.clone(),
@@ -9349,6 +9452,20 @@ fn write_export_issue_jsonl<W: Write>(
     hasher.update(b"\n");
 
     Ok(true)
+}
+
+fn write_issue_jsonl_value<W: Write>(
+    writer: &mut W,
+    issue: &Issue,
+    sequence_number: Option<IssueSequenceNumber>,
+) -> std::result::Result<(), serde_json::Error> {
+    serde_json::to_writer(
+        writer,
+        &IssueRecordRef {
+            issue,
+            sequence_number,
+        },
+    )
 }
 
 struct PreparedExportIssue {
@@ -9395,6 +9512,7 @@ const fn should_prepare_export_issues_parallel(issue_count: usize, max_paralleli
 
 fn prepare_export_issue_jsonl(
     issue: &Issue,
+    sequence_number: Option<IssueSequenceNumber>,
     retention_days: Option<u64>,
     export_as_of: &DateTime<Utc>,
 ) -> PreparedExportEntry {
@@ -9403,7 +9521,7 @@ fn prepare_export_issue_jsonl(
     }
 
     let mut jsonl_line = Vec::with_capacity(1024);
-    if let Err(err) = serde_json::to_writer(&mut jsonl_line, issue) {
+    if let Err(err) = write_issue_jsonl_value(&mut jsonl_line, issue, sequence_number) {
         return PreparedExportEntry::Error(ExportError::new(
             ExportEntityType::Issue,
             issue.id.clone(),
@@ -9427,17 +9545,26 @@ fn prepare_export_issue_jsonl(
 
 fn prepare_export_issue_chunk(
     issues: &[Issue],
+    sequence_numbers: &HashMap<String, IssueSequenceNumber>,
     retention_days: Option<u64>,
     export_as_of: &DateTime<Utc>,
 ) -> Vec<PreparedExportEntry> {
     issues
         .iter()
-        .map(|issue| prepare_export_issue_jsonl(issue, retention_days, export_as_of))
+        .map(|issue| {
+            prepare_export_issue_jsonl(
+                issue,
+                sequence_numbers.get(&issue.id).copied(),
+                retention_days,
+                export_as_of,
+            )
+        })
         .collect()
 }
 
 fn prepare_export_issues_jsonl_parallel(
     issues: &[Issue],
+    sequence_numbers: &HashMap<String, IssueSequenceNumber>,
     retention_days: Option<u64>,
     export_as_of: &DateTime<Utc>,
     max_parallelism: usize,
@@ -9445,6 +9572,7 @@ fn prepare_export_issues_jsonl_parallel(
     if !should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
         return Ok(prepare_export_issue_chunk(
             issues,
+            sequence_numbers,
             retention_days,
             export_as_of,
         ));
@@ -9460,7 +9588,12 @@ fn prepare_export_issues_jsonl_parallel(
             handles.push(scope.spawn(move || {
                 (
                     start_index,
-                    prepare_export_issue_chunk(chunk, retention_days, export_as_of),
+                    prepare_export_issue_chunk(
+                        chunk,
+                        sequence_numbers,
+                        retention_days,
+                        export_as_of,
+                    ),
                 )
             }));
         }
@@ -9824,12 +9957,14 @@ fn export_to_jsonl_with_policy_expected_authority(
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
     let max_parallelism = effective_export_parallelism(config);
+    let sequence_numbers = storage.issue_sequence_numbers_for_ids(&export_ids)?;
 
     if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
         let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
         if should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
             let prepared = prepare_export_issues_jsonl_parallel(
                 &issues,
+                &sequence_numbers,
                 config.retention_days,
                 &export_as_of,
                 max_parallelism,
@@ -9857,6 +9992,7 @@ fn export_to_jsonl_with_policy_expected_authority(
                 if !write_export_issue_jsonl(
                     &mut writer,
                     issue,
+                    sequence_numbers.get(&issue.id).copied(),
                     &mut hasher,
                     &mut buffer,
                     &mut ctx,
@@ -9886,6 +10022,7 @@ fn export_to_jsonl_with_policy_expected_authority(
             if should_prepare_export_issues_parallel(issues.len(), max_parallelism) {
                 let prepared = prepare_export_issues_jsonl_parallel(
                     &issues,
+                    &sequence_numbers,
                     config.retention_days,
                     &export_as_of,
                     max_parallelism,
@@ -9914,6 +10051,7 @@ fn export_to_jsonl_with_policy_expected_authority(
                     if !write_export_issue_jsonl(
                         &mut writer,
                         issue,
+                        sequence_numbers.get(&issue.id).copied(),
                         &mut hasher,
                         &mut buffer,
                         &mut ctx,
@@ -10092,6 +10230,7 @@ pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
     let mut skipped_tombstone_ids = Vec::new();
     let mut issue_hashes = Vec::with_capacity(export_ids.len());
     let mut buffer = Vec::with_capacity(1024);
+    let sequence_numbers = storage.issue_sequence_numbers_for_ids(&export_ids)?;
 
     if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
         let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
@@ -10100,7 +10239,14 @@ pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
                 skipped_tombstone_ids.push(issue.id.clone());
                 continue;
             }
-            if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
+            if !write_export_issue_jsonl(
+                writer,
+                issue,
+                sequence_numbers.get(&issue.id).copied(),
+                &mut hasher,
+                &mut buffer,
+                &mut ctx,
+            )? {
                 continue;
             }
 
@@ -10125,7 +10271,14 @@ pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
                     skipped_tombstone_ids.push(issue.id.clone());
                     continue;
                 }
-                if !write_export_issue_jsonl(writer, issue, &mut hasher, &mut buffer, &mut ctx)? {
+                if !write_export_issue_jsonl(
+                    writer,
+                    issue,
+                    sequence_numbers.get(&issue.id).copied(),
+                    &mut hasher,
+                    &mut buffer,
+                    &mut ctx,
+                )? {
                     continue;
                 }
 
@@ -11642,11 +11795,24 @@ pub fn auto_flush(
 ///
 /// Returns an error if the file cannot be read or contains invalid JSON.
 pub fn read_issues_from_jsonl(path: &Path) -> Result<Vec<Issue>> {
+    Ok(read_issue_records_from_jsonl(path)?
+        .into_iter()
+        .map(|record| record.issue)
+        .collect())
+}
+
+/// Read all issue records, including optional sequence metadata, from JSONL.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, contains invalid JSON, repeats
+/// an issue ID, or contains invalid record metadata.
+pub(crate) fn read_issue_records_from_jsonl(path: &Path) -> Result<Vec<IssueRecord>> {
     let file = File::open(path)?;
     path::validate_jsonl_fd_metadata(&file, path)?;
     let file_size = file.metadata().map_or(0, |m| m.len());
     let estimated_count = (file_size / 500) as usize;
-    read_issues_from_jsonl_reader(path, estimated_count, BufReader::new(file))
+    read_issue_records_from_jsonl_reader(path, estimated_count, BufReader::new(file))
 }
 
 pub(crate) fn read_issues_from_jsonl_snapshot(source: &JsonlSourceSnapshot) -> Result<Vec<Issue>> {
@@ -11657,9 +11823,29 @@ pub(crate) fn read_issues_from_jsonl_snapshot(source: &JsonlSourceSnapshot) -> R
 fn read_issues_from_jsonl_reader(
     display_path: &Path,
     estimated_count: usize,
-    mut reader: impl BufRead,
+    reader: impl BufRead,
 ) -> Result<Vec<Issue>> {
-    let mut issues = Vec::with_capacity(estimated_count);
+    Ok(
+        read_issue_records_from_jsonl_reader(display_path, estimated_count, reader)?
+            .into_iter()
+            .map(|record| record.issue)
+            .collect(),
+    )
+}
+
+pub(crate) fn read_issue_records_from_jsonl_snapshot(
+    source: &JsonlSourceSnapshot,
+) -> Result<Vec<IssueRecord>> {
+    let estimated_count = (source.size() / 500) as usize;
+    read_issue_records_from_jsonl_reader(source.display_path(), estimated_count, source.reader())
+}
+
+fn read_issue_records_from_jsonl_reader(
+    display_path: &Path,
+    estimated_count: usize,
+    mut reader: impl BufRead,
+) -> Result<Vec<IssueRecord>> {
+    let mut records = Vec::with_capacity(estimated_count);
     let mut seen_ids = HashSet::with_capacity(estimated_count);
     let mut line = String::new();
     let mut line_num = 0;
@@ -11677,22 +11863,22 @@ fn read_issues_from_jsonl_reader(
             continue;
         }
 
-        let issue: Issue = serde_json::from_str(trimmed).map_err(|e| {
+        let record: IssueRecord = serde_json::from_str(trimmed).map_err(|e| {
             BeadsError::Config(format!("Invalid JSON at line {}: {}", line_num + 1, e))
         })?;
-        if !seen_ids.insert(issue.id.clone()) {
+        if !seen_ids.insert(record.issue.id.clone()) {
             return Err(BeadsError::Config(format!(
                 "Duplicate issue id '{}' in {} at line {}",
-                issue.id,
+                record.issue.id,
                 display_path.display(),
                 line_num + 1
             )));
         }
-        issues.push(issue);
+        records.push(record);
         line_num += 1;
     }
 
-    Ok(issues)
+    Ok(records)
 }
 
 // ===== 4-Phase Collision Detection =====
@@ -11953,13 +12139,13 @@ struct ImportMetadataMaps {
     id_by_hash: HashMap<String, String>,
 }
 
-fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
-    let mut issue: Issue = serde_json::from_str(trimmed)
+fn parse_normalized_import_issue_record(trimmed: &str, line_num: usize) -> Result<IssueRecord> {
+    let mut record: IssueRecord = serde_json::from_str(trimmed)
         .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
 
-    normalize_issue(&mut issue);
+    normalize_issue(&mut record.issue);
 
-    if let Err(errors) = IssueValidator::validate(&issue) {
+    if let Err(errors) = IssueValidator::validate(&record.issue) {
         let details = errors
             .iter()
             .map(ToString::to_string)
@@ -11967,16 +12153,16 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue
             .join(", ");
         return Err(BeadsError::Config(format!(
             "Validation failed for issue {} at line {}: {}",
-            issue.id, line_num, details
+            record.issue.id, line_num, details
         )));
     }
 
-    Ok(issue)
+    Ok(record)
 }
 
-fn for_each_jsonl_import_issue(
+fn for_each_jsonl_import_issue_record(
     source: &JsonlSourceSnapshot,
-    mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
+    mut handle_issue: impl FnMut(usize, IssueRecord) -> Result<()>,
 ) -> Result<()> {
     let mut reader = source.reader();
     let mut line = String::new();
@@ -11986,8 +12172,8 @@ fn for_each_jsonl_import_issue(
         line_num += 1;
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let issue = parse_normalized_import_issue(trimmed, line_num)?;
-            handle_issue(line_num, issue)?;
+            let record = parse_normalized_import_issue_record(trimmed, line_num)?;
+            handle_issue(line_num, record)?;
         }
         line.clear();
     }
@@ -12003,10 +12189,12 @@ fn collect_import_validation_plan(
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
 
-    for_each_jsonl_import_issue(source, |line_num, issue| {
+    for_each_jsonl_import_issue_record(source, |line_num, record| {
+        let issue = record.issue;
         let prefix_mismatch = !config.skip_prefix_validation
             && expected_prefix.is_some_and(|prefix| {
-                !id_matches_expected_prefix(&issue.id, prefix)
+                record.sequence_number.is_none()
+                    && !id_matches_expected_prefix(&issue.id, prefix)
                     && issue.status != crate::model::Status::Tombstone
             });
 
@@ -12181,7 +12369,8 @@ fn scan_import_collision_renames(
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
-    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
+    for_each_jsonl_import_issue_record(source, |_line_num, record| {
+        let mut issue = record.issue;
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -12331,10 +12520,15 @@ fn stream_import_actions_in_tx(
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
 
-    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
+    for_each_jsonl_import_issue_record(source, |_line_num, record| {
+        let mut issue = record.issue;
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
+            if let Some(sequence_number) = record.sequence_number {
+                let minimum_next_value = sequence_number.checked_successor()?;
+                storage.advance_issue_sequence_counter_in_tx(minimum_next_value)?;
+            }
             progress.inc(1);
             return Ok(());
         }
@@ -12362,6 +12556,24 @@ fn stream_import_actions_in_tx(
 
         apply_collision_renames(&mut issue, collision_renames);
         process_import_action(storage, &action, &issue, &mut tx_result)?;
+        if let Some(sequence_number) = record.sequence_number {
+            match &action {
+                CollisionAction::Insert => {
+                    storage.record_issue_sequence_number_in_tx(&issue.id, sequence_number)?;
+                }
+                CollisionAction::Update { existing_id } => {
+                    storage.record_issue_sequence_number_in_tx(existing_id, sequence_number)?;
+                }
+                CollisionAction::Skip { .. } => {
+                    if storage.id_exists(&target_id)? {
+                        storage.record_issue_sequence_number_in_tx(&target_id, sequence_number)?;
+                    } else {
+                        let minimum_next_value = sequence_number.checked_successor()?;
+                        storage.advance_issue_sequence_counter_in_tx(minimum_next_value)?;
+                    }
+                }
+            }
+        }
 
         if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
             storage,
@@ -12899,13 +13111,14 @@ fn for_each_reconcile_classified_row<F>(
     mut handle: F,
 ) -> Result<(usize, usize)>
 where
-    F: FnMut(usize, Issue, &CollisionAction, &str) -> Result<()>,
+    F: FnMut(usize, Issue, Option<IssueSequenceNumber>, &CollisionAction, &str) -> Result<()>,
 {
     let mut seen_external_refs = HashSet::new();
     let mut record_count = 0usize;
     let mut ephemeral_skipped = 0usize;
 
-    for_each_jsonl_import_issue(source, |line_num, mut issue| {
+    for_each_jsonl_import_issue_record(source, |line_num, record| {
+        let mut issue = record.issue;
         record_count += 1;
         if issue.ephemeral {
             ephemeral_skipped += 1;
@@ -12928,7 +13141,7 @@ where
             CollisionResult::NewIssue => issue.id.clone(),
         };
 
-        handle(line_num, issue, &action, &target_id)
+        handle(line_num, issue, record.sequence_number, &action, &target_id)
     })?;
 
     Ok((record_count, ephemeral_skipped))
@@ -12994,7 +13207,7 @@ pub fn plan_sync_reconcile(
         &source,
         config,
         &metadata,
-        |line_num, issue, action, target_id| {
+        |line_num, issue, _sequence_number, action, target_id| {
             let kind = reconcile_kind_for_action(action);
             if matches!(
                 kind,
@@ -13203,7 +13416,7 @@ fn run_reconcile_apply_tx(
         &source,
         config,
         &metadata,
-        |line_num, mut issue, action, target_id| {
+        |line_num, mut issue, sequence_number, action, target_id| {
             let planned = plan.actions.get(action_index).ok_or_else(|| {
                 reconcile_config_error(
                     "JSONL gained rows since the reconcile plan was computed; re-run the command",
@@ -13226,6 +13439,14 @@ fn run_reconcile_apply_tx(
             let computed_hash = crate::util::content_hash(&issue);
             apply_collision_renames(&mut issue, collision_renames);
             process_import_action(storage, action, &issue, &mut import_result)?;
+            if let Some(sequence_number) = sequence_number {
+                if storage.id_exists(target_id)? {
+                    storage.record_issue_sequence_number_in_tx(target_id, sequence_number)?;
+                } else {
+                    let minimum_next_value = sequence_number.checked_successor()?;
+                    storage.advance_issue_sequence_counter_in_tx(minimum_next_value)?;
+                }
+            }
 
             match kind {
                 ReconcileActionKind::Create | ReconcileActionKind::Update => {
@@ -13825,11 +14046,10 @@ pub(crate) fn save_base_snapshot_from_jsonl_snapshot(
     jsonl_dir: &Path,
 ) -> Result<()> {
     ensure_no_conflict_markers_snapshot(source)?;
-    let issues: std::collections::HashMap<String, Issue> = read_issues_from_jsonl_snapshot(source)?
-        .into_iter()
-        .map(|issue| (issue.id.clone(), issue))
-        .collect();
-    save_base_snapshot(&issues, jsonl_dir)
+    write_base_snapshot_atomically(jsonl_dir, |writer| {
+        std::io::copy(&mut source.reader(), writer).map_err(BeadsError::Io)?;
+        Ok(())
+    })
 }
 
 /// Refresh `beads.base.jsonl` with the exact bytes of a finalized flush
@@ -14589,6 +14809,7 @@ mod tests {
             kept_issue_witnesses: Vec::new(),
             deleted_issue_ids: Vec::new(),
             note_witnesses: Vec::new(),
+            sequence_numbers: Vec::new(),
             database_before,
         };
         let committed = SyncMergePendingReceipt::new(
@@ -15802,6 +16023,57 @@ mod tests {
         assert!(!idempotent_plan.receipt().metadata_update_planned);
         assert_eq!(idempotent_plan.receipt().export_hash_updates_planned, 0);
         assert_eq!(idempotent_plan.receipt().dirty_markers_clear_planned, 0);
+    }
+
+    #[test]
+    fn additive_reconcile_preserves_sequence_metadata() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let existing = make_issue_at("bd-sequenced", "Sequenced payload", fixed_time(100));
+        storage.create_issue(&existing, "test-actor").unwrap();
+        let record = IssueRecord {
+            issue: existing.clone(),
+            sequence_number: Some(IssueSequenceNumber::new(23).unwrap()),
+        };
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        apply_reviewed_additive_plan(&mut storage, &jsonl_path, &config, &plan).unwrap();
+
+        assert_eq!(
+            storage.issue_sequence_number(&existing.id).unwrap(),
+            Some(IssueSequenceNumber::new(23).unwrap())
+        );
+        assert_eq!(storage.allocate_issue_sequence_number().unwrap().get(), 24);
+    }
+
+    #[test]
+    fn additive_reconcile_rejects_wrong_receipt_schema_before_apply() {
+        let temp = TempDir::new().unwrap();
+        let (_beads_dir, jsonl_path, config) = additive_test_paths(&temp);
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let incoming = make_issue_at("bd-wrong-schema", "Wrong schema", fixed_time(100));
+        write_additive_issues(&jsonl_path, &[incoming]);
+        let mut plan = plan_additive_reconcile(&storage, &jsonl_path, &config).unwrap();
+        plan.receipt.schema = "br.sync.additive-reconciliation.v2".to_string();
+        plan.receipt.plan_sha256 = additive_plan_sha256(&plan).unwrap();
+        let reviewed_token = plan.receipt.plan_sha256.clone();
+
+        let error =
+            apply_additive_reconcile(&mut storage, &jsonl_path, &config, &plan, &reviewed_token)
+                .expect_err("v2 receipt must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported additive reconciliation receipt schema")
+        );
+        assert!(storage.get_issue("bd-wrong-schema").unwrap().is_none());
     }
 
     #[test]
@@ -19474,9 +19746,17 @@ mod tests {
         issues[2].status = Status::Tombstone;
         issues[2].deleted_at = Some(export_as_of - ttl + chrono::Duration::nanoseconds(1));
 
-        let serial = prepare_export_issue_chunk(&issues, Some(30), &export_as_of);
-        let parallel =
-            prepare_export_issues_jsonl_parallel(&issues, Some(30), &export_as_of, 4).unwrap();
+        let sequence_numbers = HashMap::new();
+        let serial =
+            prepare_export_issue_chunk(&issues, &sequence_numbers, Some(30), &export_as_of);
+        let parallel = prepare_export_issues_jsonl_parallel(
+            &issues,
+            &sequence_numbers,
+            Some(30),
+            &export_as_of,
+            4,
+        )
+        .unwrap();
 
         assert_eq!(serial.len(), parallel.len());
         for (serial_entry, parallel_entry) in serial.iter().zip(&parallel) {

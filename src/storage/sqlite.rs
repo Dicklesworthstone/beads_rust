@@ -16,7 +16,10 @@ use crate::sync::{
     METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, METADATA_SYNC_MERGE_PENDING,
     METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent, SyncMergePendingReceipt,
 };
-use crate::util::id::{normalize_prefix, parse_id};
+use crate::util::id::{
+    IdConfig, IdGenerationInput, IdGenerationMode, IdGenerator, IssueSequenceNumber, child_id,
+    normalize_prefix, parse_id,
+};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use fsqlite::Connection;
@@ -81,6 +84,22 @@ pub(crate) struct BulkDependencyInsert {
     pub(crate) issue_id: String,
     pub(crate) depends_on_id: String,
     pub(crate) dep_type: String,
+}
+
+/// Whether templated ID generation consumes the repository sequence counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSequenceAllocation {
+    /// Consume and permanently advance the counter.
+    Allocate,
+    /// Read the next value without advancing it, for dry-run output.
+    Preview,
+}
+
+/// ID plus optional sequence metadata produced by one generation operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedIssueId {
+    pub id: String,
+    pub sequence_number: Option<IssueSequenceNumber>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6076,6 +6095,21 @@ impl SqliteStorage {
     /// Returns an error if the issue cannot be inserted (e.g. ID collision).
     #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
+        self.create_issue_with_sequence(issue, actor, None)
+    }
+
+    /// Create a new issue and optionally bind a sequence number atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the issue or sequence cannot be inserted.
+    #[allow(clippy::too_many_lines)]
+    pub fn create_issue_with_sequence(
+        &mut self,
+        issue: &Issue,
+        actor: &str,
+        sequence_number: Option<IssueSequenceNumber>,
+    ) -> Result<()> {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
         validate_issue_comments_for_create(issue)?;
         let capacity_policy = self.workflow_capacity_policy.clone();
@@ -6196,6 +6230,10 @@ impl SqliteStorage {
             // GitHub #384 phase 5: creation admits the issue into its
             // initial status; record the admitting attribution.
             Self::record_capacity_occupancy_in_tx(conn, &issue.id, &ctx.actor, &ctx.attribution)?;
+
+            if let Some(sequence_number) = sequence_number {
+                Self::record_issue_sequence_number_on_conn(conn, &issue.id, sequence_number)?;
+            }
 
             // Update child counter if this is a hierarchical ID
             if let Ok(parsed) = parse_id(&issue.id)
@@ -13457,6 +13495,311 @@ impl SqliteStorage {
         Ok(max_child.saturating_add(1))
     }
 
+    /// Generate a top-level or child issue ID under the configured policy.
+    ///
+    /// This is the single storage-aware generation boundary: collision checks,
+    /// child allocation, template validation, title-derived slugs, and sequence
+    /// allocation all use the same database generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing parents, invalid templates, exhausted child
+    /// or sequence counters, collision lookup failures, or saturated IDs.
+    pub fn generate_issue_id(
+        &self,
+        config: &IdConfig,
+        input: IdGenerationInput<'_>,
+        parent_id: Option<&str>,
+        slug: Option<&str>,
+        sequence_allocation: IssueSequenceAllocation,
+    ) -> Result<GeneratedIssueId> {
+        if let Some(parent_id) = parent_id {
+            if !self.id_exists(parent_id)? {
+                return Err(BeadsError::IssueNotFound {
+                    id: parent_id.to_string(),
+                });
+            }
+
+            let next_num = self.next_child_number(parent_id)?;
+            let candidate = child_id(parent_id, next_num);
+            if !self.id_exists(&candidate)? {
+                return Ok(GeneratedIssueId {
+                    id: candidate,
+                    sequence_number: None,
+                });
+            }
+
+            let first_alternate = next_num
+                .checked_add(1)
+                .ok_or_else(|| BeadsError::validation("parent", "child ID counter exhausted"))?;
+            for num in first_alternate..=next_num.saturating_add(100) {
+                let alternate = child_id(parent_id, num);
+                if !self.id_exists(&alternate)? {
+                    return Ok(GeneratedIssueId {
+                        id: alternate,
+                        sequence_number: None,
+                    });
+                }
+            }
+            return Err(BeadsError::validation(
+                "parent",
+                "could not find available child ID",
+            ));
+        }
+
+        let generator = IdGenerator::new(config.clone());
+        if config.generation.mode == IdGenerationMode::Templated {
+            generator.validate_template_config()?;
+            let sequence_number = if config.generation.template.contains("{seq") {
+                Some(match sequence_allocation {
+                    IssueSequenceAllocation::Allocate => self.allocate_issue_sequence_number()?,
+                    IssueSequenceAllocation::Preview => self.peek_issue_sequence_number()?,
+                })
+            } else {
+                None
+            };
+            let effective_slug = slug
+                .filter(|value| !value.trim().is_empty())
+                .or(Some(input.title));
+            let id = generator.generate_with_template(
+                input,
+                sequence_number,
+                effective_slug,
+                |candidate| self.id_exists(candidate),
+            )?;
+            return Ok(GeneratedIssueId {
+                id,
+                sequence_number,
+            });
+        }
+
+        let id = match slug.filter(|value| !value.trim().is_empty()) {
+            Some(slug) => {
+                generator.generate_with_slug(input, slug, |candidate| self.id_exists(candidate))?
+            }
+            None => generator.generate(
+                input.title,
+                input.description,
+                input.creator,
+                input.created_at,
+                input.issue_count,
+                |candidate| self.id_exists(candidate),
+            )?,
+        };
+        Ok(GeneratedIssueId {
+            id,
+            sequence_number: None,
+        })
+    }
+
+    /// Allocate the next monotonic issue sequence number for templated IDs.
+    ///
+    /// The counter is intentionally advanced in its own write transaction.
+    /// Numbers are never reused, even if the later issue creation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the counter cannot be read or advanced.
+    pub fn allocate_issue_sequence_number(&self) -> Result<IssueSequenceNumber> {
+        self.with_connection_write_transaction(|_| {
+            let current = Self::read_issue_sequence_counter_on_conn(&self.conn)?;
+            let next = current.checked_successor()?;
+            Self::write_issue_sequence_counter_on_conn(&self.conn, next)?;
+            Ok(current)
+        })
+    }
+
+    /// Read the next issue sequence number without advancing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the counter cannot be read.
+    pub fn peek_issue_sequence_number(&self) -> Result<IssueSequenceNumber> {
+        match self.conn.query_row_with_params(
+            "SELECT next_value FROM id_counters WHERE name = ?",
+            &[SqliteValue::from("issue")],
+        ) {
+            Ok(row) => {
+                IssueSequenceNumber::new(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(1))
+            }
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => IssueSequenceNumber::new(1),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Bind a sequence number to an issue and advance the local counter past it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence row or counter cannot be written.
+    pub fn record_issue_sequence_number(
+        &self,
+        issue_id: &str,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.record_issue_sequence_number_in_tx(issue_id, sequence_number)
+        })
+    }
+
+    /// Transaction-scoped sequence recording helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence row or counter cannot be written.
+    pub fn record_issue_sequence_number_in_tx(
+        &self,
+        issue_id: &str,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<()> {
+        Self::record_issue_sequence_number_on_conn(&self.conn, issue_id, sequence_number)
+    }
+
+    fn record_issue_sequence_number_on_conn(
+        conn: &Connection,
+        issue_id: &str,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM issue_sequences WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO issue_sequences (issue_id, sequence_number) VALUES (?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(sequence_number.get()),
+            ],
+        )?;
+        let minimum_next_value = sequence_number.checked_successor()?;
+        Self::advance_issue_sequence_counter_on_conn(conn, minimum_next_value)
+    }
+
+    pub(crate) fn advance_issue_sequence_counter_in_tx(
+        &self,
+        minimum_next_value: IssueSequenceNumber,
+    ) -> Result<()> {
+        Self::advance_issue_sequence_counter_on_conn(&self.conn, minimum_next_value)
+    }
+
+    fn advance_issue_sequence_counter_on_conn(
+        conn: &Connection,
+        minimum_next_value: IssueSequenceNumber,
+    ) -> Result<()> {
+        let current = Self::read_issue_sequence_counter_on_conn(conn)?;
+        if current.get() >= minimum_next_value.get() {
+            return Ok(());
+        }
+        Self::write_issue_sequence_counter_on_conn(conn, minimum_next_value)
+    }
+
+    fn read_issue_sequence_counter_on_conn(conn: &Connection) -> Result<IssueSequenceNumber> {
+        let value = match conn.query_row_with_params(
+            "SELECT next_value FROM id_counters WHERE name = ?",
+            &[SqliteValue::from("issue")],
+        ) {
+            Ok(row) => row.get(0).and_then(SqliteValue::as_integer).unwrap_or(1),
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => 1,
+            Err(error) => return Err(error.into()),
+        };
+        IssueSequenceNumber::new(value)
+    }
+
+    fn write_issue_sequence_counter_on_conn(
+        conn: &Connection,
+        next_value: IssueSequenceNumber,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM id_counters WHERE name = ?",
+            &[SqliteValue::from("issue")],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO id_counters (name, next_value) VALUES (?, ?)",
+            &[
+                SqliteValue::from("issue"),
+                SqliteValue::from(next_value.get()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return the sequence number recorded for an issue, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn issue_sequence_number(&self, issue_id: &str) -> Result<Option<IssueSequenceNumber>> {
+        match self.conn.query_row_with_params(
+            "SELECT sequence_number FROM issue_sequences WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        ) {
+            Ok(row) => row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .map(IssueSequenceNumber::new)
+                .transpose(),
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Return sequence numbers for the given issue IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn issue_sequence_numbers_for_ids(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, IssueSequenceNumber>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut result = HashMap::new();
+        for chunk in issue_ids.chunks(450) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT issue_id, sequence_number FROM issue_sequences WHERE issue_id IN ({placeholders})"
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                if let (Some(issue_id), Some(sequence_number)) = (
+                    row.get(0).and_then(SqliteValue::as_text),
+                    row.get(1).and_then(SqliteValue::as_integer),
+                ) {
+                    result.insert(
+                        issue_id.to_string(),
+                        IssueSequenceNumber::new(sequence_number)?,
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Find full IDs assigned the given sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn find_ids_by_sequence(
+        &self,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(
+            "SELECT issue_id FROM issue_sequences WHERE sequence_number = ? ORDER BY issue_id",
+            &[SqliteValue::from(sequence_number.get())],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
     /// Internal helper to update a child counter within a transaction.
     fn update_child_counter_in_tx(
         conn: &Connection,
@@ -17756,6 +18099,9 @@ impl SqliteStorage {
             for issue in kept {
                 storage.upsert_issue_for_import_in_tx(issue)?;
             }
+            for (issue_id, sequence_number) in &intent.sequence_numbers {
+                storage.record_issue_sequence_number_in_tx(issue_id, *sequence_number)?;
+            }
             for issue in kept {
                 storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
                 storage.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
@@ -18649,6 +18995,7 @@ mod tests {
             kept_issue_witnesses,
             deleted_issue_ids,
             note_witnesses,
+            sequence_numbers: Vec::new(),
             database_before: crate::sync::capture_sync_database_witness(storage).unwrap(),
         }
     }
@@ -31164,6 +31511,57 @@ mod tests {
         assert_eq!(
             next_for_child1, 2,
             "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
+        );
+    }
+
+    #[test]
+    fn generate_issue_id_rejects_exhausted_child_counter() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-parent",
+            "Parent Epic",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        let final_child = make_issue(
+            "bd-parent.4294967295",
+            "Final child",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        storage.create_issue(&final_child, "tester").unwrap();
+
+        let error = storage
+            .generate_issue_id(
+                &IdConfig::default(),
+                IdGenerationInput {
+                    title: "Impossible child",
+                    description: None,
+                    creator: Some("tester"),
+                    created_at,
+                    issue_count: 2,
+                },
+                Some(&parent.id),
+                None,
+                IssueSequenceAllocation::Allocate,
+            )
+            .expect_err("the maximum child number must fail instead of looping");
+
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Validation { field, reason }
+                    if field == "parent" && reason == "child ID counter exhausted"
+            ),
+            "unexpected exhausted-child error: {error:?}"
         );
     }
 

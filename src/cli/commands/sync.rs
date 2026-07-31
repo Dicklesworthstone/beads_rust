@@ -31,7 +31,7 @@ use crate::sync::{
     export_temp_path, export_to_jsonl_with_policy_expected_under_authorities,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     get_issue_ids_from_jsonl_snapshot, id_matches_expected_prefix, import_from_jsonl_snapshot,
-    load_base_snapshot_from_source, plan_reviewed_additive_reconcile, plan_sync_reconcile,
+    plan_reviewed_additive_reconcile, plan_sync_reconcile, read_issue_records_from_jsonl_snapshot,
     read_issues_from_jsonl_snapshot, refresh_base_snapshot_from_flushed_jsonl_snapshot,
     refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority,
     require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
@@ -4227,7 +4227,17 @@ fn execute_merge(
     let database_before = capture_sync_database_witness(storage)?;
 
     // 1. Load Base State (ancestor) from the exact retained generation.
-    let base = load_base_snapshot_from_source(base_source.as_ref())?;
+    let mut base = HashMap::new();
+    let mut base_sequences = HashMap::new();
+    if let Some(base_source) = base_source.as_ref() {
+        ensure_no_conflict_markers_snapshot(base_source)?;
+        for record in read_issue_records_from_jsonl_snapshot(base_source)? {
+            if let Some(sequence_number) = record.sequence_number {
+                base_sequences.insert(record.issue.id.clone(), sequence_number);
+            }
+            base.insert(record.issue.id.clone(), record.issue);
+        }
+    }
     debug!(base_count = base.len(), "Loaded base snapshot");
 
     // 2. Load Left State (local DB)
@@ -4248,6 +4258,11 @@ fn execute_merge(
         }
     }
 
+    let left_ids = left_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let left_sequences = storage.issue_sequence_numbers_for_ids(&left_ids)?;
     let mut left = HashMap::new();
     for issue in left_issues {
         left.insert(issue.id.clone(), issue);
@@ -4263,6 +4278,7 @@ fn execute_merge(
 
     // 3. Load Right State (external JSONL)
     let mut right = HashMap::new();
+    let mut right_sequences = HashMap::new();
     if let Some(source) = source {
         // The JSONL parser yields a generic
         // generic "Invalid JSON at line 1" error when the JSONL still
@@ -4271,8 +4287,11 @@ fn execute_merge(
         // would be nonsense, so scan for markers first and surface the
         // helpful error before we try to parse.
         ensure_no_conflict_markers_snapshot(source)?;
-        for issue in read_issues_from_jsonl_snapshot(source)? {
-            right.insert(issue.id.clone(), issue);
+        for record in read_issue_records_from_jsonl_snapshot(source)? {
+            if let Some(sequence_number) = record.sequence_number {
+                right_sequences.insert(record.issue.id.clone(), sequence_number);
+            }
+            right.insert(record.issue.id.clone(), record.issue);
         }
     }
     debug!(right_count = right.len(), "Loaded external state (JSONL)");
@@ -4343,12 +4362,46 @@ fn execute_merge(
         .iter()
         .map(|(issue_id, _)| issue_id.as_str())
         .collect::<HashSet<_>>();
+    let merged_sequence_number = |issue: &crate::model::Issue| match strategy {
+        ConflictResolution::PreferExternal => right_sequences
+            .get(&issue.id)
+            .or_else(|| left_sequences.get(&issue.id))
+            .or_else(|| base_sequences.get(&issue.id))
+            .copied(),
+        ConflictResolution::PreferLocal => left_sequences
+            .get(&issue.id)
+            .or_else(|| right_sequences.get(&issue.id))
+            .or_else(|| base_sequences.get(&issue.id))
+            .copied(),
+        ConflictResolution::PreferNewer | ConflictResolution::Manual => {
+            if context.left.get(&issue.id) == Some(issue) {
+                left_sequences
+                    .get(&issue.id)
+                    .or_else(|| right_sequences.get(&issue.id))
+                    .or_else(|| base_sequences.get(&issue.id))
+                    .copied()
+            } else if context.right.get(&issue.id) == Some(issue) {
+                right_sequences
+                    .get(&issue.id)
+                    .or_else(|| left_sequences.get(&issue.id))
+                    .or_else(|| base_sequences.get(&issue.id))
+                    .copied()
+            } else {
+                base_sequences
+                    .get(&issue.id)
+                    .or_else(|| left_sequences.get(&issue.id))
+                    .or_else(|| right_sequences.get(&issue.id))
+                    .copied()
+            }
+        }
+    };
     let mut changed_kept = report
         .kept
         .iter()
         .filter(|issue| {
             context.left.get(&issue.id) != Some(*issue)
                 || note_target_ids.contains(issue.id.as_str())
+                || merged_sequence_number(issue) != left_sequences.get(&issue.id).copied()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -4356,6 +4409,12 @@ fn execute_merge(
     let changed_kept_ids = changed_kept
         .iter()
         .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let changed_kept_sequences = changed_kept
+        .iter()
+        .filter_map(|issue| {
+            merged_sequence_number(issue).map(|sequence_number| (issue.id.clone(), sequence_number))
+        })
         .collect::<Vec<_>>();
     let kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(&changed_kept)?;
     let mut deleted_ids = report.deleted.clone();
@@ -4395,6 +4454,7 @@ fn execute_merge(
         kept_issue_witnesses,
         deleted_issue_ids: deleted_ids,
         note_witnesses,
+        sequence_numbers: changed_kept_sequences,
         database_before,
     };
     let pending_receipt = storage.apply_sync_merge_atomically(

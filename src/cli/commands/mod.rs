@@ -138,6 +138,16 @@ pub(super) fn resolve_issue_id(
     resolver: &IdResolver,
     input: &str,
 ) -> crate::Result<String> {
+    let trimmed = input.trim();
+    let normalized = crate::util::id::normalize_id(trimmed);
+    if let Some(resolved) = crate::util::id::resolve_exact_or_sequence_fallible(
+        input,
+        &normalized,
+        |id| storage.id_exists(id),
+        |sequence| storage.find_ids_by_sequence(sequence),
+    )? {
+        return Ok(resolved);
+    }
     resolver
         .resolve_fallible(
             input,
@@ -152,13 +162,10 @@ pub(super) fn resolve_issue_ids(
     resolver: &IdResolver,
     inputs: &[String],
 ) -> crate::Result<Vec<String>> {
-    resolver
-        .resolve_all_fallible(
-            inputs,
-            |id| storage.id_exists(id),
-            |hash| storage.find_ids_by_hash(hash),
-        )
-        .map(|resolved| resolved.into_iter().map(|entry| entry.id).collect())
+    inputs
+        .iter()
+        .map(|input| resolve_issue_id(storage, resolver, input))
+        .collect()
 }
 
 pub(super) fn rebuild_blocked_cache_after_partial_mutation(
@@ -603,13 +610,15 @@ mod tests {
     use super::{
         acquire_routed_workspace_write_lock, finalize_batched_blocked_cache_refresh,
         preserve_blocked_cache_on_error, rebuild_blocked_cache_after_partial_mutation,
-        retry_mutation_with_jsonl_recovery, should_attempt_mutation_jsonl_recovery,
+        resolve_issue_id, resolve_issue_ids, retry_mutation_with_jsonl_recovery,
+        should_attempt_mutation_jsonl_recovery,
     };
     use crate::config::{CliOverrides, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
+    use crate::util::id::{IdResolver, IssueSequenceNumber, ResolverConfig};
     use chrono::Utc;
     use fsqlite::Connection;
     use fsqlite_error::FrankenError;
@@ -661,6 +670,67 @@ mod tests {
         };
         let json = serde_json::to_string(&issue).expect("serialize issue");
         fs::write(path, format!("{json}\n")).expect("write jsonl");
+    }
+
+    #[test]
+    fn numeric_resolution_prefers_an_exact_full_id() {
+        let mut storage = SqliteStorage::open_memory().expect("storage");
+        storage
+            .execute_raw(
+                "INSERT INTO issues (id, title, created_at, updated_at) \
+                 VALUES ('001', 'Exact numeric ID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .expect("insert exact numeric fixture");
+        let sequenced = Issue {
+            id: "001-sequenced-abc".to_string(),
+            title: "Sequenced".to_string(),
+            ..Issue::default()
+        };
+        storage
+            .create_issue_with_sequence(
+                &sequenced,
+                "tester",
+                Some(IssueSequenceNumber::new(1).unwrap()),
+            )
+            .expect("create sequenced issue");
+        let resolver = IdResolver::new(ResolverConfig::with_prefix("br"));
+
+        assert_eq!(
+            resolve_issue_id(&storage, &resolver, "001").expect("resolve exact ID"),
+            "001"
+        );
+        assert_eq!(
+            resolve_issue_ids(&storage, &resolver, &["001".to_string()])
+                .expect("resolve exact ID in bulk"),
+            vec!["001".to_string()]
+        );
+    }
+
+    #[test]
+    fn numeric_resolution_reports_duplicate_sequences_as_ambiguous() {
+        let mut storage = SqliteStorage::open_memory().expect("storage");
+        for id in ["007-first-abc", "prefix-007-second-def"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: id.to_string(),
+                ..Issue::default()
+            };
+            storage
+                .create_issue_with_sequence(
+                    &issue,
+                    "tester",
+                    Some(IssueSequenceNumber::new(7).unwrap()),
+                )
+                .expect("create duplicate-sequence fixture");
+        }
+        let resolver = IdResolver::new(ResolverConfig::with_prefix("br"));
+
+        let error = resolve_issue_id(&storage, &resolver, "007").expect_err("ambiguous sequence");
+        assert!(matches!(
+            error,
+            BeadsError::AmbiguousId { partial, matches }
+                if partial == "007" && matches.len() == 2
+        ));
     }
 
     #[test]
