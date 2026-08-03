@@ -6,7 +6,7 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::truncate_title;
+use crate::format::{escape_markup, truncate_title};
 use crate::model::DependencyType;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
@@ -407,6 +407,23 @@ fn dep_list(
     Ok(())
 }
 
+/// Parse markup composed by this module into the `Text` a panel or tree wants.
+///
+/// The Rich renderers below compose style tags into a `String` (`[bold]Depends
+/// on (2):[/]`) and used to hand that string to `Panel::from_text` /
+/// `Text::new`, neither of which parses markup — so every tag reached the
+/// screen as literal text: `bd dep tree` printed
+/// `mk-3mt [green][open][/] fix the thing`.
+///
+/// This is the other half of the rule in `src/output/mod.rs`. Markup authored
+/// here has to be parsed exactly once, on its way into a `Text`; and stored
+/// data interpolated into it must be escaped BEFORE that parse, or the parser
+/// will eat a title reading `fix [bold] rendering` just as surely as
+/// `ctx.print` did. Every call site below escapes its titles for that reason.
+fn parse_composed_markup(content: &str) -> Text {
+    rich_rust::markup::render_or_plain(content)
+}
+
 /// Render dependency list in rich mode with panel and tree-like display
 fn render_dep_list_rich(
     ctx: &OutputContext,
@@ -434,7 +451,10 @@ fn render_dep_list_rich(
             let status_indicator = format_status_indicator(&item.status);
             content.push_str(&format!(
                 "{} {} {} {}\n",
-                prefix, item.depends_on_id, status_indicator, item.title
+                prefix,
+                item.depends_on_id,
+                status_indicator,
+                escape_markup(&item.title)
             ));
         }
     }
@@ -459,26 +479,40 @@ fn render_dep_list_rich(
             let status_indicator = format_status_indicator(&item.status);
             content.push_str(&format!(
                 "{} {} {} {}\n",
-                prefix, item.issue_id, status_indicator, item.title
+                prefix,
+                item.issue_id,
+                status_indicator,
+                escape_markup(&item.title)
             ));
         }
     }
 
-    let panel = Panel::from_text(&content)
+    let rendered = parse_composed_markup(&content);
+    let panel = Panel::from_rich_text(&rendered, ctx.width())
         .title(Text::new(format!("Dependencies for {}", issue_id)))
         .border_style(theme.panel_border.clone());
 
     ctx.render(&panel);
 }
 
-/// Format status indicator with appropriate styling hints
+/// Format status indicator with appropriate styling hints.
+///
+/// Returns MARKUP, for a sink that parses it (see [`parse_composed_markup`]).
+/// The style tags are real markup; the visible `[open]` label is literal text
+/// that merely looks like a tag, so its bracket is escaped — unescaped, the
+/// parser reads `[open]` as a style name, finds nothing, and drops the label
+/// entirely, which is how `bd dep list` came to show a bare colour and no
+/// status at all.
 fn format_status_indicator(status: &str) -> String {
+    let label = |text: &str| escape_markup(&format!("[{text}]"));
     match status {
-        "open" => "[green][open][/]".to_string(),
-        "in_progress" => "[yellow][in-progress][/]".to_string(),
-        "closed" => "[dim][closed] ✓[/]".to_string(),
-        "blocked" => "[red][blocked][/]".to_string(),
-        _ => format!("[{}]", status),
+        "open" => format!("[green]{}[/]", label("open")),
+        "in_progress" => format!("[yellow]{}[/]", label("in-progress")),
+        "closed" => format!("[dim]{} ✓[/]", label("closed")),
+        "blocked" => format!("[red]{}[/]", label("blocked")),
+        // An unrecognised status is still stored data: escape it rather than
+        // let an unexpected value silently erase its own label.
+        other => label(other),
     }
 }
 
@@ -717,45 +751,8 @@ fn build_tree_node_rich(
     node: &TreeNode,
     all_nodes: &[TreeNode],
 ) -> rich_rust::renderables::TreeNode {
-    // Format the node label with status styling
-    let status_style = match node.status.as_str() {
-        "open" => "[green]",
-        "in_progress" => "[yellow]",
-        "closed" => "[dim]",
-        "blocked" => "[red]",
-        _ => "[white]",
-    };
-    let status_close = "[/]";
-
-    let status_indicator = match node.status.as_str() {
-        "closed" => " ✓",
-        "blocked" => " ⚠",
-        _ => "",
-    };
-
-    let label = if node.truncated {
-        format!(
-            "{} {}[{}]{}{} {} [dim](truncated)[/]",
-            node.id,
-            status_style,
-            node.status,
-            status_close,
-            status_indicator,
-            truncate_title(&node.title, 35)
-        )
-    } else {
-        format!(
-            "{} {}[{}]{}{} {}",
-            node.id,
-            status_style,
-            node.status,
-            status_close,
-            status_indicator,
-            truncate_title(&node.title, 40)
-        )
-    };
-
-    let mut tree_node = rich_rust::renderables::TreeNode::new(Text::new(label));
+    let mut tree_node =
+        rich_rust::renderables::TreeNode::new(parse_composed_markup(&tree_node_label(node)));
 
     // Find and add children (nodes whose parent_id matches this node's id)
     for child in all_nodes
@@ -767,6 +764,55 @@ fn build_tree_node_rich(
     }
 
     tree_node
+}
+
+/// Compose one tree node's label as MARKUP, for [`parse_composed_markup`].
+///
+/// Separate from [`build_tree_node_rich`] so a test can see the string: the
+/// rich `TreeNode` keeps its label private, and Rich mode is unreachable from
+/// an e2e test (no tty), so this is the only seam where the label's handling
+/// of stored text can be asserted.
+fn tree_node_label(node: &TreeNode) -> String {
+    // Format the node label with status styling. `status_style` is markup;
+    // the `[open]`-style label it wraps is literal text and is escaped, for
+    // the same reason as in `format_status_indicator`.
+    let status_style = match node.status.as_str() {
+        "open" => "[green]",
+        "in_progress" => "[yellow]",
+        "closed" => "[dim]",
+        "blocked" => "[red]",
+        _ => "[white]",
+    };
+    let status_close = "[/]";
+    let status_label = escape_markup(&format!("[{}]", node.status));
+
+    let status_indicator = match node.status.as_str() {
+        "closed" => " ✓",
+        "blocked" => " ⚠",
+        _ => "",
+    };
+
+    if node.truncated {
+        format!(
+            "{} {}{}{}{} {} [dim](truncated)[/]",
+            node.id,
+            status_style,
+            status_label,
+            status_close,
+            status_indicator,
+            escape_markup(&truncate_title(&node.title, 35))
+        )
+    } else {
+        format!(
+            "{} {}{}{}{} {}",
+            node.id,
+            status_style,
+            status_label,
+            status_close,
+            status_indicator,
+            escape_markup(&truncate_title(&node.title, 40))
+        )
+    }
 }
 
 fn parse_external_dep_id(dep_id: &str) -> Option<(String, String)> {
@@ -829,8 +875,15 @@ fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize)
     ));
 
     for (i, cycle) in cycles.iter().enumerate() {
-        // Format cycle path with arrows
-        let cycle_path = cycle.join(" [red]→[/] ");
+        // Format cycle path with arrows. The IDs are escaped like any other
+        // stored value: a prefix is validated today, but the escape costs
+        // nothing and this line is one interpolation away from carrying a
+        // title.
+        let cycle_path = cycle
+            .iter()
+            .map(|id| escape_markup(id))
+            .collect::<Vec<_>>()
+            .join(" [red]→[/] ");
         content.push_str(&format!("[bold]Cycle {}:[/]\n", i + 1));
         content.push_str(&format!("  [red]{}[/]\n", cycle_path));
 
@@ -845,7 +898,8 @@ fn render_cycles_rich(ctx: &OutputContext, cycles: &[Vec<String>], count: usize)
 
     content.push_str("\n[dim]Suggestion: Remove one dependency from each cycle to break it.[/]");
 
-    let panel = Panel::from_text(&content)
+    let rendered = parse_composed_markup(&content);
+    let panel = Panel::from_rich_text(&rendered, ctx.width())
         .title(Text::new("Dependency Cycles"))
         .border_style(theme.error.clone());
 
@@ -1319,5 +1373,71 @@ mod tests {
         assert!(matches!(DepDirection::Up, DepDirection::Up));
         assert!(matches!(DepDirection::Both, DepDirection::Both));
         info!("test_dep_direction_variants: assertions passed");
+    }
+}
+
+/// Rich-mode markup handling for the dependency views.
+///
+/// These live in unit tests rather than in `tests/e2e_markup_escaping.rs`
+/// because Rich mode requires a tty: an e2e test always gets Plain, so the
+/// Rich composition is exactly the part no end-to-end assertion can see.
+#[cfg(test)]
+mod rich_markup_tests {
+    use super::{TreeNode, format_status_indicator, parse_composed_markup, tree_node_label};
+
+    fn node(status: &str, title: &str) -> TreeNode {
+        TreeNode {
+            id: "bd-1".to_string(),
+            title: title.to_string(),
+            depth: 0,
+            parent_id: None,
+            priority: 2,
+            status: status.to_string(),
+            truncated: false,
+        }
+    }
+
+    /// The status label is meant to be READ as `[open]`, brackets included,
+    /// while the colour around it is meant to be a style. Rendered, exactly
+    /// one of those survives as text.
+    #[test]
+    fn status_indicator_renders_its_bracketed_label_as_visible_text() {
+        for (status, expected) in [
+            ("open", "[open]"),
+            ("in_progress", "[in-progress]"),
+            ("closed", "[closed] ✓"),
+            ("blocked", "[blocked]"),
+            // An unknown status must still show its own name, not vanish.
+            ("archived", "[archived]"),
+        ] {
+            let rendered = parse_composed_markup(&format_status_indicator(status));
+            assert_eq!(
+                rendered.plain(),
+                expected,
+                "status {status:?} lost its label"
+            );
+        }
+    }
+
+    /// A title is stored text: it reaches the tree verbatim, brackets and all,
+    /// and it cannot inject styling into the line.
+    #[test]
+    fn tree_label_renders_a_bracketed_title_verbatim() {
+        let title = "esc [bold] [probe] x";
+        let rendered = parse_composed_markup(&tree_node_label(&node("open", title)));
+        assert_eq!(rendered.plain(), format!("bd-1 [open] {title}"));
+    }
+
+    /// The truncation marker is this module's own annotation, so it renders as
+    /// text with no brackets of its own — and the title still survives.
+    #[test]
+    fn truncated_tree_label_keeps_its_title_and_marker() {
+        let mut n = node("blocked", "esc [bold] x");
+        n.truncated = true;
+        let rendered = parse_composed_markup(&tree_node_label(&n));
+        assert_eq!(
+            rendered.plain(),
+            "bd-1 [blocked] ⚠ esc [bold] x (truncated)"
+        );
     }
 }
