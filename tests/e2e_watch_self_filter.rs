@@ -148,7 +148,12 @@ fn watch_run_mode(prefix: &str, include_self: bool, mode: Mode) -> (String, Stri
     std::thread::sleep(Duration::from_millis(1200));
 
     let self_id = create_as(path, agent, prefix, "bead created by the watcher itself");
-    let foreign_id = create_as(path, "someone-else", prefix, "bead created by another agent");
+    let foreign_id = create_as(
+        path,
+        "someone-else",
+        prefix,
+        "bead created by another agent",
+    );
 
     let mut stdout = String::new();
     child

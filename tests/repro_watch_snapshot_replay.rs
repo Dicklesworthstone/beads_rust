@@ -67,7 +67,6 @@ fn can_deny_own_read(path: &Path) -> bool {
     denied
 }
 
-
 struct Fixture {
     temp: tempfile::TempDir,
     prefix: String,
@@ -184,14 +183,8 @@ fn transient_snapshot_failure_does_not_replay_the_prefix() {
         return;
     }
 
-    let (stdout, stderr) = fx.watch_across_db_outage(&[
-        "--debounce",
-        "0",
-        "--debounce-max",
-        "0",
-        "--format",
-        "json",
-    ]);
+    let (stdout, stderr) =
+        fx.watch_across_db_outage(&["--debounce", "0", "--debounce-max", "0", "--format", "json"]);
 
     // Positive control: prove the outage actually hit the snapshot.
     assert!(
