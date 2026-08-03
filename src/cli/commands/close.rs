@@ -2,13 +2,14 @@
 
 use crate::cli::CloseArgs as CliCloseArgs;
 use crate::config;
-use crate::error::{BeadsError, Result};
+use crate::error::{BeadsError, Result, SkipReason, SkippedTarget, skip_context, skip_hint};
 use crate::model::Status;
 use crate::output::OutputContext;
 use crate::storage::IssueUpdate;
 use crate::util::id::{IdResolver, find_matching_ids};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 /// Internal arguments for the close command.
 #[derive(Debug, Clone, Default)]
@@ -87,10 +88,30 @@ pub struct ClosedIssue {
     pub close_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// An issue the command was asked to close and did not.
+///
+/// Carries the machine-readable `reason_code` alongside the human
+/// `reason` so a caller never has to parse the sentence: `blocked`,
+/// `already_closed`, `tombstoned`, `not_found` (see
+/// [`crate::error::SkipReason::code`]).
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SkippedIssue {
     pub id: String,
     pub reason: String,
+    pub reason_code: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub blockers: Vec<String>,
+}
+
+impl From<&SkippedTarget> for SkippedIssue {
+    fn from(target: &SkippedTarget) -> Self {
+        Self {
+            id: target.id.clone(),
+            reason: target.reason.describe(),
+            reason_code: target.reason.code().to_string(),
+            blockers: target.reason.blockers().to_vec(),
+        }
+    }
 }
 
 /// Execute the close command.
@@ -178,7 +199,10 @@ pub fn execute_with_args(
     };
 
     let mut closed_issues: Vec<ClosedIssue> = Vec::new();
-    let mut skipped_issues: Vec<SkippedIssue> = Vec::new();
+    // Skips are tracked as typed reasons, not as pre-rendered sentences:
+    // every surface (warning line, hint, JSON context) is rendered from
+    // these, which is what makes it impossible for them to disagree.
+    let mut skipped: Vec<SkippedTarget> = Vec::new();
 
     for resolved in &resolved_ids {
         let id = &resolved.id;
@@ -186,20 +210,19 @@ pub fn execute_with_args(
 
         // Get current issue
         let Some(issue) = storage.get_issue(id)? else {
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: "issue not found".to_string(),
-            });
+            skipped.push(SkippedTarget::new(id.clone(), SkipReason::NotFound));
             continue;
         };
 
         // Check if already closed
         if issue.status.is_terminal() {
             crate::cli::commands::update::warn_redundant_status(id, &issue.status, storage);
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason: format!("already {}", issue.status.as_str()),
-            });
+            skipped.push(SkippedTarget::new(
+                id.clone(),
+                SkipReason::AlreadyTerminal {
+                    status: issue.status.clone(),
+                },
+            ));
             continue;
         }
 
@@ -215,15 +238,12 @@ pub fn execute_with_args(
                 blocker_ids = storage.get_dependencies(id)?;
             }
             tracing::debug!(blocked_by = ?blocker_ids, "Issue is blocked");
-            let reason = if blocker_ids.is_empty() {
-                "blocked by dependencies".to_string()
-            } else {
-                format!("blocked by: {}", blocker_ids.join(", "))
-            };
-            skipped_issues.push(SkippedIssue {
-                id: id.clone(),
-                reason,
-            });
+            skipped.push(SkippedTarget::new(
+                id.clone(),
+                SkipReason::Blocked {
+                    blockers: blocker_ids,
+                },
+            ));
             continue;
         }
 
@@ -291,7 +311,7 @@ pub fn execute_with_args(
 
     // Track counts before output (which may move the vecs)
     let closed_count = closed_issues.len();
-    let skipped_count = skipped_issues.len();
+    let skipped_issues: Vec<SkippedIssue> = skipped.iter().map(SkippedIssue::from).collect();
 
     // Output
     if use_json {
@@ -320,8 +340,8 @@ pub fn execute_with_args(
                 }
                 ctx.success(&msg);
             }
-            for skipped in &skipped_issues {
-                ctx.warning(&format!("Skipped {}: {}", skipped.id, skipped.reason));
+            for skip in &skipped {
+                ctx.warning(&format!("Skipped {}: {}", skip.id, skip.reason.describe()));
             }
             if !unblocked_issues.is_empty() {
                 ctx.newline();
@@ -337,14 +357,83 @@ pub fn execute_with_args(
 
     storage_ctx.flush_no_db_if_dirty()?;
 
-    // Return non-zero exit code if all issues were skipped (none actually closed)
-    if closed_count == 0 && skipped_count > 0 {
-        return Err(BeadsError::NothingToDo {
-            reason: format!("all {skipped_count} issue(s) skipped"),
+    outcome(closed_count, skipped, use_json)
+}
+
+/// Turn what happened into an exit status, telling the truth about it.
+///
+/// The exit code answers "IS THE WORLD IN THE STATE I ASKED FOR?" rather
+/// than "did bd perform a mutation":
+///
+/// * every requested id closed, or was already closed → success. An
+///   already-closed bead satisfies `br close` the way an existing
+///   directory satisfies `mkdir -p`, which is what makes the command
+///   safe in the retry loops agents actually write. The skip is still
+///   reported — idempotent is not the same as silent.
+/// * nothing closed and something is still outstanding → `NOTHING_TO_DO`.
+/// * some closed and something is still outstanding → `PARTIALLY_CLOSED`.
+///   The batch is deliberately NOT refused up front the way
+///   `br update`'s destructive-shrink guard refuses one: a skipped close
+///   destroys nothing (`br reopen` undoes a close), and blocked-ness is
+///   recomputed per id as the batch proceeds, so `br close <blocker>
+///   <blocked>` legitimately closes BOTH — a preflight would refuse a
+///   batch that in fact succeeds completely.
+fn outcome(closed_count: usize, skipped: Vec<SkippedTarget>, use_json: bool) -> Result<()> {
+    if skipped.is_empty() {
+        return Ok(());
+    }
+
+    let outstanding = skipped.iter().any(|skip| !skip.reason.end_state_reached());
+
+    if outstanding {
+        if closed_count == 0 {
+            return Err(BeadsError::NothingToDo { skipped });
+        }
+        return Err(BeadsError::PartiallyClosed {
+            closed: closed_count,
+            skipped,
         });
     }
 
+    // Success, but something was skipped. There is no error envelope on
+    // this path, so in JSON mode the skip would otherwise be invisible on
+    // every machine-readable surface (stdout carries the bd-conformant
+    // array of CLOSED issues only). Report it as a notice, built from the
+    // same values the error envelope would have used.
+    if use_json {
+        report_satisfied_skips(closed_count, &skipped);
+    }
     Ok(())
+}
+
+/// Print the machine-readable notice for skips that did not change the
+/// outcome, on the success path, to stderr.
+///
+/// Keyed `notice` rather than `error`: bead `beads1-3c8h4` was partly
+/// about a command printing an object literally keyed "error" and
+/// exiting 0, and the fix must not reintroduce that ambiguity from the
+/// other direction.
+fn report_satisfied_skips(closed_count: usize, skipped: &[SkippedTarget]) {
+    let total = closed_count + skipped.len();
+    let summary = format!(
+        "closed {closed_count} of {total}, {} already in the requested state",
+        skipped.len()
+    );
+    let notice = json!({
+        "notice": {
+            "code": "ALREADY_SATISFIED",
+            "message": format!(
+                "{total} issue(s) are closed as requested; {} needed no change",
+                skipped.len()
+            ),
+            "hint": skip_hint(skipped),
+            "context": skip_context(closed_count, skipped, &summary),
+        }
+    });
+    eprintln!(
+        "{}",
+        serde_json::to_string_pretty(&notice).unwrap_or_else(|_| notice.to_string())
+    );
 }
 
 #[cfg(test)]
@@ -411,6 +500,8 @@ mod tests {
             skipped: vec![SkippedIssue {
                 id: "bd-456".to_string(),
                 reason: "already closed".to_string(),
+                reason_code: "already_closed".to_string(),
+                ..Default::default()
             }],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -440,6 +531,8 @@ mod tests {
             skipped: vec![SkippedIssue {
                 id: "bd-c".to_string(),
                 reason: "blocked by: bd-d".to_string(),
+                reason_code: "blocked".to_string(),
+                blockers: vec!["bd-d".to_string()],
             }],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -496,6 +589,8 @@ mod tests {
             skipped: vec![SkippedIssue {
                 id: "bd-x".to_string(),
                 reason: "not found".to_string(),
+                reason_code: "not_found".to_string(),
+                ..Default::default()
             }],
             unblocked: vec![],
         };
@@ -562,6 +657,8 @@ mod tests {
         let skipped = SkippedIssue {
             id: "bd-skip".to_string(),
             reason: "already closed".to_string(),
+            reason_code: "already_closed".to_string(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&skipped).unwrap();
         assert!(json.contains("\"id\":\"bd-skip\""));
@@ -573,6 +670,8 @@ mod tests {
         let skipped = SkippedIssue {
             id: "bd-blocked".to_string(),
             reason: "blocked by: bd-dep1, bd-dep2".to_string(),
+            reason_code: "blocked".to_string(),
+            blockers: vec!["bd-dep1".to_string(), "bd-dep2".to_string()],
         };
         let json = serde_json::to_string(&skipped).unwrap();
         let parsed: SkippedIssue = serde_json::from_str(&json).unwrap();
@@ -639,10 +738,14 @@ mod tests {
                 SkippedIssue {
                     id: "bd-3".to_string(),
                     reason: "issue not found".to_string(),
+                    reason_code: "not_found".to_string(),
+                    ..Default::default()
                 },
                 SkippedIssue {
                     id: "bd-4".to_string(),
                     reason: "already tombstone".to_string(),
+                    reason_code: "tombstoned".to_string(),
+                    ..Default::default()
                 },
             ],
         };
