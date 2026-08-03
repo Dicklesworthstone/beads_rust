@@ -1,6 +1,13 @@
 //! Search command implementation.
 //!
-//! Classic bd-style LIKE search across title/description/id with list-like filters.
+//! Classic LIKE search across title/description/id — and comment
+//! text — with list-like filters.
+//!
+//! Comments are in scope deliberately: they are where attributed history
+//! lives, and history that cannot be found again is not much better than
+//! history that was never written. A hit sourced from a comment is marked
+//! as such (`comment_match` in JSON, a snippet line in text) so a reader
+//! never has to wonder why an issue came back.
 
 use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format};
 use crate::config;
@@ -8,7 +15,7 @@ use crate::error::{BeadsError, Result};
 use crate::format::{
     IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
-use crate::model::{IssueType, Priority, Status};
+use crate::model::{Comment, IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
 use chrono::Utc;
@@ -83,15 +90,27 @@ pub fn execute(
         (HashMap::new(), HashMap::new())
     };
 
+    // Which hits matched on comment text, and the newest matching comment
+    // for each — used to mark the hit and to show a snippet, in every
+    // output mode (a comment-only match with no explanation would look
+    // like a bug).
+    let comment_matches = storage.find_matching_comments(query, &issue_ids)?;
+    let comment_stats = storage.comment_stats_for_issues(&issue_ids)?;
+
     let mut issues_with_counts: Vec<IssueWithCounts> = issues
         .into_iter()
         .map(|issue| {
             let dependency_count = *dep_counts.get(&issue.id).unwrap_or(&0);
             let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+            let stats = comment_stats.get(&issue.id).copied().unwrap_or_default();
+            let comment_match = comment_matches.contains_key(&issue.id);
             IssueWithCounts {
                 issue,
                 dependency_count,
                 dependent_count,
+                comment_count: stats.count,
+                last_comment_at: stats.last_comment_at,
+                comment_match,
             }
         })
         .collect();
@@ -140,7 +159,7 @@ pub fn execute(
             .iter()
             .map(|iwc| iwc.issue.clone())
             .collect();
-        let context_snippets = build_context_snippets(&issues, query);
+        let context_snippets = build_context_snippets(&issues, query, &comment_matches);
         let show_context = !context_snippets.is_empty();
         let columns = IssueTableColumns {
             id: true,
@@ -180,12 +199,38 @@ pub fn execute(
     for iwc in &issues_with_counts {
         let line = format_issue_line_with(&iwc.issue, format_options);
         ctx.print(&line);
+        // A comment-sourced hit gets an extra indented line naming the
+        // author and quoting around the match, rather than a bare issue
+        // line whose connection to the query is invisible.
+        if let Some(comment) = comment_matches.get(&iwc.issue.id) {
+            ctx.print(&format_comment_match_line(comment, query));
+        }
     }
 
     Ok(())
 }
 
-fn build_context_snippets(issues: &[crate::model::Issue], query: &str) -> HashMap<String, String> {
+/// Render the "why did this match?" line for a comment-sourced hit.
+fn format_comment_match_line(comment: &Comment, query: &str) -> String {
+    let snippet = build_highlight_regex(query)
+        .and_then(|regex| regex.find(&comment.body).map(|mat| (regex, mat.start(), mat.end())))
+        .map_or_else(
+            || first_line(&comment.body),
+            |(_, start, end)| snippet_around_match(&comment.body, start, end, 40),
+        );
+    format!("    comment [{}]: {}", comment.author, snippet)
+}
+
+/// First line of a body, for when the match position is unavailable.
+fn first_line(body: &str) -> String {
+    body.lines().next().unwrap_or("").trim().to_string()
+}
+
+fn build_context_snippets(
+    issues: &[crate::model::Issue],
+    query: &str,
+    comment_matches: &HashMap<String, Comment>,
+) -> HashMap<String, String> {
     let Some(regex) = build_highlight_regex(query) else {
         return HashMap::new();
     };
@@ -199,6 +244,21 @@ fn build_context_snippets(issues: &[crate::model::Issue], query: &str) -> HashMa
                     snippets.insert(issue.id.clone(), snippet);
                     continue;
                 }
+            }
+        }
+
+        // Comment matches come after description: if both matched, the
+        // issue's own text is the more useful context. But a comment-only
+        // match must still explain itself, and saying WHO wrote it is part
+        // of that — attribution is the whole point of comments.
+        if let Some(comment) = comment_matches.get(&issue.id) {
+            let snippet = regex.find(&comment.body).map_or_else(
+                || first_line(&comment.body),
+                |mat| snippet_around_match(&comment.body, mat.start(), mat.end(), 32),
+            );
+            if !snippet.is_empty() {
+                snippets.insert(issue.id.clone(), format!("comment [{}]: {snippet}", comment.author));
+                continue;
             }
         }
 
@@ -566,11 +626,13 @@ mod tests {
                 issue: issue_b,
                 dependency_count: 0,
                 dependent_count: 0,
+                ..Default::default()
             },
             IssueWithCounts {
                 issue: issue_a,
                 dependency_count: 0,
                 dependent_count: 0,
+                ..Default::default()
             },
         ];
 
@@ -593,11 +655,13 @@ mod tests {
                 issue: issue_old,
                 dependency_count: 0,
                 dependent_count: 0,
+                ..Default::default()
             },
             IssueWithCounts {
                 issue: issue_new,
                 dependency_count: 0,
                 dependent_count: 0,
+                ..Default::default()
             },
         ];
 

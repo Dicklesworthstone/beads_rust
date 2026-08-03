@@ -3,6 +3,7 @@ pub mod audit;
 pub mod blocked;
 pub mod changelog;
 pub mod close;
+pub mod comments;
 pub mod completions;
 pub mod config;
 pub mod count;

@@ -19,4 +19,6 @@ pub mod schema;
 pub mod sqlite;
 pub mod watchers;
 
-pub use sqlite::{IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage};
+pub use sqlite::{
+    CommentStats, IssueUpdate, ListFilters, ReadyFilters, ReadySortPolicy, SqliteStorage,
+};

@@ -8,7 +8,7 @@
 
 use crate::model::{Issue, IssueType, Priority, Status};
 use crate::util::time::format_age_compact;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crossterm::style::Stylize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -263,6 +263,34 @@ pub fn format_issue_age_field(issue: &Issue) -> String {
     }
 }
 
+/// Format the compact comment indicator for a listing: how much history
+/// an issue has, and how fresh it is.
+///
+/// Returns `None` when there are no comments — a listing says nothing at
+/// all about issues without history rather than printing a zero on every
+/// row. Never contains any comment text: `bd list` reports that history
+/// exists, `bd comments <id>` shows it.
+///
+/// Shape is `2·3h`: two comments, newest written three hours ago, reusing
+/// the same compact age units as the Age field so a reader learns one
+/// vocabulary rather than two.
+#[must_use]
+pub fn format_comment_marker(
+    count: usize,
+    last_comment_at: Option<DateTime<Utc>>,
+) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    Some(last_comment_at.map_or_else(
+        || count.to_string(),
+        |at| {
+            let age = format_age_compact((Utc::now() - at).num_seconds().max(0));
+            format!("{count}·{age}")
+        },
+    ))
+}
+
 /// Format a single-line issue summary with options.
 ///
 /// Format: `{icon} {id} [● {priority}] [{type}] {age} - {title}`
@@ -271,12 +299,29 @@ pub fn format_issue_age_field(issue: &Issue) -> String {
 /// titles line up across rows.
 #[must_use]
 pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> String {
+    format_issue_line_with_comments(issue, options, None)
+}
+
+/// Format a single-line issue summary, optionally with a trailing comment
+/// indicator (see [`format_comment_marker`]).
+///
+/// The marker goes at the END of the line, after the title, for two
+/// reasons: the existing prefix columns keep their alignment untouched, and
+/// its width is charged to the title budget so a long title is truncated
+/// rather than pushing the line past the terminal width.
+#[must_use]
+pub fn format_issue_line_with_comments(
+    issue: &Issue,
+    options: TextFormatOptions,
+    comment_marker: Option<&str>,
+) -> String {
     let status_icon_plain = format_status_icon(&issue.status);
     // Account for the bullet in priority badge: [● P2]
     let priority_badge_plain = format!("[● {}]", format_priority(&issue.priority));
     let type_badge_plain = format_type_badge(&issue.issue_type);
     let age_plain = format_issue_age_field(issue);
     let age_padded = format!("{age_plain:<AGE_FIELD_WIDTH$}");
+    let marker_suffix = comment_marker.map_or_else(String::new, |marker| format!("  [{marker}]"));
 
     // Add 3 for " - " separator between age field and title
     let prefix_len = visible_len(status_icon_plain)
@@ -288,7 +333,8 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
         + visible_len(&type_badge_plain)
         + 1
         + visible_len(&age_padded)
-        + 3; // " - " separator
+        + 3 // " - " separator
+        + visible_len(&marker_suffix);
 
     let title = if options.wrap {
         issue.title.clone()
@@ -308,8 +354,14 @@ pub fn format_issue_line_with(issue: &Issue, options: TextFormatOptions) -> Stri
         age_padded
     };
 
+    let marker_suffix = if options.use_color && !marker_suffix.is_empty() {
+        marker_suffix.grey().to_string()
+    } else {
+        marker_suffix
+    };
+
     format!(
-        "{status_icon} {} {priority_badge} {type_badge} {age} - {title}",
+        "{status_icon} {} {priority_badge} {type_badge} {age} - {title}{marker_suffix}",
         issue.id
     )
 }

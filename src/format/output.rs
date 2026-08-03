@@ -102,16 +102,32 @@ impl From<&Issue> for StaleIssue {
 }
 
 /// Issue with counts for list/search views.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct IssueWithCounts {
     #[serde(flatten)]
     pub issue: Issue,
     pub dependency_count: usize,
     pub dependent_count: usize,
+    /// How many comments the issue has. Omitted when zero, so listings of
+    /// uncommented issues keep exactly the shape they had before comments
+    /// were surfaced here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub comment_count: usize,
+    /// When the newest comment was written — the "is this history fresh?"
+    /// signal. Never a body: listings carry counts and ages only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_comment_at: Option<DateTime<Utc>>,
+    /// True when the search query matched this issue's comment text.
+    ///
+    /// Only ever set by `bd search`, and only when a comment matched, so a
+    /// consumer can tell a comment-sourced hit from a title/description
+    /// hit instead of being left to guess why an issue was returned.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub comment_match: bool,
 }
 
 /// Issue details with full relations for show view.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct IssueDetails {
     #[serde(flatten)]
     pub issue: Issue,
@@ -121,12 +137,40 @@ pub struct IssueDetails {
     pub dependencies: Vec<IssueWithDependencyMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependents: Vec<IssueWithDependencyMetadata>,
+    /// The comments carried in this view — possibly a bounded window.
+    ///
+    /// `bd show` renders only the newest few (see the comments command's
+    /// display bound); when it does, `comment_count` still reports the
+    /// true total and `comments_truncated` is set. Consumers that need
+    /// every comment ask `bd comments <id>`, and export never comes
+    /// through here at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub comments: Vec<Comment>,
+    /// Total comments on the issue, independent of how many are in
+    /// `comments`. Present whenever the issue has any, so a machine
+    /// consumer can always tell "no comments" from "comments not shown".
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub comment_count: usize,
+    /// True when `comments` is a bounded window over a longer log — the
+    /// explicit signal that makes truncation impossible to miss.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub comments_truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<Event>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+}
+
+/// `skip_serializing_if` helper: omit zero counts.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// `skip_serializing_if` helper: omit false flags.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -267,12 +311,47 @@ mod tests {
             issue,
             dependency_count: 2,
             dependent_count: 1,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&iwc).unwrap();
         assert!(json.contains("\"dependency_count\":2"));
         assert!(json.contains("\"dependent_count\":1"));
         assert!(json.contains("\"id\":\"bd-1\""));
+    }
+
+    /// An issue with no comments says nothing about comments: the fields are
+    /// omitted rather than emitted as zeroes, so listings of thousands of
+    /// comment-free issues do not grow a per-row tax.
+    #[test]
+    fn issue_with_counts_omits_empty_comment_fields() {
+        let iwc = IssueWithCounts {
+            issue: base_issue("bd-1", "Test"),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&iwc).unwrap();
+        assert!(!json.contains("comment_count"));
+        assert!(!json.contains("last_comment_at"));
+        assert!(!json.contains("comment_match"));
+    }
+
+    /// When comments DO exist, the count and recency are present — a reader
+    /// (or an agent) can tell there is history without fetching bodies.
+    #[test]
+    fn issue_with_counts_serializes_comment_facts() {
+        let iwc = IssueWithCounts {
+            issue: base_issue("bd-1", "Test"),
+            comment_count: 3,
+            last_comment_at: Some(Utc.with_ymd_and_hms(2025, 6, 1, 12, 0, 0).unwrap()),
+            comment_match: true,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&iwc).unwrap();
+        assert!(json.contains("\"comment_count\":3"));
+        assert!(json.contains("last_comment_at"));
+        assert!(json.contains("\"comment_match\":true"));
     }
 
     #[test]
@@ -286,11 +365,46 @@ mod tests {
             comments: vec![],
             events: vec![],
             parent: Some("bd-parent".to_string()),
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("\"parent\":\"bd-parent\""));
         assert!(json.contains("\"labels\":[\"backend\"]"));
+    }
+
+    /// The JSON contract for a bounded comment list: consumers must be able
+    /// to detect that they are holding a window, not the whole log. Without
+    /// these two fields a `jq '.comments | length'` reads as a total.
+    #[test]
+    fn issue_details_marks_truncated_comments() {
+        let details = IssueDetails {
+            issue: base_issue("bd-3", "Bounded"),
+            comment_count: 12,
+            comments_truncated: true,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&details).unwrap();
+        assert!(json.contains("\"comment_count\":12"));
+        assert!(json.contains("\"comments_truncated\":true"));
+    }
+
+    /// Conversely, an untruncated view must not carry a truthy truncation
+    /// flag: "did I get everything?" has to be answerable, in both
+    /// directions, from the payload alone.
+    #[test]
+    fn issue_details_omits_truncation_flag_when_complete() {
+        let details = IssueDetails {
+            issue: base_issue("bd-3", "Complete"),
+            comment_count: 2,
+            comments_truncated: false,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&details).unwrap();
+        assert!(json.contains("\"comment_count\":2"));
+        assert!(!json.contains("comments_truncated"));
     }
 
     #[test]

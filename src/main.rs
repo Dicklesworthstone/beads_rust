@@ -41,6 +41,9 @@ fn main() {
         Commands::Idle => commands::presence::execute_idle(&overrides, &output_ctx),
         Commands::Create(args) => commands::create::execute(&args, &overrides, &output_ctx),
         Commands::Update(args) => commands::update::execute(&args, &overrides, &output_ctx),
+        Commands::Comments(args) => {
+            commands::comments::execute(&args, cli.json, &overrides, &output_ctx)
+        }
         Commands::Delete(args) => {
             commands::delete::execute(&args, cli.json, &overrides, &output_ctx)
         }
@@ -184,6 +187,11 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
         | Commands::Defer(_)
         | Commands::Undefer(_)
         | Commands::Msg(_) => true,
+        // Only `comments add` writes; a bare `comments <id>` is a read.
+        Commands::Comments(args) => matches!(
+            args.command,
+            Some(beads_rust::cli::CommentsCommands::Add(_))
+        ),
         Commands::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
@@ -214,6 +222,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         // - Mutating commands (to avoid overwriting external changes)
         // - Subcommands (Comments, Dep, Label, Epic, Query)
         Commands::List(_)
+        | Commands::Comments(_)
         | Commands::Show(_)
         | Commands::Search(_)
         | Commands::Blocked(_)

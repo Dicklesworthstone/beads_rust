@@ -7,7 +7,10 @@ use crate::cli::{ListArgs, OutputFormat, resolve_output_format};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::csv;
-use crate::format::{IssueWithCounts, TextFormatOptions, format_issue_line_with, terminal_width};
+use crate::format::{
+    IssueWithCounts, TextFormatOptions, format_comment_marker, format_issue_line_with_comments,
+    terminal_width,
+};
 use crate::model::{IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
 use crate::storage::{ListFilters, SqliteStorage};
@@ -105,11 +108,16 @@ pub fn execute(
         return Ok(());
     }
 
+    // Comment facts for the listed issues: a count and a recency, batched
+    // in one query. Never bodies — a listing tells you history exists and
+    // how fresh it is, and `bd comments <id>` shows it.
+    let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+    let comment_stats = storage.comment_stats_for_issues(&issue_ids)?;
+
     // Output
     match output_format {
         OutputFormat::Json | OutputFormat::Toon => {
             // Fetch relations for all issues
-            let issue_ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
             let mut labels_map = storage.get_labels_for_issues(&issue_ids)?;
 
             // Use batch counting
@@ -126,11 +134,15 @@ pub fn execute(
 
                     let dependency_count = *dependency_counts.get(&issue.id).unwrap_or(&0);
                     let dependent_count = *dependent_counts.get(&issue.id).unwrap_or(&0);
+                    let stats = comment_stats.get(&issue.id).copied().unwrap_or_default();
 
                     IssueWithCounts {
                         issue,
                         dependency_count,
                         dependent_count,
+                        comment_count: stats.count,
+                        last_comment_at: stats.last_comment_at,
+                        comment_match: false,
                     }
                 })
                 .collect();
@@ -196,6 +208,9 @@ pub fn execute(
                 let mut table = IssueTable::new(&issues, ctx.theme())
                     .columns(columns)
                     .title(format!("Issues ({})", issues.len()))
+                    // Adds a narrow Cmts column, but only if some listed
+                    // issue actually has comments — see `comment_markers`.
+                    .comment_markers(comment_markers(&comment_stats))
                     .wrap(!args.no_wrap);
                 if !args.no_wrap {
                     table = table.width(Some(ctx.width()));
@@ -205,7 +220,11 @@ pub fn execute(
             } else {
                 // Note: bd outputs nothing when no issues found, matching that for conformance
                 for issue in &issues {
-                    let line = format_issue_line_with(issue, format_options);
+                    let marker = comment_stats
+                        .get(&issue.id)
+                        .and_then(|stats| format_comment_marker(stats.count, stats.last_comment_at));
+                    let line =
+                        format_issue_line_with_comments(issue, format_options, marker.as_deref());
                     println!("{line}");
                 }
             }
@@ -213,6 +232,22 @@ pub fn execute(
     }
 
     Ok(())
+}
+
+/// Build the per-issue compact comment markers for the rich table.
+///
+/// Only issues that have comments get an entry, which is also what decides
+/// whether the column appears at all (an empty map leaves it off).
+fn comment_markers(
+    stats: &std::collections::HashMap<String, crate::storage::CommentStats>,
+) -> std::collections::HashMap<String, String> {
+    stats
+        .iter()
+        .filter_map(|(id, stats)| {
+            format_comment_marker(stats.count, stats.last_comment_at)
+                .map(|marker| (id.clone(), marker))
+        })
+        .collect()
 }
 
 /// Convert CLI args to storage filter.

@@ -502,3 +502,78 @@ fn import_rejects_invalid_id_format() {
         "Expected validation error, got: {err}"
     );
 }
+
+/// Export fidelity for comments under the display bound.
+///
+/// `bd show` renders only the newest few comments, and that bound is
+/// applied to the serialized view, not to storage. Export reads comments
+/// through its own bulk path, so it must carry EVERY comment regardless of
+/// what any display would show. This test writes many more comments than
+/// the display bound, exports, throws the database away, re-imports, and
+/// insists the whole log came back — the property that makes bounding the
+/// show view safe in the first place.
+#[test]
+fn export_carries_every_comment_past_the_display_bound() {
+    use beads_rust::cli::commands::comments::{DEFAULT_SHOW_COMMENT_LIMIT, bound_comments};
+
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    let issue = issue_with_id("test-log", "Has a long comment history");
+    storage.create_issue(&issue, "tester").unwrap();
+
+    // Comfortably more than any display bound, with distinct bodies (import
+    // dedupes on author + text, so identical bodies would collapse and hide
+    // a genuine loss).
+    let total = DEFAULT_SHOW_COMMENT_LIMIT * 5 + 2;
+    for n in 0..total {
+        storage
+            .add_comment(&issue.id, &format!("agent{n}"), &format!("entry number {n}"))
+            .unwrap();
+    }
+
+    // The bounded view a reader would see is much smaller...
+    let mut details = storage
+        .get_issue_details(&issue.id, true, false, 10)
+        .unwrap()
+        .unwrap();
+    assert_eq!(details.comment_count, total);
+    assert!(bound_comments(
+        &mut details.comments,
+        Some(DEFAULT_SHOW_COMMENT_LIMIT)
+    ));
+    assert_eq!(details.comments.len(), DEFAULT_SHOW_COMMENT_LIMIT);
+
+    // ...but the export is complete.
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("issues.jsonl");
+    export_to_jsonl(&storage, &path, &ExportConfig::default()).unwrap();
+
+    // Throw the database away entirely: the JSONL is now the only copy.
+    drop(storage);
+
+    let mut reimported = SqliteStorage::open_memory().unwrap();
+    import_from_jsonl(
+        &mut reimported,
+        &path,
+        &ImportConfig::default(),
+        Some("test-"),
+    )
+    .unwrap();
+
+    let comments = reimported.get_comments(&issue.id).unwrap();
+    assert_eq!(
+        comments.len(),
+        total,
+        "export/import must preserve every comment, not just the displayed window"
+    );
+    let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+    for n in 0..total {
+        let expected = format!("entry number {n}");
+        assert!(
+            bodies.contains(&expected.as_str()),
+            "comment {n} did not survive the round trip"
+        );
+    }
+    // Attribution survives too — an unattributed history is not history.
+    assert!(comments.iter().any(|c| c.author == "agent0"));
+    assert!(comments.iter().any(|c| c.author == format!("agent{}", total - 1)));
+}

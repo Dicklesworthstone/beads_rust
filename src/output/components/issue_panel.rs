@@ -228,24 +228,8 @@ impl<'a> IssuePanel<'a> {
             }
         }
 
-        // Comments
-        let comments: &[Comment] = self
-            .details
-            .map_or(self.issue.comments.as_slice(), |d| d.comments.as_slice());
-        if self.show_comments && !comments.is_empty() {
-            content.append_styled("\nComments:\n", self.theme.emphasis.clone());
-            for comment in comments {
-                content.append("  ");
-                content.append_styled(
-                    &comment.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
-                    self.theme.timestamp.clone(),
-                );
-                content.append(" ");
-                content.append_styled(&comment.author, self.theme.username.clone());
-                content.append_styled(": ", self.theme.dimmed.clone());
-                content.append_styled(&comment.body, self.theme.comment.clone());
-                content.append("\n");
-            }
+        if self.show_comments {
+            self.append_comments(&mut content);
         }
 
         // Build and print panel
@@ -261,6 +245,55 @@ impl<'a> IssuePanel<'a> {
             .border_style(self.theme.panel_border.clone());
 
         ctx.render(&panel);
+    }
+
+    /// Render the comment section.
+    ///
+    /// `details.comments` may be a bounded window over a longer log (see the
+    /// comments command's display bound), so the heading carries the true
+    /// total and, when the window hides anything, an explicit line points at
+    /// the full log. Rich output must not be the one place truncation goes
+    /// unannounced.
+    fn append_comments(&self, content: &mut Text) {
+        let comments: &[Comment] = self
+            .details
+            .map_or(self.issue.comments.as_slice(), |d| d.comments.as_slice());
+        let total = self
+            .details
+            .map_or(comments.len(), |d| d.comment_count.max(d.comments.len()));
+        if total == 0 && comments.is_empty() {
+            return;
+        }
+
+        content.append_styled(
+            &format!("\nComments ({total}):\n"),
+            self.theme.emphasis.clone(),
+        );
+
+        let hidden = total.saturating_sub(comments.len());
+        if self.details.is_some_and(|d| d.comments_truncated) && hidden > 0 {
+            let plural = if hidden == 1 { "" } else { "s" };
+            content.append_styled(
+                &format!(
+                    "  … {hidden} earlier comment{plural} hidden — `bd comments {}` for all\n",
+                    self.issue.id
+                ),
+                self.theme.dimmed.clone(),
+            );
+        }
+
+        for comment in comments {
+            content.append("  ");
+            content.append_styled(
+                &comment.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                self.theme.timestamp.clone(),
+            );
+            content.append(" ");
+            content.append_styled(&comment.author, self.theme.username.clone());
+            content.append_styled(": ", self.theme.dimmed.clone());
+            content.append_styled(&comment.body, self.theme.comment.clone());
+            content.append("\n");
+        }
     }
 }
 
