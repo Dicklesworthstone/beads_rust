@@ -424,45 +424,76 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         }
 
         if watch_beads {
-            let current = match snapshot_state(&beads_dir, cli, &prefix) {
-                Ok(s) => s,
+            // A FAILED snapshot is not an EMPTY snapshot.
+            //
+            // This used to substitute `HashMap::new()` on error and then
+            // commit it as the new baseline, which turned any transient
+            // read failure (SQLITE_BUSY past the lock timeout, a
+            // momentarily unreadable DB, a failed auto-import inside
+            // open_storage) into a two-cycle lie: the failing cycle
+            // recorded a `deleted` for every bead under the prefix, and
+            // the next successful cycle re-announced every one of them
+            // as `created` — carrying its CURRENT status, hence the
+            // self-contradictory `created (closed)` lines. Under the
+            // fleet's default 120s debounce the two halves collapse
+            // ((Deleted, Created) -> Created in `record_change`), so the
+            // delete half is invisible and the operator just sees the
+            // whole prefix replayed as fresh creations. That is
+            // `beads1-3435j`, reproduced deterministically in
+            // tests/repro_watch_snapshot_replay.rs.
+            //
+            // Skipping the cycle costs at most one poll interval of
+            // latency and keeps the last known-good baseline, so the
+            // next successful poll diffs against reality.
+            match snapshot_state(&beads_dir, cli, &prefix) {
+                Ok(current) => {
+                    if !current.is_empty() || !bead_snapshot.is_empty() {
+                        let actor_str = actor.as_deref().unwrap_or("");
+                        if streaming {
+                            stream_diff(
+                                &bead_snapshot,
+                                &current,
+                                status_filter.as_ref(),
+                                actor_str,
+                                args.include_self,
+                                format,
+                            )?;
+                        } else {
+                            ingest_diff(
+                                &bead_snapshot,
+                                &current,
+                                status_filter.as_ref(),
+                                actor_str,
+                                args.include_self,
+                                now,
+                                &mut batches,
+                            );
+                        }
+                        bead_snapshot = current;
+                    }
+                }
                 Err(e) => {
-                    eprintln!("watch: bead snapshot failed: {e}");
-                    HashMap::new()
-                }
-            };
-            if !current.is_empty() || !bead_snapshot.is_empty() {
-                let actor_str = actor.as_deref().unwrap_or("");
-                if streaming {
-                    stream_diff(
-                        &bead_snapshot,
-                        &current,
-                        status_filter.as_ref(),
-                        actor_str,
-                        args.include_self,
-                        format,
-                    )?;
-                } else {
-                    ingest_diff(
-                        &bead_snapshot,
-                        &current,
-                        status_filter.as_ref(),
-                        actor_str,
-                        args.include_self,
-                        now,
-                        &mut batches,
+                    eprintln!(
+                        "watch: bead snapshot failed, keeping the previous snapshot \
+                         (no bead events this cycle): {e}"
                     );
-                    flush_batches(
-                        &mut batches,
-                        &prefix,
-                        format,
-                        now,
-                        false,
-                        debounce,
-                        debounce_max,
-                    )?;
                 }
-                bead_snapshot = current;
+            }
+            // Flushing is independent of this cycle's snapshot outcome:
+            // a batch already accrued must still age out on its
+            // debounce / max-age ceiling on cycles that produce no diff
+            // (or whose snapshot failed), otherwise a pending batch can
+            // sit unflushed indefinitely.
+            if !streaming {
+                flush_batches(
+                    &mut batches,
+                    &prefix,
+                    format,
+                    now,
+                    false,
+                    debounce,
+                    debounce_max,
+                )?;
             }
         }
 

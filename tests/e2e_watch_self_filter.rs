@@ -79,30 +79,56 @@ fn create_as(path: &std::path::Path, agent: &str, prefix: &str, title: &str) -> 
 /// `sender: None`, `created_by: <agent identity>` — which is the
 /// shape the plain-`resolve_actor` comparison failed to recognise.
 fn watch_run(prefix: &str, include_self: bool) -> (String, String, String) {
+    watch_run_mode(prefix, include_self, Mode::Streaming)
+}
+
+/// The two independent code paths that apply the self-filter. Each
+/// calls `is_self` at its own call sites (`stream_diff` twice,
+/// `ingest_diff` twice), so a fix must be verified through both rather
+/// than assumed to generalise from one.
+#[derive(Copy, Clone)]
+enum Mode {
+    /// `--debounce 0`: one event emitted per diff, immediately.
+    Streaming,
+    /// The fleet default shape: diffs accrue into per-sender batches
+    /// and are flushed as a digest once the window goes quiet.
+    Debounced,
+}
+
+fn watch_run_mode(prefix: &str, include_self: bool, mode: Mode) -> (String, String, String) {
     let agent = prefix;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path();
     init(path);
 
-    let mut args = vec![
-        "watch",
-        "--prefix",
-        prefix,
-        "--interval",
-        "1",
-        "--max-ticks",
-        "6",
-        // Streaming mode: no debounce batching, so each diff is emitted
-        // the moment it is seen and the test does not have to wait out a
+    let mut args = vec!["watch", "--prefix", prefix, "--interval", "1"];
+    match mode {
+        // Streaming: no debounce batching, so each diff is emitted the
+        // moment it is seen and the test does not have to wait out a
         // 120s window.
-        "--debounce",
-        "0",
-        "--debounce-max",
-        "0",
-        "--no-inbox",
-        "--format",
-        "json",
-    ];
+        Mode::Streaming => args.extend_from_slice(&[
+            "--max-ticks",
+            "6",
+            "--debounce",
+            "0",
+            "--debounce-max",
+            "0",
+            "--format",
+            "json",
+        ]),
+        // Debounced, but with a 2s window instead of the 120s default so
+        // the digest flushes inside the test's lifetime. Text format:
+        // batch digests are rendered as human lines listing each id.
+        Mode::Debounced => args.extend_from_slice(&[
+            "--max-ticks",
+            "10",
+            "--debounce",
+            "2",
+            "--debounce-max",
+            "6",
+        ]),
+    }
+    args.push("--no-inbox");
     if include_self {
         args.push("--include-self");
     }
@@ -137,7 +163,8 @@ fn watch_run(prefix: &str, include_self: bool) -> (String, String, String) {
     (self_id, foreign_id, stdout)
 }
 
-/// Collect the ids `bd watch` reported as `created`.
+/// Collect the ids `bd watch` reported as `created`, from the JSON
+/// event stream.
 fn created_ids(stdout: &str) -> Vec<String> {
     stdout
         .lines()
@@ -169,6 +196,28 @@ fn watch_filters_self_created_bead_resolved_through_agent_identity() {
         "self-created bead {self_id} must be filtered when --include-self is off \
          (created_by is written with the agent identity, so the filter must \
          resolve the comparison actor the same way). created={created:?} stdout=\n{stdout}"
+    );
+}
+
+/// The same assertion through the *other* path into the filter:
+/// `ingest_diff` + batch flushing, which is what the fleet actually
+/// runs (a debounce window, not streaming). The filter is applied at
+/// separate call sites there, so this is not redundant with the
+/// streaming test — it is the second door into the same room.
+#[test]
+fn watch_filters_self_created_bead_in_debounced_batches_too() {
+    let (self_id, foreign_id, stdout) = watch_run_mode("wbatch", false, Mode::Debounced);
+
+    assert!(
+        stdout.contains(&foreign_id),
+        "positive control: a foreign-created bead must appear in the debounced \
+         digest, else the watcher never flushed a batch at all and the negative \
+         assertion below would be vacuous. stdout=\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&self_id),
+        "self-created bead {self_id} must be filtered out of the debounced digest \
+         too when --include-self is off. stdout=\n{stdout}"
     );
 }
 
