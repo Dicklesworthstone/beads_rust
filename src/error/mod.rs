@@ -20,6 +20,27 @@ pub use structured::{ErrorCode, StructuredError};
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// The user-facing list of statuses `Status::from_str` accepts.
+///
+/// Kept honest by `hint_lists_exactly_what_from_str_accepts` in this
+/// module's tests, which parses this string back out and checks it
+/// against [`crate::model::Status::PARSEABLE`] in both directions —
+/// a hardcoded string duplicating a match arm is precisely the thing
+/// that goes stale silently.
+///
+/// The names before the parenthetical are the canonical set, comma
+/// separated, so the test can recover them mechanically. Keep that
+/// shape if you edit this.
+pub const VALID_STATUSES_HINT: &str = "Valid statuses: open, in_progress, blocked, deferred, \
+     closed, tombstone, pinned (in_progress also accepts 'inprogress'; tombstone marks a \
+     deleted bead and pinned is set by br itself, but both are accepted here — e.g. as \
+     filters)";
+
+/// Hint for the specific mistake of `--status all`: `all` is not a
+/// status, and the flag actually wanted is `-a`/`--all`.
+pub const STATUS_ALL_HINT: &str = "Did you mean -a/--all? 'all' is not a status — \
+     use the -a/--all flag for an unfiltered sweep (e.g. `br list -a`), or omit --status.";
+
 /// Primary error type for `beads_rust` operations.
 ///
 /// Design: Structured variants for common cases, with `Other` for
@@ -235,9 +256,7 @@ impl BeadsError {
             Self::InvalidPriority { .. } => {
                 Some("Use a priority between 0 (critical) and 4 (backlog)")
             }
-            Self::InvalidStatus { .. } => {
-                Some("Valid statuses: open, in_progress, blocked, deferred, closed")
-            }
+            Self::InvalidStatus { .. } => Some(VALID_STATUSES_HINT),
             Self::InvalidType { .. } => Some("Valid types: task, bug, feature, epic, chore"),
             _ => None,
         }
@@ -310,6 +329,107 @@ mod tests {
             None,
         ));
         assert!(!not_recoverable.is_user_recoverable());
+    }
+
+    /// The INVALID_STATUS hint and `Status::from_str` must describe the
+    /// same set, in both directions. A hint that under-reports what the
+    /// parser accepts is a real defect: it tells an agent that
+    /// `--status tombstone` is invalid when it works fine (bead
+    /// `beads1-17zqr`).
+    ///
+    /// The `listed_in_hint` match below is deliberately exhaustive with
+    /// no wildcard arm: adding a `Status` variant will fail to compile
+    /// here, forcing whoever adds it to decide whether it is
+    /// user-selectable and to say so in the hint.
+    #[test]
+    fn hint_lists_exactly_what_from_str_accepts() {
+        use crate::model::Status;
+        use std::str::FromStr;
+
+        const fn listed_in_hint(status: &Status) -> bool {
+            match status {
+                Status::Open
+                | Status::InProgress
+                | Status::Blocked
+                | Status::Deferred
+                | Status::Closed
+                | Status::Tombstone
+                | Status::Pinned => true,
+                // Unreachable through `from_str` (which rejects unknown
+                // names); `Custom` only arrives via serde
+                // deserialization of foreign JSONL, so it is not a
+                // value a user can pass to `--status`.
+                Status::Custom(_) => false,
+            }
+        }
+
+        let every_variant = [
+            Status::Open,
+            Status::InProgress,
+            Status::Blocked,
+            Status::Deferred,
+            Status::Closed,
+            Status::Tombstone,
+            Status::Pinned,
+            Status::Custom("something-else".to_string()),
+        ];
+
+        for status in &every_variant {
+            let name = status.as_str();
+            let expected = listed_in_hint(status);
+            assert_eq!(
+                Status::from_str(name).is_ok(),
+                expected,
+                "from_str acceptance of '{name}' disagrees with whether it is user-selectable"
+            );
+            assert_eq!(
+                Status::PARSEABLE.contains(&name),
+                expected,
+                "Status::PARSEABLE disagrees about '{name}'"
+            );
+        }
+
+        // Forward direction: every name the parser accepts is listed.
+        for name in Status::PARSEABLE {
+            assert!(
+                VALID_STATUSES_HINT.contains(name),
+                "VALID_STATUSES_HINT omits '{name}', which Status::from_str accepts"
+            );
+        }
+        for (alias, canonical) in Status::ALIASES {
+            assert!(
+                Status::from_str(alias).is_ok(),
+                "alias '{alias}' should parse"
+            );
+            assert_eq!(Status::from_str(alias).unwrap().as_str(), canonical);
+            assert!(
+                VALID_STATUSES_HINT.contains(alias),
+                "VALID_STATUSES_HINT omits the accepted alias '{alias}'"
+            );
+        }
+
+        // Reverse direction: every name the hint advertises parses, and
+        // it advertises exactly the canonical set (no extras, none
+        // missing). The hint's canonical list is the comma-separated
+        // run between "Valid statuses: " and the parenthetical.
+        let listed = VALID_STATUSES_HINT
+            .strip_prefix("Valid statuses: ")
+            .expect("hint should start with 'Valid statuses: '")
+            .split(" (")
+            .next()
+            .expect("split always yields one element");
+        let advertised: Vec<&str> = listed.split(", ").map(str::trim).collect();
+        for name in &advertised {
+            assert!(
+                Status::from_str(name).is_ok(),
+                "hint advertises '{name}', which Status::from_str rejects"
+            );
+        }
+        assert_eq!(
+            advertised,
+            Status::PARSEABLE.to_vec(),
+            "hint's status list must match Status::PARSEABLE exactly (same order)"
+        );
     }
 
     #[test]

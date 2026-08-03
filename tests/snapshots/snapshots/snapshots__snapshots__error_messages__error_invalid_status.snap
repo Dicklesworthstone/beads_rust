@@ -6,11 +6,20 @@ expression: normalize_output(&output.stderr)
   "error": {
     "code": "INVALID_STATUS",
     "message": "Invalid status: invalid",
-    "hint": "Valid statuses: open, in_progress, blocked, deferred, closed",
+    "hint": "Valid statuses: open, in_progress, blocked, deferred, closed, tombstone, pinned (in_progress also accepts 'inprogress'; tombstone marks a deleted bead and pinned is set by br itself, but both are accepted here — e.g. as filters)",
     "retryable": true,
     "context": {
       "status": "invalid",
-      "hint": null
+      "hint": null,
+      "valid_values": [
+        "open",
+        "in_progress",
+        "blocked",
+        "deferred",
+        "closed",
+        "tombstone",
+        "pinned"
+      ]
     }
   }
 }

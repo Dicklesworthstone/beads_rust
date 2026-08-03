@@ -47,6 +47,35 @@ pub enum Status {
 }
 
 impl Status {
+    /// Every status name [`Status::from_str`] accepts, canonical
+    /// spellings only, in the order `from_str` matches them.
+    ///
+    /// Single source of truth for user-facing "valid statuses" lists:
+    /// see `error::VALID_STATUSES_HINT`, which is tied to this array by
+    /// a test so the hint cannot claim a different set from the parser.
+    ///
+    /// `tombstone` and `pinned` are deliberately included. They are
+    /// real, persisted, rendered statuses (`br delete` tombstones a
+    /// bead; both show up in `br stats` / `br dash` and have their own
+    /// icons), and `from_str` accepts them — so they *are* filterable
+    /// and a hint that omits them is simply wrong. `Status::Custom` is
+    /// excluded because `from_str` rejects it: it can only arrive via
+    /// serde deserialization of foreign JSONL, never from a user
+    /// passing `--status`.
+    pub const PARSEABLE: [&'static str; 7] = [
+        "open",
+        "in_progress",
+        "blocked",
+        "deferred",
+        "closed",
+        "tombstone",
+        "pinned",
+    ];
+
+    /// Non-canonical spellings [`Status::from_str`] also accepts,
+    /// mapped to their canonical name.
+    pub const ALIASES: [(&'static str, &'static str); 1] = [("inprogress", "in_progress")];
+
     #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
