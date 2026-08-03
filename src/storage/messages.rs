@@ -130,7 +130,8 @@ pub fn list_messages(conn: &Connection, filter: &MessageFilter) -> Result<Vec<Me
     }
 
     let mut stmt = conn.prepare(&sql)?;
-    let params_ref: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+    let params_ref: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(AsRef::as_ref).collect();
     let rows = stmt
         .query_map(params_ref.as_slice(), row_to_message)?
         .collect::<std::result::Result<Vec<_>, _>>()?;

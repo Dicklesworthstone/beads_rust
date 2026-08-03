@@ -242,15 +242,13 @@ impl NormalizationRules {
                     });
                 }
             }
-            Value::String(s) => {
-                // Normalize line endings for all string values
-                if self.normalize_line_endings && s.contains("\r\n") {
-                    let normalized = s.replace("\r\n", "\n");
-                    if self.log_normalization {
-                        log.push(format!("Normalized line endings: {path}"));
-                    }
-                    *s = normalized;
+            // Normalize line endings for all string values.
+            Value::String(s) if self.normalize_line_endings && s.contains("\r\n") => {
+                let normalized = s.replace("\r\n", "\n");
+                if self.log_normalization {
+                    log.push(format!("Normalized line endings: {path}"));
                 }
+                *s = normalized;
             }
             _ => {}
         }

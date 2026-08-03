@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Run CI checks locally before pushing.
-# Mirrors .github/workflows/ci.yml steps.
+#
+# NOTE: this used to say "Mirrors .github/workflows/ci.yml steps" — that
+# file does not exist. This repo has no CI workflows at all (.github holds
+# only dependabot.yml), so this script IS the check, not a mirror of one.
+# Nothing runs it automatically; somebody has to.
+#
+# Current state, if you run it top to bottom: the two clippy steps and the
+# check step pass. The `cargo fmt --all -- --check` step FAILS on a
+# long-standing backlog of unformatted files (pre-dating this note) and
+# will stop the script before it reaches clippy, so pass over it or run
+# the steps individually until that is dealt with separately.
 
 set -euo pipefail
 

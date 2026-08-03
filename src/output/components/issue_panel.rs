@@ -70,6 +70,9 @@ impl<'a> IssuePanel<'a> {
         }
     }
 
+    // Long by construction: renders the whole issue panel top to bottom
+    // (header, metadata, body, deps, comments) in display order.
+    #[allow(clippy::too_many_lines)]
     pub fn print(&self, ctx: &OutputContext, wrap: bool) {
         let mut content = Text::new("");
 

@@ -923,6 +923,13 @@ EXAMPLES:
 /// handler. Exists to make rarely-used / diagnostic / setup operations
 /// discoverable via `bd admin --help` without polluting the agent-facing
 /// `bd --help` surface.
+//
+// Size disparity is inherent to a clap subcommand tree: the widest variant
+// carries a nested subcommand enum. Exactly one AdminCommands value is ever
+// built, on the stack, at argument-parse time, so the 416-byte footprint is
+// paid once and never copied. Boxing the field to satisfy the lint would
+// mean fighting clap's derive for no runtime gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum AdminCommands {
     /// Initialize a beads workspace

@@ -420,8 +420,8 @@ fn terminal_cols() -> usize {
 /// Compute usable title width given the row prefix (indent + id + badges).
 fn title_budget(args: &GraphArgs, used: usize) -> usize {
     let cols = terminal_cols();
-    let cap = args.max_title.unwrap_or_else(|| cols.saturating_sub(used).max(40));
-    cap
+    args.max_title
+        .unwrap_or_else(|| cols.saturating_sub(used).max(40))
 }
 
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
@@ -577,13 +577,14 @@ fn render_node_line(
     let title_cap = title_budget(args, used_for_title_budget + sender_w);
     let title = truncate_with_ellipsis(&node.title, title_cap);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::raw(indent_text));
-    spans.push(Span::styled(node.id.clone(), id_style()));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(priority_badge, priority_style_for(node.priority)));
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(status_badge, status_style_for(&node.status)));
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw(indent_text),
+        Span::styled(node.id.clone(), id_style()),
+        Span::raw("  "),
+        Span::styled(priority_badge, priority_style_for(node.priority)),
+        Span::raw("  "),
+        Span::styled(status_badge, status_style_for(&node.status)),
+    ];
     if !root_marker.is_empty() {
         spans.push(Span::styled(
             root_marker.to_string(),

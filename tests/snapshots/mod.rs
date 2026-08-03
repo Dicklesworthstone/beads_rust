@@ -394,6 +394,9 @@ impl TextDiff {
 }
 
 /// Apply normalization with logging of what was changed.
+// Long by construction: one normalization step per config flag, applied in
+// a fixed order. Splitting it would scatter the order across helpers.
+#[allow(clippy::too_many_lines)]
 fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<String>) {
     let mut normalized = text.to_string();
     let mut log = Vec::new();

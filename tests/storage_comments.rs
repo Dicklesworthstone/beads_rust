@@ -209,7 +209,7 @@ fn find_matching_comments_returns_the_newest_match_per_issue() {
     storage.add_comment(&id, "carol", "token: latest").unwrap();
 
     let matches = storage
-        .find_matching_comments("token:", &[id.clone()])
+        .find_matching_comments("token:", std::slice::from_ref(&id))
         .unwrap();
     let hit = matches.get(&id).expect("issue has a matching comment");
     assert_eq!(hit.body, "token: latest");
@@ -223,7 +223,7 @@ fn find_matching_comments_omits_issues_without_a_match() {
     let id = issue_with_id(&mut storage, "test-nomatch", "Title");
     storage.add_comment(&id, "alice", "nothing relevant").unwrap();
 
-    let matches = storage.find_matching_comments("absent", &[id.clone()]).unwrap();
+    let matches = storage.find_matching_comments("absent", std::slice::from_ref(&id)).unwrap();
     assert!(matches.is_empty());
 }
 
@@ -235,7 +235,7 @@ fn find_matching_comments_is_empty_for_blank_query_or_no_issues() {
 
     assert!(
         storage
-            .find_matching_comments("   ", &[id.clone()])
+            .find_matching_comments("   ", std::slice::from_ref(&id))
             .unwrap()
             .is_empty()
     );
