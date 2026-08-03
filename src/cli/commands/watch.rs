@@ -147,7 +147,9 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
     // (prefix → repo) for the ghwatch CI integration. Both are
     // best-effort — agents launched outside a git checkout simply
     // record empty strings and get no CI badge.
-    let pid = i64::try_from(std::process::id()).unwrap_or(0);
+    // process::id() is u32, so widening to i64 is infallible — the old
+    // try_from/unwrap_or(0) could only ever have recorded a bogus pid 0.
+    let pid = i64::from(std::process::id());
     let my_started_at = Utc::now();
     let watcher_cwd = std::env::current_dir()
         .ok()

@@ -118,6 +118,20 @@ struct DetailState {
     scroll: u16,
 }
 
+/// Largest addressable scroll offset for a pane holding `len` lines.
+///
+/// ratatui's `Paragraph::scroll` offset is a `u16`, so content longer
+/// than `u16::MAX` lines cannot be fully addressed — but saturating is
+/// the only sane response, and it must be explicit. A plain
+/// `len.saturating_sub(1) as u16` *wraps*: a 65_537-line graph would
+/// compute a maximum of 0, and the view would silently refuse to scroll
+/// at all rather than merely stopping early. `br dash` renders the whole
+/// dependency graph into this pane, so that length is reachable on a
+/// large repo.
+fn max_scroll(len: usize) -> u16 {
+    u16::try_from(len.saturating_sub(1)).unwrap_or(u16::MAX)
+}
+
 /// Numeric tier for activity sort: lower = more active. Used as the
 /// primary key when SortMode::Activity is active.
 fn activity_tier(g: &OwnedGroup) -> u8 {
@@ -338,7 +352,7 @@ impl App {
         if let Ok(lines) = crate::cli::commands::graph::render_all_lines(&self.cli, &args) {
             self.graph_lines = lines;
             // Clamp scroll if the new content is shorter.
-            let max = self.graph_lines.len().saturating_sub(1) as u16;
+            let max = max_scroll(self.graph_lines.len());
             if self.graph_scroll > max {
                 self.graph_scroll = max;
             }
@@ -346,7 +360,7 @@ impl App {
     }
 
     fn graph_scroll_down(&mut self) {
-        let max = (self.graph_lines.len().saturating_sub(1)) as u16;
+        let max = max_scroll(self.graph_lines.len());
         if self.graph_scroll < max {
             self.graph_scroll += 1;
         }
@@ -361,7 +375,7 @@ impl App {
     }
 
     fn graph_scroll_last(&mut self) {
-        self.graph_scroll = self.graph_lines.len().saturating_sub(1) as u16;
+        self.graph_scroll = max_scroll(self.graph_lines.len());
     }
 
     /// Get the bead-id under the cursor, if any.
@@ -418,7 +432,7 @@ impl App {
 
     fn detail_scroll_down(&mut self) {
         if let Some(d) = self.detail.as_mut() {
-            let max = d.lines.len().saturating_sub(1) as u16;
+            let max = max_scroll(d.lines.len());
             if d.scroll < max {
                 d.scroll += 1;
             }
@@ -439,7 +453,7 @@ impl App {
 
     fn detail_scroll_last(&mut self) {
         if let Some(d) = self.detail.as_mut() {
-            d.scroll = d.lines.len().saturating_sub(1) as u16;
+            d.scroll = max_scroll(d.lines.len());
         }
     }
 
@@ -1572,5 +1586,30 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         y,
         width: popup_width,
         height: popup_height,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::max_scroll;
+
+    #[test]
+    fn max_scroll_is_last_line_index() {
+        assert_eq!(max_scroll(0), 0);
+        assert_eq!(max_scroll(1), 0);
+        assert_eq!(max_scroll(2), 1);
+        assert_eq!(max_scroll(100), 99);
+    }
+
+    /// The point of the helper: past u16::MAX lines the offset saturates
+    /// instead of wrapping. `len as u16` would give 0 here, and the pane
+    /// would refuse to scroll at all.
+    #[test]
+    fn max_scroll_saturates_past_u16() {
+        assert_eq!(max_scroll(usize::from(u16::MAX)), u16::MAX - 1);
+        assert_eq!(max_scroll(usize::from(u16::MAX) + 1), u16::MAX);
+        assert_eq!(max_scroll(usize::from(u16::MAX) + 2), u16::MAX);
+        assert_eq!(max_scroll(1_000_000), u16::MAX);
+        assert_eq!(max_scroll(usize::MAX), u16::MAX);
     }
 }

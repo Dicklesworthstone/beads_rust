@@ -93,7 +93,9 @@ pub fn execute(cli: &config::CliOverrides, _ctx: &OutputContext) -> Result<()> {
         ));
     }
 
-    let pid = i64::try_from(std::process::id()).unwrap_or(0);
+    // process::id() is u32, so widening to i64 is infallible — the old
+    // try_from/unwrap_or(0) could only ever have recorded a bogus pid 0.
+    let pid = i64::from(std::process::id());
     let started_at = Utc::now();
     let cwd = std::env::current_dir()
         .ok()
