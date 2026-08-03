@@ -455,10 +455,10 @@ impl OutputContext {
 /// styles the message without being able to eat any of it.
 fn rich_semantic_line(glyph_markup: &str, message_style: Option<&str>, message: &str) -> String {
     let escaped = crate::format::escape_markup(message);
-    match message_style {
-        Some(style) => format!("{glyph_markup} [{style}]{escaped}[/]"),
-        None => format!("{glyph_markup} {escaped}"),
-    }
+    message_style.map_or_else(
+        || format!("{glyph_markup} {escaped}"),
+        |style| format!("{glyph_markup} [{style}]{escaped}[/]"),
+    )
 }
 
 #[cfg(test)]
