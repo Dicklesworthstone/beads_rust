@@ -13,7 +13,7 @@ use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
-    IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
+    IssueWithCounts, TextFormatOptions, csv, escape_markup, format_issue_line_with, terminal_width,
 };
 use crate::model::{Comment, IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
@@ -211,6 +211,11 @@ pub fn execute(
 }
 
 /// Render the "why did this match?" line for a comment-sourced hit.
+///
+/// Author and snippet are escaped, and the attribution is parenthesised
+/// rather than bracketed: this line goes to the console as a string, where
+/// `[alice]` would be read as a style tag and dropped. The rich table path
+/// builds `Text` directly and so needs neither.
 fn format_comment_match_line(comment: &Comment, query: &str) -> String {
     let snippet = build_highlight_regex(query)
         .and_then(|regex| regex.find(&comment.body).map(|mat| (regex, mat.start(), mat.end())))
@@ -218,7 +223,11 @@ fn format_comment_match_line(comment: &Comment, query: &str) -> String {
             || first_line(&comment.body),
             |(_, start, end)| snippet_around_match(&comment.body, start, end, 40),
         );
-    format!("    comment [{}]: {}", comment.author, snippet)
+    format!(
+        "    comment ({}): {}",
+        escape_markup(&comment.author),
+        escape_markup(&snippet)
+    )
 }
 
 /// First line of a body, for when the match position is unavailable.

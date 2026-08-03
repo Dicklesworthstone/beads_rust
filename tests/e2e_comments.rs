@@ -71,6 +71,71 @@ fn comments_add_then_list_shows_author_and_body() {
     assert!(first < second, "comments must read forwards in time");
 }
 
+/// The author must appear in the *rendered* log, not merely in the row.
+/// Attribution is the entire reason to prefer a comment over a hand-typed
+/// line in `notes`, so a text view that shows the timestamp and body but
+/// drops the name has failed at the one job the feature exists to do.
+#[test]
+fn comments_list_text_names_the_author() {
+    common::init_test_logging();
+    let (workspace, id) = workspace_with_issue("Attributed in text");
+
+    let add = run_br_with_env(
+        &workspace,
+        ["comments", "add", &id, "who said this matters"],
+        [("BD_AGENT_ID", "planner9")],
+        "add_named",
+    );
+    assert!(add.status.success(), "add failed: {}", add.stderr);
+
+    let list = run_br(&workspace, ["comments", &id], "list_named");
+    assert!(list.status.success(), "comments failed: {}", list.stderr);
+    assert!(
+        list.stdout.contains("planner9"),
+        "the author must be visible in the text log, got: {}",
+        list.stdout
+    );
+
+    let show = run_br(&workspace, ["show", &id], "show_named");
+    assert!(
+        show.stdout.contains("planner9"),
+        "the author must be visible in show, got: {}",
+        show.stdout
+    );
+}
+
+/// A body is a verbatim record. The console parses what it is handed as
+/// markup, so a body mentioning `[bold]` — entirely ordinary when the
+/// subject is CLI output or formatting — would be read as a style tag and
+/// silently deleted. Losing part of what someone wrote, invisibly, is
+/// strictly worse than an ugly line: the reader cannot tell it happened.
+#[test]
+fn comment_body_containing_markup_renders_verbatim() {
+    common::init_test_logging();
+    let (workspace, id) = workspace_with_issue("Markup in a body");
+
+    let body = "use [bold] for headings and [red]for errors";
+    add_comment(&workspace, &id, body, "add_markup");
+
+    // Ground truth: JSON is not rendered, so it shows what was stored.
+    let json = run_br(&workspace, ["comments", &id, "--json"], "list_markup_json");
+    let comments = json_of(&json.stdout);
+    assert_eq!(comments.as_array().expect("array")[0]["text"], body);
+
+    for (args, label) in [
+        (vec!["comments", id.as_str()], "list_markup_text"),
+        (vec!["show", id.as_str()], "show_markup_text"),
+    ] {
+        let out = run_br(&workspace, args, label);
+        assert!(out.status.success(), "{label} failed: {}", out.stderr);
+        assert!(
+            out.stdout.contains("[bold]") && out.stdout.contains("[red]"),
+            "{label} dropped markup from the body, got: {}",
+            out.stdout
+        );
+    }
+}
+
 /// Appending must not disturb what is already there. This is the property
 /// that `bd update --notes` cannot offer: it replaces.
 #[test]

@@ -3,7 +3,7 @@
 use crate::cli::{ShowArgs, resolve_output_format_basic};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{format_priority_label, format_status_icon_colored};
+use crate::format::{escape_markup, format_priority_label, format_status_icon_colored};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::util::id::IdResolver;
 use std::fmt::Write as FmtWrite;
@@ -251,12 +251,15 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
             );
         }
         for comment in &details.comments {
+            // Author and body are stored data, so they are escaped: the
+            // console parses what it is given as markup and would eat a
+            // `[bold]` in a body outright. See `format::escape_markup`.
             let _ = writeln!(
                 output,
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
-                comment.author,
-                comment.body
+                escape_markup(&comment.author),
+                escape_markup(&comment.body)
             );
         }
     }

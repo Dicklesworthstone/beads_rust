@@ -29,6 +29,7 @@ use crate::cli::{
 };
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::format::escape_markup;
 use crate::model::Comment;
 use crate::output::{OutputContext, OutputMode};
 use crate::storage::SqliteStorage;
@@ -193,6 +194,13 @@ fn list(args: &CommentsArgs, cli: &config::CliOverrides, outer_ctx: &OutputConte
 }
 
 /// Render the full comment log as text.
+///
+/// Author and body are escaped before they reach the console. Text printed
+/// through the rich console is parsed as markup, and a `[word]` sequence is
+/// taken for a style tag and consumed — so an unescaped author would vanish
+/// from its own heading, and a body mentioning `[bold]` would be silently
+/// rewritten. A record that quietly drops part of what someone wrote is
+/// worse than no record, so every piece of stored data is escaped here.
 fn format_comment_log(id: &str, comments: &[Comment]) -> String {
     if comments.is_empty() {
         return format!("No comments on {id}.");
@@ -204,12 +212,12 @@ fn format_comment_log(id: &str, comments: &[Comment]) -> String {
         out.push('\n');
         let _ = writeln!(
             out,
-            "[{}] at {}",
-            comment.author,
+            "{} at {}",
+            escape_markup(&comment.author),
             comment.created_at.format("%Y-%m-%d %H:%M")
         );
         for line in comment.body.lines() {
-            let _ = writeln!(out, "    {line}");
+            let _ = writeln!(out, "    {}", escape_markup(line));
         }
         if comment.body.is_empty() {
             // An empty body is legal; say so rather than rendering a
@@ -413,11 +421,30 @@ mod tests {
 
         let out = format_comment_log("bd-1", &comments);
         assert!(out.starts_with("Comments on bd-1 (2)"));
-        assert!(out.contains("[alice] at 2026-01-02 03:04"));
+        // The author is not bracketed: a bare `[alice]` is indistinguishable
+        // from a style tag to the console and would be swallowed whole.
+        assert!(out.contains("alice at 2026-01-02 03:04"));
         assert!(out.contains("    line one"));
         assert!(out.contains("    line two"));
-        assert!(out.contains("[bob] at 2026-01-03 04:05"));
+        assert!(out.contains("bob at 2026-01-03 04:05"));
         assert!(out.contains("(empty)"));
+    }
+
+    /// A body is a verbatim record, so bracketed text in it survives to the
+    /// console as an escape rather than being parsed away as markup.
+    #[test]
+    fn format_comment_log_escapes_markup_in_body_and_author() {
+        let comments = vec![Comment {
+            id: 1,
+            issue_id: "bd-1".to_string(),
+            author: "[bot]".to_string(),
+            body: "use [bold] for headings".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 0).unwrap(),
+        }];
+
+        let out = format_comment_log("bd-1", &comments);
+        assert!(out.contains("\\[bot] at"), "author escaped: {out}");
+        assert!(out.contains("use \\[bold] for headings"), "body escaped: {out}");
     }
 
     #[test]

@@ -263,6 +263,26 @@ pub fn format_issue_age_field(issue: &Issue) -> String {
     }
 }
 
+/// Escape stored text so the rich console renders it verbatim.
+///
+/// Text handed to the console is parsed as markup, and its tag pattern
+/// matches `[` followed by a letter, `#`, `/` or `@` — so a body that
+/// mentions `[bold]`, or an author literally named `[bot]`, is taken for a
+/// style tag and consumed. Existing call sites have been safe only by
+/// accident, bracketing timestamps and glyphs that begin with a digit or a
+/// symbol. Anything read back out of storage and shown to a human should go
+/// through here: silently deleting part of what someone wrote is a worse
+/// failure than an ugly line, because the reader cannot tell it happened.
+#[must_use]
+pub fn escape_markup(text: &str) -> String {
+    // Mirrors the console's own escape rule: a literal `[` is written `\[`.
+    if text.contains('[') {
+        text.replace('[', "\\[")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Format the compact comment indicator for a listing: how much history
 /// an issue has, and how fresh it is.
 ///
@@ -378,6 +398,16 @@ pub fn format_issue_line(issue: &Issue) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// The escape is only interesting for the bracket; everything else must
+    /// pass through untouched so ordinary text is never disfigured.
+    #[test]
+    fn escape_markup_only_touches_brackets() {
+        assert_eq!(escape_markup("plain text"), "plain text");
+        assert_eq!(escape_markup("closing ] alone"), "closing ] alone");
+        assert_eq!(escape_markup("use [bold] here"), "use \\[bold] here");
+        assert_eq!(escape_markup("[a] and [b]"), "\\[a] and \\[b]");
+    }
 
     fn make_test_issue() -> Issue {
         Issue {
