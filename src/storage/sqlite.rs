@@ -2268,6 +2268,11 @@ impl SqliteStorage {
     ///
     /// Returns an error if the connection cannot be established or schema application fails.
     pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
+        // GitHub #403: a group/other-readable namespace sidecar makes the open
+        // below fail with a bare "unable to open database file" naming the
+        // sidecar. Repair the mode (or explain it) before the engine gets a
+        // chance to mis-attribute the failure to the database.
+        heal_namespace_sidecar_modes(path)?;
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
@@ -2321,6 +2326,9 @@ impl SqliteStorage {
             return Ok(None);
         }
 
+        // GitHub #403: read-only commands take this path, and they wedge on an
+        // over-permissive namespace sidecar exactly like writers do.
+        heal_namespace_sidecar_modes(path)?;
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2360,6 +2368,7 @@ impl SqliteStorage {
             return Ok(None);
         }
 
+        heal_namespace_sidecar_modes(path)?;
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -15504,6 +15513,82 @@ fn remove_temp_db_files(path: &Path) {
     }
 }
 
+/// Repair over-permissive modes on the fsqlite namespace sidecars that live
+/// beside `db_path`, before anything tries to open the database (GitHub #403).
+///
+/// fsqlite refuses to open `<db>-fsqlite-ns-gate` / `-fsqlite-ns-use` when the
+/// file carries any bit in `0o077`, and the refusal surfaces as a bare
+/// `Database error: unable to open database file: '<sidecar>'`, which reads as
+/// database corruption and wedges every `br` command — reads included — until
+/// a human notices the mode. The sidecars are regenerable engine state, not
+/// user data, so when this process can chmod them we strip the group/other
+/// bits and continue. When we cannot, we return an error that names the file,
+/// the observed mode, and the required mode instead of letting the engine
+/// report an unattributable `DATABASE_ERROR`.
+///
+/// A `chmod` succeeds only for the file's owner (or root), so attempting it is
+/// itself the ownership test — no uid probing is needed in a crate that
+/// forbids `unsafe`.
+///
+/// # Errors
+///
+/// Returns an error when a sidecar is over-permissive and this process cannot
+/// restore owner-only permissions.
+fn heal_namespace_sidecar_modes(db_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+
+            let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
+                continue;
+            };
+            // A symlinked sidecar is out of scope: following it would chmod a
+            // file outside the database family.
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 == 0 {
+                continue;
+            }
+
+            let repaired = mode & !0o077;
+            if let Err(err) =
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(repaired))
+            {
+                return Err(BeadsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "fsqlite namespace sidecar {} has mode {:04o}; fsqlite requires \
+                         owner-only permissions (0600) and this process could not repair it \
+                         ({err}). The database itself is fine — run `chmod 0600 {}` (or have \
+                         its owner do so) and retry.",
+                        sidecar.display(),
+                        mode & 0o7777,
+                        sidecar.display()
+                    ),
+                )));
+            }
+            tracing::debug!(
+                sidecar = %sidecar.display(),
+                observed_mode = format!("{:04o}", mode & 0o7777),
+                repaired_mode = format!("{:04o}", repaired & 0o7777),
+                "repaired over-permissive fsqlite namespace sidecar mode",
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+    }
+    Ok(())
+}
+
 fn database_header_user_version(path: &Path) -> Option<u32> {
     if path == Path::new(":memory:") || !path.is_file() {
         return None;
@@ -19038,6 +19123,68 @@ mod tests {
             assert_eq!(issue.status, Status::InProgress);
             assert!(issue.acceptance_criteria.is_none());
             assert!(storage.get_comments(id).unwrap().is_empty());
+        }
+    }
+
+    /// GitHub #403: fsqlite refuses to open a namespace sidecar
+    /// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) that carries any bit in
+    /// `0o077`, and the refusal surfaced as a bare "unable to open database
+    /// file" naming the sidecar — wedging every command until a human noticed
+    /// the mode. The open path now repairs the mode first, because the
+    /// sidecars are regenerable engine state rather than user data.
+    #[cfg(unix)]
+    #[test]
+    fn over_permissive_namespace_sidecar_mode_is_healed_before_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let issue = make_issue(
+                "bd-ns",
+                "sidecar mode",
+                Status::Open,
+                2,
+                None,
+                Utc::now(),
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let mut loosened = Vec::new();
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.is_file() {
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o664)).unwrap();
+                loosened.push(sidecar);
+            }
+        }
+        assert!(
+            !loosened.is_empty(),
+            "expected fsqlite namespace sidecars beside {}",
+            db_path.display()
+        );
+
+        // Pre-fix this open failed with a bare `DATABASE_ERROR` naming the
+        // sidecar; the database itself was never damaged.
+        let storage = SqliteStorage::open(&db_path)
+            .expect("open must repair the sidecar mode instead of failing");
+        assert!(storage.get_issue("bd-ns").unwrap().is_some());
+        drop(storage);
+
+        for sidecar in loosened {
+            let mode = fs::metadata(&sidecar).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "sidecar {} still group/other accessible (mode {:04o})",
+                sidecar.display(),
+                mode & 0o7777
+            );
         }
     }
 

@@ -850,6 +850,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
         "permissions.root_gitignore",
         "fm-permissions-gitignore-not-writable-blocks-repair",
     ),
+    (
+        "permissions.db_sidecars",
+        "fm-permissions-db-sidecar-mode-too-open",
+    ),
     ("jsonl.duplicate_ids", "fm-state_files-jsonl-duplicate-ids"),
     ("comments.orphans", "fm-caches_indexes-comments-orphans"),
     ("labels.orphans", "fm-caches_indexes-labels-orphans"),
@@ -6004,6 +6008,177 @@ fn fix_config_yaml_secret_mode_if_warned(
     #[cfg(not(unix))]
     {
         let _ = (beads_dir, session);
+        false
+    }
+}
+
+/// Detector for `fm-permissions-db-sidecar-mode-too-open` (GitHub #403).
+///
+/// fsqlite refuses to open a namespace sidecar (`-fsqlite-ns-gate` /
+/// `-fsqlite-ns-use`) carrying any bit in `0o077`, and the refusal reaches the
+/// operator as a bare `Database error: unable to open database file: '<sidecar>'`
+/// — which reads as database corruption. The storage layer now repairs an
+/// owned sidecar on open, so this check is the visible half: it names the file
+/// and the mode whenever the workspace still holds one that is group- or
+/// other-accessible (a sidecar owned by another user is the case the storage
+/// layer cannot fix by itself).
+///
+/// On non-Unix targets the mode check is a no-op (always Ok).
+fn check_db_sidecar_modes(db_path: &Path, checks: &mut Vec<CheckResult>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut offenders = Vec::new();
+        for sidecar in fsqlite_namespace_sidecar_paths(db_path) {
+            let Ok(meta) = fs::symlink_metadata(&sidecar) else {
+                continue;
+            };
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o077 != 0 {
+                offenders.push((sidecar, mode));
+            }
+        }
+
+        if offenders.is_empty() {
+            push_check(
+                checks,
+                "permissions.db_sidecars",
+                CheckStatus::Ok,
+                None,
+                None,
+            );
+            return;
+        }
+
+        let summary = offenders
+            .iter()
+            .map(|(path, mode)| format!("{} (mode {mode:04o})", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remediation = offenders
+            .iter()
+            .map(|(path, _)| format!("chmod 0600 {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        push_check(
+            checks,
+            "permissions.db_sidecars",
+            CheckStatus::Warn,
+            Some(format!(
+                "fsqlite namespace sidecar(s) are group/other accessible and block every \
+                 database open until the mode is owner-only (0600): {summary}"
+            )),
+            Some(serde_json::json!({
+                "sidecars": offenders
+                    .iter()
+                    .map(|(path, mode)| serde_json::json!({
+                        "path": path.display().to_string(),
+                        "mode_octal": format!("{mode:04o}"),
+                    }))
+                    .collect::<Vec<_>>(),
+                "required_mode_octal": "0600",
+                "remediation": remediation,
+            })),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+        push_check(
+            checks,
+            "permissions.db_sidecars",
+            CheckStatus::Ok,
+            None,
+            None,
+        );
+    }
+}
+
+/// Fixer for `fm-permissions-db-sidecar-mode-too-open` (GitHub #403).
+///
+/// Strips the group/other bits (`0o077` mask) from every flagged fsqlite
+/// namespace sidecar through [`chokepoint::mutate(Op::Chmod)`], so the change
+/// is backed up, audited in `actions.jsonl`, and reversible via `doctor undo`.
+/// Owner bits are preserved (`0o700` is an accepted mode); only the bits that
+/// make the engine refuse the open are removed. A sidecar this process does
+/// not own fails the chmod and stays flagged, which is the correct outcome —
+/// its owner has to act.
+///
+/// Unix-only; the detector always reports Ok elsewhere so the fixer is
+/// unreachable there.
+fn fix_db_sidecar_modes_if_warned(
+    db_path: &Path,
+    report: &DoctorReport,
+    ctx: &OutputContext,
+    session: Option<&mut DoctorRepairSession>,
+) -> bool {
+    let has_warning = report
+        .checks
+        .iter()
+        .any(|c| c.name == "permissions.db_sidecars" && c.status == CheckStatus::Warn);
+    if !has_warning {
+        return false;
+    }
+    let Some(session) = session else {
+        if !ctx.is_json() {
+            ctx.warning(
+                "Skipping database sidecar chmod: no doctor repair session (run-dir creation failed)",
+            );
+        }
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut repaired_any = false;
+        for sidecar in fsqlite_namespace_sidecar_paths(db_path) {
+            let Ok(meta) = fs::symlink_metadata(&sidecar) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                continue;
+            }
+            let current = meta.permissions().mode();
+            // Already owner-only — TOCTOU defense (the storage layer may have
+            // self-healed it between detection and repair).
+            if (current & 0o077) == 0 {
+                continue;
+            }
+            let new_mode = current & !0o077;
+            session.set_fixer("doctor.db_sidecar_mode_chmod");
+            match chokepoint::mutate(&session.ctx, &sidecar, Op::Chmod { mode: new_mode }) {
+                Ok(result) if result.ok => {
+                    repaired_any = true;
+                    if !ctx.is_json() {
+                        ctx.info(&format!(
+                            "Restored owner-only mode on {} ({:o}→{:o})",
+                            sidecar.display(),
+                            current & 0o777,
+                            new_mode & 0o777
+                        ));
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    if !ctx.is_json() {
+                        ctx.warning(&format!(
+                            "Failed to chmod database sidecar {}: {err}",
+                            sidecar.display()
+                        ));
+                    }
+                }
+            }
+        }
+        repaired_any
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (db_path, session);
         false
     }
 }
@@ -11506,6 +11681,10 @@ fn collect_doctor_report_with_mode_and_db_override(
     // Pass-5 cycle 32: writability of the repo-root `.gitignore` —
     // surfaces a real blocker to the existing gitignore_repair fixer.
     check_root_gitignore_writable(repo_root, &mut checks);
+    // GitHub #403: an fsqlite namespace sidecar with group/other bits blocks
+    // every database open while doctor otherwise reports "healthy". This is a
+    // pure stat of the database family, so it runs in `--no-db` mode too.
+    check_db_sidecar_modes(&paths.db_path, &mut checks);
     // Pass-5 cycle 11: world-readable config.yaml containing secrets.
     check_config_yaml_secret_mode(beads_dir, &mut checks);
     // Pass-5 cycle 12: multiple `br` binaries on $PATH (env-based,
@@ -12506,6 +12685,22 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
     let _ = config_yaml_secret_mode_repaired;
+
+    // GitHub #403: restore owner-only mode on fsqlite namespace sidecars that
+    // would otherwise wedge every database open, via Op::Chmod.
+    let db_sidecar_mode_repaired = if args.repair
+        && fixer_filter.allows("fm-permissions-db-sidecar-mode-too-open")
+    {
+        let repaired =
+            fix_db_sidecar_modes_if_warned(&paths.db_path, &initial.report, ctx, session.as_mut());
+        if repaired {
+            initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
+        }
+        repaired
+    } else {
+        false
+    };
+    let _ = db_sidecar_mode_repaired;
 
     // Pass-5 cycle 27: append missing canonical patterns to .beads/.gitignore
     // via Op::AppendFile.
@@ -17682,6 +17877,75 @@ mod tests {
             let after_meta = fs::symlink_metadata(beads_dir.join(".gitignore")).unwrap();
             assert!(after_meta.file_type().is_symlink());
         }
+    }
+
+    /// GitHub #403: a group/other-accessible fsqlite namespace sidecar wedges
+    /// every database open while doctor reported the workspace healthy and
+    /// said nothing at all. The check must name the file and its mode, and
+    /// `--repair` must restore owner-only permissions through the chokepoint.
+    #[cfg(unix)]
+    #[test]
+    fn test_db_sidecar_mode_check_flags_and_repairs_over_permissive_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        fs::write(&db_path, b"SQLite format 3\0").unwrap();
+        let gate = beads_dir.join("beads.db-fsqlite-ns-gate");
+        let use_file = beads_dir.join("beads.db-fsqlite-ns-use");
+        fs::write(&gate, b"FSQLNS01").unwrap();
+        fs::write(&use_file, b"FSQLNS01").unwrap();
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o664)).unwrap();
+        fs::set_permissions(&use_file, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut report = DoctorReport {
+            ok: false,
+            workspace_health: Some("degraded".to_string()),
+            reliability_audit: None,
+            checks: Vec::new(),
+        };
+        check_db_sidecar_modes(&db_path, &mut report.checks);
+        let check = find_check(&report.checks, "permissions.db_sidecars").expect("check present");
+        assert_eq!(check.status, CheckStatus::Warn);
+        let message = check.message.clone().unwrap_or_default();
+        assert!(
+            message.contains("beads.db-fsqlite-ns-gate") && message.contains("0664"),
+            "message must name the sidecar and its mode: {message}"
+        );
+        assert!(
+            !message.contains("beads.db-fsqlite-ns-use"),
+            "the owner-only sidecar must not be flagged: {message}"
+        );
+
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
+        assert!(fix_db_sidecar_modes_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
+        let repaired = fs::metadata(&gate).unwrap().permissions().mode() & 0o777;
+        assert_eq!(repaired & 0o077, 0, "group/other bits must be cleared");
+        assert_eq!(repaired, 0o600, "owner bits preserved, group/other removed");
+
+        // Re-detect is clean, and a second repair is a no-op.
+        let mut after = Vec::new();
+        check_db_sidecar_modes(&db_path, &mut after);
+        assert_eq!(
+            find_check(&after, "permissions.db_sidecars")
+                .expect("check present")
+                .status,
+            CheckStatus::Ok
+        );
+        assert!(!fix_db_sidecar_modes_if_warned(
+            &db_path,
+            &report,
+            &ctx,
+            Some(&mut session),
+        ));
     }
 
     #[cfg(unix)]
