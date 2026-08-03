@@ -1,5 +1,8 @@
 use super::common::cli::{BrWorkspace, run_br};
-use super::{create_issue, init_workspace, normalize_output, normalize_output_with_age_masking};
+use super::{
+    compose_invocation, create_issue, init_workspace, normalize_output,
+    normalize_output_with_age_masking, parse_created_id,
+};
 use insta::assert_snapshot;
 
 #[cfg(feature = "self_update")]
@@ -42,12 +45,34 @@ fn snapshot_create_help() {
     assert_snapshot!("create_help", normalize_output(&output.stdout));
 }
 
+/// `br list` on a workspace with no issues.
+///
+/// This snapshot recorded ZERO BYTES. That expectation cannot fail: it is
+/// equally satisfied by `br list` working correctly, by `br list` dying
+/// before it printed anything, by its output going to stderr, and by the
+/// subcommand being deleted — every one of those exits 0 and prints nothing
+/// to stdout. It sat in the suite looking like a test of `br list`.
+///
+/// The silence itself is correct and is NOT a bug: `src/cli/commands/list.rs`
+/// keeps stdout empty here deliberately, to match the Go `bd` reference
+/// implementation (there are four conformance suites riding on that), and
+/// `br list | wc -l` scripts depend on it. So the fix is to state the
+/// expectation in a form that can fail, not to make the command speak.
+///
+/// The composed value pins all three facts — exit status, stdout, stderr —
+/// each labelled. `stdout: <empty>` is now an assertion. The stderr block
+/// pins that the command actually did its work (path validation, auto-import
+/// of zero records, blocked-cache rebuild) rather than exiting early, which
+/// is what makes "printed nothing" distinguishable from "did nothing".
 #[test]
 fn snapshot_list_empty() {
     let workspace = init_workspace();
     let output = run_br(&workspace, ["list"], "list_empty");
     assert!(output.status.success(), "list failed: {}", output.stderr);
-    assert_snapshot!("list_empty", normalize_output(&output.stdout));
+    assert_snapshot!(
+        "list_empty",
+        compose_invocation("br list", &output.stdout, &output.stderr, output.status)
+    );
 }
 
 #[test]
@@ -68,14 +93,69 @@ fn snapshot_list_with_issues() {
     );
 }
 
+/// `br show` on an issue that HAS a description.
+///
+/// The issue was titled "Test issue with description" and had none: the
+/// fixture never passed `-d`, so the recorded value stopped at the metadata
+/// header and the description render path — the one place `br show` puts
+/// stored prose on screen — was not in any snapshot. That path is exactly
+/// where the stray-backslash regression shipped, an over-eager markup escape
+/// applied at a sink that does not parse markup, printing `use \[bold]` for
+/// a body that says `use [bold]`.
+///
+/// Both the title and the description now carry bracketed text, so this
+/// snapshot pins both directions of the markup bug: content EATEN (the
+/// brackets vanishing, as `br search` once did to a `[task]` badge) and
+/// content OVER-ESCAPED (a backslash appearing). Either one changes these
+/// bytes, and `no_snapshot_records_a_markup_escape_artifact` in
+/// tests/snapshot_hygiene.rs fails on the escape direction even if someone
+/// re-records.
+///
+/// The description is deliberately a full open/close tag pair around a word
+/// (`[red]errors[/red]`), the shape a markup parser is most likely to
+/// consume, while still reading as an ordinary sentence — so the recorded
+/// value can be reviewed as correct on its face. A snapshot whose expected
+/// text looks half-eaten even when it is right teaches the next reader to
+/// shrug at damage.
 #[test]
 fn snapshot_show_output() {
     let workspace = init_workspace();
-    let id = create_issue(&workspace, "Test issue with description", "create_show");
+    let created = run_br(
+        &workspace,
+        [
+            "create",
+            "Test issue with [brackets] in the title",
+            "-d",
+            "Use [bold] for headings and [red]errors[/red] for failures.",
+        ],
+        "create_show",
+    );
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        created.stderr
+    );
+    let id = parse_created_id(&created.stdout);
 
     let output = run_br(&workspace, ["show", &id], "show_text");
     assert!(output.status.success(), "show failed: {}", output.stderr);
-    assert_snapshot!("show_output", normalize_output(&output.stdout));
+    let normalized = normalize_output(&output.stdout);
+    // Belt and braces, in the two directions this has actually failed:
+    // asserted here as well as pinned in the snapshot, so a re-record cannot
+    // quietly bless either one.
+    for expected in ["[brackets]", "[bold]", "[red]errors[/red]"] {
+        assert!(
+            normalized.contains(expected),
+            "bracketed text {expected:?} was eaten between storage and \
+             screen:\n{normalized}"
+        );
+    }
+    assert!(
+        !normalized.contains("\\["),
+        "a markup escape reached the screen; the stored text has no \
+         backslash:\n{normalized}"
+    );
+    assert_snapshot!("show_output", normalized);
 }
 
 #[test]

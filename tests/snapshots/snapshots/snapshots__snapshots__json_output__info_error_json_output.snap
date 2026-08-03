@@ -1,7 +1,0 @@
----
-source: tests/snapshots/json_output.rs
-expression: json
----
-{
-  "error": "no beads directory found"
-}

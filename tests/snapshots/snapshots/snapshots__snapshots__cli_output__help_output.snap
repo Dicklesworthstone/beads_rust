@@ -2,7 +2,7 @@
 source: tests/snapshots/cli_output.rs
 expression: normalize_output(&output.stdout)
 ---
-ID-REDACTED issue tracker (SQLite + JSONL)
+Agent-first issue tracker (SQLite + JSONL)
 
 Usage: br [OPTIONS] <COMMAND>
 
@@ -19,21 +19,21 @@ Commands:
   create    Create a new issue
   q         Quick capture (create issue, print ID only)
   update    Update an issue
-  comments  Read or append an issue's comments (ID-REDACTED attributed history)
+  comments  Read or append an issue's comments (append-only attributed history)
   close     Close an issue
   reopen    Reopen an issue
   defer     Defer issues (schedule for later)
   undefer   Undefer issues (make ready again)
   dep       Manage dependencies
-  admin     ID-REDACTED / diagnostic commands (init, dash, graph, stats, sync, ...)
+  admin     Power-user / diagnostic commands (init, dash, graph, stats, sync, ...)
   version   Show version information
   help      Print this message or the help of the given subcommand(s)
 
 Options:
-      --db <DB>     Database path (ID-REDACTED .beads/*.db if not set)
+      --db <DB>     Database path (auto-discover .beads/*.db if not set)
       --json        Output as JSON
   -v, --verbose...  Increase logging verbosity (-v, -vv)
   -q, --quiet       Quiet mode (no output except errors)
-      --ID-REDACTED    Disable colored output
+      --no-color    Disable colored output
   -h, --help        Print help
   -V, --version     Print version

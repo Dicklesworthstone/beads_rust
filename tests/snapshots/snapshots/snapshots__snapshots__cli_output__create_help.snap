@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots/cli_output.rs
-assertion_line: 42
 expression: normalize_output(&output.stdout)
 ---
 Create a new issue
@@ -17,21 +16,21 @@ Options:
   -d, --description <DESCRIPTION>    Description [aliases: --body]
   -a, --assignee <ASSIGNEE>          Assign to person
       --owner <OWNER>                Set owner email
-      --parent <PARENT>              Parent issue ID (creates ID-REDACTED dep)
+      --parent <PARENT>              Parent issue ID (creates parent-child dep)
       --deps <DEPS>                  Dependencies (format: type:id,type:id)
   -e, --estimate <ESTIMATE>          Time estimate in minutes
       --due <DUE>                    Due date (RFC3339 or relative)
       --defer <DEFER>                Defer until date (RFC3339 or relative)
-      --ID-REDACTED <EXTERNAL_REF>  External reference
+      --external-ref <EXTERNAL_REF>  External reference
       --ephemeral                    Mark as ephemeral (not exported to JSONL)
   -s, --status <STATUS>              Initial status (open, deferred, in_progress, closed)
       --prefix <PREFIX>              Issue ID prefix for the new bead (required; e.g. `--prefix demo`). There is no default — env vars and config no longer supply one
-      --ID-REDACTED                      Preview without creating
+      --dry-run                      Preview without creating
       --silent                       Output only issue ID
   -f, --file <FILE>                  Create issues from a markdown file (bulk import)
-      --db <DB>                      Database path (ID-REDACTED .beads/*.db if not set)
+      --db <DB>                      Database path (auto-discover .beads/*.db if not set)
       --json                         Output as JSON
   -v, --verbose...                   Increase logging verbosity (-v, -vv)
   -q, --quiet                        Quiet mode (no output except errors)
-      --ID-REDACTED                     Disable colored output
+      --no-color                     Disable colored output
   -h, --help                         Print help

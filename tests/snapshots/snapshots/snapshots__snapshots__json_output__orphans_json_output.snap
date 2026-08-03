@@ -2,4 +2,12 @@
 source: tests/snapshots/json_output.rs
 expression: normalize_json(&json)
 ---
-[]
+[
+  {
+    "issue_id": "ISSUE_ID",
+    "title": "Issue left open after a commit",
+    "status": "open",
+    "latest_commit": "COMMIT_HASH",
+    "latest_commit_message": "fix(ISSUE_ID): close the login hole"
+  }
+]

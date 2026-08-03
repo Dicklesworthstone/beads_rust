@@ -5,7 +5,7 @@ expression: "normalize_output(&format!(\"{}{}\", output.stdout, output.stderr))"
 Updated ID-REDACTED: Will close
   status: closed → in_progress
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::storage::sqlite: src/storage/sqlite.rs:LINE: Rebuilt blocked issues cache blocked_count=0
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: ID-REDACTED: exporting dirty issues dirty_count=1
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Auto-flush: exporting dirty issues dirty_count=1
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Validating sync path path=./.beads/issues.jsonl beads_dir=./.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Path validated for sync I/O path=./.beads/issues.jsonl
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Export path validated output_path=./.beads/issues.jsonl beads_dir=./.beads allow_external=false
@@ -16,4 +16,4 @@ YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Sync pa
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Validating sync path path=./.beads/issues.jsonl beads_dir=./.beads
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Path validated for sync I/O path=./.beads/issues.jsonl
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Sync path approved for destructive operation path=./.beads/issues.jsonl operation="overwrite JSONL output"
-YYYY-MM-DDTHH:MM:SS  INFO beads_rust::sync: src/sync/mod.rs:LINE: ID-REDACTED complete exported=1
+YYYY-MM-DDTHH:MM:SS  INFO beads_rust::sync: src/sync/mod.rs:LINE: Auto-flush complete exported=1

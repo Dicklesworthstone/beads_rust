@@ -6,7 +6,7 @@ YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Validat
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Path validated for sync I/O path=./.beads/issues.jsonl
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Import path validated input_path=./.beads/issues.jsonl beads_dir=./.beads allow_external=false
 YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::storage::sqlite: src/storage/sqlite.rs:LINE: Rebuilt blocked issues cache blocked_count=0
-YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: ID-REDACTED completed imported_count=0 jsonl_path=./.beads/issues.jsonl
+YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Auto-import completed imported_count=0 jsonl_path=./.beads/issues.jsonl
 {
   "error": {
     "code": "INVALID_PRIORITY",

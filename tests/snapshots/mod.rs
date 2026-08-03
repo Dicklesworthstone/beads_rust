@@ -1,3 +1,57 @@
+//! Recorded-output ("golden"/snapshot) tests for the `br` CLI.
+//!
+//! READ THIS BEFORE RE-RECORDING ANYTHING.
+//!
+//! A snapshot test knows exactly one thing: whether output CHANGED. It knows
+//! nothing about whether output is CORRECT. Whatever was in the buffer on the
+//! day someone ran `cargo insta accept` becomes ground truth, and every run
+//! afterwards defends it — including any defect it happened to contain. So a
+//! green snapshot suite is not evidence that the output is right; it is
+//! evidence that the output is the same as it was.
+//!
+//! That is not hypothetical here. `cli_output__search_output.snap` once
+//! recorded a `br search` line with its `[task]` type badge missing and the
+//! title truncated, because the console-markup parser was eating bracketed
+//! text. The test passed for the entire life of the bug, and it FAILED the
+//! fix: restoring the badge changed the bytes. The obvious response —
+//! re-record — would have enshrined the corruption a second time.
+//!
+//! WHAT `cargo insta accept` PROVES: that the new bytes are the bytes the
+//! code currently emits. WHAT IT DOES NOT PROVE: that those bytes are right.
+//! When a snapshot fails, the question is never "does the code still produce
+//! the old value?" but "which of these two values SHOULD the command print?"
+//! — and the answer has to come from the command's intent, not from the diff.
+//!
+//! CONVENTIONS THIS MODULE FOLLOWS, each of which exists because it was
+//! violated:
+//!
+//! 1. A recorded value must be reviewable as CORRECT ON ITS FACE. If reading
+//!    the `.snap` cannot tell you whether the command behaved, the fixture is
+//!    too thin — see `snapshot_show_output`, which asserted a description
+//!    render path with an issue that had no description.
+//!
+//! 2. An empty or trivially-satisfiable value must be EARNED. `[]`, `0` and a
+//!    zero-byte file are what a command prints when it works and also when it
+//!    is completely broken. Either populate the fixture so the empty answer
+//!    comes from filtering, or compose the value with its surrounding facts
+//!    (`compose_invocation`). `tests/snapshot_hygiene.rs` enforces this.
+//!
+//! 3. THE NORMALIZER IS PART OF THE ORACLE. Everything here passes through
+//!    `normalize_output`/`normalize_json` before being recorded, so an
+//!    over-broad masking rule destroys content BEFORE it reaches the expected
+//!    value — and unlike a rendering bug, nothing downstream can ever detect
+//!    it. A blanket `\w+-[a-z0-9]{3,}` ID rule silently rewrote `--dry-run`,
+//!    `--external-ref` and `Auto-import` as `ID-REDACTED`, leaving
+//!    `create_help.snap` unable to notice a rename of the flags it exists to
+//!    document. Any masking rule added here needs a test that it does NOT eat
+//!    ordinary text (see `test_redaction_preserves_hyphenated_words_and_flag_names`)
+//!    as well as one that it still masks what it is for.
+//!
+//! 4. Structural invariants over the corpus live in
+//!    `tests/snapshot_hygiene.rs`. They catch the corruption class without
+//!    needing to be re-recorded when output legitimately changes, which is
+//!    the only thing here that can catch a FUTURE corruption.
+
 #![allow(clippy::module_name_repetitions, clippy::trivial_regex, dead_code)]
 
 #[path = "../common/mod.rs"]
@@ -8,6 +62,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{self, Write};
+use std::process::ExitStatus;
 use std::sync::LazyLock;
 
 pub fn init_workspace() -> BrWorkspace {
@@ -21,13 +76,57 @@ pub fn init_workspace() -> BrWorkspace {
     workspace
 }
 
+/// Turn the workspace into a git repository.
+///
+/// Identity is set locally (never `--global`) and `HOME` is already pointed
+/// at the workspace by the harness, so nothing here reads or writes the
+/// developer's own git configuration.
+pub fn git_init(workspace: &BrWorkspace) {
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "snapshots@example.invalid"][..],
+        &["config", "user.name", "Snapshot Fixture"][..],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&workspace.root)
+            .output()
+            .expect(
+                "git must be available: fixtures that need a repository \
+                     cannot silently degrade to an empty result",
+            );
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Record an empty commit carrying `message`.
+///
+/// Empty on purpose: the fixtures using this care about what the commit
+/// MESSAGE says (it names an issue ID), not about any file it touches.
+pub fn git_commit(workspace: &BrWorkspace, message: &str) {
+    let out = std::process::Command::new("git")
+        .args(["commit", "-q", "--allow-empty", "-m", message])
+        .current_dir(&workspace.root)
+        .output()
+        .expect("git commit runs");
+    assert!(
+        out.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 pub fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String {
     let output = run_br(workspace, ["create", title], label);
     assert!(output.status.success(), "create failed: {}", output.stderr);
     parse_created_id(&output.stdout)
 }
 
-fn parse_created_id(stdout: &str) -> String {
+pub fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
     // Handle both formats: "Created bd-xxx: title" and "✓ Created bd-xxx: title"
     let normalized = line.strip_prefix("✓ ").unwrap_or(line);
@@ -49,8 +148,59 @@ fn parse_created_id(stdout: &str) -> String {
 // Pre-compiled regex patterns for performance
 static ANSI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("ansi regex"));
-static ID_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b").expect("id regex"));
+/// Candidate `prefix-suffix` tokens for issue-ID redaction.
+///
+/// This deliberately over-matches; [`looks_like_issue_id`] decides. The
+/// pattern this replaced was `\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b`, which is to
+/// say ANY hyphenated word, and it silently destroyed content on its way
+/// into the recorded snapshots: `--dry-run`, `--no-color`, `--external-ref`,
+/// `parent-child`, `auto-discover`, `append-only`, `Agent-first`,
+/// `Power-user` and `Auto-import` were all replaced by `ID-REDACTED`.
+/// `create_help.snap` therefore recorded `--ID-REDACTED <EXTERNAL_REF>` and
+/// could not have failed if the flag had been renamed — the one test
+/// guarding the CLI surface was blind to exactly the thing it guards.
+///
+/// Redaction is normalization, and normalization runs BEFORE recording, so
+/// an over-broad rule here is worse than an over-broad rule anywhere else in
+/// the suite: it damages the oracle rather than the output. Anything added
+/// to this pattern must be justified against that.
+static ID_CANDIDATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9_]+-[a-zA-Z0-9]{3,}\b").expect("id candidate regex"));
+
+/// Issue-ID prefixes this suite actually mints.
+///
+/// The harness appends `--prefix bd` to every `create`/`q` (see
+/// `apply_default_test_prefix_shim`), so `bd-` is the only prefix that
+/// reaches a text snapshot. Tokens with any other prefix are redacted only
+/// when their suffix carries a digit (see [`looks_like_issue_id`]).
+///
+/// If a fixture ever mints a different prefix AND draws an all-letter hash,
+/// the raw ID reaches the snapshot and the test fails loudly on the next
+/// run. That is the intended failure mode: a visibly unstable snapshot says
+/// "add your prefix here", whereas the old catch-all silently ate English.
+const KNOWN_TEST_ID_PREFIXES: &[&str] = &["bd"];
+
+/// Whether a `prefix-suffix` token is an issue ID rather than a hyphenated
+/// English word or a CLI flag.
+///
+/// Mirrors the product's own `is_likely_hash_segment` (`src/util/id.rs`):
+/// IDs are `<prefix>-<base36 hash>`, hashes are lowercase base36, and a hash
+/// of 4+ characters always contains a digit — the generator enforces that
+/// precisely to avoid colliding with words. Three-character hashes may be
+/// all letters (`bd-abc`), so for those the prefix must be one we mint.
+fn looks_like_issue_id(token: &str) -> bool {
+    let Some((prefix, hash)) = token.rsplit_once('-') else {
+        return false;
+    };
+    if hash.len() < 3
+        || !hash
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return false;
+    }
+    KNOWN_TEST_ID_PREFIXES.contains(&prefix) || hash.chars().any(|c| c.is_ascii_digit())
+}
 static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
         .expect("full timestamp regex")
@@ -79,8 +229,18 @@ static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
+/// A backslash together with the character it precedes.
+///
+/// Captured as a pair so the replacement can spare `\[` and `\]`: those are
+/// not path separators, they are the signature of a markup escape that
+/// reached a sink which does not parse markup (`br show` shipped
+/// `use \[bold] for headings` for a body reading `use [bold] for headings`).
+/// Blanket-rewriting every backslash to `/` turned that artifact into a
+/// plausible-looking `/[bold]` on its way into the recorded value — damage
+/// disguised as normalization. Leave the backslash visible so a reviewer
+/// sees it and `snapshot_hygiene` can fail on it.
 static PATH_SEP_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\\").expect("path separator regex"));
+    LazyLock::new(|| Regex::new(r"\\(.)").expect("path separator regex"));
 static TRAILING_WS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[ \t]+$").expect("trailing whitespace regex"));
 static MULTIPLE_BLANK_RE: LazyLock<Regex> =
@@ -413,10 +573,20 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("ansi_codes".to_string());
     }
 
-    // 3. Normalize path separators (Windows → Unix)
+    // 3. Normalize path separators (Windows → Unix), sparing `\[`/`\]`.
     if config.normalize_paths && normalized.contains('\\') {
-        normalized = PATH_SEP_RE.replace_all(&normalized, "/").to_string();
-        log.push("path_separators".to_string());
+        let replaced = PATH_SEP_RE.replace_all(&normalized, |caps: &regex::Captures<'_>| {
+            let next = &caps[1];
+            if next == "[" || next == "]" {
+                format!("\\{next}")
+            } else {
+                format!("/{next}")
+            }
+        });
+        if replaced != normalized {
+            normalized = replaced.into_owned();
+            log.push("path_separators".to_string());
+        }
     }
 
     // 4. Mask home directory paths
@@ -437,10 +607,10 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("temp_paths".to_string());
     }
 
-    // 6. Mask git hashes (must run BEFORE issue-ID redaction below: the
-    // generic `[a-zA-Z0-9_-]+-[a-z0-9]{3,}` issue-ID pattern would
-    // otherwise mistake a branch name like `feat-testclean` for an issue
-    // ID and mangle it before this pass ever sees it).
+    // 6. Mask git hashes. This runs before issue-ID redaction only because
+    // `(branch@hash)` is a shape of its own; the redaction pass below no
+    // longer mistakes a branch name like `feat-testclean` for an ID (its
+    // suffix carries no digit), but the dedicated placeholder is clearer.
     if config.mask_git_hashes && VERSION_RE.is_match(&normalized) {
         normalized = VERSION_RE
             .replace_all(&normalized, "(BRANCH@GIT_HASH)")
@@ -448,10 +618,23 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("git_hashes".to_string());
     }
 
-    // 7. Redact issue IDs
-    if config.redact_ids && ID_RE.is_match(&normalized) {
-        normalized = ID_RE.replace_all(&normalized, "ID-REDACTED").to_string();
-        log.push("issue_ids".to_string());
+    // 7. Redact issue IDs. `ID_CANDIDATE_RE` over-matches on purpose;
+    // `looks_like_issue_id` is what decides, so that a hyphenated word or a
+    // CLI flag is left intact instead of being replaced by a placeholder
+    // that no later reviewer can undo.
+    if config.redact_ids {
+        let replaced = ID_CANDIDATE_RE.replace_all(&normalized, |caps: &regex::Captures<'_>| {
+            let token = &caps[0];
+            if looks_like_issue_id(token) {
+                "ID-REDACTED".to_string()
+            } else {
+                token.to_string()
+            }
+        });
+        if replaced != normalized {
+            normalized = replaced.into_owned();
+            log.push("issue_ids".to_string());
+        }
     }
 
     // 8. Mask full timestamps
@@ -548,6 +731,53 @@ pub fn normalize_output(output: &str) -> String {
     normalized
 }
 
+/// Render a whole invocation — exit status, stdout AND stderr — as one
+/// reviewable block.
+///
+/// WHY THIS EXISTS. A snapshot whose expected value is empty cannot fail.
+/// A zero-byte `.snap` is satisfied by the command behaving correctly, by
+/// the command crashing before it printed anything, by its output going to
+/// the wrong stream, and by the command being deleted — as long as the exit
+/// status stays zero. `list_empty.snap` was exactly that: nothing at all,
+/// recorded as ground truth, counted among the tests guarding `br list`.
+///
+/// Some commands genuinely print nothing (`br list` on an empty workspace
+/// is silent on purpose — see `src/cli/commands/list.rs`, where the silence
+/// is a deliberate conformance contract with the Go `bd` implementation, not
+/// an oversight). For those, the fix is not to make the command speak; it is
+/// to state the expectation in a form that CAN fail. This composes the three
+/// facts a reader needs, each explicitly labelled, so that "printed nothing"
+/// is an assertion rather than an absence — and so a reader can tell WHICH
+/// stream was empty.
+///
+/// Streams are labelled `<empty>` rather than left blank, deliberately: a
+/// composed value that renders as a blank region has reproduced the original
+/// problem in a fancier wrapper.
+pub fn compose_invocation(command: &str, stdout: &str, stderr: &str, status: ExitStatus) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "$ {command}");
+    let _ = writeln!(
+        out,
+        "exit: {}",
+        status
+            .code()
+            .map_or_else(|| "signal".to_string(), |c| c.to_string())
+    );
+    for (label, stream) in [("stdout", stdout), ("stderr", stderr)] {
+        let normalized = normalize_output(stream);
+        let trimmed = normalized.trim_end();
+        if trimmed.is_empty() {
+            let _ = writeln!(out, "{label}: <empty>");
+        } else {
+            let _ = writeln!(out, "{label}:");
+            for line in trimmed.lines() {
+                let _ = writeln!(out, "  {line}");
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// Like [`normalize_output`], but additionally masks the compact
 /// relative-age field so snapshots of freshly-created-then-listed
 /// issues don't embed a time-dependent `0s`/`1s`.
@@ -567,10 +797,42 @@ pub fn normalize_minimal(output: &str) -> String {
     normalized
 }
 
+/// Replace issue IDs inside a string ("bd-abc:open", "fix(bd-2p7): ...").
+///
+/// Uses the same [`looks_like_issue_id`] decision as the text normalizer,
+/// deliberately: this function is also applied to FREE TEXT (a commit
+/// message), and the blanket `\w+-[a-z0-9]{3,}` pattern it used to carry is
+/// the one that turned `--dry-run` into `ID-REDACTED` on the text side. One
+/// definition of "is an issue ID", two call sites — otherwise the bug just
+/// moves to whichever copy is not being looked at.
 fn normalize_id_string(s: &str) -> String {
-    // Normalize strings that contain issue IDs like "bd-abc:open" or "bd-xyz"
-    let id_re = Regex::new(r"\b[a-zA-Z0-9_]+-[a-z0-9]{3,}\b").expect("id regex");
-    id_re.replace_all(s, "ISSUE_ID").to_string()
+    ID_CANDIDATE_RE
+        .replace_all(s, |caps: &regex::Captures| {
+            let token = &caps[0];
+            if looks_like_issue_id(token) {
+                "ISSUE_ID".to_string()
+            } else {
+                token.to_string()
+            }
+        })
+        .to_string()
+}
+
+/// Map `f` over an array value, leaving non-arrays to the generic pass.
+fn normalize_array(value: &Value, f: impl Fn(&Value) -> Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(f).collect()),
+        other => normalize_json(other),
+    }
+}
+
+/// An element that is itself a bare issue ID.
+fn normalize_id_element(value: &Value) -> Value {
+    if matches!(value, Value::String(_)) {
+        Value::String("ISSUE_ID".to_string())
+    } else {
+        normalize_json(value)
+    }
 }
 
 pub fn normalize_json(json: &Value) -> Value {
@@ -588,6 +850,23 @@ pub fn normalize_json(json: &Value) -> Value {
                         Value::String("TIMESTAMP".to_string())
                     }
                     "content_hash" => Value::String("HASH".to_string()),
+                    // A git object name is different on every run of the
+                    // fixture that produces it (empty commits differ by
+                    // committer timestamp), so it is masked rather than
+                    // recorded — but masked to a NAMED placeholder, never
+                    // dropped: the field's presence is part of the contract
+                    // `br orphans` owes its caller.
+                    "latest_commit" => Value::String("COMMIT_HASH".to_string()),
+                    // Free text that legitimately quotes an issue ID (a
+                    // commit message naming the bead it closed). The ID is
+                    // volatile; the rest of the sentence is the assertion.
+                    "latest_commit_message" => {
+                        if let Value::String(s) = value {
+                            Value::String(normalize_id_string(s))
+                        } else {
+                            normalize_json(value)
+                        }
+                    }
                     // Normalize actor/user fields that vary by system
                     "created_by" | "assignee" | "owner" | "author" | "deleted_by"
                     | "closed_by_session" | "actor" => {
@@ -605,67 +884,15 @@ pub fn normalize_json(json: &Value) -> Value {
                         }
                     }
                     // Handle blocked_by array which contains ID:status strings
-                    "blocked_by" | "blocks" | "depends_on" => {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|v| {
-                                        if let Value::String(s) = v {
-                                            Value::String(normalize_id_string(s))
-                                        } else {
-                                            normalize_json(v)
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            normalize_json(value)
-                        }
-                    }
-                    "roots" => {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|v| {
-                                        if matches!(v, Value::String(_)) {
-                                            Value::String("ISSUE_ID".to_string())
-                                        } else {
-                                            normalize_json(v)
-                                        }
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            normalize_json(value)
-                        }
-                    }
-                    "edges" => {
-                        if let Value::Array(items) = value {
-                            Value::Array(
-                                items
-                                    .iter()
-                                    .map(|edge| match edge {
-                                        Value::Array(pair) => Value::Array(
-                                            pair.iter()
-                                                .map(|v| {
-                                                    if matches!(v, Value::String(_)) {
-                                                        Value::String("ISSUE_ID".to_string())
-                                                    } else {
-                                                        normalize_json(v)
-                                                    }
-                                                })
-                                                .collect(),
-                                        ),
-                                        _ => normalize_json(edge),
-                                    })
-                                    .collect(),
-                            )
-                        } else {
-                            normalize_json(value)
-                        }
-                    }
+                    "blocked_by" | "blocks" | "depends_on" => normalize_array(value, |v| match v {
+                        Value::String(s) => Value::String(normalize_id_string(s)),
+                        other => normalize_json(other),
+                    }),
+                    "roots" => normalize_array(value, normalize_id_element),
+                    "edges" => normalize_array(value, |edge| match edge {
+                        Value::Array(_) => normalize_array(edge, normalize_id_element),
+                        other => normalize_json(other),
+                    }),
                     _ => normalize_json(value),
                 };
                 new_map.insert(key.clone(), normalized_value);
@@ -746,6 +973,96 @@ mod golden_snapshot_tests {
         assert!(snapshot.normalized.contains("ID-REDACTED"));
         assert!(!snapshot.normalized.contains("bd-abc123"));
         assert!(!snapshot.normalized.contains("beads_rust-xyz789"));
+    }
+
+    /// The redactor must not eat text that is not an ID.
+    ///
+    /// EVERY other test in this module asserts that a volatile value IS
+    /// masked; not one asserted that a stable value is NOT. That asymmetry is
+    /// why the old catch-all pattern survived: it was only ever observed
+    /// passing. It replaced `--dry-run`, `--external-ref`, `--no-color`,
+    /// `parent-child`, `auto-discover` and `Auto-import` with `ID-REDACTED`
+    /// on the way into `create_help.snap`, `help_output.snap` and three
+    /// error snapshots, so those recordings could not have failed if the
+    /// flags they document had been renamed.
+    ///
+    /// Each string below is real text from `br --help`, `br create --help`
+    /// or a `beads_rust::sync` log line that the recorded snapshots lost.
+    #[test]
+    fn test_redaction_preserves_hyphenated_words_and_flag_names() {
+        for stable in [
+            "--dry-run",
+            "--no-color",
+            "--external-ref <EXTERNAL_REF>",
+            "Parent issue ID (creates parent-child dep)",
+            "Database path (auto-discover .beads/*.db if not set)",
+            "Agent-first issue tracker (SQLite + JSONL)",
+            "Read or append an issue's comments (append-only attributed history)",
+            "Power-user / diagnostic commands",
+            "Auto-import completed imported_count=0",
+            "Auto-flush: exporting dirty issues",
+            "Auto-flush complete exported=1",
+        ] {
+            let normalized = normalize_output(stable);
+            assert_eq!(
+                normalized, stable,
+                "the redactor altered text that is not an issue ID; a snapshot \
+                 recorded from this can no longer fail when the text changes"
+            );
+        }
+    }
+
+    /// The inverse guard: tightening the rule until it stops eating English
+    /// can trivially be overshot into redacting nothing, and that failure
+    /// would surface much later as an unstable snapshot blamed on something
+    /// else. Every shape the harness actually mints must still be masked.
+    #[test]
+    fn test_redaction_still_masks_real_issue_ids() {
+        for (input, must_not_contain) in [
+            // The harness mints `bd-<3-char base36>`; all-letter draws are
+            // ~38% of the space, so both must go.
+            ("Created bd-2p7: a title", "bd-2p7"),
+            ("Created bd-abc: a title", "bd-abc"),
+            ("Issue not found: bd-nonexistent", "bd-nonexistent"),
+            // Longer hashes always carry a digit (src/util/id.rs), which is
+            // what lets an unknown prefix still be recognised.
+            ("Issue bd-abc123 depends on beads_rust-xyz789", "bd-abc123"),
+            (
+                "Issue bd-abc123 depends on beads_rust-xyz789",
+                "beads_rust-xyz789",
+            ),
+            ("Cycle detected: bd-1af -> bd-3m9", "bd-1af"),
+        ] {
+            let normalized = normalize_output(input);
+            assert!(
+                !normalized.contains(must_not_contain),
+                "{must_not_contain:?} survived redaction in {normalized:?} \
+                 \u{2014} a live issue ID in a snapshot makes it unstable"
+            );
+            assert!(
+                normalized.contains("ID-REDACTED"),
+                "expected a redaction placeholder in {normalized:?}"
+            );
+        }
+    }
+
+    /// Path normalization must not disguise a markup-escape artifact.
+    ///
+    /// `br show` shipped `use \[bold] for headings` for a stored body of
+    /// `use [bold] for headings`. Blanket backslash-to-slash rewriting would
+    /// have recorded that as `use /[bold] for headings` — still wrong, but
+    /// now shaped like a path, which is exactly the disguise that gets a bad
+    /// value waved through review. The backslash must reach the recorded
+    /// value so a human (and `tests/snapshot_hygiene.rs`) can see it.
+    #[test]
+    fn test_path_normalization_preserves_escaped_brackets() {
+        let escaped = r"use \[bold] for headings and \[red\]for errors";
+        let normalized = normalize_output(escaped);
+        assert_eq!(
+            normalized, escaped,
+            "a markup escape must survive normalization intact so it can be \
+             recognised as corruption rather than as a Windows path"
+        );
     }
 
     #[test]

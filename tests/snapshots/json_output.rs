@@ -1,6 +1,8 @@
 use super::common::cli::run_br;
-use super::{create_issue, init_workspace, normalize_json};
-use insta::assert_json_snapshot;
+use super::{
+    compose_invocation, create_issue, git_commit, git_init, init_workspace, normalize_json,
+};
+use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
 
 #[test]
@@ -277,9 +279,31 @@ fn snapshot_stale_json() {
 // replacement), and `label` (add/list/list-all/rename) likewise has no
 // surviving CLI surface, so there is nothing left to snapshot for either.
 
+/// `br orphans` finds issues that a commit claims to have addressed but that
+/// are still open.
+///
+/// This test used to run on a bare `init` and record `[]`. That value was
+/// produced by a guard clause — `orphans` returns early when the database
+/// holds no issue prefixes (`src/cli/commands/orphans.rs`), which is one of
+/// SIX early `output_empty` returns ahead of the scan. The recorded value
+/// therefore proved that the third guard worked, and said nothing whatever
+/// about orphan detection: an `orphans` that never scanned git, never
+/// matched an ID, or returned `[]` unconditionally passed it.
+///
+/// The fixture now builds the situation the command exists to detect: a git
+/// repository, an issue, and a commit whose message references that issue by
+/// ID while the issue is still open. The recorded value is the orphan.
 #[test]
 fn snapshot_orphans_json() {
     let workspace = init_workspace();
+    let id = create_issue(
+        &workspace,
+        "Issue left open after a commit",
+        "create_orphan",
+    );
+
+    git_init(&workspace);
+    git_commit(&workspace, &format!("fix({id}): close the login hole"));
 
     let output = run_br(&workspace, ["orphans", "--json"], "orphans_json");
     assert!(
@@ -289,6 +313,18 @@ fn snapshot_orphans_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
+    // The point of the fixture: a non-empty result. Asserted separately from
+    // the snapshot so that a regression to `[]` fails with the reason rather
+    // than as an opaque diff — and so re-recording cannot quietly restore the
+    // vacuous value this test used to hold.
+    assert_eq!(
+        json.as_array().map(Vec::len),
+        Some(1),
+        "orphan detection returned nothing for an open issue referenced by a \
+         commit; the snapshot below would otherwise re-record as `[]` and be \
+         a passing test of nothing"
+    );
+
     assert_json_snapshot!("orphans_json_output", normalize_json(&json));
 }
 
@@ -319,8 +355,29 @@ fn snapshot_graph_json() {
 // Edge Cases: Empty Results
 // ============================================================================
 
+// Every test below records an EMPTY result. An empty expected value is the
+// weakest assertion a snapshot can make: `[]` is what the command prints
+// when it is working AND what it prints when it is completely broken, so
+// recording it on a workspace that contains nothing tests nothing. Four of
+// these five ran on a bare `init` — no issues at all — so they did not test
+// empty RESULTS, they tested an empty DATABASE, and each command reaches
+// that answer through an early return long before the logic the test is
+// named for.
+//
+// The convention here, applied to all of them: the empty answer must be
+// EARNED. Each test now populates the workspace, proves with a live control
+// assertion that the same command returns something in that same workspace,
+// and only then asks the query whose correct answer is empty. `[]` then
+// means "the filter ran and correctly excluded everything" — a fact a
+// broken command cannot produce.
+
 #[test]
 fn snapshot_list_empty_json() {
+    // The one case where an empty workspace is the point: this is what a
+    // freshly-initialized project sees. No fixture can make the value
+    // non-trivial, so the value is composed instead — exit status, stdout
+    // and stderr, each labelled — pinning `[]` as the stdout of a command
+    // that ran to completion rather than as a bare two-byte file.
     let workspace = init_workspace();
 
     let output = run_br(&workspace, ["list", "--json"], "list_empty_json");
@@ -329,14 +386,49 @@ fn snapshot_list_empty_json() {
         "list empty json failed: {}",
         output.stderr
     );
-
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("list_empty_json_output", normalize_json(&json));
+    assert_eq!(json, serde_json::json!([]), "fresh workspace lists nothing");
+
+    assert_snapshot!(
+        "list_empty_json_output",
+        compose_invocation(
+            "br list --json",
+            &output.stdout,
+            &output.stderr,
+            output.status
+        )
+    );
 }
 
 #[test]
 fn snapshot_blocked_empty_json() {
+    // Earn the empty answer: a real dependency exists, and it stops
+    // blocking only because the blocker was closed. `[]` here means the
+    // blocked query re-evaluated on closure. Recorded on a bare workspace it
+    // meant nothing — a `blocked` that always returned `[]` also passed.
     let workspace = init_workspace();
+    let blocker = create_issue(&workspace, "Blocker to be closed", "create_blocker_empty");
+    let blocked = create_issue(&workspace, "Blocked until then", "create_blocked_empty");
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &blocked, &blocker],
+        "dep_add_blocked_empty",
+    );
+    assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+
+    // Live control: with the blocker open, this command DOES return the
+    // blocked issue. Without it, an always-empty `blocked` passes below.
+    let before = run_br(&workspace, ["blocked", "--json"], "blocked_before_close");
+    let before_json: Value = serde_json::from_str(&before.stdout).expect("parse json");
+    assert_eq!(
+        before_json.as_array().map(Vec::len),
+        Some(1),
+        "control failed: `blocked` must report the blocked issue while the \
+         blocker is open, otherwise the empty result below proves nothing"
+    );
+
+    let close = run_br(&workspace, ["close", &blocker], "close_blocker_empty");
+    assert!(close.status.success(), "close failed: {}", close.stderr);
 
     let output = run_br(&workspace, ["blocked", "--json"], "blocked_empty_json");
     assert!(
@@ -353,6 +445,20 @@ fn snapshot_blocked_empty_json() {
 fn snapshot_search_no_match_json() {
     let workspace = init_workspace();
     create_issue(&workspace, "Existing issue", "create_for_search_miss");
+    create_issue(&workspace, "Another matchable issue", "create_search_miss2");
+
+    // Live control: search finds a term that IS present, in this same
+    // workspace, moments before the miss below. A search returning `[]`
+    // unconditionally — broken index, broken query, broken serialization —
+    // satisfied this test's snapshot without it.
+    let hit = run_br(&workspace, ["search", "Existing", "--json"], "search_hit");
+    let hit_json: Value = serde_json::from_str(&hit.stdout).expect("parse json");
+    assert_eq!(
+        hit_json.as_array().map(Vec::len),
+        Some(1),
+        "control failed: search must find a term that exists, otherwise the \
+         empty result below proves nothing"
+    );
 
     let output = run_br(
         &workspace,
@@ -371,11 +477,29 @@ fn snapshot_search_no_match_json() {
 
 #[test]
 fn snapshot_stale_empty_json() {
+    // Earn the empty answer: an issue exists and is fresh, so a staleness
+    // window of a year excludes it. On a bare workspace the `[]` came from
+    // there being nothing to age, which is not what `stale` does.
     let workspace = init_workspace();
+    create_issue(&workspace, "Freshly created issue", "create_not_stale");
+
+    // Live control: the same command with a zero-day window returns it.
+    let control = run_br(
+        &workspace,
+        ["stale", "--days", "0", "--json"],
+        "stale_control",
+    );
+    let control_json: Value = serde_json::from_str(&control.stdout).expect("parse json");
+    assert_eq!(
+        control_json.as_array().map(Vec::len),
+        Some(1),
+        "control failed: `stale --days 0` must report the issue, otherwise \
+         the empty result below proves nothing"
+    );
 
     let output = run_br(
         &workspace,
-        ["stale", "--days", "0", "--json"],
+        ["stale", "--days", "365", "--json"],
         "stale_empty_json",
     );
     assert!(
@@ -390,9 +514,27 @@ fn snapshot_stale_empty_json() {
 
 #[test]
 fn snapshot_count_empty_json() {
+    // Earn the zero: issues exist, and the count is zero because the status
+    // filter excludes them all. On a bare workspace, `{"count": 0}` was
+    // equally the output of a `count` that had stopped counting.
     let workspace = init_workspace();
+    create_issue(&workspace, "Open issue one", "create_count_empty_one");
+    create_issue(&workspace, "Open issue two", "create_count_empty_two");
 
-    let output = run_br(&workspace, ["count", "--json"], "count_empty_json");
+    // Live control: unfiltered, the same command counts both.
+    let control = run_br(&workspace, ["count", "--json"], "count_control");
+    let control_json: Value = serde_json::from_str(&control.stdout).expect("parse json");
+    assert_eq!(
+        control_json["count"], 2,
+        "control failed: `count` must see both issues, otherwise the zero \
+         below proves nothing"
+    );
+
+    let output = run_br(
+        &workspace,
+        ["count", "--status", "closed", "--json"],
+        "count_empty_json",
+    );
     assert!(
         output.status.success(),
         "count empty json failed: {}",

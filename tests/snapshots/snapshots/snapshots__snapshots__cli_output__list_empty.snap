@@ -1,5 +1,13 @@
 ---
 source: tests/snapshots/cli_output.rs
-expression: normalize_output(&output.stdout)
+expression: "compose_invocation(\"br list\", &output.stdout, &output.stderr, output.status)"
 ---
-
+$ br list
+exit: 0
+stdout: <empty>
+stderr:
+  YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Validating sync path path=./.beads/issues.jsonl beads_dir=./.beads
+  YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync::path: src/sync/path.rs:LINE: Path validated for sync I/O path=./.beads/issues.jsonl
+  YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Import path validated input_path=./.beads/issues.jsonl beads_dir=./.beads allow_external=false
+  YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::storage::sqlite: src/storage/sqlite.rs:LINE: Rebuilt blocked issues cache blocked_count=0
+  YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Auto-import completed imported_count=0 jsonl_path=./.beads/issues.jsonl
