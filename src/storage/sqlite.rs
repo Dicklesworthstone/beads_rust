@@ -1598,6 +1598,10 @@ impl SqliteStorage {
         Ok(count)
     }
 
+    // Long by construction: one recursive-CTE cache rebuild expressed as a
+    // sequence of SQL statements that must run in this order inside a single
+    // transaction. The length is SQL, not branching.
+    #[allow(clippy::too_many_lines)]
     fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
         const MAX_DEPTH: i32 = 50;
 

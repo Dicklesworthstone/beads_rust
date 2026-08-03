@@ -100,6 +100,13 @@ struct DashOutput<'a> {
     groups: Vec<DashGroup<'a>>,
 }
 
+// serde's `skip_serializing_if` calls the predicate with a reference, so
+// this signature is fixed by the attribute above and cannot take `usize`
+// by value however small the type is.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "signature is dictated by serde's skip_serializing_if"
+)]
 const fn is_zero(n: &usize) -> bool {
     *n == 0
 }
@@ -349,7 +356,11 @@ fn fetch_parent_map(storage: &SqliteStorage) -> Result<HashMap<String, String>> 
     Ok(map)
 }
 
-#[allow(clippy::too_many_arguments)]
+// Long by construction: this walks every prefix and folds presence, CI,
+// blocked-set and closure state into one pass so the dashboard renders
+// from a single traversal. Splitting it would mean either re-walking or
+// threading a dozen locals through helpers.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn build_groups<'a>(
     issues: &'a [Issue],
     blocked_ids: &HashSet<String>,
@@ -449,9 +460,9 @@ fn build_groups<'a>(
             })
             .collect();
 
-        let presence_view = presence.get(&prefix).map(|p| {
+        let presence_view = presence.get(&prefix).and_then(|p| {
             let age = (now - p.last_changed).num_seconds().max(0);
-            let label = match (p.state, presence_ttl) {
+            match (p.state, presence_ttl) {
                 (_, None) => None, // shouldn't reach here since presence map is empty
                 (PresenceState::Working, Some(ttl)) if age <= ttl.num_seconds() => Some(
                     PresenceView { state: PresenceKind::Working, age_secs: age },
@@ -463,9 +474,8 @@ fn build_groups<'a>(
                     state: PresenceKind::Offline,
                     age_secs: age,
                 }),
-            };
-            label
-        }).flatten();
+            }
+        });
 
         // Skip prefixes that have nothing to show at all.
         if rows.is_empty() && recent.is_empty() && presence_view.is_none() {
@@ -623,6 +633,10 @@ fn kind_of(issue: &Issue, blocked_ids: &HashSet<String>) -> StatusKind {
     }
 }
 
+// Long by construction: one linear pass emitting the dashboard's header,
+// per-prefix sections and footer in order. The length is layout, not
+// logic, and breaking it into helpers hides the reading order.
+#[allow(clippy::too_many_lines)]
 fn render_text<W: Write>(
     out: &mut W,
     groups: &[OwnedGroup],
@@ -909,17 +923,17 @@ mod tests {
 
     #[test]
     fn kind_of_classifies_known_states() {
-        let blocked_ids: HashSet<String> = ["arc1-c".to_string()].into_iter().collect();
-        let a = issue("arc1-a", Status::Open, 1, "ready one");
-        let b = issue("arc1-b", Status::InProgress, 1, "running");
-        let c = issue("arc1-c", Status::Open, 1, "blocked one");
-        let d = issue("arc1-d", Status::Deferred, 1, "later");
-        let e = issue("arc1-e", Status::Closed, 1, "done");
-        assert_eq!(kind_of(&a, &blocked_ids), StatusKind::Ready);
-        assert_eq!(kind_of(&b, &blocked_ids), StatusKind::InProgress);
-        assert_eq!(kind_of(&c, &blocked_ids), StatusKind::Blocked);
-        assert_eq!(kind_of(&d, &blocked_ids), StatusKind::Deferred);
-        assert_eq!(kind_of(&e, &blocked_ids), StatusKind::Closed);
+        let blocked_ids: HashSet<String> = HashSet::from(["arc1-c".to_string()]);
+        let ready = issue("arc1-a", Status::Open, 1, "ready one");
+        let running = issue("arc1-b", Status::InProgress, 1, "running");
+        let blocked = issue("arc1-c", Status::Open, 1, "blocked one");
+        let deferred = issue("arc1-d", Status::Deferred, 1, "later");
+        let closed = issue("arc1-e", Status::Closed, 1, "done");
+        assert_eq!(kind_of(&ready, &blocked_ids), StatusKind::Ready);
+        assert_eq!(kind_of(&running, &blocked_ids), StatusKind::InProgress);
+        assert_eq!(kind_of(&blocked, &blocked_ids), StatusKind::Blocked);
+        assert_eq!(kind_of(&deferred, &blocked_ids), StatusKind::Deferred);
+        assert_eq!(kind_of(&closed, &blocked_ids), StatusKind::Closed);
     }
 
     fn default_args() -> DashArgs {
@@ -937,7 +951,7 @@ mod tests {
             issue("arc1-a", Status::Open, 0, "blocked"),
             issue("arc1-b", Status::InProgress, 3, "running"),
         ];
-        let blocked: HashSet<String> = ["arc1-a".to_string()].into_iter().collect();
+        let blocked: HashSet<String> = HashSet::from(["arc1-a".to_string()]);
         let parents = HashMap::new();
         let groups = build_groups(&issues, &blocked, &parents, &default_args(), Utc::now(), None, &HashMap::new(), None);
         assert_eq!(groups.len(), 1);

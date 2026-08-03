@@ -111,12 +111,7 @@ fn discover_state_db() -> Option<PathBuf> {
             .map(PathBuf::from)
             .map(|p| p.join(".local/state/ghwatch/state.db")),
     ];
-    for c in candidates.into_iter().flatten() {
-        if c.is_file() {
-            return Some(c);
-        }
-    }
-    None
+    candidates.into_iter().flatten().find(|c| c.is_file())
 }
 
 /// Open ghwatch's state.db read-only, query everything the dashboard
@@ -128,10 +123,7 @@ pub fn read_status() -> GhwatchStatus {
     let Some(path) = discover_state_db() else {
         return GhwatchStatus::default();
     };
-    match read_status_at(&path) {
-        Ok(s) => s,
-        Err(_) => GhwatchStatus::default(),
-    }
+    read_status_at(&path).unwrap_or_default()
 }
 
 fn read_status_at(path: &std::path::Path) -> rusqlite::Result<GhwatchStatus> {

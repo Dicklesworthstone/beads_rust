@@ -123,6 +123,14 @@ struct BatchBeadJson<'a> {
 /// # Errors
 ///
 /// Returns an error if the initial snapshot cannot be taken or arguments are invalid.
+//
+// Long by construction: this is the watch loop itself — argument
+// validation, watcher registration, the poll/debounce/flush cycle and
+// shutdown, in the order they happen. The locals are shared across every
+// stage, so extracting phases would mean inventing a state struct purely
+// to satisfy a line count. If this is ever split it should be a
+// deliberate refactor with its own review, not a side effect of a lint.
+#[allow(clippy::too_many_lines)]
 pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     if args.interval < 1 {
         return Err(BeadsError::validation("interval", "must be >= 1 second"));
@@ -629,7 +637,8 @@ fn record_change(
         (Some(BatchChange::Deleted(_)), BatchChange::Created(state)) => {
             Some(BatchChange::Created(state))
         }
-        (None, change) => Some(change),
+        // Anything else (including no prior change for this id) keeps
+        // the newest observation as-is.
         (_, change) => Some(change),
     };
 
@@ -783,6 +792,15 @@ fn emit_ci_transition_event<W: Write>(
     );
 }
 
+// The human-readable firehose keeps a short 200-char preview and points
+// the reader at `bd inbox <id>` for the rest. Structured consumers
+// (JSON / TOON) are typically other agents that must act on the message
+// directly, so they get a very generous cap — a full bead-length body
+// survives intact. Both are compared by character count (not bytes) so
+// multi-byte text isn't clipped early.
+const TEXT_PREVIEW_CHARS: usize = 200;
+const STRUCTURED_PREVIEW_CHARS: usize = 100_000;
+
 fn emit_message_event<W: Write>(
     out: &mut W,
     msg: &crate::model::Message,
@@ -794,14 +812,6 @@ fn emit_message_event<W: Write>(
         "message_received"
     };
 
-    // The human-readable firehose keeps a short 200-char preview and points
-    // the reader at `bd inbox <id>` for the rest. Structured consumers
-    // (JSON / TOON) are typically other agents that must act on the message
-    // directly, so they get a very generous cap — a full bead-length body
-    // survives intact. Compare by character count (not bytes) so multi-byte
-    // text isn't clipped early.
-    const TEXT_PREVIEW_CHARS: usize = 200;
-    const STRUCTURED_PREVIEW_CHARS: usize = 100_000;
     let body_chars = msg.body.chars().count();
 
     match format {
@@ -869,9 +879,8 @@ fn discover_git_remote(cwd: &str) -> String {
         Ok(o) if o.status.success() => o.stdout,
         _ => return String::new(),
     };
-    let raw = match String::from_utf8(stdout) {
-        Ok(s) => s,
-        Err(_) => return String::new(),
+    let Ok(raw) = String::from_utf8(stdout) else {
+        return String::new();
     };
     crate::util::git::canonicalize_repo_url(raw.trim())
 }
@@ -1402,7 +1411,7 @@ mod tests {
     fn parse_status_filter_empty_returns_none() {
         assert!(parse_status_filter(&[]).unwrap().is_none());
         assert!(
-            parse_status_filter(&["".to_string(), "  ".to_string()])
+            parse_status_filter(&[String::new(), "  ".to_string()])
                 .unwrap()
                 .is_none()
         );

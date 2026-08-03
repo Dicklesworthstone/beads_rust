@@ -34,6 +34,11 @@ const PREVIEW_CHARS: usize = 200;
 /// guard against pathologically huge bodies; anything under it is emitted
 /// whole.
 const STRUCTURED_PREVIEW_CHARS: usize = 100_000;
+/// The structured cap must stay above the text cap, or machine consumers
+/// would get *less* than humans. Enforced at compile time rather than in a
+/// test: both operands are constants, so there is nothing to observe at
+/// runtime that the compiler cannot decide now.
+const _: () = assert!(STRUCTURED_PREVIEW_CHARS > PREVIEW_CHARS);
 const MESSAGES_TTL_DAYS: i64 = 7;
 
 #[derive(Serialize)]
@@ -507,7 +512,8 @@ mod tests {
         // Machine formats consumed by other agents keep full bodies.
         assert_eq!(preview_limit_for(OutputFormat::Json), STRUCTURED_PREVIEW_CHARS);
         assert_eq!(preview_limit_for(OutputFormat::Toon), STRUCTURED_PREVIEW_CHARS);
-        assert!(STRUCTURED_PREVIEW_CHARS > PREVIEW_CHARS);
+        // (STRUCTURED > TEXT is asserted at compile time next to the
+        // constants themselves.)
     }
 
     #[test]

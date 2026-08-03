@@ -314,7 +314,7 @@ impl App {
         self.sort = self.sort.next();
         sort_groups(&mut self.groups, self.sort);
         self.rows = build_rows(&self.groups, &self.collapsed);
-        self.select_by_key(key);
+        self.select_by_key(key.as_ref());
         self.save_sort();
     }
 
@@ -550,7 +550,7 @@ impl App {
             return;
         }
         self.collapsed.insert(prefix.clone());
-        self.rebuild_rows_preserving(CursorKey::Header(prefix));
+        self.rebuild_rows_preserving(&CursorKey::Header(prefix));
         self.save_collapsed();
     }
 
@@ -564,7 +564,7 @@ impl App {
             return;
         }
         if self.collapsed.remove(&prefix) {
-            self.rebuild_rows_preserving(CursorKey::Header(prefix));
+            self.rebuild_rows_preserving(&CursorKey::Header(prefix));
             self.save_collapsed();
         }
     }
@@ -583,14 +583,14 @@ impl App {
         } else {
             self.collapsed.insert(prefix.clone());
         }
-        self.rebuild_rows_preserving(CursorKey::Header(prefix));
+        self.rebuild_rows_preserving(&CursorKey::Header(prefix));
         self.save_collapsed();
     }
 
     /// Replace `rows` from current state. The caller supplies the
     /// `CursorKey` they want re-anchored — usually the header of the
     /// prefix whose fold-state just changed.
-    fn rebuild_rows_preserving(&mut self, target: CursorKey) {
+    fn rebuild_rows_preserving(&mut self, target: &CursorKey) {
         self.rows = build_rows(&self.groups, &self.collapsed);
         self.select_by_key(Some(target));
     }
@@ -622,22 +622,21 @@ impl App {
         self.groups = groups;
         self.pending_asks = pending_asks;
         self.rows = build_rows(&self.groups, &self.collapsed);
-        self.select_by_key(key);
+        self.select_by_key(key.as_ref());
     }
 
     /// Re-select the row matching `key`. Falls back to: same prefix's
     /// header if the specific bead/closure is gone; row 0 if nothing
     /// matches at all.
-    fn select_by_key(&mut self, key: Option<CursorKey>) {
+    fn select_by_key(&mut self, key: Option<&CursorKey>) {
         if self.rows.is_empty() {
             self.state.select(None);
             return;
         }
         let target = key
-            .as_ref()
             .and_then(|k| self.find_row(k))
             .or_else(|| {
-                key.as_ref().and_then(|k| {
+                key.and_then(|k| {
                     let p = k.prefix();
                     self.rows.iter().position(
                         |r| matches!(r, VisibleRow::Header { prefix } if prefix == p),
@@ -655,8 +654,8 @@ impl App {
             (
                 CursorKey::Bead { prefix, bead_id },
                 VisibleRow::Bead { prefix: rp, bead_id: rb, .. },
-            ) => rp == prefix && rb == bead_id,
-            (
+            )
+            | (
                 CursorKey::Closure { prefix, bead_id },
                 VisibleRow::Closure { prefix: rp, bead_id: rb, .. },
             ) => rp == prefix && rb == bead_id,
@@ -813,8 +812,11 @@ fn presence_style(p: &PresenceView) -> Style {
     match p.state {
         // Yellow for the lightning bolt — it's lightning, not growth.
         crate::cli::commands::dash::PresenceKind::Working => Style::default().fg(Color::Yellow),
-        crate::cli::commands::dash::PresenceKind::Idle => Style::default().add_modifier(Modifier::DIM),
-        crate::cli::commands::dash::PresenceKind::Offline => Style::default().add_modifier(Modifier::DIM),
+        // Idle and offline are both just "not doing anything right now".
+        crate::cli::commands::dash::PresenceKind::Idle
+        | crate::cli::commands::dash::PresenceKind::Offline => {
+            Style::default().add_modifier(Modifier::DIM)
+        }
     }
 }
 
@@ -876,12 +878,13 @@ fn bead_line(b: &crate::cli::commands::dash::OwnedBead) -> Line<'static> {
         .unwrap_or_default();
 
     let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled(glyph.to_string(), status_glyph_style(b.kind)));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(b.id.clone(), Style::default().fg(Color::Cyan)));
-    spans.push(Span::raw("  "));
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw("  "),
+        Span::styled(glyph.to_string(), status_glyph_style(b.kind)),
+        Span::raw(" "),
+        Span::styled(b.id.clone(), Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+    ];
     spans.push(Span::styled(pri, Style::default().fg(Color::Yellow)));
     spans.push(Span::raw("  "));
     spans.push(Span::raw(b.title.clone()));
@@ -913,17 +916,18 @@ fn closure_line(c: &crate::cli::commands::dash::OwnedClosure) -> Line<'static> {
         .unwrap_or_default();
     let dim = Style::default().add_modifier(Modifier::DIM);
 
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::raw("  "));
-    spans.push(Span::styled("✓".to_string(), dim));
-    spans.push(Span::raw(" "));
-    // Keep the id cyan-ish but dimmed so it still parses as an id
-    // without competing visually with live beads above.
-    spans.push(Span::styled(
-        c.id.clone(),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-    ));
-    spans.push(Span::raw("  "));
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::raw("  "),
+        Span::styled("✓".to_string(), dim),
+        Span::raw(" "),
+        // Keep the id cyan-ish but dimmed so it still parses as an id
+        // without competing visually with live beads above.
+        Span::styled(
+            c.id.clone(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        ),
+        Span::raw("  "),
+    ];
     spans.push(Span::styled(format_age_compact(c.age_secs), dim));
     spans.push(Span::raw("  "));
     spans.push(Span::styled(c.title.clone(), dim));
@@ -972,79 +976,75 @@ pub fn execute(args: &DashArgs, cli: &config::CliOverrides, _ctx: &OutputContext
                 .saturating_duration_since(Instant::now())
                 .min(Duration::from_millis(EVENT_POLL_MS));
 
-            if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()?
-                    && key.kind == KeyEventKind::Press
-                {
-                    // Esc / q / ? close the help overlay first if open;
-                    // other keys are ignored until it's dismissed.
-                    if app.show_help {
-                        if matches!(
-                            key.code,
-                            KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc
-                        ) {
-                            app.show_help = false;
+            if event::poll(timeout)?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                // Esc / q / ? close the help overlay first if open;
+                // other keys are ignored until it's dismissed.
+                if app.show_help {
+                    if matches!(key.code, KeyCode::Char('?' | 'q') | KeyCode::Esc) {
+                        app.show_help = false;
+                    }
+                } else if app.detail.is_some() {
+                    // Detail pane keys. q / Backspace go back to
+                    // dashboard; Esc and Ctrl-C exit entirely.
+                    match key.code {
+                        KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
                         }
-                    } else if app.detail.is_some() {
-                        // Detail pane keys. q / Backspace go back to
-                        // dashboard; Esc and Ctrl-C exit entirely.
-                        match key.code {
-                            KeyCode::Esc => return Ok(()),
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                return Ok(());
-                            }
-                            KeyCode::Char('q') | KeyCode::Backspace => app.close_detail(),
-                            KeyCode::Char('j') | KeyCode::Down => app.detail_scroll_down(),
-                            KeyCode::Char('k') | KeyCode::Up => app.detail_scroll_up(),
-                            KeyCode::Char('g') | KeyCode::Home => app.detail_scroll_first(),
-                            KeyCode::Char('G') | KeyCode::End => app.detail_scroll_last(),
-                            KeyCode::Char('r') => app.refresh_detail(),
-                            KeyCode::Char('?') => app.show_help = true,
-                            _ => {}
+                        KeyCode::Char('q') | KeyCode::Backspace => app.close_detail(),
+                        KeyCode::Char('j') | KeyCode::Down => app.detail_scroll_down(),
+                        KeyCode::Char('k') | KeyCode::Up => app.detail_scroll_up(),
+                        KeyCode::Char('g') | KeyCode::Home => app.detail_scroll_first(),
+                        KeyCode::Char('G') | KeyCode::End => app.detail_scroll_last(),
+                        KeyCode::Char('r') => app.refresh_detail(),
+                        KeyCode::Char('?') => app.show_help = true,
+                        _ => {}
+                    }
+                } else {
+                    // Keys common to all views.
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
                         }
-                    } else {
-                        // Keys common to all views.
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                return Ok(());
-                            }
-                            KeyCode::Char('?') => app.show_help = true,
-                            KeyCode::Tab => app.cycle_view_forward(),
-                            KeyCode::BackTab => app.cycle_view_back(),
-                            KeyCode::Char('1') => app.set_view(ViewMode::Dashboard),
-                            KeyCode::Char('2') => app.set_view(ViewMode::Graph),
-                            KeyCode::Char('r') => {
-                                refresh(&mut app, args, cli, &beads_dir);
-                                next_refresh = Instant::now() + refresh_every;
-                            }
-                            // View-specific bindings.
-                            _ => match app.view {
-                                ViewMode::Dashboard => match key.code {
-                                    KeyCode::Char('j') | KeyCode::Down => app.select_next(),
-                                    KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
-                                    KeyCode::Char('h') | KeyCode::Left => app.collapse_or_jump(),
-                                    KeyCode::Char('l') | KeyCode::Right => app.expand(),
-                                    KeyCode::Char(' ') => app.toggle(),
-                                    KeyCode::Char('g') | KeyCode::Home => app.select_first(),
-                                    KeyCode::Char('G') | KeyCode::End => app.select_last(),
-                                    KeyCode::Char('s') => app.cycle_sort(),
-                                    KeyCode::Enter => app.open_detail(),
-                                    _ => {}
-                                },
-                                ViewMode::Graph => match key.code {
-                                    KeyCode::Char('j') | KeyCode::Down => app.graph_scroll_down(),
-                                    KeyCode::Char('k') | KeyCode::Up => app.graph_scroll_up(),
-                                    KeyCode::Char('g') | KeyCode::Home => app.graph_scroll_first(),
-                                    KeyCode::Char('G') | KeyCode::End => app.graph_scroll_last(),
-                                    _ => {}
-                                },
+                        KeyCode::Char('?') => app.show_help = true,
+                        KeyCode::Tab => app.cycle_view_forward(),
+                        KeyCode::BackTab => app.cycle_view_back(),
+                        KeyCode::Char('1') => app.set_view(ViewMode::Dashboard),
+                        KeyCode::Char('2') => app.set_view(ViewMode::Graph),
+                        KeyCode::Char('r') => {
+                            refresh(&mut app, args, cli, &beads_dir);
+                            next_refresh = Instant::now() + refresh_every;
+                        }
+                        // View-specific bindings.
+                        _ => match app.view {
+                            ViewMode::Dashboard => match key.code {
+                                KeyCode::Char('j') | KeyCode::Down => app.select_next(),
+                                KeyCode::Char('k') | KeyCode::Up => app.select_prev(),
+                                KeyCode::Char('h') | KeyCode::Left => app.collapse_or_jump(),
+                                KeyCode::Char('l') | KeyCode::Right => app.expand(),
+                                KeyCode::Char(' ') => app.toggle(),
+                                KeyCode::Char('g') | KeyCode::Home => app.select_first(),
+                                KeyCode::Char('G') | KeyCode::End => app.select_last(),
+                                KeyCode::Char('s') => app.cycle_sort(),
+                                KeyCode::Enter => app.open_detail(),
+                                _ => {}
                             },
-                        }
+                            ViewMode::Graph => match key.code {
+                                KeyCode::Char('j') | KeyCode::Down => app.graph_scroll_down(),
+                                KeyCode::Char('k') | KeyCode::Up => app.graph_scroll_up(),
+                                KeyCode::Char('g') | KeyCode::Home => app.graph_scroll_first(),
+                                KeyCode::Char('G') | KeyCode::End => app.graph_scroll_last(),
+                                _ => {}
+                            },
+                        },
                     }
                 }
-                // Other events (Resize, Mouse, etc.) just trigger a redraw.
             }
+            // Other events (Resize, Mouse, etc.) just trigger a redraw.
 
             if Instant::now() >= next_refresh {
                 refresh(&mut app, args, cli, &beads_dir);
@@ -1199,7 +1199,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.state);
 }
 
-fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let Some(d) = app.detail.as_ref() else {
         return;
     };
@@ -1214,7 +1214,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(para, area);
 }
 
-fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines: Vec<Line<'static>> = if app.graph_lines.is_empty() {
         vec![Line::from(Span::styled(
             "(no graph data yet — refreshing)",
@@ -1377,6 +1377,10 @@ fn render_ci_section(row: &crate::cli::commands::ghwatch::CiRow) -> Vec<Line<'st
     out
 }
 
+// Long by construction: a straight-line transcription of one bead into
+// styled lines — header, metadata block, body, deps, comments — in the
+// order they appear on screen. Helpers would just fragment the layout.
+#[allow(clippy::too_many_lines)]
 fn render_issue_detail(
     details: &crate::format::IssueDetails,
 ) -> Vec<Line<'static>> {

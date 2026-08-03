@@ -204,13 +204,13 @@ const fn is_mutating_command(cmd: &Commands) -> bool {
 const fn is_mutating_admin(cmd: &beads_rust::cli::AdminCommands) -> bool {
     use beads_rust::cli::AdminCommands as A;
     match cmd {
-        A::Delete(_) => true,
         A::Epic { command } => matches!(
             command,
             beads_rust::cli::EpicCommands::CloseEligible(args) if !args.dry_run
         ),
-        A::Msg(_) | A::Inbox(_) | A::Watch => true,
-        A::Reload(_) => true,
+        // Everything else that writes: deletion, message send, inbox
+        // (marks read), watch (registers a watcher row), reload.
+        A::Delete(_) | A::Msg(_) | A::Inbox(_) | A::Watch | A::Reload(_) => true,
         _ => false,
     }
 }
