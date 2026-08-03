@@ -933,10 +933,21 @@ fn resolve_prefix(args: &WatchArgs, beads_dir: &Path, cli: &config::CliOverrides
     Ok(candidate)
 }
 
+/// Resolve the actor that [`is_self`] compares `created_by` against.
+///
+/// This MUST use the storage-aware resolver, not plain
+/// [`config::resolve_actor`]: `created_by` is written by
+/// [`config::resolve_actor_with_storage`] (agent identity spliced in
+/// ahead of `$USER`), so resolving the comparison side without
+/// identity makes every self-created bead look foreign — "beads1"
+/// (stored) vs "toad" (`$USER`) — and the documented
+/// `--include-self`-off default silently stops filtering anything.
+/// That was the regression in `beads1-s36s7`: both sides of a `==`
+/// must come from the same resolver.
 fn resolved_actor(beads_dir: &Path, cli: &config::CliOverrides) -> Result<String> {
     let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
     let layer = config::load_config(beads_dir, Some(&storage), cli)?;
-    Ok(config::resolve_actor(&layer))
+    Ok(config::resolve_actor_with_storage(&layer, &storage))
 }
 
 fn parse_status_filter(raw: &[String]) -> Result<Option<HashSet<Status>>> {
@@ -1237,6 +1248,14 @@ mod tests {
         assert!(!id_has_prefix("app1", "app1"));
     }
 
+    /// Pure comparison logic only. Note what this deliberately does
+    /// NOT cover: both sides of the `==` are hardcoded here, so it
+    /// passes even when the *resolution* of the two sides diverges —
+    /// which is exactly how `beads1-s36s7` shipped (`created_by`
+    /// resolved with agent identity, the comparison actor without).
+    /// The seam is crossed instead by
+    /// `tests/e2e_watch_self_filter.rs`, which runs a real `br watch`
+    /// against beads written by a real `br create`.
     #[test]
     fn is_self_requires_no_sender_and_matching_creator() {
         let me = bead(Status::Open, "x", None, Some("toad"));
