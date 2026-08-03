@@ -6478,6 +6478,18 @@ impl SqliteStorage {
 
             let from = issue.status.as_str();
             let to = to_status.as_str();
+
+            // GitHub #399: enforce `workflow.transitions` at the storage
+            // chokepoint. `br update` validated the transition in its own CLI
+            // layer, but `br close` (and the MCP/epic batch writers) reached
+            // this preflight with only required-field and gate evaluation, so
+            // a status move the transitions map forbids still committed.
+            // Validating here — inside the same `BEGIN IMMEDIATE` preflight,
+            // before any row is touched — makes a batch close all-or-nothing
+            // and leaves `--bypass-policy` semantics intact because an
+            // explicit bypass reason already `continue`d above.
+            workflow.validate_transition(Some(from), to)?;
+
             let prospective_acceptance_criteria = update
                 .acceptance_criteria
                 .as_ref()
@@ -19027,6 +19039,129 @@ mod tests {
             assert!(issue.acceptance_criteria.is_none());
             assert!(storage.get_comments(id).unwrap().is_empty());
         }
+    }
+
+    /// GitHub #399: a status move that `workflow.transitions` forbids must be
+    /// rejected by the storage preflight itself (the chokepoint every batch
+    /// close routes through), before any row in the batch is mutated. An
+    /// explicit `--bypass-policy` reason still gets through.
+    #[test]
+    fn forbidden_workflow_transition_is_rejected_for_whole_batch_before_mutation() {
+        let mut transitions = std::collections::BTreeMap::new();
+        transitions.insert("open".to_string(), vec!["in_progress".to_string()]);
+        transitions.insert("in_progress".to_string(), vec!["closed".to_string()]);
+        let workflow = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec![
+                "open".to_string(),
+                "in_progress".to_string(),
+                "closed".to_string(),
+            ],
+            transitions,
+            ..Default::default()
+        };
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(workflow);
+        let allowed = make_issue(
+            "bd-trans-allowed",
+            "already in progress",
+            Status::InProgress,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&allowed, "tester").unwrap();
+        let forbidden = make_issue(
+            "bd-trans-forbidden",
+            "still open",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&forbidden, "tester").unwrap();
+
+        let closes = vec![
+            (
+                "bd-trans-allowed".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..Default::default()
+                },
+            ),
+            (
+                "bd-trans-forbidden".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let error = storage
+            .update_issues_atomically(&closes, "tester")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("workflow.transitions") && message.contains("'open'"),
+            "error should name the rejected transition: {message}"
+        );
+
+        // Neither issue moved: the whole batch is preflighted before mutation.
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-allowed")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-forbidden")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Open
+        );
+
+        // The allowed leg on its own still commits.
+        storage
+            .update_issues_atomically(&closes[..1], "tester")
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-allowed")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Closed
+        );
+
+        // `--bypass-policy` (a recorded bypass reason) still gets through.
+        storage
+            .update_issues_atomically(
+                &[(
+                    "bd-trans-forbidden".to_string(),
+                    IssueUpdate {
+                        status: Some(Status::Closed),
+                        workflow_policy_bypass_reason: Some("incident response".to_string()),
+                        ..Default::default()
+                    },
+                )],
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-forbidden")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Closed
+        );
     }
 
     #[test]

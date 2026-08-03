@@ -2345,6 +2345,82 @@ mod tests {
         );
     }
 
+    /// GitHub #399: `br close` must honor `workflow.transitions`. A policy
+    /// whose map has no `open -> closed` edge has to refuse the close and
+    /// leave the issue open; widening the map with the `any` wildcard has to
+    /// let the same close through.
+    #[test]
+    fn execute_with_args_enforces_workflow_transitions_on_close() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-wf", "Workflow governed"), "tester")
+            .expect("create workflow issue");
+        drop(storage);
+
+        let policy_path = beads_dir.join(close_policy::POLICY_FILE_NAME);
+        std::fs::write(
+            &policy_path,
+            "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  \
+             transitions:\n    open: [in_progress]\n    in_progress: [closed]\n",
+        )
+        .expect("write workflow policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-wf".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("open -> closed is not in the transitions map");
+        let message = err.to_string();
+        assert!(
+            message.contains("workflow.transitions") && message.contains("'open'"),
+            "error should name the rejected transition: {message}"
+        );
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert_eq!(
+            storage
+                .get_issue("bd-wf")
+                .expect("read issue")
+                .expect("issue exists")
+                .status,
+            Status::Open,
+            "a refused close must leave the issue open"
+        );
+        drop(storage);
+
+        // Widening the map with the `any` wildcard makes the same close legal.
+        std::fs::write(
+            &policy_path,
+            "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  \
+             transitions:\n    open: [in_progress]\n    any: [closed]\n",
+        )
+        .expect("rewrite workflow policy");
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("wildcard `any: [closed]` permits the close");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert_eq!(
+            storage
+                .get_issue("bd-wf")
+                .expect("read issue")
+                .expect("issue exists")
+                .status,
+            Status::Closed
+        );
+    }
+
     // =========================================================================
     // forbid_close_with_deferred_dependents gate (beads_rust#303)
     // =========================================================================
