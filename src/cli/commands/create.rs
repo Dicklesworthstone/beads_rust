@@ -114,18 +114,23 @@ pub fn execute(args: &CreateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ctx.json_pretty(&full_issue);
         }
     } else if args.dry_run {
+        // Every line here echoes something the caller typed, so all of it
+        // goes through `print_data`: `--title 'fix [bold] rendering'`
+        // printed through `print` came out as `fix  rendering`. Type and
+        // priority are enums, but both have a `Custom(String)` variant, so
+        // they are user text too.
         ctx.info(&format!("Dry run: would create issue {}", issue.id));
-        ctx.print(&format!("Title: {}", issue.title));
-        ctx.print(&format!("Type: {}", issue.issue_type));
-        ctx.print(&format!("Priority: {}", issue.priority));
+        ctx.print_data(&format!("Title: {}", issue.title));
+        ctx.print_data(&format!("Type: {}", issue.issue_type));
+        ctx.print_data(&format!("Priority: {}", issue.priority));
         if !args.labels.is_empty() {
-            ctx.print(&format!("Labels: {}", args.labels.join(", ")));
+            ctx.print_data(&format!("Labels: {}", args.labels.join(", ")));
         }
         if let Some(parent) = &args.parent {
-            ctx.print(&format!("Parent: {parent}"));
+            ctx.print_data(&format!("Parent: {parent}"));
         }
         if !args.deps.is_empty() {
-            ctx.print(&format!("Dependencies: {}", args.deps.join(", ")));
+            ctx.print_data(&format!("Dependencies: {}", args.deps.join(", ")));
         }
     } else {
         ctx.success(&format!("Created {}: {}", issue.id, issue.title));
@@ -656,7 +661,8 @@ fn execute_import(
             path.display()
         ));
         for (id, title) in created_ids {
-            ctx.print(&format!("  {id}: {title}"));
+            // Titles come from the imported markdown file: data.
+            ctx.print_data(&format!("  {id}: {title}"));
         }
     }
 

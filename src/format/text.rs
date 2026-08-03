@@ -273,6 +273,26 @@ pub fn format_issue_age_field(issue: &Issue) -> String {
 /// symbol. Anything read back out of storage and shown to a human should go
 /// through here: silently deleting part of what someone wrote is a worse
 /// failure than an ugly line, because the reader cannot tell it happened.
+///
+/// # The rule, in full
+///
+/// Apply this **only where the sink parses markup**, and apply it **once**:
+///
+/// * A string handed to `Console::print` — i.e. [`crate::output::OutputContext::print`] —
+///   is markup. Stored or user-controlled data going there is escaped;
+///   [`crate::output::OutputContext::print_data`] does exactly that and is
+///   the method to reach for.
+/// * A `Text` assembled from spans (`IssueTable`, `IssuePanel`, the
+///   `stale`/`blocked` line builders), a `Panel`, and anything emitted with
+///   `print!`/`println!`, `--json` or `--toon` do NOT parse markup. Escaping
+///   there is a bug in the other direction: the backslash becomes visible.
+///
+/// The escape is invisible when it lands on a markup parser, which is what
+/// makes escaping a whole assembled line safe: the parser turns `\[` back
+/// into `[`, so the brackets this codebase writes itself (`[● P2]`, `[bug]`,
+/// `[2026-01-02]`) survive unchanged, as do the ANSI sequences from
+/// `format_status_icon_colored` and friends — `\x1b[31m` is not tag-shaped,
+/// its bracket is followed by a digit.
 #[must_use]
 pub fn escape_markup(text: &str) -> String {
     // Mirrors the console's own escape rule: a literal `[` is written `\[`.
@@ -407,6 +427,50 @@ mod tests {
         assert_eq!(escape_markup("closing ] alone"), "closing ] alone");
         assert_eq!(escape_markup("use [bold] here"), "use \\[bold] here");
         assert_eq!(escape_markup("[a] and [b]"), "\\[a] and \\[b]");
+    }
+
+    /// The property that actually matters, checked against the real parser
+    /// rather than against my belief about it: escaped text renders back to
+    /// exactly the input. Asserting the shape of the escape (`\[`) only
+    /// proves this function is self-consistent; asserting the round trip
+    /// proves nothing is lost on the way to a reader.
+    ///
+    /// The cases are the ones that bite: a tag-shaped word (`[bold]`), a bare
+    /// bracketed name (`[probe]`, which is how the bug was found), an
+    /// unbalanced closing tag, and a whole assembled listing line whose own
+    /// `[bug]` badge is tag-shaped and whose ANSI colour codes contain
+    /// brackets that must NOT be disturbed.
+    #[test]
+    fn escaped_text_renders_back_to_the_original() {
+        for original in [
+            "plain text",
+            "use [bold] for headings and [red]for errors",
+            "[probe] said so",
+            "closing [/] tag with no opener",
+            "[/bold] alone",
+            "○ mk-3mt [● P2] [bug] 5d/2h - fix [bold] rendering",
+            "\u{1b}[31mred\u{1b}[0m and \u{1b}[1mbold\u{1b}[0m",
+            "nested [a[b]c] brackets",
+            "trailing backslash \\ and [tag]",
+        ] {
+            let rendered = rich_rust::markup::render_or_plain(&escape_markup(original));
+            assert_eq!(
+                rendered.plain(),
+                original,
+                "escaped text must render back verbatim: {original:?}"
+            );
+        }
+    }
+
+    /// The counterpart, and the reason `escape_markup` is not simply applied
+    /// everywhere: unescaped data really is destroyed by the parser, so the
+    /// escape is load-bearing rather than defensive decoration. If this test
+    /// ever fails because the console stopped parsing markup, the escapes can
+    /// all come out — and this is where you would find out.
+    #[test]
+    fn unescaped_bracketed_words_are_eaten_by_the_parser() {
+        let rendered = rich_rust::markup::render_or_plain("fix [bold] rendering by [probe]");
+        assert_eq!(rendered.plain(), "fix  rendering by ");
     }
 
     fn make_test_issue() -> Issue {
