@@ -341,7 +341,7 @@ impl OutputContext {
         match self.mode {
             OutputMode::Rich => {
                 self.console()
-                    .print(&format!("[bold green]✓[/] {}", crate::format::escape_markup(message)));
+                    .print(&rich_semantic_line("[bold green]✓[/]", None, message));
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -373,9 +373,10 @@ impl OutputContext {
     pub fn warning(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console().print(&format!(
-                    "[bold yellow]⚠[/] [yellow]{}[/]",
-                    crate::format::escape_markup(message)
+                self.console().print(&rich_semantic_line(
+                    "[bold yellow]⚠[/]",
+                    Some("yellow"),
+                    message,
                 ));
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
@@ -390,7 +391,7 @@ impl OutputContext {
         match self.mode {
             OutputMode::Rich => {
                 self.console()
-                    .print(&format!("[blue]ℹ[/] {}", crate::format::escape_markup(message)));
+                    .print(&rich_semantic_line("[blue]ℹ[/]", None, message));
             }
             OutputMode::Plain => println!("{}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
@@ -436,5 +437,86 @@ impl OutputContext {
             OutputMode::Quiet => eprintln!("Error: {}", description),
             OutputMode::Json | OutputMode::Toon => {} //
         }
+    }
+}
+
+/// Compose the markup for a semantic message line (`✓ …`, `⚠ …`, `ℹ …`).
+///
+/// Split out of [`OutputContext::success`], [`OutputContext::warning`] and
+/// [`OutputContext::info`] so the escape can be asserted without a terminal:
+/// the `Rich` branch only exists when stdout is a tty, so an e2e test running
+/// under a pipe never reaches it, and the corruption it caused (`Created
+/// bd-1: rich <ESC>[1m title` for a title reading `rich [bold] title`) went
+/// unnoticed for exactly that reason.
+///
+/// `glyph_markup` is markup written by this codebase and passes through
+/// as-is. `message` is DATA and is escaped. `message_style`, when given,
+/// wraps the message in a style tag — placed OUTSIDE the escaped text, so it
+/// styles the message without being able to eat any of it.
+fn rich_semantic_line(glyph_markup: &str, message_style: Option<&str>, message: &str) -> String {
+    let escaped = crate::format::escape_markup(message);
+    match message_style {
+        Some(style) => format!("{glyph_markup} [{style}]{escaped}[/]"),
+        None => format!("{glyph_markup} {escaped}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rich_semantic_line;
+
+    /// Every hazard in one message: a real style name, a bare bracketed word
+    /// that is not a style, and a closing tag. Unescaped, the parser eats the
+    /// first two and errors on the third.
+    const HAZARD: &str = "esc [bold] [probe] [/] x";
+
+    /// The property, checked against the real parser rather than against the
+    /// shape of the escape: whatever the caller passed as DATA comes out the
+    /// other side intact, with the glyph in front of it.
+    ///
+    /// `plain()` is the rendered text with styling stripped — exactly what a
+    /// reader sees on a terminal, minus the colour — so an eaten `[bold]` or
+    /// a leaked backslash both fail here.
+    #[test]
+    fn success_line_renders_the_message_verbatim() {
+        let rendered = rich_rust::markup::render_or_plain(&rich_semantic_line(
+            "[bold green]✓[/]",
+            None,
+            HAZARD,
+        ));
+        assert_eq!(rendered.plain(), format!("✓ {HAZARD}"));
+    }
+
+    #[test]
+    fn info_line_renders_the_message_verbatim() {
+        let rendered =
+            rich_rust::markup::render_or_plain(&rich_semantic_line("[blue]ℹ[/]", None, HAZARD));
+        assert_eq!(rendered.plain(), format!("ℹ {HAZARD}"));
+    }
+
+    /// A styled message is the interesting case: the style tag has to sit
+    /// outside the escaped data, or the data could close it early and take the
+    /// rest of the line with it.
+    #[test]
+    fn warning_line_renders_the_message_verbatim_and_keeps_its_style() {
+        let line = rich_semantic_line("[bold yellow]⚠[/]", Some("yellow"), HAZARD);
+        let rendered = rich_rust::markup::render_or_plain(&line);
+        assert_eq!(rendered.plain(), format!("⚠ {HAZARD}"));
+        // The style survived as STYLE, not as visible text: `[yellow]` must
+        // not appear in what the reader sees.
+        assert!(
+            !rendered.plain().contains("[yellow]"),
+            "the wrapping style tag leaked into the text: {}",
+            rendered.plain()
+        );
+    }
+
+    /// The regression itself, stated as a test: without the escape the
+    /// message is silently mutilated. If this ever stops holding, the console
+    /// stopped parsing markup and every escape in this file can go.
+    #[test]
+    fn an_unescaped_message_would_be_mutilated() {
+        let rendered = rich_rust::markup::render_or_plain(&format!("[bold green]✓[/] {HAZARD}"));
+        assert_ne!(rendered.plain(), format!("✓ {HAZARD}"));
     }
 }
