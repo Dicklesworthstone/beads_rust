@@ -9,6 +9,7 @@ use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::util::id::IdResolver;
 use crate::util::time::parse_flexible_timestamp;
 use crate::validation::LabelValidator;
+use crate::validation::text_guard::{TextChange, TextField};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -20,16 +21,76 @@ struct UpdatedIssueOutput {
     status: String,
     priority: i32,
     updated_at: DateTime<Utc>,
+    /// Before/after sizes for every free-text field this command wrote.
+    ///
+    /// Emitted so an agent parsing JSON sees the same delta a human sees on
+    /// the success line; agents never read the human line.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    text_deltas: Vec<TextDeltaOutput>,
 }
 
-impl From<&Issue> for UpdatedIssueOutput {
-    fn from(issue: &Issue) -> Self {
+/// JSON shape for one free-text field's before/after sizes.
+#[derive(Serialize)]
+struct TextDeltaOutput {
+    field: &'static str,
+    old_chars: usize,
+    new_chars: usize,
+    /// Whether the previous value survives verbatim inside the new one.
+    ///
+    /// Absent when there was no prior content to retain. `false` on a write
+    /// that GREW the field means the growth still dropped everything that was
+    /// there — the read-modify-write-with-a-failed-preimage case, which the
+    /// shrink guard cannot see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prior_content_retained: Option<bool>,
+    /// Size of the value bd was ASKED to write.
+    ///
+    /// Present only when it differs from `new_chars`, i.e. only when the write
+    /// did not land as sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_chars: Option<usize>,
+    /// Whether what is stored is what bd was asked to store.
+    ///
+    /// Emitted only when it is `false`, so its mere presence is the alarm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landed_as_sent: Option<bool>,
+}
+
+impl From<&TextChange> for TextDeltaOutput {
+    fn from(change: &TextChange) -> Self {
+        let mismatch = change.landed_as_sent == Some(false);
+        Self {
+            field: change.field.name(),
+            old_chars: change.old_chars,
+            new_chars: change.new_chars,
+            // Suppressed when the write did not land as sent, exactly as on
+            // the human line: "prior content retained" is a true answer to a
+            // question the caller has stopped caring about, and next to a
+            // failure it reads as reassurance.
+            prior_content_retained: if mismatch {
+                None
+            } else {
+                change.prior_retained
+            },
+            requested_chars: if mismatch {
+                change.requested_chars
+            } else {
+                None
+            },
+            landed_as_sent: if mismatch { Some(false) } else { None },
+        }
+    }
+}
+
+impl UpdatedIssueOutput {
+    fn new(issue: &Issue, text_deltas: Vec<TextDeltaOutput>) -> Self {
         Self {
             id: issue.id.clone(),
             title: issue.title.clone(),
             status: issue.status.as_str().to_string(),
             priority: issue.priority.0,
             updated_at: issue.updated_at,
+            text_deltas,
         }
     }
 }
@@ -70,6 +131,18 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         );
     }
 
+    // Free-text writes are checked against the STORED value before anything
+    // is mutated, for every target id. bd is the only participant that holds
+    // both the old value and the incoming one without a subprocess, so the
+    // read happens here rather than being taken on trust from the caller.
+    let text_writes = requested_text_writes(args);
+    refuse_destructive_shrinks(
+        &storage_ctx.storage,
+        &resolved_ids,
+        &text_writes,
+        args.replace,
+    )?;
+
     let claim_exclusive = config::claim_exclusive_from_layer(&config_layer);
     let update = build_update(args, &actor, claim_exclusive)?;
     let has_updates = !update.is_empty()
@@ -79,6 +152,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         || args.parent.is_some();
 
     let mut updated_issues: Vec<UpdatedIssueOutput> = Vec::new();
+    let mut write_mismatch: Option<BeadsError> = None;
 
     let storage = &mut storage_ctx.storage;
 
@@ -111,9 +185,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         }
 
         // Warn if the target status matches the current status (redundant transition)
-        if let (Some(issue_before), Some(target_status)) =
-            (&issue_before, &update.status)
-        {
+        if let (Some(issue_before), Some(target_status)) = (&issue_before, &update.status) {
             if issue_before.status == *target_status {
                 warn_redundant_status(id, target_status, storage);
             }
@@ -124,29 +196,7 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
             storage.update_issue(id, &update, &actor)?;
         }
 
-        // Apply labels
-        for label in &args.add_label {
-            LabelValidator::validate(label)
-                .map_err(|e| BeadsError::validation("label", e.message))?;
-            storage.add_label(id, label, &actor)?;
-        }
-        for label in &args.remove_label {
-            storage.remove_label(id, label, &actor)?;
-        }
-        if !args.set_labels.is_empty() {
-            // Remove all then add new
-            storage.remove_all_labels(id, &actor)?;
-            // Join all flag values, then split by comma (handles both --set-labels a,b and --set-labels a --set-labels b)
-            let combined = args.set_labels.join(",");
-            for label in combined.split(',') {
-                let label = label.trim();
-                if !label.is_empty() {
-                    LabelValidator::validate(label)
-                        .map_err(|e| BeadsError::validation("label", e.message))?;
-                    storage.add_label(id, label, &actor)?;
-                }
-            }
-        }
+        apply_label_updates(storage, id, args, &actor)?;
 
         // Apply parent
         apply_parent_update(storage, id, args.parent.as_deref(), &resolver, &actor)?;
@@ -158,13 +208,23 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         let issue_after = storage.get_issue(id)?;
 
         if let Some(issue) = issue_after {
-            if ctx.is_json() {
-                updated_issues.push(UpdatedIssueOutput::from(&issue));
-            } else if has_updates {
-                print_update_summary(id, &issue.title, issue_before.as_ref(), &issue);
-            } else {
-                println!("No updates specified for {id}");
+            let text_changes =
+                measure_text_changes(id, &text_writes, issue_before.as_ref(), &issue);
+            // Remember the FIRST write that did not land as sent; it is raised
+            // after every issue has reported, so the caller sees what happened
+            // to each field and then exits non-zero.
+            if write_mismatch.is_none() {
+                write_mismatch = first_write_mismatch(id, &text_changes);
             }
+            report_one_update(
+                id,
+                issue_before.as_ref(),
+                &issue,
+                &text_changes,
+                has_updates,
+                ctx,
+                &mut updated_issues,
+            );
         }
     }
 
@@ -173,6 +233,15 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     storage_ctx.flush_no_db_if_dirty()?;
+
+    // A write that did not land as sent has already happened and cannot be
+    // refused, but a caller running `br update ... && next-step` must not
+    // proceed as though it applied. Distinct exit code (2) from the
+    // DESTRUCTIVE_UPDATE refusal (4) so automation can tell the two apart.
+    if let Some(mismatch) = write_mismatch {
+        return Err(mismatch);
+    }
+
     Ok(())
 }
 
@@ -275,9 +344,247 @@ fn execute_reprefix(
     Ok(())
 }
 
+/// The free-text field values this invocation asks to write, in CLI order.
+///
+/// Read from `args` rather than from the assembled `IssueUpdate` so the guard
+/// sees exactly what the caller passed, including an explicit empty string.
+fn requested_text_writes(args: &UpdateArgs) -> Vec<(TextField, &str)> {
+    let candidates = [
+        (TextField::Title, args.title.as_deref()),
+        (TextField::Description, args.description.as_deref()),
+        (TextField::Design, args.design.as_deref()),
+        (
+            TextField::AcceptanceCriteria,
+            args.acceptance_criteria.as_deref(),
+        ),
+        (TextField::Notes, args.notes.as_deref()),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|(field, value)| value.map(|v| (field, v)))
+        .collect()
+}
+
+/// The currently stored value of a free-text field ("" when unset).
+fn stored_text(issue: &Issue, field: TextField) -> &str {
+    match field {
+        TextField::Title => issue.title.as_str(),
+        TextField::Description => issue.description.as_deref().unwrap_or_default(),
+        TextField::Design => issue.design.as_deref().unwrap_or_default(),
+        TextField::AcceptanceCriteria => issue.acceptance_criteria.as_deref().unwrap_or_default(),
+        TextField::Notes => issue.notes.as_deref().unwrap_or_default(),
+    }
+}
+
+/// Refuse, before any write happens, any update that would shrink a
+/// free-text field that currently has content.
+///
+/// This runs over EVERY target id up front: a multi-id update either applies
+/// everywhere or nowhere, rather than destroying the first issue and then
+/// reporting a refusal for the second.
+///
+/// The shrink test is a cheap proxy for destruction, not a proof of it — a
+/// write that GROWS the field can still drop everything that was there. That
+/// case is deliberately allowed and reported instead (see
+/// `crate::validation::text_guard`).
+///
+/// # Errors
+///
+/// Returns `BeadsError::DestructiveFieldShrink` for the first offending
+/// (issue, field) pair. Nothing has been written when it does.
+fn refuse_destructive_shrinks(
+    storage: &SqliteStorage,
+    ids: &[String],
+    writes: &[(TextField, &str)],
+    replace_opt_in: bool,
+) -> Result<()> {
+    if writes.is_empty() || replace_opt_in {
+        return Ok(());
+    }
+
+    for id in ids {
+        // FAIL CLOSED. If the stored value cannot be read there is nothing to
+        // compare against, and "the comparison did not happen" must never be
+        // reported as "the comparison passed" — that is the exact shape of the
+        // vacuous preservation checks this guard exists to replace. Ids are
+        // existence-checked during resolution, so this is not reachable by an
+        // ordinary caller; it stays a refusal rather than a skip anyway.
+        let Some(issue) = storage.get_issue(id)? else {
+            return Err(BeadsError::IssueNotFound { id: id.clone() });
+        };
+        for &(field, new_value) in writes {
+            let change = TextChange::measure(field, stored_text(&issue, field), new_value);
+            if change.is_destructive_shrink() {
+                return Err(BeadsError::DestructiveFieldShrink {
+                    id: issue.id.clone(),
+                    field: field.name().to_string(),
+                    flag: field.flag().to_string(),
+                    old_chars: change.old_chars,
+                    new_chars: change.new_chars,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Measure what actually happened to each free-text field this command wrote.
+///
+/// Uses the stored before/after values rather than the arguments, so the
+/// reported numbers are the numbers in the database.
+fn measure_text_changes(
+    id: &str,
+    writes: &[(TextField, &str)],
+    before: Option<&Issue>,
+    after: &Issue,
+) -> Vec<TextChange> {
+    if writes.is_empty() {
+        return Vec::new();
+    }
+    let Some(before) = before else {
+        // Say so out loud. A silently absent delta is indistinguishable from
+        // "no free-text field was written", which is the confusion this whole
+        // change exists to remove.
+        eprintln!(
+            "warning: {id} could not be read before the write; field size deltas unavailable"
+        );
+        return Vec::new();
+    };
+    writes
+        .iter()
+        .map(|&(field, requested)| {
+            TextChange::measure_write(
+                field,
+                stored_text(before, field),
+                stored_text(after, field),
+                requested,
+            )
+        })
+        .collect()
+}
+
+/// Apply `--add-label` / `--remove-label` / `--set-labels` to one issue.
+fn apply_label_updates(
+    storage: &mut SqliteStorage,
+    id: &str,
+    args: &UpdateArgs,
+    actor: &str,
+) -> Result<()> {
+    for label in &args.add_label {
+        LabelValidator::validate(label).map_err(|e| BeadsError::validation("label", e.message))?;
+        storage.add_label(id, label, actor)?;
+    }
+    for label in &args.remove_label {
+        storage.remove_label(id, label, actor)?;
+    }
+    if !args.set_labels.is_empty() {
+        // Remove all then add new
+        storage.remove_all_labels(id, actor)?;
+        // Join all flag values, then split by comma (handles both
+        // --set-labels a,b and --set-labels a --set-labels b)
+        let combined = args.set_labels.join(",");
+        for label in combined.split(',') {
+            let label = label.trim();
+            if !label.is_empty() {
+                LabelValidator::validate(label)
+                    .map_err(|e| BeadsError::validation("label", e.message))?;
+                storage.add_label(id, label, actor)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first field whose stored value is not the value bd was asked to store.
+fn first_write_mismatch(id: &str, changes: &[TextChange]) -> Option<BeadsError> {
+    changes
+        .iter()
+        .find(|change| change.landed_as_sent == Some(false))
+        .map(|change| BeadsError::WriteDidNotLandAsSent {
+            id: id.to_string(),
+            field: change.field.name().to_string(),
+            requested_chars: change.requested_chars.unwrap_or(change.new_chars),
+            stored_chars: change.new_chars,
+        })
+}
+
+/// Emit one issue's result, into the JSON accumulator or straight to stdout.
+fn report_one_update(
+    id: &str,
+    before: Option<&Issue>,
+    after: &Issue,
+    text_changes: &[TextChange],
+    has_updates: bool,
+    ctx: &OutputContext,
+    json_out: &mut Vec<UpdatedIssueOutput>,
+) {
+    if ctx.is_json() {
+        json_out.push(UpdatedIssueOutput::new(
+            after,
+            text_changes.iter().map(TextDeltaOutput::from).collect(),
+        ));
+    } else if has_updates {
+        print_update_summary(id, &after.title, before, after, text_changes);
+    } else {
+        println!("No updates specified for {id}");
+    }
+}
+
+/// Render one field's delta for the success line.
+///
+/// Ordering is deliberate. A discrepancy comes FIRST, ahead of the sizes and
+/// ahead of any reassuring clause, because a reader scanning the line must hit
+/// the alarm before the comfort. And when the write did not land as sent, the
+/// retention verdict is omitted entirely: "prior content retained" is a true
+/// answer to a question the caller has stopped caring about, and printing it
+/// beside a failure is how a line becomes noise.
+fn format_text_change(change: &TextChange) -> String {
+    let name = change.field.name();
+    if change.landed_as_sent == Some(false) {
+        let requested = change.requested_chars.unwrap_or(change.new_chars);
+        return format!(
+            "{name}: WRITE DID NOT LAND AS SENT, requested {requested} chars, stored {} \
+             ({} \u{2192} {} chars)",
+            change.new_chars, change.old_chars, change.new_chars
+        );
+    }
+
+    let mut rendered = format!(
+        "{name}: {} \u{2192} {} chars",
+        change.old_chars, change.new_chars
+    );
+    match change.prior_retained {
+        Some(true) => rendered.push_str(", prior content retained"),
+        Some(false) => rendered.push_str(", PRIOR CONTENT NOT RETAINED"),
+        None => {}
+    }
+    rendered
+}
+
 /// Print a summary of what changed for the issue.
-fn print_update_summary(id: &str, title: &str, before: Option<&Issue>, after: &Issue) {
-    println!("Updated {id}: {title}");
+fn print_update_summary(
+    id: &str,
+    title: &str,
+    before: Option<&Issue>,
+    after: &Issue,
+    text_changes: &[TextChange],
+) {
+    if text_changes.is_empty() {
+        println!("Updated {id}: {title}");
+    } else {
+        // Any field whose write did not land as sent is rendered first, so a
+        // multi-field update cannot bury the alarm behind two healthy deltas.
+        let (alarming, ordinary): (Vec<&TextChange>, Vec<&TextChange>) = text_changes
+            .iter()
+            .partition(|change| change.landed_as_sent == Some(false));
+        let deltas: Vec<String> = alarming
+            .into_iter()
+            .chain(ordinary)
+            .map(format_text_change)
+            .collect();
+        println!("Updated {id}: {title}  ({})", deltas.join("; "));
+    }
 
     if let Some(before) = before {
         // Status change
@@ -690,5 +997,113 @@ mod tests {
         let update = build_update(&args, "test_actor", false).unwrap();
         assert!(update.is_empty());
         info!("test_build_update_empty: assertions passed");
+    }
+
+    // === The success-line delta clause ===
+
+    #[test]
+    fn delta_clause_reports_growth_and_retention() {
+        let change = TextChange::measure_write(TextField::Notes, "abcde", "abcdefg", "abcdefg");
+        assert_eq!(
+            format_text_change(&change),
+            "notes: 5 \u{2192} 7 chars, prior content retained"
+        );
+    }
+
+    #[test]
+    fn delta_clause_shouts_when_growth_dropped_prior_content() {
+        let change = TextChange::measure_write(TextField::Notes, "aaaaa", "bbbbbbb", "bbbbbbb");
+        assert_eq!(
+            format_text_change(&change),
+            "notes: 5 \u{2192} 7 chars, PRIOR CONTENT NOT RETAINED"
+        );
+    }
+
+    /// The alarm leads, and the retention verdict is gone: it would be a true
+    /// statement ("prior content retained") sitting next to a failure, which
+    /// is how a line stops being read.
+    #[test]
+    fn delta_clause_leads_with_a_write_that_did_not_land() {
+        let change =
+            TextChange::measure_write(TextField::Notes, "abcde", "abcde", "abcdefghijKLMNOP");
+        let rendered = format_text_change(&change);
+        assert_eq!(
+            rendered,
+            "notes: WRITE DID NOT LAND AS SENT, requested 16 chars, stored 5 (5 \u{2192} 5 chars)"
+        );
+        assert!(!rendered.contains("retained"), "{rendered}");
+    }
+
+    /// The JSON must carry the same verdicts as the human line, since agents
+    /// read one and never the other.
+    #[test]
+    fn json_delta_mirrors_the_human_verdicts() {
+        let ok = TextDeltaOutput::from(&TextChange::measure_write(
+            TextField::Notes,
+            "abcde",
+            "abcdefg",
+            "abcdefg",
+        ));
+        assert_eq!(ok.prior_content_retained, Some(true));
+        assert_eq!(ok.landed_as_sent, None, "silence means it landed");
+        assert_eq!(ok.requested_chars, None);
+
+        let bad = TextDeltaOutput::from(&TextChange::measure_write(
+            TextField::Notes,
+            "abcde",
+            "abcde",
+            "abcdefghijKLMNOP",
+        ));
+        assert_eq!(bad.landed_as_sent, Some(false));
+        assert_eq!(bad.requested_chars, Some(16));
+        assert_eq!(bad.new_chars, 5);
+        assert_eq!(
+            bad.prior_content_retained, None,
+            "the retention verdict is suppressed alongside a failed write"
+        );
+    }
+
+    // === Which fields the guard sees ===
+
+    /// Every free-text flag on `UpdateArgs` must reach the guard. A field
+    /// added later that is not wired in here is silently ungated, which is
+    /// the original bug with a different flag name.
+    #[test]
+    fn requested_writes_cover_every_free_text_field() {
+        let args = UpdateArgs {
+            title: Some("t".to_string()),
+            description: Some("d".to_string()),
+            design: Some("de".to_string()),
+            acceptance_criteria: Some("ac".to_string()),
+            notes: Some("n".to_string()),
+            ..Default::default()
+        };
+        let writes = requested_text_writes(&args);
+        assert_eq!(writes.len(), TextField::ALL.len());
+        for field in TextField::ALL {
+            assert!(
+                writes.iter().any(|&(f, _)| f == field),
+                "{} is settable but never reaches the guard",
+                field.name()
+            );
+        }
+    }
+
+    /// A field the caller did not pass is not a write, and must not be
+    /// measured or gated as though it were.
+    #[test]
+    fn unpassed_fields_are_not_writes() {
+        let args = UpdateArgs {
+            notes: Some("n".to_string()),
+            ..Default::default()
+        };
+        let writes = requested_text_writes(&args);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, TextField::Notes);
+
+        assert!(
+            requested_text_writes(&UpdateArgs::default()).is_empty(),
+            "a status-only update writes no free text"
+        );
     }
 }

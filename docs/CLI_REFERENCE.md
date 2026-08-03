@@ -267,11 +267,12 @@ br update [OPTIONS] [IDS]...
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `--title <TEXT>` | Update title |
-| `--description <TEXT>` | Update description |
-| `--design <TEXT>` | Update design notes |
-| `--acceptance-criteria <TEXT>` | Update acceptance criteria |
-| `--notes <TEXT>` | Update additional notes |
+| `--title <TEXT>` | Update title (REPLACES the field) |
+| `--description <TEXT>` | Update description (REPLACES the field) |
+| `--design <TEXT>` | Update design notes (REPLACES the field) |
+| `--acceptance-criteria <TEXT>` | Update acceptance criteria (REPLACES the field) |
+| `--notes <TEXT>` | Update additional notes (REPLACES the field) |
+| `--replace` | Allow a write that shrinks a non-empty free-text field |
 | `-s, --status <STATUS>` | Change status |
 | `-p, --priority <N>` | Change priority |
 | `-t, --type <TYPE>` | Change issue type |
@@ -301,6 +302,49 @@ br update bd-abc123 bd-def456 -p 1
 # Add labels
 br update bd-abc123 --add-label "urgent,reviewed"
 ```
+
+**Free-text fields replace, and shrinking one is refused**
+
+`--title`, `--description`, `--design`, `--acceptance-criteria` and `--notes`
+each replace the whole field. A write that would shrink one of those fields
+while it has content is REFUSED — nothing is written, and the command exits 4:
+
+```bash
+$ br update bd-abc123 --notes "second block"
+{
+  "error": {
+    "code": "DESTRUCTIVE_UPDATE",
+    "message": "Refusing destructive update: notes on bd-abc123 would shrink from 63 to 12 chars",
+    ...
+  }
+}
+```
+
+Three ways forward:
+
+- to ADD to the field, use `br comments add bd-abc123 -f <file>` — append-only,
+  attributed and timestamped;
+- to rewrite it while keeping what is there, re-send the flag with the existing
+  text included;
+- to replace it anyway, pass `--replace`.
+
+Every allowed write to those fields reports its size delta, so an append and an
+annihilation no longer look the same:
+
+```bash
+$ br update bd-abc123 --notes "$(cat note.md)"
+Updated bd-abc123: fix the widget  (notes: 3535 → 4210 chars, prior content retained)
+```
+
+`prior content retained` means the previous value still appears verbatim in the
+new one; `PRIOR CONTENT NOT RETAINED` means it does not — a growing write can
+still drop everything that was there. Under `--json` the same figures appear as
+a `text_deltas` array on each updated issue.
+
+Identifier-like fields (`--external-ref`, `--session`, `--assignee`, `--owner`,
+`--due`, `--defer`) are NOT guarded: they are replaced by nature, several
+document "empty string clears", and a shorter value there is an ordinary
+correction rather than a loss.
 
 ---
 

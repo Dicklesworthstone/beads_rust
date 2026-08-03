@@ -1387,7 +1387,7 @@ pub struct UpdateArgs {
     #[arg(long, visible_alias = "acceptance")]
     pub acceptance_criteria: Option<String>,
 
-    /// Update additional notes
+    /// Update additional notes (REPLACES the field; use `br comments add` to accumulate narrative)
     #[arg(long)]
     pub notes: Option<String>,
 
@@ -1418,6 +1418,12 @@ pub struct UpdateArgs {
     /// Force update even if issue is blocked
     #[arg(long)]
     pub force: bool,
+
+    /// Allow a write that shrinks a non-empty free-text field
+    /// (--title/--description/--design/--acceptance-criteria/--notes).
+    /// Without this, such writes are refused and nothing is written.
+    #[arg(long)]
+    pub replace: bool,
 
     /// Set due date (empty string clears)
     #[arg(long)]

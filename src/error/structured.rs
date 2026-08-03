@@ -18,8 +18,9 @@
 
 #![allow(clippy::option_if_let_else, clippy::manual_map, clippy::manual_find)]
 
-use crate::error::{BeadsError, STATUS_ALL_HINT, VALID_STATUSES_HINT};
+use crate::error::{BeadsError, REPLACE_FLAG, STATUS_ALL_HINT, VALID_STATUSES_HINT};
 use crate::model::Status;
+use crate::validation::text_guard::TextField;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -40,6 +41,8 @@ pub enum ErrorCode {
     SchemaMismatch,
     /// Database operation failed
     DatabaseError,
+    /// The stored value is not the value bd was asked to store
+    WriteMismatch,
     /// Beads workspace not initialized
     NotInitialized,
     /// Already initialized
@@ -60,6 +63,8 @@ pub enum ErrorCode {
     ValidationFailed,
     /// Invalid status value
     InvalidStatus,
+    /// A write would shrink a non-empty free-text field (refused by default)
+    DestructiveUpdate,
     /// Invalid issue type value
     InvalidType,
     /// Priority out of range (0-4)
@@ -125,6 +130,7 @@ impl ErrorCode {
             Self::DatabaseNotFound => "DATABASE_NOT_FOUND",
             Self::DatabaseLocked => "DATABASE_LOCKED",
             Self::SchemaMismatch => "SCHEMA_MISMATCH",
+            Self::WriteMismatch => "WRITE_MISMATCH",
             Self::DatabaseError => "DATABASE_ERROR",
             Self::NotInitialized => "NOT_INITIALIZED",
             Self::AlreadyInitialized => "ALREADY_INITIALIZED",
@@ -136,6 +142,7 @@ impl ErrorCode {
             // Validation
             Self::ValidationFailed => "VALIDATION_FAILED",
             Self::InvalidStatus => "INVALID_STATUS",
+            Self::DestructiveUpdate => "DESTRUCTIVE_UPDATE",
             Self::InvalidType => "INVALID_TYPE",
             Self::InvalidPriority => "INVALID_PRIORITY",
             Self::RequiredField => "REQUIRED_FIELD",
@@ -178,6 +185,7 @@ impl ErrorCode {
             Self::DatabaseLocked
                 | Self::ValidationFailed
                 | Self::InvalidStatus
+                | Self::DestructiveUpdate
                 | Self::InvalidType
                 | Self::InvalidPriority
                 | Self::RequiredField
@@ -204,6 +212,7 @@ impl ErrorCode {
             | Self::DatabaseLocked
             | Self::SchemaMismatch
             | Self::DatabaseError
+            | Self::WriteMismatch
             | Self::NotInitialized
             | Self::AlreadyInitialized => 2,
             // Issue / Operational (3)
@@ -215,6 +224,7 @@ impl ErrorCode {
             // Validation (4)
             Self::ValidationFailed
             | Self::InvalidStatus
+            | Self::DestructiveUpdate
             | Self::InvalidType
             | Self::InvalidPriority
             | Self::RequiredField => 4,
@@ -527,6 +537,44 @@ impl StructuredError {
                         .collect::<Vec<_>>()
                 })),
             ),
+            BeadsError::DestructiveFieldShrink {
+                id,
+                field,
+                flag,
+                old_chars,
+                new_chars,
+            } => (
+                ErrorCode::DestructiveUpdate,
+                Some(json!({
+                    "id": id,
+                    "field": field,
+                    "flag": flag,
+                    "old_chars": old_chars,
+                    "new_chars": new_chars,
+                    "removed_chars": old_chars.saturating_sub(*new_chars),
+                    "override_flag": REPLACE_FLAG,
+                    // Absent for the title, which has no append channel:
+                    // a machine reader must not be handed an alternative
+                    // that does not exist for this field.
+                    "append_alternative": field_has_append_alternative(field)
+                        .then_some("br comments add"),
+                })),
+            ),
+            BeadsError::WriteDidNotLandAsSent {
+                id,
+                field,
+                requested_chars,
+                stored_chars,
+            } => (
+                ErrorCode::WriteMismatch,
+                Some(json!({
+                    "id": id,
+                    "field": field,
+                    "requested_chars": requested_chars,
+                    "stored_chars": stored_chars,
+                    "landed_as_sent": false,
+                })),
+            ),
             BeadsError::InvalidStatus { status } => (
                 ErrorCode::InvalidStatus,
                 Some(serde_json::json!({
@@ -617,6 +665,56 @@ impl StructuredError {
             return Some(status_hint(status));
         }
 
+        // A refused destructive write: the caller's payload is intact and
+        // unwritten, so the hint's whole job is to name both ways forward
+        // without making either one the path of least resistance.
+        if let BeadsError::DestructiveFieldShrink {
+            id,
+            field,
+            flag,
+            old_chars,
+            new_chars,
+        } = err
+        {
+            let removed = old_chars.saturating_sub(*new_chars);
+            // The append channel is named only for fields that have one.
+            // Telling someone retitling an issue to "use br comments add"
+            // is advice they cannot follow, and a hint that does not fit
+            // the situation is a hint that stops being read.
+            let keep_it = if field_has_append_alternative(field) {
+                format!(
+                    "To ADD to the field without losing what is there, use \
+                     'br comments add {id} -f <file>' (append-only, attributed, timestamped) \
+                     or re-send {flag} with the existing text included."
+                )
+            } else {
+                format!("To keep what is there, re-send {flag} with the existing text included.")
+            };
+            return Some(format!(
+                "This would remove {removed} of {old_chars} chars from {field}. \
+                 Nothing was written. {keep_it} \
+                 To replace it anyway, re-run the same command with {REPLACE_FLAG}."
+            ));
+        }
+
+        // The write already happened, so this hint cannot offer a way to
+        // prevent it — only a way to find out what is now in the field.
+        if let BeadsError::WriteDidNotLandAsSent {
+            id,
+            field,
+            requested_chars,
+            stored_chars,
+        } = err
+        {
+            return Some(format!(
+                "bd stored {stored_chars} chars of the {requested_chars} it was handed for \
+                 {field}, so the write landed altered. The value bd RECEIVED is what it \
+                 compared against, so this is a discrepancy inside bd, not in your shell. \
+                 Read the field back in full with 'br show {id} --json' before re-sending, \
+                 and do not treat the update as applied."
+            ));
+        }
+
         // Otherwise check if BeadsError has a built-in suggestion
         if let Some(suggestion) = err.suggestion() {
             return Some(suggestion.to_string());
@@ -678,6 +776,15 @@ fn status_did_you_mean(provided: &str) -> Option<String> {
         return Some(STATUS_ALL_HINT.to_string());
     }
     detect_status_intent(provided).map(|detected| format!("Did you mean --status {detected}?"))
+}
+
+/// Whether `br comments add` is a usable alternative for this field.
+///
+/// An unrecognised name is treated as having one: a field added later is far
+/// more likely to be prose than to be another one-line label, and the cost of
+/// being wrong is one extra sentence in a hint, not a lost payload.
+fn field_has_append_alternative(field: &str) -> bool {
+    TextField::from_name(field).is_none_or(TextField::has_append_alternative)
 }
 
 /// Full hint for an unparseable status: the targeted suggestion (when
@@ -1111,6 +1218,137 @@ mod tests {
             .map(|v| v.as_str().expect("string").to_string())
             .collect::<Vec<_>>();
         assert_eq!(values, Status::PARSEABLE.to_vec());
+    }
+
+    /// A refused destructive write has to hand back everything the caller
+    /// needs to proceed, in the same envelope shape as any other refusal.
+    #[test]
+    fn destructive_shrink_reports_sizes_and_the_override_flag() {
+        let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+            id: "np-3pp".to_string(),
+            field: "notes".to_string(),
+            flag: "--notes".to_string(),
+            old_chars: 62,
+            new_chars: 27,
+        });
+        assert_eq!(err.code, ErrorCode::DestructiveUpdate);
+        assert_eq!(err.code.exit_code(), 4);
+        let ctx = err.context.as_ref().expect("context");
+        assert_eq!(ctx["old_chars"], 62);
+        assert_eq!(ctx["new_chars"], 27);
+        assert_eq!(ctx["removed_chars"], 35);
+        assert_eq!(ctx["override_flag"], "--replace");
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(hint.contains("--replace"), "{hint}");
+        assert!(hint.contains("br comments add"), "{hint}");
+        assert!(hint.contains("Nothing was written"), "{hint}");
+    }
+
+    /// A title has no append channel, so neither the hint nor the machine
+    /// context may name one. Advice a caller cannot follow is how a hint
+    /// teaches people to skip hints.
+    #[test]
+    fn title_refusal_does_not_advertise_an_append_channel() {
+        let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+            id: "np-3pp".to_string(),
+            field: "title".to_string(),
+            flag: "--title".to_string(),
+            old_chars: 23,
+            new_chars: 5,
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(
+            !hint.contains("br comments add"),
+            "a title cannot be appended to: {hint}"
+        );
+        assert!(hint.contains("--replace"), "{hint}");
+        assert!(hint.contains("re-send --title"), "{hint}");
+        assert!(hint.contains("Nothing was written"), "{hint}");
+        let ctx = err.context.as_ref().expect("context");
+        assert_eq!(
+            ctx["append_alternative"],
+            serde_json::Value::Null,
+            "machine readers must not be handed a channel this field lacks"
+        );
+    }
+
+    /// Prose fields keep the append advice — that is the whole point of the
+    /// hint, and the title carve-out must not quietly swallow it.
+    #[test]
+    fn prose_field_refusals_all_name_the_append_channel() {
+        for field in ["description", "design", "acceptance_criteria", "notes"] {
+            let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+                id: "np-3pp".to_string(),
+                field: field.to_string(),
+                flag: format!("--{field}"),
+                old_chars: 62,
+                new_chars: 27,
+            });
+            let hint = err.hint.as_deref().expect("hint");
+            assert!(hint.contains("br comments add"), "{field}: {hint}");
+            let ctx = err.context.as_ref().expect("context");
+            assert_eq!(ctx["append_alternative"], "br comments add", "{field}");
+        }
+    }
+
+    /// An unknown field name must fail toward MORE advice, not less: a field
+    /// added later is prose until someone says otherwise.
+    #[test]
+    fn unknown_field_keeps_the_append_advice() {
+        let err = StructuredError::from_error(&BeadsError::DestructiveFieldShrink {
+            id: "np-3pp".to_string(),
+            field: "some_future_field".to_string(),
+            flag: "--some-future-field".to_string(),
+            old_chars: 62,
+            new_chars: 27,
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(hint.contains("br comments add"), "{hint}");
+    }
+
+    /// A write that did not land as sent is a DIFFERENT failure from the
+    /// refusal, and automation has to be able to tell them apart: the
+    /// refusal prevented a loss, this one is reporting an accomplished one.
+    #[test]
+    fn write_mismatch_is_separable_from_the_refusal() {
+        let err = StructuredError::from_error(&BeadsError::WriteDidNotLandAsSent {
+            id: "np-3pp".to_string(),
+            field: "notes".to_string(),
+            requested_chars: 16,
+            stored_chars: 5,
+        });
+        assert_eq!(err.code, ErrorCode::WriteMismatch);
+        assert_eq!(err.code.as_str(), "WRITE_MISMATCH");
+        assert_eq!(err.code.exit_code(), 2);
+        assert_ne!(
+            ErrorCode::WriteMismatch.exit_code(),
+            ErrorCode::DestructiveUpdate.exit_code(),
+            "the two must be distinguishable by exit code alone"
+        );
+        let ctx = err.context.as_ref().expect("context");
+        assert_eq!(ctx["requested_chars"], 16);
+        assert_eq!(ctx["stored_chars"], 5);
+        // A boolean, not only a human string: this is what a script reads.
+        assert_eq!(ctx["landed_as_sent"], serde_json::Value::Bool(false));
+    }
+
+    /// The hint must not blame the caller's shell for something bd measured
+    /// on its own side of the boundary.
+    #[test]
+    fn write_mismatch_hint_locates_the_discrepancy_inside_bd() {
+        let err = StructuredError::from_error(&BeadsError::WriteDidNotLandAsSent {
+            id: "np-3pp".to_string(),
+            field: "notes".to_string(),
+            requested_chars: 16,
+            stored_chars: 5,
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(hint.contains("inside bd"), "{hint}");
+        assert!(hint.contains("br show np-3pp --json"), "{hint}");
+        assert!(
+            hint.contains("do not treat the update as applied"),
+            "{hint}"
+        );
     }
 
     #[test]

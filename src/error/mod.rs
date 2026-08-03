@@ -41,6 +41,17 @@ pub const VALID_STATUSES_HINT: &str = "Valid statuses: open, in_progress, blocke
 pub const STATUS_ALL_HINT: &str = "Did you mean -a/--all? 'all' is not a status — \
      use the -a/--all flag for an unfiltered sweep (e.g. `br list -a`), or omit --status.";
 
+/// The opt-in flag that authorizes a write which shrinks a non-empty
+/// free-text field on `br update`.
+///
+/// `--replace` rather than `--force`: `br update --force` already exists and
+/// means "claim this issue even though it is blocked". Overloading it would
+/// mean an agent bypassing a blocker check silently also authorized data
+/// destruction, which is the coupling this guard exists to break. The name
+/// also says what it does to the FIELD, which is what the caller needs to
+/// think about at the moment they are asked.
+pub const REPLACE_FLAG: &str = "--replace";
+
 /// Primary error type for `beads_rust` operations.
 ///
 /// Design: Structured variants for common cases, with `Other` for
@@ -92,6 +103,47 @@ pub enum BeadsError {
     /// Multiple validation errors occurred.
     #[error("Validation errors: {errors:?}")]
     ValidationErrors { errors: Vec<ValidationError> },
+
+    /// A write would shrink a non-empty free-text field, destroying content.
+    ///
+    /// Refused by default; the caller opts in with `--replace`. See
+    /// `crate::validation::text_guard` for the transition rule.
+    #[error(
+        "Refusing destructive update: {field} on {id} would shrink from {old_chars} to {new_chars} chars"
+    )]
+    DestructiveFieldShrink {
+        /// Issue whose field would be shrunk.
+        id: String,
+        /// Field name (e.g. `notes`).
+        field: String,
+        /// CLI flag that sets this field (e.g. `--notes`).
+        flag: String,
+        /// Size of the stored value, in chars.
+        old_chars: usize,
+        /// Size of the proposed value, in chars.
+        new_chars: usize,
+    },
+
+    /// The stored value is not the value bd was asked to store.
+    ///
+    /// Raised AFTER the write, because that is the earliest moment it can be
+    /// observed. bd compares the value it received on the command line with
+    /// the value it reads back, so this reports an alteration inside bd — a
+    /// caller whose own shell mangled the payload before bd saw it produces a
+    /// perfectly consistent write and is not detectable here.
+    #[error(
+        "Write did not land as sent: {field} on {id} was given {requested_chars} chars but stores {stored_chars}"
+    )]
+    WriteDidNotLandAsSent {
+        /// Issue that was written.
+        id: String,
+        /// Field name (e.g. `notes`).
+        field: String,
+        /// Size of the value bd was asked to store, in chars.
+        requested_chars: usize,
+        /// Size of the value bd actually stored, in chars.
+        stored_chars: usize,
+    },
 
     /// Invalid status value.
     #[error("Invalid status: {status}")]
@@ -222,6 +274,7 @@ impl BeadsError {
                 | Self::NotInitialized
                 | Self::IssueNotFound { .. }
                 | Self::Validation { .. }
+                | Self::DestructiveFieldShrink { .. }
                 | Self::InvalidStatus { .. }
                 | Self::InvalidType { .. }
                 | Self::InvalidPriority { .. }

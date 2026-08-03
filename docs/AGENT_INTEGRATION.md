@@ -305,6 +305,35 @@ br list --json --assignee $(whoami) | jq '.[].title'
 
 ## Error Handling
 
+### Writing to free-text fields
+
+`--title`, `--description`, `--design`, `--acceptance-criteria` and `--notes`
+REPLACE the whole field. To accumulate narrative, use `br comments add <id> -f
+<file>` — it is append-only, attributed and timestamped.
+
+A write that would shrink one of those fields while it has content is refused
+(`DESTRUCTIVE_UPDATE`, exit 4) and nothing is written; pass `--replace` if you
+genuinely mean to discard what is there. Allowed writes report the size change
+on the success line, and under `--json` as `text_deltas`:
+
+```json
+"text_deltas": [
+  { "field": "notes", "old_chars": 3535, "new_chars": 4210, "prior_content_retained": true }
+]
+```
+
+Two things worth checking programmatically:
+
+- `prior_content_retained: false` on a growing write means the previous value
+  is no longer present — typically a read-modify-write whose read failed;
+- `landed_as_sent: false` (present only when something is wrong, exit 2,
+  `WRITE_MISMATCH`) means what is stored is NOT what bd was handed. Do not
+  treat such an update as applied.
+
+Do not verify a write by grepping for the text you just sent: that succeeds on
+a field you have just destroyed. Compare the whole field, and treat a length
+decrease as failure.
+
 ### Exit Codes
 
 | Code | Category | Example |

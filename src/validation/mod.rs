@@ -12,9 +12,13 @@
 //!
 //! See `SyncSafetyValidator` for runtime guards.
 
+pub mod text_guard;
+
 use crate::error::{BeadsError, ValidationError};
 use crate::model::{Comment, Dependency, Issue, Priority};
 use std::path::Path;
+
+pub use text_guard::{TextChange, TextField};
 
 const MAX_ID_PREFIX_LEN: usize = 64;
 const MAX_ID_HASH_LEN: usize = 40;
