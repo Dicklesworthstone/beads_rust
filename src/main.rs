@@ -11,8 +11,106 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use tracing::debug;
 
+/// Exit quietly instead of aborting when stdout disappears mid-write.
+///
+/// `bd list | head` is the most ordinary thing a user or an agent does, and
+/// before this guard it crashed the process every single time.
+///
+/// The chain: the Rust runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so a
+/// write to a pipe whose reader has exited returns `EPIPE` rather than killing
+/// the process. `println!` treats a failed stdout write as unrecoverable and
+/// panics ("failed printing to stdout"). Under `[profile.release]`'s
+/// `panic = "abort"` that panic becomes `abort()`, so the process dies on
+/// `SIGABRT` and the kernel writes a multi-megabyte core.
+///
+/// It was invisible in normal use, which is why it survived: a pipeline
+/// reports the *last* command's exit status, so the shell said `0` while the
+/// process was dying. Over 100 such cores (~288 MB) had piled up on one
+/// machine before anyone noticed, and nothing on the terminal ever said a
+/// word.
+///
+/// # Why a panic hook rather than restoring `SIG_DFL`
+///
+/// The conventional fix is `signal(SIGPIPE, SIG_DFL)`, but this crate sets
+/// `unsafe_code = "forbid"` (and `src/lib.rs` repeats `#![forbid(unsafe_code)]`)
+/// — a deliberate invariant, and `forbid` cannot be locally overridden. Doing
+/// it safely would mean taking on a new dependency purely to hide one `unsafe`
+/// call, which is a poor trade right before a release. A panic hook needs
+/// neither: it runs *before* the abort under `panic = "abort"`, so exiting
+/// from it pre-empts the core dump entirely, and it covers every one of the
+/// ~355 `println!` sites in the tree at once rather than only the ones someone
+/// remembered to convert.
+///
+/// # Why exit 0
+///
+/// The reader closing early is the reader's own choice (`head` does it by
+/// design), so the caller already knows the output was truncated — nothing is
+/// being hidden from them. Dying by `SIGPIPE` would instead surface as `141`
+/// under `set -o pipefail`, turning a completely normal idiom into a spurious
+/// failure for every agent that pipes `bd` into `head` or `jq`. If a future
+/// maintainer prefers strict unix convention, changing the `0` below to `141`
+/// is the whole edit.
+///
+/// # Interaction with auto-flush
+///
+/// Exiting at a write means a mutating command can stop before its post-command
+/// JSONL auto-flush runs. That is safe and self-healing: `auto_flush` gates on
+/// `get_dirty_issue_count()` and dirty flags are cleared only after a
+/// successful export, so the next mutating command re-exports the pending
+/// rows. The mutation itself was committed to SQLite before any output was
+/// printed. Nor is it a new exposure — the previous behaviour (`abort()`)
+/// skipped the flush just as abruptly, only with a core dump attached.
+fn install_broken_pipe_guard() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if is_broken_pipe_panic(info) {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+}
+
+/// Is this panic a failed write caused by the reader going away?
+///
+/// There are two distinct sources, and both must be caught — missing either
+/// leaves half the commands still crashing:
+///
+/// 1. **std**, from `println!`/`print!`: the message is built in
+///    `std::io::stdio::print_to` as `"failed printing to stdout: ..."`. This is
+///    what `bd list` hits.
+/// 2. **`rich_rust`**, from its console writer
+///    (`console.rs`: `"failed to write to output stream: ... BrokenPipe"`).
+///    This is what `bd search` hits, and it was found only because the
+///    regression test exercised `search` as well as `list` — fixing just the
+///    std path left `search` exiting 101.
+///
+/// Matched on payload strings because neither source offers a typed signal.
+/// That makes this the brittle part of the guard, so the check is deliberately
+/// broad: any panic whose message names a broken pipe qualifies, regardless of
+/// which writer raised it. Exiting quietly is the right response to a vanished
+/// reader no matter who noticed it first.
+///
+/// `tests/e2e_broken_pipe.rs` asserts on the *process outcome* rather than on
+/// these strings, so it will fail loudly if any of this wording drifts.
+fn is_broken_pipe_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    let payload = info.payload();
+    let Some(message) = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    else {
+        return false;
+    };
+
+    message.starts_with("failed printing to ")
+        || message.contains("BrokenPipe")
+        || message.contains("Broken pipe")
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() {
+    install_broken_pipe_guard();
+
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
