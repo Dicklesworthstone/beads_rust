@@ -171,6 +171,7 @@ pub fn execute(
             updated: false,
             age: false,
             context: args.details,
+            comments: false,
             color_id_by_type: false,
         };
 

@@ -3,7 +3,7 @@
 use crate::cli::{ShowArgs, resolve_output_format_basic};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{format_priority_label, format_status_icon_colored};
+use crate::format::{escape_markup, format_priority_label, format_status_icon_colored};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::util::id::IdResolver;
 use std::fmt::Write as FmtWrite;
@@ -42,6 +42,12 @@ pub fn execute(
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
 
+    // How many comments to render. `show` is a summary view, so it bounds
+    // comments the same way it already bounds events; the bound is applied
+    // to the serialized struct too, so text and JSON agree and neither can
+    // drop history silently (`comment_count`/`comments_truncated` say so).
+    let comment_limit = crate::cli::commands::comments::parse_comment_limit(args.comments.as_deref())?;
+
     let mut details_list = Vec::new();
     for id_input in target_ids {
         let resolution = resolver.resolve(
@@ -51,7 +57,9 @@ pub fn execute(
         )?;
 
         // Fetch full details including comments and events
-        if let Some(details) = storage.get_issue_details(&resolution.id, true, false, 10)? {
+        if let Some(mut details) = storage.get_issue_details(&resolution.id, true, false, 10)? {
+            details.comments_truncated =
+                crate::cli::commands::comments::bound_comments(&mut details.comments, comment_limit);
             details_list.push(details);
         } else {
             return Err(BeadsError::IssueNotFound { id: resolution.id });
@@ -227,16 +235,31 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
         }
     }
 
-    if !details.comments.is_empty() {
+    if !details.comments.is_empty() || details.comment_count > 0 {
         output.push('\n');
-        let _ = writeln!(output, "Comments:");
+        let _ = writeln!(output, "Comments ({}):", details.comment_count);
+        // Say what is hidden BEFORE showing what is not, so the reader
+        // learns there is more history above the window rather than
+        // discovering it after they have already drawn a conclusion.
+        let hidden = details.comment_count.saturating_sub(details.comments.len());
+        if details.comments_truncated && hidden > 0 {
+            let plural = if hidden == 1 { "" } else { "s" };
+            let _ = writeln!(
+                output,
+                "  ... {hidden} earlier comment{plural} hidden - `bd comments {}` for all",
+                issue.id
+            );
+        }
         for comment in &details.comments {
+            // Author and body are stored data, so they are escaped: the
+            // console parses what it is given as markup and would eat a
+            // `[bold]` in a body outright. See `format::escape_markup`.
             let _ = writeln!(
                 output,
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
-                comment.author,
-                comment.body
+                escape_markup(&comment.author),
+                escape_markup(&comment.body)
             );
         }
     }
@@ -443,6 +466,7 @@ mod tests {
             comments: Vec::new(),
             events: Vec::new(),
             parent: None,
+            ..Default::default()
         };
         let json = serde_json::to_string_pretty(&vec![details]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -479,12 +503,84 @@ mod tests {
             }],
             events: Vec::new(),
             parent: None,
+            comment_count: 1,
+            comments_truncated: false,
         };
         let output = format_issue_details(&details, false);
         assert!(output.contains("Dependencies:"));
         assert!(output.contains("-> bd-002 (blocks) - Dep"));
-        assert!(output.contains("Comments:"));
+        assert!(output.contains("Comments (1):"));
         assert!(output.contains("alice: Looks good"));
+        // Nothing was withheld, so nothing claims anything was.
+        assert!(!output.contains("hidden"));
         info!("test_show_text_includes_dependencies_and_comments: assertions passed");
+    }
+
+    /// A bounded view must say how much it is NOT showing, and where to get
+    /// the rest. Silence here is the failure mode that matters: a reader who
+    /// believes they have read the whole thread when they have read the tail.
+    #[test]
+    fn test_show_text_reports_hidden_comments() {
+        init_logging();
+        let mut issue = make_test_issue("bd-001", "Test Issue");
+        issue.description = None;
+        let details = IssueDetails {
+            issue,
+            comments: vec![Comment {
+                id: 9,
+                issue_id: "bd-001".to_string(),
+                author: "alice".to_string(),
+                body: "newest".to_string(),
+                created_at: Utc.with_ymd_and_hms(2025, 1, 9, 0, 0, 0).unwrap(),
+            }],
+            comment_count: 4,
+            comments_truncated: true,
+            ..Default::default()
+        };
+        let output = format_issue_details(&details, false);
+        assert!(output.contains("Comments (4):"));
+        assert!(output.contains("3 earlier comments hidden"));
+        // And it names the command that shows the whole log.
+        assert!(output.contains("bd comments bd-001"));
+        assert!(output.contains("alice: newest"));
+    }
+
+    /// Singular/plural on the hidden-count line, because "1 earlier
+    /// comments hidden" reads like a bug in the tool.
+    #[test]
+    fn test_show_text_hidden_comment_singular() {
+        init_logging();
+        let details = IssueDetails {
+            issue: make_test_issue("bd-001", "Test Issue"),
+            comments: vec![Comment {
+                id: 2,
+                issue_id: "bd-001".to_string(),
+                author: "bob".to_string(),
+                body: "second".to_string(),
+                created_at: Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap(),
+            }],
+            comment_count: 2,
+            comments_truncated: true,
+            ..Default::default()
+        };
+        let output = format_issue_details(&details, false);
+        assert!(output.contains("1 earlier comment hidden"));
+    }
+
+    /// `--comments 0` hides the bodies but must not hide the fact that
+    /// history exists: the count still shows, and so does the pointer.
+    #[test]
+    fn test_show_text_zero_bound_still_reports_count() {
+        init_logging();
+        let details = IssueDetails {
+            issue: make_test_issue("bd-001", "Test Issue"),
+            comments: Vec::new(),
+            comment_count: 5,
+            comments_truncated: true,
+            ..Default::default()
+        };
+        let output = format_issue_details(&details, false);
+        assert!(output.contains("Comments (5):"));
+        assert!(output.contains("5 earlier comments hidden"));
     }
 }

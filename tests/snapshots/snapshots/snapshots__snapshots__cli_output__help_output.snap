@@ -7,26 +7,27 @@ ID-REDACTED issue tracker (SQLite + JSONL)
 Usage: br [OPTIONS] <COMMAND>
 
 Commands:
-  watch    Watch a prefix for bead events (and inbox messages by default)
-  msg      Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
-  who      List agents currently watching for messages (active `bd watch` heartbeats)
-  inbox    List received messages (or show a specific message in full)
-  outbox   List sent messages
-  blocked  List blocked issues
-  search   Search issues
-  list     List issues
-  show     Show issue details
-  create   Create a new issue
-  q        Quick capture (create issue, print ID only)
-  update   Update an issue
-  close    Close an issue
-  reopen   Reopen an issue
-  defer    Defer issues (schedule for later)
-  undefer  Undefer issues (make ready again)
-  dep      Manage dependencies
-  admin    ID-REDACTED / diagnostic commands (init, dash, graph, stats, sync, ...)
-  version  Show version information
-  help     Print this message or the help of the given subcommand(s)
+  watch     Watch a prefix for bead events (and inbox messages by default)
+  msg       Send an ephemeral message to another prefix (e.g., `bd msg arc1 "ping"`)
+  who       List agents currently watching for messages (active `bd watch` heartbeats)
+  inbox     List received messages (or show a specific message in full)
+  outbox    List sent messages
+  blocked   List blocked issues
+  search    Search issues
+  list      List issues
+  show      Show issue details
+  create    Create a new issue
+  q         Quick capture (create issue, print ID only)
+  update    Update an issue
+  comments  Read or append an issue's comments (ID-REDACTED attributed history)
+  close     Close an issue
+  reopen    Reopen an issue
+  defer     Defer issues (schedule for later)
+  undefer   Undefer issues (make ready again)
+  dep       Manage dependencies
+  admin     ID-REDACTED / diagnostic commands (init, dash, graph, stats, sync, ...)
+  version   Show version information
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --db <DB>     Database path (ID-REDACTED .beads/*.db if not set)

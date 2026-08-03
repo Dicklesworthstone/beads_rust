@@ -184,27 +184,13 @@ pub fn insert_reopened_event(
     )
 }
 
-/// Insert a "commented" event.
-///
-/// # Errors
-///
-/// Returns an error if the database insert fails.
-pub fn insert_commented_event(
-    tx: &Transaction<'_>,
-    issue_id: &str,
-    actor: &str,
-    comment_text: &str,
-) -> Result<i64> {
-    insert_event(
-        tx,
-        issue_id,
-        &EventType::Commented,
-        actor,
-        None,
-        None,
-        Some(comment_text),
-    )
-}
+// There is deliberately no `insert_commented_event` here. Comments have
+// exactly one writer (`storage::add_comment`, reached through the comments
+// command), and it records the `Commented` event itself via the mutation
+// context's event batching. A second, independently callable event helper
+// would be an invitation to log "a comment happened" without a comment row
+// existing — an event with no history behind it. Tests that need a
+// `Commented` event build one through `insert_event` directly.
 
 /// Insert a `dependency_added` event.
 ///
@@ -583,12 +569,35 @@ mod tests {
         assert_eq!(events[0].comment.as_deref(), Some("Completed the work"));
     }
 
+    /// Build a `Commented` event directly.
+    ///
+    /// Production code never does this: comments are written by
+    /// `storage::add_comment`, which records the event itself as part of the
+    /// same mutation. These tests only need *some* event carrying a comment
+    /// body in order to exercise retrieval, ordering and counting.
+    fn commented_event(
+        tx: &Transaction<'_>,
+        issue_id: &str,
+        actor: &str,
+        text: &str,
+    ) -> Result<i64> {
+        insert_event(
+            tx,
+            issue_id,
+            &EventType::Commented,
+            actor,
+            None,
+            None,
+            Some(text),
+        )
+    }
+
     #[test]
-    fn test_insert_commented_event() {
+    fn test_commented_event_roundtrip() {
         let conn = setup_test_db();
         let tx = conn.unchecked_transaction().expect("Failed to start tx");
 
-        insert_commented_event(&tx, "test-001", "dave", "This is a comment")
+        commented_event(&tx, "test-001", "dave", "This is a comment")
             .expect("Failed to insert event");
         tx.commit().expect("Failed to commit");
 
@@ -650,7 +659,7 @@ mod tests {
         // Insert multiple events
         for i in 0..5 {
             let tx = conn.unchecked_transaction().expect("Failed to start tx");
-            insert_commented_event(&tx, "test-001", "user", &format!("Comment {i}"))
+            commented_event(&tx, "test-001", "user", &format!("Comment {i}"))
                 .expect("Failed to insert event");
             tx.commit().expect("Failed to commit");
         }
@@ -670,7 +679,7 @@ mod tests {
         // Insert 10 events
         for i in 0..10 {
             let tx = conn.unchecked_transaction().expect("Failed to start tx");
-            insert_commented_event(&tx, "test-001", "user", &format!("Comment {i}"))
+            commented_event(&tx, "test-001", "user", &format!("Comment {i}"))
                 .expect("Failed to insert event");
             tx.commit().expect("Failed to commit");
         }
@@ -691,7 +700,7 @@ mod tests {
         // Insert events
         for _ in 0..5 {
             let tx = conn.unchecked_transaction().expect("Failed to start tx");
-            insert_commented_event(&tx, "test-001", "user", "A comment")
+            commented_event(&tx, "test-001", "user", "A comment")
                 .expect("Failed to insert event");
             tx.commit().expect("Failed to commit");
         }
@@ -773,7 +782,7 @@ mod tests {
         tx.commit().expect("Commit");
 
         let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_commented_event(&tx, "test-001", "bob", "Working on this").expect("Comment");
+        commented_event(&tx, "test-001", "bob", "Working on this").expect("Comment");
         tx.commit().expect("Commit");
 
         let tx = conn.unchecked_transaction().expect("Failed to start tx");

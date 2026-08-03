@@ -47,7 +47,9 @@ pub use output::{
     TreeNode,
 };
 pub use text::{
-    TextFormatOptions, format_issue_age_field, format_issue_line, format_issue_line_with,
+    TextFormatOptions, escape_markup, format_comment_marker, format_issue_age_field,
+    format_issue_line,
+    format_issue_line_with, format_issue_line_with_comments,
     format_priority, format_priority_badge, format_priority_label, format_status_icon,
     format_status_icon_colored, format_status_label, format_type_badge, format_type_badge_colored,
     terminal_width, truncate_title,

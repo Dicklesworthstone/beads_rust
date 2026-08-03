@@ -733,6 +733,14 @@ pub enum Commands {
     /// Update an issue
     Update(UpdateArgs),
 
+    /// Read or append an issue's comments (append-only attributed history)
+    ///
+    /// Comments are HISTORY: append-only, attributed, timestamped, never
+    /// rewritten. That is deliberately different from `update --notes`,
+    /// which replaces the notes field (STATE). `comments <id>` prints the
+    /// complete log; `comments add <id> <text>` appends one entry.
+    Comments(CommentsArgs),
+
     /// Close an issue
     Close(CloseArgs),
 
@@ -1785,6 +1793,16 @@ pub struct ShowArgs {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
 
+    /// How many comments to render: a count, or `all`
+    ///
+    /// Applies to both text and JSON/TOON output. The newest N are shown
+    /// in chronological order; the rest are counted, never dropped
+    /// silently (JSON carries `comment_count`/`comments_truncated`, text
+    /// prints a hidden-count line). Use `bd comments <id>` for the full
+    /// log regardless of this flag.
+    #[arg(long, value_name = "N|all")]
+    pub comments: Option<String>,
+
     /// Truncate long lines instead of wrapping to terminal width
     #[arg(long)]
     pub no_wrap: bool,
@@ -1792,6 +1810,63 @@ pub struct ShowArgs {
     /// Show token savings stats when using TOON output
     #[arg(long)]
     pub stats: bool,
+}
+
+/// Arguments for the comments command.
+///
+/// Two shapes, matching the classic surface: `comments <id>` lists the
+/// complete log, `comments add <id> <text>` appends one entry. The
+/// positional id and the `add` subcommand are mutually exclusive
+/// (`args_conflicts_with_subcommands`), so `comments add ...` is never
+/// mistaken for a list of an issue called "add".
+#[derive(Args, Debug, Default)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct CommentsArgs {
+    #[command(subcommand)]
+    pub command: Option<CommentsCommands>,
+
+    /// Issue ID to list comments for (defaults to the last-touched issue)
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: Option<String>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
+}
+
+/// Subcommands for the comments command.
+#[derive(Subcommand, Debug)]
+pub enum CommentsCommands {
+    /// Append a comment to an issue (append-only; nothing is ever replaced)
+    Add(CommentsAddArgs),
+}
+
+/// Arguments for `comments add`.
+#[derive(Args, Debug, Default)]
+pub struct CommentsAddArgs {
+    /// Issue ID (defaults to the last-touched issue)
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub id: Option<String>,
+
+    /// Comment text
+    ///
+    /// `allow_hyphen_values` so a body that starts with a Markdown
+    /// bullet (`- fixed the thing`) is taken as text instead of being
+    /// parsed as a flag. Empty text is allowed.
+    #[arg(allow_hyphen_values = true)]
+    pub text: Option<String>,
+
+    /// Read the comment body from a file (`-` for stdin)
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    pub file: Option<PathBuf>,
+
+    /// Attribute the comment to this author instead of the resolved agent identity
+    #[arg(long)]
+    pub author: Option<String>,
+
+    /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
+    #[arg(long, value_enum)]
+    pub format: Option<OutputFormatBasic>,
 }
 
 #[derive(Subcommand, Debug)]

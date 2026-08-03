@@ -124,11 +124,15 @@ pub fn execute(
         storage.update_issue(id, &update, &actor)?;
         tracing::info!(id = %id, reason = ?args.reason, "Issue reopened");
 
-        // Add comment if reason provided
+        // Add comment if reason provided. This goes through the same
+        // single writer as `bd comments add` rather than reaching into
+        // storage directly, so there is exactly one place a comment can
+        // be created (the "Reopened: " prefix is this command's own
+        // framing of the reason, not a second writer's convention).
         if let Some(ref reason) = args.reason {
             let comment_text = format!("Reopened: {reason}");
             tracing::debug!(id = %id, "Adding reopen comment");
-            storage.add_comment(id, &actor, &comment_text)?;
+            crate::cli::commands::comments::append_comment(storage, id, &actor, &comment_text)?;
         }
 
         // Update last touched

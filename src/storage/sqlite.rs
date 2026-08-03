@@ -1191,11 +1191,19 @@ impl SqliteStorage {
 
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+        // Comment text is searched alongside the issue's own columns: an
+        // annotation that moves out of `notes` and into a comment must not
+        // become unfindable, or the append-safety win would be paid for
+        // with an amnesia bug. There is no FTS index here, so this is the
+        // same LIKE scan the other columns get, expressed as an EXISTS
+        // over the comments table.
         sql.push_str(
-            " AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')",
+            " AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\'\
+              OR EXISTS (SELECT 1 FROM comments c WHERE c.issue_id = issues.id AND c.text LIKE ? ESCAPE '\\'))",
         );
         let escaped = escape_like_pattern(trimmed);
         let pattern = format!("%{escaped}%");
+        params.push(Box::new(pattern.clone()));
         params.push(Box::new(pattern.clone()));
         params.push(Box::new(pattern.clone()));
         params.push(Box::new(pattern));
@@ -2891,6 +2899,125 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Comment count plus newest comment timestamp for multiple issues.
+    ///
+    /// Batched so `bd list` can show a compact comment indicator without
+    /// an N+1 query, and deliberately returns no bodies: list output shows
+    /// how much history exists and how fresh it is, never the history
+    /// itself.
+    ///
+    /// Issues with no comments are absent from the map rather than
+    /// present with a zero — callers render nothing at all in that case.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn comment_stats_for_issues(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, CommentStats>> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, CommentStats> = HashMap::new();
+
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT issue_id, COUNT(*), MAX(created_at) FROM comments
+                 WHERE issue_id IN ({}) GROUP BY issue_id",
+                placeholders.join(",")
+            );
+
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (issue_id, count, last) = row?;
+                map.insert(
+                    issue_id,
+                    CommentStats {
+                        count: usize::try_from(count).unwrap_or(0),
+                        last_comment_at: last.as_deref().map(parse_datetime),
+                    },
+                );
+            }
+        }
+
+        Ok(map)
+    }
+
+    /// Find, for each of `issue_ids`, the newest comment whose text
+    /// matches `query` (case-insensitive substring).
+    ///
+    /// Used by `bd search` to mark a hit as comment-sourced and to show a
+    /// snippet of the matching comment, so a comment match is never
+    /// indistinguishable from a title/description match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn find_matching_comments(
+        &self,
+        query: &str,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, Comment>> {
+        const SQLITE_VAR_LIMIT: usize = 900;
+
+        let trimmed = query.trim();
+        if trimmed.is_empty() || issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let pattern = format!("%{}%", escape_like_pattern(trimmed));
+        let mut map: HashMap<String, Comment> = HashMap::new();
+
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT id, issue_id, author, text, created_at FROM comments
+                 WHERE text LIKE ? ESCAPE '\\' AND issue_id IN ({})
+                 ORDER BY created_at ASC, id ASC",
+                placeholders.join(",")
+            );
+
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&pattern];
+            params.extend(chunk.iter().map(|s| s as &dyn rusqlite::ToSql));
+
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok(Comment {
+                    id: row.get(0)?,
+                    issue_id: row.get(1)?,
+                    author: row.get(2)?,
+                    body: row.get(3)?,
+                    created_at: parse_datetime(&row.get::<_, String>(4)?),
+                })
+            })?;
+
+            // Ascending order means the last write per issue wins, i.e.
+            // the newest matching comment.
+            for row in rows {
+                let comment = row?;
+                map.insert(comment.issue_id.clone(), comment);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count dependents for multiple issues efficiently.
     ///
     /// # Errors
@@ -3369,12 +3496,21 @@ impl SqliteStorage {
         };
         let parent = self.get_parent_id(id)?;
 
+        // Storage hands back the complete comment log and states its size;
+        // deciding how much of it a reader sees is display policy, so the
+        // bounding lives in the command layer rather than here. Export
+        // does not use this path at all (it reads comments in bulk), which
+        // is why bounding the display can never cost fidelity.
+        let comment_count = comments.len();
+
         Ok(Some(IssueDetails {
             issue,
             labels,
             dependencies,
             dependents,
             comments,
+            comment_count,
+            comments_truncated: false,
             events,
             parent,
         }))
@@ -3470,6 +3606,19 @@ impl SqliteStorage {
         let count = conn.execute("DELETE FROM export_hashes", [])?;
         Ok(count)
     }
+}
+
+/// Aggregate comment facts for one issue: how many, and how recent.
+///
+/// The shape `bd list` needs — enough to say "this issue has history and
+/// it is fresh" without carrying a single byte of comment body into a
+/// listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommentStats {
+    /// Total comments on the issue.
+    pub count: usize,
+    /// Timestamp of the newest comment, if any.
+    pub last_comment_at: Option<DateTime<Utc>>,
 }
 
 /// Filter options for listing issues.

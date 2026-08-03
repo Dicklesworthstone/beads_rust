@@ -14,6 +14,7 @@ pub struct IssueTable<'a> {
     title: Option<String>,
     highlight_query: Option<String>,
     context_snippets: Option<HashMap<String, String>>,
+    comment_markers: Option<HashMap<String, String>>,
     width: Option<usize>,
     wrap: bool,
 }
@@ -46,6 +47,13 @@ pub struct IssueTableColumns {
     /// but no caller does).
     pub age: bool,
     pub context: bool,
+    /// Compact comment indicator column (count · newest-comment age).
+    ///
+    /// Driven by [`IssueTable::comment_markers`], which only enables it
+    /// when at least one listed issue actually has comments — a listing of
+    /// comment-free issues keeps its full title budget instead of paying
+    /// for a column of blanks.
+    pub comments: bool,
     /// When set (and `id` is enabled), color the ID cell by issue
     /// type ([`Theme::type_style`]) instead of the flat
     /// [`Theme::issue_id`] color, and skip the separate `Type`
@@ -96,6 +104,7 @@ impl IssueTableColumns {
             updated: true,
             age: false,
             context: false,
+            comments: false,
             color_id_by_type: false,
         }
     }
@@ -111,6 +120,7 @@ impl<'a> IssueTable<'a> {
             title: None,
             highlight_query: None,
             context_snippets: None,
+            comment_markers: None,
             width: None,
             wrap: false,
         }
@@ -153,6 +163,21 @@ impl<'a> IssueTable<'a> {
     pub fn context_snippets(mut self, snippets: HashMap<String, String>) -> Self {
         if !snippets.is_empty() {
             self.context_snippets = Some(snippets);
+        }
+        self
+    }
+
+    /// Attach per-issue compact comment indicators (see
+    /// [`crate::format::format_comment_marker`]).
+    ///
+    /// Enables the Comments column only when at least one issue has one, so
+    /// the column — and its share of the width budget — simply does not
+    /// exist for listings with no comment history anywhere.
+    #[must_use]
+    pub fn comment_markers(mut self, markers: HashMap<String, String>) -> Self {
+        if !markers.is_empty() {
+            self.comment_markers = Some(markers);
+            self.columns.comments = true;
         }
         self
     }
@@ -203,6 +228,9 @@ impl<'a> IssueTable<'a> {
         }
         if self.columns.context {
             reserved += 20 + 3;
+        }
+        if self.columns.comments {
+            reserved += 6 + 3;
         }
         let title_max_width = self
             .width
@@ -257,6 +285,10 @@ impl<'a> IssueTable<'a> {
             // ~7-8 chars in the common case, matching the padded
             // width used by the plain-text line.
             table = table.with_column(Column::new("Age").width(7));
+        }
+        if self.columns.comments {
+            // e.g. `12·3h` — count and newest-comment age, never a body.
+            table = table.with_column(Column::new("Cmts").width(6));
         }
         if self.columns.context {
             table = table.with_column(Column::new("Context").min_width(20).max_width(60));
@@ -338,6 +370,16 @@ impl<'a> IssueTable<'a> {
                     Cell::new(Text::new(format_issue_age_field(issue)))
                         .style(self.theme.timestamp.clone()),
                 );
+            }
+            if self.columns.comments {
+                // Blank for issues with no comments: the column exists
+                // because SOME row has history, not because every row does.
+                let marker = self
+                    .comment_markers
+                    .as_ref()
+                    .and_then(|markers| markers.get(&issue.id))
+                    .map_or("", String::as_str);
+                cells.push(Cell::new(Text::new(marker)).style(self.theme.timestamp.clone()));
             }
             if self.columns.context {
                 let snippet = self
