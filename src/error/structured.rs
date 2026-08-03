@@ -18,7 +18,8 @@
 
 #![allow(clippy::option_if_let_else, clippy::manual_map, clippy::manual_find)]
 
-use crate::error::BeadsError;
+use crate::error::{BeadsError, STATUS_ALL_HINT, VALID_STATUSES_HINT};
+use crate::model::Status;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -402,15 +403,11 @@ impl StructuredError {
     /// Create a structured error for invalid status.
     #[must_use]
     pub fn invalid_status(provided: &str) -> Self {
-        let hint = if let Some(detected) = detect_status_intent(provided) {
-            Some(format!("Did you mean --status {detected}?"))
-        } else {
-            Some("Valid statuses: open, in_progress, blocked, deferred, closed".to_string())
-        };
+        let hint = Some(status_hint(provided));
 
         let context = json!({
             "provided": provided,
-            "valid_values": VALID_STATUSES.iter().collect::<Vec<_>>(),
+            "valid_values": Status::PARSEABLE,
         });
 
         Self {
@@ -530,18 +527,14 @@ impl StructuredError {
                         .collect::<Vec<_>>()
                 })),
             ),
-            BeadsError::InvalidStatus { status } => {
-                let hint = detect_status_intent(status)
-                    .map(|detected| format!("Did you mean --status {detected}?"));
-
-                (
-                    ErrorCode::InvalidStatus,
-                    Some(serde_json::json!({
-                        "status": status,
-                        "hint": hint
-                    })),
-                )
-            }
+            BeadsError::InvalidStatus { status } => (
+                ErrorCode::InvalidStatus,
+                Some(serde_json::json!({
+                    "status": status,
+                    "hint": status_did_you_mean(status),
+                    "valid_values": Status::PARSEABLE,
+                })),
+            ),
             BeadsError::InvalidType { issue_type } => {
                 let hint = detect_type_intent(issue_type)
                     .map(|detected| format!("Did you mean --type {detected}?"));
@@ -613,7 +606,18 @@ impl StructuredError {
 
     /// Generate context-aware hint from error.
     fn generate_hint(err: &BeadsError, context: Option<&Value>) -> Option<String> {
-        // First check if BeadsError has a built-in suggestion
+        // Invalid status is handled first, ahead of the generic
+        // `suggestion()` fallthrough below. `suggestion()` always
+        // returns Some for this variant, so the targeted
+        // "Did you mean ...?" arm further down was unreachable and the
+        // user only ever saw the bare list — including for
+        // `--status all`, where the answer is a different flag
+        // entirely (`-a/--all`).
+        if let BeadsError::InvalidStatus { status } = err {
+            return Some(status_hint(status));
+        }
+
+        // Otherwise check if BeadsError has a built-in suggestion
         if let Some(suggestion) = err.suggestion() {
             return Some(suggestion.to_string());
         }
@@ -665,21 +669,34 @@ impl StructuredError {
     }
 }
 
+/// The targeted part of an invalid-status hint, if there is one: a
+/// "did you mean" for a near miss or a synonym, or the pointer at
+/// `-a/--all` for the specific mistake of `--status all`. `None` when
+/// nothing about the input suggests a particular intent.
+fn status_did_you_mean(provided: &str) -> Option<String> {
+    if provided.trim().eq_ignore_ascii_case("all") {
+        return Some(STATUS_ALL_HINT.to_string());
+    }
+    detect_status_intent(provided).map(|detected| format!("Did you mean --status {detected}?"))
+}
+
+/// Full hint for an unparseable status: the targeted suggestion (when
+/// the input points at one) followed by the authoritative list of what
+/// `Status::from_str` accepts.
+fn status_hint(provided: &str) -> String {
+    match status_did_you_mean(provided) {
+        Some(targeted) => format!("{targeted} {VALID_STATUSES_HINT}"),
+        None => VALID_STATUSES_HINT.to_string(),
+    }
+}
+
 // === Precomputed Valid Values (O(1) lookup) ===
 
-/// Valid status values.
-static VALID_STATUSES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    [
-        "open",
-        "in_progress",
-        "blocked",
-        "deferred",
-        "closed",
-        "tombstone",
-    ]
-    .into_iter()
-    .collect()
-});
+/// Valid status values — derived from `Status::PARSEABLE` so
+/// intent detection and the user-facing hint can never disagree with
+/// what `Status::from_str` actually accepts.
+static VALID_STATUSES: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| Status::PARSEABLE.into_iter().collect());
 
 /// Valid issue type values (matching bd conformance).
 static VALID_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
@@ -1034,6 +1051,66 @@ mod tests {
         let err = StructuredError::invalid_status("done");
         assert_eq!(err.code, ErrorCode::InvalidStatus);
         assert!(err.hint.as_ref().unwrap().contains("closed"));
+    }
+
+    /// `--status all` is the natural way to reach for `-a/--all`, so
+    /// the hint must point at that flag rather than only reciting the
+    /// status list (bead `beads1-17zqr`). Asserted on both surfaces:
+    /// the primary `hint` line and the machine-readable `context.hint`.
+    #[test]
+    fn status_all_points_at_the_all_flag() {
+        let err = StructuredError::invalid_status("all");
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(
+            hint.contains("--all"),
+            "'--status all' must suggest -a/--all: {hint}"
+        );
+        assert!(
+            hint.contains("Valid statuses:"),
+            "the valid-status list should still follow the suggestion: {hint}"
+        );
+
+        let from_beads_error = StructuredError::from_error(&BeadsError::InvalidStatus {
+            status: "all".to_string(),
+        });
+        let hint = from_beads_error.hint.as_deref().expect("hint");
+        assert!(hint.contains("--all"), "BeadsError path must agree: {hint}");
+        let ctx_hint = from_beads_error.context.as_ref().expect("context")["hint"]
+            .as_str()
+            .expect("context.hint should be set for 'all'");
+        assert!(ctx_hint.contains("--all"), "context.hint: {ctx_hint}");
+    }
+
+    /// A near-miss / synonym now reaches the *primary* hint line, not
+    /// just `context.hint`: `generate_hint` used to return the generic
+    /// `suggestion()` first, making the targeted arm unreachable.
+    #[test]
+    fn did_you_mean_reaches_the_primary_hint() {
+        let err = StructuredError::from_error(&BeadsError::InvalidStatus {
+            status: "wip".to_string(),
+        });
+        let hint = err.hint.as_deref().expect("hint");
+        assert!(
+            hint.contains("Did you mean --status in_progress?"),
+            "targeted suggestion should lead the hint: {hint}"
+        );
+        assert!(hint.contains("Valid statuses:"), "{hint}");
+    }
+
+    /// The `valid_values` context array is what an agent parses to
+    /// retry; it must be the parser's own set.
+    #[test]
+    fn invalid_status_context_lists_parseable_statuses() {
+        let err = StructuredError::from_error(&BeadsError::InvalidStatus {
+            status: "nope".to_string(),
+        });
+        let values = err.context.as_ref().expect("context")["valid_values"]
+            .as_array()
+            .expect("valid_values array")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(values, Status::PARSEABLE.to_vec());
     }
 
     #[test]

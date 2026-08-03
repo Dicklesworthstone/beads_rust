@@ -424,45 +424,76 @@ pub fn execute(args: &WatchArgs, cli: &config::CliOverrides, ctx: &OutputContext
         }
 
         if watch_beads {
-            let current = match snapshot_state(&beads_dir, cli, &prefix) {
-                Ok(s) => s,
+            // A FAILED snapshot is not an EMPTY snapshot.
+            //
+            // This used to substitute `HashMap::new()` on error and then
+            // commit it as the new baseline, which turned any transient
+            // read failure (SQLITE_BUSY past the lock timeout, a
+            // momentarily unreadable DB, a failed auto-import inside
+            // open_storage) into a two-cycle lie: the failing cycle
+            // recorded a `deleted` for every bead under the prefix, and
+            // the next successful cycle re-announced every one of them
+            // as `created` — carrying its CURRENT status, hence the
+            // self-contradictory `created (closed)` lines. Under the
+            // fleet's default 120s debounce the two halves collapse
+            // ((Deleted, Created) -> Created in `record_change`), so the
+            // delete half is invisible and the operator just sees the
+            // whole prefix replayed as fresh creations. That is
+            // `beads1-3435j`, reproduced deterministically in
+            // tests/repro_watch_snapshot_replay.rs.
+            //
+            // Skipping the cycle costs at most one poll interval of
+            // latency and keeps the last known-good baseline, so the
+            // next successful poll diffs against reality.
+            match snapshot_state(&beads_dir, cli, &prefix) {
+                Ok(current) => {
+                    if !current.is_empty() || !bead_snapshot.is_empty() {
+                        let actor_str = actor.as_deref().unwrap_or("");
+                        if streaming {
+                            stream_diff(
+                                &bead_snapshot,
+                                &current,
+                                status_filter.as_ref(),
+                                actor_str,
+                                args.include_self,
+                                format,
+                            )?;
+                        } else {
+                            ingest_diff(
+                                &bead_snapshot,
+                                &current,
+                                status_filter.as_ref(),
+                                actor_str,
+                                args.include_self,
+                                now,
+                                &mut batches,
+                            );
+                        }
+                        bead_snapshot = current;
+                    }
+                }
                 Err(e) => {
-                    eprintln!("watch: bead snapshot failed: {e}");
-                    HashMap::new()
-                }
-            };
-            if !current.is_empty() || !bead_snapshot.is_empty() {
-                let actor_str = actor.as_deref().unwrap_or("");
-                if streaming {
-                    stream_diff(
-                        &bead_snapshot,
-                        &current,
-                        status_filter.as_ref(),
-                        actor_str,
-                        args.include_self,
-                        format,
-                    )?;
-                } else {
-                    ingest_diff(
-                        &bead_snapshot,
-                        &current,
-                        status_filter.as_ref(),
-                        actor_str,
-                        args.include_self,
-                        now,
-                        &mut batches,
+                    eprintln!(
+                        "watch: bead snapshot failed, keeping the previous snapshot \
+                         (no bead events this cycle): {e}"
                     );
-                    flush_batches(
-                        &mut batches,
-                        &prefix,
-                        format,
-                        now,
-                        false,
-                        debounce,
-                        debounce_max,
-                    )?;
                 }
-                bead_snapshot = current;
+            }
+            // Flushing is independent of this cycle's snapshot outcome:
+            // a batch already accrued must still age out on its
+            // debounce / max-age ceiling on cycles that produce no diff
+            // (or whose snapshot failed), otherwise a pending batch can
+            // sit unflushed indefinitely.
+            if !streaming {
+                flush_batches(
+                    &mut batches,
+                    &prefix,
+                    format,
+                    now,
+                    false,
+                    debounce,
+                    debounce_max,
+                )?;
             }
         }
 
@@ -933,10 +964,21 @@ fn resolve_prefix(args: &WatchArgs, beads_dir: &Path, cli: &config::CliOverrides
     Ok(candidate)
 }
 
+/// Resolve the actor that [`is_self`] compares `created_by` against.
+///
+/// This MUST use the storage-aware resolver, not plain
+/// [`config::resolve_actor`]: `created_by` is written by
+/// [`config::resolve_actor_with_storage`] (agent identity spliced in
+/// ahead of `$USER`), so resolving the comparison side without
+/// identity makes every self-created bead look foreign — "beads1"
+/// (stored) vs "toad" (`$USER`) — and the documented
+/// `--include-self`-off default silently stops filtering anything.
+/// That was the regression in `beads1-s36s7`: both sides of a `==`
+/// must come from the same resolver.
 fn resolved_actor(beads_dir: &Path, cli: &config::CliOverrides) -> Result<String> {
     let (storage, _paths) = config::open_storage(beads_dir, cli.db.as_ref(), cli.lock_timeout)?;
     let layer = config::load_config(beads_dir, Some(&storage), cli)?;
-    Ok(config::resolve_actor(&layer))
+    Ok(config::resolve_actor_with_storage(&layer, &storage))
 }
 
 fn parse_status_filter(raw: &[String]) -> Result<Option<HashSet<Status>>> {
@@ -1237,6 +1279,14 @@ mod tests {
         assert!(!id_has_prefix("app1", "app1"));
     }
 
+    /// Pure comparison logic only. Note what this deliberately does
+    /// NOT cover: both sides of the `==` are hardcoded here, so it
+    /// passes even when the *resolution* of the two sides diverges —
+    /// which is exactly how `beads1-s36s7` shipped (`created_by`
+    /// resolved with agent identity, the comparison actor without).
+    /// The seam is crossed instead by
+    /// `tests/e2e_watch_self_filter.rs`, which runs a real `br watch`
+    /// against beads written by a real `br create`.
     #[test]
     fn is_self_requires_no_sender_and_matching_creator() {
         let me = bead(Status::Open, "x", None, Some("toad"));
