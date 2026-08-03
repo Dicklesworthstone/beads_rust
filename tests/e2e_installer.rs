@@ -837,3 +837,93 @@ fn e2e_installer_shows_supported_platforms() {
         "Help should mention macOS support"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Claude Code plugin distribution (GitHub #400)
+//
+// `install.sh` is one distribution path for the official `br` skill; the
+// `.claude-plugin/` marketplace pair is the other. These tests keep the two
+// manifests honest: the plugin's literal version has to track the crate, and
+// the marketplace entry has to keep pointing at a skill directory that exists.
+// ---------------------------------------------------------------------------
+
+fn read_plugin_manifest(name: &str) -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".claude-plugin")
+        .join(name);
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("{} must be valid JSON: {e}", path.display()))
+}
+
+/// The plugin manifest carries a literal version string (the schema has no way
+/// to derive it), so a release that bumps `Cargo.toml` without bumping
+/// `.claude-plugin/plugin.json` would publish a plugin advertising a stale
+/// version. Fail the build instead.
+#[test]
+fn plugin_manifest_version_tracks_the_crate_version() {
+    let plugin = read_plugin_manifest("plugin.json");
+    assert_eq!(
+        plugin["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "bump `version` in .claude-plugin/plugin.json to match Cargo.toml"
+    );
+}
+
+/// Shape gate for the marketplace pair: the fields Claude Code requires must be
+/// present, the plugin entry must resolve to this repository, and the declared
+/// skill directory must actually contain the `br` skill. The marketplace entry
+/// declares `skills` explicitly because its source is the marketplace root —
+/// that is what keeps the opt-in `skills/bd-to-br-migration` skill out of the
+/// published plugin.
+#[test]
+fn plugin_marketplace_publishes_only_the_br_skill() {
+    let marketplace = read_plugin_manifest("marketplace.json");
+    assert_eq!(marketplace["name"].as_str(), Some("beads-rust"));
+    assert!(
+        marketplace["owner"]["name"].as_str().is_some(),
+        "marketplace.json requires an owner with a name"
+    );
+
+    let plugins = marketplace["plugins"]
+        .as_array()
+        .expect("marketplace.json requires a plugins array");
+    assert_eq!(plugins.len(), 1, "expected exactly one published plugin");
+    let entry = &plugins[0];
+
+    let plugin = read_plugin_manifest("plugin.json");
+    assert_eq!(
+        entry["name"].as_str(),
+        plugin["name"].as_str(),
+        "marketplace entry name must match the plugin manifest name"
+    );
+    assert_eq!(entry["source"].as_str(), Some("./"));
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for manifest in [&plugin, entry] {
+        let skills = manifest["skills"]
+            .as_array()
+            .expect("both manifests declare skill directories");
+        assert_eq!(
+            skills.len(),
+            1,
+            "only the official `br` skill is published; \
+             bd-to-br-migration stays opt-in via install.sh"
+        );
+        let declared = skills[0].as_str().expect("skill path is a string");
+        assert!(
+            declared.starts_with("./"),
+            "plugin paths must be relative to the plugin root: {declared}"
+        );
+        let skill_dir = root.join(declared.trim_start_matches("./"));
+        assert!(
+            skill_dir.join("br").join("SKILL.md").is_file(),
+            "declared skill directory {} must contain br/SKILL.md",
+            skill_dir.display()
+        );
+        assert!(
+            !skill_dir.join("bd-to-br-migration").exists(),
+            "the published skill directory must not carry the opt-in migration skill"
+        );
+    }
+}

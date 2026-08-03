@@ -329,6 +329,23 @@ validated against the repository's pinned nightly toolchain.
 
 > **Note:** `cargo install` places binaries in `~/.cargo/bin/`, while the install script uses `~/.local/bin/`. If you have both in PATH, ensure the desired location has higher priority to avoid running an outdated version. Run `which br` to verify which binary is active.
 
+### Claude Code Plugin (agent instructions)
+
+The official `br` skill ships as a Claude Code plugin, so agents get the
+workflow rules without you copying `SKILL.md` around:
+
+```bash
+/plugin marketplace add Dicklesworthstone/beads_rust
+/plugin install beads@beads-rust
+```
+
+The plugin installs **agent instructions only** — it does not install the `br`
+binary, so pair it with one of the install methods above. The optional
+`bd-to-br-migration` skill stays opt-in and is not part of the plugin; install
+it with `install.sh --with-migration-skill` if you are still migrating from
+`bd`. Codex users keep using `install.sh`, which writes the same skill into
+`${CODEX_HOME:-~/.codex}/skills`.
+
 ### Disable Self-Update
 
 ```bash
