@@ -40,6 +40,39 @@
 //! - [`theme`]: Visual styling with [`Theme`] struct (colors, borders)
 //! - [`components`]: Reusable output components (tables, panels, etc.)
 //!
+//! ## Markup: which emit functions parse it, and what that means for data
+//!
+//! Exactly one thing in `rich_rust` parses markup: a **string** on its way
+//! through `Console::print` (and the `Renderable` impl for `str`/`String`).
+//! Its tag pattern is `[` followed by a letter, `#`, `/` or `@`, and a tag is
+//! consumed whether or not it names a real style — `[bug]`, `[probe]` and
+//! `[bold]` all vanish. Parsing happens in **Plain mode too**; turning color
+//! off does not turn the parser off.
+//!
+//! So the question for any output path is only ever "what does it finally
+//! emit?":
+//!
+//! | Final emit                                       | Parses markup? | Stored data must be… |
+//! |--------------------------------------------------|----------------|----------------------|
+//! | [`OutputContext::print`] → `Console::print`      | **yes**        | escaped — use [`OutputContext::print_data`] |
+//! | `success`/`info`/`warning`, Rich branch          | **yes**        | escaped (done inside those methods) |
+//! | `success`/`info`/`warning`, Plain branch         | no (`println!`)| raw |
+//! | `error`/`error_panel`/`section` (`Panel`/`Text`) | no             | raw |
+//! | [`OutputContext::render`] of a `Table`/`Panel`/`Text` | no        | raw |
+//! | `IssueTable`, `IssuePanel`, `stale`/`blocked` line builders (`Text::append_styled`) | no | raw |
+//! | bare `print!`/`println!`/`eprintln!`             | no             | raw |
+//! | `json`/`json_pretty`/`toon`                     | no             | raw |
+//!
+//! This is why `bd list` was safe while `bd search` was not: both build the
+//! same line with [`crate::format::format_issue_line_with`], but `list`
+//! emits it with `println!` and `search` handed it to `ctx.print`, where the
+//! `[bug]` type badge and any bracketed word in the title were eaten.
+//!
+//! Escaping on a path that does NOT parse markup is a bug in the other
+//! direction: the backslash becomes visible. Both failures are caught by the
+//! same kind of test — assert rendered output against the JSON ground truth
+//! for a value containing `[bold]`.
+//!
 //! ## Design Principles
 //!
 //! - **Zero overhead in JSON/Quiet modes**: Console and theme are lazy-initialized

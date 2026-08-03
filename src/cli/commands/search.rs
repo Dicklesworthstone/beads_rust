@@ -13,7 +13,7 @@ use crate::cli::{ListArgs, OutputFormat, SearchArgs, resolve_output_format};
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::format::{
-    IssueWithCounts, TextFormatOptions, csv, escape_markup, format_issue_line_with, terminal_width,
+    IssueWithCounts, TextFormatOptions, csv, format_issue_line_with, terminal_width,
 };
 use crate::model::{Comment, IssueType, Priority, Status};
 use crate::output::{IssueTable, IssueTableColumns, OutputContext, OutputMode};
@@ -198,12 +198,17 @@ pub fn execute(
     ));
     for iwc in &issues_with_counts {
         let line = format_issue_line_with(&iwc.issue, format_options);
-        ctx.print(&line);
+        // `print_data`, not `print`: this is the same line `bd list` builds,
+        // and `list` gets away with `println!`. Sent to the console as
+        // markup it lost both the bracketed words in a title and its own
+        // `[bug]` type badge, which is tag-shaped — a hit rendered as
+        // `○ mk-3mt [● P2]  0s - fix  rendering`.
+        ctx.print_data(&line);
         // A comment-sourced hit gets an extra indented line naming the
         // author and quoting around the match, rather than a bare issue
         // line whose connection to the query is invisible.
         if let Some(comment) = comment_matches.get(&iwc.issue.id) {
-            ctx.print(&format_comment_match_line(comment, query));
+            ctx.print_data(&format_comment_match_line(comment, query));
         }
     }
 
@@ -212,10 +217,15 @@ pub fn execute(
 
 /// Render the "why did this match?" line for a comment-sourced hit.
 ///
-/// Author and snippet are escaped, and the attribution is parenthesised
-/// rather than bracketed: this line goes to the console as a string, where
-/// `[alice]` would be read as a style tag and dropped. The rich table path
-/// builds `Text` directly and so needs neither.
+/// Returns the text VERBATIM: escaping is the caller's job, because the
+/// caller is what knows the sink (`ctx.print_data` here; the rich table path
+/// builds `Text`, which never parses markup, and would show a backslash).
+/// Escaping in both places would double-escape and print one.
+///
+/// The attribution is parenthesised rather than bracketed, which the escape
+/// makes unnecessary but which is kept anyway: `(alice)` cannot be mistaken
+/// for a style tag by anything downstream, and relying on "this happens not
+/// to match the tag pattern" is what caused the original bug.
 fn format_comment_match_line(comment: &Comment, query: &str) -> String {
     let snippet = build_highlight_regex(query)
         .and_then(|regex| regex.find(&comment.body).map(|mat| (regex, mat.start(), mat.end())))
@@ -223,11 +233,7 @@ fn format_comment_match_line(comment: &Comment, query: &str) -> String {
             || first_line(&comment.body),
             |(_, start, end)| snippet_around_match(&comment.body, start, end, 40),
         );
-    format!(
-        "    comment ({}): {}",
-        escape_markup(&comment.author),
-        escape_markup(&snippet)
-    )
+    format!("    comment ({}): {}", comment.author, snippet)
 }
 
 /// First line of a body, for when the match position is unavailable.

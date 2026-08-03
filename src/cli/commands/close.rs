@@ -327,7 +327,9 @@ pub fn execute_with_args(
                 ctx.newline();
                 ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
                 for issue in &unblocked_issues {
-                    ctx.print(&format!("  {}: {}", issue.id, issue.title));
+                    // Stored title: escaped at the sink, or a bracketed word
+                    // in it is read as a style tag and dropped.
+                    ctx.print_data(&format!("  {}: {}", issue.id, issue.title));
                 }
             }
         }

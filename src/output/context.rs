@@ -169,6 +169,20 @@ impl OutputContext {
     // Output Methods
     // ─────────────────────────────────────────────────────────────
 
+    /// Print a string that is MARKUP.
+    ///
+    /// The console parses what it is handed: `[` followed by a letter, `#`,
+    /// `/` or `@` opens a style tag, and the tag is consumed whether or not
+    /// it names a real style. That holds in `Plain` mode too — dropping
+    /// color does not stop the parse — so this is not a
+    /// "only-on-a-terminal" concern.
+    ///
+    /// Consequently anything stored or user-controlled must NOT be
+    /// interpolated into the argument raw: a title reading
+    /// `fix [bold] rendering` would print as `fix  rendering`, deleting part
+    /// of what someone wrote with nothing on screen to say so. Use
+    /// [`Self::print_data`] for that, which is the right choice for nearly
+    /// every caller.
     pub fn print(&self, content: &str) {
         match self.mode {
             OutputMode::Rich | OutputMode::Plain => {
@@ -176,6 +190,25 @@ impl OutputContext {
             }
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} // No console access - zero overhead
         }
+    }
+
+    /// Print a string containing stored or user-controlled DATA verbatim.
+    ///
+    /// Escapes markup and then prints, so brackets in the data survive to
+    /// the screen instead of being parsed away as style tags (see
+    /// [`Self::print`] and [`crate::format::escape_markup`]). The escape is
+    /// invisible: the console turns `\[` back into `[` on the way out, and
+    /// it leaves the ANSI sequences that `format::text` writes alone,
+    /// because those brackets are followed by digits and so are not
+    /// tag-shaped.
+    ///
+    /// Escaping the WHOLE assembled line is deliberate rather than escaping
+    /// each field: the brackets this codebase writes itself — `[● P2]`,
+    /// `[bug]`, `[2026-01-02]` — are all literal text meant to be read, not
+    /// styling, and `[bug]` is itself tag-shaped. One escape at the sink is
+    /// also one place to be right, instead of one per interpolation.
+    pub fn print_data(&self, content: &str) {
+        self.print(&crate::format::escape_markup(content));
     }
 
     pub fn render<R: Renderable>(&self, renderable: &R) {
@@ -292,17 +325,36 @@ impl OutputContext {
     // Semantic Output Methods
     // ─────────────────────────────────────────────────────────────
 
+    /// Report success. `message` is DATA, not markup.
+    ///
+    /// The `Rich` branch composes markup (the green tick) and so escapes the
+    /// message it interpolates; the `Plain` branch writes to stdout directly,
+    /// where nothing parses markup and an escape would show up as a literal
+    /// backslash. Hence the escape lives here, per-branch, rather than at the
+    /// ~25 call sites — which is also why callers must not pre-escape.
+    ///
+    /// This is an invariant, not a coincidence that happens to hold: a
+    /// caller that wants pre-styled output must compose the markup itself
+    /// and use [`Self::print`], because anything handed to this method
+    /// will have its brackets escaped.
     pub fn success(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
                 self.console()
-                    .print(&format!("[bold green]✓[/] {}", message));
+                    .print(&format!("[bold green]✓[/] {}", crate::format::escape_markup(message)));
             }
             OutputMode::Plain => println!("✓ {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 
+    /// Report an error.
+    ///
+    /// Deliberately does NOT escape: `Panel::from_text` splits the message
+    /// into segments without parsing markup, so an escape here would print a
+    /// visible backslash. Same for [`Self::section`] (`Text::new`) and
+    /// [`Self::error_panel`] (`Text::from`) — a `Text` being assembled is
+    /// never markup.
     pub fn error(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
@@ -315,21 +367,30 @@ impl OutputContext {
         }
     }
 
+    /// Report a warning. `message` is DATA, not markup — see
+    /// [`Self::success`] for why the escape is applied here and only in the
+    /// `Rich` branch.
     pub fn warning(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console()
-                    .print(&format!("[bold yellow]⚠[/] [yellow]{}[/]", message));
+                self.console().print(&format!(
+                    "[bold yellow]⚠[/] [yellow]{}[/]",
+                    crate::format::escape_markup(message)
+                ));
             }
             OutputMode::Plain => eprintln!("Warning: {}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //
         }
     }
 
+    /// Report information. `message` is DATA, not markup — see
+    /// [`Self::success`] for why the escape is applied here and only in the
+    /// `Rich` branch.
     pub fn info(&self, message: &str) {
         match self.mode {
             OutputMode::Rich => {
-                self.console().print(&format!("[blue]ℹ[/] {}", message));
+                self.console()
+                    .print(&format!("[blue]ℹ[/] {}", crate::format::escape_markup(message)));
             }
             OutputMode::Plain => println!("{}", message),
             OutputMode::Quiet | OutputMode::Json | OutputMode::Toon => {} //

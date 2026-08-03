@@ -3,7 +3,7 @@
 use crate::cli::{ShowArgs, resolve_output_format_basic};
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::format::{escape_markup, format_priority_label, format_status_icon_colored};
+use crate::format::{format_priority_label, format_status_icon_colored};
 use crate::output::{IssuePanel, OutputContext, OutputMode};
 use crate::util::id::IdResolver;
 use std::fmt::Write as FmtWrite;
@@ -94,6 +94,12 @@ pub fn execute(
     Ok(())
 }
 
+/// Emit the plain-text detail view.
+///
+/// `print!`, not `ctx.print`: nothing here is markup, and the console would
+/// parse a title reading `fix [bold] rendering` down to `fix  rendering`.
+/// Because this sink does not parse markup, nothing written into
+/// [`format_issue_details`] may be escaped either.
 fn print_issue_details(details: &crate::format::IssueDetails, use_color: bool) {
     let output = format_issue_details(details, use_color);
     print!("{output}");
@@ -251,15 +257,19 @@ fn format_issue_details(details: &crate::format::IssueDetails, use_color: bool) 
             );
         }
         for comment in &details.comments {
-            // Author and body are stored data, so they are escaped: the
-            // console parses what it is given as markup and would eat a
-            // `[bold]` in a body outright. See `format::escape_markup`.
+            // NOT escaped, on purpose. This whole string is emitted by
+            // `print_issue_details` with a bare `print!`, which parses
+            // nothing, so an escape here reaches the screen as a literal
+            // backslash — `bd show` printed `use \[bold] for headings` for
+            // one release. Escaping belongs only where a markup parser is
+            // waiting (`ctx.print`/`print_data`); see `src/output/mod.rs`
+            // for which emit function does what.
             let _ = writeln!(
                 output,
                 "  [{}] {}: {}",
                 comment.created_at.format("%Y-%m-%d %H:%M UTC"),
-                escape_markup(&comment.author),
-                escape_markup(&comment.body)
+                comment.author,
+                comment.body
             );
         }
     }

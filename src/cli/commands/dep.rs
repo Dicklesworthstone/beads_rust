@@ -202,7 +202,8 @@ fn dep_add(
                 }
                 _ => format!("  Relationship: {}", dep_type.as_str()),
             };
-            ctx.print(&relationship);
+            // IDs and a `DependencyType::Custom(String)` are stored data.
+            ctx.print_data(&relationship);
         } else {
             ctx.success(&format!(
                 "Added dependency: {} -> {} ({})",
@@ -259,7 +260,7 @@ fn dep_remove(
                 "Removed dependency: {} → {}",
                 issue_id, depends_on_id
             ));
-            ctx.print(&format!(
+            ctx.print_data(&format!(
                 "  {} no longer depends on {}",
                 issue_id, depends_on_id
             ));
@@ -392,7 +393,11 @@ fn dep_list(
             } else {
                 format!("  <- {} ({})", item.issue_id, item.dep_type)
             };
-            ctx.print(&format!(
+            // Titles are arbitrary text, and this line's own `[P2]`/`[open]`
+            // brackets are literal labels rather than styling — `[open]` is
+            // even tag-shaped. `print_data` escapes the whole line, and the
+            // console renders every bracket back verbatim.
+            ctx.print_data(&format!(
                 "{}: {} [P{}] [{}]",
                 arrow, item.title, item.priority, item.status
             ));
@@ -678,7 +683,8 @@ fn dep_tree(
             } else {
                 "├── "
             };
-            ctx.print(&format!(
+            // Same as `dep list`: stored title plus literal bracket labels.
+            ctx.print_data(&format!(
                 "{}{}{}: {} [P{}] [{}]",
                 indent, prefix, node.id, node.title, node.priority, node.status
             ));
@@ -805,7 +811,7 @@ fn dep_cycles(
         // Plain mode: Simple text output
         ctx.warning(&format!("Found {count} dependency cycle(s):"));
         for (i, cycle) in cycles.iter().enumerate() {
-            ctx.print(&format!("  {}. {}", i + 1, cycle.join(" -> ")));
+            ctx.print_data(&format!("  {}. {}", i + 1, cycle.join(" -> ")));
         }
     }
 
