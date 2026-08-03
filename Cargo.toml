@@ -107,12 +107,36 @@ self_update = ["dep:self_update"]
 unsafe_code = "forbid"
 
 [lints.clippy]
+# We deny the whole `pedantic` and `nursery` groups, which is a lot of
+# surface area, so a handful of purely stylistic members are opted out
+# below. `cargo clippy --all-targets --all-features` is expected to exit
+# 0 on this tree: that exit code is the answer to "is clippy clean?", so
+# keep it meaningful rather than growing this list casually.
+#
+# Anything that can indicate a real defect stays denied. In particular
+# the `cast_*` truncation/sign lints are deliberately NOT allowed: a
+# cast that can actually lose data is a bug wearing a lint's clothing,
+# and wants an explicit bounded conversion rather than an `allow`.
+#
+# (Individual entries need `priority = 1` to outrank the group denies.)
 pedantic = { level = "deny", priority = -1 }
 nursery = { level = "deny", priority = -1 }
-# Allow these lints to unblock CI (need higher priority than groups)
 cast_precision_loss = { level = "allow", priority = 1 }
 doc_markdown = { level = "allow", priority = 1 }
 missing_const_for_fn = { level = "allow", priority = 1 }
 uninlined_format_args = { level = "allow", priority = 1 }
 useless_let_if_seq = { level = "allow", priority = 1 }
 format_push_string = { level = "allow", priority = 1 }
+# Stylistic nursery/pedantic lints that don't reflect real defects.
+# These mirror the upstream repo's own allow-list verbatim: our
+# merge-base with upstream is its "fix(clippy): resolve pedantic lint
+# violations" commit, so keeping the lint config identical to theirs
+# keeps the cost of taking future upstream changes down.
+option_if_let_else = { level = "allow", priority = 1 }
+map_unwrap_or = { level = "allow", priority = 1 }
+similar_names = { level = "allow", priority = 1 }
+too_long_first_doc_paragraph = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+redundant_clone = { level = "allow", priority = 1 }
+struct_excessive_bools = { level = "allow", priority = 1 }
+if_not_else = { level = "allow", priority = 1 }
