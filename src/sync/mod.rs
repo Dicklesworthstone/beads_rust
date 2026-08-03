@@ -10973,6 +10973,12 @@ struct ExistingJsonlReplacementScan {
 
 #[derive(Debug, PartialEq, Eq)]
 enum ExistingJsonlReplacementWrite {
+    /// The in-place writer cannot serve this flush without violating the
+    /// canonical id-sorted JSONL ordering (GitHub #404): at least one
+    /// replacement id is absent from the file, so it is a newly created issue
+    /// that could only be appended at the tail. The caller falls back to the
+    /// full `BTreeMap` rewrite, which emits every line in id order.
+    Declined,
     Unchanged {
         exported_count: usize,
     },
@@ -11116,7 +11122,17 @@ fn try_write_existing_jsonl_replacements_atomically(
 ) -> Result<ExistingJsonlReplacementWrite> {
     let scan = scan_existing_jsonl_replacements(output_path, replacement_lines)?;
 
-    if !scan.changed && scan.all_replacements_seen {
+    if !scan.all_replacements_seen {
+        // GitHub #404: a replacement id the file does not already contain is a
+        // newly created issue. Substituting matched rows in place can only put
+        // it at the tail, which leaves the JSONL non-canonically ordered until
+        // the next `br sync --force`. Decline so the caller takes the sorted
+        // full-rewrite path; updates (every id already present) keep the cheap
+        // in-place write.
+        return Ok(ExistingJsonlReplacementWrite::Declined);
+    }
+
+    if !scan.changed {
         return Ok(ExistingJsonlReplacementWrite::Unchanged {
             exported_count: scan.exported_count,
         });
@@ -11329,6 +11345,11 @@ fn try_existing_line_auto_flush(
     )?;
 
     match result {
+        // GitHub #404: the in-place writer refused because the flush carries a
+        // brand-new id. Fall through to `read_jsonl_lines_by_id` +
+        // `write_jsonl_lines_atomically`, symmetric with the removals decline
+        // above, so the file lands id-sorted.
+        ExistingJsonlReplacementWrite::Declined => Ok(None),
         ExistingJsonlReplacementWrite::Unchanged { .. } => {
             jsonl_authority.verify_jsonl_authority()?;
             if compute_jsonl_hash(jsonl_path)? != source_content_hash {
