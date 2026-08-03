@@ -189,6 +189,87 @@ fn test_auto_flush_preserves_unrelated_existing_jsonl_lines() {
     );
 }
 
+/// GitHub #404: creates used to take the streaming in-place writer, which can
+/// only put an id it did not find at the tail. Any id sorting before a row
+/// already on disk therefore left `.beads/issues.jsonl` non-canonically
+/// ordered, and only `br sync --flush-only --force` repaired it. Creates now
+/// decline the fast path so the canonical `BTreeMap` writer emits the file in
+/// id order; updates keep the cheap in-place write.
+#[test]
+fn test_auto_flush_keeps_jsonl_id_sorted_after_creates() {
+    let temp_dir = TempDir::new().unwrap();
+    let beads_dir = temp_dir.path().join(".beads");
+    fs::create_dir(&beads_dir).unwrap();
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+    storage
+        .create_issue(&make_issue("bd-r48"), "tester")
+        .unwrap();
+    assert!(
+        auto_flush(&mut storage, &beads_dir, &jsonl_path, false)
+            .unwrap()
+            .flushed
+    );
+
+    // Both new ids sort *before* the row already on disk — the shape from the
+    // report, where `demo-gy5` was created after `demo-r48`.
+    storage
+        .create_issue(&make_issue("bd-gy5"), "tester")
+        .unwrap();
+    storage
+        .create_issue(&make_issue("bd-a12"), "tester")
+        .unwrap();
+    let flushed_creates = auto_flush(&mut storage, &beads_dir, &jsonl_path, false).unwrap();
+    assert!(flushed_creates.flushed);
+    assert_eq!(flushed_creates.exported_count, 3);
+
+    let ids_after_creates = read_issues_from_jsonl(&jsonl_path)
+        .unwrap()
+        .into_iter()
+        .map(|issue| issue.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids_after_creates,
+        vec!["bd-a12", "bd-gy5", "bd-r48"],
+        "creates must leave the JSONL id-sorted, not appended at the tail"
+    );
+
+    // An update touches an id already in the file, so it still takes the
+    // in-place writer — and the file stays canonical.
+    storage
+        .update_issue(
+            "bd-r48",
+            &beads_rust::storage::IssueUpdate {
+                title: Some("Renamed".to_string()),
+                ..Default::default()
+            },
+            "tester",
+        )
+        .unwrap();
+    assert!(
+        auto_flush(&mut storage, &beads_dir, &jsonl_path, false)
+            .unwrap()
+            .flushed
+    );
+
+    let issues_after_update = read_issues_from_jsonl(&jsonl_path).unwrap();
+    let ids_after_update = issues_after_update
+        .iter()
+        .map(|issue| issue.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(ids_after_update, vec!["bd-a12", "bd-gy5", "bd-r48"]);
+    assert_eq!(
+        issues_after_update
+            .iter()
+            .find(|issue| issue.id == "bd-r48")
+            .unwrap()
+            .title,
+        "Renamed"
+    );
+}
+
 fn read_jsonl_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .unwrap()
@@ -406,13 +487,30 @@ fn e2e_auto_flush_single_mutations_preserve_bounded_jsonl_diff_after_import() {
         create_new.stderr
     );
     let delta_id = parse_created_id(&create_new.stdout);
-    assert_bounded_jsonl_diff(
-        &workspace,
-        "create",
-        &before_create,
-        std::slice::from_ref(&delta_id),
-        1,
+    // GitHub #404: a create is the one mutation that cannot both keep a
+    // bounded positional diff and leave the file canonically ordered — the
+    // fixture above deliberately reversed the JSONL, so restoring id order
+    // moves every row. Canonical order is the confirmed contract for creates
+    // (`export_sorts_by_id`), so the create leg keeps the changed-issue-set
+    // assertion and pins id-sortedness instead of positional churn. The
+    // update / comment / dep legs above still assert the bounded diff.
+    let after_create = read_jsonl_lines(&jsonl_path);
+    assert_eq!(
+        changed_issue_ids(&before_create, &after_create),
+        std::iter::once(delta_id.clone()).collect::<BTreeSet<String>>(),
+        "create must touch only the newly created issue"
     );
+    let created_order = after_create
+        .iter()
+        .map(|line| issue_id_from_jsonl_line(line))
+        .collect::<Vec<_>>();
+    let mut canonical_order = created_order.clone();
+    canonical_order.sort();
+    assert_eq!(
+        created_order, canonical_order,
+        "a create must leave the JSONL id-sorted"
+    );
+    assert_jsonl_is_valid_and_acyclic(&workspace, "create");
 
     assert!(
         [alpha_id, beta_id, gamma_id, delta_id]
