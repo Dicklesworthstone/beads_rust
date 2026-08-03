@@ -161,6 +161,13 @@ fn snapshot_search_output() {
     assert!(output.status.success(), "search failed: {}", output.stderr);
     // Same age-masking rationale as snapshot_list_with_issues above:
     // `bd search`'s plain-text path shares `format_issue_line_with`.
+    //
+    // The `[task]` badge in this snapshot used to be an empty gap: search
+    // emitted the line through `ctx.print`, which parses markup, and the
+    // parser ate `[task]` as a style tag. The recorded snapshot preserved the
+    // loss instead of catching it, because nothing here knew what the line was
+    // supposed to say. It now matches `bd list`, which never lost the badge —
+    // see docs/ARCHITECTURE.md "Output Safety".
     assert_snapshot!(
         "search_output",
         normalize_output_with_age_masking(&output.stdout)

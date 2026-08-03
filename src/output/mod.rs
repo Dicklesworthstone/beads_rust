@@ -73,6 +73,22 @@
 //! same kind of test — assert rendered output against the JSON ground truth
 //! for a value containing `[bold]`.
 //!
+//! ### Composing markup yourself
+//!
+//! Some renderers build a style-tagged string and then need it as a `Text`
+//! (`bd dep list`, `bd dep tree`). That string must be parsed exactly once —
+//! `rich_rust::markup::render_or_plain` — and any stored data inside it must
+//! be escaped BEFORE that parse. Handing markup straight to `Panel::from_text`
+//! or `Text::new` prints the tags as visible text, which is how `bd dep tree`
+//! came to display `mk-1 [green][open][/] some title`.
+//!
+//! Watch for brackets that are LABELS rather than styles. `[open]`, `[bug]`,
+//! `[P2]` are meant to be read, and `[open]` is tag-shaped, so it must be
+//! escaped even though this codebase wrote it: unescaped, the parser looks up
+//! a style called `open`, finds none, and drops the label. `[2026-01-02]` and
+//! `[● P2]` are safe only because a digit or a symbol follows the bracket —
+//! that is an accident of the tag pattern, not a design.
+//!
 //! ## Design Principles
 //!
 //! - **Zero overhead in JSON/Quiet modes**: Console and theme are lazy-initialized

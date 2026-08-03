@@ -612,6 +612,39 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
    - Temp file + rename pattern
    - No partial writes
 
+### Output Safety
+
+Text handed to the rich console is parsed as **markup**: `[` followed by a
+letter, `#`, `/` or `@` opens a style tag, and the tag is consumed whether or
+not it names a real style. `[bold]`, `[bug]` and `[probe]` all disappear. This
+happens in Plain mode too — turning colour off does not turn the parser off.
+
+1. **Escape stored data where the sink parses markup, and only there**
+   - `ctx.print` parses markup; use `ctx.print_data` for anything
+     stored or user-controlled, which escapes with `format::escape_markup`
+   - `ctx.success`/`info`/`warning` take DATA and escape it themselves
+   - `print!`/`println!`, `--json`/`--toon`, `Panel`, and any `Text` built
+     from spans (`IssueTable`, `IssuePanel`) do NOT parse markup: data goes
+     in raw, and escaping there prints a visible backslash
+
+2. **Parse markup you compose exactly once**
+   - A style-tagged string destined for a `Text` goes through
+     `rich_rust::markup::render_or_plain`
+   - Escape the data inside it *before* that parse
+
+3. **Escape bracketed labels, even your own**
+   - `[open]`/`[in-progress]` are labels to be read, and they are
+     tag-shaped; unescaped, the parser drops them
+   - `[2026-01-02]` and `[● P2]` survive only because a digit or symbol
+     follows the bracket — an accident of the tag pattern, not a design
+
+A missing escape deletes part of what someone wrote with nothing on screen to
+say so, which is why this sits under safety rather than style. Regression
+tests assert rendered output against the `--json` ground truth for a value
+containing `[bold]`-shaped text and a bare bracketed word; that shape catches
+both a missing escape and a spurious one. See `tests/e2e_markup_escaping.rs`
+and the table in `src/output/mod.rs`.
+
 ### Database Safety
 
 1. **WAL mode**
