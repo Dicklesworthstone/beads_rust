@@ -2274,25 +2274,47 @@ fn execute_flush(
             }
         }
 
-        // Even with nothing to export, materialize a MISSING merge anchor
-        // from the clean JSONL (issue #378). The guards above already proved
-        // the JSONL is conflict-marker-free and not stale relative to the DB,
-        // so it is exactly the state the anchor should capture. This makes
-        // `br sync --flush-only` an idempotent recovery command for the
-        // doctor's `base_jsonl.missing_post_flush` finding. Best-effort: a
-        // failed anchor write must not fail an otherwise successful no-op
-        // flush.
-        if fs::symlink_metadata(path_policy.beads_dir.join("beads.base.jsonl")).is_err()
-            && let Err(error) = refresh_base_snapshot_from_flushed_jsonl_snapshot(
-                source.expect("existing JSONL has an immutable snapshot"),
-                &path_policy.beads_dir,
-            )
-        {
-            warn!(
-                error = %error,
-                "Failed to materialize missing merge anchor during no-op flush"
-            );
+        // Even with nothing to export, maintain the merge anchor from the
+        // clean JSONL (issues #378/#394): a missing anchor is materialized
+        // and a stale anchor is replaced, making `br sync --flush-only` an
+        // idempotent recovery command for the doctor's
+        // `base_jsonl.missing_post_flush` / stale-anchor findings.
+        //
+        // IDs/counts alone cannot prove that a same-ID JSONL record still
+        // matches the database. Immediately before touching the merge
+        // anchor, require the last certified semantic hash and compare it
+        // directly with the captured snapshot. Missing or mismatched
+        // evidence fails closed; --force deliberately takes the real-export
+        // path instead.
+        let noop_source = source.expect("existing JSONL has an immutable snapshot");
+        let stored_content_hash = storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+            .filter(|hash| !hash.trim().is_empty())
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "Cannot certify a no-op flush because the stored JSONL content hash is \
+                     missing. The merge anchor was not changed.\n\
+                     Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally \
+                     with `br sync --import-only --force`, or replace it from the database with \
+                     `br sync --flush-only --force`."
+                        .to_string(),
+                )
+            })?;
+        let observed_content_hash = noop_source.content_sha256();
+        if observed_content_hash != stored_content_hash {
+            return Err(BeadsError::Config(format!(
+                "Refusing a no-op flush because the JSONL changed since its last certified \
+                 sync (stored hash {stored_content_hash}, observed hash \
+                 {observed_content_hash}). The merge anchor was not changed.\n\
+                 Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally with \
+                 `br sync --import-only --force`, or replace it from the database with \
+                 `br sync --flush-only --force`."
+            )));
         }
+
+        // Certified: replace the anchor with the exact snapshot bytes (also
+        // covers the missing-anchor case).
+        refresh_base_snapshot_from_flushed_jsonl_snapshot(noop_source, &path_policy.beads_dir)?;
 
         if use_json {
             let result = FlushResult {
