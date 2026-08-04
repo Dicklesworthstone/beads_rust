@@ -504,11 +504,16 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     };
 
     let mut attestation_errors = Vec::new();
+    // Deliberate cross-type comparison: the forecast promises maintenance
+    // (`post_migration_maintenance`) and the effects attest completion
+    // (`post_migration_maintenance_completed`).
+    let maintenance_matches_forecast =
+        effects.post_migration_maintenance_completed == forecast.post_migration_maintenance;
     if effects.from_version != forecast.from_version
         || effects.to_version != forecast.to_version
         || effects.content_hash_rows_rebuilt != forecast.content_hash_rows_rebuilt
         || effects.gate_result_history_created != forecast.gate_result_history_created
-        || effects.post_migration_maintenance_completed != forecast.post_migration_maintenance
+        || !maintenance_matches_forecast
     {
         attestation_errors.push(format!(
             "committed effects differ from the reviewed forecast \

@@ -56,3 +56,11 @@ cd /data/projects/beads_rust
 rg --no-heading -n 'assert_eq!\([^,]*,\s*"(test|tmp|br|bd|proj)-[a-zA-Z0-9]{4,}"' tests/ | wc -l
 # Expected: 10 (or fewer if any of the 10 are removed by future work)
 ```
+
+## Addendum 2026-08-04
+
+Two additional annotated exceptions exist in `tests/conformance.rs`
+(`normalize_value` masker unit tests): they assert the masked form
+(`bd-NORMALIZED`) of literal input constants, so the masked-ID assertion is
+the point of the test. The enforcement baseline in `tests/no_id_pinning.rs`
+is therefore 12 annotated lines.

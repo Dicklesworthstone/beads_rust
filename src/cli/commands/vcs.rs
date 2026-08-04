@@ -1051,7 +1051,7 @@ fn attributes_require_transform(output: &[u8]) -> Option<bool> {
         return None;
     }
     let mut transform = false;
-    for triple in records.chunks_exact(3) {
+    for triple in records.as_chunks::<3>().0 {
         if triple[0].is_empty() || triple[1].is_empty() {
             return None;
         }

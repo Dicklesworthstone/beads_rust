@@ -3095,8 +3095,7 @@ impl OpenStorageResult {
         }
         let write_authority =
             self._write_authority
-                .as_ref()
-                .cloned()
+                .clone()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Database recovery requires an owned database-family authority"
                         .to_string(),
@@ -4452,6 +4451,7 @@ impl CliOverrides {
         .then_some(authority)
     }
 
+    #[must_use]
     pub fn holds_database_family_lock_for(&self, beads_dir: &Path, database_path: &Path) -> bool {
         self.database_family_write_authority_for(beads_dir, database_path)
             .is_some()

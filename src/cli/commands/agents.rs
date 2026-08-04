@@ -1664,7 +1664,6 @@ mod tests {
     use super::*;
     use crate::output::OutputContext;
     use std::env;
-    use tempfile::TempDir;
 
     /// Restore the process working directory when a test that chdirs into an
     /// isolated temp project finishes (tests hold `TEST_DIR_LOCK` while using
@@ -1690,12 +1689,6 @@ mod tests {
     fn assert_unexpected_error(other: &BeadsError) {
         let message = format!("{other:?}");
         assert!(message.is_empty(), "unexpected error: {message}");
-    }
-
-    fn isolated_agent_project() -> TempDir {
-        let temp_dir = TempDir::new().expect("create isolated agent project");
-        fs::create_dir(temp_dir.path().join(".git")).expect("mark isolated project root");
-        temp_dir
     }
 
     #[test]

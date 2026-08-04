@@ -18138,22 +18138,21 @@ impl SqliteStorage {
             });
         }
         authority.verify_database_authority()?;
-        let mut storage = match Self::open_current_read_only(path)? {
-            Some(storage) => storage,
-            None => {
-                let found = effective_database_user_version(path)?;
-                return match found {
-                    Some(found) => Err(BeadsError::SchemaMismatch {
-                        expected: CURRENT_SCHEMA_VERSION,
-                        found: i32::try_from(found).unwrap_or(i32::MAX),
-                    }),
-                    None => Err(BeadsError::SyncConflict {
-                        message:
-                            "Pending sync-merge state is unknown because the database schema is missing or unreadable"
-                                .to_string(),
-                    }),
-                };
-            }
+        let mut storage = if let Some(storage) = Self::open_current_read_only(path)? {
+            storage
+        } else {
+            let found = effective_database_user_version(path)?;
+            return match found {
+                Some(found) => Err(BeadsError::SchemaMismatch {
+                    expected: CURRENT_SCHEMA_VERSION,
+                    found: i32::try_from(found).unwrap_or(i32::MAX),
+                }),
+                None => Err(BeadsError::SyncConflict {
+                    message:
+                        "Pending sync-merge state is unknown because the database schema is missing or unreadable"
+                            .to_string(),
+                }),
+            };
         };
         authority.verify_database_authority()?;
         storage.attach_write_authority(Arc::clone(authority));

@@ -164,11 +164,15 @@ fn invariant_annotation_count_matches_2026_05_09_audit_baseline() {
             }
         }
     }
-    // Exactly 10 known-legitimate hits per docs/audit_id_pinning_2026_05_09.md
+    // Exactly 12 known-legitimate hits: the 10 from
+    // docs/audit_id_pinning_2026_05_09.md plus the two normalize_value masker
+    // unit tests in tests/conformance.rs (added 2026-08-04), which assert the
+    // masked form of literal input constants.
     assert_eq!(
-        annotated, 10,
-        "audit baseline drift: expected 10 lines with `// invariant:` annotation \
-         (per docs/audit_id_pinning_2026_05_09.md), found {annotated}. If you \
+        annotated, 12,
+        "audit baseline drift: expected 12 lines with `// invariant:` annotation \
+         (per docs/audit_id_pinning_2026_05_09.md plus the two conformance \
+         masker unit tests), found {annotated}. If you \
          intentionally added/removed an annotated exception, update both this \
          constant and the audit doc."
     );

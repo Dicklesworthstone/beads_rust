@@ -25,7 +25,19 @@ use std::thread;
 use std::time::Duration;
 
 /// Helper to run sync --flush-only.
+///
+/// The real-dataset fixture is a copy of a live workspace whose DB can
+/// legitimately lag its JSONL (issues merged via git but not yet imported).
+/// Since #405 the exporter's stale-database guard refuses to flush over such
+/// a JSONL instead of silently dropping the unimported issues, so the lossless
+/// order is import-then-flush.
 fn sync_flush(workspace: &BrWorkspace) {
+    let import = run_br(workspace, ["sync", "--import-only"], "sync_import");
+    assert!(
+        import.status.success(),
+        "import should succeed: {}",
+        import.stderr
+    );
     let sync = run_br(workspace, ["sync", "--flush-only"], "sync_flush");
     assert!(
         sync.status.success(),

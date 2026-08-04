@@ -859,11 +859,9 @@ fn canonical_database_authority_key(database_path: &Path) -> Result<PathBuf> {
                 })?
                 .join(file_name))
         }
-        Err(error) => {
-            return Err(BeadsError::Config(format!(
-                "Could not resolve database lock authority for {database_descriptor}: {error}"
-            )));
-        }
+        Err(error) => Err(BeadsError::Config(format!(
+            "Could not resolve database lock authority for {database_descriptor}: {error}"
+        ))),
     }
 }
 
@@ -1153,7 +1151,7 @@ fn open_and_lock_regular_file(
     } else {
         lock_path.display().to_string()
     };
-    match fs::symlink_metadata(&lock_path) {
+    match fs::symlink_metadata(lock_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
             return Err(BeadsError::Config(format!(
                 "Refusing unsafe {role} path {}: expected a regular file, not a symlink or special file",
@@ -1189,7 +1187,7 @@ fn open_and_lock_regular_file(
             lock_path_display
         ))
     })?;
-    let path_metadata = fs::symlink_metadata(&lock_path).map_err(|error| {
+    let path_metadata = fs::symlink_metadata(lock_path).map_err(|error| {
         BeadsError::Config(format!(
             "Failed to re-witness {role} at {}: {error}",
             lock_path_display
@@ -6929,7 +6927,7 @@ fn plan_additive_reconcile_in_snapshot(
     )?;
     for mutation in mutations.iter().filter(|mutation| mutation.creates_issue()) {
         let issue = mutation.issue();
-        for label in issue.labels.iter().collect::<BTreeSet<_>>() {
+        for label in &issue.labels {
             expected_label_rows.push(vec![
                 additive_sqlite_value_witness(SqliteValue::from(issue.id.as_str())),
                 additive_sqlite_value_witness(SqliteValue::from(label.as_str())),
@@ -9648,11 +9646,7 @@ fn export_to_jsonl_with_policy_expected_authority(
     if let Some(database_authority) = provided_database_authority {
         database_authority.verify_database_authority()?;
     }
-    let export_as_of = config
-        .export_as_of
-        .as_ref()
-        .cloned()
-        .unwrap_or_else(Utc::now);
+    let export_as_of = config.export_as_of.unwrap_or_else(Utc::now);
 
     // Path validation (PC-1, PC-2, PC-3, NGI-3)
     if let Some(ref beads_dir) = config.beads_dir {
@@ -9860,7 +9854,7 @@ fn export_to_jsonl_with_policy_expected_authority(
         } else {
             for issue in &issues {
                 // Skip expired tombstones
-                if issue.is_expired_tombstone_at(config.retention_days, export_as_of.to_owned()) {
+                if issue.is_expired_tombstone_at(config.retention_days, export_as_of) {
                     skipped_tombstone_ids.push(issue.id.clone());
                     progress.inc(1);
                     continue;
@@ -9916,8 +9910,7 @@ fn export_to_jsonl_with_policy_expected_authority(
             } else {
                 for issue in &issues {
                     // Skip expired tombstones
-                    if issue.is_expired_tombstone_at(config.retention_days, export_as_of.to_owned())
-                    {
+                    if issue.is_expired_tombstone_at(config.retention_days, export_as_of) {
                         skipped_tombstone_ids.push(issue.id.clone());
                         progress.inc(1);
                         continue;
@@ -10108,7 +10101,7 @@ pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
     if export_ids.len() <= EXPORT_FULL_SCAN_ISSUE_THRESHOLD {
         let issues = hydrate_export_issues_full_scan(storage, &mut ctx)?;
         for issue in &issues {
-            if issue.is_expired_tombstone_at(retention_days, export_as_of.to_owned()) {
+            if issue.is_expired_tombstone_at(retention_days, export_as_of) {
                 skipped_tombstone_ids.push(issue.id.clone());
                 continue;
             }
@@ -10133,7 +10126,7 @@ pub(crate) fn export_to_writer_with_policy_and_retention_at<W: Write>(
         for id_batch in export_ids.chunks(EXPORT_ISSUE_BATCH_SIZE) {
             let issues = hydrate_export_issue_batch(storage, id_batch, &mut ctx)?;
             for issue in &issues {
-                if issue.is_expired_tombstone_at(retention_days, export_as_of.to_owned()) {
+                if issue.is_expired_tombstone_at(retention_days, export_as_of) {
                     skipped_tombstone_ids.push(issue.id.clone());
                     continue;
                 }

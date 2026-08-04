@@ -1040,54 +1040,6 @@ fn command_contract(name: &str) -> CommandContract {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{command_contract, command_detail_for_path};
-
-    #[test]
-    fn vcs_status_capability_is_explicit_read_only_and_machine_discoverable() {
-        let contract = command_contract("vcs-status");
-        assert_eq!(contract.operation, "read");
-        assert_eq!(contract.workspace, "required");
-        assert_eq!(contract.machine_output, ["json", "toon", "text"]);
-        assert!(
-            contract
-                .examples
-                .iter()
-                .any(|example| example.contains("br vcs-status --json"))
-        );
-
-        let detail = command_detail_for_path("vcs-status").expect("vcs-status detail");
-        assert_eq!(detail.operation, "read");
-        assert!(
-            detail
-                .safety_notes
-                .iter()
-                .any(|note| note.contains("selected from PATH is trusted"))
-        );
-    }
-
-    #[test]
-    fn doctor_capability_exposes_the_reviewed_schema_migration_workflow() {
-        let contract = command_contract("doctor");
-        assert_eq!(contract.operation, "mixed");
-        assert!(
-            contract
-                .examples
-                .iter()
-                .any(|example| example.contains("migrate-schema plan --json"))
-        );
-
-        let detail = command_detail_for_path("doctor").expect("doctor detail");
-        assert!(
-            detail
-                .safety_notes
-                .iter()
-                .any(|note| note.contains("never cross a schema-version boundary"))
-        );
-    }
-}
-
 fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
     println!(
         "{} {} ({})",
@@ -1161,5 +1113,53 @@ fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
     println!("Safety:");
     for item in output.safety {
         println!("  {}: {}", item.name, item.guarantee);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{command_contract, command_detail_for_path};
+
+    #[test]
+    fn vcs_status_capability_is_explicit_read_only_and_machine_discoverable() {
+        let contract = command_contract("vcs-status");
+        assert_eq!(contract.operation, "read");
+        assert_eq!(contract.workspace, "required");
+        assert_eq!(contract.machine_output, ["json", "toon", "text"]);
+        assert!(
+            contract
+                .examples
+                .iter()
+                .any(|example| example.contains("br vcs-status --json"))
+        );
+
+        let detail = command_detail_for_path("vcs-status").expect("vcs-status detail");
+        assert_eq!(detail.operation, "read");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("selected from PATH is trusted"))
+        );
+    }
+
+    #[test]
+    fn doctor_capability_exposes_the_reviewed_schema_migration_workflow() {
+        let contract = command_contract("doctor");
+        assert_eq!(contract.operation, "mixed");
+        assert!(
+            contract
+                .examples
+                .iter()
+                .any(|example| example.contains("migrate-schema plan --json"))
+        );
+
+        let detail = command_detail_for_path("doctor").expect("doctor detail");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("never cross a schema-version boundary"))
+        );
     }
 }

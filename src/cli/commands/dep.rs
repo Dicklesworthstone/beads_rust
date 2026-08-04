@@ -1357,7 +1357,7 @@ fn build_dep_tree_nodes_global(
     let (dependencies_by_issue, dependents_by_issue) = load_dep_tree_adjacency(storage)?;
 
     let mut nodes = Vec::new();
-    let mut expanded: HashSet<String> = HashSet::new();
+    let _expanded: HashSet<String> = HashSet::new();
 
     let mut queue = vec![DepTreeQueueItem {
         id: root_id.to_string(),
@@ -1496,7 +1496,7 @@ fn try_build_dep_tree_nodes_local(
     metadata_cache.insert(root_id.to_string(), dep_tree_root_metadata(root_issue));
 
     let mut nodes = Vec::new();
-    let mut expanded: HashSet<String> = HashSet::new();
+    let _expanded: HashSet<String> = HashSet::new();
     let mut queue = vec![DepTreeQueueItem {
         id: root_id.to_string(),
         depth: 0,

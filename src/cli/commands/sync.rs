@@ -2456,7 +2456,7 @@ fn execute_flush(
             write_manifest_atomically(&manifest_file, &manifest).map_err(|source| {
                 BeadsError::CommittedArtifactFailure {
                     operation: "flush".to_string(),
-                    primary_path: jsonl_path.to_path_buf(),
+                    primary_path: jsonl_path.clone(),
                     artifact_path: manifest_file.clone(),
                     source: Box::new(source),
                 }
@@ -3311,7 +3311,7 @@ fn execute_import(
             beads_dir,
             cli,
             source,
-            &jsonl_authority,
+            jsonl_authority,
             db_path,
             &import_config,
             target_prefix.as_deref(),
@@ -3495,7 +3495,7 @@ fn execute_import(
             beads_dir,
             cli,
             source,
-            &jsonl_authority,
+            jsonl_authority,
             db_path,
             &import_config,
         )?;

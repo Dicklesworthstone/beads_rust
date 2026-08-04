@@ -332,10 +332,10 @@ fn main() {
             }
         }
     }
-    if let Some(write_lock) = write_lock.as_ref() {
-        if let Some(beads_dir) = ctx.beads_dir.as_deref() {
-            overrides.mark_database_family_lock_held(beads_dir, write_lock);
-        }
+    if let Some(write_lock) = write_lock.as_ref()
+        && let Some(beads_dir) = ctx.beads_dir.as_deref()
+    {
+        overrides.mark_database_family_lock_held(beads_dir, write_lock);
     }
 
     // Phase 2: Open Storage (One-time)

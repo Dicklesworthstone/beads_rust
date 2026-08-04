@@ -13746,13 +13746,13 @@ fn id_normalization_preserves_the_whole_prefix() {
     });
     normalize_value(&mut value);
 
-    assert_eq!(value["id"], "bd-NORMALIZED");
+    assert_eq!(value["id"], "bd-NORMALIZED"); // invariant: masker unit test on a literal constant
     // The load-bearing case: a prefix that itself contains a dash must survive
     // intact. Splitting on the first dash yielded "beads-NORMALIZED".
     assert_eq!(value["issue_id"], "beads-rust-NORMALIZED");
     // A dotted child id has only one dash, so `find` and `rfind` agree and the
     // whole `parent.1` suffix is treated as the hash portion.
-    assert_eq!(value["depends_on_id"], "bd-NORMALIZED");
+    assert_eq!(value["depends_on_id"], "bd-NORMALIZED"); // invariant: masker unit test on a literal constant
     assert_eq!(value["nested"]["id"], "ops-NORMALIZED");
     assert_eq!(value["items"][0]["id"], "api-NORMALIZED");
 }

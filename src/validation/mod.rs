@@ -1395,13 +1395,13 @@ mod tests {
 
     #[test]
     fn sync_safety_source_scan_rejects_direct_command_construction() {
-        let source = r#"fn probe(tool: &str) {
+        let source = r"fn probe(tool: &str) {
             let _child = std
                 :: process
                 :: Command
                 :: new(tool)
                 .spawn();
-        }"#;
+        }";
         let error =
             SyncSafetyValidator::validate_sync_source_text(Path::new("src/sync/probe.rs"), source)
                 .expect_err("indirect program selection still grants process authority");
@@ -1411,9 +1411,9 @@ mod tests {
 
     #[test]
     fn sync_safety_source_scan_rejects_vcs_wrapper_delegation() {
-        let source = r#"fn status() {
+        let source = r"fn status() {
             crate::cli::commands::vcs::execute_for_sync();
-        }"#;
+        }";
         let error = SyncSafetyValidator::validate_sync_source_text(
             Path::new("src/cli/commands/sync.rs"),
             source,
