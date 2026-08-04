@@ -102,7 +102,9 @@ fn main() {
                         .map(|d| d.join(".write.lock"))
                         .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
                     let lock_display = lock_path.display().to_string();
-                    if doctor_args.repair || doctor_args.repair_indexes {
+                    if (doctor_args.repair || doctor_args.repair_indexes)
+                        && !doctor_args.robot_triage
+                    {
                         let command_name = if doctor_args.repair_indexes {
                             "--repair-indexes"
                         } else {
@@ -135,15 +137,23 @@ fn main() {
                         }
                         std::process::exit(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
                     }
-                    if doctor_args.subcommand.is_none()
-                        && !doctor_args.robot_triage
-                        && is_unwritable_write_lock_open_error(&lock_path, &e)
-                    {
-                        emit_read_only_doctor_write_lock_diagnostic(
-                            ctx.beads_dir.as_deref(),
-                            &e,
-                            json_error_mode,
-                        );
+                    if doctor_args.subcommand.is_none() {
+                        if is_unwritable_write_lock_open_error(&lock_path, &e) {
+                            emit_read_only_doctor_write_lock_diagnostic(
+                                ctx.beads_dir.as_deref(),
+                                &e,
+                                json_error_mode,
+                                doctor_args.robot_triage,
+                            );
+                        }
+                        if is_write_lock_contention_error(&lock_path, &e) {
+                            emit_read_only_doctor_live_write_lock_diagnostic(
+                                ctx.beads_dir.as_deref(),
+                                &e,
+                                json_error_mode,
+                                doctor_args.robot_triage,
+                            );
+                        }
                     }
                 }
                 handle_error(&e, json_error_mode, color_error_mode)
@@ -1168,6 +1178,7 @@ fn emit_read_only_doctor_write_lock_diagnostic(
     beads_dir: Option<&Path>,
     err: &BeadsError,
     json_mode: bool,
+    robot_triage: bool,
 ) -> ! {
     let lock_path = beads_dir
         .map(|dir| dir.join(".write.lock"))
@@ -1182,12 +1193,21 @@ fn emit_read_only_doctor_write_lock_diagnostic(
         beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::FindingsPresent;
 
     if json_mode {
-        let payload = read_only_doctor_write_lock_payload(
-            &lock_path,
-            &message,
-            &remediation,
-            &err.to_string(),
-        );
+        let payload = if robot_triage {
+            read_only_doctor_write_lock_triage_payload(
+                &lock_path,
+                &message,
+                &remediation,
+                &err.to_string(),
+            )
+        } else {
+            read_only_doctor_write_lock_payload(
+                &lock_path,
+                &message,
+                &remediation,
+                &err.to_string(),
+            )
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
@@ -1210,6 +1230,194 @@ fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bo
         return false;
     };
     message.contains("Failed to open write lock") && write_lock_lacks_owner_write(lock_path)
+}
+
+fn is_write_lock_contention_error(lock_path: &Path, err: &BeadsError) -> bool {
+    let BeadsError::Config(message) = err else {
+        return false;
+    };
+    message.contains("Timed out after")
+        && message.contains("waiting for write lock at")
+        && message.contains(lock_path.to_string_lossy().as_ref())
+}
+
+fn emit_read_only_doctor_live_write_lock_diagnostic(
+    beads_dir: Option<&Path>,
+    err: &BeadsError,
+    json_mode: bool,
+    robot_triage: bool,
+) -> ! {
+    let lock_path = beads_dir
+        .map(|dir| dir.join(".write.lock"))
+        .unwrap_or_else(|| PathBuf::from(".beads/.write.lock"));
+    let lock_display = lock_path.display().to_string();
+    let message = format!(
+        "Workspace advisory lock at {lock_display} is owned by another process; doctor did not inspect live state"
+    );
+    let exit_code =
+        beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost;
+
+    if json_mode {
+        let payload = if robot_triage {
+            read_only_doctor_live_write_lock_triage_payload(&lock_path, &message, &err.to_string())
+        } else {
+            read_only_doctor_live_write_lock_payload(&lock_path, &message, &err.to_string())
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string())
+        );
+    } else {
+        eprintln!(
+            "br doctor could not begin live inspection:\n\
+             write_lock: warn\n\
+             {message}\n\
+             Wait for the owning process to finish and retry. Do not move or delete the lock inode.\n\
+             Underlying error: {err}",
+        );
+    }
+
+    std::process::exit(exit_code.as_i32());
+}
+
+fn read_only_doctor_live_write_lock_triage_payload(
+    lock_path: &Path,
+    message: &str,
+    startup_error: &str,
+) -> serde_json::Value {
+    read_only_doctor_startup_triage_payload(
+        lock_path,
+        message,
+        startup_error,
+        "fm-concurrency_primitives-orphaned-write-lock",
+        "P1",
+        "live_owner",
+        None,
+        beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost,
+    )
+}
+
+fn read_only_doctor_write_lock_triage_payload(
+    lock_path: &Path,
+    message: &str,
+    remediation: &str,
+    startup_error: &str,
+) -> serde_json::Value {
+    read_only_doctor_startup_triage_payload(
+        lock_path,
+        message,
+        startup_error,
+        "fm-state_files-orphaned-write-lock",
+        "P2",
+        "owner_not_writable",
+        Some(remediation),
+        beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::FindingsPresent,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_only_doctor_startup_triage_payload(
+    lock_path: &Path,
+    message: &str,
+    startup_error: &str,
+    finding_id: &str,
+    severity: &str,
+    reason: &str,
+    remediation: Option<&str>,
+    exit_code: beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode,
+) -> serde_json::Value {
+    use beads_rust::cli::commands::doctor_subsystems::surface::{
+        TriageFinding, build_triage_envelope,
+    };
+
+    let envelope = build_triage_envelope(
+        0,
+        1,
+        0,
+        vec![TriageFinding {
+            id: finding_id.to_string(),
+            severity: severity.to_string(),
+            message: message.to_string(),
+        }],
+    );
+    let mut payload = serde_json::to_value(envelope).unwrap_or_else(|serialization_error| {
+        serde_json::json!({
+            "schema_version": "br.doctor.triage.v1",
+            "summary": "doctor could not begin live inspection",
+            "findings": [{
+                "id": finding_id,
+                "severity": severity,
+                "message": message,
+            }],
+            "actions_planned": [],
+            "recommended_command": "br doctor",
+            "capabilities_url": "br doctor capabilities --format json",
+            "robot_docs_command": "br doctor robot-docs",
+            "quick_ref": {"healthy": 0, "warn": 1, "error": 0},
+            "serialization_error": serialization_error.to_string(),
+        })
+    });
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("ok".to_string(), serde_json::Value::Bool(false));
+        object.insert(
+            "exit_code".to_string(),
+            serde_json::Value::from(exit_code.as_i32()),
+        );
+        object.insert(
+            "code".to_string(),
+            serde_json::Value::String(exit_code.as_str().to_string()),
+        );
+        object.insert(
+            "inspection_state".to_string(),
+            serde_json::Value::String("not_started".to_string()),
+        );
+        object.insert(
+            "lock_path".to_string(),
+            serde_json::Value::String(lock_path.display().to_string()),
+        );
+        object.insert(
+            "reason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
+        object.insert(
+            "startup_error".to_string(),
+            serde_json::Value::String(startup_error.to_string()),
+        );
+        if let Some(remediation) = remediation {
+            object.insert(
+                "remediation".to_string(),
+                serde_json::Value::String(remediation.to_string()),
+            );
+        }
+    }
+    payload
+}
+
+fn read_only_doctor_live_write_lock_payload(
+    lock_path: &Path,
+    message: &str,
+    startup_error: &str,
+) -> serde_json::Value {
+    let exit_code =
+        beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost;
+    serde_json::json!({
+        "ok": false,
+        "exit_code": exit_code.as_i32(),
+        "code": exit_code.as_str(),
+        "inspection_state": "not_started",
+        "checks": [{
+            "name": "write_lock",
+            "status": "warn",
+            "message": message,
+            "details": {
+                "path": lock_path.display().to_string(),
+                "reason": "live_owner",
+                "startup_error": startup_error,
+                "finding_id": "fm-concurrency_primitives-orphaned-write-lock",
+                "remediation": "Wait for the owning process to finish and retry; do not move or delete the lock inode.",
+            },
+        }],
+    })
 }
 
 #[cfg(unix)]
@@ -1553,6 +1761,128 @@ mod tests {
             !is_unwritable_write_lock_open_error(&directory_lock, &open_err),
             "non-file lock path belongs to the original startup error, not permissions.write_lock"
         );
+    }
+
+    #[test]
+    fn read_only_doctor_live_write_lock_payload_is_typed_and_non_destructive() {
+        let lock = PathBuf::from("/workspace/.beads/.write.lock");
+        let payload = read_only_doctor_live_write_lock_payload(
+            &lock,
+            "lock is owned",
+            "Timed out after 1ms waiting for write lock",
+        );
+
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["exit_code"], 5);
+        assert_eq!(payload["code"], "concurrency_lost");
+        assert_eq!(payload["inspection_state"], "not_started");
+        assert!(
+            payload.get("workspace_health").is_none(),
+            "an uninspected workspace must not receive a health classification"
+        );
+        assert_eq!(payload["checks"][0]["name"], "write_lock");
+        assert_eq!(payload["checks"][0]["status"], "warn");
+        assert_eq!(payload["checks"][0]["details"]["reason"], "live_owner");
+        assert_eq!(
+            payload["checks"][0]["details"]["finding_id"],
+            "fm-concurrency_primitives-orphaned-write-lock"
+        );
+        assert!(
+            payload["checks"][0]["details"]["remediation"]
+                .as_str()
+                .is_some_and(|message| message.contains("do not move or delete"))
+        );
+    }
+
+    #[test]
+    fn read_only_doctor_live_write_lock_triage_payload_preserves_v1_contract() {
+        let lock = PathBuf::from("/workspace/.beads/.write.lock");
+        let payload = read_only_doctor_live_write_lock_triage_payload(
+            &lock,
+            "lock is owned",
+            "Timed out after 1ms waiting for write lock",
+        );
+
+        assert_eq!(payload["schema_version"], "br.doctor.triage.v1");
+        assert!(payload["summary"].is_string());
+        assert!(payload["findings"].is_array());
+        assert!(payload["actions_planned"].is_array());
+        assert!(payload["recommended_command"].is_string());
+        assert!(payload["capabilities_url"].is_string());
+        assert!(payload["robot_docs_command"].is_string());
+        assert_eq!(payload["quick_ref"]["healthy"], 0);
+        assert_eq!(payload["quick_ref"]["warn"], 1);
+        assert_eq!(payload["quick_ref"]["error"], 0);
+        assert_eq!(
+            payload["findings"][0]["id"],
+            "fm-concurrency_primitives-orphaned-write-lock"
+        );
+        assert_eq!(payload["exit_code"], 5);
+        assert_eq!(payload["code"], "concurrency_lost");
+        assert_eq!(payload["inspection_state"], "not_started");
+        assert_eq!(payload["reason"], "live_owner");
+        assert!(
+            payload.get("workspace_health").is_none(),
+            "an uninspected workspace must not receive a health classification"
+        );
+    }
+
+    #[test]
+    fn read_only_doctor_unwritable_write_lock_triage_payload_preserves_v1_contract() {
+        let lock = PathBuf::from("/workspace/.beads/.write.lock");
+        let payload = read_only_doctor_write_lock_triage_payload(
+            &lock,
+            "lock is not writable",
+            "chmod u+w /workspace/.beads/.write.lock",
+            "Failed to open write lock: Permission denied",
+        );
+
+        assert_eq!(payload["schema_version"], "br.doctor.triage.v1");
+        assert!(payload["summary"].is_string());
+        assert!(payload["findings"].is_array());
+        assert!(payload["actions_planned"].is_array());
+        assert!(payload["recommended_command"].is_string());
+        assert!(payload["capabilities_url"].is_string());
+        assert!(payload["robot_docs_command"].is_string());
+        assert_eq!(payload["quick_ref"]["healthy"], 0);
+        assert_eq!(payload["quick_ref"]["warn"], 1);
+        assert_eq!(payload["quick_ref"]["error"], 0);
+        assert_eq!(
+            payload["findings"][0]["id"],
+            "fm-state_files-orphaned-write-lock"
+        );
+        assert_eq!(payload["findings"][0]["severity"], "P2");
+        assert_eq!(payload["exit_code"], 1);
+        assert_eq!(payload["code"], "findings_present");
+        assert_eq!(payload["inspection_state"], "not_started");
+        assert_eq!(payload["reason"], "owner_not_writable");
+        assert!(
+            payload["remediation"]
+                .as_str()
+                .is_some_and(|message| message.contains("chmod u+w"))
+        );
+        assert!(
+            payload.get("workspace_health").is_none(),
+            "an uninspected workspace must not receive a health classification"
+        );
+    }
+
+    #[test]
+    fn write_lock_contention_detection_is_path_scoped() {
+        let lock = PathBuf::from("/workspace/.beads/.write.lock");
+        let timeout = BeadsError::Config(format!(
+            "Timed out after 1ms waiting for write lock at {}",
+            lock.display()
+        ));
+        let other_lock = PathBuf::from("/other/.beads/.write.lock");
+        let open_error = BeadsError::Config(format!(
+            "Failed to open write lock at {}: Permission denied",
+            lock.display()
+        ));
+
+        assert!(is_write_lock_contention_error(&lock, &timeout));
+        assert!(!is_write_lock_contention_error(&other_lock, &timeout));
+        assert!(!is_write_lock_contention_error(&lock, &open_error));
     }
 
     #[test]
@@ -2268,6 +2598,12 @@ mod tests {
     #[test]
     fn should_render_errors_as_json_for_query_run_json_format() {
         let cli = Cli::parse_from(["br", "query", "run", "saved", "--format", "json"]);
+        assert!(should_render_errors_as_json_with_env(&cli, None));
+    }
+
+    #[test]
+    fn should_render_errors_as_json_for_doctor_robot_triage() {
+        let cli = Cli::parse_from(["br", "doctor", "--robot-triage"]);
         assert!(should_render_errors_as_json_with_env(&cli, None));
     }
 

@@ -13,13 +13,25 @@ tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
 has_pattern() {
-  # $1 is the canonical pattern to look for as an exact trimmed line.
+  # $1 is the canonical pattern to look for after removing only line endings
+  # and trailing whitespace. Leading whitespace is literal in gitignore.
   python3 - "$1" <<'PY'
 import sys
 needle = sys.argv[1]
+
+def normalize_gitignore_line(line):
+    line = line.rstrip("\r\n")
+    while line.endswith(" "):
+        prefix = line[:-1]
+        escaping_backslashes = len(prefix) - len(prefix.rstrip("\\"))
+        if escaping_backslashes % 2 == 1:
+            break
+        line = prefix
+    return line
+
 try:
     with open(".beads/.gitignore", "r", encoding="utf-8") as f:
-        present = any(line.strip() == needle for line in f)
+        present = any(normalize_gitignore_line(line) == needle for line in f)
 except FileNotFoundError:
     present = False
 print("1" if present else "0")
@@ -37,14 +49,18 @@ case "$stage" in
       echo "$out" | jq '.checks[] | select(.name == "gitignore.beads_inner_present")' >&2
       exit 1
     }
-    # The pre-fix state has `*.tmp` (canonical present) but NOT
-    # `.write.lock` (canonical missing).
-    if [ "$(has_pattern '*.tmp')" != "1" ]; then
-      echo "ASSERT FAIL[$stage]: expected *.tmp to be present in pre-fix state" >&2
+    # The pre-fix state effectively covers .write.lock through *.lock, while
+    # the temp-file class is genuinely missing.
+    if [ "$(has_pattern '*.lock')" != "1" ]; then
+      echo "ASSERT FAIL[$stage]: expected *.lock in pre-fix state" >&2
+      exit 1
+    fi
+    if [ "$(has_pattern '*.tmp')" != "0" ]; then
+      echo "ASSERT FAIL[$stage]: expected *.tmp to be missing in pre-fix state" >&2
       exit 1
     fi
     if [ "$(has_pattern '.write.lock')" != "0" ]; then
-      echo "ASSERT FAIL[$stage]: expected .write.lock to be missing in pre-fix state" >&2
+      echo "ASSERT FAIL[$stage]: fixture unexpectedly contains redundant .write.lock" >&2
       exit 1
     fi
     # Operator-custom line preserved through the corrupt stage.
@@ -54,13 +70,17 @@ case "$stage" in
     fi
     ;;
   post_repair)
-    # Both canonical patterns now present.
+    # The broad lock rule stays authoritative; repair adds only *.tmp.
+    if [ "$(has_pattern '*.lock')" != "1" ]; then
+      echo "ASSERT FAIL[$stage]: *.lock missing after repair" >&2
+      exit 1
+    fi
     if [ "$(has_pattern '*.tmp')" != "1" ]; then
       echo "ASSERT FAIL[$stage]: *.tmp missing after repair" >&2
       exit 1
     fi
-    if [ "$(has_pattern '.write.lock')" != "1" ]; then
-      echo "ASSERT FAIL[$stage]: .write.lock not appended after repair" >&2
+    if [ "$(has_pattern '.write.lock')" != "0" ]; then
+      echo "ASSERT FAIL[$stage]: repair appended redundant .write.lock" >&2
       exit 1
     fi
     # Operator-custom line MUST be preserved verbatim.

@@ -65,6 +65,12 @@ static OWNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"Owner: [a-zA-Z0-9_-]+").expect("owner regex"));
 static VERSION_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"version \d+\.\d+\.\d+").expect("version number regex"));
+static DOCTOR_BINARY_VERSION_OK_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^OK binary_version: Running br \d+\.\d+\.\d+; (?:no beads_rust Cargo\.toml reachable from \.beads/ — not flagging|matches \(or is ahead of\) Cargo\.toml at [^\n]+)$",
+    )
+    .expect("doctor binary version regex")
+});
 static LINE_NUM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\.rs:\d+:").expect("line number regex"));
 /// `tracing` source-location annotation that appears in dev builds after the
@@ -84,8 +90,10 @@ static HOME_PATH_RE: LazyLock<Regex> =
 static USERS_PATH_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/Users/[a-zA-Z0-9_-]+").expect("users path regex"));
 static TMP_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:/data)?/tmp/[A-Za-z0-9_-]*/?\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+")
-        .expect("tmp path regex")
+    Regex::new(
+        r"(?:/data)?/tmp(?:/[A-Za-z0-9._-]+)*/\.tmp[a-zA-Z0-9]+|(?:/[A-Za-z0-9._-]+)+/\.rch-target-[A-Za-z0-9._-]+/\.tmp[a-zA-Z0-9]+|/var/folders/[a-zA-Z0-9/_-]+",
+    )
+    .expect("tmp path regex")
 });
 /// Compact timestamp format used in backup filenames: `YYYYMMDD_HHMMSS_nano`.
 /// Produced by `sync::history` when writing rotation backups; differs run-to-run
@@ -486,6 +494,15 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
     }
 
     // 13. Mask version numbers
+    if config.mask_version_numbers && DOCTOR_BINARY_VERSION_OK_RE.is_match(&normalized) {
+        normalized = DOCTOR_BINARY_VERSION_OK_RE
+            .replace_all(
+                &normalized,
+                "OK binary_version: Running br X.Y.Z; no newer source-tree version detected",
+            )
+            .to_string();
+        log.push("doctor_binary_version".to_string());
+    }
     if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
         normalized = VERSION_NUM_RE
             .replace_all(&normalized, "version X.Y.Z")
@@ -773,6 +790,36 @@ mod golden_snapshot_tests {
         let input = "Temp file at /tmp/.tmpABC123XYZ";
         let snapshot = TextSnapshot::golden(input);
         assert!(snapshot.normalized.contains("/TMP"));
+    }
+
+    #[test]
+    fn test_mask_nested_temp_paths() {
+        let input =
+            "Temp file at /data/projects/beads_rust/.rch-target-worker/.tmpABC123XYZ/.beads";
+        let snapshot = TextSnapshot::golden(input);
+        assert_eq!(snapshot.normalized, "Temp file at /TMP/.beads");
+    }
+
+    #[test]
+    fn test_preserve_arbitrary_dot_tmp_paths() {
+        let input = "State file at /etc/app/.tmpCorrupt";
+        let snapshot = TextSnapshot::golden(input);
+        assert_eq!(snapshot.normalized, input);
+    }
+
+    #[test]
+    fn test_mask_doctor_binary_version_ok_variants() {
+        let outside_tree = TextSnapshot::golden(
+            "OK binary_version: Running br 0.2.15; no beads_rust Cargo.toml reachable from .beads/ — not flagging",
+        );
+        let inside_tree = TextSnapshot::golden(
+            "OK binary_version: Running br 0.2.19; matches (or is ahead of) Cargo.toml at /data/projects/beads_rust/Cargo.toml (0.2.19)",
+        );
+        assert_eq!(
+            outside_tree.normalized,
+            "OK binary_version: Running br X.Y.Z; no newer source-tree version detected"
+        );
+        assert_eq!(inside_tree.normalized, outside_tree.normalized);
     }
 
     #[test]

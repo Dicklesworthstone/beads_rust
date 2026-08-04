@@ -1582,6 +1582,7 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Orphans(args) => args.robot,
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
+        Commands::Doctor(args) => args.robot_triage,
         Commands::Dep { command } => match command {
             DepCommands::Import(args) => args.robot,
             DepCommands::Add(_)
@@ -3258,9 +3259,9 @@ pub struct AgentsArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic, issue_type_completer,
-        issue_type_completer_delimited, resolve_output_format_basic_with_outer_mode,
-        resolve_output_format_with_outer_mode,
+        Cli, Commands, InheritedOutputMode, OutputFormat, OutputFormatBasic,
+        command_requests_robot_json, issue_type_completer, issue_type_completer_delimited,
+        resolve_output_format_basic_with_outer_mode, resolve_output_format_with_outer_mode,
     };
     use crate::storage::sqlite::SqliteStorage;
     use clap::{CommandFactory, Parser};
@@ -3338,6 +3339,15 @@ mod tests {
         let err = Cli::try_parse_from(["br", "doctor", "--fix", "--repair-indexes"])
             .expect_err("--fix must share --repair's repair-index conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn test_doctor_robot_triage_requests_json_without_redundant_json_flag() {
+        let triage = Cli::parse_from(["br", "doctor", "--robot-triage"]);
+        let ordinary = Cli::parse_from(["br", "doctor"]);
+
+        assert!(command_requests_robot_json(&triage.command));
+        assert!(!command_requests_robot_json(&ordinary.command));
     }
 
     #[test]

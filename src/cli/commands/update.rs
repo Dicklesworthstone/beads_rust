@@ -29,6 +29,10 @@ struct UpdatedIssueOutput {
     title: String,
     status: String,
     priority: i32,
+    // Coordination fields echoed so a caller can confirm a claim landed from
+    // the update response alone, without a follow-up `br show` (#393).
+    assignee: Option<String>,
+    owner: Option<String>,
     updated_at: DateTime<Utc>,
 }
 
@@ -39,6 +43,8 @@ impl From<&Issue> for UpdatedIssueOutput {
             title: issue.title.clone(),
             status: issue.status.as_str().to_string(),
             priority: issue.priority.0,
+            assignee: issue.assignee.clone(),
+            owner: issue.owner.clone(),
             updated_at: issue.updated_at,
         }
     }

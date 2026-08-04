@@ -17,9 +17,11 @@ use crate::storage::SqliteStorage;
 use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExportConfig, ImportConfig, ImportResult, JsonlTombstoneFilter, PreservedTombstone, auto_flush,
-    blocking_write_lock_with_timeout, compute_jsonl_hash, export_to_jsonl_with_policy,
-    finalize_export, import_from_jsonl, preflight_import, restore_tombstones_after_rebuild,
-    scan_jsonl_for_tombstone_filter, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    blocking_write_lock_with_timeout, compute_jsonl_hash, dirty_issues_missing_or_newer_than_jsonl,
+    export_to_jsonl_with_policy, finalize_export, import_from_jsonl, preflight_import,
+    restore_dirty_issues_after_rebuild, restore_tombstones_after_rebuild,
+    scan_jsonl_for_tombstone_filter, snapshot_dirty_issues, snapshot_tombstones,
+    tombstones_missing_from_jsonl_tombstones,
 };
 use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
@@ -234,23 +236,28 @@ impl ConfigPaths {
 ///
 /// Returns an error if no beads directory is found or the CWD cannot be read.
 pub fn discover_beads_dir(start: Option<&Path>) -> Result<PathBuf> {
-    discover_beads_dir_with_env(start, None)
+    let env_override = beads_dir_override_from_env();
+    discover_beads_dir_with_env(start, env_override.as_deref())
 }
 
 fn discover_beads_dir_with_env(
     start: Option<&Path>,
     env_override: Option<&Path>,
 ) -> Result<PathBuf> {
+    discover_beads_dir_with_env_and_ceiling(start, env_override, None)
+}
+
+fn discover_beads_dir_with_env_and_ceiling(
+    start: Option<&Path>,
+    env_override: Option<&Path>,
+    discovery_ceiling: Option<&Path>,
+) -> Result<PathBuf> {
     if let Some(path) = env_override {
-        return resolve_explicit_beads_dir(path, "beads directory override");
-    } else if let Ok(value) = env::var("BEADS_DIR")
-        && !value.trim().is_empty()
-    {
-        let path = PathBuf::from(value);
-        return resolve_explicit_beads_dir(&path, "BEADS_DIR");
+        return resolve_explicit_beads_dir(path, "BEADS_DIR");
     }
 
-    let candidate = discover_beads_dir_candidate_with_env(start, None)?;
+    let candidate =
+        discover_beads_dir_candidate_with_env_and_ceiling(start, None, discovery_ceiling)?;
     routing::follow_redirects(&candidate, 10)
 }
 
@@ -258,13 +265,16 @@ fn discover_beads_dir_candidate_with_env(
     start: Option<&Path>,
     env_override: Option<&Path>,
 ) -> Result<PathBuf> {
+    discover_beads_dir_candidate_with_env_and_ceiling(start, env_override, None)
+}
+
+fn discover_beads_dir_candidate_with_env_and_ceiling(
+    start: Option<&Path>,
+    env_override: Option<&Path>,
+    discovery_ceiling: Option<&Path>,
+) -> Result<PathBuf> {
     if let Some(path) = env_override {
-        return validate_explicit_beads_dir(path, "beads directory override");
-    } else if let Ok(value) = env::var("BEADS_DIR")
-        && !value.trim().is_empty()
-    {
-        let path = PathBuf::from(value);
-        return validate_explicit_beads_dir(&path, "BEADS_DIR");
+        return validate_explicit_beads_dir(path, "BEADS_DIR");
     }
 
     let mut current = match start {
@@ -282,6 +292,9 @@ fn discover_beads_dir_candidate_with_env(
             return Ok(candidate_underscore);
         }
 
+        if discovery_ceiling.is_some_and(|ceiling| current == ceiling) {
+            break;
+        }
         if !current.pop() {
             break;
         }
@@ -306,7 +319,14 @@ fn discover_beads_dir_candidate_with_env(
 /// - `--db` path is external and no workspace can be discovered from CWD/BEADS_DIR
 /// - No beads directory found (when `--db` not provided)
 pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
-    discover_beads_dir_with_cli_from(None, cli, None, None)
+    let beads_dir_env_override = beads_dir_override_from_env();
+    let db_env_override = startup_db_override_from_env();
+    discover_beads_dir_with_cli_from(
+        None,
+        cli,
+        beads_dir_env_override.as_deref(),
+        db_env_override.as_deref(),
+    )
 }
 
 /// Discover the active `.beads` directory, but allow "no workspace" when no
@@ -322,7 +342,14 @@ pub fn discover_beads_dir_with_cli(cli: &CliOverrides) -> Result<PathBuf> {
 /// - An explicit `--db` path is invalid
 /// - Discovery fails for reasons other than `NotInitialized`
 pub fn discover_optional_beads_dir_with_cli(cli: &CliOverrides) -> Result<Option<PathBuf>> {
-    match discover_beads_dir_with_cli_from(None, cli, None, None) {
+    let beads_dir_env_override = beads_dir_override_from_env();
+    let db_env_override = startup_db_override_from_env();
+    match discover_beads_dir_with_cli_from(
+        None,
+        cli,
+        beads_dir_env_override.as_deref(),
+        db_env_override.as_deref(),
+    ) {
         Ok(path) => Ok(Some(path)),
         Err(BeadsError::NotInitialized) if cli.db.is_none() => Ok(None),
         Err(err) => Err(err),
@@ -332,7 +359,14 @@ pub fn discover_optional_beads_dir_with_cli(cli: &CliOverrides) -> Result<Option
 pub(crate) fn discover_optional_beads_dir_candidate_with_cli(
     cli: &CliOverrides,
 ) -> Result<Option<PathBuf>> {
-    match discover_beads_dir_candidate_with_cli_from(None, cli, None, None) {
+    let beads_dir_env_override = beads_dir_override_from_env();
+    let db_env_override = startup_db_override_from_env();
+    match discover_beads_dir_candidate_with_cli_from(
+        None,
+        cli,
+        beads_dir_env_override.as_deref(),
+        db_env_override.as_deref(),
+    ) {
         Ok(path) => Ok(Some(path)),
         Err(BeadsError::NotInitialized) if cli.db.is_none() => Ok(None),
         Err(err) => Err(err),
@@ -344,6 +378,22 @@ fn discover_beads_dir_with_cli_from(
     cli: &CliOverrides,
     beads_dir_env_override: Option<&Path>,
     db_env_override: Option<&Path>,
+) -> Result<PathBuf> {
+    discover_beads_dir_with_cli_from_and_ceiling(
+        start,
+        cli,
+        beads_dir_env_override,
+        db_env_override,
+        None,
+    )
+}
+
+fn discover_beads_dir_with_cli_from_and_ceiling(
+    start: Option<&Path>,
+    cli: &CliOverrides,
+    beads_dir_env_override: Option<&Path>,
+    db_env_override: Option<&Path>,
+    discovery_ceiling: Option<&Path>,
 ) -> Result<PathBuf> {
     let explicit_external_cli_db = cli
         .db
@@ -359,9 +409,7 @@ fn discover_beads_dir_with_cli_from(
         );
     }
 
-    let startup_db_override = db_env_override
-        .map(Path::to_path_buf)
-        .or_else(startup_db_override_from_env);
+    let startup_db_override = db_env_override.map(Path::to_path_buf);
 
     if let Some(db_path) = startup_db_override.as_deref()
         && let Ok(beads_dir) = derive_beads_dir_from_db_path(db_path)
@@ -372,8 +420,13 @@ fn discover_beads_dir_with_cli_from(
         );
     }
 
-    discover_beads_dir_with_env(start, beads_dir_env_override).map_err(
-        |err| match (
+    discover_beads_dir_with_env_and_ceiling(
+        start,
+        beads_dir_env_override,
+        discovery_ceiling,
+    )
+    .map_err(|err| {
+        match (
             err,
             explicit_external_cli_db.or(startup_db_override.as_deref()),
         ) {
@@ -385,8 +438,8 @@ fn discover_beads_dir_with_cli_from(
                 source: Box::new(BeadsError::NotInitialized),
             },
             (err, _) => err,
-        },
-    )
+        }
+    })
 }
 
 fn discover_beads_dir_candidate_with_cli_from(
@@ -409,9 +462,7 @@ fn discover_beads_dir_candidate_with_cli_from(
         );
     }
 
-    let startup_db_override = db_env_override
-        .map(Path::to_path_buf)
-        .or_else(startup_db_override_from_env);
+    let startup_db_override = db_env_override.map(Path::to_path_buf);
 
     if let Some(db_path) = startup_db_override.as_deref()
         && let Ok(beads_dir) = derive_beads_dir_from_db_path(db_path)
@@ -446,6 +497,13 @@ fn startup_db_override_from_env() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn beads_dir_override_from_env() -> Option<PathBuf> {
+    env::var("BEADS_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
 }
 
 /// Extract the `.beads/` directory from a database path.
@@ -1064,6 +1122,7 @@ fn rebuild_with_tombstone_preservation(
     allow_external_jsonl: bool,
 ) -> Result<SqliteStorage> {
     let preserved_tombstones = preserved_unflushed_tombstones(&storage, &paths.jsonl_path);
+    let preserved_dirty_issues = preserved_unflushed_dirty_issues(&storage, &paths.jsonl_path);
     drop(storage);
     let mut storage = rebuild_database_from_jsonl(
         beads_dir,
@@ -1073,6 +1132,7 @@ fn rebuild_with_tombstone_preservation(
         allow_external_jsonl,
     )?;
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
+    restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
     Ok(storage)
 }
 
@@ -1133,6 +1193,35 @@ fn preserved_unflushed_tombstones(
         JsonlTombstoneFilter::default()
     };
     tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
+}
+
+/// Snapshot local dirty (unflushed) issues that would otherwise be dropped by a
+/// JSONL rebuild, filtered so only issues newer than — or absent from — the
+/// JSONL survive (#394). Same fully best-effort posture as
+/// `preserved_unflushed_tombstones`: never fails the rebuild.
+fn preserved_unflushed_dirty_issues(
+    storage: &SqliteStorage,
+    jsonl_path: &Path,
+) -> Vec<PreservedTombstone> {
+    let snapshot = snapshot_dirty_issues(storage);
+    if snapshot.is_empty() {
+        return snapshot;
+    }
+    let jsonl_filter = if jsonl_path.is_file() {
+        match scan_jsonl_for_tombstone_filter(jsonl_path) {
+            Ok(filter) => filter,
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "Could not scan JSONL for dirty-issue filter during startup auto-rebuild; preserving all snapshotted dirty issues and letting the rebuild surface the JSONL error"
+                );
+                JsonlTombstoneFilter::default()
+            }
+        }
+    } else {
+        JsonlTombstoneFilter::default()
+    };
+    dirty_issues_missing_or_newer_than_jsonl(snapshot, &jsonl_filter)
 }
 
 pub(crate) fn repair_database_from_jsonl(
@@ -5038,7 +5127,8 @@ labels:
         let temp = TempDir::new().expect("tempdir");
         // No .beads directory created
 
-        let result = discover_beads_dir(Some(temp.path()));
+        let result =
+            discover_beads_dir_with_env_and_ceiling(Some(temp.path()), None, Some(temp.path()));
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BeadsError::NotInitialized));
     }
@@ -5208,7 +5298,7 @@ labels:
         fs::create_dir_all(&start).expect("create nested dir");
 
         let db_override = temp.path().join("cache").join("custom.db");
-        let err = discover_beads_dir_with_cli_from(
+        let err = discover_beads_dir_with_cli_from_and_ceiling(
             Some(&start),
             &CliOverrides {
                 db: Some(db_override.clone()),
@@ -5216,6 +5306,7 @@ labels:
             },
             None,
             None,
+            Some(temp.path()),
         )
         .expect_err("external cli db without workspace should error");
 
@@ -5234,11 +5325,12 @@ labels:
         let start = temp.path().join("nested").join("dir");
         fs::create_dir_all(&start).expect("create nested dir");
 
-        let err = discover_beads_dir_with_cli_from(
+        let err = discover_beads_dir_with_cli_from_and_ceiling(
             Some(&start),
             &CliOverrides::default(),
             None,
             Some(Path::new("/tmp/not-a-beads-db")),
+            Some(temp.path()),
         )
         .expect_err("external env db without workspace should error");
         assert!(matches!(err, BeadsError::WithContext { .. }));

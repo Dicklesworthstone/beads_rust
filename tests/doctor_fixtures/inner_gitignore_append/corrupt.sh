@@ -3,12 +3,9 @@
 # FM: fm-configs-gitignore-leaking-beads (P2, inner subset)
 #
 # Initialises a workspace, replaces .beads/.gitignore with a hand-
-# written file that includes an operator-custom line and only ONE of
-# the two canonical patterns (`*.tmp` present, `.write.lock` missing).
-# Doctor's `gitignore.beads_inner_present` check should fire warn;
-# `--repair` should append the missing canonical pattern via
-# Op::AppendFile while preserving every existing line; `doctor undo`
-# should byte-restore the incomplete state.
+# written file that includes an operator-custom line and a broad `*.lock`
+# rule that covers `.write.lock`, but omits `*.tmp`. Doctor should append only
+# the missing temp-file rule while preserving every existing line.
 
 set -euo pipefail
 target_dir="${1:?usage: corrupt.sh <target_dir>}"
@@ -30,7 +27,7 @@ sha256sum .beads/issues.jsonl | awk '{print $1}' > .fixture_jsonl_pre_sha256
 cat > .beads/.gitignore <<'GITIGNORE'
 # operator-custom rule
 local-cache/
-*.tmp
+*.lock
 GITIGNORE
 
 # Capture the incomplete bytes so post_undo can verify byte-

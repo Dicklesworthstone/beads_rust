@@ -6,43 +6,52 @@ stage="${2:?usage: assert.sh <target_dir> <stage>}"
 tool_bin="${TOOL_BIN:-br}"
 cd "$target_dir"
 
-# Force the stale branch by overriding the staleness threshold to 0.
-# Any non-future mtime is then "older than threshold" → warn.
-export BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0
+assert_lock_identity_preserved() {
+  [ -f .fixture_lock_identity ] || {
+    echo "ASSERT FAIL[$stage]: missing baseline lock identity" >&2
+    exit 1
+  }
+  expected_identity=$(cat .fixture_lock_identity)
+  actual_identity=$(stat -c '%d:%i' .beads/.write.lock)
+  if [ "$actual_identity" != "$expected_identity" ]; then
+    echo "ASSERT FAIL[$stage]: lock identity changed $expected_identity -> $actual_identity" >&2
+    exit 1
+  fi
+}
 
 case "$stage" in
   detect)
-    out=$("$tool_bin" doctor --json 2>/dev/null) || true
+    assert_lock_identity_preserved
+    set +e
+    out=$("$tool_bin" doctor --json 2>/dev/null)
+    doctor_rc=$?
+    set -e
+    if [ "$doctor_rc" -ne 0 ]; then
+      echo "ASSERT FAIL[$stage]: healthy persistent inode made doctor exit $doctor_rc" >&2
+      echo "$out" >&2
+      exit 1
+    fi
+    assert_lock_identity_preserved
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | select(.status == "warn" or .status == "error")
+      | select(.status == "ok")
+      | select(.details.reason == "persistent_advisory_inode")
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: write_lock not flagged" >&2
+      echo "ASSERT FAIL[$stage]: persistent lock inode was not classified healthy" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock")' >&2
       exit 1
     }
-    # reason must be stale_mtime.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | .details.reason == "stale_mtime"
+      | (.details.recommended_fix == null)
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: details.reason != stale_mtime" >&2
+      echo "ASSERT FAIL[$stage]: healthy inode exposed a destructive recommendation" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock") | .details' >&2
-      exit 1
-    }
-    # recommended_fix must include the .stale-<ts> rename suffix.
-    echo "$out" | jq -e '
-      .checks[] | select(.name == "write_lock")
-      | .details.recommended_fix | test("\\.stale-")
-    ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: recommended_fix missing .stale- rename suffix" >&2
       exit 1
     }
     ;;
   post_repair)
-    # Detect-only: .write.lock MUST still be present byte-identically
-    # (doctor must NEVER auto-remove). The fact that --repair completed
-    # without mutating it is the safety guarantee.
+    # The inode is not a finding and must remain untouched.
     [ -f .beads/.write.lock ] || {
       echo "ASSERT FAIL[$stage]: .write.lock vanished after --repair (unsafe; could corrupt a live writer)" >&2
       exit 1
@@ -51,10 +60,12 @@ case "$stage" in
       echo "ASSERT FAIL[$stage]: .write.lock became a symlink after --repair (unsafe)" >&2
       exit 1
     fi
+    assert_lock_identity_preserved
     ;;
   post_undo)
     [ -d .beads ] || { echo "ASSERT FAIL[$stage]: .beads gone after undo" >&2; exit 1; }
     [ -f .beads/.write.lock ] || { echo "ASSERT FAIL[$stage]: .write.lock gone after undo" >&2; exit 1; }
+    assert_lock_identity_preserved
     ;;
   *)
     echo "unknown stage: $stage" >&2

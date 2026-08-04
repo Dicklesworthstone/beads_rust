@@ -785,9 +785,18 @@ pub struct AgentsArgs {
 /// Returns an error if file operations fail.
 pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     validate_action_selection(args)?;
-
     let work_dir = std::env::current_dir()?;
-    let detection = detect_agent_file_in_project(&work_dir);
+    execute_validated_from(args, ctx, &work_dir)
+}
+
+#[cfg(test)]
+fn execute_from(args: &AgentsArgs, ctx: &OutputContext, work_dir: &Path) -> Result<()> {
+    validate_action_selection(args)?;
+    execute_validated_from(args, ctx, work_dir)
+}
+
+fn execute_validated_from(args: &AgentsArgs, ctx: &OutputContext, work_dir: &Path) -> Result<()> {
+    let detection = detect_agent_file_in_project(work_dir);
 
     // Default to check mode if no action specified
     let is_check = !args.add && !args.remove && !args.update;
@@ -796,28 +805,28 @@ pub fn execute(args: &AgentsArgs, ctx: &OutputContext) -> Result<()> {
     // from the current state so the user sees what *would* happen.
     if args.dry_run && is_check {
         if ctx.is_json() {
-            return execute_json(&detection, args, ctx);
+            return execute_json(&detection, args, work_dir, ctx);
         }
-        return execute_dry_run_inferred(&detection, &work_dir, ctx);
+        return execute_dry_run_inferred(&detection, work_dir, ctx);
     }
 
     if is_check || args.check {
         if ctx.is_json() {
-            return execute_json(&detection, args, ctx);
+            return execute_json(&detection, args, work_dir, ctx);
         }
-        return execute_check(&detection, &work_dir, ctx);
+        return execute_check(&detection, work_dir, ctx);
     }
 
     if args.add {
-        return execute_add(&detection, &work_dir, args.dry_run, args.force, ctx);
+        return execute_add(&detection, work_dir, args.dry_run, args.force, ctx);
     }
 
     if args.remove {
-        return execute_remove(&detection, &work_dir, args.dry_run, args.force, ctx);
+        return execute_remove(&detection, work_dir, args.dry_run, args.force, ctx);
     }
 
     if args.update {
-        return execute_update(&detection, &work_dir, args.dry_run, args.force, ctx);
+        return execute_update(&detection, work_dir, args.dry_run, args.force, ctx);
     }
 
     Ok(())
@@ -941,16 +950,16 @@ fn execute_dry_run_inferred(
 fn execute_json(
     detection: &AgentFileDetection,
     args: &AgentsArgs,
+    work_dir: &Path,
     ctx: &OutputContext,
 ) -> Result<()> {
     if args.dry_run {
         let would_action = inferred_dry_run_action(detection);
 
-        let work_dir = std::env::current_dir().unwrap_or_default();
         let target_path = if detection.found() {
             detection.file_path.clone()
         } else {
-            Some(get_preferred_agent_file_path(&work_dir))
+            Some(get_preferred_agent_file_path(work_dir))
         };
 
         let output = serde_json::json!({
@@ -1654,7 +1663,6 @@ fn render_update_success_rich(
 mod tests {
     use super::*;
     use crate::output::OutputContext;
-    use std::env;
 
     use tempfile::TempDir;
 
@@ -1663,22 +1671,10 @@ mod tests {
         assert!(message.is_empty(), "unexpected error: {message}");
     }
 
-    struct DirGuard {
-        previous: PathBuf,
-    }
-
-    impl DirGuard {
-        fn new(target: &Path) -> Self {
-            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-            env::set_current_dir(target).expect("set current dir");
-            Self { previous }
-        }
-    }
-
-    impl Drop for DirGuard {
-        fn drop(&mut self) {
-            let _ = env::set_current_dir(&self.previous);
-        }
+    fn isolated_agent_project() -> TempDir {
+        let temp_dir = TempDir::new().expect("create isolated agent project");
+        fs::create_dir(temp_dir.path().join(".git")).expect("mark isolated project root");
+        temp_dir
     }
 
     #[test]
@@ -2004,18 +2000,17 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_force_creates_file() {
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
+        let temp_dir = isolated_agent_project();
         let ctx = OutputContext::from_flags(true, false, true);
 
-        execute(
+        execute_from(
             &AgentsArgs {
                 add: true,
                 force: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect("execute add in json mode");
 
@@ -2028,9 +2023,7 @@ mod tests {
 
     #[test]
     fn test_execute_remove_strips_legacy_and_current_blurbs() {
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
+        let temp_dir = isolated_agent_project();
         let legacy_blurb =
             "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
         let agents_path = temp_dir.path().join("AGENTS.md");
@@ -2041,13 +2034,14 @@ mod tests {
         .expect("write AGENTS.md with both blurb formats");
         let ctx = OutputContext::from_flags(true, false, true);
 
-        execute(
+        execute_from(
             &AgentsArgs {
                 remove: true,
                 force: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect("remove both agent blurb formats");
 
@@ -2152,21 +2146,20 @@ mod tests {
     fn test_execute_json_add_refuses_dangling_agents_symlink() {
         use std::os::unix::fs::symlink;
 
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = isolated_agent_project();
         let outside_target = temp_dir.path().join("outside-agents.md");
         let agents_path = temp_dir.path().join("AGENTS.md");
         symlink(&outside_target, &agents_path).unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
 
-        let err = execute(
+        let err = execute_from(
             &AgentsArgs {
                 add: true,
                 force: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect_err("json add should reject symlinked AGENTS.md");
 
@@ -2189,17 +2182,16 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_requires_force() {
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
+        let temp_dir = isolated_agent_project();
         let ctx = OutputContext::from_flags(true, false, true);
 
-        let err = execute(
+        let err = execute_from(
             &AgentsArgs {
                 add: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect_err("json add without force should fail");
 
@@ -2214,18 +2206,17 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_dry_run_does_not_require_force() {
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
+        let temp_dir = isolated_agent_project();
         let ctx = OutputContext::from_flags(true, false, true);
 
-        execute(
+        execute_from(
             &AgentsArgs {
                 add: true,
                 dry_run: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect("json add dry-run should succeed without force");
 
@@ -2237,18 +2228,17 @@ mod tests {
 
     #[test]
     fn test_execute_json_remove_dry_run_without_file_errors() {
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
+        let temp_dir = isolated_agent_project();
         let ctx = OutputContext::from_flags(true, false, true);
 
-        let err = execute(
+        let err = execute_from(
             &AgentsArgs {
                 remove: true,
                 dry_run: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect_err("json remove dry-run without file should error");
 
@@ -2263,18 +2253,17 @@ mod tests {
 
     #[test]
     fn test_execute_json_update_dry_run_without_file_errors() {
-        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
-        let temp_dir = TempDir::new().unwrap();
-        let _guard = DirGuard::new(temp_dir.path());
+        let temp_dir = isolated_agent_project();
         let ctx = OutputContext::from_flags(true, false, true);
 
-        let err = execute(
+        let err = execute_from(
             &AgentsArgs {
                 update: true,
                 dry_run: true,
                 ..Default::default()
             },
             &ctx,
+            temp_dir.path(),
         )
         .expect_err("json update dry-run without file should error");
 

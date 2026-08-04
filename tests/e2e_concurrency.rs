@@ -35,6 +35,7 @@ struct BrResult {
     stdout: String,
     stderr: String,
     success: bool,
+    exit_code: Option<i32>,
     _duration: Duration,
 }
 
@@ -174,6 +175,7 @@ where
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         success: output.status.success(),
+        exit_code: output.status.code(),
         _duration: duration,
     }
 }
@@ -623,6 +625,175 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
         after.success,
         "workspace should accept writes after lock release: stdout={} stderr={}",
         after.stdout, after.stderr
+    );
+}
+
+/// Flat doctor surfaces must classify a genuinely held advisory lock before
+/// live inspection, without using inode age or recommending inode replacement.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::incompatible_msrv)]
+fn e2e_doctor_reports_live_write_lock_without_mutating_workspace() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _log = common::test_log("e2e_doctor_reports_live_write_lock_without_mutating_workspace");
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let root = temp_dir.path().to_path_buf();
+
+    let init = run_br_in_dir(&root, ["init"]);
+    assert!(init.success, "init failed: {}", init.stderr);
+    let seed = run_br_in_dir(&root, ["create", "Lock evidence seed", "--json"]);
+    assert!(seed.success, "seed failed: {}", seed.stderr);
+
+    let lock_path = root.join(".beads/.write.lock");
+    let db_path = root.join(".beads/beads.db");
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    let db_before = fs::read(&db_path).expect("read database before contention");
+    let jsonl_before = fs::read(&jsonl_path).expect("read JSONL before contention");
+    let inode_before = fs::metadata(&lock_path).expect("stat lock").ino();
+
+    let write_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open .write.lock");
+    write_lock.lock().expect("hold .write.lock");
+
+    for (args, robot_triage) in [
+        (vec!["--lock-timeout", "0", "doctor", "--json"], false),
+        (
+            vec!["--lock-timeout", "0", "doctor", "--robot-triage"],
+            true,
+        ),
+        (
+            vec![
+                "--lock-timeout",
+                "0",
+                "doctor",
+                "--robot-triage",
+                "--repair",
+            ],
+            true,
+        ),
+        (
+            vec![
+                "--lock-timeout",
+                "0",
+                "doctor",
+                "--robot-triage",
+                "--repair-indexes",
+            ],
+            true,
+        ),
+    ] {
+        let doctor = run_br_in_dir(&root, args);
+        assert!(
+            !doctor.success,
+            "doctor must not inspect through a live owner: stdout={} stderr={}",
+            doctor.stdout, doctor.stderr
+        );
+        assert_eq!(
+            doctor.exit_code,
+            Some(5),
+            "process status must agree with the typed payload: stdout={} stderr={}",
+            doctor.stdout,
+            doctor.stderr
+        );
+        let payload: serde_json::Value =
+            serde_json::from_str(&doctor.stdout).expect("typed doctor startup JSON");
+        assert_eq!(payload["exit_code"], 5, "{payload}");
+        assert_eq!(payload["code"], "concurrency_lost", "{payload}");
+        assert_eq!(payload["inspection_state"], "not_started", "{payload}");
+        assert!(
+            payload.get("workspace_health").is_none(),
+            "uninspected workspace must not receive a health value: {payload}"
+        );
+        if robot_triage {
+            assert_eq!(
+                payload["schema_version"], "br.doctor.triage.v1",
+                "{payload}"
+            );
+            for key in [
+                "summary",
+                "findings",
+                "actions_planned",
+                "recommended_command",
+                "capabilities_url",
+                "robot_docs_command",
+                "quick_ref",
+            ] {
+                assert!(
+                    payload.get(key).is_some(),
+                    "robot triage contract is missing {key}: {payload}"
+                );
+            }
+            assert_eq!(payload["quick_ref"]["healthy"], 0, "{payload}");
+            assert_eq!(payload["quick_ref"]["warn"], 1, "{payload}");
+            assert_eq!(payload["quick_ref"]["error"], 0, "{payload}");
+            assert_eq!(
+                payload["findings"][0]["id"], "fm-concurrency_primitives-orphaned-write-lock",
+                "{payload}"
+            );
+            assert_eq!(payload["reason"], "live_owner", "{payload}");
+        } else {
+            assert_eq!(payload["checks"][0]["name"], "write_lock", "{payload}");
+            assert_eq!(
+                payload["checks"][0]["details"]["reason"], "live_owner",
+                "{payload}"
+            );
+            assert_eq!(
+                payload["checks"][0]["details"]["finding_id"],
+                "fm-concurrency_primitives-orphaned-write-lock",
+                "{payload}"
+            );
+            assert!(
+                payload["checks"][0]["details"]["remediation"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("do not move or delete")),
+                "{payload}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&lock_path)
+                .expect("stat lock after doctor")
+                .ino(),
+            inode_before,
+            "doctor must not replace the lock inode"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read database after contention"),
+            db_before,
+            "doctor must not inspect or mutate the database after lock refusal"
+        );
+        assert_eq!(
+            fs::read(&jsonl_path).expect("read JSONL after contention"),
+            jsonl_before,
+            "doctor must not mutate JSONL after lock refusal"
+        );
+    }
+
+    drop(write_lock);
+    let recovery = run_br_in_dir(&root, ["doctor", "--json"]);
+    assert!(
+        matches!(recovery.exit_code, Some(0 | 1)),
+        "doctor should resume inspection after owner release without a hard failure: \
+         exit={:?} stdout={} stderr={}",
+        recovery.exit_code,
+        recovery.stdout,
+        recovery.stderr
+    );
+    let payload: serde_json::Value =
+        serde_json::from_str(&recovery.stdout).expect("recovery doctor JSON");
+    let lock_check = payload["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["name"] == "write_lock"))
+        .expect("write_lock check after recovery");
+    assert_eq!(lock_check["status"], "ok", "{lock_check}");
+    assert_eq!(
+        lock_check["details"]["reason"], "persistent_advisory_inode",
+        "{lock_check}"
     );
 }
 

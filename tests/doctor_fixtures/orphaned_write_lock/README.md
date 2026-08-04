@@ -2,24 +2,21 @@
 
 - **FM**: `fm-concurrency_primitives-orphaned-write-lock` (P1)
 - **Subsystem**: concurrency_primitives
-- **Detect**: `write_lock` check goes to `warn` when `.beads/.write.lock`
-  exists as a regular file whose mtime is older than the staleness
-  threshold (`BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS`, default 300s).
-  Surfaces the path, mtime as RFC3339, age in seconds, the
-  threshold value, and the canonical operator-fix command (a
-  manual `mv .write.lock .write.lock.stale-<ISO8601>` rename
-  gated on operator-confirming no live `br` is in the workspace).
-- **Repair contract**: SAFETY — detect-only. The doctor NEVER
-  removes `.write.lock` automatically: touching a lock file
-  that a live process holds would corrupt that process's
-  locking discipline. Operator must verify, then move aside.
+- **Detect**: a regular `.beads/.write.lock` with an arbitrarily old mtime
+  remains `ok` with `details.reason == "persistent_advisory_inode"`.
+  The file is a stable lock target; ownership lives in the OS advisory lock,
+  not in inode age.
+- **Repair contract**: doctor never moves, removes, or rewrites the lock inode.
+  Moving it while a process owns the old inode would split writers across two
+  independent lock domains. The fixture records the device and inode after
+  planting the lock and verifies the same identity after detect, repair, and
+  undo.
 - **Round-trip**: N/A — no chokepointed mutation.
 - **Expected exit codes**:
-    - detect: 1
-    - repair: 0 or 2 (warning persists; no destructive action)
-    - undo: 0
+    - detect: 0
+    - repair: 0
+    - undo: 0 or 2 when no repair run exists
 
-This fixture uses `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0` to
-force the staleness branch on a freshly-planted lock file
-without needing `filetime`-style mtime manipulation (which
-would pull in a new dev-dependency).
+Live ownership is covered separately by the held-flock CLI test: flat doctor
+must return the typed `concurrency_lost` startup envelope without inspecting or
+mutating the workspace.

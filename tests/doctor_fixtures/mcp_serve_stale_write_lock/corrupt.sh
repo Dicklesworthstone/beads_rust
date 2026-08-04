@@ -2,9 +2,8 @@
 # Fixture: mcp_serve_stale_write_lock
 # FM: fm-agent_coordination-mcp-serve-stale-write-lock.
 #
-# Simulates a killed `br serve` owner by planting a stale regular write lock
-# and an orphan holder-pid sidecar. The live doctor detector intentionally
-# handles this through the general write_lock stale-mtime check.
+# Simulates a killed `br serve` owner by planting an old regular lock inode and
+# an orphan holder-pid sidecar. No process owns the advisory lock.
 
 set -euo pipefail
 
@@ -26,5 +25,6 @@ cd "$target_dir"
 printf '99999999\n' > .beads/.write.lock.holder.pid
 touch -d '2024-01-01T00:00:00Z' .beads/.write.lock
 touch -d '2024-01-01T00:00:00Z' .beads/.write.lock.holder.pid
+stat -c '%d:%i' .beads/.write.lock > .fixture_lock_identity
 
-echo "fixture corrupt.sh: planted stale .write.lock and orphan holder pid sidecar" >&2
+echo "fixture corrupt.sh: planted persistent .write.lock and orphan holder pid sidecar" >&2

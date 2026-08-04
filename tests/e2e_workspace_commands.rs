@@ -718,6 +718,114 @@ fn e2e_doctor_repair_preserves_unflushed_tombstones() {
 }
 
 #[test]
+fn e2e_doctor_repair_preserves_unflushed_dirty_issues() {
+    // Regression for #394: `doctor --repair` falls through to a JSONL rebuild
+    // when light repairs don't clear the report. That rebuild imports only
+    // what is in the JSONL, so a dirty (unflushed) live issue that never
+    // reached the JSONL would be silently dropped — surviving only in the
+    // pre-rebuild backup directory. The fix snapshots dirty issues from the
+    // pre-repair DB and restores them after the rebuild, mirroring the
+    // tombstone-preservation pattern.
+    let _log = common::test_log("e2e_doctor_repair_preserves_unflushed_dirty_issues");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // A flushed issue so the JSONL exists and is authoritative.
+    let keep = run_br(&workspace, ["create", "Keep"], "create_keep");
+    assert!(keep.status.success(), "create keep failed: {}", keep.stderr);
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    // A brand-new issue created WITHOUT flushing: it lives only in the DB
+    // (dirty) and is absent from the JSONL — exactly the export-debt window.
+    let dirty = run_br(
+        &workspace,
+        ["create", "Db only issue", "--no-auto-flush"],
+        "create_dirty",
+    );
+    assert!(
+        dirty.status.success(),
+        "create dirty failed: {}",
+        dirty.stderr
+    );
+    let dirty_id = dirty
+        .stdout
+        .lines()
+        .next()
+        .and_then(|line| {
+            line.strip_prefix("✓ ")
+                .unwrap_or(line)
+                .strip_prefix("Created ")
+                .and_then(|rest| rest.split(':').next())
+        })
+        .expect("parse dirty id")
+        .trim()
+        .to_string();
+
+    // Inject a recoverable anomaly that forces fall-through to the JSONL
+    // rebuild path (same trick as the tombstone doctor test).
+    let db_path = workspace.root.join(".beads").join("beads.db");
+    {
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open beads db for anomaly injection");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-a')")
+            .expect("insert duplicate config row a");
+        conn.execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'dup-b')")
+            .expect("insert duplicate config row b");
+    }
+
+    let repaired = run_br(&workspace, ["doctor", "--repair", "--json"], "doctor_repair");
+    assert!(
+        repaired.status.success(),
+        "doctor --repair failed: stderr={}",
+        repaired.stderr
+    );
+
+    let show = run_br(
+        &workspace,
+        ["show", &dirty_id, "--json"],
+        "show_after_repair",
+    );
+    assert!(
+        show.status.success(),
+        "the unflushed dirty issue must survive doctor --repair's JSONL rebuild, \
+         but `show` after repair failed: stdout='{}' stderr='{}'",
+        show.stdout,
+        show.stderr
+    );
+    let payload = extract_json_payload(&show.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("parse show json");
+    let record = if json.is_array() {
+        json.as_array().and_then(|a| a.first()).cloned()
+    } else {
+        Some(json.clone())
+    }
+    .expect("show should return the preserved dirty issue");
+    assert_eq!(
+        record["title"].as_str(),
+        Some("Db only issue"),
+        "the preserved dirty issue should retain its title, got `{:?}`",
+        record["title"]
+    );
+
+    // It must remain dirty so the next flush exports it to the JSONL.
+    let flush_after = run_br(&workspace, ["sync", "--flush-only"], "sync_flush_after");
+    assert!(
+        flush_after.status.success(),
+        "flush after repair failed: {}",
+        flush_after.stderr
+    );
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let jsonl = fs::read_to_string(&jsonl_path).expect("read issues.jsonl after repair flush");
+    assert!(
+        jsonl.contains(&dirty_id),
+        "the restored dirty issue should be re-marked dirty and exported on the next flush"
+    );
+}
+
+#[test]
 fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
     let _log = common::test_log("e2e_doctor_repair_json_rebuilds_when_db_is_missing");
     let workspace = BrWorkspace::new();

@@ -15,9 +15,11 @@ use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
 use crate::sync::{
     JsonlTombstoneFilter, PathValidation, PreservedTombstone, compute_staleness,
+    dirty_issues_missing_or_newer_than_jsonl, restore_dirty_issues_after_rebuild,
     restore_tombstones_after_rebuild, scan_conflict_markers, scan_jsonl_for_tombstone_filter,
-    snapshot_tombstones, tombstones_missing_from_jsonl_tombstones, validate_jsonl_issue_records,
-    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
+    snapshot_dirty_issues, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    validate_jsonl_issue_records, validate_no_git_path, validate_sync_path,
+    validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
 use fsqlite::{Connection, Row};
@@ -2277,6 +2279,11 @@ fn repair_database_from_jsonl_after_preflight(
     // `br sync --import-only --rebuild` preserves via snapshot/restore), since the
     // rebuild only replays what's in the JSONL.
     let preserved_tombstones = preserved_tombstones_for_doctor_rebuild(db_path, jsonl_path);
+    // Same hazard as tombstones for live issues with export debt: a JSONL
+    // rebuild replays only what is in the JSONL, so any dirty (unflushed) issue
+    // whose latest state never reached the JSONL would be silently dropped
+    // (#394). Snapshot and restore them the same best-effort way.
+    let preserved_dirty_issues = preserved_dirty_issues_for_doctor_rebuild(db_path, jsonl_path);
 
     let (mut storage, import_result, verified_backups) = config::repair_database_from_jsonl(
         beads_dir,
@@ -2289,6 +2296,7 @@ fn repair_database_from_jsonl_after_preflight(
     )?;
 
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
+    restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
 
     let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
 
@@ -2507,6 +2515,52 @@ fn preserved_tombstones_for_doctor_rebuild(
         JsonlTombstoneFilter::default()
     };
     tombstones_missing_from_jsonl_tombstones(snapshot, &jsonl_filter)
+}
+
+/// Mirror of `preserved_tombstones_for_doctor_rebuild` for dirty (unflushed)
+/// live issues (#394). Snapshots dirty issues from the pre-repair DB and
+/// filters them against the JSONL so only issues newer than — or absent from —
+/// the JSONL survive the rebuild. Best-effort: returns an empty vector on any
+/// failure, and the rebuild proceeds regardless.
+fn preserved_dirty_issues_for_doctor_rebuild(
+    db_path: &Path,
+    jsonl_path: &Path,
+) -> Vec<PreservedTombstone> {
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let storage = match SqliteStorage::open(db_path) {
+        Ok(storage) => storage,
+        Err(err) => {
+            tracing::debug!(
+                db_path = %db_path.display(),
+                error = %err,
+                "Could not open DB for pre-repair dirty-issue snapshot; proceeding without preservation"
+            );
+            return Vec::new();
+        }
+    };
+    let snapshot = snapshot_dirty_issues(&storage);
+    drop(storage);
+    if snapshot.is_empty() {
+        return snapshot;
+    }
+    let jsonl_filter = if jsonl_path.is_file() {
+        match scan_jsonl_for_tombstone_filter(jsonl_path) {
+            Ok(filter) => filter,
+            Err(err) => {
+                tracing::debug!(
+                    jsonl_path = %jsonl_path.display(),
+                    error = %err,
+                    "Could not scan JSONL for dirty-issue filter during doctor --repair; preserving every snapshotted dirty issue and letting the rebuild surface the JSONL error"
+                );
+                JsonlTombstoneFilter::default()
+            }
+        }
+    } else {
+        JsonlTombstoneFilter::default()
+    };
+    dirty_issues_missing_or_newer_than_jsonl(snapshot, &jsonl_filter)
 }
 
 fn repair_recoverable_db_state(
@@ -4475,8 +4529,245 @@ fn fix_jsonl_world_writable_if_warned(
 /// Auto-fixable for the missing/incomplete regular-file cases by
 /// appending the canonical patterns. Symlinked ignore files remain
 /// operator-managed because replacing them would stomp intent.
+const INNER_GITIGNORE_EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
+
+fn normalize_gitignore_line(raw_line: &str) -> &str {
+    let mut line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+    while let Some(without_space) = line.strip_suffix(' ') {
+        let escaping_backslashes = without_space
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if !escaping_backslashes.is_multiple_of(2) {
+            break;
+        }
+        line = without_space;
+    }
+    line
+}
+
+fn canonical_gitignore_rule_is_authoritative(contents: &str, canonical: &str) -> bool {
+    let mut authoritative = false;
+    // The inner ignore file's own generated contract forbids negations. Fail
+    // closed if a later negation could weaken the class rule; appending the
+    // canonical rule again restores its precedence without deleting intent.
+    for line in contents.lines().map(normalize_gitignore_line) {
+        if line == canonical {
+            authoritative = true;
+        } else if authoritative
+            && line
+                .strip_prefix('!')
+                .is_some_and(|pattern| !pattern.is_empty())
+        {
+            authoritative = false;
+        }
+    }
+    authoritative
+}
+
+fn missing_inner_gitignore_patterns(contents: &str) -> Vec<&'static str> {
+    INNER_GITIGNORE_EXPECTED_PATTERNS
+        .iter()
+        .copied()
+        .filter(|expected| match *expected {
+            // `.write.lock` is a concrete path. A broader rule such as
+            // `*.lock` protects it just as effectively, and a later negation
+            // can intentionally expose it again.
+            ".write.lock" => !gitignore_effectively_ignores_file(contents, ".write.lock"),
+            // Temp files are a class-wide contract: retain the canonical
+            // class rule and also prove a later negation did not cancel it.
+            "*.tmp" => {
+                !canonical_gitignore_rule_is_authoritative(contents, "*.tmp")
+                    || !gitignore_effectively_ignores_file(contents, ".br-doctor-probe.tmp")
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// Evaluate the conservative, filename-only subset of gitignore glob syntax
+/// needed by the inner workspace contract. Unsupported constructs fail closed:
+/// doctor may ask for a redundant canonical rule, but must never claim a file
+/// is ignored when Git would expose it.
+fn gitignore_effectively_ignores_file(contents: &str, file_name: &str) -> bool {
+    let mut ignored = false;
+    for raw_line in contents.lines() {
+        // Leading whitespace and trailing tabs/non-ASCII whitespace are
+        // literal. Git discards only unescaped trailing ASCII spaces.
+        let line = normalize_gitignore_line(raw_line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (negated, pattern) = match line.strip_prefix('!') {
+            Some(pattern) => (true, pattern),
+            None => (false, line),
+        };
+        if gitignore_file_pattern_matches(pattern, file_name) {
+            ignored = !negated;
+        }
+    }
+    ignored
+}
+
+fn gitignore_file_pattern_matches(pattern: &str, file_name: &str) -> bool {
+    let mut pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+    while let Some(rest) = pattern.strip_prefix("**/") {
+        pattern = rest;
+    }
+    if pattern.is_empty() || pattern.ends_with('/') || pattern.contains('/') {
+        return false;
+    }
+    wildcard_matches(pattern.as_bytes(), file_name.as_bytes())
+}
+
+enum GitignoreGlobToken {
+    AnySequence,
+    AnyByte,
+    Literal(u8),
+    Class {
+        negated: bool,
+        ranges: Vec<(u8, u8)>,
+    },
+}
+
+fn wildcard_matches(pattern: &[u8], value: &[u8]) -> bool {
+    let tokens = parse_gitignore_glob(pattern);
+    let mut previous = vec![false; value.len() + 1];
+    previous[0] = true;
+    for token in tokens {
+        let mut current = vec![false; value.len() + 1];
+        match token {
+            GitignoreGlobToken::AnySequence => {
+                current[0] = previous[0];
+                for index in 1..=value.len() {
+                    current[index] = previous[index] || current[index - 1];
+                }
+            }
+            GitignoreGlobToken::AnyByte => {
+                current[1..=value.len()].copy_from_slice(&previous[..value.len()]);
+            }
+            GitignoreGlobToken::Literal(expected) => {
+                for index in 1..=value.len() {
+                    current[index] = previous[index - 1] && value[index - 1] == expected;
+                }
+            }
+            GitignoreGlobToken::Class { negated, ranges } => {
+                for index in 1..=value.len() {
+                    let matched = ranges
+                        .iter()
+                        .any(|(start, end)| (*start..=*end).contains(&value[index - 1]));
+                    current[index] = previous[index - 1] && (matched != negated);
+                }
+            }
+        }
+        previous = current;
+    }
+    previous[value.len()]
+}
+
+fn parse_gitignore_glob(pattern: &[u8]) -> Vec<GitignoreGlobToken> {
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < pattern.len() {
+        match pattern[index] {
+            b'*' => {
+                if !matches!(tokens.last(), Some(GitignoreGlobToken::AnySequence)) {
+                    tokens.push(GitignoreGlobToken::AnySequence);
+                }
+                index += 1;
+            }
+            b'?' => {
+                tokens.push(GitignoreGlobToken::AnyByte);
+                index += 1;
+            }
+            b'\\' if index + 1 < pattern.len() => {
+                tokens.push(GitignoreGlobToken::Literal(pattern[index + 1]));
+                index += 2;
+            }
+            b'[' => {
+                if let Some((token, next_index)) = parse_gitignore_character_class(pattern, index) {
+                    tokens.push(token);
+                    index = next_index;
+                } else {
+                    tokens.push(GitignoreGlobToken::Literal(b'['));
+                    index += 1;
+                }
+            }
+            byte => {
+                tokens.push(GitignoreGlobToken::Literal(byte));
+                index += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn parse_gitignore_character_class(
+    pattern: &[u8],
+    start: usize,
+) -> Option<(GitignoreGlobToken, usize)> {
+    let mut end = start + 1;
+    if matches!(pattern.get(end), Some(b'!' | b'^')) {
+        end += 1;
+    }
+    if pattern.get(end) == Some(&b']') {
+        end += 1;
+    }
+    while end < pattern.len() {
+        if pattern[end] == b'\\' && end + 1 < pattern.len() {
+            end += 2;
+        } else if pattern[end] == b']' {
+            break;
+        } else {
+            end += 1;
+        }
+    }
+    if end >= pattern.len() {
+        return None;
+    }
+
+    let mut index = start + 1;
+    let negated = matches!(pattern.get(index), Some(b'!' | b'^'));
+    if negated {
+        index += 1;
+    }
+    let mut ranges = Vec::new();
+    while index < end {
+        let (first, after_first) = parse_gitignore_class_atom(pattern, index, end)?;
+        if after_first < end && pattern[after_first] == b'-' && after_first + 1 < end {
+            let (last, after_last) = parse_gitignore_class_atom(pattern, after_first + 1, end)?;
+            if first > last {
+                // Git does not normalize reversed ranges. Treat the class as
+                // unsupported so the detector fails closed.
+                return None;
+            }
+            ranges.push((first, last));
+            index = after_last;
+        } else {
+            ranges.push((first, first));
+            index = after_first;
+        }
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    Some((GitignoreGlobToken::Class { negated, ranges }, end + 1))
+}
+
+fn parse_gitignore_class_atom(pattern: &[u8], index: usize, end: usize) -> Option<(u8, usize)> {
+    if index >= end {
+        return None;
+    }
+    if pattern[index] == b'\\' && index + 1 < end {
+        Some((pattern[index + 1], index + 2))
+    } else {
+        Some((pattern[index], index + 1))
+    }
+}
+
 fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
     let path = beads_dir.join(".gitignore");
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
@@ -4492,11 +4783,11 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
                 Some(serde_json::json!({
                     "path": path.display().to_string(),
                     "kind": "missing",
-                    "expected_patterns": EXPECTED_PATTERNS,
+                    "expected_patterns": INNER_GITIGNORE_EXPECTED_PATTERNS,
                     "remediation": format!(
                         "Create {} with at least: {}",
                         path.display(),
-                        EXPECTED_PATTERNS.join(", ")
+                        INNER_GITIGNORE_EXPECTED_PATTERNS.join(", ")
                     ),
                 })),
             );
@@ -4527,11 +4818,11 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
             Some(serde_json::json!({
                 "path": path.display().to_string(),
                 "kind": "symlink",
-                "expected_patterns": EXPECTED_PATTERNS,
+                "expected_patterns": INNER_GITIGNORE_EXPECTED_PATTERNS,
                 "remediation": format!(
                     "Replace {} with a regular file containing at least: {}",
                     path.display(),
-                    EXPECTED_PATTERNS.join(", ")
+                    INNER_GITIGNORE_EXPECTED_PATTERNS.join(", ")
                 ),
             })),
         );
@@ -4549,11 +4840,7 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
         );
         return;
     };
-    let missing: Vec<&str> = EXPECTED_PATTERNS
-        .iter()
-        .copied()
-        .filter(|needle| !contents.lines().map(str::trim).any(|line| line == *needle))
-        .collect();
+    let missing = missing_inner_gitignore_patterns(&contents);
     if missing.is_empty() {
         push_check(
             checks,
@@ -4605,7 +4892,6 @@ fn fix_inner_gitignore_if_warned(
     ctx: &OutputContext,
     session: Option<&mut DoctorRepairSession>,
 ) -> bool {
-    const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
     let has_warning = report
         .checks
         .iter()
@@ -4631,11 +4917,7 @@ fn fix_inner_gitignore_if_warned(
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(_) => return false,
     };
-    let missing: Vec<&str> = EXPECTED_PATTERNS
-        .iter()
-        .copied()
-        .filter(|needle| !existing.lines().map(str::trim).any(|line| line == *needle))
-        .collect();
+    let missing = missing_inner_gitignore_patterns(&existing);
     if missing.is_empty() {
         return false;
     }
@@ -8020,45 +8302,18 @@ fn parse_cargo_toml_package_field(body: &str, field: &str) -> Option<String> {
     None
 }
 
-/// Default staleness threshold for `.beads/.write.lock`. A lock file
-/// whose mtime is older than this with no live `br` process around is
-/// almost certainly an orphan from a crashed writer. Operator can
-/// override via `BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS`.
+/// Report the persistent advisory-lock inode's on-disk shape.
 ///
-/// 300 seconds is generous: the longest legitimate write transactions
-/// (DB rebuild from JSONL, full VACUUM) complete in well under a
-/// minute on the largest real-world workspaces.
-const DEFAULT_STALE_LOCK_THRESHOLD_SECS: u64 = 300;
-
-/// Detector: `.beads/.write.lock` exists as a regular file whose mtime
-/// is older than the staleness threshold. Pass-1 archaeology filed
-/// `fm-concurrency_primitives-orphaned-write-lock` (P1): a crashed
-/// `br` writer (kill -9, OOM, panic-abort in release mode) leaves
-/// the advisory flock file on disk, wedging subsequent writers until
-/// an operator removes it manually.
+/// `.write.lock` is intentionally opened with `create(true)` and
+/// `truncate(false)`. Its inode persists after every successful command, while
+/// ownership exists only in the operating-system lock associated with an open
+/// file description. Process exit releases that lock, including after SIGKILL;
+/// the inode's mtime therefore says nothing about ownership or staleness.
 ///
-/// Detect-only. The doctor NEVER removes `.write.lock` automatically:
-/// touching a lock file that a live process holds would corrupt that
-/// process's locking discipline. The operator must verify no `br`
-/// process is active in this workspace, then move the file aside
-/// themselves (the canonical fix is `mv .beads/.write.lock
-/// .beads/.write.lock.stale-<ISO8601>`).
-///
-/// Conservative-by-design:
-/// - Only mtime-based staleness check. We do NOT introspect
-///   /proc/locks (Linux-only) or spawn lsof (would change behavior
-///   under heredoc-style test isolation).
-/// - Outside-source-tree mtime checks rely on `SystemTime::now()` and
-///   `metadata.modified()` — both Unix + Windows + macOS safe.
-/// - If the threshold env var is set to a non-parseable value we
-///   silently fall back to the default rather than panic.
-/// - Missing file = Ok (no lock, no contention).
-///
-/// Status mapping:
-/// - `ok` — file missing OR exists but mtime is within the threshold.
-/// - `warn` — file exists, is a regular file, and mtime is older than
-///   the threshold. Surfaces the path, mtime as RFC3339, age in
-///   seconds, threshold, and the canonical operator-fix command.
+/// Full doctor inspection reaches this detector only after startup acquired
+/// the workspace lock. Actual contention is reported at startup, before any
+/// live inspection. Never recommend moving the inode: doing so while a writer
+/// owns the old inode would split future writers onto a second lock domain.
 fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let lock_path = beads_dir.join(".write.lock");
 
@@ -8075,31 +8330,19 @@ fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     }
 
-    let threshold_secs = stale_lock_threshold_secs();
-
-    let Ok(modified) = meta.modified() else {
-        // mtime unreadable — emit Ok with explicit "deferring" note
-        // rather than warn (the operator can't act on what we can't
-        // measure).
-        push_write_lock_mtime_unreadable(&lock_path, checks);
-        return;
-    };
-
-    let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
-        // Clock skew: mtime is in the future. Surface as Warn with
-        // a distinct reason so the operator sees the clock issue.
-        push_write_lock_future_mtime(&lock_path, checks);
-        return;
-    };
-    let age_secs = age.as_secs();
-
-    if age_secs < threshold_secs {
-        push_write_lock_fresh(&lock_path, age_secs, threshold_secs, checks);
-        return;
-    }
-
-    // Stale candidate. Emit warn with the canonical operator-fix.
-    push_write_lock_stale(&lock_path, modified, age_secs, threshold_secs, checks);
+    push_check(
+        checks,
+        "write_lock",
+        CheckStatus::Ok,
+        Some(
+            "Persistent .beads/.write.lock inode is normal; file age is not lock ownership"
+                .to_string(),
+        ),
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "reason": "persistent_advisory_inode",
+        })),
+    );
 }
 
 fn push_write_lock_missing(checks: &mut Vec<CheckResult>) {
@@ -8107,7 +8350,7 @@ fn push_write_lock_missing(checks: &mut Vec<CheckResult>) {
         checks,
         "write_lock",
         CheckStatus::Ok,
-        Some("No .beads/.write.lock present (no writer contention)".to_string()),
+        Some("No .beads/.write.lock inode was present before inspection".to_string()),
         None,
     );
 }
@@ -8122,98 +8365,6 @@ fn push_write_lock_non_file(meta: &fs::Metadata, checks: &mut Vec<CheckResult>) 
             meta.file_type(),
         )),
         None,
-    );
-}
-
-fn stale_lock_threshold_secs() -> u64 {
-    std::env::var("BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_STALE_LOCK_THRESHOLD_SECS)
-}
-
-fn push_write_lock_mtime_unreadable(lock_path: &Path, checks: &mut Vec<CheckResult>) {
-    push_check(
-        checks,
-        "write_lock",
-        CheckStatus::Ok,
-        Some(
-            ".beads/.write.lock present but mtime unreadable; cannot assess staleness".to_string(),
-        ),
-        Some(serde_json::json!({
-            "path": lock_path.display().to_string(),
-        })),
-    );
-}
-
-fn push_write_lock_future_mtime(lock_path: &Path, checks: &mut Vec<CheckResult>) {
-    push_check(
-        checks,
-        "write_lock",
-        CheckStatus::Warn,
-        Some(
-            ".beads/.write.lock has an mtime in the future (clock skew?); review manually"
-                .to_string(),
-        ),
-        Some(serde_json::json!({
-            "path": lock_path.display().to_string(),
-            "reason": "mtime_in_future",
-        })),
-    );
-}
-
-fn push_write_lock_fresh(
-    lock_path: &Path,
-    age_secs: u64,
-    threshold_secs: u64,
-    checks: &mut Vec<CheckResult>,
-) {
-    push_check(
-        checks,
-        "write_lock",
-        CheckStatus::Ok,
-        Some(format!(
-            ".beads/.write.lock is {age_secs}s old (within {threshold_secs}s threshold); not stale"
-        )),
-        Some(serde_json::json!({
-            "path": lock_path.display().to_string(),
-            "age_secs": age_secs,
-            "threshold_secs": threshold_secs,
-        })),
-    );
-}
-
-fn push_write_lock_stale(
-    lock_path: &Path,
-    modified: std::time::SystemTime,
-    age_secs: u64,
-    threshold_secs: u64,
-    checks: &mut Vec<CheckResult>,
-) {
-    let mtime_rfc3339 = chrono::DateTime::<chrono::Utc>::from(modified)
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let stale_suffix = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    push_check(
-        checks,
-        "write_lock",
-        CheckStatus::Warn,
-        Some(format!(
-            ".beads/.write.lock is {age_secs}s old (threshold {threshold_secs}s) and looks orphaned. \
-             Verify no live `br` process is in this workspace, then move the lock aside manually."
-        )),
-        Some(serde_json::json!({
-            "path": lock_path.display().to_string(),
-            "mtime": mtime_rfc3339,
-            "age_secs": age_secs,
-            "threshold_secs": threshold_secs,
-            "reason": "stale_mtime",
-            "recommended_fix": format!(
-                "After verifying no `br` is running here: mv {p} {p}.stale-{stale_suffix}",
-                p = lock_path.display(),
-            ),
-            "verify_no_br_running": "pgrep -af 'br ' | grep -v doctor | grep -v grep",
-            "env_override": "BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS",
-        })),
     );
 }
 
@@ -10468,19 +10619,27 @@ fn inspect_doctor_jsonl(
 /// #350: audit the dependency graph from the JSONL source of truth and surface
 /// two actionable findings:
 ///
-/// - `dep.dead_closed_blocking_edges`: open issues with a blocking dependency
-///   whose target is closed/tombstoned or entirely absent from the JSONL
-///   ("dead" edges that no longer reflect a live blocker).
-/// - `dep.fully_unblocked_open`: open issues that DO declare blocking
-///   dependencies but where EVERY blocker is now closed/tombstoned/absent —
-///   i.e. they are actually ready to work but may not be surfaced as such.
+/// - `dep.dead_closed_blocking_edges`: non-terminal issues with a blocking
+///   dependency whose target is absent from the JSONL. The legacy check name
+///   remains stable, but closed/tombstoned targets are fulfilled prerequisites,
+///   not dead edges.
+/// - `dep.fully_unblocked_open`: issues explicitly left in `blocked` after
+///   every declared blocker reached a terminal status. Ordinary open work with
+///   fulfilled prerequisites is healthy and should be surfaced by `br ready`;
+///   in-progress/deferred work is intentional and must not be second-guessed.
 ///
-/// "Open" here means non-terminal (not `closed`/`tombstone`) and non-draft —
-/// the same work-surface notion `br ready` uses. Blocking edge types are the
-/// model's canonical blocking set (`DependencyType::is_blocking`). External
-/// targets (`external:` prefix) are not treated as dead, since `br` cannot
-/// know their state.
+/// The stale-status check mirrors the storage layer's hierarchy semantics:
+/// direct blockers propagate from parents to descendants, while epics are
+/// blocked by their open children. External targets (`external:` prefix) and
+/// missing targets fail closed because doctor cannot prove them fulfilled.
 fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum BlockerState {
+        Live,
+        Fulfilled,
+        Missing,
+    }
+
     let issues = match read_jsonl_issues_for_graph(path) {
         Ok(issues) => issues,
         Err(err) => {
@@ -10497,32 +10656,31 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
         }
     };
 
-    // Index status by id. Terminal = closed or tombstone (a satisfied blocker).
-    let mut status_by_id: std::collections::HashMap<String, crate::model::Status> =
-        std::collections::HashMap::with_capacity(issues.len());
-    for issue in &issues {
-        status_by_id.insert(issue.id.clone(), issue.status.clone());
-    }
+    let issue_by_id: std::collections::HashMap<&str, &crate::model::Issue> = issues
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue))
+        .collect();
 
-    // A blocker is "live" (still blocking) when it exists AND is non-terminal.
-    // A blocker is "dead" when its target is terminal OR absent (and not an
-    // external ref, whose state `br` cannot resolve).
-    let blocker_is_dead = |target: &str| -> bool {
+    let blocker_state = |target: &str| -> BlockerState {
         if target.starts_with("external:") {
-            return false;
+            return BlockerState::Live;
         }
-        match status_by_id.get(target) {
-            Some(status) => status.is_terminal(),
-            None => true,
+        match issue_by_id.get(target) {
+            Some(issue) if issue.status.is_terminal() || issue.is_template => {
+                BlockerState::Fulfilled
+            }
+            Some(_) => BlockerState::Live,
+            None => BlockerState::Missing,
         }
     };
 
-    let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
+    let hierarchy_blocked = canonical_hierarchy_blocked_issue_ids(&issues, &issue_by_id);
+    let mut missing_edge_issues: Vec<serde_json::Value> = Vec::new();
     let mut fully_unblocked_issues: Vec<String> = Vec::new();
 
     for issue in &issues {
         // Only audit open (non-terminal, non-draft) issues — the work surface.
-        if issue.status.is_terminal() || issue.status.is_draft() {
+        if issue.status.is_terminal() || issue.status.is_draft() || issue.is_template {
             continue;
         }
 
@@ -10553,28 +10711,115 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
             continue;
         }
 
-        let dead: Vec<&str> = blocking_targets
+        let missing: Vec<&str> = blocking_targets
             .iter()
             .copied()
-            .filter(|target| blocker_is_dead(target))
+            .filter(|target| blocker_state(target) == BlockerState::Missing)
             .collect();
 
-        if !dead.is_empty() {
-            dead_edge_issues.push(serde_json::json!({
+        if !missing.is_empty() {
+            missing_edge_issues.push(serde_json::json!({
                 "id": issue.id,
-                "dead_blockers": dead,
+                "missing_blockers": missing,
             }));
         }
 
-        // Fully unblocked: every declared blocker is dead (closed/absent), so
-        // nothing live remains to block this open issue.
-        if dead.len() == blocking_targets.len() {
+        // A persisted `blocked` status is stale only when every target exists
+        // and is terminal. Missing targets fail closed above and must never be
+        // promoted to "unblocked".
+        if issue.status == crate::model::Status::Blocked
+            && blocking_targets
+                .iter()
+                .all(|target| blocker_state(target) == BlockerState::Fulfilled)
+            && !hierarchy_blocked.contains(&issue.id)
+        {
             fully_unblocked_issues.push(issue.id.clone());
         }
     }
 
-    emit_dead_closed_blocking_edges(&dead_edge_issues, checks);
+    emit_missing_blocking_edges(&missing_edge_issues, checks);
     emit_fully_unblocked_open(&fully_unblocked_issues, checks);
+}
+
+fn canonical_hierarchy_blocked_issue_ids(
+    issues: &[crate::model::Issue],
+    issue_by_id: &std::collections::HashMap<&str, &crate::model::Issue>,
+) -> std::collections::HashSet<String> {
+    use crate::model::{DependencyType, IssueType};
+    use std::collections::{HashMap, HashSet};
+
+    let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+    for issue in issues {
+        for dependency in &issue.dependencies {
+            if dependency.dep_type == DependencyType::ParentChild
+                && !issue.id.starts_with("external:")
+                && !dependency.depends_on_id.starts_with("external:")
+            {
+                children_by_parent
+                    .entry(dependency.depends_on_id.as_str())
+                    .or_default()
+                    .push(issue.id.as_str());
+            }
+        }
+    }
+
+    // Match `SqliteStorage::load_direct_blockers_impl`: standard blockers are
+    // live when local and non-terminal, missing, or external. Open templates
+    // are excluded from ready-work blocking.
+    let mut blocked: HashSet<String> = issues
+        .iter()
+        .filter(|issue| {
+            issue.dependencies.iter().any(|dependency| {
+                matches!(
+                    dependency.dep_type,
+                    DependencyType::Blocks
+                        | DependencyType::ConditionalBlocks
+                        | DependencyType::WaitsFor
+                ) && dependency.depends_on_id != issue.id
+                    && (dependency.depends_on_id.starts_with("external:")
+                        || issue_by_id
+                            .get(dependency.depends_on_id.as_str())
+                            .is_none_or(|target| {
+                                !target.status.is_terminal() && !target.is_template
+                            }))
+            })
+        })
+        .map(|issue| issue.id.clone())
+        .collect();
+
+    // Match `SqliteStorage::propagate_blocked_parents`: a directly or
+    // transitively blocked parent blocks every local descendant.
+    let mut queue: Vec<String> = blocked.iter().cloned().collect();
+    while let Some(parent_id) = queue.pop() {
+        if let Some(children) = children_by_parent.get(parent_id.as_str()) {
+            for child_id in children {
+                if blocked.insert((*child_id).to_string()) {
+                    queue.push((*child_id).to_string());
+                }
+            }
+        }
+    }
+
+    // Match `SqliteStorage::load_local_open_child_blockers_impl`: only epics
+    // roll up open children, and this happens after parent propagation so the
+    // child does not become blocked by itself through the epic.
+    for (parent_id, children) in children_by_parent {
+        let Some(parent) = issue_by_id.get(parent_id) else {
+            continue;
+        };
+        if parent.issue_type != IssueType::Epic {
+            continue;
+        }
+        if children.iter().any(|child_id| {
+            issue_by_id
+                .get(*child_id)
+                .is_some_and(|child| !child.status.is_terminal() && !child.is_template)
+        }) {
+            blocked.insert(parent_id.to_string());
+        }
+    }
+
+    blocked
 }
 
 /// Read and parse JSONL issue records for the dependency-graph audit, skipping
@@ -10598,11 +10843,11 @@ fn read_jsonl_issues_for_graph(path: &Path) -> Result<Vec<crate::model::Issue>> 
     Ok(issues)
 }
 
-fn emit_dead_closed_blocking_edges(
-    dead_edge_issues: &[serde_json::Value],
+fn emit_missing_blocking_edges(
+    missing_edge_issues: &[serde_json::Value],
     checks: &mut Vec<CheckResult>,
 ) {
-    if dead_edge_issues.is_empty() {
+    if missing_edge_issues.is_empty() {
         push_check(
             checks,
             "dep.dead_closed_blocking_edges",
@@ -10612,7 +10857,7 @@ fn emit_dead_closed_blocking_edges(
         );
         return;
     }
-    let ids: Vec<&str> = dead_edge_issues
+    let ids: Vec<&str> = missing_edge_issues
         .iter()
         .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
         .collect();
@@ -10621,14 +10866,14 @@ fn emit_dead_closed_blocking_edges(
         "dep.dead_closed_blocking_edges",
         CheckStatus::Warn,
         Some(format!(
-            "{} open issue(s) have dead blocking edges (blocker closed or missing): {}",
-            dead_edge_issues.len(),
+            "{} non-terminal issue(s) reference missing blocking targets: {}",
+            missing_edge_issues.len(),
             ids.join(", ")
         )),
         Some(serde_json::json!({
-            "count": dead_edge_issues.len(),
-            "issues": dead_edge_issues,
-            "remediation": "Remove or update the stale `blocks`/dependency edges (e.g. `br dep remove`) so the blocker reflects a live issue.",
+            "count": missing_edge_issues.len(),
+            "issues": missing_edge_issues,
+            "remediation": "Restore the missing issue record or update the dependency through `br dep`; closed prerequisite edges are fulfilled provenance and must remain.",
         })),
     );
 }
@@ -10649,14 +10894,14 @@ fn emit_fully_unblocked_open(fully_unblocked: &[String], checks: &mut Vec<CheckR
         "dep.fully_unblocked_open",
         CheckStatus::Warn,
         Some(format!(
-            "{} open issue(s) are fully unblocked (all blockers closed) but may not be surfaced as ready: {}",
+            "{} issue(s) remain explicitly blocked although all blockers are fulfilled: {}",
             fully_unblocked.len(),
             fully_unblocked.join(", ")
         )),
         Some(serde_json::json!({
             "count": fully_unblocked.len(),
             "issues": fully_unblocked,
-            "remediation": "These issues are ready to work — run `br ready` to confirm, or check status fields if they were manually set to `blocked`.",
+            "remediation": "Review the issue and use `br update <id> --status=open` when the explicit blocked status is no longer intentional.",
         })),
     );
 }
@@ -12056,6 +12301,18 @@ mod tests {
         issue
     }
 
+    fn parent_child_dependency(child_id: &str, parent_id: &str) -> crate::model::Dependency {
+        crate::model::Dependency {
+            issue_id: child_id.to_string(),
+            depends_on_id: parent_id.to_string(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: Utc::now(),
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        }
+    }
+
     fn write_issues_jsonl(path: &Path, issues: &[Issue]) {
         let mut body = String::new();
         for issue in issues {
@@ -12066,12 +12323,13 @@ mod tests {
     }
 
     #[test]
-    fn test_dep_graph_jsonl_flags_dead_edges_and_fully_unblocked() {
+    fn test_dep_graph_jsonl_separates_fulfilled_missing_and_stale_blocked() {
         // #350: fixture graph —
-        //  bd-a (open) blocked_by bd-closed (closed)  -> dead edge + fully unblocked
+        //  bd-a (open) blocked_by bd-closed (closed)  -> healthy fulfilled prerequisite
         //  bd-b (open) blocked_by bd-open (open)       -> live, not flagged
-        //  bd-c (open) blocked_by bd-missing (absent)  -> dead edge + fully unblocked
-        //  bd-d (open) blocked_by [bd-closed, bd-open] -> 1 dead edge, NOT fully unblocked
+        //  bd-c (open) blocked_by bd-missing (absent)  -> missing-target finding
+        //  bd-d (open) blocked_by [bd-closed, bd-open] -> healthy mixed state
+        //  bd-stale (blocked) blocked_by bd-closed     -> stale explicit status
         //  bd-closed (closed) blocked_by ...           -> terminal, skipped
         let temp = TempDir::new().unwrap();
         let jsonl = temp.path().join("issues.jsonl");
@@ -12080,6 +12338,7 @@ mod tests {
             issue_with_blockers("bd-b", Status::Open, &["bd-open"]),
             issue_with_blockers("bd-c", Status::Open, &["bd-missing"]),
             issue_with_blockers("bd-d", Status::Open, &["bd-closed", "bd-open"]),
+            issue_with_blockers("bd-stale", Status::Blocked, &["bd-closed"]),
             {
                 let mut closed = sample_issue("bd-closed", "bd-closed");
                 closed.status = Status::Closed;
@@ -12101,8 +12360,22 @@ mod tests {
             .and_then(|d| d.get("count"))
             .and_then(serde_json::Value::as_u64)
             .unwrap();
-        // bd-a, bd-c, bd-d each have >=1 dead blocking edge.
-        assert_eq!(dead_count, 3, "expected 3 issues with dead edges: {dead:?}");
+        assert_eq!(
+            dead_count, 1,
+            "only the genuinely missing target should be flagged: {dead:?}"
+        );
+        assert_eq!(
+            dead.details
+                .as_ref()
+                .and_then(|details| details.get("issues"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|issues| issues.first())
+                .and_then(|issue| issue.get("missing_blockers"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|blockers| blockers.first())
+                .and_then(serde_json::Value::as_str),
+            Some("bd-missing")
+        );
 
         let unblocked =
             find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
@@ -12116,25 +12389,120 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        // bd-a and bd-c are fully unblocked (all blockers dead). bd-d is NOT
-        // (bd-open is still live). bd-b is NOT (its only blocker is live).
-        assert!(
-            unblocked_ids.contains(&"bd-a".to_string()),
-            "{unblocked_ids:?}"
+        assert_eq!(unblocked_ids, vec!["bd-stale"], "{unblocked_ids:?}");
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_missing_blocker_never_promotes_blocked_issue() {
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        write_issues_jsonl(
+            &jsonl,
+            &[issue_with_blockers(
+                "bd-blocked",
+                Status::Blocked,
+                &["bd-missing"],
+            )],
         );
-        assert!(
-            unblocked_ids.contains(&"bd-c".to_string()),
-            "{unblocked_ids:?}"
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let missing =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("missing-edge check");
+        assert_eq!(missing.status, CheckStatus::Warn, "{missing:?}");
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(
+            unblocked.status,
+            CheckStatus::Ok,
+            "a missing blocker must fail closed, never become fulfilled: {unblocked:?}"
         );
-        assert!(
-            !unblocked_ids.contains(&"bd-d".to_string()),
-            "{unblocked_ids:?}"
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_skips_blocked_templates() {
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let mut template = issue_with_blockers("bd-template", Status::Blocked, &["bd-closed"]);
+        template.is_template = true;
+        let mut closed = sample_issue("bd-closed", "bd-closed");
+        closed.status = Status::Closed;
+        closed.closed_at = Some(Utc::now());
+        write_issues_jsonl(&jsonl, &[template, closed]);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(
+            unblocked.status,
+            CheckStatus::Ok,
+            "templates are not ready-work candidates and must not be actionable findings: {unblocked:?}"
         );
-        assert!(
-            !unblocked_ids.contains(&"bd-b".to_string()),
-            "{unblocked_ids:?}"
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_respects_parent_child_blocking_before_stale_status_warning() {
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+
+        let blocked_parent = issue_with_blockers("bd-parent", Status::Open, &["bd-live"]);
+        let mut inherited_child =
+            issue_with_blockers("bd-inherited-child", Status::Blocked, &["bd-closed"]);
+        inherited_child
+            .dependencies
+            .push(parent_child_dependency("bd-inherited-child", "bd-parent"));
+
+        let mut epic = issue_with_blockers("bd-epic", Status::Blocked, &["bd-closed"]);
+        epic.issue_type = IssueType::Epic;
+        let mut epic_child = sample_issue("bd-epic-child", "bd-epic-child");
+        epic_child
+            .dependencies
+            .push(parent_child_dependency("bd-epic-child", "bd-epic"));
+
+        let independently_stale =
+            issue_with_blockers("bd-independent", Status::Blocked, &["bd-closed"]);
+        let mut closed = sample_issue("bd-closed", "bd-closed");
+        closed.status = Status::Closed;
+        closed.closed_at = Some(Utc::now());
+        let live = sample_issue("bd-live", "bd-live");
+
+        write_issues_jsonl(
+            &jsonl,
+            &[
+                blocked_parent,
+                inherited_child,
+                epic,
+                epic_child,
+                independently_stale,
+                closed,
+                live,
+            ],
         );
-        assert_eq!(unblocked_ids.len(), 2, "{unblocked_ids:?}");
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let missing =
+            find_check(&checks, "dep.dead_closed_blocking_edges").expect("missing-edge check");
+        assert_eq!(missing.status, CheckStatus::Ok, "{missing:?}");
+
+        let unblocked =
+            find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
+        assert_eq!(unblocked.status, CheckStatus::Warn, "{unblocked:?}");
+        let ids = unblocked
+            .details
+            .as_ref()
+            .and_then(|details| details.get("issues"))
+            .and_then(serde_json::Value::as_array)
+            .expect("stale issue list");
+        assert_eq!(
+            ids,
+            &[serde_json::Value::String("bd-independent".to_string())],
+            "parent-inherited and epic-child blockers must suppress false stale-status warnings"
+        );
     }
 
     #[test]
@@ -14811,6 +15179,104 @@ mod tests {
     }
 
     #[test]
+    fn test_check_inner_gitignore_present_honors_effective_lock_glob() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join(".gitignore"), b"*.lock\n*.tmp\n").unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_inner_gitignore_present_honors_later_negation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join(".gitignore"),
+            b"*.lock\n!.write.lock\n*.tmp\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("missing_patterns"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|patterns| patterns.first())
+                .and_then(serde_json::Value::as_str),
+            Some(".write.lock")
+        );
+    }
+
+    #[test]
+    fn test_inner_gitignore_lock_matcher_handles_recursive_and_character_class_globs() {
+        for contents in ["**/.write.lock\n*.tmp\n", "[.]write.lock\n*.tmp\n"] {
+            assert!(
+                missing_inner_gitignore_patterns(contents).is_empty(),
+                "effective gitignore rule should cover .write.lock: {contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inner_gitignore_leading_space_is_literal() {
+        let missing = missing_inner_gitignore_patterns(" *.lock\n *.tmp\n");
+        assert_eq!(
+            missing,
+            vec![".write.lock", "*.tmp"],
+            "leading whitespace is part of a gitignore pattern, not decoration"
+        );
+    }
+
+    #[test]
+    fn test_inner_gitignore_later_temp_negation_cancels_coverage() {
+        let missing = missing_inner_gitignore_patterns("*.lock\n*.tmp\n!*.tmp\n");
+        assert_eq!(
+            missing,
+            vec!["*.tmp"],
+            "a later negation must cancel effective temp-file coverage"
+        );
+    }
+
+    #[test]
+    fn test_inner_gitignore_narrow_temp_negation_cancels_class_authority() {
+        let missing = missing_inner_gitignore_patterns("*.lock\n*.tmp\n!foo.tmp\n");
+        assert_eq!(
+            missing,
+            vec!["*.tmp"],
+            "a later exception means the canonical temp class is no longer authoritative"
+        );
+    }
+
+    #[test]
+    fn test_inner_gitignore_trailing_tab_is_literal() {
+        let missing = missing_inner_gitignore_patterns("*.lock\t\n*.tmp\t\n");
+        assert_eq!(
+            missing,
+            vec![".write.lock", "*.tmp"],
+            "Git does not discard trailing tabs from ignore patterns"
+        );
+    }
+
+    #[test]
+    fn test_inner_gitignore_reversed_character_range_fails_closed() {
+        assert!(
+            !gitignore_effectively_ignores_file("[z-.]write.lock\n", ".write.lock"),
+            "Git leaves .write.lock visible for an invalid reversed range"
+        );
+    }
+
+    #[test]
     fn test_check_inner_gitignore_present_incomplete_warns() {
         // Has .gitignore but missing one expected pattern → warn kind="incomplete".
         let temp = TempDir::new().unwrap();
@@ -15478,10 +15944,10 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        // .gitignore has one canonical pattern + a custom one; missing *.tmp.
+        // A broad lock glob already covers .write.lock; only *.tmp is missing.
         fs::write(
             beads_dir.join(".gitignore"),
-            "# operator custom\n.write.lock\nlocal-cache/\n",
+            "# operator custom\n*.lock\nlocal-cache/\n",
         )
         .unwrap();
 
@@ -15506,9 +15972,10 @@ mod tests {
         // Existing operator lines preserved verbatim.
         assert!(after.contains("# operator custom"), "{after:?}");
         assert!(after.contains("local-cache/"), "{after:?}");
-        // Both canonical patterns now present.
+        // The effective broad rule is preserved without a redundant literal.
+        assert!(after.lines().any(|l| l.trim() == "*.lock"), "{after:?}");
         assert!(
-            after.lines().any(|l| l.trim() == ".write.lock"),
+            !after.lines().any(|l| l.trim() == ".write.lock"),
             "{after:?}"
         );
         assert!(after.lines().any(|l| l.trim() == "*.tmp"), "{after:?}");
@@ -20927,20 +21394,26 @@ version = "2026-05-11-abc123"
     }
 
     #[test]
-    fn check_orphaned_write_lock_fresh_is_ok() {
+    fn check_orphaned_write_lock_persistent_inode_is_ok() {
         let tmp = TempDir::new().unwrap();
         let beads_dir = tmp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
         fs::write(beads_dir.join(".write.lock"), b"").unwrap();
-        // Fresh file: mtime is now → well within the 300s default
-        // threshold.
         let mut checks = Vec::new();
         check_orphaned_write_lock(&beads_dir, &mut checks);
         let check = find_check(&checks, "write_lock").expect("write_lock present");
         assert!(
             matches!(check.status, CheckStatus::Ok),
-            "fresh .write.lock must be Ok; got {:?}",
+            "a persistent advisory-lock inode must be Ok; got {:?}",
             check.status
+        );
+        assert_eq!(
+            check
+                .details
+                .as_ref()
+                .and_then(|details| details.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("persistent_advisory_inode")
         );
     }
 

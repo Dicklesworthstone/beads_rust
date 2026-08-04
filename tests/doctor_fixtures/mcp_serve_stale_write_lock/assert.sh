@@ -26,6 +26,16 @@ assert_lock_artifacts_preserved() {
         echo "ASSERT FAIL[$stage]: holder pid sidecar content changed" >&2
         exit 1
     fi
+    [ -f .fixture_lock_identity ] || {
+        echo "ASSERT FAIL[$stage]: missing baseline lock identity" >&2
+        exit 1
+    }
+    expected_identity=$(cat .fixture_lock_identity)
+    actual_identity=$(stat -c '%d:%i' .beads/.write.lock)
+    if [ "$actual_identity" != "$expected_identity" ]; then
+        echo "ASSERT FAIL[$stage]: lock identity changed $expected_identity -> $actual_identity" >&2
+        exit 1
+    fi
 }
 
 assert_no_repair_actions() {
@@ -33,7 +43,7 @@ assert_no_repair_actions() {
     local actions
     while IFS= read -r actions; do
         if grep -q -v '^[[:space:]]*$' "$actions"; then
-            echo "ASSERT FAIL[$stage]: detect-only stale lock produced repair actions in $actions" >&2
+            echo "ASSERT FAIL[$stage]: persistent lock inode produced repair actions in $actions" >&2
             sed 's/^/  /' "$actions" >&2
             exit 1
         fi
@@ -43,15 +53,24 @@ assert_no_repair_actions() {
 case "$stage" in
     detect)
         assert_lock_artifacts_preserved
-        out=$("$tool_bin" doctor --json 2>/dev/null) || true
+        set +e
+        out=$("$tool_bin" doctor --json 2>/dev/null)
+        doctor_rc=$?
+        set -e
+        if [ "$doctor_rc" -ne 0 ]; then
+            echo "ASSERT FAIL[$stage]: healthy persistent inode made doctor exit $doctor_rc" >&2
+            echo "$out" >&2
+            exit 1
+        fi
+        assert_lock_artifacts_preserved
         echo "$out" | jq -e '
           .checks[]
           | select(.name == "write_lock")
-          | select(.status == "warn")
-          | select(.details.reason == "stale_mtime")
+          | select(.status == "ok")
+          | select(.details.reason == "persistent_advisory_inode")
           | select(.details.finding_id == "fm-concurrency_primitives-orphaned-write-lock")
         ' >/dev/null || {
-            echo "ASSERT FAIL[$stage]: stale MCP write lock was not reported by write_lock detector" >&2
+            echo "ASSERT FAIL[$stage]: persistent MCP lock inode was not classified healthy" >&2
             echo "$out" | jq '.checks[] | select(.name == "write_lock")' >&2
             exit 1
         }

@@ -1358,9 +1358,15 @@ fn build_dep_tree_nodes_global(
         path: Vec::new(),
     }];
     let mut next_node_key = 0usize;
+    // Global expansion guard: a node reachable via multiple (non-ancestor)
+    // paths is emitted once under each parent but its subtree is expanded only
+    // the first time. Without this, DAGs with shared dependencies (diamonds)
+    // enumerate every distinct simple path, which is exponential in depth and
+    // exhausts memory (#392).
+    let mut expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while let Some(item) = queue.pop() {
-        // Cycle detection: check if current ID is already in the path
+        // Cycle detection: skip a node that is already one of its own ancestors.
         if item.path.contains(&item.id) {
             continue;
         }
@@ -1377,17 +1383,28 @@ fn build_dep_tree_nodes_global(
             &mut metadata_cache,
         )?;
 
+        let is_external = item.id.starts_with("external:");
         let mut dependencies = Vec::new();
-        let truncated = if item.id.starts_with("external:") {
-            false
-        } else {
+        if !is_external {
             dependencies = dep_tree_neighbors(
                 args.direction,
                 &item.id,
                 &dependencies_by_issue,
                 &dependents_by_issue,
             );
+        }
+
+        // Expand only if within depth, not external, and not already expanded
+        // elsewhere in the graph. A repeat occurrence renders as a shared
+        // reference (truncated) rather than re-expanding its subtree.
+        let will_expand =
+            !is_external && item.depth < args.max_depth && !expanded.contains(&item.id);
+        let truncated = if is_external {
+            false
+        } else if will_expand {
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
+        } else {
+            !dependencies.is_empty()
         };
 
         nodes.push(TreeNode {
@@ -1402,8 +1419,8 @@ fn build_dep_tree_nodes_global(
             truncated,
         });
 
-        // Don't expand if at max depth
-        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+        if will_expand {
+            expanded.insert(item.id.clone());
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
@@ -1418,7 +1435,6 @@ fn build_dep_tree_nodes_global(
             sort_dep_tree_siblings(&mut dependencies, &metadata_cache);
             // Push in reverse order so first sorted item pops first.
             for dep_id in dependencies.into_iter().rev() {
-                // No global visited check here
                 queue.push(DepTreeQueueItem {
                     id: dep_id,
                     depth: item.depth + 1,
@@ -1453,6 +1469,8 @@ fn try_build_dep_tree_nodes_local(
         path: Vec::new(),
     }];
     let mut next_node_key = 0usize;
+    // See build_dep_tree_nodes_global: expand each node's subtree once (#392).
+    let mut expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     while let Some(item) = queue.pop() {
         if nodes.len() >= LOCAL_DEP_TREE_NODE_LIMIT {
@@ -1475,12 +1493,20 @@ fn try_build_dep_tree_nodes_local(
             &mut metadata_cache,
         )?;
 
+        let is_external = item.id.starts_with("external:");
         let mut dependencies = Vec::new();
-        let truncated = if item.id.starts_with("external:") {
-            false
-        } else {
+        if !is_external {
             dependencies = dep_tree_neighbors_from_storage(storage, args.direction, &item.id)?;
+        }
+
+        let will_expand =
+            !is_external && item.depth < args.max_depth && !expanded.contains(&item.id);
+        let truncated = if is_external {
+            false
+        } else if will_expand {
             dep_tree_truncated(item.depth, args.max_depth, dependencies.len())
+        } else {
+            !dependencies.is_empty()
         };
 
         nodes.push(TreeNode {
@@ -1495,11 +1521,12 @@ fn try_build_dep_tree_nodes_local(
             truncated,
         });
 
-        if item.depth < args.max_depth && !item.id.starts_with("external:") {
+        if will_expand {
             if nodes.len().saturating_add(dependencies.len()) > LOCAL_DEP_TREE_NODE_LIMIT {
                 return Ok(None);
             }
 
+            expanded.insert(item.id.clone());
             let mut new_path = item.path.clone();
             new_path.push(item.id.clone());
 
@@ -2530,6 +2557,73 @@ mod tests {
 
         assert!(local.is_none());
         info!("test_dep_tree_local_traversal_falls_back_for_wide_roots: assertions passed");
+    }
+
+    #[test]
+    fn test_dep_tree_diamond_graph_is_bounded() {
+        // Regression for #392: a "diamond ladder" DAG (A_i depends on B_i and
+        // C_i; both depend on A_{i+1}) is reachable via 2^i distinct simple
+        // paths. Without a global expansion guard the traversal emitted
+        // 2^(depth/2+2)-3 nodes and exhausted memory. With expansion-once the
+        // node count is bounded by the number of edges regardless of depth.
+        init_test_logging();
+        info!("test_dep_tree_diamond_graph_is_bounded: starting");
+        let mut storage = SqliteStorage::open_memory().unwrap();
+
+        const RUNGS: usize = 20;
+        let a: Vec<String> = (0..=RUNGS).map(|i| format!("bd-a{i:03}")).collect();
+        let b: Vec<String> = (0..RUNGS).map(|i| format!("bd-b{i:03}")).collect();
+        let c: Vec<String> = (0..RUNGS).map(|i| format!("bd-c{i:03}")).collect();
+
+        for id in a.iter().chain(b.iter()).chain(c.iter()) {
+            storage
+                .create_issue(&make_test_issue(id, id), "tester")
+                .unwrap();
+        }
+        for i in 0..RUNGS {
+            storage.add_dependency(&a[i], &b[i], "blocks", "tester").unwrap();
+            storage.add_dependency(&a[i], &c[i], "blocks", "tester").unwrap();
+            storage.add_dependency(&b[i], &a[i + 1], "blocks", "tester").unwrap();
+            storage.add_dependency(&c[i], &a[i + 1], "blocks", "tester").unwrap();
+        }
+
+        let total_issues = a.len() + b.len() + c.len();
+        let total_edges = 4 * RUNGS;
+        // Deep traversal: the per-path traversal would need 2^(100/2+2) nodes.
+        let args = dep_tree_test_args(&a[0], DepDirection::Down, 100);
+        let root_issue = storage.get_issue(&a[0]).unwrap().unwrap();
+        let external_statuses = HashMap::new();
+
+        let global =
+            build_dep_tree_nodes_global(&args, &storage, &a[0], &root_issue, &external_statuses)
+                .unwrap();
+
+        // Node count is bounded by root + one occurrence per edge (each node is
+        // rendered under every parent, but its subtree is expanded only once).
+        assert!(
+            global.len() <= total_edges + 1,
+            "expected <= {} nodes, got {}",
+            total_edges + 1,
+            global.len()
+        );
+        // Every unique issue in the graph is present at least once.
+        let seen: std::collections::HashSet<&str> =
+            global.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            seen.len(),
+            total_issues,
+            "every unique issue should be represented"
+        );
+
+        // The local fast path must not blow up either: it either produces the
+        // same bounded set or cleanly falls back to the global path.
+        if let Some(local) =
+            try_build_dep_tree_nodes_local(&args, &storage, &a[0], &root_issue, &external_statuses)
+                .unwrap()
+        {
+            assert_eq!(tree_node_projection(&local), tree_node_projection(&global));
+        }
+        info!("test_dep_tree_diamond_graph_is_bounded: assertions passed");
     }
 
     #[test]

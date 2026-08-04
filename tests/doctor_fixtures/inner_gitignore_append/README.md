@@ -5,9 +5,9 @@
   ephemeral patterns (`.write.lock`, `*.tmp`), causing transient
   workspace state to leak into git history.
 - **Subsystem**: configs
-- **Detect**: `gitignore.beads_inner_present` check goes to `warn`
-  when the inner `.gitignore` is missing OR exists but doesn't list
-  every canonical pattern.
+- **Detect**: `gitignore.beads_inner_present` goes to `warn` when the inner
+  `.gitignore` is missing or fails to cover required transient paths. Effective
+  glob coverage such as `*.lock` satisfies `.write.lock`; later negation wins.
 - **Repair contract**: SAFETY — `--repair` appends the missing
   patterns via the `mutate()` chokepoint (`Op::AppendFile`).
   Symlinked `.beads/.gitignore` is REFUSED (operator intent may
@@ -15,11 +15,11 @@
   lines are preserved verbatim; only the missing canonical lines
   are appended at end-of-file, with a separator newline inserted
   if the file's last byte is not `\n`.
-- **Round-trip**: write a `.beads/.gitignore` with only one of two
-  canonical patterns (`*.tmp` present, `.write.lock` missing) plus
-  an operator-custom line → detect warn → `--repair` appends the
-  missing canonical pattern → re-detect ok with operator lines
-  preserved → `doctor undo` restores the incomplete state.
+- **Round-trip**: write a `.beads/.gitignore` with `*.lock` (which effectively
+  covers `.write.lock`) but no `*.tmp`, plus an operator-custom line → detect
+  only the missing temp-file class → `--repair` appends `*.tmp` without a
+  redundant literal `.write.lock` → re-detect ok with operator lines preserved
+  → `doctor undo` restores the incomplete state.
 - **Idempotence**: a second `--repair` finds no divergence; zero
   actions.
 - **Expected exit codes**:

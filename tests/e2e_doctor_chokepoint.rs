@@ -166,6 +166,13 @@ fn parse_trailing_json(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("parse JSON failed ({e}): {}", &trimmed[start..]))
 }
 
+fn doctor_check<'a>(payload: &'a Value, name: &str) -> &'a Value {
+    payload["checks"]
+        .as_array()
+        .and_then(|checks| checks.iter().find(|check| check["name"] == name))
+        .unwrap_or_else(|| panic!("doctor output omitted check {name}: {payload}"))
+}
+
 fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
     let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
     conn.execute(
@@ -1585,5 +1592,295 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
         "br doctor undo failed: stdout={} stderr={}",
         String::from_utf8_lossy(&undo.stdout),
         String::from_utf8_lossy(&undo.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dependency graph truthfulness: fulfilled prerequisites remain provenance,
+// explicit blocked status is diagnosed separately, and absent targets fail
+// closed without being mislabeled as fulfilled.
+// ---------------------------------------------------------------------------
+#[test]
+fn dependency_doctor_matches_real_cli_readiness_and_preserves_edges() {
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    br_init(&root);
+
+    let create_issue = |title: &str| {
+        let output = br_cmd(&root)
+            .args(["create", title, "--json"])
+            .output()
+            .expect("br create spawned");
+        assert!(
+            output.status.success(),
+            "br create failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_trailing_json(&String::from_utf8_lossy(&output.stdout))["id"]
+            .as_str()
+            .expect("created issue id")
+            .to_string()
+    };
+    let flush = || {
+        let output = br_cmd(&root)
+            .args(["sync", "--flush-only", "--json"])
+            .output()
+            .expect("br sync --flush-only spawned");
+        assert!(
+            output.status.success(),
+            "br sync --flush-only failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    let dependent_id = create_issue("doctor fulfilled prerequisite dependent");
+    let blocker_id = create_issue("doctor fulfilled prerequisite blocker");
+
+    let add = br_cmd(&root)
+        .args(["dep", "add", &dependent_id, &blocker_id, "--json"])
+        .output()
+        .expect("br dep add spawned");
+    assert!(
+        add.status.success(),
+        "br dep add failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let close = br_cmd(&root)
+        .args([
+            "close",
+            &blocker_id,
+            "--reason",
+            "fulfilled for doctor regression",
+            "--json",
+        ])
+        .output()
+        .expect("br close spawned");
+    assert!(
+        close.status.success(),
+        "br close failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&close.stdout),
+        String::from_utf8_lossy(&close.stderr)
+    );
+    flush();
+
+    let doctor = br_cmd(&root)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("br doctor spawned");
+    assert!(
+        matches!(doctor.status.code(), Some(0 | 1)),
+        "doctor hard-failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&doctor.stdout),
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor_json = parse_trailing_json(&String::from_utf8_lossy(&doctor.stdout));
+    assert_eq!(
+        doctor_check(&doctor_json, "dep.dead_closed_blocking_edges")["status"],
+        "ok",
+        "closed prerequisites are fulfilled provenance, not dead edges"
+    );
+    assert_eq!(
+        doctor_check(&doctor_json, "dep.fully_unblocked_open")["status"],
+        "ok",
+        "ordinary open ready work must not be diagnosed as stale status"
+    );
+
+    let ready = br_cmd(&root)
+        .args(["ready", "--json"])
+        .output()
+        .expect("br ready spawned");
+    assert!(
+        ready.status.success(),
+        "br ready failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&ready.stdout),
+        String::from_utf8_lossy(&ready.stderr)
+    );
+    let ready_json: Vec<Value> =
+        serde_json::from_slice(&ready.stdout).expect("ready JSON must parse");
+    assert!(
+        ready_json
+            .iter()
+            .any(|issue| issue["id"].as_str() == Some(dependent_id.as_str())),
+        "dependent with a fulfilled prerequisite must be ready: {ready_json:?}"
+    );
+
+    let jsonl_path = root.join(".beads/issues.jsonl");
+    let jsonl = fs::read_to_string(&jsonl_path).expect("read issues JSONL");
+    let dependent = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|issue| issue["id"].as_str() == Some(dependent_id.as_str()))
+        .expect("dependent JSONL record");
+    assert!(
+        dependent["dependencies"].as_array().is_some_and(|deps| {
+            deps.iter().any(|dep| {
+                dep["depends_on_id"].as_str() == Some(blocker_id.as_str())
+                    && dep["type"].as_str() == Some("blocks")
+            })
+        }),
+        "doctor must preserve the fulfilled dependency edge: {dependent}"
+    );
+    let dep_list = br_cmd(&root)
+        .args(["dep", "list", &dependent_id, "--json"])
+        .output()
+        .expect("br dep list spawned");
+    assert!(
+        dep_list.status.success(),
+        "br dep list failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&dep_list.stdout),
+        String::from_utf8_lossy(&dep_list.stderr)
+    );
+    let listed: Vec<Value> =
+        serde_json::from_slice(&dep_list.stdout).expect("dependency list JSON");
+    assert!(
+        listed.iter().any(|dependency| {
+            dependency["issue_id"].as_str() == Some(dependent_id.as_str())
+                && dependency["depends_on_id"].as_str() == Some(blocker_id.as_str())
+                && dependency["type"].as_str() == Some("blocks")
+        }),
+        "the real DB-backed dependency surface must preserve the fulfilled edge: {listed:?}"
+    );
+
+    let mark_blocked = br_cmd(&root)
+        .args(["update", &dependent_id, "--status", "blocked", "--json"])
+        .output()
+        .expect("br update blocked spawned");
+    assert!(
+        mark_blocked.status.success(),
+        "mark blocked failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&mark_blocked.stdout),
+        String::from_utf8_lossy(&mark_blocked.stderr)
+    );
+    flush();
+    let blocked_doctor = br_cmd(&root)
+        .args(["doctor", "--json"])
+        .output()
+        .expect("blocked doctor spawned");
+    assert_eq!(
+        blocked_doctor.status.code(),
+        Some(1),
+        "the stale explicit status finding must produce FindingsPresent: stdout={} stderr={}",
+        String::from_utf8_lossy(&blocked_doctor.stdout),
+        String::from_utf8_lossy(&blocked_doctor.stderr)
+    );
+    let blocked_json = parse_trailing_json(&String::from_utf8_lossy(&blocked_doctor.stdout));
+    let stale_status = doctor_check(&blocked_json, "dep.fully_unblocked_open");
+    assert_eq!(stale_status["status"], "warn", "{stale_status}");
+    assert!(
+        stale_status["details"]["issues"]
+            .as_array()
+            .is_some_and(|ids| {
+                ids.iter()
+                    .any(|id| id.as_str() == Some(dependent_id.as_str()))
+            }),
+        "explicitly blocked issue with only fulfilled blockers must be identified: {stale_status}"
+    );
+
+    let reopen = br_cmd(&root)
+        .args(["update", &dependent_id, "--status", "open", "--json"])
+        .output()
+        .expect("br update open spawned");
+    assert!(
+        reopen.status.success(),
+        "restore open status failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&reopen.stdout),
+        String::from_utf8_lossy(&reopen.stderr)
+    );
+    flush();
+
+    let original_jsonl = fs::read(&jsonl_path).expect("snapshot clean JSONL bytes");
+    let anchor_path = root.join(".beads/beads.base.jsonl");
+    let original_anchor = fs::read(&anchor_path).expect("snapshot clean merge anchor bytes");
+    let body = String::from_utf8(original_jsonl.clone()).expect("JSONL must be UTF-8");
+    let mut rewritten = String::new();
+    let mut injected = false;
+    for line in body.lines() {
+        let mut issue: Value = serde_json::from_str(line).expect("parse JSONL issue");
+        if issue["id"].as_str() == Some(dependent_id.as_str()) {
+            let dependencies = issue["dependencies"]
+                .as_array_mut()
+                .expect("dependent dependencies array");
+            let mut missing = dependencies
+                .first()
+                .expect("fulfilled dependency template")
+                .clone();
+            missing["depends_on_id"] = Value::String("bd-doctor-missing-target".to_string());
+            dependencies.push(missing);
+            injected = true;
+        }
+        rewritten.push_str(&serde_json::to_string(&issue).expect("serialize JSONL issue"));
+        rewritten.push('\n');
+    }
+    assert!(
+        injected,
+        "dependent record was not found for missing-target probe"
+    );
+    fs::write(&jsonl_path, rewritten).expect("write isolated missing-target JSONL");
+
+    let missing_doctor = br_cmd(&root)
+        .args(["--no-auto-import", "--no-auto-flush", "doctor", "--json"])
+        .output()
+        .expect("missing-target doctor spawned");
+    fs::write(&jsonl_path, &original_jsonl).expect("restore clean JSONL bytes");
+    fs::write(&anchor_path, &original_anchor).expect("restore clean merge anchor bytes");
+    flush();
+    assert_eq!(
+        fs::read(&jsonl_path).expect("read re-flushed JSONL"),
+        original_jsonl,
+        "supported flush after restoration must preserve canonical JSONL bytes"
+    );
+    assert_eq!(
+        missing_doctor.status.code(),
+        Some(1),
+        "the missing-target finding must produce FindingsPresent: stdout={} stderr={}",
+        String::from_utf8_lossy(&missing_doctor.stdout),
+        String::from_utf8_lossy(&missing_doctor.stderr)
+    );
+
+    let missing_json = parse_trailing_json(&String::from_utf8_lossy(&missing_doctor.stdout));
+    let missing = doctor_check(&missing_json, "dep.dead_closed_blocking_edges");
+    assert_eq!(missing["status"], "warn", "{missing}");
+    assert!(
+        missing["details"]["issues"]
+            .as_array()
+            .is_some_and(|issues| issues.iter().any(|issue| {
+                issue["id"].as_str() == Some(dependent_id.as_str())
+                    && issue["missing_blockers"].as_array().is_some_and(|ids| {
+                        ids.iter()
+                            .any(|id| id.as_str() == Some("bd-doctor-missing-target"))
+                    })
+            })),
+        "missing target must be reported without erasing the edge: {missing}"
+    );
+    assert_eq!(
+        doctor_check(&missing_json, "dep.fully_unblocked_open")["status"],
+        "ok",
+        "a missing target must fail closed, never be promoted to fulfilled"
+    );
+
+    let restored_doctor = br_cmd(&root)
+        .args(["--no-auto-import", "--no-auto-flush", "doctor", "--json"])
+        .output()
+        .expect("restored doctor spawned");
+    assert!(
+        matches!(restored_doctor.status.code(), Some(0 | 1)),
+        "restored doctor hard-failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&restored_doctor.stdout),
+        String::from_utf8_lossy(&restored_doctor.stderr)
+    );
+    let restored_json = parse_trailing_json(&String::from_utf8_lossy(&restored_doctor.stdout));
+    assert_eq!(
+        doctor_check(&restored_json, "dep.dead_closed_blocking_edges")["status"],
+        "ok",
+        "restoring the source bytes must clear the isolated missing-target finding"
+    );
+    assert_eq!(
+        doctor_check(&restored_json, "dep.fully_unblocked_open")["status"],
+        "ok",
+        "restoring the source bytes must leave the dependent ready"
     );
 }

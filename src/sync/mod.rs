@@ -5554,6 +5554,196 @@ pub(crate) fn scan_jsonl_for_tombstone_filter(path: &Path) -> Result<JsonlTombst
     Ok(filter)
 }
 
+/// Snapshot every *dirty* (locally-modified, not-yet-flushed) issue in the
+/// database — including its labels, dependencies, and comments — so a JSONL
+/// rebuild can restore mutations that never reached the JSONL export (#394).
+///
+/// A JSONL rebuild imports only what is in the JSONL, so any issue carrying
+/// export debt (a `dirty_issues` marker) whose latest state — or entire
+/// existence — has not been flushed would silently vanish from the live store,
+/// surviving only inside the pre-rebuild backup directory. This mirrors
+/// `snapshot_tombstones` for the live-issue case.
+///
+/// Tombstoned issues are deliberately excluded — those are handled by
+/// `snapshot_tombstones`, whose restore semantics (deletion wins, never
+/// resurrect) differ from live-issue preservation.
+///
+/// Fully best-effort: never returns an error. If the enumeration query fails
+/// the rebuild proceeds without dirty-issue preservation; per-issue relation
+/// fetches degrade to issue-row-only preservation.
+#[must_use]
+pub(crate) fn snapshot_dirty_issues(storage: &SqliteStorage) -> Vec<PreservedTombstone> {
+    let mut preserved = Vec::new();
+    let dirty_ids = match storage.get_dirty_issue_ids() {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Failed to enumerate dirty issues before rebuild; continuing without dirty-issue preservation"
+            );
+            return preserved;
+        }
+    };
+
+    for dirty_id in dirty_ids {
+        let Some(issue) = (match storage.get_issue(&dirty_id) {
+            Ok(issue) => issue,
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %dirty_id,
+                    error = %error,
+                    "Skipping dirty-issue preservation for issue that could not be read before rebuild"
+                );
+                continue;
+            }
+        }) else {
+            continue;
+        };
+
+        // Tombstones are preserved by `snapshot_tombstones`, whose restore
+        // semantics differ (deletion must win). Skip them here.
+        if issue.status == crate::model::Status::Tombstone {
+            continue;
+        }
+
+        let labels = match storage.get_labels(&dirty_id) {
+            Ok(labels) => Some(labels),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %dirty_id,
+                    error = %error,
+                    "Failed to snapshot dirty-issue labels before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let dependencies = match storage.get_dependencies_full(&dirty_id) {
+            Ok(dependencies) => Some(dependencies),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %dirty_id,
+                    error = %error,
+                    "Failed to snapshot dirty-issue dependencies before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        let comments = match storage.get_comments(&dirty_id) {
+            Ok(comments) => Some(comments),
+            Err(error) => {
+                tracing::warn!(
+                    issue_id = %dirty_id,
+                    error = %error,
+                    "Failed to snapshot dirty-issue comments before rebuild; preserving issue row only"
+                );
+                None
+            }
+        };
+        preserved.push(PreservedTombstone {
+            issue,
+            labels,
+            dependencies,
+            comments,
+        });
+    }
+    preserved
+}
+
+/// Filter the preserved dirty-issue set down to those that must actually be
+/// restored after the rebuild has reimported the JSONL. Reuses the same
+/// `JsonlTombstoneFilter` scan as tombstone preservation. Four cases for a
+/// dirty issue with id `X`:
+///
+/// 1. JSONL has `X` as a tombstone: the deletion has been flushed and, per the
+///    import guard, deletion wins over a local live edit — drop from the
+///    preservation set (the rebuild reinstates the tombstone).
+///
+/// 2. JSONL has `X` as a non-tombstone with `updated_at >= DB updated_at`: the
+///    JSONL is at least as fresh, so the rebuild's own import already carries
+///    the current (or newer) state — drop, to avoid clobbering a newer JSONL
+///    record with an older DB row.
+///
+/// 3. JSONL has `X` as a non-tombstone with `updated_at < DB updated_at`: the
+///    DB holds a newer, unflushed edit — preserve and restore it, re-marking
+///    it dirty so the next flush exports it.
+///
+/// 4. JSONL does not have `X` at all: a brand-new unflushed issue — always
+///    preserve, otherwise the rebuild would silently drop it.
+#[must_use]
+pub(crate) fn dirty_issues_missing_or_newer_than_jsonl(
+    dirty_issues: Vec<PreservedTombstone>,
+    jsonl_filter: &JsonlTombstoneFilter,
+) -> Vec<PreservedTombstone> {
+    let original_count = dirty_issues.len();
+    let mut skipped_flushed_tombstone = 0usize;
+    let mut skipped_jsonl_current = 0usize;
+    let preserved: Vec<PreservedTombstone> = dirty_issues
+        .into_iter()
+        .filter(|dirty| {
+            let id = &dirty.issue.id;
+            if jsonl_filter.tombstone_ids.contains(id) {
+                skipped_flushed_tombstone += 1;
+                return false;
+            }
+            if let Some(jsonl_updated_at) = jsonl_filter.non_tombstone_updated_at.get(id) {
+                // Only preserve when the DB row is strictly newer than the
+                // JSONL record the rebuild will import.
+                if *jsonl_updated_at >= dirty.issue.updated_at {
+                    skipped_jsonl_current += 1;
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    if skipped_flushed_tombstone > 0 || skipped_jsonl_current > 0 {
+        tracing::debug!(
+            preserved = preserved.len(),
+            skipped_flushed_tombstone,
+            skipped_jsonl_current,
+            original = original_count,
+            "Filtered preserved dirty issues against JSONL state"
+        );
+    }
+
+    preserved
+}
+
+/// Restore preserved dirty issues after a successful rebuild, wrapping any
+/// failure with a message that makes clear the rebuild itself succeeded — only
+/// the unflushed-issue restoration step failed. Mirrors
+/// `restore_tombstones_after_rebuild`.
+///
+/// # Errors
+///
+/// Returns a `BeadsError::WithContext` whose source is the original
+/// `restore_tombstones` error. Returns `Ok(())` when `dirty_issues` is empty.
+pub(crate) fn restore_dirty_issues_after_rebuild(
+    storage: &mut SqliteStorage,
+    dirty_issues: &[PreservedTombstone],
+) -> Result<()> {
+    if dirty_issues.is_empty() {
+        return Ok(());
+    }
+    let count = dirty_issues.len();
+    // `restore_tombstones` upserts the issues and their relations atomically
+    // and re-marks each dirty, which is exactly the behavior we need for
+    // unflushed live issues too.
+    restore_tombstones(storage, dirty_issues).map_err(|err| BeadsError::WithContext {
+        context: format!(
+            "Rebuild from JSONL succeeded, but failed to restore {count} unflushed \
+             issue(s) that had not yet been exported to the JSONL. The database now \
+             mirrors the JSONL exactly — those issues survive only in the verified \
+             pre-rebuild backup directory. Re-running the command is idempotent and \
+             safe (the rebuild itself completed successfully). If the underlying \
+             cause is lock contention, wait for other `br` processes to finish and \
+             try again."
+        ),
+        source: Box::new(err),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6332,6 +6522,43 @@ mod tests {
         assert_eq!(result.exported_count, 1);
         assert!(result.exported_ids.contains(&"bd-regular".to_string()));
         assert!(!result.exported_ids.contains(&"bd-ephemeral".to_string()));
+    }
+
+    #[test]
+    fn test_dirty_issues_missing_or_newer_than_jsonl_filter() {
+        // #394: only dirty issues that are absent from the JSONL, or strictly
+        // newer than the JSONL record, should be preserved across a rebuild.
+        let t0 = DateTime::<Utc>::from_timestamp(1_767_225_600, 0).unwrap();
+        let t1 = t0 + chrono::Duration::hours(1);
+
+        let make = |id: &str, updated_at: chrono::DateTime<Utc>| PreservedTombstone {
+            issue: make_issue_at(id, id, updated_at),
+            labels: None,
+            dependencies: None,
+            comments: None,
+        };
+
+        // brand-new (absent from JSONL) -> preserve
+        // db newer than jsonl -> preserve
+        // jsonl newer-or-equal than db -> drop (rebuild import already current)
+        // jsonl has it as a tombstone -> drop (deletion wins)
+        let dirty = vec![
+            make("new-only", t1),
+            make("db-newer", t1),
+            make("jsonl-current", t0),
+            make("jsonl-newer", t0),
+            make("flushed-tombstone", t1),
+        ];
+
+        let mut filter = JsonlTombstoneFilter::default();
+        filter.non_tombstone_updated_at.insert("db-newer".into(), t0);
+        filter.non_tombstone_updated_at.insert("jsonl-current".into(), t0);
+        filter.non_tombstone_updated_at.insert("jsonl-newer".into(), t1);
+        filter.tombstone_ids.insert("flushed-tombstone".into());
+
+        let preserved = dirty_issues_missing_or_newer_than_jsonl(dirty, &filter);
+        let ids: Vec<&str> = preserved.iter().map(|p| p.issue.id.as_str()).collect();
+        assert_eq!(ids, vec!["new-only", "db-newer"]);
     }
 
     #[test]
