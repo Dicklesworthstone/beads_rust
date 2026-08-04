@@ -71,7 +71,7 @@ fn create_issue_all_fields_populated() {
         source_system: None,
         source_repo: None,
         source_repo_path: None,
-        agent_context: None,
+        agent_context: Some(r#"{"workflow":"tdd"}"#.to_string()),
         deleted_at: None,
         deleted_by: None,
         delete_reason: None,
@@ -91,8 +91,18 @@ fn create_issue_all_fields_populated() {
         retrieved.description,
         Some("Detailed description".to_string())
     );
-    // Note: create_issue only stores basic fields; design, acceptance_criteria, notes
-    // require update_issue or upsert_issue_for_import for full field population
+    // The create transaction persists every populated field, including the
+    // governance fields settable via `br create` since #408.
+    assert_eq!(retrieved.design, Some("Technical design notes".to_string()));
+    assert_eq!(
+        retrieved.acceptance_criteria,
+        Some("Must pass all tests".to_string())
+    );
+    assert_eq!(retrieved.notes, Some("Additional notes".to_string()));
+    assert_eq!(
+        retrieved.agent_context,
+        Some(r#"{"workflow":"tdd"}"#.to_string())
+    );
     assert_eq!(retrieved.priority, Priority::HIGH);
     assert_eq!(retrieved.issue_type, IssueType::Feature);
     assert_eq!(retrieved.assignee, Some("alice".to_string()));

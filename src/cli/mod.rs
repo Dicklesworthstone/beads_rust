@@ -1119,6 +1119,22 @@ pub struct CreateArgs {
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Option<String>,
 
+    /// Acceptance criteria recorded on the initial issue (beads_rust#408).
+    // Markdown checklists routinely begin with a list marker ("- [ ] item"),
+    // which clap otherwise parses as an unknown flag.
+    #[arg(long, visible_alias = "acceptance", allow_hyphen_values = true)]
+    pub acceptance_criteria: Option<String>,
+
+    /// Set the initial `agent_context` governing-instructions JSON
+    /// (beads_rust#408).
+    ///
+    /// Accepts the same forms as `br update --agent-context`: inline JSON,
+    /// `@path/to/file.json`, or `@path/to/file.yaml` (normalized to JSON).
+    /// An empty string leaves the field unset. Invalid context is rejected
+    /// before any issue, event, or JSONL record is created.
+    #[arg(long = "agent-context")]
+    pub agent_context: Option<String>,
+
     /// Preview without creating
     #[arg(long)]
     pub dry_run: bool,

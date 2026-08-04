@@ -1291,7 +1291,7 @@ fn optional_string_field(value: Option<&str>) -> Option<Option<String>> {
 /// JSON through SQLite and then have the emission path discover the
 /// problem at agent claim time. (beads_rust#297)
 #[allow(clippy::option_option)]
-fn agent_context_update_from_arg(value: Option<&str>) -> Result<Option<Option<String>>> {
+pub(crate) fn agent_context_update_from_arg(value: Option<&str>) -> Result<Option<Option<String>>> {
     let Some(raw) = value else {
         return Ok(None);
     };

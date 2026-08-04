@@ -132,6 +132,7 @@ vergen-gix = { version = "10.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+flate2 = "1.1"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 walkdir = "2.5"

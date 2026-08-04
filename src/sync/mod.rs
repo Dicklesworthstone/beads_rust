@@ -19705,7 +19705,9 @@ mod tests {
 
         let finalization = capture_sync_merge_export_finalization_witness(&storage).unwrap();
         assert_eq!(finalization.dirty_issues.rows, 0);
-        assert_eq!(finalization.export_metadata.rows, 5);
+        // jsonl_content_hash, jsonl_mtime, jsonl_size, last_export_time,
+        // needs_flush, purged_ids_pending_export (#405).
+        assert_eq!(finalization.export_metadata.rows, 6);
         assert_eq!(
             finalization.export_hashes,
             sync_merge_export_hash_mapping_witness(&result.issue_hashes).unwrap()

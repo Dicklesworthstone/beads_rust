@@ -456,6 +456,13 @@ pub fn create_issue_impl(
 
     let due_at = parse_optional_date(args.due.as_deref())?;
     let defer_until = parse_optional_date(args.defer.as_deref())?;
+    // Parse/validate the governing agent context BEFORE any mutation so
+    // invalid context leaves no issue row, event, dirty marker, or JSONL
+    // record behind (beads_rust#408). Reuses the update parser so create and
+    // update accept identical forms (inline JSON, @file.json, @file.yaml,
+    // empty string). For create, "clear" and "absent" both mean NULL.
+    let initial_agent_context =
+        super::update::agent_context_update_from_arg(args.agent_context.as_deref())?.flatten();
     let id_resolver = IdResolver::new(ResolverConfig::with_prefix(config.id_config.prefix.clone()));
     let resolved_parent = args
         .parent
@@ -524,7 +531,7 @@ pub fn create_issue_impl(
             // Defaults
             content_hash: None,
             design: None,
-            acceptance_criteria: None,
+            acceptance_criteria: args.acceptance_criteria.clone(),
             notes: None,
             created_by: Some(config.actor.clone()),
             closed_at,
@@ -533,7 +540,7 @@ pub fn create_issue_impl(
             source_system: None,
             source_repo: config.source_repo.clone(),
             source_repo_path: config.source_repo_path.clone(),
-            agent_context: None,
+            agent_context: initial_agent_context.clone(),
             deleted_at,
             deleted_by: if deleted_at.is_some() {
                 Some(config.actor.clone())

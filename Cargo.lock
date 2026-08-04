@@ -357,6 +357,7 @@ dependencies = [
  "crossterm",
  "dunce",
  "fastmcp-rust",
+ "flate2",
  "fsqlite",
  "fsqlite-ast",
  "fsqlite-btree",
