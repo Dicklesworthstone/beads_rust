@@ -1663,6 +1663,29 @@ fn render_update_success_rich(
 mod tests {
     use super::*;
     use crate::output::OutputContext;
+    use std::env;
+    use tempfile::TempDir;
+
+    /// Restore the process working directory when a test that chdirs into an
+    /// isolated temp project finishes (tests hold `TEST_DIR_LOCK` while using
+    /// it, matching the sibling command test modules).
+    struct DirGuard {
+        previous: PathBuf,
+    }
+
+    impl DirGuard {
+        fn new(target: &Path) -> Self {
+            let previous = env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+            env::set_current_dir(target).expect("set current dir");
+            Self { previous }
+        }
+    }
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.previous);
+        }
+    }
 
     fn assert_unexpected_error(other: &BeadsError) {
         let message = format!("{other:?}");
