@@ -2,13 +2,21 @@ mod common;
 
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
+#[cfg(target_os = "linux")]
+use beads_rust::sync::{blocking_jsonl_family_write_lock_with_timeout, blocking_write_lock};
 use chrono::Utc;
 use common::cli::{
     BrRun, BrWorkspace, extract_json_payload, parse_json_value, parse_list_issues, run_br,
     run_br_smoke_at_root_with_env,
 };
 use common::isolated_workspace_failure_fixture;
+#[cfg(target_os = "linux")]
+use fsqlite::Connection;
+#[cfg(target_os = "linux")]
+use fsqlite_types::SqliteValue;
 use serde_json::Value;
+#[cfg(target_os = "linux")]
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
@@ -214,6 +222,258 @@ fn clear_br_env_for_std_command(cmd: &mut StdCommand) {
     }
 }
 
+/// GitHub #391: `br dep cycles` must agree with the add-time gate — a
+/// `related` edge accepted without a cycle check can never fail the cycle
+/// health report (which exits nonzero on active cycles since #368).
+#[test]
+fn e2e_dep_cycles_agrees_with_add_time_related_semantics() {
+    let _log = common::test_log("e2e_dep_cycles_agrees_with_add_time_related_semantics");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "cyc_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let mut ids: Vec<String> = Vec::new();
+    for title in ["epic E", "sub S", "grandchild E2", "H", "R", "A", "M"] {
+        let create = run_br(&workspace, ["create", title], "cyc_create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        ids.push(parse_created_id(&create.stdout));
+    }
+    let (epic, sub, grandchild, blocker_h, blocker_r, blocker_a, blocker_m) = (
+        &ids[0], &ids[1], &ids[2], &ids[3], &ids[4], &ids[5], &ids[6],
+    );
+    for (from, to, dep_type) in [
+        (sub, epic, "parent-child"),
+        (grandchild, sub, "parent-child"),
+        (blocker_h, epic, "blocks"),
+        (blocker_r, blocker_h, "blocks"),
+        (blocker_a, epic, "blocks"),
+        (blocker_m, blocker_a, "blocks"),
+    ] {
+        let add = run_br(
+            &workspace,
+            ["dep", "add", from, to, "--type", dep_type],
+            "cyc_dep_add",
+        );
+        assert!(add.status.success(), "dep add failed: {}", add.stderr);
+    }
+
+    // Documented containment rule: the descendant's blocks-edge back into a
+    // chain reaching the epic is rejected, and the hint explains that epic
+    // containment participates.
+    let rejected = run_br(
+        &workspace,
+        ["dep", "add", grandchild, blocker_r],
+        "cyc_rejected",
+    );
+    assert!(
+        !rejected.status.success(),
+        "containment-induced cycle must still reject: {}",
+        rejected.stdout
+    );
+    let combined = format!("{}{}", rejected.stdout, rejected.stderr);
+    assert!(
+        combined.contains("epic containment"),
+        "rejection hint must explain containment participation: {combined}"
+    );
+
+    // A `related` edge is accepted unchecked and must not fail the report.
+    let related = run_br(
+        &workspace,
+        ["dep", "add", grandchild, blocker_m, "--type", "related"],
+        "cyc_related",
+    );
+    assert!(
+        related.status.success(),
+        "related add failed: {}",
+        related.stderr
+    );
+    for args in [
+        vec!["dep", "cycles"],
+        vec!["dep", "cycles", "--blocking-only"],
+    ] {
+        let cycles = run_br(&workspace, args.clone(), "cyc_report");
+        assert!(
+            cycles.status.success(),
+            "{args:?} must exit 0 when the only 'cycle' is a related edge \
+             the add path allowed: {}{}",
+            cycles.stdout,
+            cycles.stderr
+        );
+    }
+}
+
+#[test]
+fn e2e_list_and_count_status_all_matches_every_status() {
+    let _log = common::test_log("e2e_list_and_count_status_all_matches_every_status");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "status_all_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    // One open, one in_progress, one closed issue.
+    let mut ids = Vec::new();
+    for title in ["Open one", "Working one", "Closed one"] {
+        let create = run_br(&workspace, ["create", title], "status_all_create");
+        assert!(create.status.success(), "create failed: {}", create.stderr);
+        ids.push(parse_created_id(&create.stdout));
+    }
+    let claim = run_br(
+        &workspace,
+        ["update", &ids[1], "--status", "in_progress"],
+        "status_all_claim",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+    let close = run_br(
+        &workspace,
+        ["close", &ids[2], "--reason", "done"],
+        "status_all_close",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    // `--status all` must return every issue (beads_rust-6ilv: it used to
+    // parse as the literal custom status "all" and silently match nothing).
+    let list = run_br(
+        &workspace,
+        ["list", "--status", "all", "--json"],
+        "status_all_list",
+    );
+    assert!(list.status.success(), "list failed: {}", list.stderr);
+    let issues = parse_list_issues(&list.stdout);
+    assert_eq!(
+        issues.len(),
+        3,
+        "--status all must match every status: {issues:?}"
+    );
+
+    let count = run_br(
+        &workspace,
+        ["count", "--status", "all", "--json"],
+        "status_all_count",
+    );
+    assert!(count.status.success(), "count failed: {}", count.stderr);
+    let count_json: Value =
+        serde_json::from_str(common::cli::extract_json_payload(&count.stdout).as_str())
+            .expect("count JSON");
+    let total = count_json
+        .get("count")
+        .or_else(|| count_json.get("total"))
+        .and_then(Value::as_u64)
+        .expect("count total");
+    assert_eq!(total, 3, "count --status all must match every status");
+
+    let search = run_br(
+        &workspace,
+        ["search", "one", "--status", "all", "--json"],
+        "status_all_search",
+    );
+    assert!(search.status.success(), "search failed: {}", search.stderr);
+    assert!(
+        search.stdout.contains(&ids[2]),
+        "search --status all must include closed issues: {}",
+        search.stdout
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn publication_temp_path_for_child(jsonl_path: &Path, child_pid: u32, attempt: u32) -> PathBuf {
+    if attempt == 0 {
+        return jsonl_path.with_extension(format!("jsonl.{child_pid}.tmp"));
+    }
+
+    let retry_suffix = u64::from(child_pid)
+        .saturating_mul(100)
+        .saturating_add(u64::from(attempt));
+    jsonl_path.with_extension(format!("jsonl.{retry_suffix}.tmp"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_sync_merge_with_exhausted_publication_names(
+    workspace: &BrWorkspace,
+    jsonl_path: &Path,
+    label: &str,
+) -> BrRun {
+    const PUBLICATION_NAME_ATTEMPTS: u32 = 64;
+
+    let beads_dir = workspace.root.join(".beads");
+    let write_lock =
+        blocking_write_lock(&beads_dir).expect("hold workspace write lock while arming fixture");
+
+    let mut cmd = StdCommand::new(assert_cmd::cargo::cargo_bin!("br"));
+    cmd.current_dir(&workspace.root);
+    cmd.args(["sync", "--merge", "--allow-external-jsonl", "--json"]);
+    clear_br_env_for_std_command(&mut cmd);
+    cmd.env("BR_HISTORY_MIN_INTERVAL_SECS", "0");
+    cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "beads_rust=debug");
+    cmd.env("RUST_BACKTRACE", "1");
+    cmd.env("HOME", &workspace.root);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    let start = std::time::Instant::now();
+    let child = cmd
+        .spawn()
+        .expect("spawn sync merge for publication denial");
+    let child_pid = child.id();
+    let marker = format!("reserved publication namespace for child {child_pid}\n");
+    let collision_paths = (0..PUBLICATION_NAME_ATTEMPTS)
+        .map(|attempt| publication_temp_path_for_child(jsonl_path, child_pid, attempt))
+        .collect::<Vec<_>>();
+    for collision_path in &collision_paths {
+        fs::write(collision_path, marker.as_bytes())
+            .expect("reserve PID-scoped publication namespace");
+    }
+
+    // The child can now acquire the workspace authority and commit its
+    // database transaction. Its subsequent atomic JSONL publication must
+    // exhaust the real create-new namespace rather than relying on Unix mode
+    // bits, which privileged RCH workers may legitimately bypass.
+    drop(write_lock);
+    let output = child
+        .wait_with_output()
+        .expect("collect interrupted sync merge");
+    let duration = start.elapsed();
+
+    let quarantine = workspace
+        .root
+        .join(format!("publication-collisions-{child_pid}"));
+    fs::create_dir_all(&quarantine).expect("create publication-collision quarantine");
+    for (attempt, collision_path) in collision_paths.iter().enumerate() {
+        assert_eq!(
+            fs::read(collision_path).expect("read preserved publication collision"),
+            marker.as_bytes(),
+            "merge changed a pre-existing publication collision at {}",
+            collision_path.display()
+        );
+        fs::rename(
+            collision_path,
+            quarantine.join(format!("{attempt}.collision")),
+        )
+        .expect("move publication collision aside for receipt resume");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let log_path = workspace.log_dir.join(format!("{label}.log"));
+    fs::write(
+        &log_path,
+        format!(
+            "label: {label}\nduration: {duration:?}\nstatus: {}\nchild_pid: {child_pid}\ncwd: {}\n\nstdout:\n{stdout}\n\nstderr:\n{stderr}\n",
+            output.status,
+            workspace.root.display()
+        ),
+    )
+    .expect("write publication-denial command log");
+
+    BrRun {
+        stdout,
+        stderr,
+        status: output.status,
+        duration,
+        log_path,
+    }
+}
+
 #[test]
 fn e2e_basic_lifecycle() {
     let _log = common::test_log("e2e_basic_lifecycle");
@@ -278,11 +538,14 @@ fn e2e_basic_lifecycle() {
         "show text missing title"
     );
 
+    // Terminal-state transitions must go through `br close` so close-policy
+    // (close-reason / AC / attribution) is enforced; `update --status closed`
+    // refuses by design (#301).
     let close_args = vec![
-        "update".to_string(),
+        "close".to_string(),
         id,
-        "--status".to_string(),
-        "closed".to_string(),
+        "--reason".to_string(),
+        "e2e lifecycle complete".to_string(),
     ];
     let close = run_br(&workspace, close_args, "close");
     assert!(close.status.success(), "close failed: {}", close.stderr);
@@ -360,7 +623,19 @@ fn e2e_update_description_file_preserves_exact_content() {
         "an empty file is an explicit empty-description update: {}",
         clear_to_empty.stdout
     );
-    assert_issue_description(&workspace, &issue_id, "");
+    // A cleared description reads back as null: the storage layer normalizes
+    // empty text to None on read (`get_non_empty_str`), so `Some("")` is
+    // unrepresentable after a round-trip. The contract under test is that the
+    // empty file CLEARS the previous description rather than being a no-op.
+    let show = run_br(&workspace, ["show", &issue_id, "--json"], "show_cleared");
+    assert!(show.status.success(), "show failed: {}", show.stderr);
+    let payload = extract_json_payload(&show.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("parse show json");
+    assert!(
+        issues[0]["description"].is_null(),
+        "description must be cleared to null, got: {}",
+        issues[0]["description"]
+    );
 }
 
 #[test]
@@ -674,6 +949,79 @@ fn e2e_update_claim_multiple_ids_is_all_or_nothing() {
         serde_json::from_str(&extract_json_payload(&show_second.stdout)).expect("show second json");
     assert_eq!(second_after[0]["status"].as_str(), Some("in_progress"));
     assert_eq!(second_after[0]["assignee"].as_str(), Some("bob"));
+}
+
+/// GitHub issue #393: the `--claim --json` echo must carry the resulting
+/// assignee so an agent can confirm the claim landed without a follow-up
+/// `br show`. The field is emitted unconditionally (null when unassigned) so
+/// "not claimed" and "not reported" stay distinguishable.
+#[test]
+fn e2e_update_claim_json_echo_reports_assignee() {
+    let _log = common::test_log("e2e_update_claim_json_echo_reports_assignee");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init_claim_echo_assignee");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "Claim echo target", "--json"],
+        "create_claim_echo_target",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create json");
+    let id = created["id"].as_str().expect("issue id").to_string();
+
+    let claim = run_br(
+        &workspace,
+        ["--actor", "testagent", "update", &id, "--claim", "--json"],
+        "claim_echo_assignee",
+    );
+    assert!(claim.status.success(), "claim failed: {}", claim.stderr);
+
+    let claimed: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&claim.stdout)).expect("claim echo json");
+    assert_eq!(claimed.len(), 1, "expected one updated issue in the echo");
+    assert_eq!(claimed[0]["id"].as_str(), Some(id.as_str()));
+    assert_eq!(claimed[0]["status"].as_str(), Some("in_progress"));
+    assert_eq!(
+        claimed[0]["assignee"].as_str(),
+        Some("testagent"),
+        "claim echo must report the resulting assignee: {}",
+        claim.stdout
+    );
+
+    // A non-claim update on an unassigned issue still carries the key, as
+    // an explicit null rather than an omitted field.
+    let create_plain = run_br(
+        &workspace,
+        ["create", "Unassigned target", "--json"],
+        "create_unassigned_target",
+    );
+    assert!(
+        create_plain.status.success(),
+        "create failed: {}",
+        create_plain.stderr
+    );
+    let plain: Value =
+        serde_json::from_str(&extract_json_payload(&create_plain.stdout)).expect("create json");
+    let plain_id = plain["id"].as_str().expect("issue id").to_string();
+
+    let bump = run_br(
+        &workspace,
+        ["update", &plain_id, "--priority", "1", "--json"],
+        "update_unassigned_priority",
+    );
+    assert!(bump.status.success(), "update failed: {}", bump.stderr);
+    let bumped: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&bump.stdout)).expect("update echo json");
+    assert!(
+        bumped[0].get("assignee").is_some(),
+        "assignee key must be present even when unassigned: {}",
+        bump.stdout
+    );
+    assert!(bumped[0]["assignee"].is_null());
 }
 
 #[test]
@@ -1090,6 +1438,796 @@ fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
+    let _log = common::test_log("e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_merge_resume_cutoff");
+    assert_br_success(&init, "merge-resume cutoff init");
+
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let base_path = beads_dir.join("beads.base.jsonl");
+    let external_dir = workspace.root.join("external-jsonl");
+    let jsonl_path = external_dir.join("issues.jsonl");
+    fs::create_dir_all(&external_dir).expect("create external JSONL directory");
+
+    // The tombstone expires twelve seconds after this fixture is created.
+    // That leaves comfortable headroom for the first merge to commit, while
+    // keeping the regression bounded: resume happens only after wall clock has
+    // crossed the exact one-day retention boundary.
+    let deleted_at = Utc::now() - chrono::Duration::days(1) + chrono::Duration::seconds(12);
+    let retention_boundary = deleted_at + chrono::Duration::days(1);
+    let mut storage = SqliteStorage::open(&db_path).expect("open merge-resume database");
+    let victim = make_issue(
+        "bd-resume-cutoff-victim",
+        "Deleted by the interrupted merge",
+        deleted_at,
+    );
+    storage
+        .create_issue(&victim, "merge-resume-fixture")
+        .expect("seed merge deletion victim");
+
+    let mut boundary_tombstone = make_issue(
+        "bd-resume-cutoff-boundary",
+        "Retained only at the receipt cutoff",
+        deleted_at,
+    );
+    boundary_tombstone.status = Status::Tombstone;
+    boundary_tombstone.updated_at = deleted_at;
+    boundary_tombstone.deleted_at = Some(deleted_at);
+    boundary_tombstone.deleted_by = Some("merge-resume-fixture".to_string());
+    boundary_tombstone.delete_reason = Some("retention boundary fixture".to_string());
+    boundary_tombstone.original_type = Some("task".to_string());
+    storage
+        .upsert_issue_for_import(&boundary_tombstone)
+        .expect("seed boundary tombstone");
+
+    let mut base_bytes = Vec::new();
+    beads_rust::sync::export_to_writer(&storage, &mut base_bytes)
+        .expect("export canonical merge base");
+    drop(storage);
+    fs::write(&base_path, &base_bytes).expect("write merge base");
+
+    let current_jsonl = std::str::from_utf8(&base_bytes)
+        .expect("canonical base is UTF-8")
+        .lines()
+        .filter(|line| {
+            let issue: Value = serde_json::from_str(line).expect("parse canonical base issue");
+            issue["id"].as_str() == Some(boundary_tombstone.id.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&jsonl_path, current_jsonl).expect("write external deletion generation");
+
+    let metadata_path = beads_dir.join("metadata.json");
+    let mut metadata: Value =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("read workspace metadata"))
+            .expect("parse workspace metadata");
+    metadata["jsonl_export"] = Value::String(jsonl_path.to_string_lossy().into_owned());
+    metadata["deletions_retention_days"] = Value::from(1_u64);
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize workspace metadata"),
+    )
+    .expect("route sync to external JSONL with one-day retention");
+
+    let interrupted = run_sync_merge_with_exhausted_publication_names(
+        &workspace,
+        &jsonl_path,
+        "merge_interrupted_after_database_commit",
+    );
+
+    let read_pending_receipt = || {
+        let connection =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open raw merge DB");
+        let rows = connection
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC",
+                &[SqliteValue::from("sync_merge_pending_v2")],
+            )
+            .expect("query pending merge receipt");
+        let receipt = rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_text)
+            .map(str::to_owned);
+        connection
+            .close()
+            .expect("close raw receipt-inspection connection");
+        receipt
+            .as_deref()
+            .map(|raw| serde_json::from_str::<Value>(raw).expect("parse pending merge receipt"))
+    };
+
+    assert!(
+        !interrupted.status.success(),
+        "post-commit publication interruption unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        interrupted.stdout,
+        interrupted.stderr
+    );
+    let failure_output = format!("{}\n{}", interrupted.stdout, interrupted.stderr);
+    assert!(
+        failure_output.contains("committed_unwitnessed")
+            || failure_output.contains("committed, but"),
+        "failure did not report the committed-but-unpublished path:\n{failure_output}"
+    );
+    assert!(
+        failure_output.contains("Failed to allocate pinned temporary export file"),
+        "failure was not the injected post-commit publication denial:\n{failure_output}"
+    );
+
+    let committed_receipt =
+        read_pending_receipt().expect("database commit must retain a resumable receipt");
+    assert_eq!(committed_receipt["phase"], "database_committed");
+    assert_eq!(committed_receipt["intent"]["retention_days"], 1);
+    assert_eq!(committed_receipt["jsonl_after_issue_count"], 2);
+    let receipt_id = committed_receipt["receipt_id"]
+        .as_str()
+        .expect("receipt ID")
+        .to_string();
+    let receipt_cutoff = chrono::DateTime::parse_from_rfc3339(
+        committed_receipt["intent"]["export_as_of"]
+            .as_str()
+            .expect("receipt export cutoff"),
+    )
+    .expect("parse receipt export cutoff")
+    .with_timezone(&Utc);
+    assert!(
+        retention_boundary - receipt_cutoff >= chrono::Duration::seconds(5),
+        "fixture did not leave deterministic pre-boundary headroom: cutoff={receipt_cutoff} boundary={retention_boundary}"
+    );
+
+    let storage = SqliteStorage::open(&db_path).expect("open committed merge database");
+    let persisted_boundary = storage
+        .get_issue(&boundary_tombstone.id)
+        .expect("read boundary tombstone")
+        .expect("boundary tombstone persists");
+    assert_eq!(persisted_boundary.deleted_at, Some(deleted_at));
+    assert!(
+        !persisted_boundary.is_expired_tombstone_at(Some(1), retention_boundary),
+        "strict retention boundary must still retain the tombstone"
+    );
+    assert!(
+        persisted_boundary.is_expired_tombstone_at(
+            Some(1),
+            retention_boundary + chrono::Duration::nanoseconds(1),
+        ),
+        "the first instant after the retention boundary must exclude the tombstone"
+    );
+    assert!(
+        !persisted_boundary.is_expired_tombstone_at(Some(1), receipt_cutoff),
+        "the receipt cutoff must retain the boundary tombstone"
+    );
+
+    let mut receipt_reviewed_bytes = Vec::new();
+    beads_rust::sync::export_to_writer(&storage, &mut receipt_reviewed_bytes)
+        .expect("reconstruct receipt-reviewed bytes from committed database");
+    drop(storage);
+    assert_eq!(
+        receipt_reviewed_bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count(),
+        committed_receipt["jsonl_after_issue_count"]
+            .as_u64()
+            .expect("receipt issue count") as usize
+    );
+    let reviewed_digest = Sha256::digest(&receipt_reviewed_bytes);
+    assert_eq!(
+        beads_rust::util::hex_encode(&reviewed_digest),
+        committed_receipt["jsonl_after_raw_sha256"]
+            .as_str()
+            .expect("receipt raw hash"),
+        "committed database must reproduce the exact receipt-reviewed bytes"
+    );
+
+    while Utc::now() <= retention_boundary {
+        sleep(Duration::from_millis(50));
+    }
+    assert!(
+        persisted_boundary.is_expired_tombstone(Some(1)),
+        "wall clock must cross the boundary before resume"
+    );
+
+    let resumed = run_br(
+        &workspace,
+        ["sync", "--merge", "--allow-external-jsonl", "--json"],
+        "resume_merge_with_persisted_cutoff",
+    );
+    assert!(
+        resumed.status.success(),
+        "receipt resume failed after wall clock crossed the boundary\nstdout:\n{}\nstderr:\n{}",
+        resumed.stdout,
+        resumed.stderr
+    );
+    let resumed_json: Value =
+        serde_json::from_str(&extract_json_payload(&resumed.stdout)).expect("parse resume output");
+    assert_eq!(resumed_json["status"], "resumed");
+    assert_eq!(resumed_json["receipt_id"], receipt_id);
+    assert_eq!(resumed_json["phase_before"], "database_committed");
+
+    let published_bytes = fs::read(&jsonl_path).expect("read resumed JSONL");
+    assert_eq!(
+        published_bytes, receipt_reviewed_bytes,
+        "resume must publish the exact bytes reviewed at the persisted receipt cutoff"
+    );
+    assert_eq!(
+        fs::read(&base_path).expect("read resumed base"),
+        published_bytes,
+        "terminal base must adopt the exact resumed JSONL generation"
+    );
+    assert!(
+        read_pending_receipt().is_none(),
+        "terminal adoption must clear the pending receipt"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses() {
+    let _log = common::test_log(
+        "e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses",
+    );
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_pending_file_mutation_gate");
+    assert_br_success(&init, "pending file-mutation gate init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Database title before interrupted merge"],
+        "create_pending_file_mutation_gate_issue",
+    );
+    assert_br_success(&create, "seed pending file-mutation gate issue");
+    let issue_id = parse_created_id(&create.stdout);
+    assert!(
+        !issue_id.is_empty(),
+        "pending file-mutation gate fixture did not report a created issue ID"
+    );
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "flush_pending_file_mutation_gate_issue",
+    );
+    assert_br_success(&flush, "flush pending file-mutation gate issue");
+
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let metadata_path = beads_dir.join("metadata.json");
+    let base_path = beads_dir.join("beads.base.jsonl");
+    let internal_jsonl_path = beads_dir.join("issues.jsonl");
+    let external_dir = workspace.root.join("external-jsonl");
+    let jsonl_path = external_dir.join("issues.jsonl");
+    let agents_path = workspace.root.join("AGENTS.md");
+    let user_config_path = workspace
+        .root
+        .join(".config")
+        .join("beads")
+        .join("config.yaml");
+
+    fs::write(
+        &agents_path,
+        b"# Workspace instructions\n\nPending-gate sentinel.\n",
+    )
+    .expect("seed AGENTS.md sentinel");
+    fs::copy(&internal_jsonl_path, &base_path).expect("seed merge base");
+    fs::create_dir_all(&external_dir).expect("create external JSONL directory");
+
+    let mut external_issue: Value = serde_json::from_slice(
+        &fs::read(&internal_jsonl_path).expect("read initial JSONL generation"),
+    )
+    .expect("parse initial JSONL issue");
+    external_issue["title"] = Value::String("JSONL title committed by merge".to_string());
+    external_issue["updated_at"] = Value::String("2999-01-01T00:00:00Z".to_string());
+    fs::write(
+        &jsonl_path,
+        format!(
+            "{}\n",
+            serde_json::to_string(&external_issue).expect("serialize changed external issue")
+        ),
+    )
+    .expect("write changed external JSONL generation");
+
+    let mut metadata: Value =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("read workspace metadata"))
+            .expect("parse workspace metadata");
+    metadata["jsonl_export"] = Value::String(jsonl_path.to_string_lossy().into_owned());
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize workspace metadata"),
+    )
+    .expect("route sync to external JSONL");
+
+    let interrupted = run_sync_merge_with_exhausted_publication_names(
+        &workspace,
+        &jsonl_path,
+        "install_database_committed_pending_receipt",
+    );
+
+    assert!(
+        !interrupted.status.success(),
+        "post-commit publication interruption unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        interrupted.stdout,
+        interrupted.stderr
+    );
+    let interruption_output = format!("{}\n{}", interrupted.stdout, interrupted.stderr);
+    assert!(
+        interruption_output.contains("committed_unwitnessed")
+            || interruption_output.contains("committed, but"),
+        "fixture did not stop after the database commit:\n{interruption_output}"
+    );
+    assert!(
+        interruption_output.contains("Failed to allocate pinned temporary export file"),
+        "fixture did not fail at the injected publication denial:\n{interruption_output}"
+    );
+
+    let read_pending_receipt = || {
+        let connection =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open raw merge DB");
+        let rows = connection
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC",
+                &[SqliteValue::from("sync_merge_pending_v2")],
+            )
+            .expect("query pending merge receipt");
+        let raw = rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_text)
+            .expect("pending merge receipt row")
+            .to_owned();
+        connection
+            .close()
+            .expect("close raw receipt-inspection connection");
+        let parsed = serde_json::from_str::<Value>(&raw).expect("parse pending merge receipt");
+        (raw, parsed)
+    };
+    let read_issue_witness = || {
+        let connection =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open raw merge DB");
+        let rows = connection
+            .query_with_params("SELECT id, title, status FROM issues ORDER BY id", &[])
+            .expect("query issue logical witness");
+        let witness = rows
+            .iter()
+            .map(|row| {
+                [
+                    row.get(0)
+                        .and_then(SqliteValue::as_text)
+                        .expect("issue ID")
+                        .to_owned(),
+                    row.get(1)
+                        .and_then(SqliteValue::as_text)
+                        .expect("issue title")
+                        .to_owned(),
+                    row.get(2)
+                        .and_then(SqliteValue::as_text)
+                        .expect("issue status")
+                        .to_owned(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        connection
+            .close()
+            .expect("close raw issue-inspection connection");
+        witness
+    };
+    let database_family_snapshot = || {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .map(|suffix| {
+                let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+                let bytes = match fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("read database-family member {}: {error}", path.display()),
+                };
+                (suffix, bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let (receipt_raw_before, receipt_before) = read_pending_receipt();
+    assert_eq!(receipt_before["schema_version"], 2);
+    assert_eq!(receipt_before["phase"], "database_committed");
+    let receipt_id = receipt_before["receipt_id"]
+        .as_str()
+        .expect("pending receipt ID")
+        .to_owned();
+    assert_eq!(
+        receipt_id.len(),
+        64,
+        "valid receipt ID must be a SHA-256 digest"
+    );
+    let issue_witness_before = read_issue_witness();
+    assert_eq!(
+        issue_witness_before,
+        vec![[
+            issue_id,
+            "JSONL title committed by merge".to_string(),
+            "open".to_string(),
+        ]],
+        "fixture must expose the database-committed logical poststate"
+    );
+
+    let database_family_before = database_family_snapshot();
+    let metadata_before = fs::read(&metadata_path).expect("read metadata baseline");
+    let agents_before = fs::read(&agents_path).expect("read AGENTS baseline");
+    let jsonl_before = fs::read(&jsonl_path).expect("read JSONL baseline");
+    let base_before = fs::read(&base_path).expect("read merge-base baseline");
+    assert!(
+        !user_config_path.exists(),
+        "fixture must begin without a user config so an ungated edit is observable"
+    );
+
+    let assert_refused = |action: &str, run: &BrRun| {
+        assert!(
+            !run.status.success(),
+            "{action} unexpectedly crossed the pending-merge gate\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr
+        );
+        let rendered = format!("{}\n{}", run.stdout, run.stderr);
+        assert!(
+            rendered.contains("Refusing non-merge mutation")
+                && rendered.contains("pending sync-merge state is valid")
+                && rendered.contains("phase=database_committed")
+                && rendered.contains(&receipt_id)
+                && rendered.contains("br sync --merge"),
+            "{action} returned the wrong refusal diagnostic:\n{rendered}"
+        );
+    };
+    let assert_unchanged = |action: &str| {
+        assert_eq!(
+            database_family_snapshot(),
+            database_family_before,
+            "{action} changed database-family bytes"
+        );
+        assert_eq!(
+            fs::read(&metadata_path).expect("read metadata after refusal"),
+            metadata_before,
+            "{action} changed workspace metadata bytes"
+        );
+        assert_eq!(
+            fs::read(&agents_path).expect("read AGENTS after refusal"),
+            agents_before,
+            "{action} changed AGENTS.md bytes"
+        );
+        assert_eq!(
+            fs::read(&jsonl_path).expect("read JSONL after refusal"),
+            jsonl_before,
+            "{action} changed the merge-owned JSONL generation"
+        );
+        assert_eq!(
+            fs::read(&base_path).expect("read merge base after refusal"),
+            base_before,
+            "{action} changed the merge-base generation"
+        );
+        assert!(
+            !user_config_path.exists(),
+            "{action} created the user config before receipt reconciliation"
+        );
+        let (receipt_raw_after, receipt_after) = read_pending_receipt();
+        assert_eq!(
+            receipt_raw_after, receipt_raw_before,
+            "{action} changed the exact pending-receipt row"
+        );
+        assert_eq!(
+            receipt_after, receipt_before,
+            "{action} changed the parsed pending-receipt witness"
+        );
+        assert_eq!(
+            read_issue_witness(),
+            issue_witness_before,
+            "{action} changed the committed issue poststate"
+        );
+    };
+
+    let config_edit = common::cli::run_br_with_env(
+        &workspace,
+        ["config", "edit"],
+        [("EDITOR", "true")],
+        "pending_gate_config_edit",
+    );
+    assert_refused("br config edit", &config_edit);
+    assert_unchanged("br config edit");
+
+    let agents_add = run_br(
+        &workspace,
+        ["agents", "--add", "--force"],
+        "pending_gate_agents_add",
+    );
+    assert_refused("br agents --add --force", &agents_add);
+    assert_unchanged("br agents --add --force");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human() {
+    let _log = common::test_log(
+        "e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human",
+    );
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_merge_capacity_warning");
+    assert_br_success(&init, "merge-capacity warning init");
+
+    let first_create = run_br(
+        &workspace,
+        ["create", "Receipt-bound soft-capacity transition"],
+        "create_receipt_bound_capacity_issue",
+    );
+    assert_br_success(&first_create, "create receipt-bound capacity issue");
+    let first_id = parse_created_id(&first_create.stdout);
+    assert!(
+        !first_id.is_empty(),
+        "receipt-bound capacity fixture did not report a created issue ID"
+    );
+    let first_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "flush_receipt_bound_capacity_issue",
+    );
+    assert_br_success(&first_flush, "flush receipt-bound capacity issue");
+
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let metadata_path = beads_dir.join("metadata.json");
+    let policy_path = beads_dir.join("policy.yaml");
+    let base_path = beads_dir.join("beads.base.jsonl");
+    let internal_jsonl_path = beads_dir.join("issues.jsonl");
+    let external_dir = workspace.root.join("external-jsonl");
+    let jsonl_path = external_dir.join("issues.jsonl");
+    fs::create_dir_all(&external_dir).expect("create external JSONL directory");
+    fs::copy(&internal_jsonl_path, &base_path).expect("seed merge base");
+    fs::copy(&internal_jsonl_path, &jsonl_path).expect("seed external JSONL");
+
+    fs::write(
+        &policy_path,
+        r"
+workflow:
+  statuses: [open, in_progress, in_review, closed]
+  capacity:
+    statuses:
+      in_progress:
+        soft: 1
+        hard: 2
+",
+    )
+    .expect("write in-progress soft-capacity policy");
+
+    let write_external_status = |issue_id: &str, status: &str| {
+        let mut values = read_jsonl_values(&jsonl_path);
+        let issue = values
+            .iter_mut()
+            .find(|issue| issue["id"].as_str() == Some(issue_id))
+            .unwrap_or_else(|| panic!("external JSONL lacks issue {issue_id}"));
+        issue["status"] = Value::String(status.to_string());
+        issue["updated_at"] = Value::String("2999-01-01T00:00:00Z".to_string());
+        let serialized = values
+            .iter()
+            .map(|issue| serde_json::to_string(issue).expect("serialize external issue"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&jsonl_path, serialized).expect("write changed external JSONL");
+    };
+    write_external_status(&first_id, "in_progress");
+
+    let mut metadata: Value =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("read workspace metadata"))
+            .expect("parse workspace metadata");
+    metadata["jsonl_export"] = Value::String(jsonl_path.to_string_lossy().into_owned());
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize workspace metadata"),
+    )
+    .expect("route sync to external JSONL");
+
+    // Force the real merge to stop after its database transaction has
+    // committed the warning-bearing receipt but before JSONL publication.
+    let interrupted = run_sync_merge_with_exhausted_publication_names(
+        &workspace,
+        &jsonl_path,
+        "interrupt_capacity_warning_after_database_commit",
+    );
+
+    assert!(
+        !interrupted.status.success(),
+        "warning-bearing merge unexpectedly published instead of interrupting\nstdout:\n{}\nstderr:\n{}",
+        interrupted.stdout,
+        interrupted.stderr
+    );
+    let interruption_output = format!("{}\n{}", interrupted.stdout, interrupted.stderr);
+    assert!(
+        interruption_output.contains("committed_unwitnessed")
+            || interruption_output.contains("committed, but"),
+        "fixture did not stop after the warning-bearing database commit:\n{interruption_output}"
+    );
+    assert!(
+        interruption_output.contains("Failed to allocate pinned temporary export file"),
+        "fixture did not fail at the injected publication denial:\n{interruption_output}"
+    );
+
+    let read_pending_receipt = || {
+        let connection =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open raw merge DB");
+        let rows = connection
+            .query_with_params(
+                "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC",
+                &[SqliteValue::from("sync_merge_pending_v2")],
+            )
+            .expect("query pending merge receipt");
+        let raw = rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_text)
+            .map(str::to_owned);
+        connection
+            .close()
+            .expect("close raw receipt-inspection connection");
+        raw.map(|raw| {
+            let parsed = serde_json::from_str::<Value>(&raw).expect("parse pending merge receipt");
+            (raw, parsed)
+        })
+    };
+    let (receipt_raw, committed_receipt) =
+        read_pending_receipt().expect("database commit must retain a warning-bearing receipt");
+    assert!(
+        receipt_raw.contains("\"capacity_warnings\""),
+        "exact raw receipt omitted capacity-warning evidence"
+    );
+    assert_eq!(committed_receipt["phase"], "database_committed");
+    let receipt_id = committed_receipt["receipt_id"]
+        .as_str()
+        .expect("pending receipt ID")
+        .to_owned();
+    let receipt_warnings = committed_receipt["capacity_warnings"]
+        .as_array()
+        .expect("receipt capacity warnings");
+    assert_eq!(
+        receipt_warnings.len(),
+        1,
+        "one kept transition must produce one receipt-bound warning"
+    );
+    let receipt_warning = &receipt_warnings[0];
+    assert_eq!(receipt_warning["issue_id"], first_id);
+    assert_eq!(receipt_warning["from_status"], "open");
+    assert_eq!(receipt_warning["to_status"], "in_progress");
+    assert_eq!(receipt_warning["capacity_kind"], "status");
+    assert_eq!(receipt_warning["capacity_name"], "in_progress");
+    assert_eq!(receipt_warning["scope"], "repository");
+    assert_eq!(receipt_warning["counting_mode"], "all");
+    assert_eq!(receipt_warning["current"], 0);
+    assert_eq!(receipt_warning["prospective"], 1);
+    assert_eq!(receipt_warning["soft_limit"], 1);
+    assert_eq!(receipt_warning["hard_limit"], 2);
+    assert_eq!(
+        receipt_warning["policy_path"],
+        "workflow.capacity.statuses.in_progress"
+    );
+    let exact_receipt_warnings = committed_receipt["capacity_warnings"].clone();
+
+    let resumed = run_br(
+        &workspace,
+        ["sync", "--merge", "--allow-external-jsonl", "--json"],
+        "resume_receipt_bound_capacity_warning",
+    );
+    assert!(
+        resumed.status.success(),
+        "warning-bearing receipt resume failed\nstdout:\n{}\nstderr:\n{}",
+        resumed.stdout,
+        resumed.stderr
+    );
+    let resumed_json: Value =
+        serde_json::from_str(&extract_json_payload(&resumed.stdout)).expect("parse resume JSON");
+    assert_eq!(resumed_json["status"], "resumed");
+    assert_eq!(resumed_json["receipt_id"], receipt_id);
+    assert_eq!(resumed_json["phase_before"], "database_committed");
+    assert_eq!(
+        resumed_json["warnings"], exact_receipt_warnings,
+        "machine output must replay the exact warning evidence bound into the committed receipt"
+    );
+    assert!(
+        read_pending_receipt().is_none(),
+        "successful warning-bearing resume must clear its receipt"
+    );
+
+    // Reuse the reconciled workspace for a second, independent soft-capacity
+    // transition so the human warning path is covered without duplicating the
+    // interruption fixture.
+    //
+    // Non-sync commands intentionally cannot opt into an external JSONL path.
+    // Route only this genuine CLI create through the internal JSONL, with both
+    // automatic import and export disabled, then restore the exact reviewed
+    // external route before the explicitly authorized flush.
+    let external_route_metadata =
+        fs::read(&metadata_path).expect("save exact external-route metadata");
+    let mut internal_route_metadata: Value =
+        serde_json::from_slice(&external_route_metadata).expect("parse external-route metadata");
+    internal_route_metadata["jsonl_export"] =
+        Value::String(internal_jsonl_path.to_string_lossy().into_owned());
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&internal_route_metadata)
+            .expect("serialize temporary internal-route metadata"),
+    )
+    .expect("temporarily route create to internal JSONL");
+    let second_create = run_br(
+        &workspace,
+        [
+            "create",
+            "Human soft-capacity transition",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "create_human_capacity_issue",
+    );
+    assert_br_success(&second_create, "create human capacity issue");
+    fs::write(&metadata_path, &external_route_metadata)
+        .expect("restore exact external-route metadata");
+    assert_eq!(
+        fs::read(&metadata_path).expect("verify restored external-route metadata"),
+        external_route_metadata,
+        "second-phase create did not restore the exact reviewed external route"
+    );
+    let second_id = parse_created_id(&second_create.stdout);
+    assert!(
+        !second_id.is_empty(),
+        "human capacity fixture did not report a created issue ID"
+    );
+    let second_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--allow-external-jsonl"],
+        "flush_human_capacity_issue",
+    );
+    assert_br_success(&second_flush, "flush human capacity issue");
+    fs::copy(&jsonl_path, &base_path).expect("refresh base before human merge");
+    fs::write(
+        &policy_path,
+        r"
+workflow:
+  statuses: [open, in_progress, in_review, closed]
+  capacity:
+    statuses:
+      in_review:
+        soft: 1
+        hard: 2
+",
+    )
+    .expect("write in-review soft-capacity policy");
+    write_external_status(&second_id, "in_review");
+
+    let human_merge = run_br(
+        &workspace,
+        ["sync", "--merge", "--allow-external-jsonl"],
+        "merge_human_capacity_warning",
+    );
+    assert!(
+        human_merge.status.success(),
+        "human warning merge failed\nstdout:\n{}\nstderr:\n{}",
+        human_merge.stdout,
+        human_merge.stderr
+    );
+    assert!(
+        human_merge.stdout.contains("Merge complete:")
+            && human_merge.stdout.contains("JSONL exported."),
+        "human merge success output is incomplete:\n{}",
+        human_merge.stdout
+    );
+    let human_warning = &human_merge.stderr;
+    assert!(
+        human_warning.contains(&format!(
+            "Warning: transitioned {second_id} from open to in_review"
+        )) && human_warning.contains("repository status capacity 'in_review'")
+            && human_warning.contains("current: 0, prospective: 1, soft: 1")
+            && human_warning.contains("workflow.capacity.statuses.in_review")
+            && human_warning.contains("Drain existing work before admitting more"),
+        "human merge omitted actionable soft-capacity evidence:\n{human_warning}"
+    );
+}
+
 #[test]
 fn e2e_no_db_read_write() {
     let workspace = BrWorkspace::new();
@@ -1157,6 +2295,107 @@ fn e2e_no_db_read_write() {
     assert!(
         updated.contains("No DB create"),
         "no-db create did not update JSONL"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_no_db_sync_jsonl_rewriters_lock_before_loading_the_snapshot() {
+    let _log = common::test_log("e2e_no_db_sync_jsonl_rewriters_lock_before_loading_the_snapshot");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_no_db_sync_lock");
+    assert_br_success(&init, "init failed");
+    let create = run_br(
+        &workspace,
+        ["create", "No-DB sync lock seed"],
+        "create_no_db_sync_lock",
+    );
+    assert_br_success(&create, "seed create failed");
+    let initial_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only"],
+        "initial_no_db_sync_lock_flush",
+    );
+    assert_br_success(&initial_flush, "initial flush failed");
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let valid_before = fs::read(&jsonl_path).expect("read JSONL before lock contention");
+    let authority = blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, Some(1_000))
+        .expect("hold cooperative JSONL-family authority");
+    let malformed = b"{ definitely-not-valid-json\n";
+    fs::write(&jsonl_path, malformed).expect("install malformed JSONL ordering witness");
+    authority
+        .verify_jsonl_authority()
+        .expect("in-place malformed witness must retain the held inode authority");
+
+    let mut modes = vec![vec!["sync", "--flush-only"], vec!["sync", "--merge"]];
+    for resolution in ["--force", "--force-db", "--force-jsonl"] {
+        modes.push(vec!["sync", "--merge", resolution]);
+    }
+    for (index, mode) in modes.into_iter().enumerate() {
+        let mut args = vec!["--no-db", "--lock-timeout", "25"];
+        args.extend(mode);
+        let run = run_br(
+            &workspace,
+            args,
+            &format!("contended_no_db_sync_mode_{index}"),
+        );
+        assert!(
+            !run.status.success(),
+            "contended no-DB JSONL rewriter unexpectedly succeeded: stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("JSONL-family write lock")
+                || run.stderr.contains("JSONL-family write authority"),
+            "the JSONL authority must fail before malformed snapshot parsing: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("Invalid JSON")
+                && !run.stderr.contains("invalid JSON")
+                && !run.stderr.contains("expected value"),
+            "snapshot parsing ran before JSONL authority acquisition: {}",
+            run.stderr
+        );
+        assert_eq!(
+            fs::read(&jsonl_path).expect("read JSONL after contended command"),
+            malformed,
+            "a contended no-DB sync mode must not rewrite the JSONL family"
+        );
+    }
+
+    authority
+        .verify_jsonl_authority()
+        .expect("held authority must remain valid after rejected competitors");
+    drop(authority);
+
+    let parse_after_release = run_br(
+        &workspace,
+        ["--no-db", "--lock-timeout", "1000", "sync", "--flush-only"],
+        "malformed_no_db_sync_after_authority_release",
+    );
+    assert!(
+        !parse_after_release.status.success(),
+        "malformed JSONL unexpectedly parsed after authority release"
+    );
+    assert!(
+        parse_after_release.stderr.contains("Invalid JSON")
+            || parse_after_release.stderr.contains("invalid JSON")
+            || parse_after_release.stderr.contains("expected value"),
+        "after authority release the malformed snapshot should reach parsing: {}",
+        parse_after_release.stderr
+    );
+    fs::write(&jsonl_path, &valid_before).expect("restore valid JSONL after ordering witness");
+    let successful_after_release = run_br(
+        &workspace,
+        ["--no-db", "--lock-timeout", "1000", "sync", "--flush-only"],
+        "valid_no_db_sync_after_authority_release",
+    );
+    assert_br_success(
+        &successful_after_release,
+        "valid no-DB flush failed after authority release",
     );
 }
 
@@ -1556,6 +2795,288 @@ fn e2e_sync_status_json() {
     let payload = extract_json_payload(&status.stdout);
     let status_json: Value = serde_json::from_str(&payload).expect("sync status json");
     assert!(status_json["dirty_count"].is_number());
+}
+
+#[test]
+fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_additive_reconciliation");
+    assert_br_success(&init, "additive reconciliation init");
+
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Database audit seed",
+            "--id",
+            "bd-db-seed",
+            "--no-auto-flush",
+        ],
+        "create_additive_database_seed",
+    );
+    assert_br_success(&create, "create additive database seed");
+    let create_db_only = run_br(
+        &workspace,
+        [
+            "create",
+            "Database-only preserved row",
+            "--id",
+            "bd-db-only",
+            "--no-auto-flush",
+        ],
+        "create_additive_database_only_row",
+    );
+    assert_br_success(
+        &create_db_only,
+        "create additive database-only preserved row",
+    );
+
+    let beads_dir = workspace.root.join(".beads");
+    let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let storage = SqliteStorage::open(&db_path).expect("open additive database before plan");
+    let database_seed = storage
+        .get_issue("bd-db-seed")
+        .expect("read database seed")
+        .expect("database seed exists");
+    let events_before = storage.get_all_events(0).expect("read events before plan");
+
+    let jsonl_only = make_issue("bd-jsonl-only", "JSONL-only recovery row", Utc::now());
+    let source = [&database_seed, &jsonl_only]
+        .into_iter()
+        .map(|issue| serde_json::to_string(issue).expect("serialize additive source issue"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&jsonl_path, source.as_bytes()).expect("write additive source JSONL");
+    let source_before = fs::read(&jsonl_path).expect("read additive source before plan");
+    let database_family_snapshot = || {
+        ["", "-wal", "-shm", "-journal"]
+            .into_iter()
+            .filter_map(|suffix| {
+                let path = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+                path.exists().then(|| {
+                    (
+                        path.file_name()
+                            .expect("database-family filename")
+                            .to_string_lossy()
+                            .into_owned(),
+                        fs::read(&path).expect("read database-family member"),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let database_family_before_plan = database_family_snapshot();
+
+    let plan = run_br(
+        &workspace,
+        ["sync", "--reconcile-additive", "--json"],
+        "sync_additive_plan",
+    );
+    assert!(
+        plan.status.success(),
+        "additive dry-run failed\nstdout:\n{}\nstderr:\n{}",
+        plan.stdout,
+        plan.stderr
+    );
+    let plan_json: Value = serde_json::from_str(&extract_json_payload(&plan.stdout))
+        .expect("parse additive dry-run receipt");
+    assert_eq!(plan_json["schema"], "br.sync.additive-reconciliation.v2");
+    assert_eq!(plan_json["status"], "ready");
+    assert_eq!(plan_json["source_issues"].as_u64(), Some(2));
+    assert_eq!(plan_json["created"].as_u64(), Some(1));
+    assert_eq!(plan_json["skipped_equal"].as_u64(), Some(1));
+    assert_eq!(plan_json["db_only_preserved"].as_u64(), Some(1));
+    assert_eq!(plan_json["deleted"].as_u64(), Some(0));
+    assert_eq!(plan_json["jsonl_written"], false);
+    assert!(plan_json["target_after"].is_null());
+    assert!(
+        plan_json["expected_target_after"].is_object(),
+        "dry-run must publish the complete expected typed poststate"
+    );
+    let reviewed_plan_sha256 = plan_json["plan_sha256"]
+        .as_str()
+        .expect("dry-run receipt plan_sha256")
+        .to_string();
+    assert_eq!(
+        database_family_snapshot(),
+        database_family_before_plan,
+        "dry-run must leave every existing database-family file byte-identical"
+    );
+
+    assert!(
+        storage
+            .get_issue("bd-jsonl-only")
+            .expect("probe JSONL-only issue after plan")
+            .is_none(),
+        "dry-run must not mutate the database"
+    );
+    assert_eq!(
+        storage.get_all_events(0).expect("events after dry-run"),
+        events_before,
+        "dry-run must not mutate the audit event stream"
+    );
+    drop(storage);
+    assert_eq!(
+        fs::read(&jsonl_path).expect("read JSONL after dry-run"),
+        source_before,
+        "dry-run must not rewrite JSONL"
+    );
+
+    let mismatched_apply = run_br(
+        &workspace,
+        vec![
+            "sync".to_string(),
+            "--reconcile-additive".to_string(),
+            "--apply".to_string(),
+            "--expect-plan-sha256".to_string(),
+            "0".repeat(64),
+            "--json".to_string(),
+        ],
+        "sync_additive_apply_mismatched_token",
+    );
+    assert!(
+        !mismatched_apply.status.success(),
+        "mismatched plan token must fail closed"
+    );
+    assert_eq!(
+        mismatched_apply.status.code(),
+        Some(6),
+        "stale reviewed tokens use the documented sync-conflict exit code"
+    );
+    assert_eq!(
+        database_family_snapshot(),
+        database_family_before_plan,
+        "stale-token rejection must preserve every existing database-family byte"
+    );
+    let storage =
+        SqliteStorage::open(&db_path).expect("open additive database after rejected apply");
+    assert!(
+        storage
+            .get_issue("bd-jsonl-only")
+            .expect("probe JSONL-only issue after rejected apply")
+            .is_none(),
+        "rejected apply must not create the planned issue"
+    );
+    assert_eq!(
+        storage
+            .get_all_events(0)
+            .expect("events after rejected apply"),
+        events_before
+    );
+    drop(storage);
+
+    let apply = run_br(
+        &workspace,
+        vec![
+            "sync".to_string(),
+            "--reconcile-additive".to_string(),
+            "--apply".to_string(),
+            "--expect-plan-sha256".to_string(),
+            reviewed_plan_sha256,
+            "--json".to_string(),
+        ],
+        "sync_additive_apply",
+    );
+    assert!(
+        apply.status.success(),
+        "additive apply failed\nstdout:\n{}\nstderr:\n{}",
+        apply.stdout,
+        apply.stderr
+    );
+    let apply_json: Value = serde_json::from_str(&extract_json_payload(&apply.stdout))
+        .expect("parse additive apply receipt");
+    assert_eq!(apply_json["status"], "applied");
+    assert_eq!(apply_json["created"].as_u64(), Some(1));
+    assert_eq!(apply_json["db_only_preserved"].as_u64(), Some(1));
+    assert_eq!(apply_json["deleted"].as_u64(), Some(0));
+    assert_eq!(apply_json["events_before"], apply_json["events_after"]);
+    assert_eq!(
+        apply_json["event_payload_sha256_before"],
+        apply_json["event_payload_sha256_after"]
+    );
+    assert_eq!(apply_json["cache_rebuild_performed"], true);
+    assert_eq!(
+        apply_json["export_hashes_updated"],
+        apply_json["export_hash_updates_planned"]
+    );
+    assert_eq!(
+        apply_json["dirty_markers_cleared"],
+        apply_json["dirty_markers_clear_planned"]
+    );
+    assert_eq!(apply_json["jsonl_written"], false);
+    assert_eq!(apply_json["base_snapshot_used"], false);
+    assert_eq!(apply_json["merge_note_written"], false);
+    assert_eq!(
+        apply_json["target_after"], plan_json["expected_target_after"],
+        "apply must land the complete poststate published by the reviewed dry-run"
+    );
+
+    let storage = SqliteStorage::open(&db_path).expect("open additive database after apply");
+    assert_eq!(
+        storage
+            .get_issue("bd-jsonl-only")
+            .expect("read recovered issue")
+            .expect("recovered issue exists")
+            .title,
+        jsonl_only.title
+    );
+    assert!(
+        storage
+            .get_issue("bd-db-seed")
+            .expect("read preserved database seed")
+            .is_some(),
+        "pre-existing database issue must be preserved"
+    );
+    assert!(
+        storage
+            .get_issue("bd-db-only")
+            .expect("read database-only issue")
+            .is_some(),
+        "database-only issue must be preserved"
+    );
+    assert_eq!(
+        storage.get_all_events(0).expect("events after apply"),
+        events_before,
+        "apply must preserve the audit event stream byte-for-byte"
+    );
+    drop(storage);
+    assert_eq!(
+        fs::read(&jsonl_path).expect("read JSONL after apply"),
+        source_before,
+        "apply must not rewrite its source JSONL"
+    );
+    assert!(!beads_dir.join("beads.base.jsonl").exists());
+    assert!(!beads_dir.join("merge.json").exists());
+
+    let idempotent_plan = run_br(
+        &workspace,
+        ["sync", "--reconcile-additive", "--json"],
+        "sync_additive_idempotent_plan",
+    );
+    assert!(
+        idempotent_plan.status.success(),
+        "idempotent additive plan failed\nstdout:\n{}\nstderr:\n{}",
+        idempotent_plan.stdout,
+        idempotent_plan.stderr
+    );
+    let idempotent_json: Value =
+        serde_json::from_str(&extract_json_payload(&idempotent_plan.stdout))
+            .expect("parse idempotent additive receipt");
+    assert_eq!(idempotent_json["status"], "no_changes");
+    assert_eq!(idempotent_json["created"].as_u64(), Some(0));
+    assert_eq!(idempotent_json["updated"].as_u64(), Some(0));
+    assert_eq!(idempotent_json["deleted"].as_u64(), Some(0));
+    assert_eq!(idempotent_json["metadata_update_planned"], false);
+    assert_eq!(
+        idempotent_json["export_hash_updates_planned"].as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        idempotent_json["dirty_markers_clear_planned"].as_u64(),
+        Some(0)
+    );
 }
 
 #[test]

@@ -58,6 +58,13 @@ static GRAPH_ROOT_LATER_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#",\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+""#)
         .expect("later graph-root usage hint regex")
 });
+/// `data_hash` is bv's content fingerprint of the beads data it read. It is a
+/// derived value, not part of the robot envelope's shape, and it changes on any
+/// fixture edit or bv hashing tweak — the same volatility class as
+/// `generated_at`, elapsed times, and scores, all of which are already masked.
+/// Freezing it adds no shape coverage and guarantees churn in every golden.
+static DATA_HASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#""data_hash"\s*:\s*"[^"]*""#).expect("data_hash regex"));
 static STALE_DAYS_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"No activity in \d+ days").expect("stale days regex"));
 static AGING_DAYS_RE: LazyLock<Regex> =
@@ -167,6 +174,9 @@ fn normalize_bv_robot_output(raw: &str) -> String {
     normalized = BV_VERSION_RE
         .replace_all(&normalized, r#""version":"BV_VERSION""#)
         .to_string();
+    normalized = DATA_HASH_RE
+        .replace_all(&normalized, r#""data_hash":"DATA_HASH""#)
+        .to_string();
     normalized = normalize_bv_usage_hints(&normalized);
     normalized = STALE_DAYS_RE
         .replace_all(&normalized, "No activity in DAYS days")
@@ -210,6 +220,17 @@ fn normalize_bv_robot_output_masks_semver_pseudo_versions() {
     assert_eq!(
         normalize_bv_robot_output(raw),
         r#"{"version":"BV_VERSION","id":"bd-one"}"#
+    );
+}
+
+#[test]
+fn normalize_bv_robot_output_masks_data_hash() {
+    let raw =
+        r#"{"generated_at":"2026-07-25T14:00:00Z","data_hash":"e81c9b30773152f2","id":"bd-one"}"#;
+
+    assert_eq!(
+        normalize_bv_robot_output(raw),
+        r#"{"generated_at": "TIMESTAMP","data_hash":"DATA_HASH","id":"bd-one"}"#
     );
 }
 

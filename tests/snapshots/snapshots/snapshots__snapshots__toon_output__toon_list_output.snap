@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/toon_output.rs
+assertion_line: 65
 expression: normalized
 ---
 issues[5]:
@@ -79,6 +80,6 @@ issues[5]:
     dependency_count: 0
     dependent_count: 0
 total: 5
-limit: 50
+limit: 0
 offset: 0
 has_more: false

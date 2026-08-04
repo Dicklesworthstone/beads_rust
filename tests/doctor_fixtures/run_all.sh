@@ -169,9 +169,18 @@ run_fixture() {
         fi
     fi
 
-    # Stage 2: detect-stage assertions.
-    if ! ( cd "$tmp" && "${doctor_env[@]}" bash "$assert_sh" "$tmp" detect ) \
-            > "$diag/detect.stdout" 2> "$diag/detect.stderr"; then
+    # Stage 2: detect-stage assertions. Exit code 3 is the fixture-skip
+    # protocol: the environment cannot hold the fixture's planted
+    # precondition (e.g. permission bits that do not bind for this uid on
+    # this host), which is not a product failure and must not read as one.
+    local detect_rc=0
+    ( cd "$tmp" && "${doctor_env[@]}" bash "$assert_sh" "$tmp" detect ) \
+            > "$diag/detect.stdout" 2> "$diag/detect.stderr" || detect_rc=$?
+    if [ "$detect_rc" -eq 3 ]; then
+        echo "[SKIP] $name: environment cannot hold the fixture precondition"
+        sed 's/^/  /' "$diag/detect.stderr"
+        return 2
+    elif [ "$detect_rc" -ne 0 ]; then
         echo "[FAIL] $name: detect stage failed" >&2
         sed 's/^/  /' "$diag/detect.stderr" >&2
         echo "  (workspace at $tmp)" >&2

@@ -9,7 +9,8 @@
 Before merging any PR that touches sync code, verify all checks pass:
 
 ```
-[ ] No git operations introduced
+[ ] Fail-closed sync authority scan passes
+[ ] Every sync mode passes the PATH-sentinel and exact .git snapshot matrix
 [ ] Path allowlist unchanged or documented
 [ ] All sync safety tests pass
 [ ] Logs reviewed for safety events
@@ -27,18 +28,38 @@ Before merging any PR that touches sync code, verify all checks pass:
 **Checks**:
 
 ```bash
-# Static check: no git subprocess calls
-grep -rn 'Command::new.*git' src/sync/ src/cli/commands/sync.rs
+# Structural check over both complete sync source boundaries. This fails on
+# missing/unreadable/non-UTF-8/symlinked/special source entries as well as direct
+# process authority, Git libraries, and delegation to the VCS adapter.
+cargo test --lib 'validation::tests::sync_safety_' -- --nocapture
 
-# Should return 0 results. Any git command invocation is a blocker.
+# Runtime check: every sync mode gets a fake `git` first on PATH and a
+# byte-exact, zero-exclusion .git tree comparison around the invocation.
+cargo test --test e2e_sync_git_safety \
+  e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation
 
-# Dependency check: no git libraries
-grep -E '^(git2|gitoxide|libgit)' Cargo.toml
+# Parsed direct-runtime dependency check (normal/target declarations, aliases,
+# malformed manifests, and non-table forms fail closed)
+cargo test --lib sync_safety_no_direct_runtime_git_library_dependencies
 
-# Should return 0 results.
+# Resolved transitive runtime closure (build/dev tooling is excluded)
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
+  rch --no-self-healing exec -- cargo tree -e normal --prefix none
 ```
 
-**If found**: STOP. Discuss with team before proceeding. The sync module must remain git-free.
+Fail closed if the runtime tree contains `git2-*`, `libgit2-*`, `gix-*`,
+`gitoxide-*`, or legacy `git-repository-*` authority packages. A clean direct
+manifest check alone does not prove this transitive closure.
+
+The structural scan deliberately treats matching text in comments and strings
+as a failure. This conservative false-positive boundary is acceptable
+maintenance friction: documentation can be reworded or moved outside the sync
+authority boundary, while skipping source regions would create an evasion
+surface. Whitespace is normalized so split-token formatting cannot bypass the
+check.
+
+**If either test fails**: STOP. The sync module must remain process- and
+VCS-authority-free.
 
 ---
 
@@ -58,6 +79,9 @@ grep -A20 'fn is_allowed_sync_file' src/sync/path.rs
 Verify the allowlist only includes:
 - `.beads/*.db` (SQLite database)
 - `.beads/*.db-wal`, `.beads/*.db-shm`, `.beads/*.db-journal` (SQLite sidecar files)
+- `.beads/*.db-fsqlite-ns-gate`, `.beads/*.db-fsqlite-ns-use` (fsqlite multi-process
+  namespace admission sidecars; the engine creates and updates these for every
+  database path it opens, so sync observes them alongside the classic trio)
 - `.beads/*.jsonl` (JSONL export)
 - `.beads/*.jsonl.tmp` (atomic write temp files)
 - `.beads/.manifest.json` (optional manifest)
@@ -81,10 +105,14 @@ cargo test --release
 cargo test sync:: --release
 
 # Run sync safety e2e tests
-cargo test e2e_sync --release
+cargo test --test e2e_sync_git_safety
+
+# Run the additive-reconcile suite (false-equal repair, event preservation,
+# dry-run zero-mutation, plan/apply witness rollback)
+cargo test --test e2e_sync_reconcile --release
 
 # Run with verbose output for debugging
-cargo test e2e_sync --release -- --nocapture
+cargo test --test e2e_sync_git_safety -- --nocapture
 ```
 
 **Expected results**:
@@ -104,7 +132,11 @@ cargo test e2e_sync --release -- --nocapture
 
 1. Enable verbose logging:
    ```bash
-   RUST_LOG=beads_rust=debug cargo test e2e_sync --release -- --nocapture 2>&1 | tee sync_test.log
+   RUST_LOG=beads_rust=debug cargo test --release \
+     --test e2e_sync_git_safety \
+     --test e2e_sync_status_health \
+     --test e2e_vcs_status \
+     -- --nocapture 2>&1 | tee sync_test.log
    ```
 
 2. Search for safety events:
@@ -141,6 +173,15 @@ cargo test e2e_sync --release -- --nocapture
 [ ] Test coverage section updated?
 ```
 
+**Reconcile-specific invariants** (when touching `--reconcile` code paths):
+```
+[ ] Deletion still structurally impossible (no delete/reset/tombstone-write calls)
+[ ] Apply still verifies event-table witness and rolls back on any event change
+[ ] Dry-run still opens no write transaction and writes no file
+[ ] Apply still writes no JSONL/base/manifest/history file
+[ ] Receipt schema version bumped if the receipt shape changed
+```
+
 ---
 
 ## Pre-Merge Verification Summary
@@ -148,14 +189,15 @@ cargo test e2e_sync --release -- --nocapture
 Run this final check before approving:
 
 ```bash
-# 1. Verify no git operations
-! grep -rn 'Command::new.*git' src/sync/ src/cli/commands/sync.rs
+# 1. Verify no process/VCS authority in either sync source boundary
+cargo test --lib 'validation::tests::sync_safety_' -- --nocapture
 
-# 2. Run full test suite
+# 2. Verify every sync mode under PATH sentinel + exact .git snapshot
+cargo test --test e2e_sync_git_safety \
+  e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation
+
+# 3. Run full test suite
 cargo test --release
-
-# 3. Specifically run sync safety tests
-cargo test e2e_sync --release
 
 # 4. Check for any test failures
 echo $?  # Should be 0
@@ -180,7 +222,9 @@ After merging sync changes:
 Escalate immediately if:
 
 - Any test containing `SAFETY VIOLATION` fails
-- `grep` finds git command invocations in sync code
+- The structural authority scan finds a forbidden construct or cannot inspect
+  the complete source boundary
+- The PATH sentinel is invoked or any `.git` byte/path changes
 - Path allowlist needs expansion beyond `.beads/`
 - User reports data loss or unexpected file modifications
 

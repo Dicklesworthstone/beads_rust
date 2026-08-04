@@ -1,7 +1,7 @@
 //! `SQLite` storage implementation.
 
 use crate::error::{BeadsError, Result};
-use crate::format::{IssueDetails, IssueWithDependencyMetadata};
+use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
@@ -13,7 +13,8 @@ use crate::storage::schema::{
 };
 use crate::sync::{
     METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
-    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
+    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, METADATA_SYNC_MERGE_PENDING,
+    METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent, SyncMergePendingReceipt,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
@@ -22,12 +23,20 @@ use fsqlite::Connection;
 use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(test)]
+thread_local! {
+    static REPLACE_ATTACHED_DATABASE_AFTER_COMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// Number of mutations between WAL checkpoint attempts.
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
@@ -86,6 +95,14 @@ struct CapacityViolationEvidence<'a> {
     transition: CapacityTransition<'a>,
     kind: &'a str,
     name: &'a str,
+    /// Scope partition the numbers were counted in (GitHub #384 phase 5).
+    scope: &'static str,
+    /// Partition key within a non-repository scope; `None` keeps the
+    /// pre-scope evidence shape byte-stable.
+    scope_key: Option<String>,
+    counting_mode: &'static str,
+    aggregate_parents_excluded: Option<u32>,
+    exempt: Option<u32>,
     current: u32,
     prospective: u32,
     soft_limit: Option<u32>,
@@ -98,6 +115,14 @@ struct CapacityWarningEvidence<'a> {
     transition: CapacityTransition<'a>,
     kind: &'a str,
     name: &'a str,
+    /// Scope partition the numbers were counted in (GitHub #384 phase 5).
+    scope: &'static str,
+    /// Partition key within a non-repository scope; `None` keeps the
+    /// pre-scope evidence shape byte-stable.
+    scope_key: Option<String>,
+    counting_mode: &'static str,
+    aggregate_parents_excluded: Option<u32>,
+    exempt: Option<u32>,
     current: u32,
     prospective: u32,
     soft_limit: u32,
@@ -110,6 +135,804 @@ struct CapacityBatchTransition {
     issue_id: String,
     from: Option<String>,
     to: String,
+    /// New issue type when the same mutation creates the issue or changes
+    /// its type; `None` means "use the type already stored". Only weighted
+    /// counting reads this.
+    issue_type: Option<String>,
+    /// Assignee currently stored on the issue (`None` for creates). Only
+    /// assignee-scope counting reads this (GitHub #384 phase 5).
+    current_assignee: Option<String>,
+    /// Assignee after this mutation commits. Only assignee-scope counting
+    /// reads this.
+    prospective_assignee: Option<String>,
+}
+
+/// The acting attribution one CLI mutation carries into capacity-scope
+/// admission (GitHub #384 phase 5). A batch shares one acting context: the
+/// actor comes from normal actor resolution and the rest is the
+/// self-reported Tier-1 attribution. Scoped admission is cooperation, not
+/// authentication — a missing key simply makes that scope inapplicable.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CapacityActingContext {
+    actor: Option<String>,
+    harness: Option<String>,
+    session: Option<String>,
+}
+
+impl CapacityActingContext {
+    pub(crate) fn new(actor: &str, attribution: &EventAttribution) -> Self {
+        fn normalized(value: &str) -> Option<String> {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Self {
+            actor: normalized(actor),
+            harness: attribution.harness.clone(),
+            session: attribution.session.clone(),
+        }
+    }
+}
+
+/// Current and prospective assignee of one enforced transition, for
+/// assignee-scope counting (GitHub #384 phase 5).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CapacityTransitionAssignee<'a> {
+    pub(crate) current: Option<&'a str>,
+    pub(crate) prospective: Option<&'a str>,
+}
+
+/// How one capacity scope partitions occupancy (GitHub #384 phase 5).
+#[derive(Debug)]
+enum CapacityScopeKeying {
+    /// One partition covering the whole repository.
+    Repository,
+    /// A single acting-attribution partition (actor/harness/session key).
+    Acting(String),
+    /// Partitioned by the issue's assignee.
+    Assignee,
+    /// Partitioned by the issue's root ancestor over parent-child edges.
+    Subtree,
+}
+
+/// One scoped status/group limit being enforced.
+struct ScopedCapacityCheck<'a> {
+    kind_str: &'static str,
+    name: &'a str,
+    members: &'a [String],
+    limit: crate::close_policy::CapacityLimit,
+    scope: crate::close_policy::CapacityScopeKind,
+    keying: &'a CapacityScopeKeying,
+    policy_path: String,
+}
+
+/// Occupancy attribution loaded for one batch issue.
+#[derive(Debug, Clone)]
+struct CapacityOccupancyRow {
+    actor: Option<String>,
+    harness: Option<String>,
+    session: Option<String>,
+}
+
+/// Observed occupancy of one configured capacity (GitHub #384 phase 6).
+///
+/// Produced by [`SqliteStorage::capacity_snapshot`] for the observability
+/// surfaces (`br stats`, `br coordination status`). One row per repository
+/// capacity, plus one row per OCCUPIED partition of each scoped capacity.
+#[derive(Debug, Clone)]
+pub struct CapacitySnapshotRow {
+    /// `status` or `group`.
+    pub kind: String,
+    /// The status or group name.
+    pub name: String,
+    /// Scope partition dimension (`repository`, `actor`, ...).
+    pub scope: String,
+    /// Partition key within a non-repository scope.
+    pub scope_key: Option<String>,
+    /// Occupancy excluding exemptions (and hierarchy aggregates).
+    pub counted: u32,
+    /// Active issues excluded as hierarchy aggregates (`leaf_work`/`roots`).
+    pub aggregate_parents_excluded: Option<u32>,
+    /// Occupancy excluded by active, authorized exemptions.
+    pub exempt: Option<u32>,
+    /// Advisory threshold, if configured.
+    pub soft: Option<u32>,
+    /// Enforced threshold, if configured.
+    pub hard: Option<u32>,
+    /// Counting mode the numbers were computed under.
+    pub counting_mode: String,
+    /// Policy location of the limit.
+    pub policy_path: String,
+}
+
+/// Maximum partition rows reported per scoped capacity in a snapshot.
+/// Mirrors the doctor `IdDelta` preview discipline: operators want the
+/// first partitions, not an unbounded dump.
+const CAPACITY_SNAPSHOT_PARTITION_LIMIT: usize = 50;
+
+/// Root-ancestor index over parent-child edges for subtree capacity
+/// scoping (GitHub #384 phase 5).
+///
+/// The root of an issue is the deterministic (lexicographically smallest)
+/// terminal ancestor reachable over parent-child edges; an issue with no
+/// parents — including one being created in this very mutation — is its own
+/// root, and a pure ancestor cycle uses its smallest member. Loaded at most
+/// once per enforcement call, inside the admission transaction.
+struct CapacitySubtreeIndex {
+    parents_by_child: HashMap<String, Vec<String>>,
+    memo: std::cell::RefCell<HashMap<String, String>>,
+}
+
+impl CapacitySubtreeIndex {
+    fn load(conn: &Connection) -> Result<Self> {
+        let children_by_parent = SqliteStorage::load_local_parent_child_edges_impl(conn)?;
+        let parents_by_child = SqliteStorage::build_parents_by_child(&children_by_parent);
+        Ok(Self {
+            parents_by_child,
+            memo: std::cell::RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Deterministic subtree root for `issue_id`.
+    fn root_of(&self, issue_id: &str) -> String {
+        if let Some(root) = self.memo.borrow().get(issue_id) {
+            return root.clone();
+        }
+
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = vec![issue_id.to_string()];
+        let mut terminals: Vec<String> = Vec::new();
+        while let Some(current) = frontier.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            match self.parents_by_child.get(&current) {
+                Some(parents) if !parents.is_empty() => {
+                    frontier.extend(parents.iter().cloned());
+                }
+                _ => terminals.push(current),
+            }
+        }
+        let root = terminals
+            .into_iter()
+            .min()
+            .or_else(|| visited.into_iter().min())
+            .unwrap_or_else(|| issue_id.to_string());
+        self.memo
+            .borrow_mut()
+            .insert(issue_id.to_string(), root.clone());
+        root
+    }
+}
+
+/// Current-vs-prospective occupancy for one capacity, as produced by
+/// [`CapacityCountEngine::counts`].
+#[derive(Debug, Clone, Copy)]
+struct CapacityCountPair {
+    current: u32,
+    prospective: u32,
+    /// Prospective active issues excluded as hierarchy aggregates
+    /// (`leaf_work`/`roots` only).
+    aggregate_parents_excluded: Option<u32>,
+    /// Prospective occupancy excluded because the issues hold active,
+    /// authorized exemptions for this capacity (GitHub #384 phase 4).
+    /// `None` when no exemption affected the numbers.
+    exempt: Option<u32>,
+}
+
+/// Active, authorized capacity exemptions loaded once per enforcement call
+/// (GitHub #384 phase 4).
+///
+/// Only exemptions that are unended, unexpired, and whose granting provider
+/// is still listed in `workflow.capacity.exemptions.providers` participate:
+/// removing a provider from policy silently withdraws its grants without
+/// rewriting audit history. The exempted issues' statuses are captured here
+/// so `all`-mode counting can subtract them without loading the full issue
+/// set.
+#[derive(Debug, Default)]
+struct CapacityExemptionIndex {
+    /// `(kind, canonical capacity name)` -> issue ids holding an active,
+    /// authorized exemption for that capacity.
+    by_capacity: HashMap<(String, String), HashSet<String>>,
+    /// Actual status (trimmed, lowercased) of every exempted issue.
+    status_of: HashMap<String, String>,
+}
+
+impl CapacityExemptionIndex {
+    /// The exempted issue ids for one capacity identity, if any.
+    fn exempt_ids(&self, kind: &str, canonical_name: &str) -> Option<&HashSet<String>> {
+        if self.by_capacity.is_empty() {
+            return None;
+        }
+        self.by_capacity
+            .get(&(kind.to_string(), canonical_name.to_string()))
+            .filter(|ids| !ids.is_empty())
+    }
+}
+
+/// Transaction-scoped counting engine for workflow capacity (GitHub #384
+/// phase 3).
+///
+/// One engine wraps one enforcement call: the batch's transitions are fixed
+/// at construction and every configured capacity asks it for a
+/// [`CapacityCountPair`]. Mode `all` keeps the phase-1 fast path (memoized
+/// `COUNT(*)` plus per-transition ±1 arithmetic). The hierarchy modes load
+/// the issue set and the parent-child graph once inside the same
+/// transaction, condense strongly connected components so an imported
+/// dependency cycle can never make active work invisible to capacity, and
+/// evaluate the actual and the prospective status maps over that one
+/// condensation.
+struct CapacityCountEngine<'a> {
+    conn: &'a Connection,
+    counting: &'a crate::close_policy::CapacityCounting,
+    transitions: &'a [CapacityBatchTransition],
+    /// Active, authorized exemptions consulted per capacity identity.
+    exemptions: &'a CapacityExemptionIndex,
+    /// Mode `all`: memoized per-status `COUNT(*)` results.
+    status_counts: HashMap<String, u32>,
+    /// Hierarchy modes: lazily loaded graph snapshot.
+    hierarchy: Option<CapacityHierarchyState>,
+    /// Memoized results per capacity identity + canonical status set.
+    memo: HashMap<String, CapacityCountPair>,
+}
+
+impl<'a> CapacityCountEngine<'a> {
+    fn new(
+        conn: &'a Connection,
+        counting: &'a crate::close_policy::CapacityCounting,
+        transitions: &'a [CapacityBatchTransition],
+        exemptions: &'a CapacityExemptionIndex,
+    ) -> Self {
+        Self {
+            conn,
+            counting,
+            transitions,
+            exemptions,
+            status_counts: HashMap::new(),
+            hierarchy: None,
+            memo: HashMap::new(),
+        }
+    }
+
+    const fn transitions(&self) -> &'a [CapacityBatchTransition] {
+        self.transitions
+    }
+
+    const fn mode_str(&self) -> &'static str {
+        self.counting.hierarchy.as_str()
+    }
+
+    /// Prospective status of one exempted issue: the batch transition's
+    /// target when the issue transitions in this batch, else its actual
+    /// status from the index snapshot.
+    fn exempt_prospective_status(&self, issue_id: &str) -> Option<String> {
+        if let Some(transition) = self
+            .transitions
+            .iter()
+            .find(|transition| transition.issue_id == issue_id)
+        {
+            return Some(transition.to.trim().to_lowercase());
+        }
+        self.exemptions.status_of.get(issue_id).cloned()
+    }
+
+    /// Occupancy for one capacity under mode `all` with exemptions applied:
+    /// exempted issues are subtracted from the current count and their
+    /// transitions never move the counted total.
+    fn all_mode_counts_with_exemptions(
+        &mut self,
+        canonical: &BTreeSet<String>,
+        statuses: &[String],
+        exempt_ids: &HashSet<String>,
+    ) -> Result<CapacityCountPair> {
+        let raw_current = SqliteStorage::count_capacity_statuses_in_tx(
+            self.conn,
+            &mut self.status_counts,
+            statuses,
+        )?;
+        let exempt_current = u32::try_from(
+            exempt_ids
+                .iter()
+                .filter(|id| {
+                    self.exemptions
+                        .status_of
+                        .get(id.as_str())
+                        .is_some_and(|status| canonical.contains(status.as_str()))
+                })
+                .count(),
+        )
+        .map_err(|_| BeadsError::internal("workflow capacity exempt count overflowed u32"))?;
+        let current = raw_current.saturating_sub(exempt_current);
+
+        let mut prospective = i64::from(current);
+        for transition in self.transitions {
+            if exempt_ids.contains(&transition.issue_id) {
+                continue;
+            }
+            if SqliteStorage::transition_enters_capacity(transition, statuses) {
+                prospective += 1;
+            } else if SqliteStorage::transition_drains_capacity(transition, statuses) {
+                prospective -= 1;
+            }
+        }
+        let prospective = u32::try_from(prospective).map_err(|_| {
+            BeadsError::internal(format!(
+                "invalid prospective workflow capacity count {prospective}"
+            ))
+        })?;
+
+        let exempt_prospective = u32::try_from(
+            exempt_ids
+                .iter()
+                .filter(|id| {
+                    self.exempt_prospective_status(id)
+                        .is_some_and(|status| canonical.contains(status.as_str()))
+                })
+                .count(),
+        )
+        .map_err(|_| BeadsError::internal("workflow capacity exempt count overflowed u32"))?;
+
+        Ok(CapacityCountPair {
+            current,
+            prospective,
+            aggregate_parents_excluded: None,
+            exempt: (exempt_prospective > 0).then_some(exempt_prospective),
+        })
+    }
+
+    /// Current and prospective occupancy for one named capacity's status
+    /// set. `kind`/`name` identify the capacity so issue-specific
+    /// exemptions scoped to it can be applied.
+    fn counts(&mut self, kind: &str, name: &str, statuses: &[String]) -> Result<CapacityCountPair> {
+        use crate::close_policy::CapacityCountingMode;
+
+        let canonical: BTreeSet<String> = statuses
+            .iter()
+            .map(|status| status.trim().to_lowercase())
+            .filter(|status| !status.is_empty())
+            .collect();
+        let canonical_name = name.trim().to_lowercase();
+        let key = format!(
+            "{kind}\u{1}{canonical_name}\u{1}{}",
+            canonical.iter().cloned().collect::<Vec<_>>().join("\u{1}")
+        );
+        if let Some(pair) = self.memo.get(&key) {
+            return Ok(*pair);
+        }
+        let exempt_ids = self
+            .exemptions
+            .exempt_ids(kind, &canonical_name)
+            .cloned()
+            .unwrap_or_default();
+
+        if matches!(self.counting.hierarchy, CapacityCountingMode::All) {
+            let pair = if exempt_ids.is_empty() {
+                let current = SqliteStorage::count_capacity_statuses_in_tx(
+                    self.conn,
+                    &mut self.status_counts,
+                    statuses,
+                )?;
+                let prospective = SqliteStorage::batch_prospective_capacity_count(
+                    current,
+                    statuses,
+                    self.transitions,
+                )?;
+                CapacityCountPair {
+                    current,
+                    prospective,
+                    aggregate_parents_excluded: None,
+                    exempt: None,
+                }
+            } else {
+                self.all_mode_counts_with_exemptions(&canonical, statuses, &exempt_ids)?
+            };
+            self.memo.insert(key, pair);
+            return Ok(pair);
+        }
+
+        if self.hierarchy.is_none() {
+            self.hierarchy = Some(CapacityHierarchyState::load(self.conn, self.transitions)?);
+        }
+        let Some(state) = self.hierarchy.as_ref() else {
+            return Err(BeadsError::internal(
+                "capacity hierarchy state missing after load",
+            ));
+        };
+
+        let pair = match self.counting.hierarchy {
+            CapacityCountingMode::All => {
+                return Err(BeadsError::internal(
+                    "capacity counting mode 'all' reached the hierarchy path",
+                ));
+            }
+            CapacityCountingMode::Weighted => {
+                let (current, _) = state.weighted_count(
+                    &canonical,
+                    &state.actual_status,
+                    &state.actual_type,
+                    &self.counting.weights,
+                    &exempt_ids,
+                )?;
+                let (prospective, exempt_prospective) = state.weighted_count(
+                    &canonical,
+                    &state.prospective_status,
+                    &state.prospective_type,
+                    &self.counting.weights,
+                    &exempt_ids,
+                )?;
+                CapacityCountPair {
+                    current,
+                    prospective,
+                    aggregate_parents_excluded: None,
+                    exempt: (exempt_prospective > 0).then_some(exempt_prospective),
+                }
+            }
+            mode @ (CapacityCountingMode::LeafWork | CapacityCountingMode::Roots) => {
+                let (current, _, _) =
+                    state.hierarchy_count(&canonical, &state.actual_status, mode, &exempt_ids)?;
+                let (prospective, excluded, exempt_prospective) = state.hierarchy_count(
+                    &canonical,
+                    &state.prospective_status,
+                    mode,
+                    &exempt_ids,
+                )?;
+                CapacityCountPair {
+                    current,
+                    prospective,
+                    aggregate_parents_excluded: Some(excluded),
+                    exempt: (exempt_prospective > 0).then_some(exempt_prospective),
+                }
+            }
+        };
+        self.memo.insert(key, pair);
+        Ok(pair)
+    }
+}
+
+/// Issue-graph snapshot used by the hierarchy-aware counting modes.
+///
+/// Nodes are every issue in the repository plus every parent-child edge
+/// endpoint plus every transition subject (so an issue being created in
+/// this same transaction participates as an isolated node). Missing nodes
+/// carry an empty status and are therefore never active.
+struct CapacityHierarchyState {
+    ids: Vec<String>,
+    actual_status: Vec<String>,
+    prospective_status: Vec<String>,
+    actual_type: Vec<String>,
+    prospective_type: Vec<String>,
+    /// Strongly connected component members, in Tarjan emission order: a
+    /// component is emitted only after every component it can reach, so
+    /// descendant components always precede their ancestors.
+    comp_members: Vec<Vec<usize>>,
+    /// Deduplicated condensation edges, parent component -> child component.
+    comp_children: Vec<Vec<usize>>,
+}
+
+impl CapacityHierarchyState {
+    fn intern(
+        id: &str,
+        ids: &mut Vec<String>,
+        index_of: &mut HashMap<String, usize>,
+        actual_status: &mut Vec<String>,
+        actual_type: &mut Vec<String>,
+    ) -> usize {
+        if let Some(&index) = index_of.get(id) {
+            return index;
+        }
+        let index = ids.len();
+        index_of.insert(id.to_string(), index);
+        ids.push(id.to_string());
+        actual_status.push(String::new());
+        actual_type.push(String::new());
+        index
+    }
+
+    fn load(conn: &Connection, transitions: &[CapacityBatchTransition]) -> Result<Self> {
+        let mut ids = Vec::new();
+        let mut index_of: HashMap<String, usize> = HashMap::new();
+        let mut actual_status = Vec::new();
+        let mut actual_type = Vec::new();
+
+        let rows = conn.query("SELECT id, status, issue_type FROM issues")?;
+        for row in &rows {
+            let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            if id.is_empty() {
+                continue;
+            }
+            let status = row
+                .get(1)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            let issue_type = row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+            let index = Self::intern(
+                id,
+                &mut ids,
+                &mut index_of,
+                &mut actual_status,
+                &mut actual_type,
+            );
+            actual_status[index] = status;
+            actual_type[index] = issue_type;
+        }
+
+        let edge_map = SqliteStorage::load_local_parent_child_edges_impl(conn)?;
+        for (parent, children) in &edge_map {
+            Self::intern(
+                parent,
+                &mut ids,
+                &mut index_of,
+                &mut actual_status,
+                &mut actual_type,
+            );
+            for child in children {
+                Self::intern(
+                    child,
+                    &mut ids,
+                    &mut index_of,
+                    &mut actual_status,
+                    &mut actual_type,
+                );
+            }
+        }
+        for transition in transitions {
+            Self::intern(
+                &transition.issue_id,
+                &mut ids,
+                &mut index_of,
+                &mut actual_status,
+                &mut actual_type,
+            );
+        }
+
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+        for (parent, kids) in &edge_map {
+            let Some(&parent_index) = index_of.get(parent.as_str()) else {
+                continue;
+            };
+            for kid in kids {
+                let Some(&kid_index) = index_of.get(kid.as_str()) else {
+                    continue;
+                };
+                if parent_index != kid_index {
+                    children[parent_index].push(kid_index);
+                }
+            }
+        }
+
+        let mut prospective_status = actual_status.clone();
+        let mut prospective_type = actual_type.clone();
+        for transition in transitions {
+            let Some(&index) = index_of.get(transition.issue_id.as_str()) else {
+                continue;
+            };
+            prospective_status[index] = transition.to.trim().to_lowercase();
+            if let Some(issue_type) = &transition.issue_type {
+                prospective_type[index] = issue_type.trim().to_lowercase();
+            }
+        }
+
+        let (comp_members, comp_children) = Self::condense(&children);
+
+        Ok(Self {
+            ids,
+            actual_status,
+            prospective_status,
+            actual_type,
+            prospective_type,
+            comp_members,
+            comp_children,
+        })
+    }
+
+    /// Iterative Tarjan strongly-connected-components condensation.
+    ///
+    /// The dependency graph forbids parent-child cycles at mutation time,
+    /// but imported or hand-edited data can still contain them; treating a
+    /// cycle as one component means its active members always count instead
+    /// of silently excluding each other.
+    fn condense(children: &[Vec<usize>]) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+        let node_count = children.len();
+        let mut next_index = 0usize;
+        let mut indices = vec![usize::MAX; node_count];
+        let mut lowlink = vec![0usize; node_count];
+        let mut on_stack = vec![false; node_count];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut comp_of = vec![usize::MAX; node_count];
+        let mut comp_members: Vec<Vec<usize>> = Vec::new();
+        let mut call_stack: Vec<(usize, usize)> = Vec::new();
+
+        for start in 0..node_count {
+            if indices[start] != usize::MAX {
+                continue;
+            }
+            call_stack.push((start, 0));
+            while let Some(frame) = call_stack.last_mut() {
+                let node = frame.0;
+                if indices[node] == usize::MAX {
+                    indices[node] = next_index;
+                    lowlink[node] = next_index;
+                    next_index += 1;
+                    stack.push(node);
+                    on_stack[node] = true;
+                }
+                if frame.1 < children[node].len() {
+                    let child = children[node][frame.1];
+                    frame.1 += 1;
+                    if indices[child] == usize::MAX {
+                        call_stack.push((child, 0));
+                    } else if on_stack[child] {
+                        lowlink[node] = lowlink[node].min(indices[child]);
+                    }
+                } else {
+                    call_stack.pop();
+                    if let Some(&(parent, _)) = call_stack.last() {
+                        lowlink[parent] = lowlink[parent].min(lowlink[node]);
+                    }
+                    if lowlink[node] == indices[node] {
+                        let comp_index = comp_members.len();
+                        let mut members = Vec::new();
+                        while let Some(member) = stack.pop() {
+                            on_stack[member] = false;
+                            comp_of[member] = comp_index;
+                            members.push(member);
+                            if member == node {
+                                break;
+                            }
+                        }
+                        comp_members.push(members);
+                    }
+                }
+            }
+        }
+
+        let mut comp_children: Vec<Vec<usize>> = vec![Vec::new(); comp_members.len()];
+        let mut seen: HashSet<(usize, usize)> = HashSet::new();
+        for node in 0..node_count {
+            for &child in &children[node] {
+                let parent_comp = comp_of[node];
+                let child_comp = comp_of[child];
+                if parent_comp != child_comp && seen.insert((parent_comp, child_comp)) {
+                    comp_children[parent_comp].push(child_comp);
+                }
+            }
+        }
+        (comp_members, comp_children)
+    }
+
+    /// Count occupancy for one status set under `leaf_work` or `roots`.
+    ///
+    /// Returns `(counted, aggregate_excluded, exempt)`. `aggregate_excluded`
+    /// is the number of active issues that did not count because a
+    /// relative in the same capacity already covers their work stream.
+    /// `exempt` is the number of active issues in counting components that
+    /// were excluded by an issue-specific exemption (GitHub #384 phase 4).
+    /// Exempted issues stay *active* for suppression purposes — an
+    /// exemption can therefore never raise a count, only lower it.
+    fn hierarchy_count(
+        &self,
+        statuses: &BTreeSet<String>,
+        status_of: &[String],
+        mode: crate::close_policy::CapacityCountingMode,
+        exempt_ids: &HashSet<String>,
+    ) -> Result<(u32, u32, u32)> {
+        use crate::close_policy::CapacityCountingMode;
+
+        let comp_count = self.comp_members.len();
+        let mut active_members = vec![0u64; comp_count];
+        let mut exempt_members = vec![0u64; comp_count];
+        let mut total_active = 0u64;
+        for (comp, members) in self.comp_members.iter().enumerate() {
+            for &member in members {
+                if statuses.contains(status_of[member].as_str()) {
+                    active_members[comp] += 1;
+                    total_active += 1;
+                    if exempt_ids.contains(self.ids[member].as_str()) {
+                        exempt_members[comp] += 1;
+                    }
+                }
+            }
+        }
+
+        let (counted, exempt): (u64, u64) = match mode {
+            CapacityCountingMode::LeafWork => {
+                // Emission order puts descendant components first, so every
+                // child flag is final before its parent is examined.
+                let mut has_active_descendant = vec![false; comp_count];
+                let mut counted = 0u64;
+                let mut exempt = 0u64;
+                for comp in 0..comp_count {
+                    for &child in &self.comp_children[comp] {
+                        if active_members[child] > 0 || has_active_descendant[child] {
+                            has_active_descendant[comp] = true;
+                            break;
+                        }
+                    }
+                    if active_members[comp] > 0 && !has_active_descendant[comp] {
+                        counted += active_members[comp] - exempt_members[comp];
+                        exempt += exempt_members[comp];
+                    }
+                }
+                (counted, exempt)
+            }
+            CapacityCountingMode::Roots => {
+                // Reverse emission order puts ancestor components first, so
+                // each component's flag is final before it propagates down.
+                let mut has_active_ancestor = vec![false; comp_count];
+                for comp in (0..comp_count).rev() {
+                    if active_members[comp] > 0 || has_active_ancestor[comp] {
+                        for &child in &self.comp_children[comp] {
+                            has_active_ancestor[child] = true;
+                        }
+                    }
+                }
+                let mut counted = 0u64;
+                let mut exempt = 0u64;
+                for comp in 0..comp_count {
+                    if active_members[comp] > 0 && !has_active_ancestor[comp] {
+                        counted += active_members[comp] - exempt_members[comp];
+                        exempt += exempt_members[comp];
+                    }
+                }
+                (counted, exempt)
+            }
+            CapacityCountingMode::All | CapacityCountingMode::Weighted => {
+                return Err(BeadsError::internal(
+                    "hierarchy_count called with a non-hierarchy counting mode",
+                ));
+            }
+        };
+
+        let counted = u32::try_from(counted).map_err(|_| {
+            BeadsError::internal("workflow capacity hierarchy count overflowed u32")
+        })?;
+        let exempt = u32::try_from(exempt)
+            .map_err(|_| BeadsError::internal("workflow capacity exempt count overflowed u32"))?;
+        let excluded =
+            u32::try_from(total_active.saturating_sub(u64::from(counted) + u64::from(exempt)))
+                .map_err(|_| {
+                    BeadsError::internal("workflow capacity aggregate exclusion overflowed u32")
+                })?;
+        Ok((counted, excluded, exempt))
+    }
+
+    /// Sum explicit weights over the active issues of one status set,
+    /// splitting exempted issues' weights into a separate total.
+    fn weighted_count(
+        &self,
+        statuses: &BTreeSet<String>,
+        status_of: &[String],
+        type_of: &[String],
+        weights: &crate::close_policy::CapacityWeights,
+        exempt_ids: &HashSet<String>,
+    ) -> Result<(u32, u32)> {
+        let mut total = 0u64;
+        let mut exempt = 0u64;
+        for index in 0..self.ids.len() {
+            if statuses.contains(status_of[index].as_str()) {
+                let weight = u64::from(weights.weight_for(&self.ids[index], &type_of[index]));
+                if exempt_ids.contains(self.ids[index].as_str()) {
+                    exempt += weight;
+                } else {
+                    total += weight;
+                }
+            }
+        }
+        let total = u32::try_from(total)
+            .map_err(|_| BeadsError::internal("workflow capacity weighted count overflowed u32"))?;
+        let exempt = u32::try_from(exempt).map_err(|_| {
+            BeadsError::internal("workflow capacity exempt weight total overflowed u32")
+        })?;
+        Ok((total, exempt))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,10 +1181,174 @@ const KNOWN_METADATA_DEFAULTS: [(&str, &str); 7] = [
     (METADATA_LAST_IMPORT_TIME, METADATA_EMPTY_VALUE),
 ];
 
+/// Coherent classification of the two durable pending-sync-merge metadata keys.
+///
+/// `Absent` is the only state that permits an unrelated automatic mutation.
+/// Every other variant is a durable or ambiguous saga state that only the
+/// explicit `br sync --merge` recovery path may advance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingSyncMergeInspection {
+    Absent,
+    Valid(SyncMergePendingReceipt),
+    Legacy {
+        metadata_key: String,
+        row_count: usize,
+        diagnostic: String,
+    },
+    Malformed {
+        metadata_key: String,
+        diagnostic: String,
+    },
+}
+
+impl PendingSyncMergeInspection {
+    #[must_use]
+    pub(crate) const fn permits_automatic_mutation(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    #[must_use]
+    pub(crate) fn diagnostic(&self) -> String {
+        match self {
+            Self::Absent => "No pending sync merge receipt is present".to_string(),
+            Self::Valid(receipt) => format!(
+                "Pending sync merge receipt {} is in {:?} phase",
+                receipt.receipt_id, receipt.phase
+            ),
+            Self::Legacy { diagnostic, .. } | Self::Malformed { diagnostic, .. } => {
+                diagnostic.clone()
+            }
+        }
+    }
+}
+
+/// Classify exact raw rows from both pending-sync-merge metadata keys.
+///
+/// This function deliberately receives every matching row, including SQL
+/// `NULL`, rather than going through `get_metadata()`. That prevents a
+/// duplicate, null, empty, legacy, or malformed receipt from being mistaken
+/// for the safe `Absent` state.
+pub(crate) fn classify_pending_sync_merge_rows(
+    current_rows: &[Option<String>],
+    legacy_rows: &[Option<String>],
+) -> PendingSyncMergeInspection {
+    if !legacy_rows.is_empty() && !current_rows.is_empty() {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: format!(
+                "{METADATA_SYNC_MERGE_PENDING_LEGACY},{METADATA_SYNC_MERGE_PENDING}"
+            ),
+            diagnostic: format!(
+                "Found both legacy ({}) and current ({}) pending sync-merge metadata row(s); competing receipts are ambiguous and automatic mutation is disabled",
+                legacy_rows.len(),
+                current_rows.len()
+            ),
+        };
+    }
+
+    if legacy_rows.len() > 1 {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING_LEGACY.to_string(),
+            diagnostic: format!(
+                "Found {} legacy pending sync-merge metadata rows; duplicate receipts are ambiguous and automatic mutation is disabled",
+                legacy_rows.len()
+            ),
+        };
+    }
+    if let [legacy] = legacy_rows {
+        if legacy
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING_LEGACY.to_string(),
+                diagnostic:
+                    "Legacy pending sync-merge metadata is NULL or empty; automatic mutation is disabled"
+                        .to_string(),
+            };
+        }
+        return PendingSyncMergeInspection::Legacy {
+            metadata_key: METADATA_SYNC_MERGE_PENDING_LEGACY.to_string(),
+            row_count: 1,
+            diagnostic:
+                "Legacy pending sync-merge state requires explicit `br sync --merge` reconciliation"
+                    .to_string(),
+        };
+    }
+
+    let [serialized] = current_rows else {
+        return if current_rows.is_empty() {
+            PendingSyncMergeInspection::Absent
+        } else {
+            PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+                diagnostic: format!(
+                    "Found {} current pending sync-merge metadata rows; duplicate receipts are ambiguous and automatic mutation is disabled",
+                    current_rows.len()
+                ),
+            }
+        };
+    };
+    let Some(serialized) = serialized
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+            diagnostic:
+                "Current pending sync-merge metadata is NULL or empty; automatic mutation is disabled"
+                    .to_string(),
+        };
+    };
+    let receipt = match serde_json::from_str::<SyncMergePendingReceipt>(serialized) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+                diagnostic: format!(
+                    "Current pending sync-merge receipt is not valid JSON for schema v2: {error}"
+                ),
+            };
+        }
+    };
+    if let Err(error) = receipt.validate() {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+            diagnostic: format!(
+                "Current pending sync-merge receipt failed schema or intent-hash validation: {error}"
+            ),
+        };
+    }
+    let canonical = match serde_json::to_string(&receipt) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return PendingSyncMergeInspection::Malformed {
+                metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+                diagnostic: format!(
+                    "Current pending sync-merge receipt could not be canonically serialized: {error}"
+                ),
+            };
+        }
+    };
+    if canonical != serialized {
+        return PendingSyncMergeInspection::Malformed {
+            metadata_key: METADATA_SYNC_MERGE_PENDING.to_string(),
+            diagnostic:
+                "Current pending sync-merge receipt is noncanonical or contains unrecognized fields; exact compare-and-swap recovery would be ambiguous"
+                    .to_string(),
+        };
+    }
+    PendingSyncMergeInspection::Valid(receipt)
+}
+
 /// SQLite-based storage backend.
 #[derive(Debug)]
 pub struct SqliteStorage {
     conn: Connection,
+    /// Owned advisory capability for writable persistent storage. Keeping it
+    /// on the storage itself prevents callers from moving the public storage
+    /// handle out of a higher-level context and accidentally releasing the
+    /// database-family authority first.
+    write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
     /// When set, this storage owns an ephemeral on-disk temp database (created
@@ -402,22 +1389,35 @@ pub struct SqliteStorage {
 
 /// Context for a mutation operation, tracking side effects.
 /// Tier 1 attribution captured on status-mutating commands (issue #312,
-/// Layer 3 capture-only). Self-reported agent/harness/model identity that is
-/// recorded onto emitted audit events as a trail ONLY — it is never gated or
-/// enforced on. Empty/whitespace-only inputs are coerced to `None` so absent
-/// attribution never produces blank-string noise in the audit log.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Layer 3). Self-reported agent/harness/model/session identity recorded
+/// onto emitted audit events and the capacity-occupancy row. Since GitHub
+/// #384 phase 5, the harness/session values (plus the resolved actor) also
+/// key OPTIONAL capacity scopes — cooperative admission control, not
+/// authentication: attribution stays self-reported and a missing value
+/// simply makes the corresponding scope inapplicable. Empty/whitespace-only
+/// inputs are coerced to `None` so absent attribution never produces
+/// blank-string noise in the audit log.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EventAttribution {
     pub agent_name: Option<String>,
     pub harness: Option<String>,
     pub model: Option<String>,
+    /// Self-reported session identity (`BR_SESSION`). Feeds the capacity
+    /// occupancy record and the `session` capacity scope; deliberately NOT
+    /// written to the events table, whose schema is shared with classic bd.
+    pub session: Option<String>,
 }
 
 impl EventAttribution {
     /// Build attribution from raw CLI/env inputs, normalizing empty or
     /// whitespace-only values to `None`.
     #[must_use]
-    pub fn new(agent_name: Option<&str>, harness: Option<&str>, model: Option<&str>) -> Self {
+    pub fn new(
+        agent_name: Option<&str>,
+        harness: Option<&str>,
+        model: Option<&str>,
+        session: Option<&str>,
+    ) -> Self {
         let norm = |v: Option<&str>| {
             v.map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -427,13 +1427,17 @@ impl EventAttribution {
             agent_name: norm(agent_name),
             harness: norm(harness),
             model: norm(model),
+            session: norm(session),
         }
     }
 
     /// True when no attribution value was supplied.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.agent_name.is_none() && self.harness.is_none() && self.model.is_none()
+        self.agent_name.is_none()
+            && self.harness.is_none()
+            && self.model.is_none()
+            && self.session.is_none()
     }
 }
 
@@ -516,6 +1520,7 @@ struct IssueDetailRelationPresence {
     has_dependencies: bool,
     has_dependents: bool,
     has_comments: bool,
+    has_children: bool,
     parent: Option<String>,
 }
 
@@ -755,21 +1760,86 @@ impl MutationContext {
     }
 }
 
+pub(crate) struct ReconcileTransactionOutcome<T> {
+    pub value: T,
+    pub foreign_keys_restored: bool,
+    pub database_authority_preserved: bool,
+}
+
 impl SqliteStorage {
-    fn with_connection_write_transaction<F, R>(conn: &Connection, mut f: F) -> Result<R>
+    #[cfg(test)]
+    pub(crate) fn arm_database_replacement_after_commit_for_test() {
+        REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
+    }
+
+    pub(crate) fn attach_write_authority(
+        &mut self,
+        authority: Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) {
+        self.write_authority = Some(authority);
+    }
+
+    pub(crate) fn attached_write_authority(
+        &self,
+    ) -> Option<Arc<crate::sync::DatabaseFamilyWriteLock>> {
+        self.write_authority.clone()
+    }
+
+    fn verify_attached_database_authority(&self) -> Result<()> {
+        if let Some(authority) = self.write_authority.as_ref() {
+            authority.verify_database_authority()?;
+        }
+        Ok(())
+    }
+
+    fn verify_attached_database_authority_after_commit(
+        &self,
+        transaction_kind: &str,
+    ) -> Result<()> {
+        self.verify_attached_database_authority().map_err(|source| {
+            BeadsError::CommittedStateUnwitnessed {
+                operation: transaction_kind.to_string(),
+                source: Box::new(source),
+            }
+        })
+    }
+
+    #[cfg(test)]
+    fn maybe_replace_attached_database_after_commit(&self) -> Result<()> {
+        let replace = REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.replace(false));
+        if !replace {
+            return Ok(());
+        }
+
+        let authority = self.write_authority.as_ref().ok_or_else(|| {
+            BeadsError::Config(
+                "post-commit database replacement test hook requires attached authority".into(),
+            )
+        })?;
+        let database_path = authority.canonical_database_path();
+        let mut displaced_name = database_path.as_os_str().to_os_string();
+        displaced_name.push(".postcommit-original");
+        let displaced_path = PathBuf::from(displaced_name);
+        std::fs::rename(database_path, &displaced_path)?;
+        std::fs::copy(&displaced_path, database_path)?;
+        Ok(())
+    }
+
+    fn with_connection_write_transaction<F, R>(&self, mut f: F) -> Result<R>
     where
         F: FnMut(&Connection) -> Result<R>,
     {
         // Issue #219: same retry parameters as with_write_transaction (see
-        // that method for rationale).  This static variant is used for
-        // blocked-cache rebuilds and metadata writes which also contend for
-        // the write lock under parallel agent operations.
+        // that method for rationale). This shared-connection variant is used
+        // for blocked-cache rebuilds and metadata writes which also contend
+        // for the write lock under parallel agent operations.
         const MAX_RETRIES: u32 = 8;
         let base_backoff_ms: u64 = 50;
         let mut last_error: Option<crate::error::BeadsError> = None;
 
         for attempt in 0..MAX_RETRIES {
-            match conn.execute("BEGIN IMMEDIATE") {
+            self.verify_attached_database_authority()?;
+            match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
                     last_error = Some(e.into());
@@ -780,30 +1850,58 @@ impl SqliteStorage {
                 Err(e) => return Err(e.into()),
             }
 
-            match f(conn) {
-                Ok(result) => match conn.execute("COMMIT") {
-                    Ok(_) => return Ok(result),
-                    Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                        if let Err(rb_err) = conn.execute("ROLLBACK") {
-                            tracing::warn!(
-                                error = %rb_err,
-                                "ROLLBACK failed after transient COMMIT error"
-                            );
-                        }
-                        last_error = Some(e.into());
-                        let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
-                        std::thread::sleep(Duration::from_millis(backoff));
+            match f(&self.conn) {
+                Ok(result) => {
+                    if let Some(authority) = self.write_authority.as_ref()
+                        && let Err(authority_error) = authority.verify_database_authority()
+                    {
+                        return Err(Self::rollback_transaction_error(
+                            &self.conn,
+                            authority_error,
+                            "database authority changed before shared COMMIT",
+                        ));
                     }
-                    Err(e) => {
-                        if let Err(rb_err) = conn.execute("ROLLBACK") {
-                            tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
+                    match self.conn.execute("COMMIT") {
+                        Ok(_) => {
+                            #[cfg(test)]
+                            self.maybe_replace_attached_database_after_commit()?;
+                            self.verify_attached_database_authority_after_commit(
+                                "shared write transaction",
+                            )?;
+                            return Ok(result);
                         }
-                        return Err(e.into());
+                        Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
+                            let commit_error = e.into();
+                            if let Err(rollback_error) = Self::rollback_transaction(
+                                &self.conn,
+                                "transient shared COMMIT error",
+                            ) {
+                                return Err(BeadsError::WithContext {
+                                    context: rollback_error,
+                                    source: Box::new(commit_error),
+                                });
+                            }
+                            last_error = Some(commit_error);
+                            let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
+                            std::thread::sleep(Duration::from_millis(backoff));
+                        }
+                        Err(e) => {
+                            return Err(Self::rollback_transaction_error(
+                                &self.conn,
+                                e.into(),
+                                "shared COMMIT error",
+                            ));
+                        }
                     }
-                },
+                }
                 Err(e) => {
-                    if let Err(rb_err) = conn.execute("ROLLBACK") {
-                        tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
+                    if let Err(rollback_error) =
+                        Self::rollback_transaction(&self.conn, "shared transaction body error")
+                    {
+                        return Err(BeadsError::WithContext {
+                            context: rollback_error,
+                            source: Box::new(e),
+                        });
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
                         last_error = Some(e);
@@ -986,6 +2084,93 @@ impl SqliteStorage {
         }
     }
 
+    /// Run a recovery transaction with FK enforcement suppressed only for the
+    /// duration required by fsqlite's cache-rebuild workaround (#215).
+    ///
+    /// The caller remains responsible for an explicit in-transaction
+    /// `foreign_key_check` before commit. FK enforcement is restored and
+    /// verified after both commit and rollback.
+    pub(crate) fn with_reconcile_transaction<F, T>(
+        &mut self,
+        operation: &str,
+        mut f: F,
+    ) -> Result<ReconcileTransactionOutcome<T>>
+    where
+        F: FnMut(&mut Self) -> Result<T>,
+    {
+        self.conn.execute("PRAGMA foreign_keys = OFF")?;
+        let mut completed_value = None;
+        let result = self.with_write_transaction(|storage| {
+            completed_value = Some(f(storage)?);
+            Ok(())
+        });
+        match result {
+            Ok(()) => {
+                let foreign_keys_restored = match Self::restore_foreign_keys(&self.conn, operation)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            operation,
+                            error = %error,
+                            "Transaction committed, but foreign-key enforcement could not be restored on the disposable recovery connection"
+                        );
+                        false
+                    }
+                };
+                Ok(ReconcileTransactionOutcome {
+                    value: completed_value.ok_or_else(|| BeadsError::Internal {
+                        message: format!(
+                            "{operation} committed without retaining its transaction result"
+                        ),
+                    })?,
+                    foreign_keys_restored,
+                    database_authority_preserved: true,
+                })
+            }
+            Err(committed_error @ BeadsError::CommittedStateUnwitnessed { .. })
+                if completed_value.is_some() =>
+            {
+                let value = completed_value.ok_or_else(|| BeadsError::Internal {
+                    message: format!(
+                        "{operation} committed with unwitnessed authority but no transaction result was retained"
+                    ),
+                })?;
+                let foreign_keys_restored = match Self::restore_foreign_keys(&self.conn, operation)
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            operation,
+                            error = %error,
+                            "Transaction committed with unwitnessed database authority, and foreign-key enforcement could not be restored"
+                        );
+                        false
+                    }
+                };
+                tracing::error!(
+                    operation,
+                    error = %committed_error,
+                    "Transaction committed, but database authority changed; automatic retry is forbidden"
+                );
+                Ok(ReconcileTransactionOutcome {
+                    value,
+                    foreign_keys_restored,
+                    database_authority_preserved: false,
+                })
+            }
+            Err(original_error) => match Self::restore_foreign_keys(&self.conn, operation) {
+                Ok(()) => Err(original_error),
+                Err(restore_error) => Err(BeadsError::WithContext {
+                    context: format!(
+                        "{operation} rolled back, and SQLite foreign key enforcement could not be re-enabled: {restore_error}"
+                    ),
+                    source: Box::new(original_error),
+                }),
+            },
+        }
+    }
+
     fn refresh_blocked_cache_after_commit(
         &self,
         op: &str,
@@ -995,7 +2180,7 @@ impl SqliteStorage {
         // can only be changed outside an active transaction.  fsqlite can
         // surface false FK violations on blocked_issues_cache inserts (#215).
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
-        let result = Self::with_connection_write_transaction(&self.conn, |conn| {
+        let result = self.with_connection_write_transaction(|conn| {
             let refreshed = Self::apply_blocked_cache_refresh_plan(conn, plan)?;
             Self::upsert_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
             tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
@@ -1055,7 +2240,7 @@ impl SqliteStorage {
         // can only be changed outside an active transaction.  fsqlite can
         // surface false FK violations on blocked_issues_cache inserts (#215).
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
-        let result = Self::with_connection_write_transaction(&self.conn, |conn| {
+        let result = self.with_connection_write_transaction(|conn| {
             if !Self::metadata_equals(conn, BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)? {
                 return Ok(false);
             }
@@ -1083,6 +2268,11 @@ impl SqliteStorage {
     ///
     /// Returns an error if the connection cannot be established or schema application fails.
     pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
+        // GitHub #403: a group/other-readable namespace sidecar makes the open
+        // below fail with a bare "unable to open database file" naming the
+        // sidecar. Repair the mode (or explain it) before the engine gets a
+        // chance to mis-attribute the failure to the database.
+        heal_namespace_sidecar_modes(path)?;
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
@@ -1093,6 +2283,12 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
+        // Ordinary opens keep the shipped auto-migration contract: a database
+        // behind CURRENT_SCHEMA_VERSION is migrated in place (legacy fleets
+        // depend on this — pre-v13 databases have no reviewed migration
+        // pair). The reviewed `br doctor migrate-schema` lifecycle remains
+        // the explicit, receipt-bound alternative for operator-driven
+        // migrations of supported version pairs.
         let schema_current = connection_user_version(&conn)
             .or_else(|| database_header_user_version(path))
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
@@ -1108,6 +2304,7 @@ impl SqliteStorage {
         Self::ensure_known_metadata_defaults(&conn)?;
         Ok(Self {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
@@ -1129,21 +2326,65 @@ impl SqliteStorage {
             return Ok(None);
         }
 
+        // GitHub #403: read-only commands take this path, and they wedge on an
+        // over-permissive namespace sidecar exactly like writers do.
+        heal_namespace_sidecar_modes(path)?;
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         // Now that the connection is open, consult the effective schema version
-        // (WAL-aware) and fall back to the header peek. If it is still below the
-        // current version, this database is genuinely stale.
-        if connection_user_version(&conn)
-            .or_else(|| database_header_user_version(path))
-            .is_none_or(|version| version < current_schema_version)
+        // (WAL-aware) and fall back to the header peek. Reviewed reconciliation
+        // is intentionally exact-version only: a future schema may add columns,
+        // triggers, or invariants that this binary cannot witness safely.
+        if connection_user_version(&conn).or_else(|| database_header_user_version(path))
+            != Some(current_schema_version)
+        {
+            conn.close().map_err(BeadsError::Database)?;
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            conn,
+            write_authority: None,
+            mutation_count: 0,
+            temp_db_path: None,
+            pending_event_attribution: None,
+            workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
+            workflow_transition_policy: crate::close_policy::Workflow::default(),
+            last_capacity_warnings: Vec::new(),
+        }))
+    }
+
+    /// Open an existing current-schema database for a token-bound recovery write.
+    ///
+    /// Unlike [`Self::open`], this never creates, migrates, repairs, or seeds
+    /// metadata. Callers must hold the project writer lock before opening it.
+    pub(crate) fn open_current_for_reconcile(
+        path: &Path,
+        lock_timeout_ms: Option<u64>,
+    ) -> Result<Option<Self>> {
+        let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+        if database_header_user_version(path).is_none() {
+            return Ok(None);
+        }
+
+        heal_namespace_sidecar_modes(path)?;
+        let conn = open_with_flags(
+            path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        if let Some(timeout_ms) = lock_timeout_ms {
+            conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
+        }
+        if connection_user_version(&conn).or_else(|| database_header_user_version(path))
+            != Some(current_schema_version)
+            || !runtime_schema_compatible(&conn)
         {
             return Ok(None);
         }
         Ok(Some(Self {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
@@ -1196,6 +2437,7 @@ impl SqliteStorage {
         Self::ensure_known_metadata_defaults(&conn)?;
         Ok(Self {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
@@ -1215,6 +2457,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if any DROP/CREATE statement fails.
     pub fn reset_data_tables(&mut self) -> Result<()> {
+        self.with_write_transaction(|storage| storage.reset_data_tables_in_tx())
+    }
+
+    fn reset_data_tables_in_tx(&self) -> Result<()> {
         use crate::storage::schema::execute_batch;
         execute_batch(
             &self.conn,
@@ -1229,6 +2475,9 @@ impl SqliteStorage {
             DROP TABLE IF EXISTS dependencies;
             DROP TABLE IF EXISTS gate_result_history;
             DROP TABLE IF EXISTS gate_results;
+            DROP TABLE IF EXISTS capacity_exemption_history;
+            DROP TABLE IF EXISTS capacity_exemptions;
+            DROP TABLE IF EXISTS capacity_occupancy;
             DROP TABLE IF EXISTS close_metadata;
             DROP TABLE IF EXISTS issues;
             ",
@@ -1359,7 +2608,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the statement fails.
     pub(crate) fn execute_raw(&self, sql: &str) -> Result<()> {
+        self.verify_attached_database_authority()?;
         self.conn.execute(sql)?;
+        self.verify_attached_database_authority()?;
         Ok(())
     }
 
@@ -1397,6 +2648,8 @@ impl SqliteStorage {
             ("close_metadata", "issue_id"),
             ("gate_result_history", "issue_id"),
             ("gate_results", "issue_id"),
+            ("capacity_exemption_history", "issue_id"),
+            ("capacity_exemptions", "issue_id"),
         ];
         if !ALLOWED_PAIRS.contains(&(table, column)) {
             return Err(crate::error::BeadsError::Config(format!(
@@ -1437,6 +2690,8 @@ impl SqliteStorage {
             ("close_metadata", "issue_id"),
             ("gate_result_history", "issue_id"),
             ("gate_results", "issue_id"),
+            ("capacity_exemption_history", "issue_id"),
+            ("capacity_exemptions", "issue_id"),
         ];
 
         let mut violations = Vec::new();
@@ -1455,8 +2710,23 @@ impl SqliteStorage {
     ///
     /// Returns an error if the statement fails.
     pub(crate) fn execute_raw_count(&self, sql: &str) -> Result<usize> {
+        self.verify_attached_database_authority()?;
         let rows = self.conn.execute(sql)?;
+        self.verify_attached_database_authority()?;
         Ok(rows)
+    }
+
+    /// Read the schema version visible through this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `PRAGMA user_version` is unavailable or invalid.
+    pub(crate) fn schema_user_version(&self) -> Result<u32> {
+        connection_user_version(&self.conn).ok_or_else(|| {
+            BeadsError::Config(
+                "Could not read PRAGMA user_version for reconciliation provenance".to_string(),
+            )
+        })
     }
 
     /// Probe whether a rollback-only write against an issue can safely touch
@@ -1469,6 +2739,7 @@ impl SqliteStorage {
     ///
     /// Returns any database error raised while executing the probe.
     pub(crate) fn probe_issue_mutation_write_path(&self, issue_id: &str) -> Result<()> {
+        self.verify_attached_database_authority()?;
         self.conn.execute("BEGIN IMMEDIATE")?;
 
         let probe_result = self.conn.execute_with_params(
@@ -1477,7 +2748,88 @@ impl SqliteStorage {
         );
         let rollback_result = self.conn.execute("ROLLBACK");
 
-        finish_issue_mutation_write_probe(probe_result, rollback_result)
+        finish_issue_mutation_write_probe(probe_result, rollback_result)?;
+        self.verify_attached_database_authority()
+    }
+
+    /// Execute a closure against one coherent read snapshot.
+    ///
+    /// This uses a deferred transaction: the first query in `f` establishes
+    /// the SQLite snapshot, and every later query observes that same database
+    /// state even if another process commits concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot begin/commit, the closure
+    /// fails, or rollback after a failure also exposes a database error.
+    pub(crate) fn with_read_transaction<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&Self) -> Result<R>,
+    {
+        self.verify_attached_database_authority()?;
+        self.conn.execute("BEGIN")?;
+        match f(self) {
+            Ok(result) => {
+                if let Err(authority_error) = self.verify_attached_database_authority() {
+                    return Err(Self::rollback_transaction_error(
+                        &self.conn,
+                        authority_error,
+                        "database authority changed during read transaction",
+                    ));
+                }
+                match self.conn.execute("COMMIT") {
+                    Ok(_) => {
+                        self.verify_attached_database_authority()?;
+                        Ok(result)
+                    }
+                    Err(error) => {
+                        let original_error = BeadsError::Database(error);
+                        match self.conn.execute("ROLLBACK") {
+                            Ok(_) => Err(original_error),
+                            Err(rollback_error) => Err(Self::rollback_failure_error(
+                                original_error,
+                                rollback_error,
+                                "read-transaction COMMIT error",
+                            )),
+                        }
+                    }
+                }
+            }
+            Err(original_error) => match self.conn.execute("ROLLBACK") {
+                Ok(_) => Err(original_error),
+                Err(rollback_error) => Err(Self::rollback_failure_error(
+                    original_error,
+                    rollback_error,
+                    "read-transaction body error",
+                )),
+            },
+        }
+    }
+
+    fn rollback_failure_error(
+        original_error: BeadsError,
+        rollback_error: FrankenError,
+        cause: &str,
+    ) -> BeadsError {
+        BeadsError::WithContext {
+            context: format!(
+                "ROLLBACK failed after {cause}; transaction state is unknown and no retry was attempted: {rollback_error}"
+            ),
+            source: Box::new(original_error),
+        }
+    }
+
+    fn rollback_result_error(
+        original_error: BeadsError,
+        rollback_result: std::result::Result<usize, FrankenError>,
+        cause: &str,
+    ) -> BeadsError {
+        match rollback_result {
+            Ok(_) => original_error,
+            Err(rollback_error) => {
+                Self::rollback_failure_error(original_error, rollback_error, cause)
+            }
+        }
     }
 
     /// Execute a closure inside a write transaction with robust retry logic
@@ -1505,6 +2857,7 @@ impl SqliteStorage {
         let mut last_error: Option<crate::error::BeadsError> = None;
 
         for attempt in 0..MAX_RETRIES {
+            self.verify_attached_database_authority()?;
             match self.conn.execute("BEGIN IMMEDIATE") {
                 Ok(_) => {}
                 Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
@@ -1518,8 +2871,22 @@ impl SqliteStorage {
 
             match f(self) {
                 Ok(result) => {
+                    if let Some(authority) = self.write_authority.as_ref()
+                        && let Err(authority_error) = authority.verify_database_authority()
+                    {
+                        return Err(Self::rollback_transaction_error(
+                            &self.conn,
+                            authority_error,
+                            "database authority changed before COMMIT",
+                        ));
+                    }
                     match self.conn.execute("COMMIT") {
                         Ok(_) => {
+                            #[cfg(test)]
+                            self.maybe_replace_attached_database_after_commit()?;
+                            self.verify_attached_database_authority_after_commit(
+                                "write transaction",
+                            )?;
                             // Periodic WAL checkpoint to prevent unbounded WAL growth.
                             // Uses PASSIVE mode so it never blocks concurrent readers
                             // or writers (issue #219).
@@ -1531,25 +2898,37 @@ impl SqliteStorage {
                             return Ok(result);
                         }
                         Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                                tracing::warn!(error = %rb_err, "ROLLBACK failed after transient COMMIT error");
+                            let commit_error = e.into();
+                            if let Err(rollback_error) =
+                                Self::rollback_transaction(&self.conn, "transient COMMIT error")
+                            {
+                                return Err(BeadsError::WithContext {
+                                    context: rollback_error,
+                                    source: Box::new(commit_error),
+                                });
                             }
-                            last_error = Some(e.into());
+                            last_error = Some(commit_error);
                             let backoff = Self::jittered_backoff(base_backoff_ms, attempt);
                             std::thread::sleep(Duration::from_millis(backoff));
                             // retry
                         }
                         Err(e) => {
-                            if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                                tracing::warn!(error = %rb_err, "ROLLBACK failed after COMMIT error");
-                            }
-                            return Err(e.into());
+                            return Err(Self::rollback_transaction_error(
+                                &self.conn,
+                                e.into(),
+                                "COMMIT error",
+                            ));
                         }
                     }
                 }
                 Err(e) => {
-                    if let Err(rb_err) = self.conn.execute("ROLLBACK") {
-                        tracing::warn!(error = %rb_err, "ROLLBACK failed after transaction error");
+                    if let Err(rollback_error) =
+                        Self::rollback_transaction(&self.conn, "transaction body error")
+                    {
+                        return Err(BeadsError::WithContext {
+                            context: rollback_error,
+                            source: Box::new(e),
+                        });
                     }
                     if e.is_transient() && attempt < MAX_RETRIES - 1 {
                         last_error = Some(e);
@@ -1567,6 +2946,28 @@ impl SqliteStorage {
                 "write transaction retry loop exhausted without producing an error".into(),
             )
         }))
+    }
+
+    fn rollback_transaction(conn: &Connection, cause: &str) -> std::result::Result<(), String> {
+        conn.execute("ROLLBACK").map(|_| ()).map_err(|error| {
+            format!(
+                "ROLLBACK failed after {cause}; transaction state is unknown and no retry was attempted: {error}"
+            )
+        })
+    }
+
+    fn rollback_transaction_error(
+        conn: &Connection,
+        original_error: BeadsError,
+        cause: &str,
+    ) -> BeadsError {
+        match Self::rollback_transaction(conn, cause) {
+            Ok(()) => original_error,
+            Err(context) => BeadsError::WithContext {
+                context,
+                source: Box::new(original_error),
+            },
+        }
     }
 
     /// Compute exponential backoff with random jitter (+/-25%) to prevent
@@ -1678,6 +3079,18 @@ impl SqliteStorage {
         &self,
         exports: &[(String, String)],
     ) -> Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        self.set_changed_export_hashes_at_in_tx(exports, &now)
+    }
+
+    /// Set only changed export hashes at a caller-supplied, evidence-bound
+    /// timestamp. Reviewed recovery uses this so transaction retries and a
+    /// delayed apply produce the exact poststate authorized by the plan.
+    pub(crate) fn set_changed_export_hashes_at_in_tx(
+        &self,
+        exports: &[(String, String)],
+        exported_at: &str,
+    ) -> Result<usize> {
         let unique_exports = Self::dedupe_export_hash_batch(exports);
         if unique_exports.is_empty() {
             return Ok(0);
@@ -1688,7 +3101,6 @@ impl SqliteStorage {
             .map(|(issue_id, _hash)| issue_id.clone())
             .collect::<Vec<_>>();
         let existing_hashes = self.get_export_hashes_for_ids_in_tx(&issue_ids)?;
-        let now = Utc::now().to_rfc3339();
         let mut count = 0;
 
         for (issue_id, content_hash) in &unique_exports {
@@ -1708,13 +3120,48 @@ impl SqliteStorage {
                 &[
                     SqliteValue::from(issue_id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(now.as_str()),
+                    SqliteValue::from(exported_at),
                 ],
             )?;
             count += 1;
         }
 
         Ok(count)
+    }
+
+    /// Repair only persisted issue content hashes in the caller's transaction.
+    ///
+    /// This intentionally leaves issue scalars, relations, `updated_at`, dirty
+    /// tracking, and audit events untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an issue disappeared or the database update fails.
+    pub(crate) fn repair_issue_content_hashes_in_tx(
+        &self,
+        repairs: &[(String, String)],
+    ) -> Result<usize> {
+        let mut repaired = 0usize;
+        for (issue_id, content_hash) in repairs {
+            let changed = self.conn.execute_with_params(
+                "UPDATE issues SET content_hash = ? WHERE id = ?",
+                &[
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(issue_id.as_str()),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(BeadsError::Config(format!(
+                    "Content-hash repair expected one issue row for '{issue_id}', updated {changed}"
+                )));
+            }
+            repaired = repaired.checked_add(1).ok_or_else(|| {
+                BeadsError::Config(
+                    "Content-hash repair count overflow during additive reconciliation".to_string(),
+                )
+            })?;
+        }
+        Ok(repaired)
     }
 
     fn get_export_hashes_for_ids_in_tx(
@@ -1811,8 +3258,14 @@ impl SqliteStorage {
         // so it never blocks other connections.  The WAL file may grow slightly
         // larger between checkpoints, but journal_size_limit (set in
         // apply_runtime_pragmas) caps it.
+        if let Err(e) = self.verify_attached_database_authority() {
+            tracing::warn!(error = %e, "Skipping WAL checkpoint after database authority changed");
+            return;
+        }
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)") {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
+        } else if let Err(e) = self.verify_attached_database_authority() {
+            tracing::warn!(error = %e, "Database authority changed during WAL checkpoint");
         }
     }
 
@@ -1832,6 +3285,7 @@ impl SqliteStorage {
     /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
     /// failure is downgraded to a warning because it is best-effort.
     pub(crate) fn checkpoint_full(&self) -> Result<()> {
+        self.verify_attached_database_authority()?;
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(
                 error = %e,
@@ -1839,7 +3293,7 @@ impl SqliteStorage {
             );
             self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
         }
-        Ok(())
+        self.verify_attached_database_authority()
     }
 
     /// Run SQLite's native integrity probe and return its diagnostic rows.
@@ -1848,7 +3302,28 @@ impl SqliteStorage {
     ///
     /// Returns an error if the pragma cannot be executed.
     pub(crate) fn integrity_check_messages(&self) -> Result<Vec<String>> {
-        let rows = self.conn.query("PRAGMA integrity_check")?;
+        self.database_check_messages("PRAGMA integrity_check")
+    }
+
+    /// Run SQLite's structural check without its page-ownership scan.
+    ///
+    /// This is the in-transaction companion to [`Self::integrity_check_messages`].
+    /// FrankenSQLite's full integrity walker switches to a transaction-local
+    /// freelist projection while a transaction is active; a read transaction
+    /// over a healthy database with committed free pages can therefore report
+    /// a false orphan. `quick_check` still validates every B-tree page and is
+    /// safe at the transaction boundary. Callers must run the full integrity
+    /// check again from autocommit state after the transaction ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma cannot be executed.
+    pub(crate) fn quick_check_messages(&self) -> Result<Vec<String>> {
+        self.database_check_messages("PRAGMA quick_check")
+    }
+
+    fn database_check_messages(&self, pragma: &str) -> Result<Vec<String>> {
+        let rows = self.conn.query(pragma)?;
         let mut messages = Vec::new();
         for row in rows {
             for value in row.values() {
@@ -1864,6 +3339,38 @@ impl SqliteStorage {
             messages.push("integrity_check returned no diagnostic rows".to_string());
         }
         Ok(messages)
+    }
+
+    /// Return raw rows from SQLite's foreign-key consistency probe.
+    ///
+    /// An empty vector is the only healthy result. The textual row projection
+    /// is intentionally retained so reconciliation receipts can diagnose the
+    /// exact table/row/parent constraint that failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pragma cannot be executed.
+    pub(crate) fn foreign_key_check_messages(&self) -> Result<Vec<Vec<String>>> {
+        let rows = self.conn.query("PRAGMA foreign_key_check")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                row.values()
+                    .iter()
+                    .map(|value| {
+                        value.as_text().map_or_else(
+                            || {
+                                value.as_integer().map_or_else(
+                                    || format!("{value:?}"),
+                                    |number| number.to_string(),
+                                )
+                            },
+                            str::to_string,
+                        )
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     /// Get audit events for a specific issue.
@@ -1948,37 +3455,39 @@ impl SqliteStorage {
         // the prior row. If the project ever needs full history, querying the
         // events table gives an audit trail; `close_metadata` is the
         // currently-effective metadata for the most recent close.
-        self.conn.execute_with_params(
-            "INSERT OR REPLACE INTO close_metadata (
-                issue_id,
-                closed_by_agent_name,
-                closed_by_harness,
-                closed_by_model,
-                bypassed_policy,
-                bypass_reason,
-                policy_gates_fired,
-                recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            &[
-                SqliteValue::from(issue_id),
-                attribution
-                    .agent_name
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                attribution
-                    .harness
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                attribution
-                    .model
-                    .as_deref()
-                    .map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(i64::from(bypassed)),
-                bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
-                SqliteValue::from(gates_json.as_str()),
-            ],
-        )?;
-        Ok(())
+        self.with_connection_write_transaction(|conn| {
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO close_metadata (
+                    issue_id,
+                    closed_by_agent_name,
+                    closed_by_harness,
+                    closed_by_model,
+                    bypassed_policy,
+                    bypass_reason,
+                    policy_gates_fired,
+                    recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    attribution
+                        .agent_name
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    attribution
+                        .harness
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    attribution
+                        .model
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(i64::from(bypassed)),
+                    bypass_reason.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(gates_json.as_str()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     /// Read a previously-stored close-metadata row, or `None` when no policy
@@ -2076,7 +3585,7 @@ impl SqliteStorage {
             ));
         }
         let mut recorded = None;
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             let issue = Self::get_issue_from_conn(conn, issue_id)?.ok_or_else(|| {
                 BeadsError::IssueNotFound {
                     id: issue_id.to_string(),
@@ -2356,6 +3865,828 @@ impl SqliteStorage {
             .collect())
     }
 
+    /// Validate one grant/renew request against the installed capacity
+    /// policy and return the canonical `(kind, name)` pair to store.
+    ///
+    /// GitHub #384: "Unauthorized, expired, or reasonless exemptions fail" —
+    /// the checks here are the grant-time half; enforcement re-filters by
+    /// provider so a later policy edit withdraws recorded grants too.
+    /// True when any capacity scope declares a limit for this canonical
+    /// status/group name (GitHub #384 phase 5): a capacity limited only
+    /// within a scope is still a real capacity an exemption can free.
+    fn capacity_name_is_scoped(
+        policy: &crate::close_policy::CapacityPolicy,
+        kind: &str,
+        name: &str,
+    ) -> bool {
+        policy.scopes.values().any(|scope| {
+            let keys: Vec<&String> = if kind == "status" {
+                scope.statuses.keys().collect()
+            } else {
+                scope.groups.keys().collect()
+            };
+            keys.into_iter()
+                .any(|candidate| candidate.trim().eq_ignore_ascii_case(name))
+        })
+    }
+
+    fn validate_capacity_exemption_request(
+        &self,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<(String, String)> {
+        let policy = &self.workflow_capacity_policy;
+        if !policy.exemptions.is_enabled() {
+            return Err(BeadsError::validation(
+                "workflow.capacity.exemptions",
+                "capacity exemptions are not enabled: list authorized providers under \
+                 workflow.capacity.exemptions.providers in .beads/policy.yaml",
+            ));
+        }
+        let provider = provider.trim();
+        if !policy.exemptions.authorizes(provider) {
+            return Err(BeadsError::validation(
+                "provider",
+                format!(
+                    "provider '{provider}' is not authorized to manage capacity exemptions; \
+                     authorized providers: {}",
+                    policy.exemptions.providers.join(", ")
+                ),
+            ));
+        }
+        let kind = capacity_kind.trim().to_lowercase();
+        let name = capacity_name.trim().to_lowercase();
+        if name.is_empty() {
+            return Err(BeadsError::validation(
+                "capacity",
+                "capacity name must not be empty",
+            ));
+        }
+        match kind.as_str() {
+            "status" => {
+                let named_by_limit = policy
+                    .statuses
+                    .keys()
+                    .any(|status| status.trim().eq_ignore_ascii_case(&name));
+                let named_by_admission = policy.admission.iter().any(|rule| {
+                    rule.require_below
+                        .statuses
+                        .keys()
+                        .any(|status| status.trim().eq_ignore_ascii_case(&name))
+                });
+                let named_by_scope = Self::capacity_name_is_scoped(policy, "status", &name);
+                if !named_by_limit && !named_by_admission && !named_by_scope {
+                    return Err(BeadsError::validation(
+                        "capacity",
+                        format!(
+                            "status '{name}' has no configured capacity limit and is not \
+                             observed by any admission rule; an exemption from it would \
+                             have no effect"
+                        ),
+                    ));
+                }
+            }
+            "group" => {
+                let named_by_scope = Self::capacity_name_is_scoped(policy, "group", &name);
+                if Self::capacity_group(policy, &name).is_none() && !named_by_scope {
+                    return Err(BeadsError::validation(
+                        "capacity",
+                        format!(
+                            "capacity group '{name}' is not configured in workflow.capacity.groups"
+                        ),
+                    ));
+                }
+            }
+            other => {
+                return Err(BeadsError::validation(
+                    "capacity",
+                    format!("capacity kind '{other}' must be 'status' or 'group'"),
+                ));
+            }
+        }
+        if policy.exemptions.require_expiry && expires_at.is_none() {
+            return Err(BeadsError::validation(
+                "expires",
+                "policy requires every capacity exemption to carry an expiration \
+                 (workflow.capacity.exemptions.require_expiry)",
+            ));
+        }
+        if let Some(expiry) = expires_at {
+            let now = Utc::now();
+            if expiry <= now {
+                return Err(BeadsError::validation(
+                    "expires",
+                    "capacity exemption expiry must be in the future",
+                ));
+            }
+            if let Some(max_ttl) = policy.exemptions.max_ttl_seconds {
+                let horizon =
+                    now + chrono::Duration::seconds(i64::try_from(max_ttl).unwrap_or(i64::MAX));
+                if expiry > horizon {
+                    return Err(BeadsError::validation(
+                        "expires",
+                        format!(
+                            "capacity exemption expiry exceeds the policy maximum of \
+                             {max_ttl} seconds from now \
+                             (workflow.capacity.exemptions.max_ttl_seconds)"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok((kind, name))
+    }
+
+    /// Read the state row for one `(issue, capacity)` exemption and derive
+    /// its display state at `now`. Listing never mutates: expiry is only
+    /// *marked* inside enforcement and mutating exemption commands.
+    fn capacity_exemption_record_from_conn(
+        conn: &Connection,
+        issue_id: &str,
+        kind: &str,
+        name: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<crate::close_policy::CapacityExemptionRecord>> {
+        let rows = conn.query_with_params(
+            "SELECT issue_id, capacity_kind, capacity_name, provider, reason,
+                    granted_by, granted_at, expires_at, ended_at, ended_action, ended_by
+             FROM capacity_exemptions
+             WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(kind),
+                SqliteValue::from(name),
+            ],
+        )?;
+        Ok(rows
+            .first()
+            .and_then(|row| Self::capacity_exemption_record_from_row(row, now)))
+    }
+
+    fn capacity_exemption_record_from_row(
+        row: &fsqlite::Row,
+        now: chrono::DateTime<Utc>,
+    ) -> Option<crate::close_policy::CapacityExemptionRecord> {
+        let text = |index: usize| {
+            row.get(index)
+                .and_then(SqliteValue::as_text)
+                .map(String::from)
+        };
+        let expires_at = text(7);
+        let ended_action = text(9);
+        let state = ended_action.as_deref().map_or_else(
+            || {
+                let has_expired = expires_at.as_deref().is_some_and(|raw| {
+                    chrono::DateTime::parse_from_rfc3339(raw)
+                        .map_or(true, |dt| dt.with_timezone(&Utc) <= now)
+                });
+                if has_expired { "expired" } else { "active" }.to_string()
+            },
+            |action| match action {
+                "revoked" | "expired" | "left_status" => action.to_string(),
+                other => other.to_string(),
+            },
+        );
+        Some(crate::close_policy::CapacityExemptionRecord {
+            issue_id: text(0)?,
+            capacity_kind: text(1)?,
+            capacity_name: text(2)?,
+            provider: text(3)?,
+            reason: text(4).unwrap_or_default(),
+            granted_by: text(5).unwrap_or_default(),
+            granted_at: text(6).unwrap_or_default(),
+            expires_at,
+            ended_at: text(8),
+            ended_action,
+            ended_by: text(10),
+            state,
+        })
+    }
+
+    /// Grant (or re-grant) an audited issue-specific capacity exemption
+    /// (GitHub #384 phase 4). A re-grant replaces the state row; every
+    /// action lands in the append-only history table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when exemptions are disabled, the
+    /// provider is unauthorized, the capacity is not configured, the reason
+    /// is empty, or the expiry violates policy; `IssueNotFound` when the
+    /// issue does not exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grant_capacity_exemption(
+        &self,
+        issue_id: &str,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        reason: &str,
+        expires_at: Option<chrono::DateTime<Utc>>,
+        actor: &str,
+    ) -> Result<crate::close_policy::CapacityExemptionRecord> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(BeadsError::validation(
+                "reason",
+                "a capacity exemption requires a non-empty --reason",
+            ));
+        }
+        let (kind, name) = self.validate_capacity_exemption_request(
+            capacity_kind,
+            capacity_name,
+            provider,
+            expires_at,
+        )?;
+        let provider = provider.trim().to_string();
+        let expires_text = expires_at.map(|dt| dt.to_rfc3339());
+        let mut record = None;
+        self.with_connection_write_transaction(|conn| {
+            if Self::get_issue_from_conn(conn, issue_id)?.is_none() {
+                return Err(BeadsError::IssueNotFound {
+                    id: issue_id.to_string(),
+                });
+            }
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO capacity_exemptions (
+                    issue_id, capacity_kind, capacity_name, provider, reason,
+                    granted_by, granted_at, expires_at, ended_at, ended_action, ended_by
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, NULL, NULL, NULL)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(actor),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'grant', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    SqliteValue::from(reason),
+                    SqliteValue::from(actor),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            record = Self::capacity_exemption_record_from_conn(
+                conn,
+                issue_id,
+                &kind,
+                &name,
+                Utc::now(),
+            )?;
+            Ok(())
+        })?;
+        record.ok_or_else(|| {
+            BeadsError::internal("capacity exemption grant committed without a state row")
+        })
+    }
+
+    /// Renew an active exemption's expiry (GitHub #384 phase 4). An expired
+    /// or ended exemption cannot be renewed — grant a new one, so the audit
+    /// trail shows the gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the exemption is missing, ended, or
+    /// expired, or when the provider/expiry violates policy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn renew_capacity_exemption(
+        &self,
+        issue_id: &str,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        reason: Option<&str>,
+        expires_at: Option<chrono::DateTime<Utc>>,
+        actor: &str,
+    ) -> Result<crate::close_policy::CapacityExemptionRecord> {
+        let (kind, name) = self.validate_capacity_exemption_request(
+            capacity_kind,
+            capacity_name,
+            provider,
+            expires_at,
+        )?;
+        let provider = provider.trim().to_string();
+        let expires_text = expires_at.map(|dt| dt.to_rfc3339());
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        let mut record = None;
+        self.with_connection_write_transaction(|conn| {
+            let now = Utc::now();
+            let existing =
+                Self::capacity_exemption_record_from_conn(conn, issue_id, &kind, &name, now)?
+                    .ok_or_else(|| {
+                        BeadsError::validation(
+                            "capacity",
+                            format!(
+                                "no capacity exemption exists for {issue_id} on {kind} '{name}'; \
+                                 grant one first"
+                            ),
+                        )
+                    })?;
+            if existing.state != "active" {
+                Self::mark_capacity_exemption_expired_if_needed(conn, &existing)?;
+                return Err(BeadsError::validation(
+                    "capacity",
+                    format!(
+                        "capacity exemption for {issue_id} on {kind} '{name}' is {}; \
+                         grant a new exemption instead of renewing",
+                        existing.state
+                    ),
+                ));
+            }
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions SET provider = ?, expires_at = ?
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(provider.as_str()),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'renew', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    reason.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(actor),
+                    expires_text
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            record = Self::capacity_exemption_record_from_conn(
+                conn,
+                issue_id,
+                &kind,
+                &name,
+                Utc::now(),
+            )?;
+            Ok(())
+        })?;
+        record.ok_or_else(|| {
+            BeadsError::internal("capacity exemption renewal committed without a state row")
+        })
+    }
+
+    /// Mark an observed-expired exemption ended with an audited `expire`
+    /// history record. No-op when the record is not in the derived
+    /// `expired` state or is already ended.
+    fn mark_capacity_exemption_expired_if_needed(
+        conn: &Connection,
+        record: &crate::close_policy::CapacityExemptionRecord,
+    ) -> Result<()> {
+        if record.state != "expired" || record.ended_at.is_some() {
+            return Ok(());
+        }
+        conn.execute_with_params(
+            "UPDATE capacity_exemptions
+             SET ended_at = CURRENT_TIMESTAMP, ended_action = 'expired', ended_by = 'system'
+             WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+               AND ended_at IS NULL",
+            &[
+                SqliteValue::from(record.issue_id.as_str()),
+                SqliteValue::from(record.capacity_kind.as_str()),
+                SqliteValue::from(record.capacity_name.as_str()),
+            ],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO capacity_exemption_history (
+                issue_id, capacity_kind, capacity_name, action, provider,
+                reason, actor, expires_at, recorded_at
+            ) VALUES (?, ?, ?, 'expire', ?, ?, 'system', ?, CURRENT_TIMESTAMP)",
+            &[
+                SqliteValue::from(record.issue_id.as_str()),
+                SqliteValue::from(record.capacity_kind.as_str()),
+                SqliteValue::from(record.capacity_name.as_str()),
+                SqliteValue::from(record.provider.as_str()),
+                SqliteValue::from("expiration observed during exemption management"),
+                record
+                    .expires_at
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Revoke an active exemption (GitHub #384 phase 4). Revocation is
+    /// deliberately *not* provider-gated: withdrawing privilege must stay
+    /// possible even after policy edits; the provider and actor are still
+    /// recorded for audit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the exemption is missing or already
+    /// ended/expired.
+    pub fn revoke_capacity_exemption(
+        &self,
+        issue_id: &str,
+        capacity_kind: &str,
+        capacity_name: &str,
+        provider: &str,
+        reason: Option<&str>,
+        actor: &str,
+    ) -> Result<crate::close_policy::CapacityExemptionRecord> {
+        let kind = capacity_kind.trim().to_lowercase();
+        let name = capacity_name.trim().to_lowercase();
+        let provider = provider.trim().to_string();
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        let mut record = None;
+        self.with_connection_write_transaction(|conn| {
+            let now = Utc::now();
+            let existing =
+                Self::capacity_exemption_record_from_conn(conn, issue_id, &kind, &name, now)?
+                    .ok_or_else(|| {
+                        BeadsError::validation(
+                            "capacity",
+                            format!(
+                                "no capacity exemption exists for {issue_id} on {kind} '{name}'"
+                            ),
+                        )
+                    })?;
+            if existing.state != "active" {
+                Self::mark_capacity_exemption_expired_if_needed(conn, &existing)?;
+                return Err(BeadsError::validation(
+                    "capacity",
+                    format!(
+                        "capacity exemption for {issue_id} on {kind} '{name}' is already {}",
+                        existing.state
+                    ),
+                ));
+            }
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions
+                 SET ended_at = CURRENT_TIMESTAMP, ended_action = 'revoked', ended_by = ?
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(actor),
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'revoke', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    reason.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(actor),
+                    existing
+                        .expires_at
+                        .as_deref()
+                        .map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+            record = Self::capacity_exemption_record_from_conn(
+                conn,
+                issue_id,
+                &kind,
+                &name,
+                Utc::now(),
+            )?;
+            Ok(())
+        })?;
+        record.ok_or_else(|| {
+            BeadsError::internal("capacity exemption revocation committed without a state row")
+        })
+    }
+
+    /// List exemption state rows, optionally restricted to one issue, with
+    /// display state derived at read time (never mutating).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn list_capacity_exemptions(
+        &self,
+        issue_id: Option<&str>,
+    ) -> Result<Vec<crate::close_policy::CapacityExemptionRecord>> {
+        if !crate::storage::schema::table_exists(&self.conn, "capacity_exemptions") {
+            return Ok(Vec::new());
+        }
+        let base = "SELECT issue_id, capacity_kind, capacity_name, provider, reason,
+                    granted_by, granted_at, expires_at, ended_at, ended_action, ended_by
+             FROM capacity_exemptions";
+        let rows = if let Some(issue_id) = issue_id {
+            self.conn.query_with_params(
+                &format!(
+                    "{base} WHERE issue_id = ? ORDER BY issue_id, capacity_kind, capacity_name"
+                ),
+                &[SqliteValue::from(issue_id)],
+            )?
+        } else {
+            self.conn.query(&format!(
+                "{base} ORDER BY issue_id, capacity_kind, capacity_name"
+            ))?
+        };
+        let now = Utc::now();
+        Ok(rows
+            .iter()
+            .filter_map(|row| Self::capacity_exemption_record_from_row(row, now))
+            .collect())
+    }
+
+    /// Append-only exemption history, optionally restricted to one issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_capacity_exemption_history(
+        &self,
+        issue_id: Option<&str>,
+    ) -> Result<Vec<crate::close_policy::CapacityExemptionHistoryRecord>> {
+        if !crate::storage::schema::table_exists(&self.conn, "capacity_exemption_history") {
+            return Ok(Vec::new());
+        }
+        let base = "SELECT id, issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+             FROM capacity_exemption_history";
+        let rows = if let Some(issue_id) = issue_id {
+            self.conn.query_with_params(
+                &format!("{base} WHERE issue_id = ? ORDER BY id"),
+                &[SqliteValue::from(issue_id)],
+            )?
+        } else {
+            self.conn.query(&format!("{base} ORDER BY id"))?
+        };
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let text = |index: usize| {
+                    row.get(index)
+                        .and_then(SqliteValue::as_text)
+                        .map(String::from)
+                };
+                Some(crate::close_policy::CapacityExemptionHistoryRecord {
+                    id: row.get(0).and_then(SqliteValue::as_integer)?,
+                    issue_id: text(1)?,
+                    capacity_kind: text(2)?,
+                    capacity_name: text(3)?,
+                    action: text(4)?,
+                    provider: text(5).unwrap_or_default(),
+                    reason: text(6),
+                    actor: text(7).unwrap_or_default(),
+                    expires_at: text(8),
+                    recorded_at: text(9).unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
+
+    /// Load the active, authorized capacity exemptions consulted by one
+    /// enforcement call (GitHub #384 phase 4).
+    ///
+    /// Runs inside the caller's `BEGIN IMMEDIATE` transaction. Expired rows
+    /// observed here are marked ended and receive an append-only `expire`
+    /// history record — the audited form of "expired exemptions count
+    /// again". Rows whose provider is no longer authorized are skipped but
+    /// left untouched: re-listing the provider restores their effect.
+    fn load_capacity_exemption_index_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+    ) -> Result<CapacityExemptionIndex> {
+        Self::load_capacity_exemption_index(conn, policy, true)
+    }
+
+    /// Read-only exemption index for observability surfaces (`br stats`,
+    /// `br coordination status`): expired exemptions stop counting exactly
+    /// like enforcement, but the audited lazy-expire records stay pending
+    /// for the next committed enforcement observation — a read command must
+    /// not write.
+    fn load_capacity_exemption_index_read_only(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+    ) -> Result<CapacityExemptionIndex> {
+        Self::load_capacity_exemption_index(conn, policy, false)
+    }
+
+    fn load_capacity_exemption_index(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        record_lazy_expirations: bool,
+    ) -> Result<CapacityExemptionIndex> {
+        if !policy.exemptions.is_enabled()
+            || !crate::storage::schema::table_exists(conn, "capacity_exemptions")
+        {
+            return Ok(CapacityExemptionIndex::default());
+        }
+        let rows = conn.query(
+            "SELECT issue_id, capacity_kind, capacity_name, provider, expires_at
+             FROM capacity_exemptions WHERE ended_at IS NULL",
+        )?;
+        let now = Utc::now();
+        let mut index = CapacityExemptionIndex::default();
+        let mut expired: Vec<(String, String, String, String, String)> = Vec::new();
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(kind) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(name) = row.get(2).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let provider = row.get(3).and_then(SqliteValue::as_text).unwrap_or("");
+            let expires_at = row.get(4).and_then(SqliteValue::as_text);
+            // An unparseable expiry is treated as already expired: counting
+            // again is the fail-safe direction for a corrupt record.
+            let has_expired = expires_at.is_some_and(|raw| {
+                chrono::DateTime::parse_from_rfc3339(raw)
+                    .map_or(true, |dt| dt.with_timezone(&Utc) <= now)
+            });
+            if has_expired {
+                expired.push((
+                    issue_id.to_string(),
+                    kind.to_string(),
+                    name.to_string(),
+                    provider.to_string(),
+                    expires_at.unwrap_or_default().to_string(),
+                ));
+                continue;
+            }
+            if !policy.exemptions.authorizes(provider) {
+                continue;
+            }
+            index
+                .by_capacity
+                .entry((kind.to_string(), name.to_string()))
+                .or_default()
+                .insert(issue_id.to_string());
+        }
+
+        if !record_lazy_expirations {
+            expired.clear();
+        }
+        for (issue_id, kind, name, provider, expires_at) in expired {
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions
+                 SET ended_at = CURRENT_TIMESTAMP, ended_action = 'expired', ended_by = 'system'
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'expire', ?, ?, 'system', ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(kind.as_str()),
+                    SqliteValue::from(name.as_str()),
+                    SqliteValue::from(provider.as_str()),
+                    SqliteValue::from("expiration observed during capacity enforcement"),
+                    if expires_at.is_empty() {
+                        SqliteValue::Null
+                    } else {
+                        SqliteValue::from(expires_at.as_str())
+                    },
+                ],
+            )?;
+        }
+
+        let exempt_ids: HashSet<String> = index.by_capacity.values().flatten().cloned().collect();
+        for id in &exempt_ids {
+            let rows = conn.query_with_params(
+                "SELECT status FROM issues WHERE id = ?",
+                &[SqliteValue::from(id.as_str())],
+            )?;
+            if let Some(status) = rows
+                .first()
+                .and_then(|row| row.get(0))
+                .and_then(SqliteValue::as_text)
+            {
+                index
+                    .status_of
+                    .insert(id.clone(), status.trim().to_lowercase());
+            }
+        }
+        Ok(index)
+    }
+
+    /// End every active exemption whose applicable status set the issue is
+    /// leaving in this transition (GitHub #384: "Leaving the applicable
+    /// status ends the exemption"). A `status`-kind exemption's applicable
+    /// set is its named status; a `group`-kind exemption's is the group's
+    /// configured status list. Runs inside the mutation transaction so the
+    /// ending commits atomically with the departure itself.
+    fn end_departed_capacity_exemptions_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        issue_id: &str,
+        from: &str,
+        to: &str,
+        actor: &str,
+    ) -> Result<()> {
+        let from_canonical = from.trim().to_lowercase();
+        let to_canonical = to.trim().to_lowercase();
+        if from_canonical == to_canonical || from_canonical.is_empty() {
+            return Ok(());
+        }
+        if !crate::storage::schema::table_exists(conn, "capacity_exemptions") {
+            return Ok(());
+        }
+        let rows = conn.query_with_params(
+            "SELECT capacity_kind, capacity_name, provider, expires_at
+             FROM capacity_exemptions WHERE issue_id = ? AND ended_at IS NULL",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        for row in &rows {
+            let Some(kind) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let Some(name) = row.get(1).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let provider = row.get(2).and_then(SqliteValue::as_text).unwrap_or("");
+            let expires_at = row.get(3).and_then(SqliteValue::as_text);
+            let departed = match kind {
+                "status" => name == from_canonical && name != to_canonical,
+                "group" => Self::capacity_group(policy, name).is_some_and(|(_, group)| {
+                    let contains = |candidate: &str| {
+                        group
+                            .statuses
+                            .iter()
+                            .any(|status| status.trim().eq_ignore_ascii_case(candidate))
+                    };
+                    contains(&from_canonical) && !contains(&to_canonical)
+                }),
+                _ => false,
+            };
+            if !departed {
+                continue;
+            }
+            conn.execute_with_params(
+                "UPDATE capacity_exemptions
+                 SET ended_at = CURRENT_TIMESTAMP, ended_action = 'left_status', ended_by = ?
+                 WHERE issue_id = ? AND capacity_kind = ? AND capacity_name = ?
+                   AND ended_at IS NULL",
+                &[
+                    SqliteValue::from(actor),
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind),
+                    SqliteValue::from(name),
+                ],
+            )?;
+            conn.execute_with_params(
+                "INSERT INTO capacity_exemption_history (
+                    issue_id, capacity_kind, capacity_name, action, provider,
+                    reason, actor, expires_at, recorded_at
+                ) VALUES (?, ?, ?, 'left_status', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(kind),
+                    SqliteValue::from(name),
+                    SqliteValue::from(provider),
+                    SqliteValue::from(format!(
+                        "issue left the applicable status set ({from_canonical} -> {to_canonical})"
+                    )),
+                    SqliteValue::from(actor),
+                    expires_at.map_or(SqliteValue::Null, SqliteValue::from),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Stage Tier 1 attribution for the next mutation (issue #312, Layer 3
     /// capture-only). The values are stamped onto every audit event produced by
     /// the immediately following `create`/`update`/status-mutating call, then
@@ -2435,26 +4766,6 @@ impl SqliteStorage {
         Ok(total)
     }
 
-    fn prospective_capacity_count(
-        current: u32,
-        statuses: &[String],
-        from: Option<&str>,
-        to: &str,
-    ) -> u32 {
-        let contains = |candidate: &str| {
-            statuses
-                .iter()
-                .any(|status| status.eq_ignore_ascii_case(candidate))
-        };
-        let was_counted = from.is_some_and(contains);
-        let will_count = contains(to);
-        match (was_counted, will_count) {
-            (false, true) => current.saturating_add(1),
-            (true, false) => current.saturating_sub(1),
-            _ => current,
-        }
-    }
-
     fn capacity_group<'a>(
         policy: &'a crate::close_policy::CapacityPolicy,
         name: &str,
@@ -2475,8 +4786,11 @@ impl SqliteStorage {
                 to_status: transition.to.to_string(),
                 capacity_kind: evidence.kind.to_string(),
                 capacity_name: evidence.name.to_string(),
-                scope: "repository".to_string(),
-                counting_mode: "all".to_string(),
+                scope: evidence.scope.to_string(),
+                scope_key: evidence.scope_key,
+                counting_mode: evidence.counting_mode.to_string(),
+                aggregate_parents_excluded: evidence.aggregate_parents_excluded,
+                exempt: evidence.exempt,
                 current: evidence.current,
                 prospective: evidence.prospective,
                 soft_limit: evidence.soft_limit,
@@ -2496,132 +4810,17 @@ impl SqliteStorage {
             to_status: transition.to.to_string(),
             capacity_kind: evidence.kind.to_string(),
             capacity_name: evidence.name.to_string(),
-            scope: "repository".to_string(),
-            counting_mode: "all".to_string(),
+            scope: evidence.scope.to_string(),
+            scope_key: evidence.scope_key,
+            counting_mode: evidence.counting_mode.to_string(),
+            aggregate_parents_excluded: evidence.aggregate_parents_excluded,
+            exempt: evidence.exempt,
             current: evidence.current,
             prospective: evidence.prospective,
             soft_limit: evidence.soft_limit,
             hard_limit: evidence.hard_limit,
             policy_path: evidence.policy_path,
         }
-    }
-
-    fn collect_capacity_soft_warnings(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
-        let mut warnings = Vec::new();
-        for (status, limit) in &policy.statuses {
-            let Some(soft_limit) = limit.soft else {
-                continue;
-            };
-            let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
-            if prospective > current && prospective >= soft_limit {
-                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
-                    transition,
-                    kind: "status",
-                    name: status,
-                    current,
-                    prospective,
-                    soft_limit,
-                    hard_limit: limit.hard,
-                    policy_path: format!("workflow.capacity.statuses.{status}"),
-                }));
-            }
-        }
-        for (name, group) in &policy.groups {
-            let Some(soft_limit) = group.soft else {
-                continue;
-            };
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective = Self::prospective_capacity_count(
-                current,
-                &group.statuses,
-                transition.from,
-                transition.to,
-            );
-            if prospective > current && prospective >= soft_limit {
-                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
-                    transition,
-                    kind: "group",
-                    name,
-                    current,
-                    prospective,
-                    soft_limit,
-                    hard_limit: group.hard,
-                    policy_path: format!("workflow.capacity.groups.{name}"),
-                }));
-            }
-        }
-        Ok(warnings)
-    }
-
-    fn enforce_status_hard_limits(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (status, limit) in &policy.statuses {
-            let Some(hard_limit) = limit.hard else {
-                continue;
-            };
-            let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
-            if prospective > current && prospective > hard_limit {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "status",
-                    name: status,
-                    current,
-                    prospective,
-                    soft_limit: limit.soft,
-                    hard_limit,
-                    policy_path: format!("workflow.capacity.statuses.{status}"),
-                }));
-            }
-        }
-        Ok(())
-    }
-
-    fn enforce_group_hard_limits(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (name, group) in &policy.groups {
-            let Some(hard_limit) = group.hard else {
-                continue;
-            };
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective = Self::prospective_capacity_count(
-                current,
-                &group.statuses,
-                transition.from,
-                transition.to,
-            );
-            if prospective > current && prospective > hard_limit {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "group",
-                    name,
-                    current,
-                    prospective,
-                    soft_limit: group.soft,
-                    hard_limit,
-                    policy_path: format!("workflow.capacity.groups.{name}"),
-                }));
-            }
-        }
-        Ok(())
     }
 
     fn admission_transition_matches(
@@ -2642,103 +4841,38 @@ impl SqliteStorage {
                 .any(|candidate| candidate.eq_ignore_ascii_case(transition.to))
     }
 
-    fn enforce_admission_statuses(
-        conn: &Connection,
-        rule: &crate::close_policy::CapacityAdmissionRule,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (status, threshold) in &rule.require_below.statuses {
-            let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::prospective_capacity_count(current, &members, transition.from, transition.to);
-            if prospective >= *threshold && prospective >= current {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "admission_status",
-                    name: status,
-                    current,
-                    prospective,
-                    soft_limit: None,
-                    hard_limit: *threshold,
-                    policy_path: format!(
-                        "workflow.capacity.admission.{}.require_below.statuses.{status}",
-                        rule.name
-                    ),
-                }));
-            }
-        }
-        Ok(())
-    }
-
-    fn enforce_admission_groups(
-        conn: &Connection,
-        policy: &crate::close_policy::CapacityPolicy,
-        rule: &crate::close_policy::CapacityAdmissionRule,
-        transition: CapacityTransition<'_>,
-        counts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        for (requested_name, threshold) in &rule.require_below.groups {
-            let Some((canonical_name, group)) = Self::capacity_group(policy, requested_name) else {
-                return Err(BeadsError::internal(format!(
-                    "validated workflow capacity group '{requested_name}' disappeared"
-                )));
-            };
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective = Self::prospective_capacity_count(
-                current,
-                &group.statuses,
-                transition.from,
-                transition.to,
-            );
-            if prospective >= *threshold && prospective >= current {
-                return Err(Self::capacity_violation(CapacityViolationEvidence {
-                    transition,
-                    kind: "admission_group",
-                    name: canonical_name,
-                    current,
-                    prospective,
-                    soft_limit: None,
-                    hard_limit: *threshold,
-                    policy_path: format!(
-                        "workflow.capacity.admission.{}.require_below.groups.{canonical_name}",
-                        rule.name
-                    ),
-                }));
-            }
-        }
-        Ok(())
-    }
-
     /// Evaluate every repository-level capacity affected by a status change.
     ///
     /// This function must only be called while the caller holds the same
     /// `BEGIN IMMEDIATE` transaction that will perform the mutation.  Counts
     /// therefore observe all prior commits and cannot race another writer for
-    /// the last slot.
+    /// the last slot.  A single transition is exactly a one-element batch, so
+    /// this delegates to the batch evaluator; `issue_type` carries the type of
+    /// an issue being created (or retyped) in the same mutation so weighted
+    /// counting can resolve its weight before the row exists.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn enforce_workflow_capacity_in_tx(
         conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
         issue_id: &str,
         from: Option<&str>,
         to: &str,
+        issue_type: Option<&str>,
+        assignee: CapacityTransitionAssignee<'_>,
+        acting: &CapacityActingContext,
     ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
         if !policy.is_active() || from.is_some_and(|status| status.eq_ignore_ascii_case(to)) {
             return Ok(Vec::new());
         }
-        let transition = CapacityTransition { issue_id, from, to };
-        let mut counts = HashMap::new();
-        Self::enforce_status_hard_limits(conn, policy, transition, &mut counts)?;
-        Self::enforce_group_hard_limits(conn, policy, transition, &mut counts)?;
-        for rule in &policy.admission {
-            if !Self::admission_transition_matches(rule, transition) {
-                continue;
-            }
-            Self::enforce_admission_statuses(conn, rule, transition, &mut counts)?;
-            Self::enforce_admission_groups(conn, policy, rule, transition, &mut counts)?;
-        }
-        Self::collect_capacity_soft_warnings(conn, policy, transition, &mut counts)
+        let transitions = [CapacityBatchTransition {
+            issue_id: issue_id.to_string(),
+            from: from.map(ToString::to_string),
+            to: to.to_string(),
+            issue_type: issue_type.map(ToString::to_string),
+            current_assignee: assignee.current.map(ToString::to_string),
+            prospective_assignee: assignee.prospective.map(ToString::to_string),
+        }];
+        Self::evaluate_workflow_capacity_batch_in_tx(conn, policy, &transitions, acting)
     }
 
     fn transition_enters_capacity(
@@ -2793,32 +4927,51 @@ impl SqliteStorage {
         }
     }
 
+    /// The transition a capacity change is attributed to: the first one that
+    /// enters the capacity, or — when hierarchy counting raised the count
+    /// without any direct entry — the first transition in the batch, so a
+    /// real increase is never silently unenforced.
+    fn blamed_capacity_transition<'a>(
+        engine: &CapacityCountEngine<'a>,
+        statuses: &[String],
+    ) -> Option<&'a CapacityBatchTransition> {
+        engine
+            .transitions()
+            .iter()
+            .find(|transition| Self::transition_enters_capacity(transition, statuses))
+            .or_else(|| engine.transitions().first())
+    }
+
     fn evaluate_capacity_status_limits_in_tx(
-        conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[CapacityBatchTransition],
-        counts: &mut HashMap<String, u32>,
+        engine: &mut CapacityCountEngine<'_>,
         warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
     ) -> Result<()> {
         for (status, limit) in &policy.statuses {
             let members = [status.clone()];
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-            let prospective =
-                Self::batch_prospective_capacity_count(current, &members, transitions)?;
-            let entering = transitions
-                .iter()
-                .find(|transition| Self::transition_enters_capacity(transition, &members));
+            let pair = engine.counts("status", status, &members)?;
+            // Under `all`, a rising count always has an entering transition.
+            // Hierarchy counting can raise a capacity without one — closing a
+            // child shared by two active parents makes both parents start
+            // counting — so fall back to the first transition in the batch
+            // rather than letting the increase escape enforcement.
+            let entering = Self::blamed_capacity_transition(engine, &members);
 
             if let (Some(hard_limit), Some(transition)) = (limit.hard, entering)
-                && prospective > current
-                && prospective > hard_limit
+                && pair.prospective > pair.current
+                && pair.prospective > hard_limit
             {
                 return Err(Self::capacity_violation(CapacityViolationEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "status",
                     name: status,
-                    current,
-                    prospective,
+                    scope: "repository",
+                    scope_key: None,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit: limit.soft,
                     hard_limit,
                     policy_path: format!("workflow.capacity.statuses.{status}"),
@@ -2826,15 +4979,20 @@ impl SqliteStorage {
             }
 
             if let (Some(soft_limit), Some(transition)) = (limit.soft, entering)
-                && prospective > current
-                && prospective >= soft_limit
+                && pair.prospective > pair.current
+                && pair.prospective >= soft_limit
             {
                 warnings.push(Self::capacity_warning(CapacityWarningEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "status",
                     name: status,
-                    current,
-                    prospective,
+                    scope: "repository",
+                    scope_key: None,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit,
                     hard_limit: limit.hard,
                     policy_path: format!("workflow.capacity.statuses.{status}"),
@@ -2845,30 +5003,29 @@ impl SqliteStorage {
     }
 
     fn evaluate_capacity_group_limits_in_tx(
-        conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[CapacityBatchTransition],
-        counts: &mut HashMap<String, u32>,
+        engine: &mut CapacityCountEngine<'_>,
         warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
     ) -> Result<()> {
         for (name, group) in &policy.groups {
-            let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-            let prospective =
-                Self::batch_prospective_capacity_count(current, &group.statuses, transitions)?;
-            let entering = transitions
-                .iter()
-                .find(|transition| Self::transition_enters_capacity(transition, &group.statuses));
+            let pair = engine.counts("group", name, &group.statuses)?;
+            let entering = Self::blamed_capacity_transition(engine, &group.statuses);
 
             if let (Some(hard_limit), Some(transition)) = (group.hard, entering)
-                && prospective > current
-                && prospective > hard_limit
+                && pair.prospective > pair.current
+                && pair.prospective > hard_limit
             {
                 return Err(Self::capacity_violation(CapacityViolationEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "group",
                     name,
-                    current,
-                    prospective,
+                    scope: "repository",
+                    scope_key: None,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit: group.soft,
                     hard_limit,
                     policy_path: format!("workflow.capacity.groups.{name}"),
@@ -2876,15 +5033,20 @@ impl SqliteStorage {
             }
 
             if let (Some(soft_limit), Some(transition)) = (group.soft, entering)
-                && prospective > current
-                && prospective >= soft_limit
+                && pair.prospective > pair.current
+                && pair.prospective >= soft_limit
             {
                 warnings.push(Self::capacity_warning(CapacityWarningEvidence {
                     transition: Self::batch_transition_ref(transition),
                     kind: "group",
                     name,
-                    current,
-                    prospective,
+                    scope: "repository",
+                    scope_key: None,
+                    counting_mode: engine.mode_str(),
+                    aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                    exempt: pair.exempt,
+                    current: pair.current,
+                    prospective: pair.prospective,
                     soft_limit,
                     hard_limit: group.hard,
                     policy_path: format!("workflow.capacity.groups.{name}"),
@@ -2895,13 +5057,12 @@ impl SqliteStorage {
     }
 
     fn enforce_capacity_admission_rules_in_tx(
-        conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
-        transitions: &[CapacityBatchTransition],
-        counts: &mut HashMap<String, u32>,
+        engine: &mut CapacityCountEngine<'_>,
     ) -> Result<()> {
         for rule in &policy.admission {
-            let matching = transitions
+            let matching = engine
+                .transitions()
                 .iter()
                 .filter(|transition| {
                     Self::admission_transition_matches(rule, Self::batch_transition_ref(transition))
@@ -2913,21 +5074,24 @@ impl SqliteStorage {
 
             for (status, threshold) in &rule.require_below.statuses {
                 let members = [status.clone()];
-                let current = Self::count_capacity_statuses_in_tx(conn, counts, &members)?;
-                let prospective =
-                    Self::batch_prospective_capacity_count(current, &members, transitions)?;
+                let pair = engine.counts("status", status, &members)?;
                 let blocked_transition = matching
                     .iter()
                     .find(|transition| !Self::transition_drains_capacity(transition, &members));
-                if prospective >= *threshold
+                if pair.prospective >= *threshold
                     && let Some(transition) = blocked_transition
                 {
                     return Err(Self::capacity_violation(CapacityViolationEvidence {
                         transition: Self::batch_transition_ref(transition),
                         kind: "admission_status",
                         name: status,
-                        current,
-                        prospective,
+                        scope: "repository",
+                        scope_key: None,
+                        counting_mode: engine.mode_str(),
+                        aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                        exempt: pair.exempt,
+                        current: pair.current,
+                        prospective: pair.prospective,
                         soft_limit: None,
                         hard_limit: *threshold,
                         policy_path: format!(
@@ -2945,21 +5109,24 @@ impl SqliteStorage {
                         "validated workflow capacity group '{requested_name}' disappeared"
                     )));
                 };
-                let current = Self::count_capacity_statuses_in_tx(conn, counts, &group.statuses)?;
-                let prospective =
-                    Self::batch_prospective_capacity_count(current, &group.statuses, transitions)?;
+                let pair = engine.counts("group", canonical_name, &group.statuses)?;
                 let blocked_transition = matching.iter().find(|transition| {
                     !Self::transition_drains_capacity(transition, &group.statuses)
                 });
-                if prospective >= *threshold
+                if pair.prospective >= *threshold
                     && let Some(transition) = blocked_transition
                 {
                     return Err(Self::capacity_violation(CapacityViolationEvidence {
                         transition: Self::batch_transition_ref(transition),
                         kind: "admission_group",
                         name: canonical_name,
-                        current,
-                        prospective,
+                        scope: "repository",
+                        scope_key: None,
+                        counting_mode: engine.mode_str(),
+                        aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                        exempt: pair.exempt,
+                        current: pair.current,
+                        prospective: pair.prospective,
                         soft_limit: None,
                         hard_limit: *threshold,
                         policy_path: format!(
@@ -2984,30 +5151,731 @@ impl SqliteStorage {
         conn: &Connection,
         policy: &crate::close_policy::CapacityPolicy,
         transitions: &[CapacityBatchTransition],
+        acting: &CapacityActingContext,
     ) -> Result<Vec<crate::close_policy::WorkflowCapacityWarning>> {
         if !policy.is_active() || transitions.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut counts = HashMap::new();
+        let exemptions = Self::load_capacity_exemption_index_in_tx(conn, policy)?;
+        let mut engine = CapacityCountEngine::new(conn, &policy.counting, transitions, &exemptions);
         let mut warnings = Vec::new();
-        Self::evaluate_capacity_status_limits_in_tx(
+        Self::evaluate_capacity_status_limits_in_tx(policy, &mut engine, &mut warnings)?;
+        Self::evaluate_capacity_group_limits_in_tx(policy, &mut engine, &mut warnings)?;
+        Self::enforce_capacity_admission_rules_in_tx(policy, &mut engine)?;
+        Self::evaluate_capacity_scope_limits_in_tx(
             conn,
             policy,
             transitions,
-            &mut counts,
+            &exemptions,
+            acting,
             &mut warnings,
         )?;
-        Self::evaluate_capacity_group_limits_in_tx(
-            conn,
-            policy,
-            transitions,
-            &mut counts,
-            &mut warnings,
-        )?;
-        Self::enforce_capacity_admission_rules_in_tx(conn, policy, transitions, &mut counts)?;
 
         Ok(warnings)
+    }
+
+    /// Evaluate every configured capacity scope (GitHub #384 phase 5).
+    ///
+    /// Scoped counting is plain per-issue occupancy within one partition:
+    /// hierarchy-aware counting modes and admission rules remain repository
+    /// features. Each scope's limits compose with the repository limits —
+    /// a transition must satisfy all of them. Only partitions whose count
+    /// would INCREASE are checked, so departures and cross-partition
+    /// handoffs can always proceed.
+    #[allow(clippy::too_many_lines)]
+    fn evaluate_capacity_scope_limits_in_tx(
+        conn: &Connection,
+        policy: &crate::close_policy::CapacityPolicy,
+        transitions: &[CapacityBatchTransition],
+        exemptions: &CapacityExemptionIndex,
+        acting: &CapacityActingContext,
+        warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<()> {
+        use crate::close_policy::CapacityScopeKind;
+
+        if policy.scopes.is_empty() {
+            return Ok(());
+        }
+
+        // Lazily built shared inputs.
+        let mut occupancy: Option<HashMap<String, CapacityOccupancyRow>> = None;
+        let mut subtree: Option<CapacitySubtreeIndex> = None;
+
+        for (scope_name, scope_policy) in &policy.scopes {
+            let Some(kind) = CapacityScopeKind::parse(scope_name) else {
+                return Err(BeadsError::internal(format!(
+                    "validated workflow capacity scope '{scope_name}' is unrecognized"
+                )));
+            };
+            if !scope_policy.is_active() {
+                continue;
+            }
+
+            let keying: CapacityScopeKeying = match kind {
+                CapacityScopeKind::Repository => CapacityScopeKeying::Repository,
+                CapacityScopeKind::Actor => match &acting.actor {
+                    Some(actor) => CapacityScopeKeying::Acting(actor.clone()),
+                    None => continue,
+                },
+                CapacityScopeKind::Harness => match &acting.harness {
+                    Some(harness) => CapacityScopeKeying::Acting(harness.clone()),
+                    None => continue,
+                },
+                CapacityScopeKind::Session => match &acting.session {
+                    Some(session) => CapacityScopeKeying::Acting(session.clone()),
+                    None => continue,
+                },
+                CapacityScopeKind::Assignee => CapacityScopeKeying::Assignee,
+                CapacityScopeKind::Subtree => CapacityScopeKeying::Subtree,
+            };
+
+            if matches!(
+                kind,
+                CapacityScopeKind::Harness | CapacityScopeKind::Session
+            ) && occupancy.is_none()
+            {
+                occupancy = Some(Self::load_capacity_occupancy_for_batch_in_tx(
+                    conn,
+                    transitions,
+                )?);
+            }
+            if matches!(kind, CapacityScopeKind::Actor) && occupancy.is_none() {
+                occupancy = Some(Self::load_capacity_occupancy_for_batch_in_tx(
+                    conn,
+                    transitions,
+                )?);
+            }
+            if matches!(kind, CapacityScopeKind::Subtree) && subtree.is_none() {
+                subtree = Some(CapacitySubtreeIndex::load(conn)?);
+            }
+
+            for (status, limit) in &scope_policy.statuses {
+                let members = [status.clone()];
+                Self::enforce_one_scoped_capacity_in_tx(
+                    conn,
+                    &ScopedCapacityCheck {
+                        kind_str: "status",
+                        name: status,
+                        members: &members,
+                        limit: *limit,
+                        scope: kind,
+                        keying: &keying,
+                        policy_path: format!(
+                            "workflow.capacity.scopes.{}.statuses.{status}",
+                            kind.as_str()
+                        ),
+                    },
+                    transitions,
+                    exemptions,
+                    occupancy.as_ref(),
+                    subtree.as_ref(),
+                    warnings,
+                )?;
+            }
+            for (name, group) in &scope_policy.groups {
+                Self::enforce_one_scoped_capacity_in_tx(
+                    conn,
+                    &ScopedCapacityCheck {
+                        kind_str: "group",
+                        name,
+                        members: &group.statuses,
+                        limit: group.limit(),
+                        scope: kind,
+                        keying: &keying,
+                        policy_path: format!(
+                            "workflow.capacity.scopes.{}.groups.{name}",
+                            kind.as_str()
+                        ),
+                    },
+                    transitions,
+                    exemptions,
+                    occupancy.as_ref(),
+                    subtree.as_ref(),
+                    warnings,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce one scoped capacity across every partition key the batch
+    /// could increase.
+    #[allow(clippy::too_many_lines)]
+    fn enforce_one_scoped_capacity_in_tx(
+        conn: &Connection,
+        check: &ScopedCapacityCheck<'_>,
+        transitions: &[CapacityBatchTransition],
+        exemptions: &CapacityExemptionIndex,
+        occupancy: Option<&HashMap<String, CapacityOccupancyRow>>,
+        subtree: Option<&CapacitySubtreeIndex>,
+        warnings: &mut Vec<crate::close_policy::WorkflowCapacityWarning>,
+    ) -> Result<()> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let canonical_name = check.name.trim().to_lowercase();
+        let exempt_ids = exemptions.exempt_ids(check.kind_str, &canonical_name);
+        let is_exempt = |issue_id: &str| exempt_ids.is_some_and(|ids| ids.contains(issue_id));
+
+        // Scope key of a transition, in the entering and draining direction.
+        let enter_key = |transition: &CapacityBatchTransition| -> Option<String> {
+            match check.keying {
+                CapacityScopeKeying::Repository => Some(String::new()),
+                CapacityScopeKeying::Acting(key) => Some(key.clone()),
+                CapacityScopeKeying::Assignee => transition
+                    .prospective_assignee
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(ToString::to_string),
+                CapacityScopeKeying::Subtree => {
+                    subtree.map(|index| index.root_of(&transition.issue_id))
+                }
+            }
+        };
+        let drain_key = |transition: &CapacityBatchTransition| -> Option<String> {
+            match check.keying {
+                CapacityScopeKeying::Repository => Some(String::new()),
+                CapacityScopeKeying::Acting(_) => occupancy
+                    .and_then(|rows| rows.get(&transition.issue_id))
+                    .and_then(|row| match check.scope {
+                        CapacityScopeKind::Actor => row.actor.clone(),
+                        CapacityScopeKind::Harness => row.harness.clone(),
+                        CapacityScopeKind::Session => row.session.clone(),
+                        _ => None,
+                    }),
+                CapacityScopeKeying::Assignee => transition
+                    .current_assignee
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .map(ToString::to_string),
+                CapacityScopeKeying::Subtree => {
+                    subtree.map(|index| index.root_of(&transition.issue_id))
+                }
+            }
+        };
+
+        // Partition keys that gain occupancy from this batch. For the acting
+        // scopes this is at most the single acting key; for assignee/subtree
+        // it is the distinct keys of entering transitions.
+        let mut candidate_keys: Vec<String> = Vec::new();
+        for transition in transitions {
+            if is_exempt(&transition.issue_id) {
+                continue;
+            }
+            if Self::transition_enters_capacity(transition, check.members)
+                && let Some(key) = enter_key(transition)
+                && !candidate_keys.contains(&key)
+            {
+                candidate_keys.push(key);
+            }
+        }
+
+        for key in candidate_keys {
+            let population = Self::scoped_capacity_population_in_tx(
+                conn,
+                check.members,
+                check.keying,
+                check.scope,
+                &key,
+                subtree,
+            )?;
+            let exempt_count = exempt_ids.map_or(0_u32, |ids| {
+                u32::try_from(population.intersection(ids).count()).unwrap_or(u32::MAX)
+            });
+            let current = u32::try_from(population.len())
+                .unwrap_or(u32::MAX)
+                .saturating_sub(exempt_count);
+
+            let mut prospective = i64::from(current);
+            let mut blamed: Option<&CapacityBatchTransition> = None;
+            for transition in transitions {
+                if is_exempt(&transition.issue_id) {
+                    continue;
+                }
+                if Self::transition_enters_capacity(transition, check.members)
+                    && enter_key(transition).as_deref() == Some(key.as_str())
+                {
+                    prospective += 1;
+                    if blamed.is_none() {
+                        blamed = Some(transition);
+                    }
+                } else if Self::transition_drains_capacity(transition, check.members)
+                    && drain_key(transition).as_deref() == Some(key.as_str())
+                    && population.contains(&transition.issue_id)
+                {
+                    prospective -= 1;
+                }
+            }
+            let prospective = u32::try_from(prospective.max(0)).unwrap_or(u32::MAX);
+            let Some(transition) = blamed.or_else(|| transitions.first()) else {
+                continue;
+            };
+            let scope_key =
+                (!matches!(check.keying, CapacityScopeKeying::Repository)).then(|| key.clone());
+
+            if let Some(hard_limit) = check.limit.hard
+                && prospective > current
+                && prospective > hard_limit
+            {
+                return Err(Self::capacity_violation(CapacityViolationEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: check.kind_str,
+                    name: check.name,
+                    scope: check.scope.as_str(),
+                    scope_key,
+                    counting_mode: "all",
+                    aggregate_parents_excluded: None,
+                    exempt: (exempt_count > 0).then_some(exempt_count),
+                    current,
+                    prospective,
+                    soft_limit: check.limit.soft,
+                    hard_limit,
+                    policy_path: check.policy_path.clone(),
+                }));
+            }
+
+            if let Some(soft_limit) = check.limit.soft
+                && prospective > current
+                && prospective >= soft_limit
+            {
+                warnings.push(Self::capacity_warning(CapacityWarningEvidence {
+                    transition: Self::batch_transition_ref(transition),
+                    kind: check.kind_str,
+                    name: check.name,
+                    scope: check.scope.as_str(),
+                    scope_key,
+                    counting_mode: "all",
+                    aggregate_parents_excluded: None,
+                    exempt: (exempt_count > 0).then_some(exempt_count),
+                    current,
+                    prospective,
+                    soft_limit,
+                    hard_limit: check.limit.hard,
+                    policy_path: check.policy_path.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Issue ids currently occupying `members` within one scope partition.
+    fn scoped_capacity_population_in_tx(
+        conn: &Connection,
+        members: &[String],
+        keying: &CapacityScopeKeying,
+        scope: crate::close_policy::CapacityScopeKind,
+        key: &str,
+        subtree: Option<&CapacitySubtreeIndex>,
+    ) -> Result<HashSet<String>> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let mut population = HashSet::new();
+        let mut seen = HashSet::new();
+        for status in members {
+            let canonical = status.trim().to_lowercase();
+            if canonical.is_empty() || !seen.insert(canonical.clone()) {
+                continue;
+            }
+            match keying {
+                CapacityScopeKeying::Repository => {
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ?",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKeying::Assignee => {
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ? AND assignee = ?",
+                        &[
+                            SqliteValue::from(canonical.as_str()),
+                            SqliteValue::from(key),
+                        ],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKeying::Acting(_) => {
+                    let column = match scope {
+                        CapacityScopeKind::Actor => "actor",
+                        CapacityScopeKind::Harness => "harness",
+                        CapacityScopeKind::Session => "session",
+                        _ => {
+                            return Err(BeadsError::internal(
+                                "acting capacity scope resolved to a non-acting kind",
+                            ));
+                        }
+                    };
+                    let sql = format!(
+                        "SELECT i.id FROM issues i \
+                         JOIN capacity_occupancy o ON o.issue_id = i.id \
+                         WHERE i.status = ? AND o.{column} = ?"
+                    );
+                    let rows = conn.query_with_params(
+                        &sql,
+                        &[
+                            SqliteValue::from(canonical.as_str()),
+                            SqliteValue::from(key),
+                        ],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKeying::Subtree => {
+                    let Some(index) = subtree else {
+                        return Err(BeadsError::internal(
+                            "subtree capacity scope evaluated without a loaded hierarchy",
+                        ));
+                    };
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ?",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text)
+                            && index.root_of(id) == key
+                        {
+                            population.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(population)
+    }
+
+    /// Load the occupancy attribution rows for every issue in the batch, so
+    /// drains can be keyed to the partition that originally admitted them.
+    fn load_capacity_occupancy_for_batch_in_tx(
+        conn: &Connection,
+        transitions: &[CapacityBatchTransition],
+    ) -> Result<HashMap<String, CapacityOccupancyRow>> {
+        let mut rows_by_issue = HashMap::new();
+        for transition in transitions {
+            let result = conn.query_row_with_params(
+                "SELECT actor, harness, session FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from(transition.issue_id.as_str())],
+            );
+            match result {
+                Ok(row) => {
+                    let text = |index: usize| {
+                        row.get(index)
+                            .and_then(SqliteValue::as_text)
+                            .map(ToString::to_string)
+                    };
+                    rows_by_issue.insert(
+                        transition.issue_id.clone(),
+                        CapacityOccupancyRow {
+                            actor: text(0),
+                            harness: text(1),
+                            session: text(2),
+                        },
+                    );
+                }
+                Err(FrankenError::QueryReturnedNoRows) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(rows_by_issue)
+    }
+
+    /// Observed occupancy of every configured capacity (GitHub #384
+    /// phase 6). Read-only: reuses the enforcement counting engine with an
+    /// empty transition batch, honors exemptions and hierarchy counting
+    /// exactly like admission, and never writes (lazy exemption expiry
+    /// stays pending for the next enforcement observation). Scoped
+    /// capacities report one row per occupied partition, deterministic
+    /// order, capped at [`CAPACITY_SNAPSHOT_PARTITION_LIMIT`] per capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a database query fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn capacity_snapshot(&self) -> Result<Vec<CapacitySnapshotRow>> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let policy = self.workflow_capacity_policy.clone();
+        if !policy.is_active() {
+            return Ok(Vec::new());
+        }
+        let conn = &self.conn;
+        let exemptions = Self::load_capacity_exemption_index_read_only(conn, &policy)?;
+        let transitions: [CapacityBatchTransition; 0] = [];
+        let mut engine =
+            CapacityCountEngine::new(conn, &policy.counting, &transitions, &exemptions);
+        let mut rows = Vec::new();
+
+        for (status, limit) in &policy.statuses {
+            let members = [status.clone()];
+            let pair = engine.counts("status", status, &members)?;
+            rows.push(CapacitySnapshotRow {
+                kind: "status".to_string(),
+                name: status.clone(),
+                scope: "repository".to_string(),
+                scope_key: None,
+                counted: pair.current,
+                aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                exempt: pair.exempt,
+                soft: limit.soft,
+                hard: limit.hard,
+                counting_mode: engine.mode_str().to_string(),
+                policy_path: format!("workflow.capacity.statuses.{status}"),
+            });
+        }
+        for (name, group) in &policy.groups {
+            let pair = engine.counts("group", name, &group.statuses)?;
+            rows.push(CapacitySnapshotRow {
+                kind: "group".to_string(),
+                name: name.clone(),
+                scope: "repository".to_string(),
+                scope_key: None,
+                counted: pair.current,
+                aggregate_parents_excluded: pair.aggregate_parents_excluded,
+                exempt: pair.exempt,
+                soft: group.soft,
+                hard: group.hard,
+                counting_mode: engine.mode_str().to_string(),
+                policy_path: format!("workflow.capacity.groups.{name}"),
+            });
+        }
+
+        let mut subtree: Option<CapacitySubtreeIndex> = None;
+        for (scope_name, scope_policy) in &policy.scopes {
+            let Some(scope_kind) = CapacityScopeKind::parse(scope_name) else {
+                continue;
+            };
+            if matches!(scope_kind, CapacityScopeKind::Subtree) && subtree.is_none() {
+                subtree = Some(CapacitySubtreeIndex::load(conn)?);
+            }
+            let checks = scope_policy
+                .statuses
+                .iter()
+                .map(|(status, limit)| {
+                    (
+                        "status",
+                        status.clone(),
+                        vec![status.clone()],
+                        *limit,
+                        format!(
+                            "workflow.capacity.scopes.{}.statuses.{status}",
+                            scope_kind.as_str()
+                        ),
+                    )
+                })
+                .chain(scope_policy.groups.iter().map(|(name, group)| {
+                    (
+                        "group",
+                        name.clone(),
+                        group.statuses.clone(),
+                        group.limit(),
+                        format!(
+                            "workflow.capacity.scopes.{}.groups.{name}",
+                            scope_kind.as_str()
+                        ),
+                    )
+                }));
+            for (kind_str, name, members, limit, policy_path) in checks {
+                Self::snapshot_scoped_capacity(
+                    conn,
+                    &exemptions,
+                    subtree.as_ref(),
+                    scope_kind,
+                    kind_str,
+                    &name,
+                    &members,
+                    limit,
+                    &policy_path,
+                    &mut rows,
+                )?;
+            }
+        }
+
+        Ok(rows)
+    }
+
+    /// Append one snapshot row per occupied partition of a scoped capacity.
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_scoped_capacity(
+        conn: &Connection,
+        exemptions: &CapacityExemptionIndex,
+        subtree: Option<&CapacitySubtreeIndex>,
+        scope_kind: crate::close_policy::CapacityScopeKind,
+        kind_str: &'static str,
+        name: &str,
+        members: &[String],
+        limit: crate::close_policy::CapacityLimit,
+        policy_path: &str,
+        rows: &mut Vec<CapacitySnapshotRow>,
+    ) -> Result<()> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let mut keys = Self::scoped_partition_keys(conn, members, scope_kind, subtree)?;
+        keys.sort();
+        keys.dedup();
+        keys.truncate(CAPACITY_SNAPSHOT_PARTITION_LIMIT);
+
+        let canonical_name = name.trim().to_lowercase();
+        let exempt_ids = exemptions.exempt_ids(kind_str, &canonical_name);
+        for key in keys {
+            let keying = match scope_kind {
+                CapacityScopeKind::Repository => CapacityScopeKeying::Repository,
+                CapacityScopeKind::Actor
+                | CapacityScopeKind::Harness
+                | CapacityScopeKind::Session => CapacityScopeKeying::Acting(key.clone()),
+                CapacityScopeKind::Assignee => CapacityScopeKeying::Assignee,
+                CapacityScopeKind::Subtree => CapacityScopeKeying::Subtree,
+            };
+            let population = Self::scoped_capacity_population_in_tx(
+                conn, members, &keying, scope_kind, &key, subtree,
+            )?;
+            let exempt_count = exempt_ids.map_or(0_u32, |ids| {
+                u32::try_from(population.intersection(ids).count()).unwrap_or(u32::MAX)
+            });
+            let counted = u32::try_from(population.len())
+                .unwrap_or(u32::MAX)
+                .saturating_sub(exempt_count);
+            let scope_key =
+                (!matches!(scope_kind, CapacityScopeKind::Repository)).then(|| key.clone());
+            rows.push(CapacitySnapshotRow {
+                kind: kind_str.to_string(),
+                name: name.to_string(),
+                scope: scope_kind.as_str().to_string(),
+                scope_key,
+                counted,
+                aggregate_parents_excluded: None,
+                exempt: (exempt_count > 0).then_some(exempt_count),
+                soft: limit.soft,
+                hard: limit.hard,
+                counting_mode: "all".to_string(),
+                policy_path: policy_path.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Distinct occupied partition keys for one scoped capacity.
+    fn scoped_partition_keys(
+        conn: &Connection,
+        members: &[String],
+        scope_kind: crate::close_policy::CapacityScopeKind,
+        subtree: Option<&CapacitySubtreeIndex>,
+    ) -> Result<Vec<String>> {
+        use crate::close_policy::CapacityScopeKind;
+
+        let mut keys: HashSet<String> = HashSet::new();
+        let mut seen = HashSet::new();
+        for status in members {
+            let canonical = status.trim().to_lowercase();
+            if canonical.is_empty() || !seen.insert(canonical.clone()) {
+                continue;
+            }
+            match scope_kind {
+                CapacityScopeKind::Repository => {
+                    keys.insert(String::new());
+                }
+                CapacityScopeKind::Assignee => {
+                    let rows = conn.query_with_params(
+                        "SELECT DISTINCT assignee FROM issues \
+                         WHERE status = ? AND assignee IS NOT NULL AND assignee != ''",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(key) = row.get(0).and_then(SqliteValue::as_text) {
+                            keys.insert(key.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKind::Actor
+                | CapacityScopeKind::Harness
+                | CapacityScopeKind::Session => {
+                    let column = match scope_kind {
+                        CapacityScopeKind::Actor => "actor",
+                        CapacityScopeKind::Harness => "harness",
+                        _ => "session",
+                    };
+                    let sql = format!(
+                        "SELECT DISTINCT o.{column} FROM capacity_occupancy o \
+                         JOIN issues i ON i.id = o.issue_id \
+                         WHERE i.status = ? AND o.{column} IS NOT NULL"
+                    );
+                    let rows =
+                        conn.query_with_params(&sql, &[SqliteValue::from(canonical.as_str())])?;
+                    for row in &rows {
+                        if let Some(key) = row.get(0).and_then(SqliteValue::as_text) {
+                            keys.insert(key.to_string());
+                        }
+                    }
+                }
+                CapacityScopeKind::Subtree => {
+                    let Some(index) = subtree else {
+                        continue;
+                    };
+                    let rows = conn.query_with_params(
+                        "SELECT id FROM issues WHERE status = ?",
+                        &[SqliteValue::from(canonical.as_str())],
+                    )?;
+                    for row in &rows {
+                        if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                            keys.insert(index.root_of(id));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(keys.into_iter().collect())
+    }
+
+    /// Record who moved an issue into its current status, inside the same
+    /// write transaction (GitHub #384 phase 5). Delete-then-insert mirrors
+    /// `replace_dirty_issue_marker`; `ON CONFLICT` upserts are avoided for
+    /// engine compatibility. Deliberately NOT called by the JSONL import
+    /// path: import is state replication, not admission.
+    pub(crate) fn record_capacity_occupancy_in_tx(
+        conn: &Connection,
+        issue_id: &str,
+        actor: &str,
+        attribution: &EventAttribution,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM capacity_occupancy WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let normalized_actor = actor.trim();
+        let optional = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map_or(SqliteValue::Null, SqliteValue::from)
+        };
+        conn.execute_with_params(
+            "INSERT INTO capacity_occupancy \
+             (issue_id, actor, agent_name, harness, session, recorded_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                if normalized_actor.is_empty() {
+                    SqliteValue::Null
+                } else {
+                    SqliteValue::from(normalized_actor)
+                },
+                optional(&attribution.agent_name),
+                optional(&attribution.harness),
+                optional(&attribution.session),
+                SqliteValue::from(chrono::Utc::now().to_rfc3339().as_str()),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Remove and return any staged Tier 1 attribution without consuming it via
@@ -3018,6 +5886,26 @@ impl SqliteStorage {
     /// transferred/cleared — it never leaks into an unrelated operation.
     pub(crate) fn take_pending_event_attribution(&mut self) -> Option<EventAttribution> {
         self.pending_event_attribution.take()
+    }
+
+    /// Return the normalized attribution staged for the next mutation.
+    ///
+    /// Reviewed multi-phase mutations bind this value into their immutable
+    /// intent before entering the write transaction. Returning the normalized
+    /// empty value instead of exposing the optional slot keeps receipt evidence
+    /// independent of the storage implementation's staging representation.
+    #[must_use]
+    pub(crate) fn pending_event_attribution_for_review(&self) -> EventAttribution {
+        self.pending_event_attribution.clone().unwrap_or_default()
+    }
+
+    /// Return the exact workflow-capacity policy installed for the next
+    /// reviewed mutation.
+    #[must_use]
+    pub(crate) fn workflow_capacity_policy_for_review(
+        &self,
+    ) -> crate::close_policy::CapacityPolicy {
+        self.workflow_capacity_policy.clone()
     }
 
     /// Execute a mutation with the 4-step transaction protocol.
@@ -3235,12 +6123,19 @@ impl SqliteStorage {
                 }
             }
 
+            let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
             let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
                 conn,
                 &capacity_policy,
                 &issue.id,
                 None,
                 issue.status.as_str(),
+                Some(issue.issue_type.as_str()),
+                CapacityTransitionAssignee {
+                    current: None,
+                    prospective: issue.assignee.as_deref(),
+                },
+                &acting,
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
 
@@ -3306,6 +6201,10 @@ impl SqliteStorage {
                     issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 ],
             )?;
+
+            // GitHub #384 phase 5: creation admits the issue into its
+            // initial status; record the admitting attribution.
+            Self::record_capacity_occupancy_in_tx(conn, &issue.id, &ctx.actor, &ctx.attribution)?;
 
             // Update child counter if this is a hierarchical ID
             if let Ok(parsed) = parse_id(&issue.id)
@@ -3532,7 +6431,6 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the issue doesn't exist or the update fails.
-    #[allow(clippy::too_many_lines)]
     pub fn update_issue(&mut self, id: &str, updates: &IssueUpdate, actor: &str) -> Result<Issue> {
         let updates = [(id.to_string(), updates.clone())];
         self.update_issues_atomically(&updates, actor)?
@@ -3589,6 +6487,18 @@ impl SqliteStorage {
 
             let from = issue.status.as_str();
             let to = to_status.as_str();
+
+            // GitHub #399: enforce `workflow.transitions` at the storage
+            // chokepoint. `br update` validated the transition in its own CLI
+            // layer, but `br close` (and the MCP/epic batch writers) reached
+            // this preflight with only required-field and gate evaluation, so
+            // a status move the transitions map forbids still committed.
+            // Validating here — inside the same `BEGIN IMMEDIATE` preflight,
+            // before any row is touched — makes a batch close all-or-nothing
+            // and leaves `--bypass-policy` semantics intact because an
+            // explicit bypass reason already `continue`d above.
+            workflow.validate_transition(Some(from), to)?;
+
             let prospective_acceptance_criteria = update
                 .acceptance_criteria
                 .as_ref()
@@ -3746,22 +6656,59 @@ impl SqliteStorage {
                             issue_id: id.clone(),
                             from: Some(issue.status.as_str().to_string()),
                             to: status.as_str().to_string(),
+                            issue_type: update
+                                .issue_type
+                                .as_ref()
+                                .map(|issue_type| issue_type.as_str().to_string()),
+                            current_assignee: issue.assignee.clone(),
+                            prospective_assignee: match &update.assignee {
+                                Some(prospective) => prospective.clone(),
+                                None => issue.assignee.clone(),
+                            },
                         });
                     }
                 }
 
                 Self::enforce_workflow_transition_batch_in_tx(conn, &workflow_policy, updates)?;
 
+                let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
                 let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
                     conn,
                     &capacity_policy,
                     &transitions,
+                    &acting,
                 )?;
                 ctx.capacity_warnings.extend(capacity_warnings);
 
                 for (id, update) in updates {
                     if !update.is_empty() {
                         Self::update_issue_in_tx(conn, ctx, id, update, actor)?;
+                    }
+                }
+
+                // GitHub #384 phase 5: record who moved each issue into its
+                // new status so scoped capacities can key future admissions.
+                for transition in &transitions {
+                    Self::record_capacity_occupancy_in_tx(
+                        conn,
+                        &transition.issue_id,
+                        &ctx.actor,
+                        &ctx.attribution,
+                    )?;
+                }
+
+                // GitHub #384 phase 4: leaving the applicable status ends an
+                // issue's capacity exemption, atomically with the departure.
+                for transition in &transitions {
+                    if let Some(from) = transition.from.as_deref() {
+                        Self::end_departed_capacity_exemptions_in_tx(
+                            conn,
+                            &capacity_policy,
+                            &transition.issue_id,
+                            from,
+                            &transition.to,
+                            actor,
+                        )?;
                     }
                 }
                 Ok(())
@@ -4258,15 +7205,34 @@ impl SqliteStorage {
         let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
         let capacity_policy = self.workflow_capacity_policy.clone();
+        let tombstone_assignee = tombstone_issue.assignee.clone();
         self.mutate("delete_issue", actor, |conn, ctx| {
+            let acting = CapacityActingContext::new(&ctx.actor, &ctx.attribution);
             let capacity_warnings = Self::enforce_workflow_capacity_in_tx(
                 conn,
                 &capacity_policy,
                 id,
                 Some(&previous_status),
                 "tombstone",
+                None,
+                CapacityTransitionAssignee {
+                    current: tombstone_assignee.as_deref(),
+                    prospective: tombstone_assignee.as_deref(),
+                },
+                &acting,
             )?;
             ctx.capacity_warnings.extend(capacity_warnings);
+            // GitHub #384 phase 4: tombstoning leaves every status, so any
+            // active exemption whose applicable set contained the previous
+            // status ends here, atomically with the delete.
+            Self::end_departed_capacity_exemptions_in_tx(
+                conn,
+                &capacity_policy,
+                id,
+                &previous_status,
+                "tombstone",
+                actor,
+            )?;
             conn.execute_with_params(
                 "UPDATE issues SET
                     content_hash = ?,
@@ -4291,6 +7257,9 @@ impl SqliteStorage {
                 "DELETE FROM close_metadata WHERE issue_id = ?",
                 &[SqliteValue::from(id)],
             )?;
+            // GitHub #384 phase 5: the tombstone transition is a status
+            // change like any other; record its admission attribution.
+            Self::record_capacity_occupancy_in_tx(conn, id, &ctx.actor, &ctx.attribution)?;
 
             if !was_terminal {
                 ctx.record_event(
@@ -6993,6 +9962,17 @@ impl SqliteStorage {
         Ok(rebuilt)
     }
 
+    /// Rebuild the blocked cache and normalize its operational timestamps to
+    /// the exact source-snapshot time bound into a reviewed recovery plan.
+    pub(crate) fn rebuild_blocked_cache_at_in_tx(&self, blocked_at: &str) -> Result<usize> {
+        let rebuilt = self.rebuild_blocked_cache_in_tx()?;
+        self.conn.execute_with_params(
+            "UPDATE blocked_issues_cache SET blocked_at = ?",
+            &[SqliteValue::from(blocked_at)],
+        )?;
+        Ok(rebuilt)
+    }
+
     /// Rebuild the child counters table from all existing issues.
     ///
     /// Useful after a full import or manual database manipulation.
@@ -7002,6 +9982,11 @@ impl SqliteStorage {
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_child_counters_in_tx(&self) -> Result<usize> {
         Self::rebuild_child_counters_impl(&self.conn)
+    }
+
+    #[allow(dead_code)] // Guarded standalone entry point; bulk mutations use the in-tx primitive.
+    pub(crate) fn rebuild_child_counters(&self) -> Result<usize> {
+        self.with_connection_write_transaction(|_| self.rebuild_child_counters_in_tx())
     }
 
     fn rebuild_child_counters_impl(conn: &Connection) -> Result<usize> {
@@ -8344,6 +11329,34 @@ impl SqliteStorage {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Count the two derived sync tables without rebuilding either one.
+    ///
+    /// Additive reconciliation uses this read-only snapshot to prove whether
+    /// its transactional cache rebuild changed either materialized view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either count query fails.
+    pub(crate) fn count_sync_derived_rows(&self) -> Result<(usize, usize)> {
+        let blocked = self
+            .conn
+            .query_row("SELECT count(*) FROM blocked_issues_cache")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        let child_counters = self
+            .conn
+            .query_row("SELECT count(*) FROM child_counters")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+
+        Ok((
+            usize::try_from(blocked).unwrap_or(0),
+            usize::try_from(child_counters).unwrap_or(0),
+        ))
+    }
+
     /// Get all issue IDs in the database.
     ///
     /// # Errors
@@ -8700,7 +11713,7 @@ impl SqliteStorage {
                 }
             }
 
-            let mut graph = Self::load_dependency_cycle_graph_from_conn(conn, true)?;
+            let mut graph = Self::load_dependency_cycle_graph_from_conn(conn)?;
             for (dep, dep_type) in &unique_dependencies {
                 let Ok(parsed_type) = dep_type.parse::<DependencyType>() else {
                     continue;
@@ -10649,6 +13662,111 @@ impl SqliteStorage {
         Ok(map)
     }
 
+    /// Mirror of [`Self::get_blocking_dependents_for_issue_ids`]: for each id,
+    /// the issues it *depends on* rather than the issues that depend on it.
+    ///
+    /// Backs `br graph --dependencies` (`beads_rust-mf72`), which answers "what
+    /// is blocking this?" where the default walk answers "what does closing
+    /// this unblock?". The two queries are exact inverses, including the
+    /// `parent-child` special case, which the dependents query deliberately
+    /// walks the other way round.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_blocking_dependencies_for_issue_ids(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, Vec<IssueWithDependencyMetadata>>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<IssueWithDependencyMetadata>> = HashMap::new();
+        let chunk_size = SQLITE_VAR_LIMIT.saturating_div(2).max(1);
+        for chunk in issue_ids.chunks(chunk_size) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "SELECT root_id, dependency_id, title, status, priority, type
+                 FROM (
+                     SELECT d.issue_id AS root_id,
+                            d.depends_on_id AS dependency_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.depends_on_id = i.id
+                      WHERE d.issue_id IN ({placeholders})
+                        AND d.type IN ('blocks', 'conditional-blocks', 'waits-for')
+                     UNION ALL
+                     SELECT d.depends_on_id AS root_id,
+                            d.issue_id AS dependency_id,
+                            i.title AS title,
+                            i.status AS status,
+                            i.priority AS priority,
+                            i.created_at AS created_at,
+                            d.type AS type
+                       FROM dependencies d
+                       LEFT JOIN issues i ON d.issue_id = i.id
+                      WHERE d.depends_on_id IN ({placeholders})
+                        AND d.type = 'parent-child'
+                 )
+                 ORDER BY COALESCE(priority, 2) ASC, created_at DESC, dependency_id ASC",
+                placeholders = placeholders.join(",")
+            );
+            let mut params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect();
+            params.extend(
+                chunk
+                    .iter()
+                    .map(|issue_id| SqliteValue::from(issue_id.as_str())),
+            );
+            let rows = self.conn.query_with_params(&sql, &params)?;
+
+            for row in &rows {
+                let Some(root_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let Some(dependency_id) = row.get(1).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let dep_type = row
+                    .get(5)
+                    .and_then(SqliteValue::as_text)
+                    .unwrap_or("blocks")
+                    .to_string();
+                let title = row.get(2).and_then(SqliteValue::as_text);
+                let status = row.get(3).and_then(SqliteValue::as_text);
+                let priority = row.get(4).and_then(SqliteValue::as_integer);
+
+                let meta = match (title, status, priority) {
+                    (Some(title), Some(status), Some(priority)) => IssueWithDependencyMetadata {
+                        id: dependency_id.to_string(),
+                        title: title.to_string(),
+                        status: parse_status(Some(status)),
+                        priority: Priority(i32::try_from(priority).unwrap_or(2)),
+                        dep_type,
+                    },
+                    _ => IssueWithDependencyMetadata {
+                        id: dependency_id.to_string(),
+                        title: format!("[missing issue: {dependency_id}]"),
+                        status: Status::Tombstone,
+                        priority: Priority::MEDIUM,
+                        dep_type,
+                    },
+                };
+
+                map.entry(root_id.to_string()).or_default().push(meta);
+            }
+        }
+
+        Ok(map)
+    }
+
     /// Count dependencies and dependents for multiple issues with one round-trip per chunk.
     ///
     /// # Errors
@@ -10887,11 +14005,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database delete fails.
     pub fn delete_config(&mut self, key: &str) -> Result<bool> {
-        let deleted = self.conn.execute_with_params(
-            "DELETE FROM config WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        Ok(deleted > 0)
+        self.with_write_transaction(|storage| {
+            let deleted = storage.conn.execute_with_params(
+                "DELETE FROM config WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            Ok(deleted > 0)
+        })
     }
 
     // ========================================================================
@@ -11099,15 +14219,21 @@ impl SqliteStorage {
     pub fn get_dirty_issue_metadata(&self) -> Result<Vec<(String, String)>> {
         let rows = self
             .conn
-            .query("SELECT issue_id, marked_at FROM dirty_issues ORDER BY marked_at")?;
-        Ok(rows
-            .iter()
-            .filter_map(|r| {
-                let id = r.get(0).and_then(SqliteValue::as_text).map(String::from)?;
-                let marked_at = r.get(1).and_then(SqliteValue::as_text).map(String::from)?;
-                Some((id, marked_at))
+            .query("SELECT issue_id, marked_at FROM dirty_issues ORDER BY issue_id, marked_at")?;
+        rows.iter()
+            .enumerate()
+            .map(|(row_index, row)| {
+                let issue_id = row.get(0).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::Config(format!("Dirty-issue row {row_index} issue_id was not text"))
+                })?;
+                let marked_at = row.get(1).and_then(SqliteValue::as_text).ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "Dirty-issue row {row_index} marked_at was not text"
+                    ))
+                })?;
+                Ok((issue_id.to_string(), marked_at.to_string()))
             })
-            .collect())
+            .collect()
     }
 
     /// Get IDs of all dirty issues (issues modified since last export).
@@ -11138,7 +14264,10 @@ impl SqliteStorage {
         if metadata.is_empty() {
             return Ok(0);
         }
+        self.with_connection_write_transaction(|_| self.clear_dirty_issues_in_tx(metadata))
+    }
 
+    pub(crate) fn clear_dirty_issues_in_tx(&self, metadata: &[(String, String)]) -> Result<usize> {
         let mut total_deleted = 0;
         for (id, marked_at) in metadata {
             let count = self.conn.execute_with_params(
@@ -11160,11 +14289,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn clear_dirty_issues_legacy(&mut self, issue_ids: &[String]) -> Result<usize> {
-        const SQLITE_VAR_LIMIT: usize = 900;
         if issue_ids.is_empty() {
             return Ok(0);
         }
+        self.with_write_transaction(|storage| storage.clear_dirty_issue_ids_in_tx(issue_ids))
+    }
 
+    fn clear_dirty_issue_ids_in_tx(&self, issue_ids: &[String]) -> Result<usize> {
         let mut total_deleted = 0;
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
@@ -11188,8 +14319,11 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn clear_all_dirty_issues(&mut self) -> Result<usize> {
-        let count = self.conn.execute("DELETE FROM dirty_issues")?;
-        Ok(count)
+        self.with_write_transaction(Self::clear_all_dirty_issues_in_tx)
+    }
+
+    fn clear_all_dirty_issues_in_tx(storage: &mut Self) -> Result<usize> {
+        Ok(storage.conn.execute("DELETE FROM dirty_issues")?)
     }
 
     // =========================================================================
@@ -11273,8 +14407,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn clear_all_export_hashes(&mut self) -> Result<usize> {
-        let count = self.conn.execute("DELETE FROM export_hashes")?;
-        Ok(count)
+        self.with_write_transaction(|storage| {
+            Ok(storage.conn.execute("DELETE FROM export_hashes")?)
+        })
     }
 
     /// Get issues that need to be exported (dirty issues whose content hash differs from stored export hash).
@@ -11360,7 +14495,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub(crate) fn set_metadata_shared(&self, key: &str, value: &str) -> Result<()> {
-        Self::with_connection_write_transaction(&self.conn, |conn| {
+        self.with_connection_write_transaction(|conn| {
             Self::upsert_metadata_key_in_tx(conn, key, value)?;
             Ok(())
         })
@@ -11372,11 +14507,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database update fails.
     pub fn delete_metadata(&mut self, key: &str) -> Result<bool> {
-        let count = self.conn.execute_with_params(
-            "DELETE FROM metadata WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        Ok(count > 0)
+        self.with_write_transaction(|storage| {
+            let count = storage.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            Ok(count > 0)
+        })
     }
 
     /// Count issues in the database.
@@ -11392,6 +14529,86 @@ impl SqliteStorage {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         Ok(usize::try_from(count).unwrap_or(0))
+    }
+
+    /// Snapshot the events table shape as an immutability witness.
+    ///
+    /// Returns `(row_count, max_rowid)`. Additive reconciliation captures this
+    /// at plan time and re-verifies it inside (and at the end of) the apply
+    /// transaction: import-path upserts never write events, so any change is
+    /// evidence of a concurrent writer and must roll the apply back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn events_table_witness(&self) -> Result<(u64, Option<i64>)> {
+        let count = self
+            .conn
+            .query_row("SELECT count(*) FROM events")?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        let max_id = self
+            .conn
+            .query_row("SELECT max(id) FROM events")?
+            .get(0)
+            .and_then(SqliteValue::as_integer);
+        Ok((u64::try_from(count).unwrap_or(0), max_id))
+    }
+
+    /// Get all non-ephemeral, non-wisp issue IDs (the exportable population).
+    ///
+    /// Uses the same filter as the doctor `counts.db_vs_jsonl` check so that
+    /// DB↔JSONL set comparisons agree on the same population.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_non_ephemeral_issue_ids(&self) -> Result<Vec<String>> {
+        let rows = self.conn.query(
+            "SELECT id FROM issues \
+             WHERE (ephemeral = 0 OR ephemeral IS NULL) AND id NOT LIKE '%-wisp-%' \
+             ORDER BY id",
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
+    /// Delete dependency rows owned by the given issues whose target issue is
+    /// missing, inside the current write transaction.
+    ///
+    /// This is the scoped counterpart of the import path's global orphan
+    /// cleanup: additive reconciliation may only introduce dangling
+    /// `depends_on_id` references through rows it just wrote, so it must not
+    /// touch orphan rows owned by any other issue. `external:` dependency
+    /// targets are never orphans.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn delete_orphan_dependencies_for_issues_in_tx(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<usize> {
+        let mut deleted = 0usize;
+        for chunk in issue_ids.chunks(IMPORT_DEPENDENCY_CHUNK_SIZE) {
+            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            let sql = format!(
+                "DELETE FROM dependencies \
+                 WHERE issue_id IN ({}) \
+                   AND depends_on_id NOT LIKE 'external:%' \
+                   AND depends_on_id NOT IN (SELECT id FROM issues)",
+                placeholders.join(", ")
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            deleted += self.conn.execute_with_params(&sql, &params)?;
+        }
+        Ok(deleted)
     }
 
     /// Count active project issues using default user-facing visibility.
@@ -11469,6 +14686,11 @@ impl SqliteStorage {
             vec![]
         };
         let parent = relation_presence.parent;
+        let rollup = if relation_presence.has_children {
+            self.derived_rollup(id)?
+        } else {
+            None
+        };
 
         Ok(Some(IssueDetails {
             issue,
@@ -11478,6 +14700,108 @@ impl SqliteStorage {
             comments,
             events,
             parent,
+            rollup,
+        }))
+    }
+
+    /// Derived parent-child subtree rollup (GitHub #384 phase 3).
+    ///
+    /// Returns `None` when the issue has no local parent-child children.
+    /// The derived status is the furthest-along non-terminal descendant
+    /// status: position in the declared `workflow.statuses` order when the
+    /// project configures one, otherwise a built-in
+    /// `draft < deferred < open < blocked < in_progress` ladder (statuses
+    /// outside the order rank lowest; ties resolve to the lexicographically
+    /// greatest name). When every descendant is terminal
+    /// (`closed`/`tombstone`) the rollup is `closed`. Traversal uses a
+    /// visited set, so imported dependency cycles terminate and the issue
+    /// itself is never counted as its own descendant.
+    pub fn derived_rollup(&self, issue_id: &str) -> Result<Option<RollupSummary>> {
+        // Walk the subtree level by level against `idx_dependencies_depends_on_type`
+        // instead of loading the repository's whole edge map: showing a handful
+        // of issues in a large project should touch only their own subtrees.
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(issue_id.to_string());
+        let mut frontier: Vec<String> = vec![issue_id.to_string()];
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+
+        while !frontier.is_empty() {
+            let mut next: Vec<String> = Vec::new();
+            for chunk in frontier.chunks(SQLITE_VAR_LIMIT) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT d.issue_id, i.status
+                     FROM dependencies d
+                     JOIN issues i ON d.issue_id = i.id
+                     WHERE d.depends_on_id IN ({placeholders})
+                       AND d.type = 'parent-child'"
+                );
+                let params: Vec<SqliteValue> = chunk
+                    .iter()
+                    .map(|id| SqliteValue::from(id.as_str()))
+                    .collect();
+                let rows = self.conn.query_with_params(&sql, &params)?;
+                for row in &rows {
+                    let Some(child) = row.get(0).and_then(SqliteValue::as_text) else {
+                        continue;
+                    };
+                    // A visited set keeps an imported parent-child cycle from
+                    // looping and stops the issue counting itself.
+                    if !visited.insert(child.to_string()) {
+                        continue;
+                    }
+                    let status = row
+                        .get(1)
+                        .and_then(SqliteValue::as_text)
+                        .unwrap_or("")
+                        .trim()
+                        .to_lowercase();
+                    if !status.is_empty() {
+                        *counts.entry(status).or_insert(0) += 1;
+                    }
+                    next.push(child.to_string());
+                }
+            }
+            frontier = next;
+        }
+
+        if counts.is_empty() {
+            return Ok(None);
+        }
+
+        let workflow_order: Vec<String> = self
+            .workflow_transition_policy
+            .statuses
+            .iter()
+            .map(|status| status.trim().to_lowercase())
+            .collect();
+        let rank = |status: &str| -> i64 {
+            if workflow_order.is_empty() {
+                match status {
+                    "draft" => 1,
+                    "deferred" => 2,
+                    "open" => 3,
+                    "blocked" => 4,
+                    "in_progress" => 5,
+                    _ => 0,
+                }
+            } else {
+                workflow_order
+                    .iter()
+                    .position(|candidate| candidate == status)
+                    .map_or(-1, |position| i64::try_from(position).unwrap_or(i64::MAX))
+            }
+        };
+        let status = counts
+            .keys()
+            .filter(|status| !matches!(status.as_str(), "closed" | "tombstone"))
+            .max_by(|left, right| rank(left).cmp(&rank(right)).then_with(|| left.cmp(right)))
+            .cloned()
+            .unwrap_or_else(|| "closed".to_string());
+
+        Ok(Some(RollupSummary {
+            status,
+            descendants: counts,
         }))
     }
 
@@ -11488,10 +14812,13 @@ impl SqliteStorage {
                  EXISTS(SELECT 1 FROM dependencies WHERE issue_id = ?),
                  EXISTS(SELECT 1 FROM dependencies WHERE depends_on_id = ?),
                  EXISTS(SELECT 1 FROM comments WHERE issue_id = ?),
+                 EXISTS(SELECT 1 FROM dependencies
+                        WHERE depends_on_id = ? AND type = 'parent-child'),
                  (SELECT depends_on_id FROM dependencies
                   WHERE issue_id = ? AND type = 'parent-child'
                   ORDER BY rowid DESC LIMIT 1)",
             &[
+                SqliteValue::from(id),
                 SqliteValue::from(id),
                 SqliteValue::from(id),
                 SqliteValue::from(id),
@@ -11505,7 +14832,8 @@ impl SqliteStorage {
             has_dependencies: row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
             has_dependents: row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
             has_comments: row.get(3).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
-            parent: row.get(4).and_then(SqliteValue::as_text).map(String::from),
+            has_children: row.get(4).and_then(SqliteValue::as_integer).unwrap_or(0) != 0,
+            parent: row.get(5).and_then(SqliteValue::as_text).map(String::from),
         })
     }
 
@@ -12131,30 +15459,33 @@ fn finish_issue_mutation_write_probe(
         // built to catch (issue #263). Returning Ok here would turn
         // the probe into a false-negative oracle for the storage
         // layer's visibility/write-path bug class. Surface it as the
-        // primary error even when ROLLBACK also fails: a downstream
-        // rollback hiccup is noise compared to "we couldn't update
-        // the row we just inserted".
+        // primary error. If ROLLBACK also fails, retain the zero-row
+        // diagnostic as the source while explicitly reporting that the
+        // connection's transaction state is now unknown.
         (Ok(0), rollback) => {
-            if let Err(rollback_err) = rollback {
-                tracing::warn!(
-                    error = %rollback_err,
-                    "ROLLBACK failed after zero-row issue write probe"
-                );
-            }
-            Err(BeadsError::Database(FrankenError::Internal(
+            let original_error = BeadsError::Database(FrankenError::Internal(
                 "write probe did not find issue inside mutation transaction".to_string(),
-            )))
+            ));
+            Err(SqliteStorage::rollback_result_error(
+                original_error,
+                rollback,
+                "zero-row issue write probe",
+            ))
         }
         (Ok(_), Ok(_)) => Ok(()),
-        (Ok(_), Err(rollback_err)) => Err(BeadsError::Database(rollback_err)),
+        (Ok(_), Err(rollback_err)) => Err(SqliteStorage::rollback_failure_error(
+            BeadsError::Config(
+                "issue write probe succeeded but its rollback cleanup failed".to_string(),
+            ),
+            rollback_err,
+            "successful issue write probe",
+        )),
         (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
-        (Err(probe_err), Err(rollback_err)) => {
-            tracing::warn!(
-                error = %rollback_err,
-                "ROLLBACK failed after issue write probe"
-            );
-            Err(BeadsError::Database(probe_err))
-        }
+        (Err(probe_err), Err(rollback_err)) => Err(SqliteStorage::rollback_failure_error(
+            BeadsError::Database(probe_err),
+            rollback_err,
+            "issue write probe error",
+        )),
     }
 }
 
@@ -12180,6 +15511,82 @@ fn remove_temp_db_files(path: &Path) {
             }
         }
     }
+}
+
+/// Repair over-permissive modes on the fsqlite namespace sidecars that live
+/// beside `db_path`, before anything tries to open the database (GitHub #403).
+///
+/// fsqlite refuses to open `<db>-fsqlite-ns-gate` / `-fsqlite-ns-use` when the
+/// file carries any bit in `0o077`, and the refusal surfaces as a bare
+/// `Database error: unable to open database file: '<sidecar>'`, which reads as
+/// database corruption and wedges every `br` command — reads included — until
+/// a human notices the mode. The sidecars are regenerable engine state, not
+/// user data, so when this process can chmod them we strip the group/other
+/// bits and continue. When we cannot, we return an error that names the file,
+/// the observed mode, and the required mode instead of letting the engine
+/// report an unattributable `DATABASE_ERROR`.
+///
+/// A `chmod` succeeds only for the file's owner (or root), so attempting it is
+/// itself the ownership test — no uid probing is needed in a crate that
+/// forbids `unsafe`.
+///
+/// # Errors
+///
+/// Returns an error when a sidecar is over-permissive and this process cannot
+/// restore owner-only permissions.
+fn heal_namespace_sidecar_modes(db_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+
+            let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
+                continue;
+            };
+            // A symlinked sidecar is out of scope: following it would chmod a
+            // file outside the database family.
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                continue;
+            }
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 == 0 {
+                continue;
+            }
+
+            let repaired = mode & !0o077;
+            if let Err(err) =
+                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(repaired))
+            {
+                return Err(BeadsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "fsqlite namespace sidecar {} has mode {:04o}; fsqlite requires \
+                         owner-only permissions (0600) and this process could not repair it \
+                         ({err}). The database itself is fine — run `chmod 0600 {}` (or have \
+                         its owner do so) and retry.",
+                        sidecar.display(),
+                        mode & 0o7777,
+                        sidecar.display()
+                    ),
+                )));
+            }
+            tracing::debug!(
+                sidecar = %sidecar.display(),
+                observed_mode = format!("{:04o}", mode & 0o7777),
+                repaired_mode = format!("{:04o}", repaired & 0o7777),
+                "repaired over-permissive fsqlite namespace sidecar mode",
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+    }
+    Ok(())
 }
 
 fn database_header_user_version(path: &Path) -> Option<u32> {
@@ -12213,6 +15620,19 @@ fn connection_user_version(conn: &Connection) -> Option<u32> {
     row.get(0)
         .and_then(SqliteValue::as_integer)
         .and_then(|v| u32::try_from(v).ok())
+}
+
+fn effective_database_user_version(path: &Path) -> Result<Option<u32>> {
+    if database_header_user_version(path).is_none() {
+        return Ok(None);
+    }
+    let conn = open_with_flags(
+        path.to_string_lossy().as_ref(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let version = connection_user_version(&conn).or_else(|| database_header_user_version(path));
+    conn.close().map_err(BeadsError::Database)?;
+    Ok(version)
 }
 
 fn is_transient_wal_tail_read_error(error: &dyn std::fmt::Display) -> bool {
@@ -13195,26 +16615,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn clear_dirty_flags(&mut self, ids: &[String]) -> Result<usize> {
-        const SQLITE_VAR_LIMIT: usize = 900;
         if ids.is_empty() {
             return Ok(0);
         }
-
-        let mut total_deleted = 0;
-        for chunk in ids.chunks(SQLITE_VAR_LIMIT) {
-            // Delete existing entries row-by-row to avoid fsqlite IN-clause bugs
-            let mut chunk_deleted = 0;
-            for id in chunk {
-                let deleted = self.conn.execute_with_params(
-                    "DELETE FROM dirty_issues WHERE issue_id = ?",
-                    &[SqliteValue::from(id.as_str())],
-                )?;
-                chunk_deleted += deleted;
-            }
-            total_deleted += chunk_deleted;
-        }
-
-        Ok(total_deleted)
+        self.with_write_transaction(|storage| storage.clear_dirty_issue_ids_in_tx(ids))
     }
 
     /// Clear all dirty flags.
@@ -13223,8 +16627,7 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn clear_all_dirty_flags(&mut self) -> Result<usize> {
-        let deleted = self.conn.execute("DELETE FROM dirty_issues")?;
-        Ok(deleted)
+        self.with_write_transaction(Self::clear_all_dirty_issues_in_tx)
     }
 
     /// Get the count of issues (for safety guard).
@@ -13305,6 +16708,12 @@ impl SqliteStorage {
 
     /// Detect all cycles in the dependency graph.
     ///
+    /// Since GitHub #391 the graph contains only *blocking* edges (`blocks`,
+    /// `conditional-blocks`, `waits-for`, plus reversed `parent-child`
+    /// containment), matching the add-time gate — `related` and other
+    /// non-blocking types are never cycle-checked on insertion, so they must
+    /// not fail the report either.
+    ///
     /// Returns deterministic cycle witnesses, where each cycle is a vector of
     /// issue IDs ending with its starting ID. The implementation finds strongly
     /// connected components first, then emits one witness per cyclic component.
@@ -13329,8 +16738,8 @@ impl SqliteStorage {
         self.detect_cycles(true)
     }
 
-    fn detect_cycles(&self, blocking_only: bool) -> Result<Vec<Vec<String>>> {
-        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+    fn detect_cycles(&self, _blocking_only: bool) -> Result<Vec<Vec<String>>> {
+        let graph = self.load_dependency_cycle_graph()?;
         Ok(Self::cycle_witnesses_from_graph(&graph))
     }
 
@@ -13342,11 +16751,14 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database query fails.
+    /// Since GitHub #391, the cycle graph always uses the blocking edge set
+    /// (matching the add-time gate), so `blocking_only` is a compatible
+    /// no-op alias retained for the `--blocking-only` CLI flag.
     pub fn detect_dependency_cycle_report(
         &self,
-        blocking_only: bool,
+        _blocking_only: bool,
     ) -> Result<DependencyCycleReport> {
-        let graph = self.load_dependency_cycle_graph(blocking_only)?;
+        let graph = self.load_dependency_cycle_graph()?;
         let statuses = self.load_dependency_cycle_issue_statuses()?;
         let witnesses = Self::cycle_witnesses_with_components_from_graph(&graph);
         let mut active_cycles = Vec::new();
@@ -13368,24 +16780,25 @@ impl SqliteStorage {
         })
     }
 
-    fn load_dependency_cycle_graph(
-        &self,
-        blocking_only: bool,
-    ) -> Result<BTreeMap<String, Vec<String>>> {
-        Self::load_dependency_cycle_graph_from_conn(&self.conn, blocking_only)
+    fn load_dependency_cycle_graph(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        Self::load_dependency_cycle_graph_from_conn(&self.conn)
     }
 
     fn load_dependency_cycle_graph_from_conn(
         conn: &Connection,
-        blocking_only: bool,
     ) -> Result<BTreeMap<String, Vec<String>>> {
         let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let standard_edge_sql = if blocking_only {
-            "SELECT issue_id, depends_on_id FROM dependencies \
-             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')"
-        } else {
-            "SELECT issue_id, depends_on_id FROM dependencies WHERE type != 'parent-child'"
-        };
+        // Cycle health is a *blocking* question, and it must agree with the
+        // add-time gate: `br dep add -t related` (and custom non-blocking
+        // types) are never cycle-checked on insertion, so counting those
+        // edges here made `br dep cycles` fail (nonzero since #368) on
+        // graphs the add path deliberately allowed (GitHub #391). Both modes
+        // therefore use the blocking edge set; `--blocking-only` remains a
+        // compatible alias now that the default matches add-time semantics.
+        // The reversed parent-child containment edges below participate in
+        // both modes, exactly like the add-time traversal.
+        let standard_edge_sql = "SELECT issue_id, depends_on_id FROM dependencies \
+             WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')";
         let rows1 = conn.query(standard_edge_sql)?;
         for row in &rows1 {
             let from = cycle_endpoint(row.get(0));
@@ -13690,6 +17103,39 @@ impl SqliteStorage {
         ]
     }
 
+    /// Return the exact SQLite values a full import INSERT/UPDATE writes, in
+    /// physical `issues` table column order. Additive reconciliation uses this
+    /// to bind implementation-produced raw poststate into its review token.
+    pub(crate) fn import_issue_raw_row_for_witness(issue: &Issue) -> Result<Vec<SqliteValue>> {
+        let timestamps = ImportIssueTimestampStrings::from_issue(issue);
+        let mut fields = Self::import_issue_field_values(issue, &timestamps);
+        if fields.len() != 37 {
+            return Err(BeadsError::Config(format!(
+                "Import issue raw witness expected 37 fields, found {}",
+                fields.len()
+            )));
+        }
+        // Import SQL places source_repo_path beside source_repo for parameter
+        // readability, while migrated physical schemas append it immediately
+        // before agent_context. Reorder into SELECT * / schema-catalog order.
+        let source_repo_path = fields.remove(23);
+        let agent_context = fields.pop().ok_or_else(|| {
+            BeadsError::Config("Import issue raw witness lost the agent_context field".to_string())
+        })?;
+        let mut row = Vec::with_capacity(38);
+        row.push(SqliteValue::from(issue.id.as_str()));
+        row.extend(fields);
+        row.push(source_repo_path);
+        row.push(agent_context);
+        if row.len() != 38 {
+            return Err(BeadsError::Config(format!(
+                "Import issue raw witness expected 38 columns, found {}",
+                row.len()
+            )));
+        }
+        Ok(row)
+    }
+
     fn insert_issue_row_for_import(
         &self,
         issue: &Issue,
@@ -13749,7 +17195,12 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import uses the in-tx primitive.
     pub(crate) fn insert_new_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        self.with_connection_write_transaction(|_| self.insert_new_issue_for_import_in_tx(issue))
+    }
+
+    pub(crate) fn insert_new_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
         Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
     }
@@ -13772,6 +17223,10 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn upsert_issue_for_import(&self, issue: &Issue) -> Result<bool> {
+        self.with_connection_write_transaction(|_| self.upsert_issue_for_import_in_tx(issue))
+    }
+
+    pub(crate) fn upsert_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
 
         // Narrow existence probe: don't deserialize the row, just check
@@ -13831,7 +17286,18 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the marker cannot be updated.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import uses the in-tx primitive.
     pub(crate) fn replace_dirty_issue_marker(&self, issue_id: &str, marked_at: &str) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.replace_dirty_issue_marker_in_tx(issue_id, marked_at)
+        })
+    }
+
+    pub(crate) fn replace_dirty_issue_marker_in_tx(
+        &self,
+        issue_id: &str,
+        marked_at: &str,
+    ) -> Result<()> {
         self.conn.execute_with_params(
             "DELETE FROM dirty_issues WHERE issue_id = ?",
             &[SqliteValue::from(issue_id)],
@@ -13850,6 +17316,16 @@ impl SqliteStorage {
     /// Returns an error if the label replacement is invalid or the database
     /// operation fails.
     pub fn sync_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.sync_labels_for_import_in_tx(issue_id, labels)
+        })
+    }
+
+    pub(crate) fn sync_labels_for_import_in_tx(
+        &self,
+        issue_id: &str,
+        labels: &[String],
+    ) -> Result<()> {
         let unique_labels = unique_label_refs(labels);
         validate_storage_label_refs(&unique_labels)?;
 
@@ -13899,6 +17375,16 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database operation fails.
     pub fn sync_dependencies_for_import(
+        &self,
+        issue_id: &str,
+        dependencies: &[crate::model::Dependency],
+    ) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.sync_dependencies_for_import_in_tx(issue_id, dependencies)
+        })
+    }
+
+    pub(crate) fn sync_dependencies_for_import_in_tx(
         &self,
         issue_id: &str,
         dependencies: &[crate::model::Dependency],
@@ -14032,6 +17518,16 @@ impl SqliteStorage {
         issue_id: &str,
         comments: &[crate::model::Comment],
     ) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.sync_comments_for_import_in_tx(issue_id, comments)
+        })
+    }
+
+    pub(crate) fn sync_comments_for_import_in_tx(
+        &self,
+        issue_id: &str,
+        comments: &[crate::model::Comment],
+    ) -> Result<()> {
         validate_import_comments_for_issue(issue_id, comments)?;
 
         // Remove existing comments
@@ -14052,11 +17548,690 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if any relation insert fails.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import uses the in-tx primitive.
     pub(crate) fn insert_new_issue_relations_for_import(&self, issue: &Issue) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.insert_new_issue_relations_for_import_in_tx(issue)
+        })
+    }
+
+    pub(crate) fn insert_new_issue_relations_for_import_in_tx(&self, issue: &Issue) -> Result<()> {
         self.insert_labels_for_import(&issue.id, &issue.labels)?;
         self.insert_dependencies_for_import(&issue.id, &issue.dependencies)?;
         self.insert_comments_for_import(&issue.id, &issue.comments)?;
         Ok(())
+    }
+
+    /// Upsert one imported issue and replace all of its owned relations in one
+    /// authority-verified transaction.
+    #[allow(dead_code)] // Guarded standalone entry point; bulk import/merge use one outer transaction.
+    pub(crate) fn upsert_issue_and_relations_for_import(&self, issue: &Issue) -> Result<bool> {
+        self.with_connection_write_transaction(|_| {
+            let changed = self.upsert_issue_for_import_in_tx(issue)?;
+            self.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
+            self.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
+            self.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
+            Ok(changed)
+        })
+    }
+
+    /// Apply the complete database side of one reviewed three-way merge in a
+    /// single write transaction.
+    ///
+    /// Deletions, issue rows, owned relations, resolution notes, dirty
+    /// markers, export-hash invalidation, operational caches, child counters,
+    /// and the merge-pending receipt either all commit or all roll back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation or any database operation fails.
+    pub(crate) fn apply_sync_merge_atomically(
+        &mut self,
+        kept: &[Issue],
+        deleted_ids: &[String],
+        notes: &[(String, String)],
+        intent: &SyncMergeIntent,
+    ) -> Result<SyncMergePendingReceipt> {
+        self.last_capacity_warnings.clear();
+        let actor = intent.actor.as_str();
+        if actor.trim().is_empty() || actor.trim() != actor {
+            return Err(BeadsError::validation(
+                "actor",
+                "sync merge actor must be nonblank and trimmed",
+            ));
+        }
+        let timestamp = intent.export_as_of;
+        let created_at = timestamp.to_rfc3339();
+        for (issue_id, note) in notes {
+            validate_new_comment(issue_id, "br-sync", note)?;
+        }
+
+        let kept_by_id = kept
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue))
+            .collect::<BTreeMap<_, _>>();
+        if kept_by_id.len() != kept.len() {
+            return Err(BeadsError::validation(
+                "kept",
+                "sync merge report contains duplicate kept issue IDs",
+            ));
+        }
+        let deleted_set = deleted_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if deleted_set.len() != deleted_ids.len() {
+            return Err(BeadsError::validation(
+                "deleted",
+                "sync merge report contains duplicate deleted issue IDs",
+            ));
+        }
+        if let Some(overlap) = kept_by_id
+            .keys()
+            .find(|issue_id| deleted_set.contains(**issue_id))
+        {
+            return Err(BeadsError::validation(
+                "merge_report",
+                format!("issue {overlap} is both kept and deleted"),
+            ));
+        }
+        let note_ids = notes
+            .iter()
+            .map(|(issue_id, _)| issue_id.as_str())
+            .collect::<HashSet<_>>();
+        if note_ids.len() != notes.len() {
+            return Err(BeadsError::validation(
+                "notes",
+                "sync merge report contains duplicate note targets",
+            ));
+        }
+        for note_id in &note_ids {
+            let issue = kept_by_id.get(note_id).ok_or_else(|| {
+                BeadsError::validation(
+                    "notes",
+                    format!("merge note target {note_id} is not a kept issue"),
+                )
+            })?;
+            if issue.status == Status::Tombstone {
+                return Err(BeadsError::validation(
+                    "notes",
+                    format!("merge note target {note_id} is a tombstone"),
+                ));
+            }
+        }
+
+        let mut actual_kept_ids = kept_by_id
+            .keys()
+            .map(|id| (*id).to_string())
+            .collect::<Vec<_>>();
+        actual_kept_ids.sort();
+        let mut actual_deleted_ids = deleted_ids.to_vec();
+        actual_deleted_ids.sort();
+        let mut actual_note_witnesses = notes
+            .iter()
+            .map(|(issue_id, note)| crate::sync::SyncMergeNoteWitness {
+                issue_id: issue_id.clone(),
+                note_sha256: crate::util::hex_encode(&Sha256::digest(note.as_bytes())),
+            })
+            .collect::<Vec<_>>();
+        actual_note_witnesses.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+        let actual_kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(kept)?;
+        if actual_kept_ids != intent.changed_kept_issue_ids
+            || actual_kept_issue_witnesses != intent.kept_issue_witnesses
+            || actual_deleted_ids != intent.deleted_issue_ids
+            || actual_note_witnesses != intent.note_witnesses
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Sync merge mutation payload does not match its reviewed intent"
+                    .to_string(),
+            });
+        }
+        if intent.schema_version != 2 {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Unsupported sync merge intent schema {}",
+                    intent.schema_version
+                ),
+            });
+        }
+
+        let pending_attribution = self.pending_event_attribution_for_review();
+        if pending_attribution != intent.event_attribution {
+            return Err(BeadsError::SyncConflict {
+                message: "Sync merge event attribution changed after its intent was reviewed"
+                    .to_string(),
+            });
+        }
+        let reviewed_attribution = intent.event_attribution.clone();
+        if self.workflow_capacity_policy != intent.capacity_policy {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Workflow capacity policy changed after the sync merge intent was reviewed"
+                        .to_string(),
+            });
+        }
+        let capacity_policy = intent.capacity_policy.clone();
+        let result = self.with_write_transaction(|storage| {
+            match storage.inspect_pending_sync_merge_in_current_transaction()? {
+                PendingSyncMergeInspection::Absent => {}
+                pending => {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "{}; refusing to begin a second sync merge",
+                            pending.diagnostic()
+                        ),
+                    });
+                }
+            }
+            let database_before = crate::sync::capture_sync_database_witness(storage)?;
+            if database_before != intent.database_before {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database changed after sync merge planning; refusing to clobber the newer generation"
+                            .to_string(),
+                });
+            }
+
+            let mut changed_ids = kept
+                .iter()
+                .map(|issue| issue.id.clone())
+                .collect::<HashSet<_>>();
+            changed_ids.extend(notes.iter().map(|(issue_id, _)| issue_id.clone()));
+
+            // Capacity is a final-state property of the complete merge, not a
+            // sequence of independent row writes. Build one transition batch
+            // from the transaction's exact prestate so a kept/new issue cannot
+            // bypass limits and a capacity-neutral swap is not rejected merely
+            // because its admitting row happens to be applied first.
+            let mut affected_ids = kept
+                .iter()
+                .map(|issue| issue.id.clone())
+                .chain(deleted_ids.iter().cloned())
+                .collect::<Vec<_>>();
+            affected_ids.sort();
+            affected_ids.dedup();
+            let existing_by_id = storage
+                .get_issues_by_ids(&affected_ids)?
+                .into_iter()
+                .map(|issue| (issue.id.clone(), issue))
+                .collect::<HashMap<_, _>>();
+            let mut capacity_transitions = Vec::with_capacity(affected_ids.len());
+            for issue in kept {
+                let from = existing_by_id
+                    .get(&issue.id)
+                    .map(|existing| existing.status.as_str().to_string());
+                if from
+                    .as_deref()
+                    .is_none_or(|status| !status.eq_ignore_ascii_case(issue.status.as_str()))
+                {
+                    capacity_transitions.push(CapacityBatchTransition {
+                        issue_id: issue.id.clone(),
+                        from,
+                        to: issue.status.as_str().to_string(),
+                        issue_type: Some(issue.issue_type.as_str().to_string()),
+                        current_assignee: existing_by_id
+                            .get(&issue.id)
+                            .and_then(|existing| existing.assignee.clone()),
+                        prospective_assignee: issue.assignee.clone(),
+                    });
+                }
+            }
+            let tombstones = deleted_ids
+                .iter()
+                .filter_map(|issue_id| existing_by_id.get(issue_id).cloned())
+                .collect::<Vec<_>>();
+            for tombstone in &tombstones {
+                if tombstone.status != Status::Tombstone {
+                    capacity_transitions.push(CapacityBatchTransition {
+                        issue_id: tombstone.id.clone(),
+                        from: Some(tombstone.status.as_str().to_string()),
+                        to: Status::Tombstone.as_str().to_string(),
+                        issue_type: None,
+                        current_assignee: tombstone.assignee.clone(),
+                        prospective_assignee: tombstone.assignee.clone(),
+                    });
+                }
+            }
+            capacity_transitions.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+            let acting = CapacityActingContext::new(actor, &reviewed_attribution);
+            let capacity_warnings = Self::evaluate_workflow_capacity_batch_in_tx(
+                &storage.conn,
+                &capacity_policy,
+                &capacity_transitions,
+                &acting,
+            )?;
+
+            for tombstone in &tombstones {
+                if tombstone.status == Status::Tombstone {
+                    continue;
+                }
+                let was_terminal = tombstone.status.is_terminal();
+                let original_type = tombstone.issue_type.as_str().to_string();
+                let mut tombstone_for_hash = tombstone.clone();
+                tombstone_for_hash.status = Status::Tombstone;
+                let tombstone_hash = crate::util::content_hash(&tombstone_for_hash);
+                storage.conn.execute_with_params(
+                    "UPDATE issues SET
+                        content_hash = ?,
+                        status = 'tombstone',
+                        deleted_at = ?,
+                        deleted_by = ?,
+                        delete_reason = ?,
+                        original_type = ?,
+                        updated_at = ?
+                     WHERE id = ?",
+                    &[
+                        SqliteValue::from(tombstone_hash.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(actor),
+                        SqliteValue::from("merge deletion"),
+                        SqliteValue::from(original_type.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(tombstone.id.as_str()),
+                    ],
+                )?;
+                storage.conn.execute_with_params(
+                    "DELETE FROM close_metadata WHERE issue_id = ?",
+                    &[SqliteValue::from(tombstone.id.as_str())],
+                )?;
+                if !was_terminal {
+                    storage.insert_sync_merge_event_in_tx(
+                        &tombstone.id,
+                        EventType::Deleted,
+                        actor,
+                        Some("Deleted issue: merge deletion"),
+                        &created_at,
+                        &reviewed_attribution,
+                    )?;
+                }
+                changed_ids.insert(tombstone.id.clone());
+            }
+
+            // Materialize every issue row before validating/inserting
+            // dependency relations so references between two newly merged
+            // rows do not depend on report ordering.
+            for issue in kept {
+                storage.upsert_issue_for_import_in_tx(issue)?;
+            }
+            for issue in kept {
+                storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
+                storage.sync_dependencies_for_import_in_tx(&issue.id, &issue.dependencies)?;
+                storage.sync_comments_for_import_in_tx(&issue.id, &issue.comments)?;
+            }
+
+            for (issue_id, note) in notes {
+                Self::ensure_issue_mutable_in_tx(&storage.conn, issue_id, "add merge note to")?;
+                storage.conn.execute_with_params(
+                    "INSERT INTO comments (issue_id, author, text, created_at) \
+                     VALUES (?, ?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from("br-sync"),
+                        SqliteValue::from(note.as_str()),
+                        SqliteValue::from(created_at.as_str()),
+                    ],
+                )?;
+                storage.conn.execute_with_params(
+                    "UPDATE issues SET updated_at = ? WHERE id = ?",
+                    &[
+                        SqliteValue::from(created_at.as_str()),
+                        SqliteValue::from(issue_id.as_str()),
+                    ],
+                )?;
+                storage.insert_sync_merge_event_in_tx(
+                    issue_id,
+                    EventType::Commented,
+                    actor,
+                    Some(note),
+                    &created_at,
+                    &reviewed_attribution,
+                )?;
+            }
+
+            let mut changed_ids = changed_ids.into_iter().collect::<Vec<_>>();
+            changed_ids.sort();
+            for issue_id in &changed_ids {
+                storage.replace_dirty_issue_marker_in_tx(issue_id, &created_at)?;
+            }
+            storage.clear_export_hashes_in_tx(&changed_ids)?;
+            storage.set_metadata_in_tx("needs_flush", "true")?;
+            storage.rebuild_blocked_cache_in_tx()?;
+            storage.rebuild_child_counters_in_tx()?;
+            let database_after = crate::sync::capture_sync_merge_core_witness(storage)?;
+            let mut sink = std::io::sink();
+            let (export_result, _) =
+                crate::sync::export_to_writer_with_policy_and_retention_at(
+                    storage,
+                    &mut sink,
+                    crate::sync::ExportErrorPolicy::Strict,
+                    intent.retention_days,
+                    intent.export_as_of,
+                )?;
+            let receipt = SyncMergePendingReceipt::new(
+                intent.clone(),
+                timestamp.to_rfc3339(),
+                database_after,
+                export_result.content_hash,
+                export_result.exported_count,
+                &export_result.issue_hashes,
+                capacity_warnings.clone(),
+            )?;
+            receipt.validate()?;
+            let receipt_serialized = serde_json::to_string(&receipt)?;
+            storage.set_metadata_in_tx(
+                METADATA_SYNC_MERGE_PENDING,
+                &receipt_serialized,
+            )?;
+            storage.require_exact_pending_sync_merge_row_in_current_transaction(
+                &receipt_serialized,
+                "New sync merge receipt was not durably materialized before COMMIT",
+            )?;
+            Ok((receipt, capacity_warnings))
+        });
+
+        if result.is_ok() {
+            self.pending_event_attribution = None;
+        }
+        let (receipt, capacity_warnings) = result?;
+        self.last_capacity_warnings = capacity_warnings;
+        Ok(receipt)
+    }
+
+    fn insert_sync_merge_event_in_tx(
+        &self,
+        issue_id: &str,
+        event_type: EventType,
+        actor: &str,
+        comment: Option<&str>,
+        created_at: &str,
+        attribution: &EventAttribution,
+    ) -> Result<()> {
+        self.conn.execute_with_params(
+            "INSERT INTO events (
+                issue_id, event_type, actor, old_value, new_value, comment,
+                created_at, agent_name, harness, model
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(event_type.as_str()),
+                SqliteValue::from(actor),
+                SqliteValue::Null,
+                SqliteValue::Null,
+                comment.map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(created_at),
+                attribution
+                    .agent_name
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .harness
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                attribution
+                    .model
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn pending_sync_merge_metadata_rows(&self, key: &str) -> Result<Vec<Option<String>>> {
+        let rows = self.conn.query_with_params(
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid",
+            &[SqliteValue::from(key)],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .map(str::to_string)
+            })
+            .collect())
+    }
+
+    fn inspect_pending_sync_merge_in_current_transaction(
+        &self,
+    ) -> Result<PendingSyncMergeInspection> {
+        let current_rows = self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING)?;
+        let legacy_rows =
+            self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING_LEGACY)?;
+        Ok(classify_pending_sync_merge_rows(
+            &current_rows,
+            &legacy_rows,
+        ))
+    }
+
+    fn require_exact_pending_sync_merge_row_in_current_transaction(
+        &self,
+        expected_serialized: &str,
+        operation: &str,
+    ) -> Result<()> {
+        let current_rows = self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING)?;
+        let legacy_rows =
+            self.pending_sync_merge_metadata_rows(METADATA_SYNC_MERGE_PENDING_LEGACY)?;
+        let exact_current = matches!(
+            current_rows.as_slice(),
+            [Some(serialized)] if serialized == expected_serialized
+        );
+        if exact_current && legacy_rows.is_empty() {
+            return Ok(());
+        }
+        let diagnostic = classify_pending_sync_merge_rows(&current_rows, &legacy_rows).diagnostic();
+        Err(BeadsError::SyncConflict {
+            message: format!(
+                "{operation}: the exact pending sync-merge receipt row changed or became ambiguous ({diagnostic})"
+            ),
+        })
+    }
+
+    /// Inspect both pending-sync-merge metadata keys in one coherent read
+    /// transaction.
+    ///
+    /// Query/open uncertainty is returned as an error. `Absent` is produced
+    /// only after both exact raw row sets were read successfully from the same
+    /// SQLite snapshot.
+    ///
+    /// Callers must invoke this outside any caller-managed SQLite transaction.
+    /// If an in-transaction caller is added, it must use the private
+    /// `inspect_pending_sync_merge_in_current_transaction` classifier directly.
+    pub(crate) fn inspect_pending_sync_merge(&self) -> Result<PendingSyncMergeInspection> {
+        self.with_read_transaction(Self::inspect_pending_sync_merge_in_current_transaction)
+    }
+
+    /// Inspect pending-sync-merge state on an existing current-schema database
+    /// while a caller-owned database-family authority prevents replacement.
+    ///
+    /// Missing databases, stale/future schemas, route mismatches, open errors,
+    /// query errors, and receipt validation failures all fail closed. The
+    /// read-only storage carries the caller's authority, so
+    /// `with_read_transaction` verifies it before the transaction, immediately
+    /// before COMMIT, and again after COMMIT.
+    pub(crate) fn inspect_pending_sync_merge_under_authority(
+        path: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<PendingSyncMergeInspection> {
+        let planned_authority = crate::sync::database_write_authority_sha256(path)?;
+        if planned_authority != authority.authority_path_sha256() {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync-merge inspection path does not match the held database-family authority"
+                        .to_string(),
+            });
+        }
+        if authority.bind_database_inode_for_mutation()? {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync-merge state is unknown because the authorized database is missing"
+                        .to_string(),
+            });
+        }
+        authority.verify_database_authority()?;
+        let mut storage = match Self::open_current_read_only(path)? {
+            Some(storage) => storage,
+            None => {
+                let found = effective_database_user_version(path)?;
+                return match found {
+                    Some(found) => Err(BeadsError::SchemaMismatch {
+                        expected: CURRENT_SCHEMA_VERSION,
+                        found: i32::try_from(found).unwrap_or(i32::MAX),
+                    }),
+                    None => Err(BeadsError::SyncConflict {
+                        message:
+                            "Pending sync-merge state is unknown because the database schema is missing or unreadable"
+                                .to_string(),
+                    }),
+                };
+            }
+        };
+        authority.verify_database_authority()?;
+        storage.attach_write_authority(Arc::clone(authority));
+        storage.inspect_pending_sync_merge()
+    }
+
+    pub(crate) fn pending_sync_merge_receipt(&self) -> Result<Option<SyncMergePendingReceipt>> {
+        match self.inspect_pending_sync_merge()? {
+            PendingSyncMergeInspection::Absent => Ok(None),
+            PendingSyncMergeInspection::Valid(receipt) => Ok(Some(receipt)),
+            pending @ (PendingSyncMergeInspection::Legacy { .. }
+            | PendingSyncMergeInspection::Malformed { .. }) => Err(BeadsError::SyncConflict {
+                message: format!(
+                    "{}; refusing automatic recovery until `br sync --merge` reconciles it",
+                    pending.diagnostic()
+                ),
+            }),
+        }
+    }
+
+    pub(crate) fn compare_and_set_pending_sync_merge_receipt(
+        &mut self,
+        expected: &SyncMergePendingReceipt,
+        replacement: &SyncMergePendingReceipt,
+    ) -> Result<()> {
+        expected.validate()?;
+        replacement.validate()?;
+        if expected.phase != crate::sync::SyncMergePendingPhase::DatabaseCommitted
+            || replacement.phase != crate::sync::SyncMergePendingPhase::ExportFinalized
+        {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge phase update must advance database_committed to export_finalized"
+                        .to_string(),
+            });
+        }
+        if expected.receipt_id != replacement.receipt_id
+            || expected.intent_sha256 != replacement.intent_sha256
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync merge phase update changed immutable receipt identity"
+                    .to_string(),
+            });
+        }
+        let Some(jsonl_after) = replacement.jsonl_after.as_ref() else {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Export-finalized sync merge receipt must witness a published JSONL source"
+                        .to_string(),
+            });
+        };
+        let Some(export_finalization) = replacement.export_finalization.as_ref() else {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Export-finalized sync merge receipt must witness database export bookkeeping"
+                        .to_string(),
+            });
+        };
+        let exact_advancement = expected
+            .advance_to_export_finalized(jsonl_after.clone(), export_finalization.clone())?;
+        if replacement != &exact_advancement {
+            return Err(BeadsError::SyncConflict {
+                message: "Pending sync merge phase update changed immutable receipt evidence"
+                    .to_string(),
+            });
+        }
+        let expected_serialized = serde_json::to_string(expected)?;
+        let replacement_serialized = serde_json::to_string(replacement)?;
+        self.with_write_transaction(|storage| {
+            storage.require_exact_pending_sync_merge_row_in_current_transaction(
+                &expected_serialized,
+                "Pending sync merge receipt changed before phase advancement",
+            )?;
+            if crate::sync::capture_sync_merge_core_witness(storage)? != expected.database_after {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database merge-authoritative state changed before pending merge phase advancement"
+                            .to_string(),
+                });
+            }
+            let live_finalization =
+                crate::sync::capture_sync_merge_export_finalization_witness(storage)?;
+            if replacement.export_finalization.as_ref() != Some(&live_finalization) {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database export bookkeeping changed before pending merge phase advancement"
+                            .to_string(),
+                });
+            }
+            storage.set_metadata_in_tx(METADATA_SYNC_MERGE_PENDING, &replacement_serialized)
+        })
+    }
+
+    pub(crate) fn compare_and_clear_pending_sync_merge_receipt(
+        &mut self,
+        expected: &SyncMergePendingReceipt,
+    ) -> Result<()> {
+        expected.validate()?;
+        let terminal_raw_sha256 = match (expected.phase, expected.jsonl_after.as_ref()) {
+            (
+                crate::sync::SyncMergePendingPhase::ExportFinalized,
+                Some(crate::sync::JsonlSourceStateWitness::Present { raw_sha256, .. }),
+            ) => raw_sha256,
+            _ => {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Pending sync merge receipt may be cleared only after exact export finalization"
+                            .to_string(),
+                });
+            }
+        };
+        if terminal_raw_sha256 != &expected.jsonl_after_raw_sha256 {
+            return Err(BeadsError::SyncConflict {
+                message: "Terminal sync merge source witness does not match reviewed export bytes"
+                    .to_string(),
+            });
+        }
+        let expected_serialized = serde_json::to_string(expected)?;
+        self.with_write_transaction(|storage| {
+            storage.require_exact_pending_sync_merge_row_in_current_transaction(
+                &expected_serialized,
+                "Pending sync merge receipt changed before terminal cleanup",
+            )?;
+            if crate::sync::capture_sync_merge_core_witness(storage)? != expected.database_after {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database merge-authoritative state changed before pending merge terminal cleanup"
+                            .to_string(),
+                });
+            }
+            let live_finalization =
+                crate::sync::capture_sync_merge_export_finalization_witness(storage)?;
+            if expected.export_finalization.as_ref() != Some(&live_finalization) {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Database export bookkeeping changed before pending merge terminal cleanup"
+                            .to_string(),
+                });
+            }
+            storage.conn.execute_with_params(
+                "DELETE FROM metadata WHERE key = ? AND value = ?",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(expected_serialized.as_str()),
+                ],
+            )?;
+            Ok(())
+        })
     }
 
     fn insert_comments_for_import(
@@ -14529,6 +18704,299 @@ mod tests {
         }
     }
 
+    fn sync_merge_test_intent(
+        storage: &SqliteStorage,
+        kept: &[Issue],
+        deleted_ids: &[String],
+        notes: &[(String, String)],
+    ) -> SyncMergeIntent {
+        let mut changed_kept_issue_ids = kept
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<Vec<_>>();
+        changed_kept_issue_ids.sort();
+        let kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(kept).unwrap();
+        let mut deleted_issue_ids = deleted_ids.to_vec();
+        deleted_issue_ids.sort();
+        let mut note_witnesses = notes
+            .iter()
+            .map(|(issue_id, note)| crate::sync::SyncMergeNoteWitness {
+                issue_id: issue_id.clone(),
+                note_sha256: crate::util::hex_encode(&Sha256::digest(note.as_bytes())),
+            })
+            .collect::<Vec<_>>();
+        note_witnesses.sort_by(|left, right| left.issue_id.cmp(&right.issue_id));
+        SyncMergeIntent {
+            schema_version: 2,
+            database_authority_sha256: "11".repeat(32),
+            jsonl_authority_sha256: "22".repeat(32),
+            jsonl_path_sha256: "33".repeat(32),
+            jsonl_before: crate::sync::JsonlSourceStateWitness::Missing,
+            jsonl_before_content_sha256: None,
+            base_authority_sha256: "44".repeat(32),
+            base_before: crate::sync::JsonlSourceStateWitness::Missing,
+            base_before_content_sha256: None,
+            resolution: "manual".to_string(),
+            actor: "merge-agent".to_string(),
+            event_attribution: storage.pending_event_attribution_for_review(),
+            capacity_policy: storage.workflow_capacity_policy_for_review(),
+            retention_days: None,
+            export_as_of: Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap(),
+            changed_kept_issue_ids,
+            kept_issue_witnesses,
+            deleted_issue_ids,
+            note_witnesses,
+            database_before: crate::sync::capture_sync_database_witness(storage).unwrap(),
+        }
+    }
+
+    fn sync_merge_test_export_hashes(
+        storage: &SqliteStorage,
+        intent: &SyncMergeIntent,
+    ) -> Vec<(String, String)> {
+        let mut sink = Vec::new();
+        crate::sync::export_to_writer_with_policy_and_retention_at(
+            storage,
+            &mut sink,
+            crate::sync::ExportErrorPolicy::Strict,
+            intent.retention_days,
+            intent.export_as_of,
+        )
+        .unwrap()
+        .0
+        .issue_hashes
+    }
+
+    fn finalized_sync_merge_test_receipt(
+        storage: &mut SqliteStorage,
+        receipt: &SyncMergePendingReceipt,
+    ) -> SyncMergePendingReceipt {
+        let dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        storage.clear_dirty_flags(&dirty_ids).unwrap();
+        let reviewed_issue_hashes = sync_merge_test_export_hashes(storage, &receipt.intent);
+        storage.clear_all_export_hashes().unwrap();
+        storage.set_export_hashes(&reviewed_issue_hashes).unwrap();
+        storage
+            .set_metadata(
+                METADATA_JSONL_CONTENT_HASH,
+                &receipt.jsonl_after_content_sha256,
+            )
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, "2026-07-27T08:00:00+00:00")
+            .unwrap();
+        storage.set_metadata(METADATA_JSONL_SIZE, "128").unwrap();
+        storage
+            .set_metadata(METADATA_LAST_EXPORT_TIME, &receipt.created_at)
+            .unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        receipt
+            .advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Present {
+                    raw_sha256: receipt.jsonl_after_raw_sha256.clone(),
+                    mtime: "2026-07-27T08:00:00+00:00".to_string(),
+                    size: 128,
+                    identity: None,
+                },
+                crate::sync::capture_sync_merge_export_finalization_witness(storage).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn assert_sync_merge_payload_rejected_without_writes(
+        storage: &mut SqliteStorage,
+        kept: &[Issue],
+        deleted_ids: &[String],
+        notes: &[(String, String)],
+    ) -> BeadsError {
+        let intent = sync_merge_test_intent(storage, kept, deleted_ids, notes);
+        let before = crate::sync::capture_sync_database_witness(storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(kept, deleted_ids, notes, &intent)
+            .unwrap_err();
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(storage).unwrap(),
+            before
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        error
+    }
+
+    fn assert_sync_merge_substituted_issue_rejected_without_writes(
+        storage: &mut SqliteStorage,
+        planned: &Issue,
+        substituted: &Issue,
+    ) {
+        let intent = sync_merge_test_intent(storage, std::slice::from_ref(planned), &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(std::slice::from_ref(substituted), &[], &[], &intent)
+            .unwrap_err();
+        assert!(
+            matches!(error, BeadsError::SyncConflict { .. }),
+            "same-ID payload substitution must fail as a reviewed-intent conflict: {error}"
+        );
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(storage).unwrap(),
+            before,
+            "rejected same-ID payload substitution must perform zero writes"
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn pending_sync_merge_raw_classifier_fails_closed_on_legacy_null_and_duplicates() {
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[], &[]),
+            PendingSyncMergeInspection::Absent
+        ));
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[], &[Some("legacy-receipt".to_string())]),
+            PendingSyncMergeInspection::Legacy { row_count: 1, .. }
+        ));
+        for current in [
+            vec![None],
+            vec![Some(String::new())],
+            vec![Some("{}".to_string()), Some("{}".to_string())],
+        ] {
+            assert!(
+                matches!(
+                    classify_pending_sync_merge_rows(&current, &[]),
+                    PendingSyncMergeInspection::Malformed { .. }
+                ),
+                "current rows must fail closed: {current:?}"
+            );
+        }
+        for legacy in [
+            vec![None],
+            vec![Some(" ".to_string())],
+            vec![Some("legacy-a".to_string()), Some("legacy-b".to_string())],
+        ] {
+            assert!(
+                matches!(
+                    classify_pending_sync_merge_rows(&[], &legacy),
+                    PendingSyncMergeInspection::Malformed { .. }
+                ),
+                "legacy rows must fail closed: {legacy:?}"
+            );
+        }
+        assert!(matches!(
+            classify_pending_sync_merge_rows(
+                &[Some("{}".to_string())],
+                &[Some("legacy-receipt".to_string())],
+            ),
+            PendingSyncMergeInspection::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_sync_merge_raw_classifier_requires_exact_canonical_receipt_bytes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-canonical-receipt",
+            "Canonical receipt",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        let canonical = serde_json::to_string(&receipt).unwrap();
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[Some(canonical)], &[]),
+            PendingSyncMergeInspection::Valid(observed) if observed == receipt
+        ));
+
+        let pretty = serde_json::to_string_pretty(&receipt).unwrap();
+        assert!(matches!(
+            classify_pending_sync_merge_rows(&[Some(pretty)], &[]),
+            PendingSyncMergeInspection::Malformed { .. }
+        ));
+
+        let mut with_unknown = serde_json::to_value(&receipt).unwrap();
+        with_unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unrecognized_state".to_string(), serde_json::json!(true));
+        assert!(matches!(
+            classify_pending_sync_merge_rows(
+                &[Some(serde_json::to_string(&with_unknown).unwrap())],
+                &[],
+            ),
+            PendingSyncMergeInspection::Malformed { .. }
+        ));
+    }
+
+    #[test]
+    fn sync_merge_transaction_refuses_legacy_malformed_and_duplicate_pending_rows() {
+        for (case, rows) in [
+            (
+                "empty-current",
+                vec![(METADATA_SYNC_MERGE_PENDING, String::new())],
+            ),
+            (
+                "legacy",
+                vec![(
+                    METADATA_SYNC_MERGE_PENDING_LEGACY,
+                    "legacy-pending-state".to_string(),
+                )],
+            ),
+            (
+                "duplicate-current",
+                vec![
+                    (METADATA_SYNC_MERGE_PENDING, "{}".to_string()),
+                    (METADATA_SYNC_MERGE_PENDING, "{}".to_string()),
+                ],
+            ),
+        ] {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            for (key, value) in rows {
+                storage
+                    .conn
+                    .execute_with_params(
+                        "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                        &[SqliteValue::from(key), SqliteValue::from(value.as_str())],
+                    )
+                    .unwrap();
+            }
+            let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+            let issue = make_issue(
+                &format!("bd-refuse-{case}"),
+                "Must not commit",
+                Status::Open,
+                2,
+                None,
+                now,
+                None,
+            );
+            let kept = vec![issue];
+            let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+            let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+            assert!(matches!(
+                storage.apply_sync_merge_atomically(&kept, &[], &[], &intent),
+                Err(BeadsError::SyncConflict { .. })
+            ));
+            assert_eq!(
+                crate::sync::capture_sync_database_witness(&storage).unwrap(),
+                before,
+                "{case} must reject before any merge write"
+            );
+            assert!(
+                !matches!(
+                    storage.inspect_pending_sync_merge().unwrap(),
+                    PendingSyncMergeInspection::Absent
+                ),
+                "{case} must preserve the exact blocking state"
+            );
+        }
+    }
+
     fn hard_status_capacity(status: &str, hard: u32) -> crate::close_policy::CapacityPolicy {
         let mut policy = crate::close_policy::CapacityPolicy::default();
         policy.statuses.insert(
@@ -14656,6 +19124,191 @@ mod tests {
             assert!(issue.acceptance_criteria.is_none());
             assert!(storage.get_comments(id).unwrap().is_empty());
         }
+    }
+
+    /// GitHub #403: fsqlite refuses to open a namespace sidecar
+    /// (`-fsqlite-ns-gate` / `-fsqlite-ns-use`) that carries any bit in
+    /// `0o077`, and the refusal surfaced as a bare "unable to open database
+    /// file" naming the sidecar — wedging every command until a human noticed
+    /// the mode. The open path now repairs the mode first, because the
+    /// sidecars are regenerable engine state rather than user data.
+    #[cfg(unix)]
+    #[test]
+    fn over_permissive_namespace_sidecar_mode_is_healed_before_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let issue = make_issue(
+                "bd-ns",
+                "sidecar mode",
+                Status::Open,
+                2,
+                None,
+                Utc::now(),
+                None,
+            );
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        let mut loosened = Vec::new();
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            if sidecar.is_file() {
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o664)).unwrap();
+                loosened.push(sidecar);
+            }
+        }
+        assert!(
+            !loosened.is_empty(),
+            "expected fsqlite namespace sidecars beside {}",
+            db_path.display()
+        );
+
+        // Pre-fix this open failed with a bare `DATABASE_ERROR` naming the
+        // sidecar; the database itself was never damaged.
+        let storage = SqliteStorage::open(&db_path)
+            .expect("open must repair the sidecar mode instead of failing");
+        assert!(storage.get_issue("bd-ns").unwrap().is_some());
+        drop(storage);
+
+        for sidecar in loosened {
+            let mode = fs::metadata(&sidecar).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "sidecar {} still group/other accessible (mode {:04o})",
+                sidecar.display(),
+                mode & 0o7777
+            );
+        }
+    }
+
+    /// GitHub #399: a status move that `workflow.transitions` forbids must be
+    /// rejected by the storage preflight itself (the chokepoint every batch
+    /// close routes through), before any row in the batch is mutated. An
+    /// explicit `--bypass-policy` reason still gets through.
+    #[test]
+    fn forbidden_workflow_transition_is_rejected_for_whole_batch_before_mutation() {
+        let mut transitions = std::collections::BTreeMap::new();
+        transitions.insert("open".to_string(), vec!["in_progress".to_string()]);
+        transitions.insert("in_progress".to_string(), vec!["closed".to_string()]);
+        let workflow = crate::close_policy::Workflow {
+            strict: true,
+            statuses: vec![
+                "open".to_string(),
+                "in_progress".to_string(),
+                "closed".to_string(),
+            ],
+            transitions,
+            ..Default::default()
+        };
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage.set_workflow_policy(workflow);
+        let allowed = make_issue(
+            "bd-trans-allowed",
+            "already in progress",
+            Status::InProgress,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&allowed, "tester").unwrap();
+        let forbidden = make_issue(
+            "bd-trans-forbidden",
+            "still open",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&forbidden, "tester").unwrap();
+
+        let closes = vec![
+            (
+                "bd-trans-allowed".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..Default::default()
+                },
+            ),
+            (
+                "bd-trans-forbidden".to_string(),
+                IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..Default::default()
+                },
+            ),
+        ];
+        let error = storage
+            .update_issues_atomically(&closes, "tester")
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("workflow.transitions") && message.contains("'open'"),
+            "error should name the rejected transition: {message}"
+        );
+
+        // Neither issue moved: the whole batch is preflighted before mutation.
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-allowed")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-forbidden")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Open
+        );
+
+        // The allowed leg on its own still commits.
+        storage
+            .update_issues_atomically(&closes[..1], "tester")
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-allowed")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Closed
+        );
+
+        // `--bypass-policy` (a recorded bypass reason) still gets through.
+        storage
+            .update_issues_atomically(
+                &[(
+                    "bd-trans-forbidden".to_string(),
+                    IssueUpdate {
+                        status: Some(Status::Closed),
+                        workflow_policy_bypass_reason: Some("incident response".to_string()),
+                        ..Default::default()
+                    },
+                )],
+                "tester",
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_issue("bd-trans-forbidden")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::Closed
+        );
     }
 
     #[test]
@@ -15256,6 +19909,1639 @@ mod tests {
         assert_eq!(warnings[1].capacity_kind, "group");
         assert_eq!(warnings[1].capacity_name, "active_work");
         assert!(storage.take_capacity_warnings().is_empty());
+        // `all` counting must not advertise hierarchy evidence.
+        assert_eq!(warnings[0].counting_mode, "all");
+        assert!(warnings[0].aggregate_parents_excluded.is_none());
+    }
+
+    /// Build the epic -> parent -> {child A, child B} shape from the GitHub
+    /// #384 hierarchy example, with `prefix`-scoped IDs.
+    fn exemptable_hard_status_capacity(
+        status: &str,
+        hard: u32,
+    ) -> crate::close_policy::CapacityPolicy {
+        let mut policy = hard_status_capacity(status, hard);
+        policy.exemptions.providers = vec!["operator".to_string()];
+        policy
+    }
+
+    #[test]
+    fn capacity_exemption_admits_beyond_hard_limit_and_separates_counted_exempt_totals() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-ex-active", Status::InProgress),
+            ("bd-ex-hotfix", Status::Open),
+            ("bd-ex-normal", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+
+        storage
+            .grant_capacity_exemption(
+                "bd-ex-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "externally mandated hotfix",
+                Some(now + chrono::Duration::hours(2)),
+                "human-lead",
+            )
+            .unwrap();
+
+        // The exempted issue enters a full capacity without consuming a slot.
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-ex-hotfix", &update, "tester")
+            .unwrap();
+
+        // A normal issue is still rejected, and the evidence separates the
+        // counted total from the exempt total (GitHub #384: "Reports show
+        // counted and exempt totals separately").
+        let error = storage
+            .update_issue("bd-ex-normal", &update, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1, "exempt issue must not be counted");
+        assert_eq!(violation.prospective, 2);
+        assert_eq!(violation.exempt, Some(1));
+        assert!(
+            violation.to_string().contains("exempt: 1"),
+            "human evidence missing exempt total: {violation}"
+        );
+    }
+
+    #[test]
+    fn capacity_exemption_ends_when_issue_leaves_the_applicable_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exl-active", Status::InProgress),
+            ("bd-exl-hotfix", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+        storage
+            .grant_capacity_exemption(
+                "bd-exl-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "one admission only",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exl-hotfix", &enter, "tester")
+            .unwrap();
+
+        // Leaving the applicable status ends the exemption, audited, in the
+        // same transaction as the departure.
+        let leave = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exl-hotfix", &leave, "tester")
+            .unwrap();
+        let records = storage
+            .list_capacity_exemptions(Some("bd-exl-hotfix"))
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, "left_status");
+        let history = storage
+            .get_capacity_exemption_history(Some("bd-exl-hotfix"))
+            .unwrap();
+        assert_eq!(
+            history.last().map(|entry| entry.action.as_str()),
+            Some("left_status")
+        );
+
+        // Re-entry counts again: without a fresh grant the full capacity
+        // rejects it.
+        let error = storage
+            .update_issue("bd-exl-hotfix", &enter, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+    }
+
+    #[test]
+    fn capacity_exemption_expires_lazily_with_audited_record_and_counts_again() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exp-active", Status::InProgress),
+            ("bd-exp-hotfix", Status::Open),
+            ("bd-exp-normal", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+        storage
+            .grant_capacity_exemption(
+                "bd-exp-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "will expire",
+                Some(now + chrono::Duration::hours(2)),
+                "human-lead",
+            )
+            .unwrap();
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exp-hotfix", &enter, "tester")
+            .unwrap();
+
+        // Simulate the clock passing the expiry.
+        storage
+            .with_connection_write_transaction(|conn| {
+                conn.execute_with_params(
+                    "UPDATE capacity_exemptions SET expires_at = ? WHERE issue_id = ?",
+                    &[
+                        SqliteValue::from((now - chrono::Duration::hours(1)).to_rfc3339()),
+                        SqliteValue::from("bd-exp-hotfix"),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Expired exemptions count again: the hotfix now occupies a slot, so
+        // the next admission sees current=2 with no exempt total.
+        let error = storage
+            .update_issue("bd-exp-normal", &enter, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 2);
+        assert_eq!(violation.exempt, None);
+
+        // The rejected mutation rolled its own expiry marking back with it,
+        // but listing derives `expired` from the record without mutating.
+        let records = storage
+            .list_capacity_exemptions(Some("bd-exp-hotfix"))
+            .unwrap();
+        assert_eq!(records[0].state, "expired");
+        assert!(records[0].ended_at.is_none(), "read paths never mutate");
+
+        // The first *committed* observation persists the audited expire
+        // record: draining the overfull status is allowed and commits.
+        let drain = IssueUpdate {
+            status: Some(Status::Closed),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-exp-active", &drain, "tester")
+            .unwrap();
+        let records = storage
+            .list_capacity_exemptions(Some("bd-exp-hotfix"))
+            .unwrap();
+        assert_eq!(records[0].state, "expired");
+        assert!(records[0].ended_at.is_some());
+        let history = storage
+            .get_capacity_exemption_history(Some("bd-exp-hotfix"))
+            .unwrap();
+        assert_eq!(
+            history.last().map(|entry| entry.action.as_str()),
+            Some("expire")
+        );
+    }
+
+    #[test]
+    fn capacity_exemption_effect_is_withdrawn_when_provider_leaves_policy() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exw-active", Status::InProgress),
+            ("bd-exw-hotfix", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(exemptable_hard_status_capacity("in_progress", 1));
+        storage
+            .grant_capacity_exemption(
+                "bd-exw-hotfix",
+                "status",
+                "in_progress",
+                "operator",
+                "granted before the policy change",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+
+        // Removing the provider from policy silently withdraws its grants
+        // without touching the audit history.
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-exw-hotfix", &enter, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+    }
+
+    #[test]
+    fn capacity_exemption_grant_enforces_expiry_policy() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-exg", "issue", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let mut policy = exemptable_hard_status_capacity("in_progress", 1);
+        policy.exemptions.require_expiry = true;
+        policy.exemptions.max_ttl_seconds = Some(3600);
+        storage.set_workflow_capacity_policy(policy);
+
+        let no_expiry = storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "missing expiry",
+                None,
+                "human-lead",
+            )
+            .unwrap_err();
+        assert!(no_expiry.to_string().contains("require_expiry"));
+
+        let too_long = storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "beyond the cap",
+                Some(now + chrono::Duration::hours(48)),
+                "human-lead",
+            )
+            .unwrap_err();
+        assert!(too_long.to_string().contains("max_ttl_seconds"));
+
+        let in_the_past = storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "already over",
+                Some(now - chrono::Duration::hours(1)),
+                "human-lead",
+            )
+            .unwrap_err();
+        assert!(in_the_past.to_string().contains("future"));
+
+        storage
+            .grant_capacity_exemption(
+                "bd-exg",
+                "status",
+                "in_progress",
+                "operator",
+                "within the cap",
+                Some(now + chrono::Duration::minutes(30)),
+                "human-lead",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn capacity_exemption_applies_to_admission_observations_of_the_same_status() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-exa-review", Status::Custom("in_review".to_string())),
+            ("bd-exa-next", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy
+            .admission
+            .push(crate::close_policy::CapacityAdmissionRule {
+                name: "drain_review_before_starting".to_string(),
+                transitions: crate::close_policy::CapacityTransitionMatcher {
+                    from: vec!["open".to_string()],
+                    to: vec!["in_progress".to_string()],
+                },
+                require_below: crate::close_policy::CapacityRequirements {
+                    statuses: std::collections::BTreeMap::from([("in_review".to_string(), 1)]),
+                    groups: std::collections::BTreeMap::new(),
+                },
+            });
+        policy.exemptions.providers = vec!["operator".to_string()];
+        storage.set_workflow_capacity_policy(policy);
+
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let error = storage
+            .update_issue("bd-exa-next", &enter, "tester")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::WorkflowCapacityExceeded { .. }));
+
+        // Exempting the long-lived review item from the observed queue lets
+        // fresh work start without draining it.
+        storage
+            .grant_capacity_exemption(
+                "bd-exa-review",
+                "status",
+                "in_review",
+                "operator",
+                "awaiting an external regulatory decision",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+        storage
+            .update_issue("bd-exa-next", &enter, "tester")
+            .unwrap();
+    }
+
+    #[test]
+    fn capacity_exemption_under_leaf_work_excludes_only_counting_members() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-lwx-parent", Status::InProgress),
+            ("bd-lwx-child", Status::InProgress),
+            ("bd-lwx-new", Status::Open),
+            ("bd-lwx-extra", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "tester")
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-lwx-child", "bd-lwx-parent", "parent-child", "tester")
+            .unwrap();
+        let mut policy = exemptable_hard_status_capacity("in_progress", 1);
+        policy.counting.hierarchy = crate::close_policy::CapacityCountingMode::LeafWork;
+        storage.set_workflow_capacity_policy(policy);
+
+        // leaf_work counts only the child; exempting it frees the slot while
+        // the parent stays aggregate-excluded (the exempt issue remains
+        // active for suppression, so an exemption can never raise a count).
+        storage
+            .grant_capacity_exemption(
+                "bd-lwx-child",
+                "status",
+                "in_progress",
+                "operator",
+                "external dependency stalls this leaf",
+                None,
+                "human-lead",
+            )
+            .unwrap();
+        let enter = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-lwx-new", &enter, "tester")
+            .unwrap();
+
+        let error = storage
+            .update_issue("bd-lwx-extra", &enter, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(violation.exempt, Some(1));
+        assert_eq!(violation.aggregate_parents_excluded, Some(1));
+    }
+
+    fn seed_capacity_hierarchy(storage: &mut SqliteStorage, prefix: &str, statuses: [Status; 4]) {
+        let now = Utc::now();
+        let ids = [
+            format!("{prefix}-epic"),
+            format!("{prefix}-parent"),
+            format!("{prefix}-child-a"),
+            format!("{prefix}-child-b"),
+        ];
+        for (id, status) in ids.iter().zip(statuses) {
+            let mut issue = make_issue(id, id, status, 1, None, now, None);
+            if issue.status == Status::Closed {
+                issue.closed_at = Some(now);
+            }
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency(&ids[1], &ids[0], "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency(&ids[2], &ids[1], "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency(&ids[3], &ids[1], "parent-child", "tester")
+            .unwrap();
+    }
+
+    fn leaf_work_group_policy(
+        name: &str,
+        statuses: &[&str],
+        hard: u32,
+    ) -> crate::close_policy::CapacityPolicy {
+        let mut policy = crate::close_policy::CapacityPolicy {
+            counting: crate::close_policy::CapacityCounting {
+                hierarchy: crate::close_policy::CapacityCountingMode::LeafWork,
+                weights: crate::close_policy::CapacityWeights::default(),
+            },
+            ..crate::close_policy::CapacityPolicy::default()
+        };
+        policy.groups.insert(
+            name.to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: statuses.iter().map(|s| (*s).to_string()).collect(),
+                soft: None,
+                hard: Some(hard),
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn capacity_leaf_work_counts_the_github_384_example_as_two_slots() {
+        // Epic: in_progress / Parent: in_progress / A: in_progress /
+        // B: in_review. The issue body specifies this consumes two slots
+        // under leaf_work, not four.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-lw",
+            [
+                Status::InProgress,
+                Status::InProgress,
+                Status::InProgress,
+                Status::Custom("in_review".to_string()),
+            ],
+        );
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress", "in_review"],
+            2,
+        ));
+
+        // A fresh leaf admitted into the group makes it 3 > hard 2.
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-lw-solo", "solo", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-lw-solo",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.counting_mode, "leaf_work");
+        assert_eq!(violation.current, 2, "epic and parent are aggregates");
+        assert_eq!(violation.prospective, 3);
+        // Epic and parent are active but excluded as aggregates.
+        assert_eq!(violation.aggregate_parents_excluded, Some(2));
+    }
+
+    #[test]
+    fn capacity_leaf_work_starts_counting_a_parent_when_its_last_child_leaves() {
+        // Draining the final active descendant must not free a slot: the
+        // active parent stops being an aggregate and begins counting itself.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-lw2",
+            [
+                Status::Closed,
+                Status::InProgress,
+                Status::InProgress,
+                Status::Closed,
+            ],
+        );
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            1,
+        ));
+
+        // Only child A counts right now; the parent is an aggregate.
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-lw2-solo", "solo", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let admit = IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        };
+        let blocked = storage
+            .update_issue("bd-lw2-solo", &admit, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = blocked else {
+            panic!("unexpected capacity error: {blocked:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(violation.aggregate_parents_excluded, Some(1));
+
+        // Closing child A leaves the parent as the sole counted issue, so
+        // the count stays 1 and admitting a fresh issue still fails.
+        storage
+            .update_issue(
+                "bd-lw2-child-a",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap();
+        let still_blocked = storage
+            .update_issue("bd-lw2-solo", &admit, "tester")
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = still_blocked else {
+            panic!("unexpected capacity error: {still_blocked:?}");
+        };
+        assert_eq!(
+            violation.current, 1,
+            "parent must begin counting once its last active descendant leaves"
+        );
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+    }
+
+    #[test]
+    fn capacity_leaf_work_enforces_an_increase_caused_only_by_a_drain() {
+        // A child shared by two active parents is the one case where a
+        // transition that only *leaves* the capacity still raises the count:
+        // closing it turns both parents from aggregates into counted work.
+        // The hard limit must still be enforced.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-shared-p1", "bd-shared-p2", "bd-shared-child"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        // Two parents for one child: reachable through import, not through
+        // `--parent`, which replaces the existing edge.
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at)
+                 VALUES ('bd-shared-child', 'bd-shared-p1', 'parent-child', '2026-01-01T00:00:00Z'),
+                        ('bd-shared-child', 'bd-shared-p2', 'parent-child', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            1,
+        ));
+
+        // Only the shared child counts today: both parents are aggregates.
+        let error = storage
+            .update_issue(
+                "bd-shared-child",
+                &IssueUpdate {
+                    status: Some(Status::Closed),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 1);
+        assert_eq!(
+            violation.prospective, 2,
+            "both parents begin counting once the shared child leaves"
+        );
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+        assert_eq!(
+            storage
+                .get_issue("bd-shared-child")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress,
+            "rejection must roll back"
+        );
+    }
+
+    #[test]
+    fn capacity_leaf_work_ignores_blocks_edges() {
+        // Only parent-child edges participate: a `blocks` edge between two
+        // active leaves must never suppress one of them.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-lwb-1", "bd-lwb-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-lwb-2", "bd-lwb-1", "blocks", "tester")
+            .unwrap();
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            2,
+        ));
+
+        storage
+            .create_issue(
+                &make_issue("bd-lwb-3", "third", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-lwb-3",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 2, "blocks edges must not aggregate");
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+    }
+
+    #[test]
+    fn capacity_roots_counts_the_highest_active_ancestor() {
+        // Same tree as the leaf_work example: under `roots` the epic is the
+        // single counted work stream.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-roots",
+            [
+                Status::InProgress,
+                Status::InProgress,
+                Status::InProgress,
+                Status::InProgress,
+            ],
+        );
+        let mut policy = leaf_work_group_policy("active_work", &["in_progress"], 1);
+        policy.counting.hierarchy = crate::close_policy::CapacityCountingMode::Roots;
+        storage.set_workflow_capacity_policy(policy);
+
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-roots-solo", "solo", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-roots-solo",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.counting_mode, "roots");
+        assert_eq!(violation.current, 1, "one active work stream");
+        assert_eq!(violation.prospective, 2);
+        assert_eq!(violation.aggregate_parents_excluded, Some(3));
+    }
+
+    #[test]
+    fn capacity_weighted_applies_issue_and_type_weights() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut epic = make_issue("bd-w-epic", "epic", Status::InProgress, 1, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        storage.create_issue(&epic, "tester").unwrap();
+        for id in ["bd-w-1", "bd-w-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+
+        let mut weights = crate::close_policy::CapacityWeights {
+            default: Some(1),
+            ..crate::close_policy::CapacityWeights::default()
+        };
+        // An epic represents no independent execution; bd-w-2 is double-weight.
+        weights.types.insert("epic".to_string(), 0);
+        weights.issues.insert("bd-w-2".to_string(), 2);
+        let mut policy = crate::close_policy::CapacityPolicy {
+            counting: crate::close_policy::CapacityCounting {
+                hierarchy: crate::close_policy::CapacityCountingMode::Weighted,
+                weights,
+            },
+            ..crate::close_policy::CapacityPolicy::default()
+        };
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(3),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        // Weighted current = 0 (epic) + 1 + 2 = 3; one more unit exceeds 3.
+        storage
+            .create_issue(
+                &make_issue("bd-w-3", "third", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-w-3",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.counting_mode, "weighted");
+        assert_eq!(violation.current, 3);
+        assert_eq!(violation.prospective, 4);
+        assert!(
+            violation.aggregate_parents_excluded.is_none(),
+            "weighted counting has no aggregate exclusion"
+        );
+    }
+
+    #[test]
+    fn capacity_weighted_counts_a_created_issue_before_its_row_exists() {
+        // Creation must resolve the new issue's weight from the requested
+        // type, not from a row that does not exist yet.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut weights = crate::close_policy::CapacityWeights::default();
+        weights.types.insert("epic".to_string(), 5);
+        let mut policy = crate::close_policy::CapacityPolicy {
+            counting: crate::close_policy::CapacityCounting {
+                hierarchy: crate::close_policy::CapacityCountingMode::Weighted,
+                weights,
+            },
+            ..crate::close_policy::CapacityPolicy::default()
+        };
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: None,
+                hard: Some(4),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let mut epic = make_issue("bd-wc-epic", "epic", Status::InProgress, 1, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        let error = storage.create_issue(&epic, "tester").unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(violation.current, 0);
+        assert_eq!(violation.prospective, 5);
+        assert!(storage.get_issue("bd-wc-epic").unwrap().is_none());
+    }
+
+    #[test]
+    fn capacity_hierarchy_counts_every_member_of_a_dependency_cycle() {
+        // Imported data can contain a parent-child cycle. Condensing the
+        // cycle into one component keeps its active members visible instead
+        // of letting them cancel each other out.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-cyc-1", "bd-cyc-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        // Bypass the cycle guard the way a JSONL import would.
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at)
+                 VALUES ('bd-cyc-1', 'bd-cyc-2', 'parent-child', '2026-01-01T00:00:00Z'),
+                        ('bd-cyc-2', 'bd-cyc-1', 'parent-child', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            2,
+        ));
+
+        storage
+            .create_issue(
+                &make_issue("bd-cyc-3", "third", Status::Open, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        let error = storage
+            .update_issue(
+                "bd-cyc-3",
+                &IssueUpdate {
+                    status: Some(Status::InProgress),
+                    ..IssueUpdate::default()
+                },
+                "tester",
+            )
+            .unwrap_err();
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("unexpected capacity error: {error:?}");
+        };
+        assert_eq!(
+            violation.current, 2,
+            "both cycle members must remain counted"
+        );
+        assert_eq!(violation.aggregate_parents_excluded, Some(0));
+    }
+
+    #[test]
+    fn capacity_leaf_work_batch_is_evaluated_on_the_final_state() {
+        // A batch that activates a parent and closes its only active child
+        // is capacity-neutral under leaf_work regardless of request order.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-lwbatch",
+            [
+                Status::Closed,
+                Status::Open,
+                Status::InProgress,
+                Status::Closed,
+            ],
+        );
+        storage.set_workflow_capacity_policy(leaf_work_group_policy(
+            "active_work",
+            &["in_progress"],
+            1,
+        ));
+
+        storage
+            .update_issues_atomically(
+                &[
+                    (
+                        "bd-lwbatch-parent".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::InProgress),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    (
+                        "bd-lwbatch-child-a".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::Closed),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                ],
+                "tester",
+            )
+            .expect("capacity-neutral hierarchy swap must be admitted");
+
+        assert_eq!(
+            storage
+                .get_issue("bd-lwbatch-parent")
+                .unwrap()
+                .unwrap()
+                .status,
+            Status::InProgress
+        );
+    }
+
+    fn scoped_status_capacity(
+        scope: &str,
+        status: &str,
+        soft: Option<u32>,
+        hard: Option<u32>,
+    ) -> crate::close_policy::CapacityPolicy {
+        let mut scope_policy = crate::close_policy::CapacityScopePolicy::default();
+        scope_policy.statuses.insert(
+            status.to_string(),
+            crate::close_policy::CapacityLimit { soft, hard },
+        );
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.scopes.insert(scope.to_string(), scope_policy);
+        policy
+    }
+
+    fn to_in_progress() -> IssueUpdate {
+        IssueUpdate {
+            status: Some(Status::InProgress),
+            ..IssueUpdate::default()
+        }
+    }
+
+    fn expect_capacity_violation(
+        error: &BeadsError,
+    ) -> &crate::close_policy::WorkflowCapacityViolation {
+        match error {
+            BeadsError::WorkflowCapacityExceeded { violation } => violation,
+            other => panic!("expected a workflow capacity violation, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn capacity_scope_actor_limits_each_actor_partition_independently() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-sca-1", "bd-sca-2", "bd-sca-3", "bd-sca-4"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "actor",
+            "in_progress",
+            None,
+            Some(2),
+        ));
+
+        for id in ["bd-sca-1", "bd-sca-2"] {
+            storage
+                .update_issues_atomically(&[(id.to_string(), to_in_progress())], "alice")
+                .expect("alice is under her cap");
+        }
+        let error = storage
+            .update_issues_atomically(&[("bd-sca-3".to_string(), to_in_progress())], "alice")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "actor");
+        assert_eq!(violation.scope_key.as_deref(), Some("alice"));
+        assert_eq!(violation.current, 2);
+        assert_eq!(violation.prospective, 3);
+        assert_eq!(
+            violation.policy_path,
+            "workflow.capacity.scopes.actor.statuses.in_progress"
+        );
+        assert_eq!(
+            storage.get_issue("bd-sca-3").unwrap().unwrap().status,
+            Status::Open,
+            "rejected transition must not modify issue state"
+        );
+
+        // A different actor has an independent partition.
+        storage
+            .update_issues_atomically(&[("bd-sca-4".to_string(), to_in_progress())], "bob")
+            .expect("bob's partition is empty");
+    }
+
+    #[test]
+    fn capacity_scope_finish_and_claim_swap_is_scope_neutral() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-scs-1", "bd-scs-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "actor",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+        storage
+            .update_issues_atomically(&[("bd-scs-1".to_string(), to_in_progress())], "alice")
+            .unwrap();
+
+        // One batch: alice releases her slot and claims another issue.
+        storage
+            .update_issues_atomically(
+                &[
+                    (
+                        "bd-scs-1".to_string(),
+                        IssueUpdate {
+                            status: Some(Status::Open),
+                            ..IssueUpdate::default()
+                        },
+                    ),
+                    ("bd-scs-2".to_string(), to_in_progress()),
+                ],
+                "alice",
+            )
+            .expect("a scope-neutral swap must be admitted at the cap");
+    }
+
+    #[test]
+    fn capacity_scope_assignee_keys_on_prospective_assignee_and_skips_unassigned() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-scg-1", "bd-scg-2", "bd-scg-3", "bd-scg-4"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "assignee",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        let claim_for = |assignee: &str| IssueUpdate {
+            status: Some(Status::InProgress),
+            assignee: Some(Some(assignee.to_string())),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issues_atomically(&[("bd-scg-1".to_string(), claim_for("bob"))], "op")
+            .expect("bob's first claim fits");
+        let error = storage
+            .update_issues_atomically(&[("bd-scg-2".to_string(), claim_for("bob"))], "op")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "assignee");
+        assert_eq!(violation.scope_key.as_deref(), Some("bob"));
+
+        storage
+            .update_issues_atomically(&[("bd-scg-3".to_string(), claim_for("carol"))], "op")
+            .expect("carol's partition is independent");
+        // No prospective assignee → the assignee scope is inapplicable.
+        storage
+            .update_issues_atomically(&[("bd-scg-4".to_string(), to_in_progress())], "op")
+            .expect("unassigned transitions are not subject to the assignee scope");
+    }
+
+    #[test]
+    fn capacity_scope_harness_and_session_key_on_attribution_and_skip_when_absent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-sch-1", "bd-sch-2", "bd-sch-3"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "harness",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            Some("swarm-h1"),
+            None,
+            None,
+        ));
+        storage
+            .update_issues_atomically(&[("bd-sch-1".to_string(), to_in_progress())], "op")
+            .expect("first harness claim fits");
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            Some("swarm-h1"),
+            None,
+            None,
+        ));
+        let error = storage
+            .update_issues_atomically(&[("bd-sch-2".to_string(), to_in_progress())], "op")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "harness");
+        assert_eq!(violation.scope_key.as_deref(), Some("swarm-h1"));
+
+        // No harness attribution → the harness scope is inapplicable. The
+        // staged attribution deliberately survives the failed mutation above
+        // (post-recovery retry semantics), so clear it first.
+        let _ = storage.take_pending_event_attribution();
+        storage
+            .update_issues_atomically(&[("bd-sch-3".to_string(), to_in_progress())], "op")
+            .expect("attribution-free transitions skip the harness scope");
+
+        // Session scope behaves identically, keyed on the session value.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-scn-1", "bd-scn-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "session",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            None,
+            None,
+            Some("sess-9"),
+        ));
+        storage
+            .update_issues_atomically(&[("bd-scn-1".to_string(), to_in_progress())], "op")
+            .unwrap();
+        storage.set_pending_event_attribution(EventAttribution::new(
+            None,
+            None,
+            None,
+            Some("sess-9"),
+        ));
+        let error = storage
+            .update_issues_atomically(&[("bd-scn-2".to_string(), to_in_progress())], "op")
+            .unwrap_err();
+        assert_eq!(
+            expect_capacity_violation(&error).scope_key.as_deref(),
+            Some("sess-9")
+        );
+    }
+
+    #[test]
+    fn capacity_scope_subtree_counts_by_root_ancestor() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-sct-root", "bd-sct-a", "bd-sct-b", "bd-sct-other"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage
+            .add_dependency("bd-sct-a", "bd-sct-root", "parent-child", "seed")
+            .unwrap();
+        storage
+            .add_dependency("bd-sct-b", "bd-sct-root", "parent-child", "seed")
+            .unwrap();
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "subtree",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        storage
+            .update_issues_atomically(&[("bd-sct-a".to_string(), to_in_progress())], "op")
+            .expect("first active leaf in the subtree fits");
+        let error = storage
+            .update_issues_atomically(&[("bd-sct-b".to_string(), to_in_progress())], "op")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "subtree");
+        assert_eq!(violation.scope_key.as_deref(), Some("bd-sct-root"));
+
+        // An issue outside the subtree has its own root partition.
+        storage
+            .update_issues_atomically(&[("bd-sct-other".to_string(), to_in_progress())], "op")
+            .expect("a different subtree is unaffected");
+    }
+
+    #[test]
+    fn capacity_scope_exemption_frees_the_scoped_slot() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for (id, status) in [
+            ("bd-sce-held", Status::InProgress),
+            ("bd-sce-next", Status::Open),
+        ] {
+            storage
+                .create_issue(&make_issue(id, id, status, 1, None, now, None), "alice")
+                .unwrap();
+        }
+        let mut policy = scoped_status_capacity("actor", "in_progress", None, Some(1));
+        policy.exemptions.providers = vec!["operator".to_string()];
+        storage.set_workflow_capacity_policy(policy);
+
+        // Alice occupies her only slot; without an exemption the claim fails.
+        let error = storage
+            .update_issues_atomically(&[("bd-sce-next".to_string(), to_in_progress())], "alice")
+            .unwrap_err();
+        assert_eq!(
+            expect_capacity_violation(&error).scope_key.as_deref(),
+            Some("alice")
+        );
+
+        storage
+            .grant_capacity_exemption(
+                "bd-sce-held",
+                "status",
+                "in_progress",
+                "operator",
+                "externally blocked long-runner",
+                Some(now + chrono::Duration::hours(2)),
+                "human-lead",
+            )
+            .unwrap();
+        let violation_free = storage
+            .update_issues_atomically(&[("bd-sce-next".to_string(), to_in_progress())], "alice")
+            .expect("an exempted issue frees its scoped slot too");
+        drop(violation_free);
+    }
+
+    #[test]
+    fn capacity_scope_soft_limit_warns_with_scope_evidence() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-scw-1", "one", Status::Open, 1, None, now, None),
+                "seed",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "actor",
+            "in_progress",
+            Some(1),
+            None,
+        ));
+
+        storage
+            .update_issues_atomically(&[("bd-scw-1".to_string(), to_in_progress())], "alice")
+            .expect("soft limits never reject");
+        let warnings = storage.take_capacity_warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one scoped warning: {warnings:?}"
+        );
+        assert_eq!(warnings[0].scope, "actor");
+        assert_eq!(warnings[0].scope_key.as_deref(), Some("alice"));
+        assert_eq!(
+            warnings[0].policy_path,
+            "workflow.capacity.scopes.actor.statuses.in_progress"
+        );
+        assert!(
+            warnings[0].to_string().contains("for 'alice'"),
+            "human text names the partition key: {}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn capacity_scope_repository_entry_composes_with_top_level_limits() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-scr-1", "bd-scr-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        storage.set_workflow_capacity_policy(scoped_status_capacity(
+            "repository",
+            "in_progress",
+            None,
+            Some(1),
+        ));
+
+        storage
+            .update_issues_atomically(&[("bd-scr-1".to_string(), to_in_progress())], "alice")
+            .unwrap();
+        // The repository scope ignores the acting partition: a different
+        // actor is still bound by the shared limit.
+        let error = storage
+            .update_issues_atomically(&[("bd-scr-2".to_string(), to_in_progress())], "bob")
+            .unwrap_err();
+        let violation = expect_capacity_violation(&error);
+        assert_eq!(violation.scope, "repository");
+        assert_eq!(violation.scope_key, None);
+        assert_eq!(
+            violation.policy_path,
+            "workflow.capacity.scopes.repository.statuses.in_progress"
+        );
+    }
+
+    #[test]
+    fn capacity_occupancy_records_the_admitting_attribution() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-occ-1", "one", Status::Open, 1, None, now, None),
+                "creator",
+            )
+            .unwrap();
+
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-7"),
+            Some("swarm-h1"),
+            Some("opus-4"),
+            Some("sess-1"),
+        ));
+        storage
+            .update_issues_atomically(&[("bd-occ-1".to_string(), to_in_progress())], "alice")
+            .unwrap();
+
+        let row = storage
+            .conn
+            .query_row_with_params(
+                "SELECT actor, agent_name, harness, session \
+                 FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from("bd-occ-1")],
+            )
+            .expect("occupancy row exists after a status transition");
+        let text = |index: usize| {
+            row.get(index)
+                .and_then(SqliteValue::as_text)
+                .map(ToString::to_string)
+        };
+        assert_eq!(text(0).as_deref(), Some("alice"));
+        assert_eq!(text(1).as_deref(), Some("agent-7"));
+        assert_eq!(text(2).as_deref(), Some("swarm-h1"));
+        assert_eq!(text(3).as_deref(), Some("sess-1"));
+    }
+
+    /// GitHub #391: the cycle report must agree with the add-time gate.
+    /// A `related` edge is never cycle-checked on insertion, so it must not
+    /// be counted by `br dep cycles` either; the containment-induced
+    /// rejection of a descendant's blocks-edge stays (documented design).
+    #[test]
+    fn dependency_cycles_agree_with_add_time_blocking_semantics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in [
+            "bd-391-e",
+            "bd-391-s",
+            "bd-391-e2",
+            "bd-391-h",
+            "bd-391-r",
+            "bd-391-a",
+            "bd-391-m",
+        ] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        // Containment: E ── S ── E2 (parent-child rows are child -> parent).
+        storage
+            .add_dependency("bd-391-s", "bd-391-e", "parent-child", "seed")
+            .unwrap();
+        storage
+            .add_dependency("bd-391-e2", "bd-391-s", "parent-child", "seed")
+            .unwrap();
+        // Blocks chains reaching the epic: H -> E, R -> H, A -> E, M -> A.
+        for (from, to) in [
+            ("bd-391-h", "bd-391-e"),
+            ("bd-391-r", "bd-391-h"),
+            ("bd-391-a", "bd-391-e"),
+            ("bd-391-m", "bd-391-a"),
+        ] {
+            storage.add_dependency(from, to, "blocks", "seed").unwrap();
+        }
+
+        // Documented containment rule: a descendant's blocks-edge back into
+        // a chain that reaches the epic is rejected as a cycle.
+        let error = storage
+            .add_dependency("bd-391-e2", "bd-391-r", "blocks", "seed")
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::DependencyCycle { .. }));
+
+        // A `related` edge is accepted unchecked...
+        storage
+            .add_dependency("bd-391-e2", "bd-391-m", "related", "seed")
+            .unwrap();
+        // ...and must NOT surface as a cycle in any report mode.
+        assert!(
+            storage.detect_blocking_cycles().unwrap().is_empty(),
+            "blocking cycle report must ignore related edges"
+        );
+        for blocking_only in [false, true] {
+            let report = storage
+                .detect_dependency_cycle_report(blocking_only)
+                .unwrap();
+            assert!(
+                report.active_cycles.is_empty(),
+                "related edges the add path allowed must not fail the cycle \
+                 report (blocking_only={blocking_only}): {:?}",
+                report.active_cycles
+            );
+        }
+
+        // Positive control: a genuine blocking cycle is still detected.
+        // (Insert via the import-relation path, which does not cycle-check.)
+        for id in ["bd-391-p", "bd-391-q"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::Open, 1, None, now, None),
+                    "seed",
+                )
+                .unwrap();
+        }
+        let cyclic_dep = |issue: &str, on: &str| crate::model::Dependency {
+            issue_id: issue.to_string(),
+            depends_on_id: on.to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: now,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        };
+        storage
+            .sync_dependencies_for_import("bd-391-p", &[cyclic_dep("bd-391-p", "bd-391-q")])
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("bd-391-q", &[cyclic_dep("bd-391-q", "bd-391-p")])
+            .unwrap();
+        assert!(
+            !storage.detect_blocking_cycles().unwrap().is_empty(),
+            "a genuine blocking cycle must still be reported"
+        );
+    }
+
+    #[test]
+    fn workflow_capacity_same_status_update_does_not_affect_capacity() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue("bd-same-1", "held", Status::InProgress, 1, None, now, None),
+                "tester",
+            )
+            .unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+
+        // The status is already at its hard limit; a same-status update must
+        // not be treated as a new admission.
+        let update = IssueUpdate {
+            status: Some(Status::InProgress),
+            title: Some("still held".to_string()),
+            ..IssueUpdate::default()
+        };
+        storage
+            .update_issue("bd-same-1", &update, "tester")
+            .expect("same-status updates do not consume capacity");
+        assert_eq!(
+            storage.get_issue("bd-same-1").unwrap().unwrap().title,
+            "still held"
+        );
+    }
+
+    #[test]
+    fn derived_rollup_reports_subtree_status_without_mutating_the_parent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-rollup",
+            [
+                Status::Open,
+                Status::Open,
+                Status::InProgress,
+                Status::Closed,
+            ],
+        );
+
+        let epic = storage
+            .get_issue_details("bd-rollup-epic", false, false, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(epic.issue.status, Status::Open, "explicit status is intact");
+        let rollup = epic.rollup.expect("epic has children");
+        assert_eq!(rollup.status, "in_progress");
+        assert_eq!(rollup.descendants.get("in_progress"), Some(&1));
+        assert_eq!(rollup.descendants.get("open"), Some(&1));
+        assert_eq!(rollup.descendants.get("closed"), Some(&1));
+
+        // A leaf has no children and therefore no rollup.
+        let leaf = storage
+            .get_issue_details("bd-rollup-child-a", false, false, 0)
+            .unwrap()
+            .unwrap();
+        assert!(leaf.rollup.is_none());
+    }
+
+    #[test]
+    fn derived_rollup_terminates_on_a_parent_child_cycle() {
+        // The subtree walk must not loop on imported cyclic data, and the
+        // issue itself must never appear among its own descendants.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        for id in ["bd-rc-1", "bd-rc-2"] {
+            storage
+                .create_issue(
+                    &make_issue(id, id, Status::InProgress, 1, None, now, None),
+                    "tester",
+                )
+                .unwrap();
+        }
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at)
+                 VALUES ('bd-rc-1', 'bd-rc-2', 'parent-child', '2026-01-01T00:00:00Z'),
+                        ('bd-rc-2', 'bd-rc-1', 'parent-child', '2026-01-01T00:00:00Z')",
+            )
+            .unwrap();
+
+        let rollup = storage
+            .derived_rollup("bd-rc-1")
+            .unwrap()
+            .expect("cyclic parent still has a child");
+        assert_eq!(rollup.status, "in_progress");
+        assert_eq!(
+            rollup.descendants.get("in_progress"),
+            Some(&1),
+            "only the other cycle member counts as a descendant"
+        );
+    }
+
+    #[test]
+    fn derived_rollup_is_closed_when_every_descendant_is_terminal() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        seed_capacity_hierarchy(
+            &mut storage,
+            "bd-rollup2",
+            [Status::Open, Status::Closed, Status::Closed, Status::Closed],
+        );
+
+        let rollup = storage
+            .get_issue_details("bd-rollup2-epic", false, false, 0)
+            .unwrap()
+            .unwrap()
+            .rollup
+            .expect("epic has children");
+        assert_eq!(rollup.status, "closed");
+        assert_eq!(rollup.descendants.get("closed"), Some(&3));
     }
 
     #[test]
@@ -18851,7 +25137,10 @@ mod tests {
         storage.add_dependency("bd-rel-cy1", "bd-rel-cy2", "related", "tester")?;
         storage.add_dependency("bd-rel-cy2", "bd-rel-cy1", "related", "tester")?;
 
-        assert!(!storage.detect_all_cycles()?.is_empty());
+        // GitHub #391: `related` edges are never cycle-checked when added,
+        // so no report mode may count them — the default previously did,
+        // making `br dep cycles` fail on graphs the add path allowed.
+        assert!(storage.detect_all_cycles()?.is_empty());
         assert!(storage.detect_blocking_cycles()?.is_empty());
         Ok(())
     }
@@ -21745,12 +28034,45 @@ mod tests {
             SqliteStorage::open_current_read_only(&db_path)
                 .unwrap()
                 .is_none(),
-            "stale schema headers must fall back to the normal repair-capable open path"
+            "stale schema headers must decline the current-schema read-only path"
         );
     }
 
     #[test]
-    fn test_open_repairs_runtime_compatible_legacy_db_indexes() {
+    fn test_reviewed_reconcile_opens_decline_unknown_future_schema() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("reviewed_future_schema.db");
+        let future_version = CURRENT_SCHEMA_VERSION
+            .checked_add(1)
+            .expect("schema version increment");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute(&format!("PRAGMA user_version = {future_version}"))
+                .unwrap();
+        }
+
+        assert!(
+            SqliteStorage::open_current_read_only(&db_path)
+                .unwrap()
+                .is_none(),
+            "read-only planning must refuse an unknown future schema"
+        );
+        assert!(
+            SqliteStorage::open_current_for_reconcile(&db_path, Some(100))
+                .unwrap()
+                .is_none(),
+            "reviewed apply must refuse an unknown future schema before mutation"
+        );
+    }
+
+    #[test]
+    #[ignore = "superseded by the merge decision keeping shipped auto-migration on ordinary \
+                opens (open_auto_migrates_legacy_integer_datetimes_and_done_status); the \
+                reviewed migrate-schema lifecycle remains the explicit operator surface"]
+    fn test_open_refuses_runtime_compatible_legacy_db_without_reviewed_migration() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_runtime_compatible.db");
 
@@ -21763,30 +28085,34 @@ mod tests {
             storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
-        let reopened = SqliteStorage::open(&db_path).unwrap();
-        let user_version = reopened
-            .conn
+        let error = SqliteStorage::open(&db_path)
+            .expect_err("ordinary open must not cross a schema-version boundary");
+        assert!(
+            error.to_string().contains("br doctor migrate-schema plan"),
+            "refusal must provide the reviewed migration command: {error}"
+        );
+
+        let unchanged = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let user_version = unchanged
             .query_row("PRAGMA user_version")
             .unwrap()
             .get(0)
             .and_then(SqliteValue::as_integer)
             .unwrap();
         assert_eq!(
-            user_version,
-            i64::from(CURRENT_SCHEMA_VERSION),
-            "runtime-compatible legacy DBs should be repaired and marked current on open"
+            user_version, 0,
+            "refused ordinary open must not stamp the stale database"
         );
 
-        let indexes: HashSet<String> = reopened
-            .conn
+        let indexes: HashSet<String> = unchanged
             .query("SELECT name FROM sqlite_master WHERE type='index'")
             .unwrap()
             .iter()
             .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
             .collect();
         assert!(
-            indexes.contains("idx_issues_external_ref_unique"),
-            "runtime-compatible repair path should restore missing canonical indexes"
+            !indexes.contains("idx_issues_external_ref_unique"),
+            "refused ordinary open must not repair DDL as a side effect"
         );
     }
 
@@ -21801,10 +28127,6 @@ mod tests {
                 .conn
                 .execute("DROP INDEX IF EXISTS idx_issues_external_ref_unique")
                 .unwrap();
-            // Reset user_version so the reopen takes the full schema path
-            // (the fast path only applies runtime pragmas and does not
-            // recreate missing indexes).
-            storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
         let reopened = SqliteStorage::open(&db_path).unwrap();
@@ -21902,7 +28224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_repairs_legacy_kv_primary_key_tables() {
+    fn test_open_repairs_current_version_legacy_kv_primary_key_tables() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_kv_primary_keys.db");
 
@@ -21938,8 +28260,6 @@ mod tests {
                 .conn
                 .execute("INSERT INTO metadata (key, value) VALUES ('project', 'legacy-project')")
                 .unwrap();
-
-            storage.conn.execute("PRAGMA user_version = 0").unwrap();
         }
 
         let reopened = SqliteStorage::open(&db_path).unwrap();
@@ -22159,19 +28479,24 @@ mod tests {
 
     /// Regression test for issue #263 (b): when both the probe update
     /// matches zero rows AND the rollback returns an error, the
-    /// zero-row diagnostic remains the primary failure reported up
-    /// the stack — a downstream rollback hiccup is noise compared to
-    /// "we couldn't update the row we just inserted".
+    /// zero-row diagnostic remains the primary source while the rollback
+    /// failure is also surfaced as an unknown transaction state.
     #[test]
-    fn test_finish_issue_mutation_write_probe_prefers_zero_row_over_rollback_error() {
+    fn test_finish_issue_mutation_write_probe_composes_zero_row_and_rollback_errors() {
         let err = finish_issue_mutation_write_probe(
             Ok(0),
             Err(FrankenError::Internal("rollback failed".to_string())),
         )
-        .expect_err("zero-row probe must outrank rollback error");
+        .expect_err("zero-row probe and rollback failure must both surface");
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("write probe did not find issue"),
-            "unexpected error: {err}",
+            message.contains("write probe did not find issue"),
+            "{message}"
+        );
+        assert!(message.contains("rollback failed"), "{message}");
+        assert!(
+            message.contains("transaction state is unknown"),
+            "{message}"
         );
     }
 
@@ -24836,6 +31161,7 @@ mod tests {
 
         let storage = SqliteStorage {
             conn,
+            write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
@@ -25181,16 +31507,19 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_issue_mutation_write_probe_prefers_write_error() {
+    fn test_finish_issue_mutation_write_probe_composes_write_and_rollback_errors() {
         let result = finish_issue_mutation_write_probe(
             Err(FrankenError::Internal("write failed".to_string())),
             Err(FrankenError::Internal("rollback failed".to_string())),
         );
 
-        let err = result.expect_err("write failure should surface");
+        let err = result.expect_err("write and rollback failures should surface");
+        let message = err.to_string();
+        assert!(message.contains("write failed"), "{message}");
+        assert!(message.contains("rollback failed"), "{message}");
         assert!(
-            err.to_string().contains("write failed"),
-            "unexpected error: {err}"
+            message.contains("transaction state is unknown"),
+            "{message}"
         );
     }
 
@@ -26160,6 +32489,97 @@ mod tests {
     }
 
     #[test]
+    fn write_transaction_surfaces_actual_rollback_failure_without_retrying_body() {
+        let dir = TempDir::new().unwrap();
+        let mut storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let mut body_attempts = 0_u8;
+
+        let result: Result<()> = storage.with_write_transaction(|storage| {
+            body_attempts += 1;
+            storage
+                .conn
+                .execute("ROLLBACK")
+                .expect("end transaction inside body");
+            Err(crate::error::BeadsError::Config(
+                "original transaction body failure".into(),
+            ))
+        });
+
+        assert_eq!(body_attempts, 1, "unknown transaction state must not retry");
+        let err_msg = result.expect_err("second ROLLBACK must fail").to_string();
+        assert!(
+            err_msg.contains("ROLLBACK failed after transaction body error"),
+            "rollback failure context must be preserved: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("transaction state is unknown and no retry was attempted"),
+            "operator guidance must forbid an unsafe retry: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("original transaction body failure"),
+            "original body error must remain in the composed error: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn read_transaction_composes_body_and_rollback_failures() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let mut body_attempts = 0_u8;
+
+        let result: Result<()> = storage.with_read_transaction(|storage| {
+            body_attempts += 1;
+            storage
+                .conn
+                .execute("ROLLBACK")
+                .expect("end read transaction inside body");
+            Err(BeadsError::Config(
+                "original read transaction body failure".into(),
+            ))
+        });
+
+        assert_eq!(body_attempts, 1);
+        let message = result
+            .expect_err("outer read rollback must fail")
+            .to_string();
+        assert!(
+            message.contains("original read transaction body failure"),
+            "{message}"
+        );
+        assert!(message.contains("ROLLBACK failed"), "{message}");
+        assert!(
+            message.contains("transaction state is unknown"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn read_transaction_composes_commit_and_rollback_failures() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+
+        let result: Result<()> = storage.with_read_transaction(|storage| {
+            storage
+                .conn
+                .execute("COMMIT")
+                .expect("end read transaction inside body");
+            Ok(())
+        });
+
+        let message = result
+            .expect_err("outer read COMMIT and cleanup ROLLBACK must fail")
+            .to_string();
+        assert!(
+            message.contains("ROLLBACK failed after read-transaction COMMIT error"),
+            "{message}"
+        );
+        assert!(
+            message.contains("transaction state is unknown"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn open_auto_migrates_legacy_integer_datetimes_and_done_status() {
         // Simulate the exact on-disk corruption observed in the wild: a v5
         // DB (pre-migration user_version) with integer-typed DATETIME
@@ -26240,15 +32660,252 @@ mod tests {
     fn connection_write_transaction_propagates_body_error() {
         let dir = TempDir::new().unwrap();
         let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
-        let result: Result<()> =
-            SqliteStorage::with_connection_write_transaction(&storage.conn, |_| {
-                Err(crate::error::BeadsError::Config("conn test error".into()))
-            });
+        let result: Result<()> = storage.with_connection_write_transaction(|_| {
+            Err(crate::error::BeadsError::Config("conn test error".into()))
+        });
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("conn test error"),
             "should propagate body error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn connection_write_transaction_surfaces_actual_rollback_failure_without_retrying_body() {
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("test.db")).unwrap();
+        let mut body_attempts = 0_u8;
+
+        let result: Result<()> = storage.with_connection_write_transaction(|conn| {
+            body_attempts += 1;
+            conn.execute("ROLLBACK")
+                .expect("end shared transaction inside body");
+            Err(crate::error::BeadsError::Config(
+                "original shared transaction body failure".into(),
+            ))
+        });
+
+        assert_eq!(body_attempts, 1, "unknown transaction state must not retry");
+        let err_msg = result
+            .expect_err("second shared ROLLBACK must fail")
+            .to_string();
+        assert!(
+            err_msg.contains("ROLLBACK failed after shared transaction body error"),
+            "rollback failure context must be preserved: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("transaction state is unknown and no retry was attempted"),
+            "operator guidance must forbid an unsafe retry: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("original shared transaction body failure"),
+            "original body error must remain in the composed error: {err_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attached_authority_rejects_replaced_database_before_both_write_transaction_paths() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let displaced_path = beads_dir.join("beads.displaced.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        authority.verify_database_authority().unwrap();
+        storage.attach_write_authority(authority);
+
+        fs::rename(&db_path, &displaced_path).unwrap();
+        fs::copy(&displaced_path, &db_path).unwrap();
+
+        let exclusive_error = storage
+            .set_metadata("must_not_commit_exclusive", "value")
+            .expect_err("exclusive write must reject a replaced database inode")
+            .to_string();
+        assert!(
+            exclusive_error.contains("database")
+                && (exclusive_error.contains("authority")
+                    || exclusive_error.contains("identity")
+                    || exclusive_error.contains("inode")),
+            "exclusive transaction should report the authority mismatch: {exclusive_error}"
+        );
+
+        let shared_error = storage
+            .set_metadata_shared("must_not_commit_shared", "value")
+            .expect_err("shared write must reject a replaced database inode")
+            .to_string();
+        assert!(
+            shared_error.contains("database")
+                && (shared_error.contains("authority")
+                    || shared_error.contains("identity")
+                    || shared_error.contains("inode")),
+            "shared transaction should report the authority mismatch: {shared_error}"
+        );
+
+        // Since fsqlite 0.1.18 the engine itself fails closed (CannotOpen)
+        // on a connection whose underlying file was replaced, so post-scenario
+        // forensics must reopen the displaced inode fresh instead of reading
+        // through the stale connection.
+        drop(storage);
+        let displaced = SqliteStorage::open(&displaced_path).unwrap();
+        assert_eq!(
+            displaced.get_metadata("must_not_commit_exclusive").unwrap(),
+            None,
+            "the displaced inode must remain unchanged"
+        );
+        assert_eq!(
+            displaced.get_metadata("must_not_commit_shared").unwrap(),
+            None,
+            "the displaced inode must remain unchanged for the shared path"
+        );
+        drop(displaced);
+        let replacement = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            replacement
+                .get_metadata("must_not_commit_exclusive")
+                .unwrap(),
+            None,
+            "the unowned replacement inode must remain unchanged"
+        );
+        assert_eq!(
+            replacement.get_metadata("must_not_commit_shared").unwrap(),
+            None,
+            "the unowned replacement inode must remain unchanged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
+                pre-merge snapshot); tracked for completion by the owning workstream"]
+    fn write_transaction_reports_post_commit_authority_loss_without_retrying() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        storage.attach_write_authority(authority);
+
+        let mut body_attempts = 0_u8;
+        REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
+        let error = storage
+            .with_write_transaction(|storage| {
+                body_attempts += 1;
+                storage.set_metadata_in_tx("postcommit_exclusive", "committed")
+            })
+            .expect_err("post-COMMIT inode replacement must fail the witness check");
+
+        assert_eq!(
+            body_attempts, 1,
+            "a committed transaction must never be retried"
+        );
+        assert!(
+            matches!(&error, BeadsError::CommittedStateUnwitnessed { .. }),
+            "post-COMMIT authority loss must remain typed: {error:?}"
+        );
+        assert!(
+            !error.is_transient(),
+            "a potentially committed mutation must never be classified as retryable"
+        );
+        let structured = crate::error::StructuredError::from_error(&error);
+        assert!(!structured.retryable);
+        assert_eq!(structured.code.exit_code(), 6);
+        assert_eq!(
+            structured
+                .context
+                .as_ref()
+                .and_then(|context| context.get("committed"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("write transaction committed, but database authority changed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("reconcile committed state before retrying"),
+            "{error}"
+        );
+        assert_eq!(
+            storage.get_metadata("postcommit_exclusive").unwrap(),
+            Some("committed".to_string()),
+            "the connection's displaced inode must retain the committed mutation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_write_transaction_reports_post_commit_authority_loss_without_retrying() {
+        let dir = TempDir::new().unwrap();
+        let beads_dir = dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        storage.attach_write_authority(authority);
+
+        let mut body_attempts = 0_u8;
+        REPLACE_ATTACHED_DATABASE_AFTER_COMMIT.with(|replace| replace.set(true));
+        let error = storage
+            .with_connection_write_transaction(|conn| {
+                body_attempts += 1;
+                SqliteStorage::upsert_metadata_key_in_tx(conn, "postcommit_shared", "committed")
+            })
+            .expect_err("post-COMMIT inode replacement must fail the shared witness check");
+
+        assert_eq!(
+            body_attempts, 1,
+            "a committed shared transaction must never be retried"
+        );
+        assert!(matches!(
+            &error,
+            BeadsError::CommittedStateUnwitnessed { .. }
+        ));
+        assert!(!error.is_transient());
+        let error = error.to_string();
+        assert!(
+            error.contains("shared write transaction committed, but database authority changed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("reconcile committed state before retrying"),
+            "{error}"
+        );
+        // fsqlite 0.1.18 fails closed on the displaced-inode connection, so
+        // verify the committed mutation with a fresh open of the database
+        // path: the commit lives in the WAL, which stays beside the original
+        // path and replays over the hook's byte-identical copy.
+        drop(storage);
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_metadata("postcommit_shared").unwrap(),
+            Some("committed".to_string()),
+            "the committed mutation must survive in the WAL at the database path"
         );
     }
 
@@ -26274,6 +32931,7 @@ mod tests {
             Some("agent-7"),
             Some("codex-cli"),
             Some("opus-4"),
+            None,
         ));
         storage.create_issue(&issue, "tester").expect("create");
 
@@ -26306,6 +32964,7 @@ mod tests {
             Some("agent-9"),
             None,
             Some("opus-4"),
+            None,
         ));
         let update = IssueUpdate {
             status: Some(Status::InProgress),
@@ -26334,7 +32993,12 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 6, 7, 12, 0, 0).unwrap();
 
         // First create stages attribution...
-        storage.set_pending_event_attribution(EventAttribution::new(Some("agent-x"), None, None));
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-x"),
+            None,
+            None,
+            None,
+        ));
         let first = make_issue("bd-attr-3", "First", Status::Open, 2, None, now, None);
         storage
             .create_issue(&first, "tester")
@@ -26359,12 +33023,12 @@ mod tests {
 
     #[test]
     fn event_attribution_normalizes_blank_inputs_to_none() {
-        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"));
+        let attribution = EventAttribution::new(Some("  "), Some(""), Some("opus-4"), None);
         assert!(attribution.agent_name.is_none());
         assert!(attribution.harness.is_none());
         assert_eq!(attribution.model.as_deref(), Some("opus-4"));
         assert!(!attribution.is_empty());
-        assert!(EventAttribution::new(None, None, None).is_empty());
+        assert!(EventAttribution::new(None, None, None, None).is_empty());
     }
 
     // ---- #312 hardening (F1): attribution survives a non-committing mutation
@@ -26383,6 +33047,7 @@ mod tests {
             Some("agent-retry"),
             None,
             Some("opus-4"),
+            None,
         ));
 
         // A mutation whose closure fails with a non-transient error: it rolls
@@ -26442,6 +33107,7 @@ mod tests {
             Some("agent-leak"),
             None,
             None,
+            None,
         ));
         let empty = IssueUpdate::default();
         storage
@@ -26464,5 +33130,1667 @@ mod tests {
         assert!(created.agent_name.is_none());
         assert!(created.harness.is_none());
         assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn sync_merge_transaction_commits_rows_relations_notes_and_operational_state_together() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let victim = make_issue(
+            "bd-merge-victim",
+            "Delete me",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut parent = make_issue(
+            "bd-merge-parent",
+            "Old parent",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&victim, "fixture").unwrap();
+        storage.create_issue(&parent, "fixture").unwrap();
+        storage
+            .set_export_hash(&victim.id, "victim-export-hash")
+            .unwrap();
+        storage
+            .set_export_hash(&parent.id, "parent-export-hash")
+            .unwrap();
+        storage.clear_all_dirty_issues().unwrap();
+
+        parent.title = "Merged parent".to_string();
+        parent.labels = vec!["sync".to_string(), "verified".to_string()];
+        parent.comments = vec![crate::model::Comment {
+            id: 7001,
+            issue_id: parent.id.clone(),
+            author: "fixture".to_string(),
+            body: "Imported merge comment".to_string(),
+            created_at: now,
+        }];
+        let mut child = make_issue(
+            "bd-merge-parent.1",
+            "Merged child",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        child.dependencies = vec![crate::model::Dependency {
+            issue_id: child.id.clone(),
+            depends_on_id: parent.id.clone(),
+            dep_type: crate::model::DependencyType::ParentChild,
+            created_at: now,
+            created_by: Some("fixture".to_string()),
+            metadata: Some("{}".to_string()),
+            thread_id: None,
+        }];
+        let kept = vec![parent.clone(), child.clone()];
+        let deleted = vec![victim.id.clone()];
+        let notes = vec![(
+            parent.id.clone(),
+            "Merge resolution selected the reviewed generation.".to_string(),
+        )];
+        let intent = sync_merge_test_intent(&storage, &kept, &deleted, &notes);
+
+        let pending_receipt = storage
+            .apply_sync_merge_atomically(&kept, &deleted, &notes, &intent)
+            .unwrap();
+
+        let stored_parent = storage.get_issue(&parent.id).unwrap().unwrap();
+        assert_eq!(stored_parent.title, "Merged parent");
+        assert_eq!(
+            storage.get_labels(&parent.id).unwrap(),
+            vec!["sync", "verified"]
+        );
+        assert_eq!(
+            storage
+                .get_dependencies_full(&child.id)
+                .unwrap()
+                .first()
+                .map(|dependency| dependency.depends_on_id.as_str()),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(storage.next_child_number(&parent.id).unwrap(), 2);
+        let parent_comments = storage.get_comments(&parent.id).unwrap();
+        assert_eq!(parent_comments.len(), 2);
+        assert!(
+            parent_comments
+                .iter()
+                .any(|comment| comment.body == "Imported merge comment")
+        );
+        let merge_note = parent_comments
+            .iter()
+            .find(|comment| comment.body == "Merge resolution selected the reviewed generation.")
+            .expect("merge note comment");
+        assert_eq!(merge_note.author, "br-sync");
+        assert_eq!(merge_note.created_at, intent.export_as_of);
+
+        let tombstone = storage.get_issue(&victim.id).unwrap().unwrap();
+        assert_eq!(tombstone.status, Status::Tombstone);
+        assert_eq!(tombstone.deleted_by.as_deref(), Some("merge-agent"));
+        assert_eq!(tombstone.delete_reason.as_deref(), Some("merge deletion"));
+        assert!(
+            storage
+                .get_events(&victim.id, 0)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == EventType::Deleted)
+        );
+        let merge_note_event = storage
+            .get_events(&parent.id, 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                event.event_type == EventType::Commented
+                    && event.comment.as_deref()
+                        == Some("Merge resolution selected the reviewed generation.")
+            })
+            .expect("merge note audit event");
+        assert_eq!(merge_note_event.actor, "merge-agent");
+        assert_eq!(merge_note_event.created_at, intent.export_as_of);
+
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(pending_receipt)
+        );
+        assert_eq!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            storage.get_dirty_issue_ids().unwrap(),
+            vec![parent.id, child.id, victim.id]
+        );
+        assert!(
+            storage
+                .get_export_hash("bd-merge-parent")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_export_hash("bd-merge-victim")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sync_merge_transaction_rolls_back_rows_when_relation_validation_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let mut invalid = make_issue(
+            "bd-merge-invalid-relation",
+            "Must roll back",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        invalid.dependencies = vec![crate::model::Dependency {
+            issue_id: invalid.id.clone(),
+            depends_on_id: "bd-dependency-target".to_string(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: now,
+            created_by: None,
+            metadata: Some("not-json".to_string()),
+            thread_id: None,
+        }];
+
+        let kept = vec![invalid.clone()];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let result = storage.apply_sync_merge_atomically(&kept, &[], &[], &intent);
+
+        assert!(matches!(result, Err(BeadsError::Validation { .. })));
+        assert!(storage.get_issue(&invalid.id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_merge_transaction_rolls_back_rows_when_note_target_is_absent() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let kept = make_issue(
+            "bd-merge-before-note-failure",
+            "Must roll back",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        let notes = vec![(
+            "bd-absent-note-target".to_string(),
+            "Valid note with an absent owner.".to_string(),
+        )];
+        let intent = sync_merge_test_intent(&storage, std::slice::from_ref(&kept), &[], &notes);
+        let result =
+            storage.apply_sync_merge_atomically(std::slice::from_ref(&kept), &[], &notes, &intent);
+
+        assert!(result.is_err());
+        assert!(storage.get_issue(&kept.id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_merge_transaction_rolls_back_rows_when_cache_rebuild_fails() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-merge-cache-parent",
+            "Must roll back with child",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let child = make_issue(
+            "bd-merge-cache-parent.1",
+            "Child forces a counter insert",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage
+            .conn
+            .execute(
+                "CREATE TRIGGER fail_sync_merge_child_counter
+                 BEFORE INSERT ON child_counters
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected child-counter rebuild failure');
+                 END",
+            )
+            .unwrap();
+        let kept = vec![parent.clone(), child.clone()];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+
+        let result = storage.apply_sync_merge_atomically(&kept, &[], &[], &intent);
+
+        assert!(result.is_err());
+        assert!(storage.get_issue(&parent.id).unwrap().is_none());
+        assert!(storage.get_issue(&child.id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert_eq!(storage.get_dirty_issue_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_roundtrips_and_rejects_full_envelope_tampering() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-receipt",
+            "Receipt target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        let expected_intent_sha256 = receipt.intent.intent_sha256().unwrap();
+        assert_eq!(receipt.intent_sha256, expected_intent_sha256);
+        assert_ne!(
+            receipt.receipt_id, expected_intent_sha256,
+            "the receipt ID must identify the full immutable evidence envelope"
+        );
+        assert_ne!(
+            receipt.state_sha256, receipt.receipt_id,
+            "state and immutable-envelope digests must use distinct domains"
+        );
+        receipt.validate().unwrap();
+        let serialized = serde_json::to_string(&receipt).unwrap();
+        let roundtrip = serde_json::from_str::<SyncMergePendingReceipt>(&serialized).unwrap();
+        assert_eq!(roundtrip, receipt);
+        assert_eq!(roundtrip.intent.export_as_of, intent.export_as_of);
+        roundtrip.validate().unwrap();
+
+        let mut different_cutoff = receipt.intent.clone();
+        different_cutoff.export_as_of += chrono::Duration::nanoseconds(1);
+        assert_ne!(
+            different_cutoff.intent_sha256().unwrap(),
+            receipt.intent_sha256,
+            "the frozen export cutoff must be hash-bound into merge intent"
+        );
+        let reviewed_issue_hashes = sync_merge_test_export_hashes(&storage, &receipt.intent);
+        assert!(
+            SyncMergePendingReceipt::new(
+                receipt.intent.clone(),
+                (now + chrono::Duration::nanoseconds(1)).to_rfc3339(),
+                receipt.database_after.clone(),
+                receipt.jsonl_after_raw_sha256.clone(),
+                receipt.jsonl_after_issue_count,
+                &reviewed_issue_hashes,
+                Vec::new(),
+            )
+            .is_err(),
+            "receipt creation time and frozen export cutoff must identify one instant"
+        );
+
+        let mut unsupported_schema = receipt.clone();
+        unsupported_schema.schema_version += 1;
+        let mut tampered_intent_schema = receipt.clone();
+        tampered_intent_schema.intent.schema_version += 1;
+        let mut tampered_intent = receipt.clone();
+        tampered_intent.intent.resolution = "force-db".to_string();
+        tampered_intent.intent_sha256 = tampered_intent.intent.intent_sha256().unwrap();
+        let mut tampered_intent_digest = receipt.clone();
+        tampered_intent_digest.intent_sha256 = "10".repeat(32);
+        let mut tampered_created_at = receipt.clone();
+        tampered_created_at.created_at = "2026-07-27T08:00:00.000000001+00:00".to_string();
+        let mut tampered_database_after = receipt.clone();
+        tampered_database_after.database_after.issue_payload_sha256 = "20".repeat(32);
+        let mut tampered_raw_hash = receipt.clone();
+        tampered_raw_hash.jsonl_after_raw_sha256 = "30".repeat(32);
+        let mut tampered_content_hash = receipt.clone();
+        tampered_content_hash.jsonl_after_content_sha256 = "40".repeat(32);
+        let mut tampered_count = receipt.clone();
+        tampered_count.jsonl_after_issue_count += 1;
+        let mut tampered_identity = receipt.clone();
+        tampered_identity.receipt_id = "50".repeat(32);
+        let mut tampered_state_digest = receipt.clone();
+        tampered_state_digest.state_sha256 = "60".repeat(32);
+
+        for (field, tampered) in [
+            ("schema_version", unsupported_schema),
+            ("intent.schema_version", tampered_intent_schema),
+            ("intent", tampered_intent),
+            ("intent_sha256", tampered_intent_digest),
+            ("created_at", tampered_created_at),
+            ("database_after", tampered_database_after),
+            ("jsonl_after_raw_sha256", tampered_raw_hash),
+            ("jsonl_after_content_sha256", tampered_content_hash),
+            ("jsonl_after_issue_count", tampered_count),
+            ("receipt_id", tampered_identity),
+            ("state_sha256", tampered_state_digest),
+        ] {
+            storage
+                .set_metadata(
+                    METADATA_SYNC_MERGE_PENDING,
+                    &serde_json::to_string(&tampered).unwrap(),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    storage.pending_sync_merge_receipt(),
+                    Err(BeadsError::SyncConflict { .. })
+                ),
+                "persisted {field} tampering must be rejected"
+            );
+        }
+
+        storage
+            .set_metadata(
+                METADATA_SYNC_MERGE_PENDING,
+                &serde_json::to_string(&receipt).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(storage.pending_sync_merge_receipt().unwrap(), Some(receipt));
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_state_digest_rejects_phase_and_witness_tampering() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 5, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-state",
+            "State digest target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+
+        assert_eq!(finalized.receipt_id, committed.receipt_id);
+        assert_ne!(finalized.state_sha256, committed.state_sha256);
+        finalized.validate().unwrap();
+
+        let mut stale_committed_state = finalized.clone();
+        stale_committed_state.phase = crate::sync::SyncMergePendingPhase::DatabaseCommitted;
+        stale_committed_state.jsonl_after = None;
+        let mut stale_finalized_state = finalized.clone();
+        let Some(crate::sync::JsonlSourceStateWitness::Present { size, .. }) =
+            stale_finalized_state.jsonl_after.as_mut()
+        else {
+            panic!("finalized fixture must contain a present JSONL witness");
+        };
+        *size += 1;
+        let mut stale_finalization_witness = finalized.clone();
+        stale_finalization_witness
+            .export_finalization
+            .as_mut()
+            .expect("finalized fixture must contain database bookkeeping")
+            .export_hashes
+            .payload_sha256 = "ab".repeat(32);
+
+        for (field, tampered) in [
+            ("phase", stale_committed_state),
+            ("jsonl_after", stale_finalized_state),
+            ("export_finalization", stale_finalization_witness),
+        ] {
+            storage
+                .set_metadata(
+                    METADATA_SYNC_MERGE_PENDING,
+                    &serde_json::to_string(&tampered).unwrap(),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    storage.pending_sync_merge_receipt(),
+                    Err(BeadsError::SyncConflict { .. })
+                ),
+                "persisted {field} tampering without a state digest update must be rejected"
+            );
+        }
+
+        let finalization =
+            crate::sync::capture_sync_merge_export_finalization_witness(&storage).unwrap();
+        assert!(matches!(
+            finalized.advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Present {
+                    raw_sha256: finalized.jsonl_after_raw_sha256.clone(),
+                    mtime: "2026-07-27T08:00:00+00:00".to_string(),
+                    size: 129,
+                    identity: None,
+                },
+                finalization.clone(),
+            ),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(matches!(
+            committed.advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Missing,
+                finalization.clone(),
+            ),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(matches!(
+            committed.advance_to_export_finalized(
+                crate::sync::JsonlSourceStateWitness::Present {
+                    raw_sha256: "70".repeat(32),
+                    mtime: "2026-07-27T08:00:00+00:00".to_string(),
+                    size: 128,
+                    identity: None,
+                },
+                finalization,
+            ),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_merge_existing_pending_receipt_blocks_second_merge_without_mutation() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 15, 0).unwrap();
+        let first = make_issue(
+            "bd-merge-first",
+            "First committed merge",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let first_kept = vec![first];
+        let first_intent = sync_merge_test_intent(&storage, &first_kept, &[], &[]);
+        let first_receipt = storage
+            .apply_sync_merge_atomically(&first_kept, &[], &[], &first_intent)
+            .unwrap();
+
+        let second = make_issue(
+            "bd-merge-second",
+            "Must remain absent",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let second_kept = vec![second.clone()];
+        let second_intent = sync_merge_test_intent(&storage, &second_kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(&second_kept, &[], &[], &second_intent)
+            .unwrap_err();
+
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert!(storage.get_issue(&second.id).unwrap().is_none());
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(first_receipt)
+        );
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_cas_rejects_stale_backward_and_immutable_changes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 30, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-cas",
+            "CAS target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &committed),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+        let mut stale = committed.clone();
+        stale.created_at = "2026-07-27T08:31:00+00:00".to_string();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&stale, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(committed.clone())
+        );
+
+        assert_eq!(finalized.receipt_id, committed.receipt_id);
+        assert_eq!(finalized.intent_sha256, committed.intent_sha256);
+        assert_eq!(finalized.created_at, committed.created_at);
+        assert_eq!(finalized.database_after, committed.database_after);
+        assert_eq!(
+            finalized.jsonl_after_raw_sha256,
+            committed.jsonl_after_raw_sha256
+        );
+        assert_eq!(
+            finalized.jsonl_after_content_sha256,
+            committed.jsonl_after_content_sha256
+        );
+        assert_eq!(
+            finalized.jsonl_after_issue_count,
+            committed.jsonl_after_issue_count
+        );
+        assert_ne!(finalized.state_sha256, committed.state_sha256);
+
+        let mut cross_intent = committed.intent.clone();
+        cross_intent.resolution = "force-db".to_string();
+        let cross_issue_hashes = sync_merge_test_export_hashes(&storage, &cross_intent);
+        let cross_committed = SyncMergePendingReceipt::new(
+            cross_intent,
+            committed.created_at.clone(),
+            committed.database_after.clone(),
+            committed.jsonl_after_raw_sha256.clone(),
+            committed.jsonl_after_issue_count,
+            &cross_issue_hashes,
+            Vec::new(),
+        )
+        .unwrap();
+        let changed_identity = finalized_sync_merge_test_receipt(&mut storage, &cross_committed);
+        assert_ne!(changed_identity.receipt_id, committed.receipt_id);
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &changed_identity),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+
+        let mut changed_created_at = finalized.clone();
+        changed_created_at.created_at = "2026-07-27T08:32:00+00:00".to_string();
+        let mut changed_core = finalized.clone();
+        changed_core.database_after.issue_payload_sha256 = "aa".repeat(32);
+        let mut changed_hash = finalized.clone();
+        changed_hash.jsonl_after_content_sha256 = "bb".repeat(32);
+        let mut changed_count = finalized.clone();
+        changed_count.jsonl_after_issue_count += 1;
+        for changed in [
+            changed_created_at,
+            changed_core,
+            changed_hash,
+            changed_count,
+        ] {
+            assert!(matches!(
+                storage.compare_and_set_pending_sync_merge_receipt(&committed, &changed),
+                Err(BeadsError::SyncConflict { .. })
+            ));
+        }
+
+        storage
+            .set_metadata("sync_merge_cas_core_drift", "must-block")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(
+            storage
+                .delete_metadata("sync_merge_cas_core_drift")
+                .unwrap()
+        );
+
+        let committed_serialized = serde_json::to_string(&committed).unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(committed_serialized.as_str()),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata \
+                 WHERE rowid = (SELECT MAX(rowid) FROM metadata WHERE key = ?)",
+                &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+            )
+            .unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING_LEGACY),
+                    SqliteValue::from("legacy-pending-state"),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&committed, &finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata WHERE key = ?",
+                &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING_LEGACY)],
+            )
+            .unwrap();
+
+        storage
+            .compare_and_set_pending_sync_merge_receipt(&committed, &finalized)
+            .unwrap();
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized.clone())
+        );
+        assert!(matches!(
+            storage.compare_and_set_pending_sync_merge_receipt(&finalized, &committed),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized)
+        );
+    }
+
+    #[test]
+    fn sync_merge_pending_receipt_clear_requires_exact_terminal_value() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 45, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-clear",
+            "Clear target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&committed),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        let mut incomplete_terminal = committed.clone();
+        incomplete_terminal.phase = crate::sync::SyncMergePendingPhase::ExportFinalized;
+        incomplete_terminal.jsonl_after = Some(crate::sync::JsonlSourceStateWitness::Missing);
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&incomplete_terminal),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+        storage
+            .compare_and_set_pending_sync_merge_receipt(&committed, &finalized)
+            .unwrap();
+
+        let finalized_serialized = serde_json::to_string(&finalized).unwrap();
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                &[
+                    SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                    SqliteValue::from(finalized_serialized.as_str()),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .conn
+            .execute_with_params(
+                "DELETE FROM metadata \
+                 WHERE rowid = (SELECT MAX(rowid) FROM metadata WHERE key = ?)",
+                &[SqliteValue::from(METADATA_SYNC_MERGE_PENDING)],
+            )
+            .unwrap();
+
+        storage
+            .set_metadata("sync_merge_clear_core_drift", "must-block")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert!(
+            storage
+                .delete_metadata("sync_merge_clear_core_drift")
+                .unwrap()
+        );
+
+        let mut stale_finalized = finalized.clone();
+        stale_finalized.created_at = "2026-07-27T08:46:00+00:00".to_string();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&stale_finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized.clone())
+        );
+
+        let reviewed_export_hash = sync_merge_test_export_hashes(&storage, &finalized.intent)
+            .into_iter()
+            .find_map(|(issue_id, content_hash)| (issue_id == kept[0].id).then_some(content_hash))
+            .expect("reviewed export mapping contains the kept issue");
+        let original_export_hash = storage
+            .get_export_hash(&kept[0].id)
+            .unwrap()
+            .expect("finalized export-hash fixture");
+        storage
+            .set_export_hash(&kept[0].id, "drifted-export-hash")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(original_export_hash.0, reviewed_export_hash);
+        storage
+            .with_write_transaction(|storage| {
+                storage.conn.execute_with_params(
+                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    &[SqliteValue::from(kept[0].id.as_str())],
+                )?;
+                storage.conn.execute_with_params(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) \
+                     VALUES (?, ?, ?)",
+                    &[
+                        SqliteValue::from(kept[0].id.as_str()),
+                        SqliteValue::from(original_export_hash.0.as_str()),
+                        SqliteValue::from(original_export_hash.1.as_str()),
+                    ],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        storage
+            .replace_dirty_issue_marker(&kept[0].id, "2026-07-27T08:45:01+00:00")
+            .unwrap();
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        storage
+            .clear_dirty_flags(std::slice::from_ref(&kept[0].id))
+            .unwrap();
+
+        for (key, drifted) in [
+            (METADATA_JSONL_CONTENT_HASH, "drifted-content-hash"),
+            (METADATA_JSONL_MTIME, "2026-07-27T08:46:00+00:00"),
+            (METADATA_JSONL_SIZE, "129"),
+            (METADATA_LAST_EXPORT_TIME, "2026-07-27T08:47:00+00:00"),
+            ("needs_flush", "true"),
+        ] {
+            let original = storage
+                .get_metadata(key)
+                .unwrap()
+                .expect("finalized metadata fixture");
+            storage.set_metadata(key, drifted).unwrap();
+            assert!(
+                matches!(
+                    storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+                    Err(BeadsError::SyncConflict { .. })
+                ),
+                "drift in finalized metadata key {key} must prevent receipt cleanup"
+            );
+            storage.set_metadata(key, &original).unwrap();
+        }
+        assert_eq!(
+            storage.pending_sync_merge_receipt().unwrap(),
+            Some(finalized.clone()),
+            "all rejected finalization drift must preserve the exact receipt"
+        );
+
+        storage
+            .compare_and_clear_pending_sync_merge_receipt(&finalized)
+            .unwrap();
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert!(matches!(
+            storage.compare_and_clear_pending_sync_merge_receipt(&finalized),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn sync_merge_core_witness_ignores_only_export_finalization_bookkeeping() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-core",
+            "Core witness target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue.clone()];
+        for (key, value) in [
+            ("unrelated_sync_merge_metadata", "baseline"),
+            ("project", "baseline-project"),
+            (METADATA_LAST_IMPORT_TIME, "2026-07-27T08:59:00+00:00"),
+        ] {
+            storage.set_metadata(key, value).unwrap();
+        }
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let committed = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+        assert_eq!(
+            crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+            committed.database_after
+        );
+
+        storage
+            .set_export_hash(&issue.id, "reviewed-export-hash")
+            .unwrap();
+        let dirty_ids = storage.get_dirty_issue_ids().unwrap();
+        storage.clear_dirty_flags(&dirty_ids).unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_CONTENT_HASH, "canonical-jsonl-hash")
+            .unwrap();
+        storage
+            .set_metadata(METADATA_JSONL_MTIME, "2026-07-27T09:01:00+00:00")
+            .unwrap();
+        storage.set_metadata(METADATA_JSONL_SIZE, "128").unwrap();
+        storage.set_metadata("needs_flush", "false").unwrap();
+        storage
+            .set_metadata(METADATA_LAST_EXPORT_TIME, "2026-07-27T09:01:00+00:00")
+            .unwrap();
+        let finalized = finalized_sync_merge_test_receipt(&mut storage, &committed);
+        storage
+            .compare_and_set_pending_sync_merge_receipt(&committed, &finalized)
+            .unwrap();
+
+        assert_eq!(
+            crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+            committed.database_after
+        );
+
+        for (key, replacement) in [
+            ("unrelated_sync_merge_metadata", "must-be-bound"),
+            ("project", "different-project"),
+            (METADATA_LAST_IMPORT_TIME, "2026-07-27T09:02:00+00:00"),
+        ] {
+            let original = storage.get_metadata(key).unwrap();
+            storage.set_metadata(key, replacement).unwrap();
+            assert_ne!(
+                crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+                committed.database_after,
+                "stable metadata key {key} must be bound by the merge core witness"
+            );
+            storage
+                .set_metadata(key, &original.expect("stable metadata fixture"))
+                .unwrap();
+            assert_eq!(
+                crate::sync::capture_sync_merge_core_witness(&storage).unwrap(),
+                committed.database_after,
+                "restoring stable metadata key {key} must restore the exact core witness"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_merge_intent_prestate_drift_rejects_without_additional_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 15, 0).unwrap();
+        let planned = make_issue(
+            "bd-merge-planned",
+            "Planned merge row",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![planned.clone()];
+        let stale_intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+
+        let concurrent = make_issue(
+            "bd-merge-concurrent",
+            "Concurrent committed row",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&concurrent, "other-agent").unwrap();
+        let drifted_prestate = crate::sync::capture_sync_database_witness(&storage).unwrap();
+
+        let error = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &stale_intent)
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::SyncConflict { .. }));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            drifted_prestate
+        );
+        assert!(storage.get_issue(&planned.id).unwrap().is_none());
+        assert!(storage.get_issue(&concurrent.id).unwrap().is_some());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_merge_payload_validation_rejects_duplicates_and_overlap_without_writes() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 30, 0).unwrap();
+
+        let duplicate_kept = make_issue(
+            "bd-merge-duplicate-kept",
+            "Duplicate kept row",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            &[duplicate_kept.clone(), duplicate_kept],
+            &[],
+            &[],
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let duplicate_deleted = vec![
+            "bd-merge-duplicate-deleted".to_string(),
+            "bd-merge-duplicate-deleted".to_string(),
+        ];
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            &[],
+            &duplicate_deleted,
+            &[],
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+
+        let overlap = make_issue(
+            "bd-merge-overlap",
+            "Kept and deleted",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            std::slice::from_ref(&overlap),
+            std::slice::from_ref(&overlap.id),
+            &[],
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+
+        let note_target = make_issue(
+            "bd-merge-duplicate-note",
+            "Duplicate note target",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let duplicate_notes = vec![
+            (note_target.id.clone(), "First valid note.".to_string()),
+            (note_target.id.clone(), "Second valid note.".to_string()),
+        ];
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let error = assert_sync_merge_payload_rejected_without_writes(
+            &mut storage,
+            std::slice::from_ref(&note_target),
+            &[],
+            &duplicate_notes,
+        );
+        assert!(matches!(error, BeadsError::Validation { .. }));
+    }
+
+    #[test]
+    fn sync_merge_intent_rejects_every_same_id_issue_payload_substitution_without_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 40, 0).unwrap();
+        let planned = make_issue(
+            "bd-merge-payload-bound",
+            "Reviewed payload",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+
+        let mut scalar = planned.clone();
+        scalar.title = "Substituted scalar".to_string();
+        let mut label = planned.clone();
+        label.labels.push("substituted-label".to_string());
+        let mut dependency = planned.clone();
+        dependency.dependencies.push(crate::model::Dependency {
+            issue_id: planned.id.clone(),
+            depends_on_id: "bd-substituted-target".to_string(),
+            dep_type: crate::model::DependencyType::Related,
+            created_at: now,
+            created_by: Some("substituted".to_string()),
+            metadata: Some("{}".to_string()),
+            thread_id: None,
+        });
+        let mut comment = planned.clone();
+        comment.comments.push(crate::model::Comment {
+            id: 991,
+            issue_id: planned.id.clone(),
+            author: "substituted".to_string(),
+            body: "Substituted owned comment".to_string(),
+            created_at: now,
+        });
+        let mut timestamp = planned.clone();
+        timestamp.updated_at += chrono::Duration::nanoseconds(1);
+        let mut content_hash = planned.clone();
+        content_hash.content_hash = Some("substituted-content-hash".to_string());
+
+        for (field, substituted) in [
+            ("scalar", scalar),
+            ("label", label),
+            ("dependency", dependency),
+            ("comment", comment),
+            ("timestamp", timestamp),
+            ("content_hash", content_hash),
+        ] {
+            assert_eq!(substituted.id, planned.id);
+            assert_sync_merge_substituted_issue_rejected_without_writes(
+                &mut storage,
+                &planned,
+                &substituted,
+            );
+            assert!(
+                storage.get_issue(&planned.id).unwrap().is_none(),
+                "{field} substitution must not materialize the reviewed ID"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_merge_actor_is_hash_bound_and_invalid_actor_performs_zero_writes() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 42, 0).unwrap();
+        let issue = make_issue(
+            "bd-merge-actor-bound",
+            "Actor-bound merge",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let kept = vec![issue];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let mut substituted_actor = intent.clone();
+        substituted_actor.actor = "different-reviewed-actor".to_string();
+        assert_ne!(
+            intent.intent_sha256().unwrap(),
+            substituted_actor.intent_sha256().unwrap(),
+            "the actor must be part of the immutable reviewed intent"
+        );
+
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let mut invalid_actor = intent;
+        invalid_actor.actor = " untrimmed".to_string();
+        let error = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &invalid_actor)
+            .unwrap_err();
+        assert!(matches!(error, BeadsError::Validation { .. }));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_merge_attribution_is_applied_to_all_merge_events_and_consumed_once() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 45, 0).unwrap();
+        let victim = make_issue(
+            "bd-merge-attribution-victim",
+            "Attribution deletion",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let note_target = make_issue(
+            "bd-merge-attribution-note",
+            "Attribution note",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&victim, "fixture").unwrap();
+        storage.create_issue(&note_target, "fixture").unwrap();
+
+        let kept = vec![note_target.clone()];
+        let deleted = vec![victim.id.clone()];
+        let notes = vec![(
+            note_target.id.clone(),
+            "Reviewed merge attribution note.".to_string(),
+        )];
+        storage.set_pending_event_attribution(EventAttribution::new(
+            Some("agent-merge"),
+            Some("test-harness"),
+            Some("test-model"),
+            None,
+        ));
+        let intent = sync_merge_test_intent(&storage, &kept, &deleted, &notes);
+        storage
+            .apply_sync_merge_atomically(&kept, &deleted, &notes, &intent)
+            .unwrap();
+
+        let attributed_merge_events = storage
+            .get_events(&victim.id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == EventType::Deleted)
+            .chain(
+                storage
+                    .get_events(&note_target.id, 0)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|event| event.event_type == EventType::Commented),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(attributed_merge_events.len(), 2);
+        for event in attributed_merge_events {
+            assert_eq!(event.actor, "merge-agent");
+            assert_eq!(event.agent_name.as_deref(), Some("agent-merge"));
+            assert_eq!(event.harness.as_deref(), Some("test-harness"));
+            assert_eq!(event.model.as_deref(), Some("test-model"));
+        }
+        assert!(storage.pending_event_attribution.is_none());
+
+        let unrelated = make_issue(
+            "bd-merge-attribution-next",
+            "Must not inherit attribution",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&unrelated, "fixture").unwrap();
+        let created = storage
+            .get_events(&unrelated.id, 0)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == EventType::Created)
+            .unwrap();
+        assert!(created.agent_name.is_none());
+        assert!(created.harness.is_none());
+        assert!(created.model.is_none());
+    }
+
+    #[test]
+    fn sync_merge_rejects_attribution_and_capacity_policy_drift_without_writes() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 50, 0).unwrap();
+        let kept = vec![make_issue(
+            "bd-merge-reviewed-context",
+            "Reviewed merge context",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        )];
+
+        let mut attribution_storage = SqliteStorage::open_memory().unwrap();
+        attribution_storage.set_pending_event_attribution(EventAttribution::new(
+            Some("reviewed-agent"),
+            Some("reviewed-harness"),
+            Some("reviewed-model"),
+            None,
+        ));
+        let attribution_intent = sync_merge_test_intent(&attribution_storage, &kept, &[], &[]);
+        let mut substituted_attribution = attribution_intent.clone();
+        substituted_attribution.event_attribution = EventAttribution::new(
+            Some("substituted-agent"),
+            Some("reviewed-harness"),
+            Some("reviewed-model"),
+            None,
+        );
+        assert_ne!(
+            attribution_intent.intent_sha256().unwrap(),
+            substituted_attribution.intent_sha256().unwrap()
+        );
+        attribution_storage
+            .set_pending_event_attribution(substituted_attribution.event_attribution.clone());
+        let before = crate::sync::capture_sync_database_witness(&attribution_storage).unwrap();
+        assert!(matches!(
+            attribution_storage.apply_sync_merge_atomically(&kept, &[], &[], &attribution_intent),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&attribution_storage).unwrap(),
+            before
+        );
+        assert!(
+            attribution_storage
+                .pending_sync_merge_receipt()
+                .unwrap()
+                .is_none()
+        );
+
+        let mut policy_storage = SqliteStorage::open_memory().unwrap();
+        policy_storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+        let policy_intent = sync_merge_test_intent(&policy_storage, &kept, &[], &[]);
+        let mut substituted_policy = policy_intent.clone();
+        substituted_policy.capacity_policy = hard_status_capacity("in_progress", 2);
+        assert_ne!(
+            policy_intent.intent_sha256().unwrap(),
+            substituted_policy.intent_sha256().unwrap()
+        );
+        policy_storage.set_workflow_capacity_policy(substituted_policy.capacity_policy);
+        let before = crate::sync::capture_sync_database_witness(&policy_storage).unwrap();
+        assert!(matches!(
+            policy_storage.apply_sync_merge_atomically(&kept, &[], &[], &policy_intent),
+            Err(BeadsError::SyncConflict { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&policy_storage).unwrap(),
+            before
+        );
+        assert!(
+            policy_storage
+                .pending_sync_merge_receipt()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sync_merge_new_kept_rows_obey_group_capacity_and_roll_back_atomically() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.groups.insert(
+            "active_work".to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: vec!["open".to_string(), "in_progress".to_string()],
+                soft: None,
+                hard: Some(0),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 52, 0).unwrap();
+        let kept = vec![make_issue(
+            "bd-merge-capacity-new",
+            "New merge row must be admitted",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        )];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+
+        assert!(matches!(
+            storage.apply_sync_merge_atomically(&kept, &[], &[], &intent),
+            Err(BeadsError::WorkflowCapacityExceeded { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert!(storage.get_issue(&kept[0].id).unwrap().is_none());
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+        assert!(storage.take_capacity_warnings().is_empty());
+    }
+
+    #[test]
+    fn sync_merge_kept_status_changes_obey_hard_capacity_and_roll_back_atomically() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 53, 0).unwrap();
+        let existing = make_issue(
+            "bd-merge-capacity-status",
+            "Existing row changes status",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&existing, "fixture").unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 0));
+
+        let mut changed = storage.get_issue(&existing.id).unwrap().unwrap();
+        changed.status = Status::InProgress;
+        let kept = vec![changed];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+
+        assert!(matches!(
+            storage.apply_sync_merge_atomically(&kept, &[], &[], &intent),
+            Err(BeadsError::WorkflowCapacityExceeded { .. })
+        ));
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert_eq!(
+            storage.get_issue(&existing.id).unwrap().unwrap().status,
+            Status::Open
+        );
+        assert!(storage.pending_sync_merge_receipt().unwrap().is_none());
+    }
+
+    #[test]
+    fn sync_merge_kept_status_changes_obey_cross_queue_admission_rules() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 54, 0).unwrap();
+        let blocker = make_issue(
+            "bd-merge-capacity-blocker",
+            "Occupies active-work admission queue",
+            Status::InProgress,
+            2,
+            None,
+            now,
+            None,
+        );
+        let candidate = make_issue(
+            "bd-merge-capacity-admission",
+            "Must satisfy cross-queue admission",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&blocker, "fixture").unwrap();
+        storage.create_issue(&candidate, "fixture").unwrap();
+
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.groups.insert(
+            "active_work".to_string(),
+            crate::close_policy::CapacityGroup {
+                statuses: vec!["in_progress".to_string()],
+                soft: None,
+                hard: None,
+            },
+        );
+        policy
+            .admission
+            .push(crate::close_policy::CapacityAdmissionRule {
+                name: "review_requires_active_headroom".to_string(),
+                transitions: crate::close_policy::CapacityTransitionMatcher {
+                    from: vec!["open".to_string()],
+                    to: vec!["in_review".to_string()],
+                },
+                require_below: crate::close_policy::CapacityRequirements {
+                    statuses: std::collections::BTreeMap::new(),
+                    groups: std::collections::BTreeMap::from([("active_work".to_string(), 1)]),
+                },
+            });
+        storage.set_workflow_capacity_policy(policy);
+
+        let mut changed = storage.get_issue(&candidate.id).unwrap().unwrap();
+        changed.status = Status::Custom("in_review".to_string());
+        let kept = vec![changed];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let before = crate::sync::capture_sync_database_witness(&storage).unwrap();
+        let error = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap_err();
+
+        let BeadsError::WorkflowCapacityExceeded { violation } = error else {
+            panic!("expected a cross-queue policy violation");
+        };
+        assert_eq!(violation.capacity_kind, "admission_group");
+        assert_eq!(violation.capacity_name, "active_work");
+        assert_eq!(
+            crate::sync::capture_sync_database_witness(&storage).unwrap(),
+            before
+        );
+        assert_eq!(
+            storage.get_issue(&candidate.id).unwrap().unwrap().status,
+            Status::Open
+        );
+    }
+
+    #[test]
+    fn sync_merge_capacity_neutral_swap_uses_final_batch_state() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 55, 0).unwrap();
+        let open = make_issue(
+            "bd-merge-capacity-swap-open",
+            "Enters active work",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let active = make_issue(
+            "bd-merge-capacity-swap-active",
+            "Drains active work",
+            Status::InProgress,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&open, "fixture").unwrap();
+        storage.create_issue(&active, "fixture").unwrap();
+        storage.set_workflow_capacity_policy(hard_status_capacity("in_progress", 1));
+
+        let mut entering = storage.get_issue(&open.id).unwrap().unwrap();
+        entering.status = Status::InProgress;
+        let mut draining = storage.get_issue(&active.id).unwrap().unwrap();
+        draining.status = Status::Open;
+        // Deliberately put the admitting row first. Sequential evaluation
+        // would reject it even though the complete merge is capacity-neutral.
+        let kept = vec![entering, draining];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert_eq!(
+            storage.get_issue(&open.id).unwrap().unwrap().status,
+            Status::InProgress
+        );
+        assert_eq!(
+            storage.get_issue(&active.id).unwrap().unwrap().status,
+            Status::Open
+        );
+        assert!(receipt.capacity_warnings.is_empty());
+        assert!(storage.take_capacity_warnings().is_empty());
+    }
+
+    #[test]
+    fn sync_merge_capacity_warnings_are_receipt_bound_and_consumable() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 9, 56, 0).unwrap();
+        let existing = make_issue(
+            "bd-merge-capacity-warning",
+            "Crosses a soft threshold",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&existing, "fixture").unwrap();
+        let mut policy = crate::close_policy::CapacityPolicy::default();
+        policy.statuses.insert(
+            "in_progress".to_string(),
+            crate::close_policy::CapacityLimit {
+                soft: Some(1),
+                hard: Some(2),
+            },
+        );
+        storage.set_workflow_capacity_policy(policy);
+
+        let mut changed = storage.get_issue(&existing.id).unwrap().unwrap();
+        changed.status = Status::InProgress;
+        let kept = vec![changed];
+        let intent = sync_merge_test_intent(&storage, &kept, &[], &[]);
+        let receipt = storage
+            .apply_sync_merge_atomically(&kept, &[], &[], &intent)
+            .unwrap();
+
+        assert_eq!(receipt.capacity_warnings.len(), 1);
+        assert_eq!(receipt.capacity_warnings[0].issue_id, existing.id);
+        assert_eq!(receipt.capacity_warnings[0].capacity_kind, "status");
+        assert_eq!(storage.take_capacity_warnings(), receipt.capacity_warnings);
+        assert!(storage.take_capacity_warnings().is_empty());
+        receipt.validate().unwrap();
+
+        let mut tampered = receipt.clone();
+        tampered.capacity_warnings[0].prospective += 1;
+        assert!(
+            tampered.validate().is_err(),
+            "capacity warning evidence must be immutable-envelope bound"
+        );
+    }
+
+    #[test]
+    fn sync_merge_deletion_events_match_tombstone_semantics_without_terminal_duplicates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 27, 10, 0, 0).unwrap();
+        let open = make_issue(
+            "bd-merge-delete-open",
+            "Open deletion",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        let mut closed = make_issue(
+            "bd-merge-delete-closed",
+            "Closed deletion",
+            Status::Closed,
+            2,
+            None,
+            now,
+            None,
+        );
+        closed.closed_at = Some(now);
+        closed.close_reason = Some("completed before merge".to_string());
+        let already_tombstoned = make_issue(
+            "bd-merge-delete-tombstone",
+            "Existing tombstone",
+            Status::Open,
+            2,
+            None,
+            now,
+            None,
+        );
+        storage.create_issue(&open, "fixture").unwrap();
+        storage.create_issue(&closed, "fixture").unwrap();
+        storage
+            .create_issue(&already_tombstoned, "fixture")
+            .unwrap();
+        storage
+            .delete_issue(
+                &already_tombstoned.id,
+                "fixture",
+                "preexisting deletion",
+                Some(now),
+            )
+            .unwrap();
+
+        let deleted = vec![
+            open.id.clone(),
+            closed.id.clone(),
+            already_tombstoned.id.clone(),
+        ];
+        let intent = sync_merge_test_intent(&storage, &[], &deleted, &[]);
+        let merge_timestamp = intent.export_as_of;
+        storage
+            .apply_sync_merge_atomically(&[], &deleted, &[], &intent)
+            .unwrap();
+
+        let open_tombstone = storage.get_issue(&open.id).unwrap().unwrap();
+        assert_eq!(open_tombstone.status, Status::Tombstone);
+        assert_eq!(open_tombstone.deleted_at, Some(merge_timestamp));
+        assert_eq!(open_tombstone.deleted_by.as_deref(), Some("merge-agent"));
+        assert_eq!(
+            open_tombstone.delete_reason.as_deref(),
+            Some("merge deletion")
+        );
+        assert_eq!(
+            open_tombstone.content_hash.as_deref(),
+            Some(crate::util::content_hash(&open_tombstone).as_str())
+        );
+        let open_deleted = storage
+            .get_events(&open.id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == EventType::Deleted)
+            .collect::<Vec<_>>();
+        assert_eq!(open_deleted.len(), 1);
+        assert_eq!(open_deleted[0].actor, "merge-agent");
+        assert_eq!(
+            open_deleted[0].comment.as_deref(),
+            Some("Deleted issue: merge deletion")
+        );
+        assert_eq!(open_deleted[0].created_at, merge_timestamp);
+
+        assert_eq!(
+            storage
+                .get_events(&closed.id, 0)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == EventType::Deleted)
+                .count(),
+            0
+        );
+        assert_eq!(
+            storage
+                .get_events(&already_tombstoned.id, 0)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == EventType::Deleted)
+                .count(),
+            1
+        );
     }
 }

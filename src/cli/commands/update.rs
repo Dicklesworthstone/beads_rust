@@ -23,6 +23,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 /// JSON output structure for updated issues.
+///
+/// `assignee` is always emitted (null when unassigned) rather than being
+/// skipped when absent. `br update --claim` sets the assignee, and an agent
+/// must be able to confirm the claim landed from the response alone; a field
+/// that disappears when unset would leave "not claimed" and "not reported"
+/// indistinguishable and force a verification `br show` round trip (GitHub
+/// issue #393).
 #[derive(Debug, Serialize)]
 struct UpdatedIssueOutput {
     id: String,
@@ -497,6 +504,7 @@ fn prepare_single_route(
             args.agent_name.as_deref(),
             args.harness.as_deref(),
             args.model.as_deref(),
+            super::session_attribution_from_env().as_deref(),
         ),
         _routed_write_lock: routed_write_lock,
     })

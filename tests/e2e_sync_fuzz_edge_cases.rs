@@ -21,6 +21,7 @@ use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, run_br};
 use serde_json::Value;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 
 // ============================================================================
@@ -449,6 +450,7 @@ fn edge_case_path_traversal_blocked() {
 
 /// Test: Symlink escape attempts are blocked
 #[test]
+#[cfg(unix)]
 fn edge_case_symlink_escape_blocked() {
     let _log = common::test_log("edge_case_symlink_escape_blocked");
     let workspace = BrWorkspace::new();

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "beads",
+  "displayName": "Beads (br)",
+  "version": "0.2.19",
+  "description": "Official br (beads_rust) skill: a local-first, dependency-aware issue tracker for AI agents. Ships agent instructions only — install the br binary separately.",
+  "author": {
+    "name": "Dicklesworthstone",
+    "url": "https://github.com/Dicklesworthstone"
+  },
+  "homepage": "https://github.com/Dicklesworthstone/beads_rust#readme",
+  "repository": "https://github.com/Dicklesworthstone/beads_rust",
+  "license": "MIT",
+  "keywords": [
+    "beads",
+    "br",
+    "issue-tracker",
+    "dependencies",
+    "ready-work",
+    "jsonl",
+    "agent-workflow"
+  ],
+  "skills": [
+    "./.claude/skills/"
+  ]
+}

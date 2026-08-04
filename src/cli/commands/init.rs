@@ -201,6 +201,8 @@ pub fn execute(
 *.db-journal
 *.db-shm
 *.db-wal
+# fsqlite multi-process namespace sidecars (-fsqlite-ns-gate / -fsqlite-ns-use)
+*.db-fsqlite-*
 
 # Lock files
 .write.lock

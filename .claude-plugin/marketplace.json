@@ -1,0 +1,41 @@
+{
+  "name": "beads-rust",
+  "description": "Official marketplace for beads_rust (br), the agent-first issue tracker.",
+  "owner": {
+    "name": "Dicklesworthstone",
+    "url": "https://github.com/Dicklesworthstone"
+  },
+  "plugins": [
+    {
+      "name": "beads",
+      "source": "./",
+      "displayName": "Beads (br)",
+      "description": "Official br (beads_rust) skill: create, triage, and unblock issues; find ready work; keep SQLite and issues.jsonl in sync. Agent instructions only — the br binary is installed separately.",
+      "author": {
+        "name": "Dicklesworthstone",
+        "url": "https://github.com/Dicklesworthstone"
+      },
+      "homepage": "https://github.com/Dicklesworthstone/beads_rust#readme",
+      "repository": "https://github.com/Dicklesworthstone/beads_rust",
+      "license": "MIT",
+      "skills": [
+        "./.claude/skills/"
+      ],
+      "category": "productivity",
+      "keywords": [
+        "beads",
+        "br",
+        "issue-tracker",
+        "dependencies",
+        "ready-work",
+        "jsonl",
+        "agent-workflow"
+      ],
+      "tags": [
+        "issue-tracking",
+        "task-management",
+        "agent-workflow"
+      ]
+    }
+  ]
+}

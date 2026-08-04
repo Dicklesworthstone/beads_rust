@@ -24,8 +24,10 @@ guards.
 | **Export** (`--flush-only`) | Writes issues from SQLite to `.beads/issues.jsonl` |
 | **Import** (`--import-only`) | Reads issues from JSONL into SQLite |
 | **Merge** (`--merge`) | Three-way merge of base snapshot, SQLite, and JSONL |
+| **Additive reconciliation** (`--reconcile-additive`) | Plans exact-ID recovery of JSONL-only rows while preserving SQLite-only rows and events |
+| **Additive apply** (`--reconcile-additive --apply`) | Applies a conflict-free, hash-bound additive plan transactionally |
 | **Rebuild** (`--import-only --rebuild`) | Treats JSONL as authoritative and rebuilds SQLite from it |
-| **Status** (`--status`) | Shows sync state without modifying anything |
+| **Status** (`--status`) | Shows database/JSONL sync state without probing VCS |
 
 All file I/O is confined to the `.beads/` directory by default.
 
@@ -47,6 +49,42 @@ Other explicitly requested br commands have their own scope: for example,
 history, while `br agents`, `br doctor --repair`, `br config`, and `br
 completions -o` can write the user-requested files they manage. Those commands
 do not weaken the `br sync` invariants described here.
+
+### Explicit VCS diagnostics are separate
+
+`br sync --status --json` retains a compatibility `git_export` object, but it
+always reports:
+
+```json
+{
+  "available": false,
+  "reason": "not_probed",
+  "diagnostic_command": "br vcs-status --json"
+}
+```
+
+Run `br vcs-status` only when you explicitly want Git visibility for the JSONL
+export. That command is isolated outside both sync source boundaries. Its probe
+budget starts before secure source capture; capture, every Git subprocess, and
+each in-process blob-hash chunk check the shared deadline between bounded
+operations. An individual filesystem read cannot itself be preempted. Subprocess output goes
+to anonymous temporary files with hard retained-output caps. On timeout or a
+runner failure, br terminates and reaps the direct child before returning;
+cleanup can extend past the probe budget. The v2 result compares exact
+HEAD/index identities and computes raw Git/SHA-256 hashes in-process from one
+immutable no-follow JSONL snapshot. Effective system/global/common/worktree
+configuration and repository-local attributes are inspected before any
+worktree comparison; configured filters or text conversions make that
+comparison explicitly unavailable rather than being executed. The observations
+are sequential, not a transactional Git snapshot.
+
+The selected Git executable remains part of the trust boundary. Search and
+attribute probes neutralize hooks, filters, prompts, paging, lazy object
+fetches, fsmonitor, untracked-cache writes, and inherited Git redirections.
+Fixed-key effective-config probes intentionally observe Git's normal
+system/global/common/worktree precedence without printing configured paths.
+The command is not a process sandbox and does not claim to terminate
+arbitrary daemonized descendants. No sync mode calls or delegates to it.
 
 ---
 
@@ -74,6 +112,20 @@ do not weaken the `br sync` invariants described here.
 | **Both modified conflict** | Silently choosing between divergent SQLite and JSONL edits | `--force`, `--force-db`, `--force-jsonl` |
 | **Delete vs modify conflict** | Silently deleting one side's edit | `--force`, `--force-db`, `--force-jsonl` |
 | **Convergent creation conflict** | Silently choosing between independently created same-ID issues | `--force`, `--force-db`, `--force-jsonl` |
+
+### Additive Reconciliation Guards
+
+| Guard | What it prevents | Override |
+|-------|------------------|----------|
+| **Read-only default** | Accidental mutation while inspecting recovery scope | `--apply` after receipt review |
+| **Exact-ID identity** | Merging unrelated rows that happen to share a content hash | **None** |
+| **Database-only preservation** | JSONL set difference deleting local rows | **None** |
+| **Event witness** | Recovery truncating or rewriting the audit log | **None** |
+| **Timestamp conflict** | Unreviewed scalar drift or older JSONL overwriting newer SQLite | Exact `--resolve-source-id` only for the non-lifecycle scalar whitelist when JSONL is not older |
+| **Tombstone protection** | Recovery resurrecting a deleted issue | **None** |
+| **Relation identity** | Orphan/self dependencies, logical comment-payload changes, invalid metadata, or relation-owner mismatch | **None**; storage-local incoming comment surrogates are deterministically reallocated and witnessed |
+| **Projected-cycle check** | Newly introducing a blocking or parent-child dependency cycle | **None** |
+| **Source/database witness recheck** | Applying a plan after either side changed | **None** - regenerate the plan |
 
 ---
 
@@ -147,6 +199,47 @@ the configured prefix. In that mode, br skips set-difference orphan cleanup
 because the original JSONL IDs no longer match the rewritten database IDs. If
 open-time recovery already rebuilt the database before `--rename-prefix` could
 apply, br reports a rerun command with the needed flags.
+
+## Lossless Additive Recovery
+
+Use additive reconciliation when valid JSONL contains rows missing from SQLite
+but SQLite also contains rows or audit events that must not be discarded:
+
+```bash
+# Read-only plan with complete source/database witnesses
+br sync --reconcile-additive --json
+
+# Apply only the exact conflict-free plan that was reviewed
+plan="$(br sync --reconcile-additive --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+br sync --reconcile-additive --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
+```
+
+The dry-run opens the current-schema database read-only and does not take the
+writer lock. Its v2 receipt includes an exact `plan_sha256`. The apply path
+requires that token, takes `.beads/.write.lock`, rebuilds the identically
+configured plan, and rejects a mismatch before mutation. It rechecks exact JSONL
+bytes plus canonical content, size, mtime, issue payload, all relation rows,
+events, close metadata, gate-result tables, config, dirty/export state, metadata,
+SQLite schema/AUTOINCREMENT state, and independently projected derived caches.
+Raw SQLite storage classes and semantic issue projections are separately
+witnessed. Source and database health are rechecked inside the transaction
+before commit.
+
+The operation is deliberately additive: SQLite-only issues are retained and no
+physical delete is available. Shared scalar drift is fail-closed except for a
+narrowly defined monotonic closure. A reviewed operator may use
+`--resolve-source-id` only for the documented non-lifecycle scalar whitelist,
+and never when JSONL is older than SQLite. Relation drift and lifecycle or
+tombstone transitions remain non-bypassable. The complete requested resolution
+set, including inapplicable IDs, is part of the plan token. The operation never
+writes the JSONL source, `.beads/beads.base.jsonl`, or a merge note. Preserved
+SQLite-only state sets `needs_flush=true` rather than hiding divergence.
+
+Use authoritative rebuild only when deleting SQLite-only state is intentional.
+Additive reconciliation is the safer first recovery tool when both sides may
+contain valuable evidence.
 
 ---
 
@@ -246,16 +339,17 @@ This incident motivated every design decision in `br`'s safety model.
 | **No sync git operations** | `br sync` has no runtime git subprocess path | Eliminates the primary attack vector from the original incident |
 | **Sync write allowlist** | Default writes stay in `.beads/`; external JSONL writes require opt-in | Prevents accidental modification of source code, configs, or system files |
 | **Path validation** | Rejects `.git`, traversal (`../`), symlink escapes, and disallowed extensions | Blocks path injection attacks and symlink-based escapes |
-| **Atomic writes** | Uses temp file + rename; partial failures don't corrupt | Prevents data loss from interrupted operations |
+| **Checked publication and transactions** | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback | Prevents partial publication and partial database mutation |
 | **Safety guards** | Empty DB and stale DB guards require `--force` to override | Makes destructive operations explicit and intentional |
 
 ### How Tests Enforce Safety
 
-The safety model is backed by an extensive test suite (**635+ tests**) that ensures these guarantees cannot regress:
+The safety model is backed by an extensive test suite that ensures these guarantees cannot regress:
 
 - **Path guard unit tests** (`sync::path::tests`): 22 tests verify that traversal attempts, external paths, and disallowed file types are rejected
 - **File tree snapshot tests** (`e2e_sync_git_safety.rs`): Integration tests take complete snapshots of the directory tree before and after sync, verifying that only `.beads/issues.jsonl` and related files are touched
-- **Git mutation tests**: Regression tests verify that no commits, staged changes, or `.git/` modifications occur during sync
+- **Authority sentinel matrix** (`e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation`): supported sync operations and distinct option branches run with a fake `git` first on `PATH`, detecting ordinary executable-name dispatch; every invocation compares the complete `.git` tree byte-for-byte with no exceptions. The source and runtime-dependency guards cover absolute-path, shell, linked-library, and sibling-adapter authority surfaces separately
+- **Fail-closed source validation** (`SyncSafetyValidator::validate_no_git_authority_in_sync_sources`): recursively scans both `src/sync/**/*.rs` and `src/cli/commands/sync.rs`, rejecting subprocess construction, inclusion escape hatches, Git libraries, process-capable CLI delegation, missing/unreadable/non-UTF-8 paths, symlinks, and unsupported special filesystem entries; a parsed Cargo-manifest check rejects direct normal and target-runtime Git-library edges, while `cargo tree -e normal` is the separate transitive runtime-closure gate
 - **Atomic write tests** (`e2e_sync_failure_injection.rs`): Tests inject failures mid-export to verify the original file is preserved
 - **Conflict marker tests**: Import preflight tests verify that merge conflicts are detected and rejected
 
@@ -279,13 +373,21 @@ If a safety guard triggers unexpectedly, the verbose log will show exactly why.
 
 ### The Core Guarantee
 
-**With the default `.beads/` paths, even if `br sync` has a bug, it cannot
-delete your source code.**
+With default `.beads/` paths, sync is deliberately constrained to its storage
+allowlist and has no intended process, Git-library, or CLI-adapter authority.
+External JSONL access requires explicit opt-in.
 
-This is not a best-effort promise—it's an architectural constraint enforced by:
-1. Sync code that does not call git
-2. Path validation that rejects anything outside `.beads/` unless an external JSONL path is explicitly allowed
-3. Tests that would fail if these constraints were violated
+This is defense-in-depth regression evidence, not a proof against arbitrary
+future code outside the inspected boundary or a compromised absolute-path
+executable. The maintained evidence consists of:
+
+1. Path validation that rejects `.git` and confines default writes to the sync
+   allowlist.
+2. A fail-closed static scan of the complete declared sync source boundary and
+   direct normal/target runtime dependency declarations, plus a strict
+   `cargo tree -e normal` review for the resolved transitive runtime closure.
+3. A Unix runtime PATH sentinel plus byte-exact `.git` snapshot matrix over
+   supported sync branches.
 
 ---
 

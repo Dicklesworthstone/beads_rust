@@ -22,7 +22,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use tempfile::TempDir;
 use tracing::info;
 
@@ -33,44 +32,14 @@ use tracing::info;
 /// Get the path to the `bd` (Go beads) binary.
 /// Checks `BD_BINARY` environment variable first, falls back to PATH lookup.
 fn get_bd_binary() -> String {
-    std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string())
+    common::bd_binary_name()
 }
 
-/// Check if bd (Go beads binary) is available for conformance tests.
-/// Returns false if `bd` is aliased/symlinked to `br` (detected via version output).
-/// Respects `BD_BINARY` environment variable for custom binary path.
-fn bd_available() -> bool {
-    let bd_bin = get_bd_binary();
-    Command::new(&bd_bin)
-        .arg("version")
-        .output()
-        .is_ok_and(|o| {
-            if !o.status.success() {
-                return false;
-            }
-            // Check that this is actually Go bd, not br aliased as bd.
-            // Go bd outputs "bd version X" or "beads version X".
-            // Rust br outputs "br version X".
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let Some(first_token) = stdout.split_whitespace().next() else {
-                return false;
-            };
-            match first_token.to_ascii_lowercase().as_str() {
-                "bd" | "beads" => true,
-                "br" => false,
-                _ => false,
-            }
-        })
-}
-
-/// Skip test if bd is not available (used in CI where bd isn't installed)
+/// Skip test when `bd` is not a usable classic conformance reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!(
-                "Skipping test: 'bd' binary missing or aliased to br. \
-                 Set BD_BINARY to a Go bd path for conformance runs."
-            );
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping conformance test: {reason}");
             return;
         }
     };

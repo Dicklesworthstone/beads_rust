@@ -144,6 +144,7 @@ impl<'a> IssuePanel<'a> {
             self.theme.timestamp.clone(),
         );
 
+        self.append_rollup(&mut content);
         self.append_relationships(&mut content);
 
         // Comments
@@ -169,6 +170,31 @@ impl<'a> IssuePanel<'a> {
             .border_style(self.theme.panel_border.clone());
 
         ctx.render(&panel);
+    }
+
+    /// Render the derived parent-child subtree rollup (GitHub #384 phase 3).
+    /// The issue's own status badge stays authoritative; this line reports
+    /// what the subtree beneath it is doing.
+    fn append_rollup(&self, content: &mut Text) {
+        let Some(rollup) = self.details.and_then(|details| details.rollup.as_ref()) else {
+            return;
+        };
+        let breakdown = rollup
+            .descendants
+            .iter()
+            .map(|(status, count)| format!("{count} {}", sanitize_terminal_inline(status)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rollup_status = rollup
+            .status
+            .parse::<crate::model::Status>()
+            .unwrap_or_default();
+        content.append_styled("Rollup:   ", self.theme.dimmed.clone());
+        content.append_styled(
+            sanitize_terminal_inline(&rollup.status).as_ref(),
+            self.theme.status_style(&rollup_status),
+        );
+        content.append_styled(&format!(" ({breakdown})\n"), self.theme.dimmed.clone());
     }
 
     fn append_relationships(&self, content: &mut Text) {

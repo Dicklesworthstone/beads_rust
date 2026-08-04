@@ -2,21 +2,19 @@
 
 - **FM**: `fm-concurrency_primitives-orphaned-write-lock` (P1)
 - **Subsystem**: concurrency_primitives
-- **Detect**: a regular `.beads/.write.lock` with an arbitrarily old mtime
-  remains `ok` with `details.reason == "persistent_advisory_inode"`.
-  The file is a stable lock target; ownership lives in the OS advisory lock,
-  not in inode age.
-- **Repair contract**: doctor never moves, removes, or rewrites the lock inode.
-  Moving it while a process owns the old inode would split writers across two
-  independent lock domains. The fixture records the device and inode after
-  planting the lock and verifies the same identity after detect, repair, and
-  undo.
-- **Round-trip**: N/A — no chokepointed mutation.
-- **Expected exit codes**:
-    - detect: 0
-    - repair: 0
-    - undo: 0 or 2 when no repair run exists
-
-Live ownership is covered separately by the held-flock CLI test: flat doctor
-must return the typed `concurrency_lost` startup envelope without inspecting or
-mutating the workspace.
+- **Detect**: since GitHub #395 the `write_lock` check probes instead of
+  trusting mtime. `.beads/.write.lock` is a persistent lock *target*:
+  flock acquisition never updates mtime, and the kernel releases an
+  advisory flock when the owning fd closes (kill -9/OOM included), so a
+  leftover file wedges nothing. A stale-mtime file is only a probe
+  candidate: a non-blocking `try_lock` that acquires → `ok`
+  (`probe_acquired_free`); would-block → `ok` (live holder, normal on a
+  busy workspace); only an unprobeable file warns (`stale_mtime`), and
+  the guidance is to investigate holders — never to move the file aside,
+  because renaming it while a holder keeps the old inode locked lets the
+  next writer lock a NEW inode, splitting mutual exclusion.
+- **Repair contract**: SAFETY — detect-only. The doctor NEVER removes or
+  renames `.write.lock` automatically.
+- **This fixture**: plants an ancient-mtime FREE lock file and asserts
+  the probe classifies it `ok`/`probe_acquired_free` with no move-aside
+  advice, and that `--repair` leaves the file untouched.

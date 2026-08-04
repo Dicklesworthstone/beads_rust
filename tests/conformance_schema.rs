@@ -112,25 +112,22 @@ impl SchemaWorkspace {
     }
 }
 
-/// Check if both br and bd are available for schema comparison tests
-fn binaries_available() -> bool {
-    // Check br binary exists
-    let br_exists = assert_cmd::cargo::cargo_bin!("br").exists();
-
-    // Check bd is available
-    let bd_available = Command::new("bd")
-        .arg("version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-
-    br_exists && bd_available
+/// Why schema comparison cannot run, if it cannot.
+///
+/// Schema conformance additionally needs the cargo-built `br`, because it opens
+/// the database `br init` produced.
+fn schema_comparison_skip_reason() -> Option<String> {
+    if !assert_cmd::cargo::cargo_bin!("br").exists() {
+        return Some("cargo-built 'br' binary not found; run `cargo build` first.".to_string());
+    }
+    common::bd_skip_reason()
 }
 
-/// Skip test if br release binary or bd is not available (used in CI)
+/// Skip test if br release binary or a classic bd is not available.
 macro_rules! skip_if_no_binaries {
     () => {
-        if !binaries_available() {
-            eprintln!("Skipping test: 'br' release binary or 'bd' not found (expected in CI)");
+        if let Some(reason) = schema_comparison_skip_reason() {
+            eprintln!("Skipping schema conformance test: {reason}");
             return;
         }
     };

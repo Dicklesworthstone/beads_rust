@@ -75,8 +75,12 @@ where
     cmd.args(args);
     clear_inherited_br_env_std(&mut cmd);
     cmd.env("NO_COLOR", "1");
+    cmd.env("RUST_LOG", "error");
     cmd.env("RUST_BACKTRACE", "1");
     cmd.env("HOME", root);
+    // Hermetic $PATH: dual `br` installs otherwise trip the br_path_dupes
+    // doctor warning inside spawned doctor runs (beads_rust-ozdh class).
+    cmd.env("PATH", common::cli::deduplicated_br_path());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.spawn().expect("spawn br child")
@@ -163,6 +167,9 @@ where
     cmd.current_dir(root);
     cmd.args(args);
     clear_inherited_br_env(&mut cmd);
+    // Hermetic defaults; explicit env_vars below may override RUST_LOG.
+    cmd.env("RUST_LOG", "error");
+    cmd.env("PATH", common::cli::deduplicated_br_path());
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_BACKTRACE", "1");

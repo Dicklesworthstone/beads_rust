@@ -16,6 +16,7 @@ use toon_rust::options::{DecodeOptions, ExpandPathsMode};
 // top-level generated_at value; schema names, key order, field definitions,
 // descriptions, and TOON structure are intentionally frozen for review.
 const EXPECTED_SCHEMA_NAMES: &[&str] = &[
+    "AdditiveReconcileReceipt",
     "BlockedIssue",
     "CoordinationClaimRow",
     "CoordinationStatusOutput",
@@ -27,7 +28,9 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "ReadyIssue",
     "StaleIssue",
     "Statistics",
+    "SyncReconcileReceipt",
     "TreeNode",
+    "VcsExportStatus",
 ];
 
 static JSON_GENERATED_AT_RE: LazyLock<Regex> =

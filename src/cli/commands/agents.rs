@@ -1664,8 +1664,6 @@ mod tests {
     use super::*;
     use crate::output::OutputContext;
 
-    use tempfile::TempDir;
-
     fn assert_unexpected_error(other: &BeadsError) {
         let message = format!("{other:?}");
         assert!(message.is_empty(), "unexpected error: {message}");
@@ -1735,7 +1733,7 @@ mod tests {
 
     #[test]
     fn test_detect_agent_file() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
 
         // No file exists
         let detection = detect_agent_file(temp_dir.path());
@@ -1753,7 +1751,7 @@ mod tests {
 
     #[test]
     fn test_detect_agent_file_with_blurb() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let content = format!("# Agents\n\n{AGENT_BLURB}\n");
         let agents_path = temp_dir.path().join("AGENTS.md");
         fs::write(&agents_path, content).unwrap();
@@ -1768,7 +1766,7 @@ mod tests {
 
     #[test]
     fn test_check_agent_file_reads_unreadable_path_once() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let agents_path = temp_dir.path().join("AGENTS.md");
         fs::write(&agents_path, "# Agents\n").unwrap();
 
@@ -1963,7 +1961,7 @@ mod tests {
 
     #[test]
     fn test_detect_in_parents() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let sub_dir = temp_dir.path().join("subdir");
         fs::create_dir(&sub_dir).unwrap();
 
@@ -1979,7 +1977,7 @@ mod tests {
 
     #[test]
     fn test_detect_in_deep_project_parents() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let deep_dir = temp_dir
             .path()
             .join("a")
@@ -2000,7 +1998,9 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_force_creates_file() {
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
+        let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
 
         execute_from(
@@ -2023,7 +2023,9 @@ mod tests {
 
     #[test]
     fn test_execute_remove_strips_legacy_and_current_blurbs() {
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
+        let _guard = DirGuard::new(temp_dir.path());
         let legacy_blurb =
             "<!-- bv-agent-instructions-v1 -->\nold\n<!-- end-bv-agent-instructions -->";
         let agents_path = temp_dir.path().join("AGENTS.md");
@@ -2055,7 +2057,7 @@ mod tests {
     fn test_detect_agent_file_refuses_symlink() {
         use std::os::unix::fs::symlink;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let outside_target = temp_dir.path().join("outside-agents.md");
         fs::write(&outside_target, "# Outside\n").unwrap();
         let agents_path = temp_dir.path().join("AGENTS.md");
@@ -2080,7 +2082,7 @@ mod tests {
     fn test_write_agent_file_atomically_rejects_symlink_target() {
         use std::os::unix::fs::symlink;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let outside_target = temp_dir.path().join("outside-agents.md");
         fs::write(&outside_target, "# Outside\n").unwrap();
         let agents_path = temp_dir.path().join("AGENTS.md");
@@ -2112,7 +2114,7 @@ mod tests {
     fn test_backup_agent_file_refuses_symlinked_backup_path() {
         use std::os::unix::fs::symlink;
 
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let agents_path = temp_dir.path().join("AGENTS.md");
         fs::write(&agents_path, "# Agents\n").unwrap();
         let outside_backup_target = temp_dir.path().join("outside-backup.md");
@@ -2146,7 +2148,8 @@ mod tests {
     fn test_execute_json_add_refuses_dangling_agents_symlink() {
         use std::os::unix::fs::symlink;
 
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         let outside_target = temp_dir.path().join("outside-agents.md");
         let agents_path = temp_dir.path().join("AGENTS.md");
         symlink(&outside_target, &agents_path).unwrap();
@@ -2182,7 +2185,9 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_requires_force() {
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
+        let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
 
         let err = execute_from(
@@ -2206,7 +2211,9 @@ mod tests {
 
     #[test]
     fn test_execute_json_add_dry_run_does_not_require_force() {
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
+        let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
 
         execute_from(
@@ -2228,7 +2235,9 @@ mod tests {
 
     #[test]
     fn test_execute_json_remove_dry_run_without_file_errors() {
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
+        let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
 
         let err = execute_from(
@@ -2253,7 +2262,9 @@ mod tests {
 
     #[test]
     fn test_execute_json_update_dry_run_without_file_errors() {
-        let temp_dir = isolated_agent_project();
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK.lock().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
+        let _guard = DirGuard::new(temp_dir.path());
         let ctx = OutputContext::from_flags(true, false, true);
 
         let err = execute_from(
@@ -2278,7 +2289,7 @@ mod tests {
 
     #[test]
     fn test_search_scope_description_for_project_subdir() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         fs::create_dir(temp_dir.path().join(".git")).unwrap();
         let sub_dir = temp_dir.path().join("nested").join("deeper");
         fs::create_dir_all(&sub_dir).unwrap();
@@ -2292,7 +2303,7 @@ mod tests {
 
     #[test]
     fn test_agent_file_not_found_reason_for_project_subdir() {
-        let temp_dir = TempDir::new().unwrap();
+        let temp_dir = crate::util::test_helpers::isolated_temp_dir();
         fs::create_dir(temp_dir.path().join(".git")).unwrap();
         let sub_dir = temp_dir.path().join("nested");
         fs::create_dir(&sub_dir).unwrap();

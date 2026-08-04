@@ -28,6 +28,8 @@
 //! `.gitignore` isolates the WP3-rewired chokepoint flow without
 //! dragging the as-yet-unmigrated repair paths into the assertion.
 
+mod common;
+
 use assert_cmd::Command;
 use beads_rust::cli::commands::doctor_subsystems::mutate::{
     Capabilities, DbArg, MutateContext, Op, mutate,
@@ -53,6 +55,10 @@ fn br_cmd(cwd: &Path) -> Command {
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_LOG", "warn");
     cmd.env("HOME", cwd);
+    // Hermetic $PATH: a developer host with two `br` installs (install
+    // script + cargo install) otherwise trips the `br_path_dupes` doctor
+    // warning inside every spawned doctor run (beads_rust-ozdh).
+    cmd.env("PATH", common::cli::deduplicated_br_path());
     // Strip any inherited beads / bd env that might redirect storage.
     for (key, _) in std::env::vars_os() {
         let key_s = key.to_string_lossy();
@@ -189,6 +195,18 @@ fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
     ))
     .unwrap();
     let _ = conn.close();
+}
+
+fn db_user_version(db_path: &Path) -> i64 {
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).expect("open database");
+    let version = conn
+        .query_row("PRAGMA user_version")
+        .expect("read user_version")
+        .get(0)
+        .and_then(fsqlite_types::SqliteValue::as_integer)
+        .expect("integer user_version");
+    let _ = conn.close();
+    version
 }
 
 fn db_exec_context(root: &Path, run_id: &str) -> (PathBuf, MutateContext) {
@@ -955,6 +973,7 @@ fn chokepoint_db_exec_undo_replay() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .output()
         .expect("invoke br doctor undo");
     assert!(
@@ -1030,6 +1049,7 @@ fn chokepoint_repair_acquires_workspace_lock() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1076,6 +1096,7 @@ fn chokepoint_repair_acquires_workspace_lock() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1135,6 +1156,7 @@ fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1234,6 +1256,7 @@ fn chokepoint_refuse_gate_blocks_downgrade() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1333,6 +1356,7 @@ fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1392,6 +1416,7 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
         .current_dir(&root)
         .env("RUST_LOG", "error")
         .env("BR_NO_AUTOFLUSH", "1")
+        .env("PATH", common::cli::deduplicated_br_path())
         .env_remove("BD_DB")
         .env_remove("BEADS_DB")
         .output()
@@ -1464,13 +1489,16 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
     // Overwrite a non-header page so `PRAGMA integrity_check` reports
     // page-level corruption (the trigger for `repair_via_vacuum`).
     {
-        use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new()
+        use std::io::{Seek, SeekFrom, Write};
+
+        let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open(&db_path)
             .expect("open db rw");
         let junk = vec![0xffu8; 200];
-        f.write_at(&junk, 4096).expect("corrupt page-2");
+        f.seek(SeekFrom::Start(4096))
+            .expect("seek to page-2 corruption offset");
+        f.write_all(&junk).expect("corrupt page-2");
     }
 
     // Capture the pre-VACUUM SHA-256 so we can compare to the backup.
@@ -1596,291 +1624,349 @@ fn legacy_op_audit_for_vacuum_via_page_corruption() {
 }
 
 // ---------------------------------------------------------------------------
-// Dependency graph truthfulness: fulfilled prerequisites remain provenance,
-// explicit blocked status is diagnosed separately, and absent targets fail
-// closed without being mislabeled as fulfilled.
+// GitHub #394 — dirty unflushed issues must survive recovery rebuilds.
+//
+// Reproduction shape from the report: one issue flushed to JSONL, a second
+// created with `--no-auto-flush` (dirty, DB-only), then the main DB gets
+// page-level corruption. Both implicit rebuild families — `doctor --repair`'s
+// JSONL rebuild and the startup auto-recovery probe — replay only the JSONL,
+// so before the fix the DB-only issue vanished silently while the repair
+// reported `repaired:true, verified:true`.
 // ---------------------------------------------------------------------------
+
+/// Seed the #394 workspace: `flushed fine` in DB+JSONL, `db-only issue`
+/// dirty in the DB only, then corrupt page 2 of the checkpointed DB.
+/// Returns the dirty issue's id.
+fn seed_dirty_issue_and_corrupt_db(root: &Path) -> String {
+    br_init(root);
+
+    let flushed = br_cmd(root)
+        .args(["create", "--title", "flushed fine", "--priority", "2"])
+        .output()
+        .expect("br create spawned");
+    assert!(flushed.status.success(), "br create (flushed) failed");
+    let flush = br_cmd(root)
+        .args(["sync", "--flush-only"])
+        .output()
+        .expect("br sync spawned");
+    assert!(flush.status.success(), "br sync --flush-only failed");
+
+    let dirty = br_cmd(root)
+        .args([
+            "create",
+            "--title",
+            "db-only issue",
+            "--priority",
+            "2",
+            "--no-auto-flush",
+        ])
+        .output()
+        .expect("br create spawned");
+    assert!(dirty.status.success(), "br create (dirty) failed");
+
+    let list = br_cmd(root)
+        .args(["list", "--json"])
+        .output()
+        .expect("br list spawned");
+    assert!(list.status.success(), "br list --json failed");
+    let listed = parse_trailing_json(&String::from_utf8_lossy(&list.stdout));
+    let dirty_id = listed["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .find(|issue| issue["title"] == "db-only issue")
+        .and_then(|issue| issue["id"].as_str())
+        .expect("dirty issue id")
+        .to_string();
+
+    // Drop any WAL/SHM sidecars so the page corruption lands in the
+    // authoritative main DB file rather than being masked by an
+    // uncheckpointed overlay. (This does not checkpoint anything — br
+    // checkpoints on clean close, so the rows are already in the main
+    // file; removal just discards the empty sidecars.) Same pattern as
+    // the vacuum test above.
+    let db_path = root.join(".beads").join("beads.db");
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-wal"));
+    let _ = fs::remove_file(root.join(".beads").join("beads.db-shm"));
+    {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("open db rw");
+        let junk = vec![0xffu8; 200];
+        f.write_at(&junk, 4096).expect("corrupt page-2");
+    }
+
+    dirty_id
+}
+
 #[test]
-fn dependency_doctor_matches_real_cli_readiness_and_preserves_edges() {
+fn repair_rebuild_preserves_dirty_unflushed_issue() {
     let tmp = TempDir::new().expect("tempdir");
     let root = tmp.path().to_path_buf();
-    br_init(&root);
+    let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
 
-    let create_issue = |title: &str| {
-        let output = br_cmd(&root)
-            .args(["create", title, "--json"])
-            .output()
-            .expect("br create spawned");
-        assert!(
-            output.status.success(),
-            "br create failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        parse_trailing_json(&String::from_utf8_lossy(&output.stdout))["id"]
-            .as_str()
-            .expect("created issue id")
-            .to_string()
-    };
-    let flush = || {
-        let output = br_cmd(&root)
-            .args(["sync", "--flush-only", "--json"])
-            .output()
-            .expect("br sync --flush-only spawned");
-        assert!(
-            output.status.success(),
-            "br sync --flush-only failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-
-    let dependent_id = create_issue("doctor fulfilled prerequisite dependent");
-    let blocker_id = create_issue("doctor fulfilled prerequisite blocker");
-
-    let add = br_cmd(&root)
-        .args(["dep", "add", &dependent_id, &blocker_id, "--json"])
+    let out = br_cmd(&root)
+        .args(["doctor", "--repair", "--json"])
         .output()
-        .expect("br dep add spawned");
+        .expect("br doctor --repair spawned");
     assert!(
-        add.status.success(),
-        "br dep add failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&add.stdout),
-        String::from_utf8_lossy(&add.stderr)
+        out.status.success(),
+        "br doctor --repair must verify after preserving the dirty issue: \
+         stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let repair = parse_trailing_json(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(repair["repaired"], true, "repair payload: {repair}");
+    assert_eq!(repair["verified"], true, "repair payload: {repair}");
+    assert_eq!(
+        repair["preserved_dirty_issues"], 1,
+        "repair payload: {repair}"
+    );
+    assert!(
+        repair["preserved_dirty_issue_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == dirty_id.as_str())),
+        "repair payload must name the preserved issue id {dirty_id}: {repair}"
     );
 
-    let close = br_cmd(&root)
+    // The preserved issue is alive in the rebuilt store...
+    let show = br_cmd(&root)
+        .args(["show", &dirty_id, "--json"])
+        .output()
+        .expect("br show spawned");
+    assert!(
+        show.status.success(),
+        "preserved issue {dirty_id} vanished across --repair: stderr={}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+
+    // ...still marked dirty, and the next flush exports it to the JSONL.
+    let status = br_cmd(&root)
+        .args(["sync", "--status", "--json"])
+        .output()
+        .expect("br sync --status spawned");
+    let status_json = parse_trailing_json(&String::from_utf8_lossy(&status.stdout));
+    assert_eq!(
+        status_json["dirty_count"], 1,
+        "preserved issue must be re-marked dirty: {status_json}"
+    );
+    let flush = br_cmd(&root)
+        .args(["sync", "--flush-only"])
+        .output()
+        .expect("br sync spawned");
+    assert!(flush.status.success(), "post-repair flush failed");
+    let jsonl =
+        fs::read_to_string(root.join(".beads").join("issues.jsonl")).expect("read issues.jsonl");
+    assert!(
+        jsonl.contains("db-only issue"),
+        "flush after repair must export the preserved issue; jsonl:\n{jsonl}"
+    );
+}
+
+#[test]
+fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
+    // Same corruption, but recovered by the startup probe's automatic
+    // rebuild (config-layer `rebuild_with_tombstone_preservation`) when a
+    // plain read command opens the workspace — no doctor involved.
+    let tmp = TempDir::new().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
+
+    let list = br_cmd(&root)
+        .args(["list", "--json"])
+        .output()
+        .expect("br list spawned");
+    assert!(
+        list.status.success(),
+        "br list must auto-recover: stderr={}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed = parse_trailing_json(&String::from_utf8_lossy(&list.stdout));
+    let titles: Vec<&str> = listed["issues"]
+        .as_array()
+        .expect("issues array")
+        .iter()
+        .filter_map(|issue| issue["title"].as_str())
+        .collect();
+    assert!(
+        titles.contains(&"db-only issue"),
+        "dirty issue {dirty_id} lost across startup auto-recovery; titles: {titles:?}"
+    );
+    assert!(titles.contains(&"flushed fine"), "titles: {titles:?}");
+
+    let status = br_cmd(&root)
+        .args(["sync", "--status", "--json"])
+        .output()
+        .expect("br sync --status spawned");
+    let status_json = parse_trailing_json(&String::from_utf8_lossy(&status.stdout));
+    assert_eq!(
+        status_json["dirty_count"], 1,
+        "preserved issue must stay dirty for the next flush: {status_json}"
+    );
+}
+
+#[test]
+fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().to_path_buf();
+    br_init(&root);
+    let db_path = root.join(".beads/beads.db");
+
+    {
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open initialized db");
+        conn.execute(
+            "INSERT INTO issues (
+                id, title, status, priority, issue_type, created_at, updated_at
+             ) VALUES (
+                'bd-e2e-schema', 'Schema migration e2e', 'open', 2, 'task',
+                '2026-07-27T12:00:00Z', '2026-07-27T12:00:00Z'
+             )",
+        )
+        .expect("seed issue");
+        conn.execute("DROP TABLE gate_result_history")
+            .expect("restore v14 table shape");
+        conn.execute("PRAGMA user_version = 14").expect("stamp v14");
+        conn.close().expect("close v14 fixture");
+    }
+
+    let refused = br_cmd(&root)
+        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
+        .output()
+        .expect("ordinary command spawned");
+    assert!(
+        !refused.status.success(),
+        "ordinary storage open must refuse an implicit schema migration"
+    );
+    assert_eq!(db_user_version(&db_path), 14);
+    let refusal_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        refusal_text.contains("br doctor migrate-schema plan"),
+        "refusal must route the operator to the reviewed workflow: {refusal_text}"
+    );
+
+    let plan = br_cmd(&root)
+        .args(["doctor", "migrate-schema", "plan", "--json"])
+        .output()
+        .expect("migration plan spawned");
+    assert!(
+        plan.status.success(),
+        "migration plan failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&plan.stdout),
+        String::from_utf8_lossy(&plan.stderr)
+    );
+    let plan_json = parse_trailing_json(&String::from_utf8_lossy(&plan.stdout));
+    assert_eq!(
+        plan_json["schema_version"],
+        "br.doctor.schema_migration.plan.v1"
+    );
+    assert_eq!(plan_json["eligible"], true);
+    assert_eq!(plan_json["from_version"], 14);
+    assert_eq!(plan_json["to_version"], 15);
+    let token = plan_json["plan_token"]
+        .as_str()
+        .expect("plan token")
+        .to_string();
+    assert_eq!(
+        db_user_version(&db_path),
+        14,
+        "planning must not migrate the live database"
+    );
+
+    let apply = br_cmd(&root)
         .args([
-            "close",
-            &blocker_id,
-            "--reason",
-            "fulfilled for doctor regression",
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            &token,
             "--json",
         ])
         .output()
-        .expect("br close spawned");
+        .expect("migration apply spawned");
     assert!(
-        close.status.success(),
-        "br close failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&close.stdout),
-        String::from_utf8_lossy(&close.stderr)
+        apply.status.success(),
+        "migration apply failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&apply.stdout),
+        String::from_utf8_lossy(&apply.stderr)
     );
-    flush();
-
-    let doctor = br_cmd(&root)
-        .args(["doctor", "--json"])
-        .output()
-        .expect("br doctor spawned");
-    assert!(
-        matches!(doctor.status.code(), Some(0 | 1)),
-        "doctor hard-failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&doctor.stdout),
-        String::from_utf8_lossy(&doctor.stderr)
-    );
-    let doctor_json = parse_trailing_json(&String::from_utf8_lossy(&doctor.stdout));
+    let apply_json = parse_trailing_json(&String::from_utf8_lossy(&apply.stdout));
     assert_eq!(
-        doctor_check(&doctor_json, "dep.dead_closed_blocking_edges")["status"],
-        "ok",
-        "closed prerequisites are fulfilled provenance, not dead edges"
+        apply_json["schema_version"],
+        "br.doctor.schema_migration.applied.v1"
     );
-    assert_eq!(
-        doctor_check(&doctor_json, "dep.fully_unblocked_open")["status"],
-        "ok",
-        "ordinary open ready work must not be diagnosed as stale status"
-    );
+    let run_id = apply_json["run_id"]
+        .as_str()
+        .expect("migration run id")
+        .to_string();
+    assert_eq!(db_user_version(&db_path), 15);
+    let run_dir = root
+        .join(".beads/.br_recovery/schema-migrations")
+        .join(&run_id);
+    assert!(run_dir.join("prepared.json").is_file());
+    assert!(run_dir.join("applied.json").is_file());
+    assert!(run_dir.join("before/beads.db").is_file());
 
-    let ready = br_cmd(&root)
-        .args(["ready", "--json"])
+    let list_after = br_cmd(&root)
+        .args(["--no-auto-import", "--allow-stale", "list", "--json"])
         .output()
-        .expect("br ready spawned");
+        .expect("post-migration list spawned");
     assert!(
-        ready.status.success(),
-        "br ready failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&ready.stdout),
-        String::from_utf8_lossy(&ready.stderr)
-    );
-    let ready_json: Vec<Value> =
-        serde_json::from_slice(&ready.stdout).expect("ready JSON must parse");
-    assert!(
-        ready_json
-            .iter()
-            .any(|issue| issue["id"].as_str() == Some(dependent_id.as_str())),
-        "dependent with a fulfilled prerequisite must be ready: {ready_json:?}"
+        list_after.status.success(),
+        "current canonical schema should open normally: stdout={} stderr={}",
+        String::from_utf8_lossy(&list_after.stdout),
+        String::from_utf8_lossy(&list_after.stderr)
     );
 
-    let jsonl_path = root.join(".beads/issues.jsonl");
-    let jsonl = fs::read_to_string(&jsonl_path).expect("read issues JSONL");
-    let dependent = jsonl
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find(|issue| issue["id"].as_str() == Some(dependent_id.as_str()))
-        .expect("dependent JSONL record");
-    assert!(
-        dependent["dependencies"].as_array().is_some_and(|deps| {
-            deps.iter().any(|dep| {
-                dep["depends_on_id"].as_str() == Some(blocker_id.as_str())
-                    && dep["type"].as_str() == Some("blocks")
-            })
-        }),
-        "doctor must preserve the fulfilled dependency edge: {dependent}"
-    );
-    let dep_list = br_cmd(&root)
-        .args(["dep", "list", &dependent_id, "--json"])
+    let undo_plan = br_cmd(&root)
+        .args([
+            "doctor",
+            "migrate-schema",
+            "undo",
+            &run_id,
+            "--dry-run",
+            "--json",
+        ])
         .output()
-        .expect("br dep list spawned");
+        .expect("migration undo dry-run spawned");
     assert!(
-        dep_list.status.success(),
-        "br dep list failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&dep_list.stdout),
-        String::from_utf8_lossy(&dep_list.stderr)
+        undo_plan.status.success(),
+        "undo dry-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&undo_plan.stdout),
+        String::from_utf8_lossy(&undo_plan.stderr)
     );
-    let listed: Vec<Value> =
-        serde_json::from_slice(&dep_list.stdout).expect("dependency list JSON");
-    assert!(
-        listed.iter().any(|dependency| {
-            dependency["issue_id"].as_str() == Some(dependent_id.as_str())
-                && dependency["depends_on_id"].as_str() == Some(blocker_id.as_str())
-                && dependency["type"].as_str() == Some("blocks")
-        }),
-        "the real DB-backed dependency surface must preserve the fulfilled edge: {listed:?}"
-    );
+    assert_eq!(db_user_version(&db_path), 15);
 
-    let mark_blocked = br_cmd(&root)
-        .args(["update", &dependent_id, "--status", "blocked", "--json"])
+    let undo = br_cmd(&root)
+        .args(["doctor", "migrate-schema", "undo", &run_id, "--json"])
         .output()
-        .expect("br update blocked spawned");
+        .expect("migration undo spawned");
     assert!(
-        mark_blocked.status.success(),
-        "mark blocked failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&mark_blocked.stdout),
-        String::from_utf8_lossy(&mark_blocked.stderr)
+        undo.status.success(),
+        "migration undo failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&undo.stdout),
+        String::from_utf8_lossy(&undo.stderr)
     );
-    flush();
-    let blocked_doctor = br_cmd(&root)
-        .args(["doctor", "--json"])
-        .output()
-        .expect("blocked doctor spawned");
+    let undo_json = parse_trailing_json(&String::from_utf8_lossy(&undo.stdout));
     assert_eq!(
-        blocked_doctor.status.code(),
-        Some(1),
-        "the stale explicit status finding must produce FindingsPresent: stdout={} stderr={}",
-        String::from_utf8_lossy(&blocked_doctor.stdout),
-        String::from_utf8_lossy(&blocked_doctor.stderr)
+        undo_json["schema_version"],
+        "br.doctor.schema_migration.undo.v1"
     );
-    let blocked_json = parse_trailing_json(&String::from_utf8_lossy(&blocked_doctor.stdout));
-    let stale_status = doctor_check(&blocked_json, "dep.fully_unblocked_open");
-    assert_eq!(stale_status["status"], "warn", "{stale_status}");
-    assert!(
-        stale_status["details"]["issues"]
-            .as_array()
-            .is_some_and(|ids| {
-                ids.iter()
-                    .any(|id| id.as_str() == Some(dependent_id.as_str()))
-            }),
-        "explicitly blocked issue with only fulfilled blockers must be identified: {stale_status}"
-    );
-
-    let reopen = br_cmd(&root)
-        .args(["update", &dependent_id, "--status", "open", "--json"])
-        .output()
-        .expect("br update open spawned");
-    assert!(
-        reopen.status.success(),
-        "restore open status failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&reopen.stdout),
-        String::from_utf8_lossy(&reopen.stderr)
-    );
-    flush();
-
-    let original_jsonl = fs::read(&jsonl_path).expect("snapshot clean JSONL bytes");
-    let anchor_path = root.join(".beads/beads.base.jsonl");
-    let original_anchor = fs::read(&anchor_path).expect("snapshot clean merge anchor bytes");
-    let body = String::from_utf8(original_jsonl.clone()).expect("JSONL must be UTF-8");
-    let mut rewritten = String::new();
-    let mut injected = false;
-    for line in body.lines() {
-        let mut issue: Value = serde_json::from_str(line).expect("parse JSONL issue");
-        if issue["id"].as_str() == Some(dependent_id.as_str()) {
-            let dependencies = issue["dependencies"]
-                .as_array_mut()
-                .expect("dependent dependencies array");
-            let mut missing = dependencies
-                .first()
-                .expect("fulfilled dependency template")
-                .clone();
-            missing["depends_on_id"] = Value::String("bd-doctor-missing-target".to_string());
-            dependencies.push(missing);
-            injected = true;
-        }
-        rewritten.push_str(&serde_json::to_string(&issue).expect("serialize JSONL issue"));
-        rewritten.push('\n');
-    }
-    assert!(
-        injected,
-        "dependent record was not found for missing-target probe"
-    );
-    fs::write(&jsonl_path, rewritten).expect("write isolated missing-target JSONL");
-
-    let missing_doctor = br_cmd(&root)
-        .args(["--no-auto-import", "--no-auto-flush", "doctor", "--json"])
-        .output()
-        .expect("missing-target doctor spawned");
-    fs::write(&jsonl_path, &original_jsonl).expect("restore clean JSONL bytes");
-    fs::write(&anchor_path, &original_anchor).expect("restore clean merge anchor bytes");
-    flush();
+    assert_eq!(undo_json["dry_run"], false);
+    assert_eq!(db_user_version(&db_path), 14);
+    assert!(run_dir.join("undone.json").is_file());
+    let quarantine_entries = fs::read_dir(run_dir.join("undo-quarantine"))
+        .expect("read undo quarantine")
+        .count();
     assert_eq!(
-        fs::read(&jsonl_path).expect("read re-flushed JSONL"),
-        original_jsonl,
-        "supported flush after restoration must preserve canonical JSONL bytes"
-    );
-    assert_eq!(
-        missing_doctor.status.code(),
-        Some(1),
-        "the missing-target finding must produce FindingsPresent: stdout={} stderr={}",
-        String::from_utf8_lossy(&missing_doctor.stdout),
-        String::from_utf8_lossy(&missing_doctor.stderr)
-    );
-
-    let missing_json = parse_trailing_json(&String::from_utf8_lossy(&missing_doctor.stdout));
-    let missing = doctor_check(&missing_json, "dep.dead_closed_blocking_edges");
-    assert_eq!(missing["status"], "warn", "{missing}");
-    assert!(
-        missing["details"]["issues"]
-            .as_array()
-            .is_some_and(|issues| issues.iter().any(|issue| {
-                issue["id"].as_str() == Some(dependent_id.as_str())
-                    && issue["missing_blockers"].as_array().is_some_and(|ids| {
-                        ids.iter()
-                            .any(|id| id.as_str() == Some("bd-doctor-missing-target"))
-                    })
-            })),
-        "missing target must be reported without erasing the edge: {missing}"
-    );
-    assert_eq!(
-        doctor_check(&missing_json, "dep.fully_unblocked_open")["status"],
-        "ok",
-        "a missing target must fail closed, never be promoted to fulfilled"
-    );
-
-    let restored_doctor = br_cmd(&root)
-        .args(["--no-auto-import", "--no-auto-flush", "doctor", "--json"])
-        .output()
-        .expect("restored doctor spawned");
-    assert!(
-        matches!(restored_doctor.status.code(), Some(0 | 1)),
-        "restored doctor hard-failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&restored_doctor.stdout),
-        String::from_utf8_lossy(&restored_doctor.stderr)
-    );
-    let restored_json = parse_trailing_json(&String::from_utf8_lossy(&restored_doctor.stdout));
-    assert_eq!(
-        doctor_check(&restored_json, "dep.dead_closed_blocking_edges")["status"],
-        "ok",
-        "restoring the source bytes must clear the isolated missing-target finding"
-    );
-    assert_eq!(
-        doctor_check(&restored_json, "dep.fully_unblocked_open")["status"],
-        "ok",
-        "restoring the source bytes must leave the dependent ready"
+        quarantine_entries, 1,
+        "undo must retain exactly one displaced applied-state directory"
     );
 }

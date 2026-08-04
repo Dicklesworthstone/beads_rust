@@ -8,6 +8,7 @@ expression: width_80
 │ Alpha layout regression with a medium length title                           │
 │                                                                              │
 │ A deterministic issue used to freeze Rich-mode show panel wrapping and field │
+│ alignment.                                                                   │
 │                                                                              │
 │ ───────────────────────────────────                                          │
 │ Labels:   regression, ui                                                     │
@@ -19,6 +20,7 @@ expression: width_80
 │   ← rich-ID  [open] Beta table row exercises dependency columns (blocks)     │
 │                                                                              │
 │ Comments:                                                                    │
-│   TIMESTAMP            ubuntu: A stable comment keeps the show panel exercis │
+│   TIMESTAMP            ubuntu: A stable comment keeps the show panel         │
+│ exercising comment rendering.                                                │
 │                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯

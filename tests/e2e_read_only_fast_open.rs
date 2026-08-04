@@ -298,17 +298,22 @@ fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
 }
 
 fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_open: bool) -> BrRun {
-    let args = command.args.iter().map(String::as_str);
     if disable_fast_open {
-        run_br_with_env(
+        return run_br_with_env(
             workspace,
-            args,
+            command.args.iter().map(String::as_str),
             [DISABLE_FAST_OPEN_ENV],
             &format!("{}_conservative", command.label),
-        )
-    } else {
-        run_br(workspace, args, &format!("{}_fast", command.label))
+        );
     }
+
+    // The read-only fast path is opt-in: it is only selected when the caller
+    // has also waived auto-import and auto-flush, since both of those write.
+    // Ask for it explicitly rather than relying on the bare command happening
+    // to avoid the workspace write lock.
+    let mut args: Vec<&str> = vec!["--no-auto-import", "--no-auto-flush"];
+    args.extend(command.args.iter().map(String::as_str));
+    run_br(workspace, args, &format!("{}_fast", command.label))
 }
 
 fn assert_outputs_match(command: &MatrixCommand, fast: &BrRun, conservative: &BrRun) {

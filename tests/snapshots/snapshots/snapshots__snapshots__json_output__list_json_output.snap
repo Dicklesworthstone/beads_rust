@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 56
 expression: normalize_json(&json)
 ---
 {
@@ -38,7 +39,7 @@ expression: normalize_json(&json)
     }
   ],
   "total": 2,
-  "limit": 50,
+  "limit": 0,
   "offset": 0,
   "has_more": false
 }

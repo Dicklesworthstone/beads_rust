@@ -99,6 +99,83 @@ pub enum BeadsError {
     #[error("Sync conflict: {message}")]
     SyncConflict { message: String },
 
+    /// A mutation committed, but the process lost authority to witness the
+    /// committed database inode before it could report ordinary success.
+    ///
+    /// Callers must not retry automatically: the mutation body may already be
+    /// durable on the displaced inode.
+    #[error(
+        "{operation} committed, but database authority changed before it could be witnessed; reconcile committed state before retrying: {source}"
+    )]
+    CommittedStateUnwitnessed {
+        operation: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A JSONL exchange completed, but the displaced generation did not match
+    /// the exact source generation the exporting session had retained.
+    ///
+    /// The publisher preserves both names instead of risking a destructive
+    /// rollback across another actor's write. Callers must reconcile the
+    /// primary and recovery paths manually before retrying.
+    #[error(
+        "JSONL publication conflict at '{output_path}': {message}; the displaced generation is preserved at '{recovery_path}'"
+    )]
+    JsonlPublicationConflict {
+        output_path: PathBuf,
+        recovery_path: PathBuf,
+        message: String,
+    },
+
+    /// The new JSONL generation reached its destination name and was verified,
+    /// but the containing directory could not be synced.
+    ///
+    /// The operation is committed from the namespace's point of view but is
+    /// not certified power-loss durable. Automatic retry could overwrite a
+    /// newer generation, so callers must reconcile first.
+    #[error(
+        "JSONL generation {content_sha256} was published at '{output_path}', but its directory durability could not be certified; recovery copy: {recovery_path:?}: {source}"
+    )]
+    JsonlPublishedButNotDurable {
+        output_path: PathBuf,
+        recovery_path: Option<PathBuf>,
+        content_sha256: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The namespace-changing publication syscall completed, but the process
+    /// could not certify the resulting target generation.
+    ///
+    /// A displaced generation, when any, remains at `recovery_path`. Callers
+    /// must inspect both paths and must not automatically retry.
+    #[error(
+        "JSONL publication changed '{output_path}', but the published generation could not be certified; recovery copy: {recovery_path:?}: {source}"
+    )]
+    JsonlPublishedButUnwitnessed {
+        output_path: PathBuf,
+        recovery_path: Option<PathBuf>,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// The command's primary state was already committed and finalized, but a
+    /// requested or required auxiliary artifact could not be published.
+    ///
+    /// Retrying the whole command is unsafe because its primary mutation may
+    /// no longer be idempotent. Callers should repair only the named artifact.
+    #[error(
+        "{operation} committed its primary state at '{primary_path}', but failed to publish auxiliary artifact '{artifact_path}': {source}"
+    )]
+    CommittedArtifactFailure {
+        operation: String,
+        primary_path: PathBuf,
+        artifact_path: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     // === Dependency Errors ===
     /// Adding the dependency would create a cycle.
     #[error("Cycle detected in dependencies: {path}")]
@@ -175,6 +252,21 @@ pub enum BeadsError {
     /// All requested items were skipped (already closed, not found, etc.).
     #[error("Nothing to do: {reason}")]
     NothingToDo { reason: String },
+
+    /// Some requested items were applied and the rest were skipped.
+    ///
+    /// A partially applied batch must never report success. The caller asked
+    /// for N transitions and got fewer, so the exit status has to carry that:
+    /// otherwise a skip is visible only as a warning on stderr, and a caller
+    /// that branches on `$?` — or that follows `docs/agent/ERRORS.md` and
+    /// parses stdout because the exit code was `0` — reads the partial batch
+    /// as a complete success.
+    #[error("Partially applied: {closed} closed, {skipped} skipped — {summary}")]
+    CloseIncomplete {
+        closed: usize,
+        skipped: usize,
+        summary: String,
+    },
 
     // === Policy Errors ===
     /// One or more closure-time policy gates fired.
@@ -277,6 +369,26 @@ impl BeadsError {
         )
     }
 
+    /// Whether the error proves that the command's primary mutation or
+    /// namespace publication may already be committed.
+    ///
+    /// Deferred-recovery callers must never restore an older database family
+    /// in response to one of these errors.
+    #[must_use]
+    pub fn primary_mutation_committed(&self) -> bool {
+        match self {
+            Self::CommittedStateUnwitnessed { .. }
+            | Self::JsonlPublicationConflict { .. }
+            | Self::JsonlPublishedButNotDurable { .. }
+            | Self::JsonlPublishedButUnwitnessed { .. }
+            | Self::CommittedArtifactFailure { .. } => true,
+            Self::WithContext { source, .. } => source
+                .downcast_ref::<Self>()
+                .is_some_and(Self::primary_mutation_committed),
+            _ => false,
+        }
+    }
+
     /// Human-friendly suggestion for fixing this error.
     #[must_use]
     pub const fn suggestion(&self) -> Option<&'static str> {
@@ -286,7 +398,13 @@ impl BeadsError {
             Self::AmbiguousId { .. } => Some("Provide more characters of the ID"),
             Self::HasDependents { .. } => Some("Use --force or --cascade to delete anyway"),
             Self::ImportCollision { .. } => Some("Use --force to overwrite or resolve manually"),
-            Self::DependencyCycle { .. } => Some("Remove one dependency to break the cycle"),
+            Self::DependencyCycle { .. } => Some(
+                "Remove one dependency to break the cycle. Note: epic containment \
+                 participates in blocking cycles — depending on an epic implies \
+                 depending on its entire subtree, so the cycle may traverse \
+                 parent-child edges that the message does not list (see \
+                 docs/CLI_REFERENCE.md, `dep add`)",
+            ),
             Self::SelfDependency { .. } => Some("An issue cannot depend on itself"),
             Self::AlreadyInitialized { .. } => Some("Use --force to reinitialize"),
             Self::InvalidPriority { .. } => {
@@ -303,6 +421,17 @@ impl BeadsError {
             ),
             Self::WorkflowCapacityExceeded { .. } => Some(
                 "Drain the named queue before admitting fresh work; inspect it with `br list --status <status>`.",
+            ),
+            Self::CommittedStateUnwitnessed { .. } => Some(
+                "Do not retry automatically. Reconcile the committed database state and authority first.",
+            ),
+            Self::JsonlPublicationConflict { .. }
+            | Self::JsonlPublishedButNotDurable { .. }
+            | Self::JsonlPublishedButUnwitnessed { .. } => Some(
+                "Do not retry automatically. Inspect the primary and recovery JSONL generations, reconcile them, then run doctor.",
+            ),
+            Self::CommittedArtifactFailure { .. } => Some(
+                "Do not retry the primary command. Repair only the named auxiliary artifact or run doctor.",
             ),
             _ => None,
         }
@@ -457,5 +586,20 @@ mod tests {
     fn test_validation_error_struct() {
         let err = ValidationError::new("priority", "must be 0-4");
         assert_eq!(err.to_string(), "priority: must be 0-4");
+    }
+
+    #[test]
+    fn committed_state_classification_survives_context_wrapping() {
+        let committed = BeadsError::CommittedStateUnwitnessed {
+            operation: "sync merge".to_string(),
+            source: Box::new(std::io::Error::other("postcommit witness failed")),
+        };
+        let wrapped = BeadsError::WithContext {
+            context: "outer command context".to_string(),
+            source: Box::new(committed),
+        };
+
+        assert!(wrapped.primary_mutation_committed());
+        assert!(!BeadsError::Config("precommit refusal".to_string()).primary_mutation_committed());
     }
 }

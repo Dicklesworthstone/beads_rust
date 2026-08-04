@@ -57,7 +57,13 @@ fn is_binary(path: &std::path::Path) -> bool {
 }
 
 fn is_transient_sqlite(name: &str) -> bool {
-    name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal")
+    name.ends_with("-wal")
+        || name.ends_with("-shm")
+        || name.ends_with("-journal")
+        // fsqlite's multi-process namespace sidecars are engine-managed and
+        // recreated on demand, so they are transient in the same sense.
+        || name.ends_with("-fsqlite-ns-gate")
+        || name.ends_with("-fsqlite-ns-use")
 }
 
 fn build_directory_listing(beads_dir: &std::path::Path) -> String {
@@ -103,7 +109,16 @@ fn build_text_contents(beads_dir: &std::path::Path) -> String {
         .sort_by_file_name()
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file() && !is_binary(e.path()))
+        // Engine-managed sidecars are excluded here for the same reason the
+        // directory listing and expected-file-set skip them: which ones the
+        // storage engine materializes is an implementation detail. `is_binary`
+        // alone does not catch them — fsqlite's `-fsqlite-ns-gate` is created
+        // empty, so it reads as a text file.
+        .filter(|e| {
+            e.file_type().is_file()
+                && !is_binary(e.path())
+                && !is_transient_sqlite(&e.file_name().to_string_lossy())
+        })
         .collect();
     entries.sort_by(|a, b| a.path().cmp(b.path()));
 

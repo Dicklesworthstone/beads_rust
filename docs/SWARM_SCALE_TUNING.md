@@ -25,8 +25,9 @@ Default recommendations:
 
 - Prefer `--json` or `--robot` for all machine parsing.
 - Set `RUST_LOG=error` unless debugging `br` internals.
-- Keep mutation commands explicit. `br` does not run git and does not install
-  hooks or daemons.
+- Keep mutation commands explicit. `br sync` does not run Git, and `br` does
+  not install hooks or daemons. Git visibility is an explicit
+  `br vcs-status` request.
 - Use `br sync --status --json` as a cheap pre-commit state check.
 - Use `br sync --flush-only` at the end of a mutation session before staging
   `.beads/issues.jsonl`.

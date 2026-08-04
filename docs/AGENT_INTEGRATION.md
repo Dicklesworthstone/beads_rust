@@ -496,16 +496,33 @@ import subprocess
 
 
 class BrError(RuntimeError):
-    def __init__(self, exit_code, envelope, stdout, stderr):
+    def __init__(self, exit_code, envelope, partial, stdout, stderr):
         error = envelope.get("error", {})
-        message = error.get("message") or stderr.strip() or f"br exited {exit_code}"
+        message = error.get("message") or f"br exited {exit_code}"
         super().__init__(message)
         self.exit_code = exit_code
         self.envelope = envelope
+        # Payload document from a partially applied batch (e.g. `close`
+        # with a blocked issue in the list), or None. See docs/agent/ERRORS.md.
+        self.partial = partial
         self.code = error.get("code")
         self.hint = error.get("hint")
         self.stdout = stdout
         self.stderr = stderr
+
+
+def _parse_json_documents(text):
+    """Parse a stream of concatenated JSON documents (stdout may carry a
+    partial-batch payload followed by the error envelope)."""
+    decoder = json.JSONDecoder()
+    docs, idx, text = [], 0, text.strip()
+    while idx < len(text):
+        doc, end = decoder.raw_decode(text, idx)
+        docs.append(doc)
+        idx = end
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+    return docs
 
 
 def br_command(*args):
@@ -517,8 +534,12 @@ def br_command(*args):
         check=False,
     )
     if result.returncode != 0:
-        envelope = json.loads(result.stderr) if result.stderr.strip() else {}
-        raise BrError(result.returncode, envelope, result.stdout, result.stderr)
+        # The structured envelope is the LAST JSON document on STDOUT
+        # (stderr carries human diagnostics only — docs/agent/ERRORS.md).
+        docs = _parse_json_documents(result.stdout) if result.stdout.strip() else []
+        envelope = docs[-1] if docs and isinstance(docs[-1], dict) and "error" in docs[-1] else {}
+        partial = docs[0] if len(docs) > 1 else None
+        raise BrError(result.returncode, envelope, partial, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
 # Find ready work
@@ -536,19 +557,54 @@ if ready:
 ```javascript
 const { spawnSync } = require('node:child_process');
 
+// stdout may carry several concatenated JSON documents: a partial-batch
+// payload followed by the error envelope (see docs/agent/ERRORS.md).
+function parseJsonDocuments(text) {
+  const docs = [];
+  let rest = text.trim();
+  while (rest.length > 0) {
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = 0; i < rest.length; i++) {
+      const c = rest[i];
+      if (esc) { esc = false; continue; }
+      if (inStr) {
+        if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') inStr = true;
+      else if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') {
+        depth--;
+        if (depth === 0) { end = i + 1; break; }
+      }
+    }
+    if (end < 0) break;
+    docs.push(JSON.parse(rest.slice(0, end)));
+    rest = rest.slice(end).trim();
+  }
+  return docs;
+}
+
 function br(...args) {
   const result = spawnSync('br', ['--json', ...args], {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe']
   });
   if (result.status !== 0) {
-    const envelope = result.stderr.trim() ? JSON.parse(result.stderr) : {};
+    // The structured envelope is the LAST JSON document on STDOUT
+    // (stderr carries human diagnostics only).
+    const docs = result.stdout.trim() ? parseJsonDocuments(result.stdout) : [];
+    const last = docs[docs.length - 1];
+    const envelope = last && typeof last === 'object' && 'error' in last ? last : {};
     const error = envelope.error || {};
-    const err = new Error(error.message || result.stderr.trim() || `br exited ${result.status}`);
+    const err = new Error(error.message || `br exited ${result.status}`);
     err.exitCode = result.status;
     err.code = error.code;
     err.hint = error.hint;
     err.envelope = envelope;
+    // Payload document from a partially applied batch, if any.
+    err.partial = docs.length > 1 ? docs[0] : undefined;
     throw err;
   }
   return JSON.parse(result.stdout);
@@ -600,7 +656,7 @@ br list --json --assignee $(whoami) | jq '.issues[].title'
 
 ### Structured Error Response
 
-With `--json`, successful command data is written to stdout. Structured errors are written to stderr and the process exits non-zero, so agents must parse the stream that matches the exit code.
+With `--json`, the machine-readable result is written to stdout: successful command data on exit `0`, and the structured error envelope on non-zero exits (stderr carries human diagnostics, `RUST_LOG` tracing output, and non-fatal structured warnings such as `AUTO_FLUSH_FAILED` — never the envelope). On a partial-batch failure the envelope is preceded by a payload document describing what did apply — parse stdout as a stream of JSON documents and treat the last one's `error` key as the envelope. See [docs/agent/ERRORS.md](agent/ERRORS.md) for the full contract.
 
 ```json
 {

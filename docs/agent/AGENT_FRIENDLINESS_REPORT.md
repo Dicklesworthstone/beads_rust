@@ -43,7 +43,7 @@ br schema all --format toon
 
 ### Error envelope
 
-Many failures emit a structured JSON error object on stderr. A canonical example is captured in:
+In JSON mode, failures emit a structured JSON error object on stdout (the same stream as success data — selected by exit code; see `ERRORS.md`). A canonical example is captured in:
 
 - `agent_baseline/errors/show_not_found.json`
 
@@ -77,6 +77,6 @@ Rationale:
 | CLI ergonomics | 5 | Task-focused commands; consistent flags across major read flows |
 | Robot/machine mode | 5 | JSON everywhere; TOON for many read commands |
 | Schemas | 4 | `br schema` exists; TOON key folding is documented |
-| Errors | 4 | Structured envelope w/ hints; stderr routing needs care when piping |
+| Errors | 4 | Structured envelope w/ hints on stdout in JSON mode; partial batches emit payload + envelope (see ERRORS.md) |
 | Consistency | 4 | Some commands also have `--robot`; others rely on `--json`/`--format` |
 | Overall | 4.5 | High maturity; remaining work is mostly polish/consistency |

@@ -311,7 +311,7 @@ pub fn export_to_jsonl(
 **Safety Guards:**
 
 1. Path validation (must be in `.beads/`)
-2. Atomic writes (temp file + rename)
+2. Atomic JSONL publication (temp file + rename)
 3. Content hashing (detect corruption)
 4. History backups (optional, created when overwriting JSONL inside `.beads/`)
 
@@ -562,9 +562,9 @@ impl Issue {
 - `created_at`, `updated_at` (timestamps)
 - `labels`, `dependencies`, `comments` (relations)
 
-### Atomic File Writes
+### Atomic JSONL Export Writes
 
-Safe file updates using temp + rename:
+JSONL export publication uses temp + rename:
 
 ```rust
 fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
@@ -693,17 +693,17 @@ workspace taxonomy without speculative follow-up.
 
 ### File System Safety
 
-1. **All writes confined to `.beads/`**
+1. **Sync writes confined to its validated `.beads/` authority by default**
    - Path validation before any write
-   - No operations outside workspace
+   - External JSONL requires explicit opt-in
 
-2. **No git operations**
-   - Never runs `git` commands
+2. **No Git operations in sync**
+   - `br sync` never runs `git` commands
    - User handles git manually
 
-3. **Atomic writes**
-   - Temp file + rename pattern
-   - No partial writes
+3. **Atomic JSONL publication**
+   - Export uses a same-directory temp file + rename pattern
+   - Other durable mutations use their own transaction/receipt contracts
 
 ### Database Safety
 

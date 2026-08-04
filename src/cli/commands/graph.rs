@@ -185,17 +185,19 @@ fn execute_graph_with_storage_ctx(
             &resolved_id,
             args.compact,
             args.dot,
+            GraphDirection::from_flag(args.dependencies),
             ctx,
         )
     }
 }
 
-/// Show graph for a single issue (traverse dependents only).
+/// Show the graph for a single issue, walking `direction` from the root.
 fn graph_single(
     storage: &SqliteStorage,
     root_id: &str,
     compact: bool,
     dot: bool,
+    direction: GraphDirection,
     ctx: &OutputContext,
 ) -> Result<()> {
     // Verify the root issue exists
@@ -209,11 +211,25 @@ fn graph_single(
         return Ok(());
     }
 
-    let traversal = collect_single_graph(storage, root_id, &root_issue)?;
+    let traversal = collect_single_graph(storage, root_id, &root_issue, direction)?;
     let root_nodes = [root_id.to_string()];
+    // `calculate_depths_from_dependency_edges` measures distance from the
+    // dependency side of each edge, which is "distance from the root" only for
+    // the dependents walk. Walking dependencies puts the root at the dependent
+    // end, so feed that direction reversed edges to keep depth meaning
+    // "hops from the root". The edges reported in the output stay in their
+    // canonical `(dependent, dependency)` orientation either way.
+    let depth_edges: Vec<(String, String)> = match direction {
+        GraphDirection::Dependents => traversal.edges.clone(),
+        GraphDirection::Dependencies => traversal
+            .edges
+            .iter()
+            .map(|(dependent, dependency)| (dependency.clone(), dependent.clone()))
+            .collect(),
+    };
     let depths = calculate_depths_from_dependency_edges(
         &traversal.traversal_order,
-        &traversal.edges,
+        &depth_edges,
         &root_nodes,
     );
     let mut nodes = build_graph_nodes(&traversal.traversal_order, &traversal.issues_by_id, &depths);
@@ -246,16 +262,20 @@ fn graph_single(
     // Text output
     if nodes.len() == 1 {
         if matches!(ctx.mode(), OutputMode::Rich) {
-            render_no_dependents_rich(root_id, &root_issue, ctx);
+            render_no_dependents_rich(root_id, &root_issue, direction, ctx);
         } else {
-            println!("No dependents for {}", graph_display_text(root_id));
+            println!(
+                "No {} for {}",
+                direction.neighbour_noun(),
+                graph_display_text(root_id)
+            );
         }
         return Ok(());
     }
 
     match human_graph_render_mode(ctx.mode(), compact) {
         HumanGraphRenderMode::Rich => {
-            render_single_graph_rich(&nodes, &traversal.edges, &root_issue, ctx);
+            render_single_graph_rich(&nodes, &traversal.edges, &root_issue, direction, ctx);
         }
         HumanGraphRenderMode::Compact => {
             println!(
@@ -264,7 +284,7 @@ fn graph_single(
             );
         }
         HumanGraphRenderMode::Plain => {
-            render_single_graph_plain(&nodes, &traversal.edges, &root_issue);
+            render_single_graph_plain(&nodes, &traversal.edges, &root_issue, direction);
         }
     }
 
@@ -578,6 +598,7 @@ fn collect_single_graph(
     storage: &SqliteStorage,
     root_id: &str,
     root_issue: &Issue,
+    direction: GraphDirection,
 ) -> Result<SingleGraphTraversal> {
     // DFS traversal producing first-visit order so rendered subtrees stay contiguous.
     // Cycle prevention uses expanded_nodes (fully processed) and queued_nodes (on stack)
@@ -613,7 +634,7 @@ fn collect_single_graph(
         let mut frontier_batch = Vec::with_capacity(stack.len().saturating_add(1));
         frontier_batch.push(current_id.clone());
         frontier_batch.extend(stack.iter().rev().cloned());
-        cache_graph_dependents(storage, &mut dependents_cache, &frontier_batch)?;
+        cache_graph_dependents(storage, direction, &mut dependents_cache, &frontier_batch)?;
 
         let mut dependents: Vec<_> = dependents_cache
             .get(&current_id)
@@ -622,7 +643,13 @@ fn collect_single_graph(
         dependents.sort_by(|a, b| a.priority.0.cmp(&b.priority.0).then(a.id.cmp(&b.id)));
 
         for dep in dependents.into_iter().rev() {
-            let edge = (dep.id.clone(), current_id.clone());
+            // Edges are always recorded as `(dependent, dependency)` — the
+            // orientation `calculate_depths_from_dependency_edges` and the
+            // renderers expect — whichever way we walked to discover them.
+            let edge = match direction {
+                GraphDirection::Dependents => (dep.id.clone(), current_id.clone()),
+                GraphDirection::Dependencies => (current_id.clone(), dep.id.clone()),
+            };
             if seen_edges.insert(edge.clone()) {
                 edges.push(edge);
             }
@@ -665,8 +692,50 @@ fn collect_single_graph(
     })
 }
 
+/// Which way `br graph <id>` walks the dependency edges (`beads_rust-mf72`).
+///
+/// The default is [`Self::Dependents`] — "what does closing this unblock?" —
+/// which is the triage question and a deliberate divergence from classic `bd`.
+/// `--dependencies` selects the other direction, "what is blocking this?", so
+/// one command covers both walks instead of sending the user to `br dep tree`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GraphDirection {
+    /// Issues blocked by the root.
+    #[default]
+    Dependents,
+    /// Issues the root is blocked by.
+    Dependencies,
+}
+
+impl GraphDirection {
+    const fn from_flag(dependencies: bool) -> Self {
+        if dependencies {
+            Self::Dependencies
+        } else {
+            Self::Dependents
+        }
+    }
+
+    /// Noun used in human-facing output for the neighbours being walked.
+    const fn neighbour_noun(self) -> &'static str {
+        match self {
+            Self::Dependents => "dependents",
+            Self::Dependencies => "dependencies",
+        }
+    }
+
+    /// Capitalized form for headings.
+    const fn heading_noun(self) -> &'static str {
+        match self {
+            Self::Dependents => "Dependents",
+            Self::Dependencies => "Dependencies",
+        }
+    }
+}
+
 fn cache_graph_dependents(
     storage: &SqliteStorage,
+    direction: GraphDirection,
     dependents_cache: &mut HashMap<String, Vec<IssueWithDependencyMetadata>>,
     issue_ids: &[String],
 ) -> Result<()> {
@@ -686,7 +755,14 @@ fn cache_graph_dependents(
         return Ok(());
     }
 
-    let fetched = storage.get_blocking_dependents_for_issue_ids(&missing_ids)?;
+    let fetched = match direction {
+        GraphDirection::Dependents => {
+            storage.get_blocking_dependents_for_issue_ids(&missing_ids)?
+        }
+        GraphDirection::Dependencies => {
+            storage.get_blocking_dependencies_for_issue_ids(&missing_ids)?
+        }
+    };
     for issue_id in &missing_ids {
         dependents_cache.insert(
             issue_id.clone(),
@@ -1048,10 +1124,16 @@ const fn human_graph_render_mode(mode: OutputMode, compact: bool) -> HumanGraphR
     }
 }
 
-fn render_single_graph_plain(nodes: &[GraphNode], edges: &[(String, String)], root_issue: &Issue) {
+fn render_single_graph_plain(
+    nodes: &[GraphNode],
+    edges: &[(String, String)],
+    root_issue: &Issue,
+    direction: GraphDirection,
+) {
     let parent_map = build_parent_map(edges);
     println!(
-        "Dependents of {} by depth ({} total):",
+        "{} of {} by depth ({} total):",
+        direction.heading_noun(),
         graph_display_text(&root_issue.id),
         nodes.len() - 1
     );
@@ -1199,6 +1281,7 @@ fn render_single_graph_rich(
     nodes: &[GraphNode],
     edges: &[(String, String)],
     root_issue: &Issue,
+    direction: GraphDirection,
     ctx: &OutputContext,
 ) {
     let console = Console::default();
@@ -1218,18 +1301,22 @@ fn render_single_graph_rich(
     );
     content.append("\n\n");
 
-    // Dependent count
+    // Neighbour count, in whichever direction was walked.
     let dep_count = nodes.len() - 1;
+    let noun = direction.neighbour_noun();
     content.append_styled(
         &format!(
-            "{} dependent{}\n\n",
-            dep_count,
-            if dep_count == 1 { "" } else { "s" }
+            "{dep_count} {}\n\n",
+            if dep_count == 1 {
+                noun.trim_end_matches('s')
+            } else {
+                noun
+            }
         ),
         theme.dimmed.clone(),
     );
     content.append_styled(
-        "Layered view; shared dependents list all blockers in this graph.\n\n",
+        &format!("Layered view; shared {noun} list all blockers in this graph.\n\n"),
         theme.dimmed.clone(),
     );
 
@@ -1281,7 +1368,12 @@ fn render_single_graph_rich(
 }
 
 /// Render no dependents message with rich formatting.
-fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputContext) {
+fn render_no_dependents_rich(
+    root_id: &str,
+    root_issue: &Issue,
+    direction: GraphDirection,
+    ctx: &OutputContext,
+) {
     let console = Console::default();
     let theme = ctx.theme();
     let width = ctx.width();
@@ -1293,7 +1385,10 @@ fn render_no_dependents_rich(root_id: &str, root_issue: &Issue, ctx: &OutputCont
     content.append(" ");
     content.append(sanitize_terminal_inline(&root_issue.title).as_ref());
     content.append("\n\n");
-    content.append_styled("No dependents found", theme.dimmed.clone());
+    content.append_styled(
+        &format!("No {} found", direction.neighbour_noun()),
+        theme.dimmed.clone(),
+    );
     content.append("\n");
 
     let panel = Panel::from_rich_text(&content, width)
@@ -1966,8 +2061,9 @@ mod tests {
             ))
             .unwrap();
 
-        let traversal = collect_single_graph(&storage, "bd-root", &root)
-            .expect("graph traversal should preserve missing dependent placeholders");
+        let traversal =
+            collect_single_graph(&storage, "bd-root", &root, GraphDirection::Dependents)
+                .expect("graph traversal should preserve missing dependent placeholders");
 
         let missing = traversal
             .issues_by_id
@@ -2024,7 +2120,8 @@ mod tests {
             .unwrap()
             .expect("root issue should exist");
         let traversal =
-            collect_single_graph(&storage, "bd-root", &root).expect("graph traversal should work");
+            collect_single_graph(&storage, "bd-root", &root, GraphDirection::Dependents)
+                .expect("graph traversal should work");
 
         assert_eq!(
             traversal.traversal_order,
@@ -2064,8 +2161,9 @@ mod tests {
             .get_issue("bd-child")
             .unwrap()
             .expect("child issue should exist");
-        let child_traversal = collect_single_graph(&storage, "bd-child", &child)
-            .expect("child graph traversal should work");
+        let child_traversal =
+            collect_single_graph(&storage, "bd-child", &child, GraphDirection::Dependents)
+                .expect("child graph traversal should work");
         assert_eq!(
             child_traversal.traversal_order,
             vec!["bd-child".to_string(), "bd-parent".to_string()]
@@ -2080,8 +2178,9 @@ mod tests {
             .get_issue("bd-parent")
             .unwrap()
             .expect("parent issue should exist");
-        let parent_traversal = collect_single_graph(&storage, "bd-parent", &parent)
-            .expect("parent graph traversal should work");
+        let parent_traversal =
+            collect_single_graph(&storage, "bd-parent", &parent, GraphDirection::Dependents)
+                .expect("parent graph traversal should work");
         assert_eq!(
             parent_traversal.traversal_order,
             vec!["bd-parent".to_string()]
@@ -2146,6 +2245,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache_graph_dependents(
             &storage,
+            GraphDirection::Dependents,
             &mut cache,
             &["bd-root".to_string(), "bd-a".to_string()],
         )
@@ -2445,5 +2545,90 @@ mod tests {
             !escaped.contains("a\"b"),
             "raw quote must not survive: {escaped}"
         );
+    }
+
+    /// `beads_rust-mf72`: `--dependencies` walks the inverse of the default
+    /// direction, so `br graph <blocked-issue> --dependencies` finally shows
+    /// what is blocking it. Edges keep their canonical `(dependent,
+    /// dependency)` orientation in both directions.
+    #[test]
+    fn graph_direction_dependencies_walks_the_inverse_of_dependents() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-a", "bd-b", "bd-c"] {
+            let issue = Issue {
+                id: id.to_string(),
+                title: id.to_string(),
+                status: Status::Open,
+                priority: crate::model::Priority::MEDIUM,
+                issue_type: crate::model::IssueType::Task,
+                ..Default::default()
+            };
+            storage.create_issue(&issue, "test").unwrap();
+        }
+        // A depends on B depends on C.
+        storage
+            .add_dependency("bd-a", "bd-b", "blocks", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-b", "bd-c", "blocks", "tester")
+            .unwrap();
+
+        let a = storage.get_issue("bd-a").unwrap().expect("a exists");
+        let c = storage.get_issue("bd-c").unwrap().expect("c exists");
+
+        // Default direction from the most-blocked issue finds nothing: A
+        // blocks no one. This is the behavior that surprised users.
+        let from_a_default =
+            collect_single_graph(&storage, "bd-a", &a, GraphDirection::Dependents).unwrap();
+        assert_eq!(from_a_default.traversal_order, vec!["bd-a".to_string()]);
+        assert!(from_a_default.edges.is_empty());
+
+        // `--dependencies` from the same issue walks the whole blocker chain.
+        let from_a_deps =
+            collect_single_graph(&storage, "bd-a", &a, GraphDirection::Dependencies).unwrap();
+        assert_eq!(
+            from_a_deps.traversal_order,
+            vec!["bd-a".to_string(), "bd-b".to_string(), "bd-c".to_string()]
+        );
+        assert_eq!(
+            from_a_deps.edges,
+            vec![
+                ("bd-a".to_string(), "bd-b".to_string()),
+                ("bd-b".to_string(), "bd-c".to_string()),
+            ],
+            "edges stay (dependent, dependency) regardless of walk direction"
+        );
+
+        // Walking dependents from the deepest blocker reaches the same set,
+        // with the same edge orientation, in the opposite traversal order.
+        let from_c_default =
+            collect_single_graph(&storage, "bd-c", &c, GraphDirection::Dependents).unwrap();
+        let mut deps_nodes = from_a_deps.traversal_order.clone();
+        let mut dependents_nodes = from_c_default.traversal_order.clone();
+        deps_nodes.sort();
+        dependents_nodes.sort();
+        assert_eq!(deps_nodes, dependents_nodes);
+        let mut a_edges = from_a_deps.edges.clone();
+        let mut c_edges = from_c_default.edges.clone();
+        a_edges.sort();
+        c_edges.sort();
+        assert_eq!(a_edges, c_edges);
+    }
+
+    #[test]
+    fn graph_direction_from_flag_and_nouns() {
+        assert_eq!(GraphDirection::from_flag(false), GraphDirection::Dependents);
+        assert_eq!(
+            GraphDirection::from_flag(true),
+            GraphDirection::Dependencies
+        );
+        assert_eq!(GraphDirection::default(), GraphDirection::Dependents);
+        assert_eq!(GraphDirection::Dependents.neighbour_noun(), "dependents");
+        assert_eq!(
+            GraphDirection::Dependencies.neighbour_noun(),
+            "dependencies"
+        );
+        assert_eq!(GraphDirection::Dependents.heading_noun(), "Dependents");
+        assert_eq!(GraphDirection::Dependencies.heading_noun(), "Dependencies");
     }
 }

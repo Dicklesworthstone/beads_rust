@@ -14,7 +14,9 @@ const GUIDE: &str = r#"br Agent Guide
 
 Purpose:
   br is a local-first issue tracker. It stores primary state in SQLite and
-  exports .beads/issues.jsonl for git-friendly handoff. br never runs git.
+  exports .beads/issues.jsonl for git-friendly handoff. Normal issue and sync
+  paths never run git. Only an explicit br vcs-status request runs bounded,
+  read-only Git probes.
 
 Machine-output defaults:
   Use --json or --format json for scripts. Diagnostics and structured errors
@@ -50,12 +52,16 @@ Completing work:
 Discovery:
   br schema commands --format json
   br schema all --format json
+  br vcs-status --json
   br robot-docs guide
 
 Safety:
   Avoid bare bv in automated sessions; use bv --robot-* flags.
   Use RUST_LOG=error for routine br runs to suppress dependency logs.
   br sync does not commit, push, pull, or install hooks.
+  Existing databases are never schema-migrated implicitly. Run
+  br doctor migrate-schema plan --json, review the receipt, then apply its
+  exact token.
 "#;
 
 #[derive(Debug, Serialize)]
@@ -95,6 +101,14 @@ const CANONICAL_COMMANDS: &[CanonicalCommand] = &[
     CanonicalCommand {
         task: "inspect JSON contracts",
         command: "br schema commands --format json",
+    },
+    CanonicalCommand {
+        task: "explicitly inspect JSONL Git visibility",
+        command: "br vcs-status --json",
+    },
+    CanonicalCommand {
+        task: "review a required schema migration",
+        command: "br doctor migrate-schema plan --json",
     },
     CanonicalCommand {
         task: "final JSONL export",
@@ -140,5 +154,20 @@ fn execute_guide(args: &RobotDocsGuideArgs, outer_ctx: &OutputContext) {
         OutputFormat::Json => ctx.json_pretty(&payload),
         OutputFormat::Toon => ctx.toon_with_stats(&payload, args.stats),
         OutputFormat::Text | OutputFormat::Csv => print!("{GUIDE}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CANONICAL_COMMANDS, GUIDE};
+
+    #[test]
+    fn guide_scopes_git_authority_and_discovers_vcs_status() {
+        assert!(GUIDE.contains("Only an explicit br vcs-status request"));
+        assert!(
+            CANONICAL_COMMANDS
+                .iter()
+                .any(|entry| entry.command == "br vcs-status --json")
+        );
     }
 }

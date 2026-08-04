@@ -721,9 +721,25 @@ pub fn execute_with_args(
         }
     }
 
-    if closed_count == 0 && skipped_count > 0 {
-        return Err(BeadsError::NothingToDo {
-            reason: format!("all {skipped_count} issue(s) skipped — {skip_summary}"),
+    // Exit status must carry the outcome for EVERY requested id, not just for
+    // the all-or-nothing case. Gating this on `closed_count == 0` meant a batch
+    // that closed one issue and refused another exited 0 with the refusal
+    // visible only as a warning on stderr — so `br close <blocked> <closeable>`
+    // reported success while the blocked issue was untouched, and stdout showed
+    // an unqualified "✓ Closed". `docs/agent/ERRORS.md` tells callers to parse
+    // stdout precisely when the exit code is 0, which made that transcript
+    // authoritative. A no-op must not be able to read as success.
+    if skipped_count > 0 {
+        return Err(if closed_count == 0 {
+            BeadsError::NothingToDo {
+                reason: format!("all {skipped_count} issue(s) skipped — {skip_summary}"),
+            }
+        } else {
+            BeadsError::CloseIncomplete {
+                closed: closed_count,
+                skipped: skipped_count,
+                summary: skip_summary,
+            }
         });
     }
 
@@ -1070,6 +1086,7 @@ fn execute_route(
                 attribution.agent_name.as_deref(),
                 attribution.harness.as_deref(),
                 attribution.model.as_deref(),
+                super::session_attribution_from_env().as_deref(),
             ));
         let update_result = update_issues_atomically_with_recovery(
             &mut storage_ctx,
@@ -1235,6 +1252,7 @@ mod tests {
     use super::*;
     use crate::cli::commands;
     use crate::config::CliOverrides;
+    use crate::error::StructuredError;
     use crate::model::{DependencyType, Issue, IssueType, Priority, Status};
     use crate::output::OutputContext;
     use crate::storage::SqliteStorage;
@@ -2084,6 +2102,111 @@ mod tests {
     }
 
     #[test]
+    fn execute_with_args_reports_partial_batch_as_error_not_success() {
+        // A batch that closes one issue and refuses another used to return
+        // `Ok(())`, because the terminal error was gated on `closed_count == 0`.
+        // The refusal was then visible ONLY as a warning on stderr, while stdout
+        // carried an unqualified "✓ Closed" and `$?` was 0 — and
+        // `docs/agent/ERRORS.md` instructs callers to parse stdout precisely
+        // when the exit code is 0. Any caller branching on exit status read the
+        // untouched issue as closed.
+        //
+        // This is the direction that fires: under the old predicate this test
+        // fails at `expect_err`. The all-succeed case is covered by
+        // `execute_with_args_closes_requested_blocker_chain_in_one_batch`, which
+        // still expects `Ok(())` — so the new predicate is proven in both
+        // directions.
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-blocker", "Unrequested blocker"), "tester")
+            .expect("create blocker");
+        storage
+            .create_issue(
+                &make_issue("bd-blocked", "Blocked by unrequested"),
+                "tester",
+            )
+            .expect("create blocked");
+        storage
+            .create_issue(&make_issue("bd-free", "Independently closeable"), "tester")
+            .expect("create free");
+        storage
+            .add_dependency(
+                "bd-blocked",
+                "bd-blocker",
+                DependencyType::Blocks.as_str(),
+                "tester",
+            )
+            .expect("add dependency");
+        storage.rebuild_blocked_cache(true).expect("rebuild cache");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-blocked".to_string(), "bd-free".to_string()],
+            ..CloseArgs::default()
+        };
+
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("a partially applied batch must not report success");
+        assert!(
+            matches!(err, BeadsError::CloseIncomplete { .. }),
+            "a partial batch must surface as CloseIncomplete, got: {err:?}"
+        );
+        // Destructure without a diverging arm: the fallback carries values that
+        // fail every assertion below, so a wrong variant is still loud.
+        let (closed, skipped, summary) = match &err {
+            BeadsError::CloseIncomplete {
+                closed,
+                skipped,
+                summary,
+            } => (*closed, *skipped, summary.clone()),
+            other => (0, 0, format!("wrong variant: {other:?}")),
+        };
+        assert_eq!(closed, 1, "exactly one issue should have closed");
+        assert_eq!(skipped, 1, "exactly one issue should have been skipped");
+        assert!(
+            summary.contains("bd-blocked") && summary.contains("blocked by"),
+            "summary must name the refused issue and the real reason, got: {summary}"
+        );
+
+        // The exit status now agrees with the record, which is the whole point.
+        assert_ne!(
+            StructuredError::from_error(&err).code.exit_code(),
+            0,
+            "a partial close must not exit 0"
+        );
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert_eq!(
+            storage
+                .get_issue("bd-free")
+                .expect("get free")
+                .expect("free exists")
+                .status,
+            Status::Closed,
+            "the closeable issue should still have been closed"
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-blocked")
+                .expect("get blocked")
+                .expect("blocked exists")
+                .status,
+            Status::Open,
+            "the blocked issue must remain open — the error is what reports that"
+        );
+    }
+
+    #[test]
     fn execute_with_args_records_clean_policy_close_metadata() {
         let _lock = crate::util::test_helpers::TEST_DIR_LOCK
             .lock()
@@ -2219,6 +2342,82 @@ mod tests {
                 .expect("read close metadata")
                 .is_none(),
             "repos without an active policy should retain the no-observable-change invariant"
+        );
+    }
+
+    /// GitHub #399: `br close` must honor `workflow.transitions`. A policy
+    /// whose map has no `open -> closed` edge has to refuse the close and
+    /// leave the issue open; widening the map with the `any` wildcard has to
+    /// let the same close through.
+    #[test]
+    fn execute_with_args_enforces_workflow_transitions_on_close() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        storage
+            .create_issue(&make_issue("bd-wf", "Workflow governed"), "tester")
+            .expect("create workflow issue");
+        drop(storage);
+
+        let policy_path = beads_dir.join(close_policy::POLICY_FILE_NAME);
+        std::fs::write(
+            &policy_path,
+            "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  \
+             transitions:\n    open: [in_progress]\n    in_progress: [closed]\n",
+        )
+        .expect("write workflow policy");
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-wf".to_string()],
+            reason: Some("done".to_string()),
+            ..CloseArgs::default()
+        };
+        let err = execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect_err("open -> closed is not in the transitions map");
+        let message = err.to_string();
+        assert!(
+            message.contains("workflow.transitions") && message.contains("'open'"),
+            "error should name the rejected transition: {message}"
+        );
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert_eq!(
+            storage
+                .get_issue("bd-wf")
+                .expect("read issue")
+                .expect("issue exists")
+                .status,
+            Status::Open,
+            "a refused close must leave the issue open"
+        );
+        drop(storage);
+
+        // Widening the map with the `any` wildcard makes the same close legal.
+        std::fs::write(
+            &policy_path,
+            "workflow:\n  strict: true\n  statuses: [open, in_progress, closed]\n  \
+             transitions:\n    open: [in_progress]\n    any: [closed]\n",
+        )
+        .expect("rewrite workflow policy");
+        execute_with_args(&args, false, &CliOverrides::default(), &ctx)
+            .expect("wildcard `any: [closed]` permits the close");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert_eq!(
+            storage
+                .get_issue("bd-wf")
+                .expect("read issue")
+                .expect("issue exists")
+                .status,
+            Status::Closed
         );
     }
 

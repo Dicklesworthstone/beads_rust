@@ -132,7 +132,8 @@ Some explicit commands intentionally step outside that default storage boundary:
 the project `.gitignore`, `br config edit/set` updates config files,
 `br completions -o` writes shell completion files, `br upgrade` updates the
 installed binary, and git-reporting commands such as `br changelog`, `br
-orphans`, and commit-activity `br stats` inspect git history.
+orphans`, commit-activity `br stats`, and the explicitly requested bounded
+`br vcs-status` diagnostic inspect git state/history.
 
 ```bash
 # Normal issue state lives under .beads/
@@ -174,6 +175,16 @@ br sync --import-only
 
 # Merge divergent DB and JSONL edits using the saved base snapshot
 br sync --merge
+
+# Additively pull JSONL rows the database is missing (previewable, lossless)
+br sync --reconcile --dry-run
+br sync --reconcile
+# Recover JSONL-only rows without deleting SQLite-only rows.
+# Review the dry-run receipt, then bind apply to that exact plan.
+plan="$(br sync --reconcile-additive --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+br sync --reconcile-additive --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
 
 # Rebuild SQLite from authoritative JSONL after recovery/corruption
 br sync --import-only --rebuild
@@ -317,6 +328,23 @@ repository's fuzz package. `--locked` makes Cargo use the dependency versions
 validated against the repository's pinned nightly toolchain.
 
 > **Note:** `cargo install` places binaries in `~/.cargo/bin/`, while the install script uses `~/.local/bin/`. If you have both in PATH, ensure the desired location has higher priority to avoid running an outdated version. Run `which br` to verify which binary is active.
+
+### Claude Code Plugin (agent instructions)
+
+The official `br` skill ships as a Claude Code plugin, so agents get the
+workflow rules without you copying `SKILL.md` around:
+
+```bash
+/plugin marketplace add Dicklesworthstone/beads_rust
+/plugin install beads@beads-rust
+```
+
+The plugin installs **agent instructions only** — it does not install the `br`
+binary, so pair it with one of the install methods above. The optional
+`bd-to-br-migration` skill stays opt-in and is not part of the plugin; install
+it with `install.sh --with-migration-skill` if you are still migrating from
+`bd`. Codex users keep using `install.sh`, which writes the same skill into
+`${CODEX_HOME:-~/.codex}/skills`.
 
 ### Disable Self-Update
 
@@ -492,7 +520,8 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | Command | Description | Example |
 |---------|-------------|---------|
 | `epic` | Manage epic rollups | `br epic status --eligible-only` |
-| `graph` | Visualize dependency graph | `br graph br-abc123` |
+| `graph` | Show what an issue unblocks (its dependents) | `br graph br-abc123` |
+| `graph --dependencies` | Show what is blocking an issue | `br graph br-abc123 --dependencies` |
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
@@ -510,14 +539,18 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `info` | Show workspace diagnostics | `br info` |
 | `robot-docs` | Print concise docs for automation agents | `br robot-docs guide` |
 | `schema` | Emit JSON Schemas for outputs | `br schema all --format json` |
+| `vcs-status` | Explicit bounded JSONL Git visibility | `br vcs-status --json` |
 | `where` | Show active `.beads` directory | `br where` |
 
 ### Sync & System
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `sync` | Sync DB ↔ JSONL | `br sync --flush-only` |
+| `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
+| `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
+| `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
+| `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
 | `stats` | Project statistics | `br stats` |
 | `config` | Manage config | `br config list` |
 | `upgrade` | Self-update | `br upgrade` |
@@ -689,10 +722,87 @@ has one matching target. Leaving and later re-entering review invalidates prior
 passes without deleting their append-only audit history. Pre-v15 unscoped gate
 rows remain visible through `br gate list` but can never authorize a transition.
 
-The current enforcement layer uses repository scope and counts all matching
-issues. Hierarchy-aware counts, audited exemptions, additional actor/harness/
-session/subtree scopes, and capacity observability remain subsequent phases of
-GitHub issue #384.
+Capacity counts every matching issue by default. `workflow.capacity.counting.
+hierarchy` measures occupancy across `parent-child` edges instead, so an
+aggregate parent and its executable child do not each consume a slot:
+
+```yaml
+workflow:
+  capacity:
+    counting:
+      hierarchy: leaf_work   # all | leaf_work | roots | weighted
+```
+
+Under `leaf_work` an active leaf counts one and a parent with active counted
+descendants counts zero, so an epic → parent → {child, child} tree consumes
+two slots rather than four; the parent starts counting once its last active
+descendant leaves. `roots` counts each work stream by its highest active
+ancestor, and `weighted` sums explicit `counting.weights` (per issue, then
+per type, then a default), where a weight of `0` is the audited way to say a
+parent carries no independent execution. Only `parent-child` edges
+participate — `blocks` and `related` never affect counting — and the walk
+happens inside the same transaction as admission. Under `leaf_work`/`roots`,
+capacity evidence reports `counting_mode` plus `aggregate_parents_excluded`.
+
+`br show --json` also exposes a derived `rollup` for any issue with local
+children (`{"status": "in_progress", "descendants": {...}}`), letting an epic
+stay `open` while reporting that its subtree has started.
+
+Audited issue-specific **capacity exemptions** let one named issue occupy one
+named capacity without consuming a slot — the escape hatch for a long-lived
+external blocker that legitimately stays in a limited status:
+
+```yaml
+workflow:
+  capacity:
+    exemptions:
+      providers: [operator]     # who may grant; empty disables granting
+      require_expiry: true      # optional: every grant must carry an expiry
+```
+
+```bash
+br capacity exempt br-abc --status blocked \
+  --provider operator \
+  --reason "Awaiting an external regulatory decision" \
+  --expires 2026-08-15
+```
+
+Grants, renewals, revocations, and observed expirations are all recorded in an
+append-only audit table. Exempt issues stay visible in queue metrics, capacity
+evidence reports counted and exempt totals separately, leaving the applicable
+status ends the exemption, and expired exemptions count again. See
+`docs/CLI_REFERENCE.md` (the `capacity` command) for full semantics.
+
+Optional **multi-agent admission scopes** partition capacity beyond the
+repository total — per acting actor, per issue assignee, per self-reported
+harness (`--harness`/`BR_HARNESS`) or session (`BR_SESSION`), or per
+subtree root over parent-child edges:
+
+```yaml
+workflow:
+  capacity:
+    scopes:
+      actor:
+        statuses:
+          in_progress:
+            hard: 2
+      harness:
+        statuses:
+          in_progress:
+            hard: 6
+```
+
+Every applicable scope composes with the repository limits inside the same
+admission transaction; a partition with no key (e.g. no harness reported)
+is simply not subject to that scope. This is cooperative admission control,
+not process supervision — attribution stays self-reported. Scoped evidence
+carries the partition key as `scope_key` and a
+`workflow.capacity.scopes.<scope>...` policy path. Once any capacity is
+configured, `br stats` and `br coordination status` report per-capacity
+occupancy (counted/exempt/limits/remaining/state, including occupied scope
+partitions) in human, JSON, and TOON output. See `docs/CLI_REFERENCE.md`
+for full semantics and `docs/GH384_ACCEPTANCE_MATRIX.md` for the complete
+GitHub #384 acceptance matrix.
 
 ### Environment Variables
 
@@ -726,7 +836,7 @@ This keeps successful commands readable by suppressing low-level dependency logg
 │  ┌─────────────────┐              ┌─────────────────────┐    │
 │  │  SqliteStorage  │◄────────────►│  JSONL Export/Import │    │
 │  │                 │   sync       │                     │    │
-│  │  - WAL mode     │              │  - Atomic writes    │    │
+│  │  - WAL mode     │              │  - Atomic publish   │    │
 │  │  - Dirty track  │              │  - Content hashing  │    │
 │  │  - Blocked cache│              │  - Merge support    │    │
 │  └────────┬────────┘              └──────────┬──────────┘    │
@@ -759,7 +869,10 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 ```
 
 Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
-`--merge`, `--status`, or `--witness` so the data direction is explicit.
+`--merge`, `--reconcile`, `--reconcile-additive`, `--status`, or `--witness`
+so the data direction and authority are explicit. `br sync --status` never
+probes Git; run `br vcs-status --json` only when Git visibility is explicitly
+wanted.
 
 ### Safety Model
 
@@ -769,7 +882,7 @@ Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
 |-----------|----------------|
 | Sync never executes git | No runtime `Command::new("git")` calls in `src/sync/` or `src/cli/commands/sync.rs` |
 | Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
-| Atomic writes | Write to temp file, then rename |
+| Checked publication and transactions | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback |
 | No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
 
 ---
@@ -823,12 +936,21 @@ If you want to preserve imported IDs exactly as-is, omit `--rename-prefix`.
 # Check sync status
 br sync --status
 
+# Lossless recovery: preview, then additively pull the missing/newer rows
+# (never deletes, never writes JSONL, preserves all audit events)
+br sync --reconcile --dry-run
+br sync --reconcile
+
 # Force import (may lose local changes)
 br sync --import-only --force
 
 # If JSONL is authoritative, rebuild SQLite to match it exactly
 br sync --import-only --rebuild
 ```
+
+The reconcile path also repairs the "false equal" state where `br sync
+--status` reports synchronized (the stored content hash matches the file)
+while the JSONL still holds rows the database never imported.
 
 `--rebuild` is an explicit import-mode operation. It is valid only with
 `--import-only`; after import it removes database entries that are absent from

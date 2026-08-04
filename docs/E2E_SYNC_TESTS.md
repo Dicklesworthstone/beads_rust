@@ -11,30 +11,38 @@ The e2e sync test suite verifies several critical safety properties:
 3. **Atomic Writes** - Export uses write-to-temp + atomic rename; failures preserve original files
 4. **Preflight Validation** - Import validates JSONL before any database changes
 5. **No Partial Writes** - Failed operations leave state unchanged
+6. **Lossless Additive Recovery** - Dry-run is read-only; token-bound apply preserves DB-only rows, audit/close/gate evidence, JSONL bytes, and relation identity
+7. **Fail-Closed Review** - Mismatched/stale plan tokens, unreviewed scalar drift, lossy JSON, and relation drift roll back without partial state
 
 ## Test Files
 
 | File | Purpose |
 |------|---------|
-| `tests/e2e_sync_git_safety.rs` | Verifies sync never creates commits or mutates `.git/` |
+| `tests/e2e_sync_git_safety.rs` | Verifies every sync mode has zero Git authority and preserves the complete `.git/` tree |
+| `tests/e2e_vcs_status.rs` | Verifies the separately requested, bounded `br vcs-status` diagnostic |
 | `tests/e2e_sync_artifacts.rs` | Tests with detailed logging and artifact preservation |
 | `tests/e2e_sync_fuzz_edge_cases.rs` | Malformed JSONL, path traversal, conflict markers |
 | `tests/e2e_sync_failure_injection.rs` | Read-only dirs, permission errors, atomic guarantees |
 | `tests/e2e_sync_preflight_integration.rs` | Preflight checks catch safety issues before writes |
+| `tests/e2e_sync_reconcile.rs` | Additive `--reconcile`: false-equal repair, event preservation, dry-run zero-mutation, witness rollback |
+| `tests/e2e_basic_lifecycle.rs` | Additive dry-run/apply/idempotency receipt, event preservation, and unchanged-source coverage |
 
 ## Running the Tests
 
 ### Run All Sync E2E Tests
 
 ```bash
-# Run all sync-related e2e tests
-cargo test e2e_sync --release
-
-# Run with verbose output
-cargo test e2e_sync --release -- --nocapture
-
-# Run specific test file
-cargo test --test e2e_sync_git_safety --release -- --nocapture
+# Run every dedicated sync/VCS E2E target. Cargo's positional test filter does
+# not select integration-test target names, so name each target explicitly.
+cargo test --release \
+  --test e2e_sync_git_safety \
+  --test e2e_sync_status_health \
+  --test e2e_vcs_status \
+  --test e2e_sync_artifacts \
+  --test e2e_sync_fuzz_edge_cases \
+  --test e2e_sync_failure_injection \
+  --test e2e_sync_preflight_integration \
+  -- --nocapture
 ```
 
 ### Run Individual Test Categories
@@ -54,6 +62,13 @@ cargo test --test e2e_sync_failure_injection --release
 
 # Preflight integration tests
 cargo test --test e2e_sync_preflight_integration --release
+
+# Additive reconcile tests (br sync --reconcile / --dry-run)
+cargo test --test e2e_sync_reconcile --release
+# Additive recovery with command-level logs retained by BrWorkspace
+RUST_LOG=beads_rust=debug cargo test --test e2e_basic_lifecycle \
+  e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent \
+  --release -- --nocapture
 ```
 
 ### Run a Specific Test
@@ -68,10 +83,14 @@ cargo test conflict_marker --release -- --nocapture
 
 ### Debug Mode
 
-For debugging test failures, omit `--release` to get better stack traces:
+For debugging the safety-contract targets, omit `--release`:
 
 ```bash
-cargo test e2e_sync --release -- --nocapture 2>&1 | tee test_output.log
+cargo test \
+  --test e2e_sync_git_safety \
+  --test e2e_sync_status_health \
+  --test e2e_vcs_status \
+  -- --nocapture 2>&1 | tee test_output.log
 ```
 
 ## Artifact Locations
@@ -197,6 +216,12 @@ Detailed log: /tmp/tmpXXX/logs/sync_export_diff.log
 Verifies the core safety invariant: **sync never touches git**.
 
 Tests:
+- `e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation` - Runs
+  flush, import, import-rebuild, status (human and JSON), witness, merge,
+  additive plan/apply, every distinct supported no-DB sync path, and external
+  JSONL flush/status with a fake `git` first on `PATH`; each invocation compares
+  every `.git` path, byte, symlink target, and Unix mode with no
+  index/log/ref/object/config/HEAD exclusions
 - `regression_sync_export_does_not_create_commits` - Export leaves HEAD unchanged
 - `regression_sync_import_does_not_create_commits` - Import leaves HEAD unchanged
 - `regression_full_sync_cycle_does_not_touch_git` - Full cycle preserves git state
@@ -204,7 +229,58 @@ Tests:
 - `regression_sync_never_touches_source_files` - Source files are never modified
 - `integration_sync_only_touches_allowed_files` - Comprehensive allowlist verification
 
-### 2. Artifact Tests (`e2e_sync_artifacts.rs`)
+The companion fail-closed unit gate
+`sync_safety_source_scan_accepts_complete_real_tree` recursively inspects both
+`src/sync/**/*.rs` and `src/cli/commands/sync.rs`. Missing, unreadable,
+non-UTF-8, symlinked, or special source-tree entries fail the gate, as do
+direct subprocess construction, inclusion escape hatches, Git libraries, and
+delegation to process-capable CLI adapters. The focused command
+`cargo test --lib 'validation::tests::sync_safety_' -- --nocapture` selects the
+real-tree check, parsed dependency-policy guard, and every adversarial fixture.
+
+The central authority matrix invokes all operation dispatches, human/JSON
+status, additive plan/apply, all three merge-winner flags, manifest export,
+each accepted error-policy and orphan-mode spelling, rename-prefix import,
+supported no-DB operation paths, representative authorized external-source
+flush/import/witness/status combinations, and clap/dispatch rejection paths.
+It does not claim a separate authority branch for every numeric
+parallelism/chunk-size value: those knobs feed the already-exercised
+flush/witness implementations. Dedicated semantic tests remain responsible for
+conflict-winner, orphan, serialization-policy, and prefix-rewrite correctness.
+
+### 2. Explicit VCS Diagnostic Tests (`e2e_vcs_status.rs`)
+
+Verifies the `br.vcs-export-status.v2` contract without restoring VCS authority
+to sync. The E2E target covers untracked, committed, unstaged, staged,
+staged-plus-worktree, add/delete/recreate, unborn, ignored, intent-to-add,
+unmerged, assume-unchanged, skip-worktree, executable/type-change, SHA-1, and
+SHA-256 states. It also covers transform refusal for clean/process filters,
+text/eol, working-tree encoding, ident, local attributes files, and
+`core.autocrlf`; linked-worktree config, effective global transform config,
+`.git/info/attributes`, and config.worktree precedence are covered as distinct
+fixtures. The Unix process-filter sentinel proves the configured filter is not
+invoked. Missing Git, non-repository, corrupt-repository, absent leaf, missing
+parent, symlink rejection, authorized external capture-failure redaction, and
+honest human `unavailable` rendering are included.
+
+VCS runner unit tests (not the E2E target) cover probe-deadline precedence,
+hard-capped anonymous-file capture, mandatory direct-child termination/reaping,
+inherited descriptor behavior, mixed-case environment removal, parser failure
+modes, and non-UTF-8 paths. Source capture is fail-closed but remains
+deadline-aware between bounded reads; an individual filesystem read cannot be
+preempted, and cleanup may extend past the probe budget. Run both surfaces explicitly:
+
+```bash
+cargo test --lib 'cli::commands::vcs::tests' -- --nocapture
+cargo test --test e2e_vcs_status -- --nocapture
+```
+
+The selected Git executable is trusted after its ambient execution features
+are neutralized; these tests do not claim to sandbox or reap arbitrary
+daemonized descendants. Native Windows command execution is not implied by the
+Unix-only process sentinel.
+
+### 3. Artifact Tests (`e2e_sync_artifacts.rs`)
 
 Tests with detailed logging for debugging:
 
@@ -216,7 +292,7 @@ Tests with detailed logging for debugging:
 - `e2e_sync_export_empty_db` - Empty database handling
 - `e2e_sync_deterministic_export` - Export ordering consistency
 
-### 3. Fuzz/Edge Case Tests (`e2e_sync_fuzz_edge_cases.rs`)
+### 4. Fuzz/Edge Case Tests (`e2e_sync_fuzz_edge_cases.rs`)
 
 Tests malformed input handling:
 
@@ -232,7 +308,7 @@ Tests malformed input handling:
 - Deeply nested JSON
 - Partial write prevention
 
-### 4. Failure Injection Tests (`e2e_sync_failure_injection.rs`)
+### 5. Failure Injection Tests (`e2e_sync_failure_injection.rs`)
 
 Tests atomic operation guarantees:
 
@@ -245,7 +321,7 @@ Tests atomic operation guarantees:
 - Multiple sequential failures
 - Large JSONL preservation
 
-### 5. Preflight Tests (`e2e_sync_preflight_integration.rs`)
+### 6. Preflight Tests (`e2e_sync_preflight_integration.rs`)
 
 Tests early validation:
 
@@ -254,6 +330,24 @@ Tests early validation:
 - Path traversal rejection
 - Export safety checks
 - Actionable error messages
+
+### 6. Reconcile Tests (`e2e_sync_reconcile.rs`)
+
+Tests the additive `br sync --reconcile` mode (beads_rust-3r45):
+
+- False-equal cached-hash repair: `--import-only` skips, reconcile recovers
+- The CASS-shaped fixture: 1,732 DB issues + 1,915-row JSONL → created=183,
+  updated=5, all 315 audit events preserved byte-for-byte
+- Timestamp classification (newer updates, equal/older/tombstone skips)
+- Content-hash-only drift → uncertified local win + `needs_flush`
+- Relation import on created rows; unsuperseded relations survive
+- Scoped dangling-dependency cleanup (only rows reconcile wrote)
+- Malformed JSON / conflict markers / duplicate ids reject with a
+  byte-identical DB family
+- Dry-run mutates zero files (including `-wal`/`-shm`) and is deterministic
+- Plan/apply witness rollback on concurrent DB or JSONL change
+- Write-lock contention fails apply cleanly; read-only dry-run proceeds
+- External JSONL path policy, read-only JSONL, empty DB/JSONL, 2K+ row bulk
 
 ## Troubleshooting
 
@@ -270,7 +364,7 @@ This indicates a genuine safety regression. Steps:
 
 ```bash
 # Run with timeout
-timeout 120 cargo test e2e_sync --release
+timeout 120 cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status
 
 # Check for lock contention
 lsof +D /tmp/tmp.* 2>/dev/null | grep -E '\.db'
@@ -285,7 +379,7 @@ Some tests (failure injection) require filesystem permission manipulation:
 ls -la /tmp/
 
 # Some CI environments may restrict this - check stderr for details
-cargo test e2e_sync_failure_injection -- --nocapture
+cargo test --test e2e_sync_failure_injection -- --nocapture
 ```
 
 ### Flaky Tests
@@ -295,7 +389,7 @@ If tests pass/fail intermittently:
 1. Check for race conditions in parallel test execution
 2. Run with `--test-threads=1`:
    ```bash
-   cargo test e2e_sync --release -- --test-threads=1
+   cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status -- --test-threads=1
    ```
 
 ### "Command not found: br"
@@ -342,7 +436,7 @@ For CI pipelines:
 # GitHub Actions example
 - name: Run sync safety tests
   run: |
-    cargo test e2e_sync --release -- --nocapture 2>&1 | tee sync_test_output.log
+    cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status -- --nocapture 2>&1 | tee sync_test_output.log
 
 - name: Upload test artifacts on failure
   if: failure()

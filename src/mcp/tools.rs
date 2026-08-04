@@ -280,6 +280,7 @@ fn beads_to_mcp(err: impl Into<crate::BeadsError>) -> McpError {
         | ErrorCode::AmbiguousId
         | ErrorCode::ShuttingDown
         | ErrorCode::NothingToDo
+        | ErrorCode::CloseIncomplete
         | ErrorCode::CycleDetected
         | ErrorCode::DependencyNotFound
         | ErrorCode::HasDependents

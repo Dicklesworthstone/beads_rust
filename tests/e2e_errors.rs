@@ -307,7 +307,7 @@ fn e2e_update_tombstone_rejected() {
     assert!(!update.status.success(), "tombstone update should fail");
     assert_eq!(update.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&update.stderr).expect("should be valid error json");
+    let json = parse_error_json(&update.stdout).expect("should be valid error json");
     assert!(verify_error_structure(&json), "missing required fields");
     assert_eq!(json["error"]["code"], "VALIDATION_FAILED");
     assert!(
@@ -885,7 +885,7 @@ fn e2e_sync_rebuild_preserves_unflushed_tombstones_across_delegation() {
     // Regression: `br sync --import-only --rebuild` on an existing DB used
     // to lose tombstones that had not yet been flushed to JSONL. The
     // in-place path preserves them via `snapshot_tombstones` +
-    // `restore_tombstones` across `reset_data_tables`, but the new
+    // `restore_preserved_issues` across `reset_data_tables`, but the new
     // delegation path to `recover_database_from_jsonl` opens a fresh DB and
     // imports only what's in the JSONL. Unflushed tombstones therefore
     // vanished silently, taking their deletion-retention state with them.
@@ -1406,9 +1406,9 @@ fn e2e_sync_rename_prefix_failed_import_restores_original_corrupt_db_family() {
         "malformed JSONL should fail explicit import after deferred recovery"
     );
     assert!(
-        result.stderr.contains("Invalid JSON"),
-        "unexpected stderr: {}",
-        result.stderr
+        result.stdout.contains("Invalid JSON"),
+        "unexpected stdout: {}",
+        result.stdout
     );
 
     let restored_bytes = fs::read(&alt_db).expect("read restored alt db");
@@ -1611,9 +1611,9 @@ fn e2e_sync_rename_prefix_import_failure_does_not_leave_missing_db_created() {
         "malformed JSONL should fail explicit import after deferred recovery"
     );
     assert!(
-        result.stderr.contains("Invalid JSON"),
-        "unexpected stderr: {}",
-        result.stderr
+        result.stdout.contains("Invalid JSON"),
+        "unexpected stdout: {}",
+        result.stdout
     );
     assert!(
         !alt_db.exists(),
@@ -2009,7 +2009,7 @@ fn e2e_structured_error_not_initialized() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(2), "exit code should be 2");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2019,6 +2019,122 @@ fn e2e_structured_error_not_initialized() {
 }
 
 #[test]
+fn e2e_partially_applied_close_batch_does_not_exit_zero() {
+    // The process-level half of the defect. `br close <blocked> <closeable>`
+    // exited 0 while printing "Warning: Skipped ..." and leaving the blocked
+    // issue untouched, because the terminal error was gated on
+    // `closed_count == 0`. docs/agent/ERRORS.md tells callers to parse stdout
+    // precisely when the exit code is 0, so the transcript — which shows an
+    // unqualified "✓ Closed" and nothing else — was certified authoritative.
+    //
+    // This asserts the real ExitStatus of the real binary, not a Result, and
+    // then reads the record back rather than trusting the output. Under the old
+    // predicate it fails at the exit-code assertion with `Some(0)`.
+    let _log = common::test_log("e2e_partially_applied_close_batch_does_not_exit_zero");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "partial_close_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(
+        &workspace,
+        ["create", "Blocker issue", "-p", "2"],
+        "partial_close_create_blocker",
+    );
+    assert!(
+        blocker.status.success(),
+        "blocker create failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let blocked = run_br(
+        &workspace,
+        ["create", "Blocked issue", "-p", "2"],
+        "partial_close_create_blocked",
+    );
+    assert!(
+        blocked.status.success(),
+        "blocked create failed: {}",
+        blocked.stderr
+    );
+    let blocked_id = parse_created_id(&blocked.stdout);
+
+    let free = run_br(
+        &workspace,
+        ["create", "Independently closeable issue", "-p", "2"],
+        "partial_close_create_free",
+    );
+    assert!(free.status.success(), "free create failed: {}", free.stderr);
+    let free_id = parse_created_id(&free.stdout);
+
+    let dep_add = run_br(
+        &workspace,
+        ["dep", "add", &blocked_id, &blocker_id],
+        "partial_close_dep_add",
+    );
+    assert!(
+        dep_add.status.success(),
+        "dep add failed: {}",
+        dep_add.stderr
+    );
+
+    // One id is refused, the other closes. The batch is partially applied.
+    let close = run_br(
+        &workspace,
+        ["close", &blocked_id, &free_id, "--reason", "partial batch"],
+        "partial_close_batch",
+    );
+
+    assert!(
+        !close.status.success(),
+        "a partially applied batch must not report success; stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+    assert_eq!(
+        close.status.code(),
+        Some(3),
+        "partial close should exit 3, not 0; stdout={} stderr={}",
+        close.stdout,
+        close.stderr
+    );
+
+    // The record is the authority, not the transcript: one closed, one refused.
+    let show_blocked = run_br(
+        &workspace,
+        ["show", &blocked_id, "--json"],
+        "partial_close_show_blocked",
+    );
+    assert!(
+        show_blocked.status.success(),
+        "show blocked failed: {}",
+        show_blocked.stderr
+    );
+    assert!(
+        show_blocked.stdout.contains("\"status\":\"open\""),
+        "the blocked issue must still be open, got: {}",
+        show_blocked.stdout
+    );
+
+    let show_free = run_br(
+        &workspace,
+        ["show", &free_id, "--json"],
+        "partial_close_show_free",
+    );
+    assert!(
+        show_free.status.success(),
+        "show free failed: {}",
+        show_free.stderr
+    );
+    assert!(
+        show_free.stdout.contains("\"status\":\"closed\""),
+        "the closeable issue should have closed, got: {}",
+        show_free.stdout
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_transition_required_fields_are_structured_fresh_and_atomic() {
     let _log = common::test_log("e2e_transition_required_fields_are_structured_fresh_and_atomic");
     let workspace = BrWorkspace::new();
@@ -2484,6 +2600,128 @@ workflow:
 }
 
 #[test]
+fn e2e_workflow_capacity_leaf_work_excludes_aggregate_parents_and_reports_rollup() {
+    // GitHub #384 phase 3, end to end: an epic -> parent -> child chain
+    // occupies one leaf_work slot, not three, and `br show` reports the
+    // parent's derived rollup without mutating its explicit status.
+    let _log = common::test_log(
+        "e2e_workflow_capacity_leaf_work_excludes_aggregate_parents_and_reports_rollup",
+    );
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "capacity_leaf_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic_id =
+        create_issue_with_description(&workspace, "Epic", Some("epic"), None, "capacity_leaf_epic");
+    let parent_id =
+        create_issue_with_description(&workspace, "Parent", None, None, "capacity_leaf_parent");
+    let child_id =
+        create_issue_with_description(&workspace, "Child", None, None, "capacity_leaf_child");
+    let fresh_id =
+        create_issue_with_description(&workspace, "Fresh", None, None, "capacity_leaf_fresh");
+
+    for (child, parent, label) in [
+        (&parent_id, &epic_id, "capacity_leaf_dep_parent"),
+        (&child_id, &parent_id, "capacity_leaf_dep_child"),
+    ] {
+        let dep = run_br(
+            &workspace,
+            ["dep", "add", child, parent, "--type", "parent-child"],
+            label,
+        );
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    }
+
+    // Activate the whole chain before the policy exists so the pre-existing
+    // state is what hierarchy counting has to interpret.
+    let activate = run_br(
+        &workspace,
+        [
+            "update",
+            &epic_id,
+            &parent_id,
+            &child_id,
+            "--status",
+            "in_progress",
+        ],
+        "capacity_leaf_activate",
+    );
+    assert!(
+        activate.status.success(),
+        "activate failed: {}",
+        activate.stderr
+    );
+
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        r"
+workflow:
+  statuses: [open, in_progress, closed]
+  capacity:
+    counting:
+      hierarchy: leaf_work
+    statuses:
+      in_progress:
+        hard: 1
+",
+    )
+    .expect("write hierarchy capacity policy");
+
+    let rejected = run_br(
+        &workspace,
+        ["update", &fresh_id, "--status", "in_progress", "--json"],
+        "capacity_leaf_reject",
+    );
+    assert!(
+        !rejected.status.success(),
+        "admitting a fourth active issue must fail"
+    );
+    assert_eq!(rejected.status.code(), Some(4));
+    let json = parse_error_json(&rejected.stdout).expect("structured capacity error");
+    let error = &json["error"];
+    assert_eq!(error["code"], "WORKFLOW_CAPACITY_EXCEEDED");
+    assert_eq!(error["context"]["counting_mode"], "leaf_work");
+    // Three issues are in_progress, but the epic and the parent are
+    // aggregates: only the leaf counts.
+    assert_eq!(error["context"]["current"], 1);
+    assert_eq!(error["context"]["prospective"], 2);
+    assert_eq!(error["context"]["aggregate_parents_excluded"], 2);
+
+    // The rejected transition left no trace.
+    let show_fresh = run_br(
+        &workspace,
+        ["show", &fresh_id, "--json"],
+        "capacity_leaf_show_fresh",
+    );
+    let fresh: Value =
+        serde_json::from_str(&extract_json_payload(&show_fresh.stdout)).expect("show fresh json");
+    assert_eq!(fresh[0]["status"], "open");
+
+    // The parent keeps its own status and gains a derived rollup.
+    let show_parent = run_br(
+        &workspace,
+        ["show", &parent_id, "--json"],
+        "capacity_leaf_show_parent",
+    );
+    let parent: Value =
+        serde_json::from_str(&extract_json_payload(&show_parent.stdout)).expect("show parent json");
+    assert_eq!(parent[0]["status"], "in_progress");
+    assert_eq!(parent[0]["rollup"]["status"], "in_progress");
+    assert_eq!(parent[0]["rollup"]["descendants"]["in_progress"], 1);
+
+    // A childless leaf has no rollup key at all.
+    let show_child = run_br(
+        &workspace,
+        ["show", &child_id, "--json"],
+        "capacity_leaf_show_child",
+    );
+    let child: Value =
+        serde_json::from_str(&extract_json_payload(&show_child.stdout)).expect("show child json");
+    assert!(child[0].get("rollup").is_none());
+}
+
+#[test]
 fn e2e_structured_error_issue_not_found() {
     let _log = common::test_log("e2e_structured_error_issue_not_found");
     let workspace = BrWorkspace::new();
@@ -2499,7 +2737,7 @@ fn e2e_structured_error_issue_not_found() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(3), "exit code should be 3");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2538,7 +2776,7 @@ fn e2e_structured_error_cycle_detected() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(5), "exit code should be 5");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2567,7 +2805,7 @@ fn e2e_structured_error_self_dependency() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(5), "exit code should be 5");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2626,7 +2864,7 @@ fn e2e_structured_error_ambiguous_id() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(3), "exit code should be 3");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2662,7 +2900,7 @@ fn e2e_structured_error_jsonl_parse() {
     );
 
     // The error output should be valid JSON
-    let json = parse_error_json(&result.stderr);
+    let json = parse_error_json(&result.stdout);
     if let Some(json) = json {
         assert!(verify_error_structure(&json), "missing required fields");
     }
@@ -2695,7 +2933,7 @@ fn e2e_structured_error_conflict_markers() {
 
     // Should detect conflict markers
     assert!(
-        result.stderr.contains("conflict") || result.stderr.contains("CONFLICT"),
+        result.stdout.contains("conflict") || result.stdout.contains("CONFLICT"),
         "should detect conflict markers"
     );
 }
@@ -2764,9 +3002,9 @@ fn e2e_sync_flush_refuses_to_overwrite_conflict_markers() {
         "conflict-marker flush refusal should be a sync/config error, got {exit_code}"
     );
     assert!(
-        refused_flush.stderr.contains("conflict") || refused_flush.stderr.contains("CONFLICT"),
+        refused_flush.stdout.contains("conflict") || refused_flush.stdout.contains("CONFLICT"),
         "flush error should explain the unresolved conflict markers: {}",
-        refused_flush.stderr
+        refused_flush.stdout
     );
 
     let after_refusal = fs::read_to_string(&issues_path).expect("read refused jsonl");
@@ -2826,7 +3064,7 @@ fn e2e_structured_error_invalid_priority() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -2893,7 +3131,7 @@ fn e2e_error_text_vs_json_parity() {
     );
 
     // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
+    let json = parse_error_json(&json_result.stdout).expect("JSON mode should produce valid JSON");
     assert!(
         verify_error_structure(&json),
         "JSON error should have required fields"
@@ -2995,7 +3233,7 @@ fn e2e_structured_error_label_validation() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -3030,7 +3268,7 @@ fn e2e_structured_error_label_too_long() {
     assert!(!result.status.success());
     assert_eq!(result.status.code(), Some(4), "exit code should be 4");
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -3063,7 +3301,7 @@ fn e2e_structured_error_dependency_target_not_found() {
         "exit code should be 3 (issue not found)"
     );
 
-    let json = parse_error_json(&result.stderr).expect("should be valid JSON");
+    let json = parse_error_json(&result.stdout).expect("should be valid JSON");
     assert!(verify_error_structure(&json), "missing required fields");
 
     let error = &json["error"];
@@ -3688,7 +3926,7 @@ fn e2e_error_text_json_parity_validation() {
     );
 
     // JSON mode should produce valid structured error
-    let json = parse_error_json(&json_result.stderr).expect("JSON mode should produce valid JSON");
+    let json = parse_error_json(&json_result.stdout).expect("JSON mode should produce valid JSON");
     assert!(
         verify_error_structure(&json),
         "JSON error should have required fields"

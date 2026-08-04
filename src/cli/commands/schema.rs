@@ -12,6 +12,7 @@
 //! reading source code. The CLI surface marks `br schema` as
 //! not-yet-stable; agents should re-call across release boundaries.
 
+use crate::cli::commands::vcs::VcsExportStatus;
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
@@ -22,6 +23,7 @@ use crate::format::{
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
+use crate::sync::AdditiveReconcileReceipt;
 use crate::{config, output};
 use chrono::{DateTime, Utc};
 use schemars::{JsonSchema, Schema, generate::SchemaSettings};
@@ -117,8 +119,10 @@ struct CommandShape {
     /// the `schemas` map (e.g. `"Issue"`, `"IssueWithCounts"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     item_schema: Option<&'static str>,
-    /// On error, the same command writes an `ErrorEnvelope` to stderr.
-    /// True for commands that may fail per-call (e.g. lookups that miss).
+    /// Whether machine-mode failures write an `ErrorEnvelope` to stderr.
+    /// False means callers must consult the command notes for the actual
+    /// stream; the current top-level CLI handler emits structured errors on
+    /// stdout for the two safety command shapes below.
     error_envelope_on_stderr: bool,
     /// Free-form notes describing quirks of the envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,6 +205,15 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 "CoordinationClaimRow",
                 schema_for_output::<CoordinationClaimRow>(),
             );
+            schemas.insert(
+                "SyncReconcileReceipt",
+                schema_for_output::<crate::cli::commands::sync::SyncReconcileReceipt>(),
+            );
+            schemas.insert(
+                "AdditiveReconcileReceipt",
+                schema_for_output::<AdditiveReconcileReceipt>(),
+            );
+            schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Issue => {
@@ -236,6 +249,15 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 "CoordinationClaimRow",
                 schema_for_output::<CoordinationClaimRow>(),
             );
+        }
+        SchemaTarget::AdditiveReconciliation => {
+            schemas.insert(
+                "AdditiveReconcileReceipt",
+                schema_for_output::<AdditiveReconcileReceipt>(),
+            );
+        }
+        SchemaTarget::VcsStatus => {
+            schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
         }
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
@@ -273,6 +295,38 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     insert_dependency_command_shapes(&mut commands);
     insert_aggregate_command_shapes(&mut commands);
     insert_label_command_shapes(&mut commands);
+    commands.insert(
+        "sync --reconcile-additive",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("AdditiveReconcileReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Dry-run by default. Apply requires the exact plan_sha256 from an \
+                 identically configured reviewed dry-run via --expect-plan-sha256. \
+                 Structured machine-mode errors are currently emitted on stdout.",
+            ),
+        },
+    );
+    commands.insert(
+        "vcs-status",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("VcsExportStatus"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Explicit bounded read-only Git diagnostic. It is isolated from sync, \
+                 retains HEAD/index evidence when worktree comparison is unavailable, \
+                 never executes Git content filters, and reports sequential evidence with \
+                 observation_atomic=false. Structured machine-mode errors are currently \
+                 emitted on stdout.",
+            ),
+        },
+    );
 
     commands
 }
@@ -534,6 +588,24 @@ mod tests {
         assert!(
             !commands.is_empty(),
             "Commands target should emit a non-empty command map"
+        );
+    }
+
+    #[test]
+    fn vcs_status_schema_and_command_shape_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::VcsStatus);
+        assert!(schemas.contains_key("VcsExportStatus"));
+
+        let commands = build_commands(SchemaTarget::Commands);
+        let shape = commands
+            .get("vcs-status")
+            .expect("vcs-status command shape");
+        assert_eq!(shape.shape, "object");
+        assert_eq!(shape.jq_filter, ".");
+        assert_eq!(shape.item_schema, Some("VcsExportStatus"));
+        assert!(
+            !shape.error_envelope_on_stderr,
+            "top-level structured CLI errors are emitted on stdout"
         );
     }
 

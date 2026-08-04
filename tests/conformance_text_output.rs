@@ -12,31 +12,11 @@ use common::harness::ConformanceWorkspace;
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Check if the `bd` (Go beads) binary is available on the system.
-fn bd_available() -> bool {
-    let bd_bin = std::env::var("BD_BINARY").unwrap_or_else(|_| "bd".to_string());
-    std::process::Command::new(bd_bin)
-        .arg("version")
-        .output()
-        .is_ok_and(|o| {
-            if !o.status.success() {
-                return false;
-            }
-
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let Some(first_token) = stdout.split_whitespace().next() else {
-                return false;
-            };
-
-            matches!(first_token.to_ascii_lowercase().as_str(), "bd" | "beads")
-        })
-}
-
-/// Skip test if bd binary is not available (used in CI where only br is built)
+/// Skip test when `bd` is not a usable classic conformance reference.
 macro_rules! skip_if_no_bd {
     () => {
-        if !bd_available() {
-            eprintln!("Skipping test: 'bd' binary not found (expected in CI)");
+        if let Some(reason) = common::bd_skip_reason() {
+            eprintln!("Skipping conformance test: {reason}");
             return;
         }
     };

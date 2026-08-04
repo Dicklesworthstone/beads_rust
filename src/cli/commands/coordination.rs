@@ -195,11 +195,14 @@ fn build_coordination_status_output(
         .collect();
     let workspace = workspace_counts(storage, claims.len())?;
 
-    Ok(CoordinationStatusOutput::new(
-        generated_at,
-        workspace,
-        claims,
-    ))
+    let mut output = CoordinationStatusOutput::new(generated_at, workspace, claims);
+    // GitHub #384 phase 6: capacity occupancy, absent when unconfigured.
+    output.capacity = storage
+        .capacity_snapshot()?
+        .into_iter()
+        .map(crate::format::CapacityStat::from_snapshot)
+        .collect();
+    Ok(output)
 }
 
 struct ClaimRowContext<'a> {

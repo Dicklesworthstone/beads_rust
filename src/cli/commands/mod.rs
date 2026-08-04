@@ -7,13 +7,14 @@ use crate::storage::{IssueUpdate, SqliteStorage};
 use crate::sync::auto_import_if_stale;
 use crate::util::id::IdResolver;
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub mod agents;
 pub mod audit;
 pub mod blocked;
 pub mod capabilities;
+pub mod capacity;
 pub mod changelog;
 pub mod close;
 pub mod comments;
@@ -50,6 +51,7 @@ pub mod stale;
 pub mod stats;
 pub mod sync;
 pub mod update;
+pub mod vcs;
 pub mod version;
 pub mod r#where;
 
@@ -277,6 +279,28 @@ pub(super) fn finalize_batched_blocked_cache_refresh(
     }
 }
 
+/// Whether a CLI status filter contains the `all` meta-value
+/// (case-insensitive), meaning "every status" — the same convention
+/// `br lint --status all` uses. Without this, `all` would parse as the
+/// custom status literal `Custom("all")` and silently match nothing
+/// (beads_rust-6ilv).
+pub(super) fn status_filter_requests_all(statuses: &[String]) -> bool {
+    statuses
+        .iter()
+        .any(|status| status.trim().eq_ignore_ascii_case("all"))
+}
+
+/// Self-reported session identity for capacity occupancy and the `session`
+/// capacity scope (GitHub #384 phase 5). Env-only (`BR_SESSION`): a CLI flag
+/// would collide with `br close --session`, which records close metadata,
+/// and session identity is a harness-level property anyway.
+pub(super) fn session_attribution_from_env() -> Option<String> {
+    std::env::var("BR_SESSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 pub(super) fn update_issues_atomically_with_recovery(
     storage_ctx: &mut OpenStorageResult,
     allow_recovery: bool,
@@ -446,7 +470,7 @@ pub(super) fn external_project_db_paths_after_auto_import_if_needed(
 }
 
 pub(super) struct RoutedWorkspaceWriteLock {
-    _lock: Option<File>,
+    _lock: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     beads_dir: Option<PathBuf>,
 }
 
@@ -460,8 +484,8 @@ impl RoutedWorkspaceWriteLock {
     }
 
     pub(super) fn mark_cli_write_lock_held(&self, cli: &mut crate::config::CliOverrides) {
-        if let Some(beads_dir) = &self.beads_dir {
-            cli.held_write_lock_beads_dir = Some(beads_dir.clone());
+        if let (Some(beads_dir), Some(lock)) = (&self.beads_dir, &self._lock) {
+            cli.mark_database_family_lock_held(beads_dir, lock);
         }
     }
 }
@@ -475,16 +499,21 @@ pub(super) fn acquire_routed_workspace_write_lock(
         return Ok(RoutedWorkspaceWriteLock::local());
     }
 
+    let startup = crate::config::load_startup_config_with_paths(beads_dir, None)?;
     let lock_path = beads_dir.join(".write.lock");
-    let file =
-        crate::sync::blocking_write_lock_with_timeout(beads_dir, lock_timeout_ms).map_err(|err| {
+    let lock = crate::sync::blocking_database_family_write_lock_with_timeout(
+        beads_dir,
+        &startup.paths.db_path,
+        lock_timeout_ms,
+    )
+    .map_err(|err| {
             BeadsError::Config(format!(
                 "Routed external workspace is busy: target write lock at {} could not be acquired: {err}",
                 lock_path.display()
             ))
         })?;
     Ok(RoutedWorkspaceWriteLock {
-        _lock: Some(file),
+        _lock: Some(Arc::new(lock)),
         beads_dir: Some(beads_dir.to_path_buf()),
     })
 }
@@ -837,6 +866,7 @@ mod tests {
                 Some("agent-recovered"),
                 None,
                 Some("opus-4"),
+                None,
             ));
 
         retry_mutation_with_jsonl_recovery(

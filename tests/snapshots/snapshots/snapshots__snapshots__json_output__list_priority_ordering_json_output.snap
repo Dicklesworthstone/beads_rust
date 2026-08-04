@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/json_output.rs
+assertion_line: 643
 expression: normalized
 ---
 {
@@ -54,7 +55,7 @@ expression: normalized
     }
   ],
   "total": 3,
-  "limit": 50,
+  "limit": 0,
   "offset": 0,
   "has_more": false
 }

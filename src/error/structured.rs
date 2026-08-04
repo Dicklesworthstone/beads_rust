@@ -126,6 +126,8 @@ pub enum ErrorCode {
     ShuttingDown,
     /// All requested items were skipped; nothing to do
     NothingToDo,
+    /// Some requested items were applied and the rest were skipped
+    CloseIncomplete,
 
     // === Policy Errors (exit code 4) ===
     /// Closure-time policy gate fired (issue #274)
@@ -185,6 +187,7 @@ impl ErrorCode {
             // Operational
             Self::ShuttingDown => "SHUTTING_DOWN",
             Self::NothingToDo => "NOTHING_TO_DO",
+            Self::CloseIncomplete => "CLOSE_INCOMPLETE",
             // Policy
             Self::PolicyViolation => "POLICY_VIOLATION",
             Self::WorkflowCapacityExceeded => "WORKFLOW_CAPACITY_EXCEEDED",
@@ -241,7 +244,8 @@ impl ErrorCode {
             | Self::AmbiguousId
             | Self::IdCollision
             | Self::InvalidId
-            | Self::NothingToDo => 3,
+            | Self::NothingToDo
+            | Self::CloseIncomplete => 3,
             Self::ShuttingDown => 130,
             // Validation (4)
             Self::ValidationFailed
@@ -298,6 +302,18 @@ pub struct StructuredError {
     pub context: Option<Value>,
 }
 
+#[derive(Clone, Copy)]
+struct ArtifactCommitEvidence {
+    state: &'static str,
+    /// A namespace syscall is known to have completed. This does not by
+    /// itself prove which generation is installed at the destination.
+    namespace_changed: bool,
+    committed: Option<bool>,
+    durable: Option<bool>,
+    witnessed: Option<bool>,
+    requires_reconciliation: bool,
+}
+
 impl StructuredError {
     /// Create a new structured error from a `BeadsError`.
     #[must_use]
@@ -339,6 +355,74 @@ impl StructuredError {
             None => json!({
                 "wrapper_context": wrapper_context,
             }),
+        }
+    }
+
+    fn innermost_beads_error(err: &BeadsError) -> &BeadsError {
+        match err {
+            BeadsError::WithContext { source, .. } => source
+                .downcast_ref::<BeadsError>()
+                .map_or(err, Self::innermost_beads_error),
+            _ => err,
+        }
+    }
+
+    fn artifact_commit_evidence(
+        source: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> ArtifactCommitEvidence {
+        let Some(source) = source.downcast_ref::<BeadsError>() else {
+            return ArtifactCommitEvidence {
+                state: "not_committed",
+                namespace_changed: false,
+                committed: Some(false),
+                durable: None,
+                witnessed: None,
+                requires_reconciliation: false,
+            };
+        };
+
+        match Self::innermost_beads_error(source) {
+            BeadsError::JsonlPublishedButNotDurable { .. } => ArtifactCommitEvidence {
+                state: "committed_not_durable",
+                namespace_changed: true,
+                committed: Some(true),
+                durable: Some(false),
+                witnessed: Some(true),
+                requires_reconciliation: true,
+            },
+            BeadsError::JsonlPublishedButUnwitnessed { .. } => ArtifactCommitEvidence {
+                state: "published_unwitnessed",
+                namespace_changed: true,
+                committed: None,
+                durable: None,
+                witnessed: Some(false),
+                requires_reconciliation: true,
+            },
+            BeadsError::JsonlPublicationConflict { .. } => ArtifactCommitEvidence {
+                state: "publication_conflict",
+                namespace_changed: true,
+                committed: None,
+                durable: None,
+                witnessed: None,
+                requires_reconciliation: true,
+            },
+            BeadsError::CommittedStateUnwitnessed { .. }
+            | BeadsError::CommittedArtifactFailure { .. } => ArtifactCommitEvidence {
+                state: "committed_unwitnessed",
+                namespace_changed: false,
+                committed: Some(true),
+                durable: None,
+                witnessed: Some(false),
+                requires_reconciliation: true,
+            },
+            _ => ArtifactCommitEvidence {
+                state: "not_committed",
+                namespace_changed: false,
+                committed: Some(false),
+                durable: None,
+                witnessed: None,
+                requires_reconciliation: false,
+            },
         }
     }
 
@@ -638,6 +722,124 @@ impl StructuredError {
             BeadsError::SyncConflict { message } => {
                 (ErrorCode::SyncConflict, Some(json!({"message": message})))
             }
+            BeadsError::CommittedStateUnwitnessed { operation, source } => {
+                let source_context = source.downcast_ref::<BeadsError>().and_then(|error| {
+                    let (_, context) = Self::extract_code_and_context(error);
+                    context
+                });
+                (
+                    ErrorCode::SyncConflict,
+                    Some(json!({
+                    "operation": operation,
+                    "primary_commit_state": "committed_unwitnessed",
+                    "primary_committed": true,
+                    "primary_witnessed": false,
+                    "retryable": false,
+                    "requires_reconciliation": true,
+                    "source_context": source_context,
+                    })),
+                )
+            }
+            BeadsError::JsonlPublicationConflict {
+                output_path,
+                recovery_path,
+                message,
+            } => {
+                let evidence = Self::artifact_commit_evidence(err);
+                (
+                    ErrorCode::SyncConflict,
+                    Some(json!({
+                    "operation": "jsonl_publication",
+                    "output_path": output_path,
+                    "recovery_path": recovery_path,
+                    "message": message,
+                    "namespace_changed": evidence.namespace_changed,
+                    "artifact_commit_state": evidence.state,
+                    "artifact_committed": evidence.committed,
+                    "artifact_durable": evidence.durable,
+                    "artifact_witnessed": evidence.witnessed,
+                    "retryable": false,
+                    "requires_reconciliation": evidence.requires_reconciliation,
+                    })),
+                )
+            }
+            BeadsError::JsonlPublishedButNotDurable {
+                output_path,
+                recovery_path,
+                content_sha256,
+                ..
+            } => {
+                let evidence = Self::artifact_commit_evidence(err);
+                (
+                    ErrorCode::SyncConflict,
+                    Some(json!({
+                    "operation": "jsonl_publication",
+                    "output_path": output_path,
+                    "recovery_path": recovery_path,
+                    "content_sha256": content_sha256,
+                    "namespace_changed": evidence.namespace_changed,
+                    "artifact_commit_state": evidence.state,
+                    "artifact_committed": evidence.committed,
+                    "artifact_durable": evidence.durable,
+                    "artifact_witnessed": evidence.witnessed,
+                    "retryable": false,
+                    "requires_reconciliation": evidence.requires_reconciliation,
+                    })),
+                )
+            }
+            BeadsError::JsonlPublishedButUnwitnessed {
+                output_path,
+                recovery_path,
+                ..
+            } => {
+                let evidence = Self::artifact_commit_evidence(err);
+                (
+                    ErrorCode::SyncConflict,
+                    Some(json!({
+                    "operation": "jsonl_publication",
+                    "output_path": output_path,
+                    "recovery_path": recovery_path,
+                    "namespace_changed": evidence.namespace_changed,
+                    "artifact_commit_state": evidence.state,
+                    "artifact_committed": evidence.committed,
+                    "artifact_durable": evidence.durable,
+                    "artifact_witnessed": evidence.witnessed,
+                    "retryable": false,
+                    "requires_reconciliation": evidence.requires_reconciliation,
+                    })),
+                )
+            }
+            BeadsError::CommittedArtifactFailure {
+                operation,
+                primary_path,
+                artifact_path,
+                source,
+            } => {
+                let evidence = Self::artifact_commit_evidence(source.as_ref());
+                let source_context = source.downcast_ref::<BeadsError>().and_then(|error| {
+                    let (_, context) = Self::extract_code_and_context(error);
+                    context
+                });
+
+                (
+                    ErrorCode::SyncConflict,
+                    Some(json!({
+                    "operation": operation,
+                    "primary_path": primary_path,
+                    "artifact_path": artifact_path,
+                    "primary_committed": true,
+                    "namespace_changed": evidence.namespace_changed,
+                    "artifact_commit_state": evidence.state,
+                    "artifact_committed": evidence.committed,
+                    "artifact_durable": evidence.durable,
+                    "artifact_witnessed": evidence.witnessed,
+                    "requires_reconciliation": evidence.requires_reconciliation,
+                    "source_context": source_context,
+                    "retryable": false,
+                    "repair_artifact_only": true,
+                    })),
+                )
+            }
             BeadsError::DependencyCycle { path } => {
                 (ErrorCode::CycleDetected, Some(json!({"cycle_path": path})))
             }
@@ -662,6 +864,22 @@ impl StructuredError {
             BeadsError::NothingToDo { reason } => {
                 (ErrorCode::NothingToDo, Some(json!({"reason": reason})))
             }
+            BeadsError::CloseIncomplete {
+                closed,
+                skipped,
+                summary,
+            } => (
+                ErrorCode::CloseIncomplete,
+                // The counts ride in the envelope so stderr alone is a
+                // sufficient account of the partial batch: a caller that
+                // discards stdout on a non-zero exit still learns how many
+                // transitions landed and which ones did not.
+                Some(json!({
+                    "closed": closed,
+                    "skipped": skipped,
+                    "reason": summary,
+                })),
+            ),
             BeadsError::PolicyViolation {
                 issue_id,
                 summary,
@@ -764,27 +982,8 @@ impl StructuredError {
                 }
                 Some(format!("Use --force to delete '{id}' anyway."))
             }
-            BeadsError::NothingToDo { reason } => {
-                // The reason string carries the per-issue skip explanations
-                // (issue #380). Pick the hint that matches what actually
-                // happened instead of unconditionally claiming "already
-                // closed or not found" — that wording sent operators hunting
-                // for a nonexistent state bug when the skip was really a
-                // dependency block.
-                if reason.contains("blocked by") {
-                    Some(
-                        "Skipped issue(s) have open blocking dependencies. Close the blockers first, or re-run with --force to close anyway."
-                            .to_string(),
-                    )
-                } else if reason.contains("open children") || reason.contains("child issue") {
-                    Some(
-                        "Skipped issue(s) have open children. Close the children first, or re-run with --force to close anyway."
-                            .to_string(),
-                    )
-                } else {
-                    Some("All specified issues were already closed or not found.".to_string())
-                }
-            }
+            BeadsError::NothingToDo { reason } => Some(skip_reason_hint(reason)),
+            BeadsError::CloseIncomplete { summary, .. } => Some(skip_reason_hint(summary)),
             BeadsError::ShuttingDown => {
                 Some("Retry after starting a fresh br process.".to_string())
             }
@@ -793,6 +992,32 @@ impl StructuredError {
             )),
             _ => None,
         }
+    }
+}
+
+/// Pick the actionable hint for a batch whose per-issue skip reasons are
+/// rendered into `reasons`.
+///
+/// The reason string carries the per-issue skip explanations (issue #380).
+/// The hint has to match what actually happened instead of unconditionally
+/// claiming "already closed or not found" — that wording sent operators
+/// hunting for a nonexistent state bug when the skip was really a dependency
+/// block, and it is the last line of the output, which is where CLIs
+/// conventionally put the actionable summary.
+///
+/// Shared by [`BeadsError::NothingToDo`] (nothing landed) and
+/// [`BeadsError::CloseIncomplete`] (some landed): the skip reasons mean the
+/// same thing in both, so the hint must not depend on how many siblings
+/// happened to succeed.
+fn skip_reason_hint(reasons: &str) -> String {
+    if reasons.contains("blocked by") {
+        "Skipped issue(s) have open blocking dependencies. Close the blockers first, or re-run with --force to close anyway."
+            .to_string()
+    } else if reasons.contains("open children") || reasons.contains("child issue") {
+        "Skipped issue(s) have open children. Close the children first, or re-run with --force to close anyway."
+            .to_string()
+    } else {
+        "Skipped issue(s) were already closed or not found.".to_string()
     }
 }
 
@@ -1112,7 +1337,10 @@ mod tests {
                 capacity_kind: "status".to_string(),
                 capacity_name: "in_progress".to_string(),
                 scope: "repository".to_string(),
+                scope_key: None,
                 counting_mode: "all".to_string(),
+                aggregate_parents_excluded: None,
+                exempt: None,
                 current: 2,
                 prospective: 3,
                 soft_limit: Some(1),
@@ -1133,6 +1361,46 @@ mod tests {
         assert_eq!(
             context["policy_path"],
             "workflow.capacity.statuses.in_progress"
+        );
+        // `all` counting omits the hierarchy field entirely, so phase-1/2
+        // consumers see the exact evidence shape they saw before phase 3.
+        assert!(context.get("aggregate_parents_excluded").is_none());
+        // Likewise, no active exemption means no `exempt` field: phase-4
+        // evidence stays byte-identical for repos without exemptions.
+        assert!(context.get("exempt").is_none());
+    }
+
+    #[test]
+    fn workflow_capacity_error_reports_hierarchy_counting_evidence() {
+        let err = BeadsError::WorkflowCapacityExceeded {
+            violation: Box::new(crate::close_policy::WorkflowCapacityViolation {
+                issue_id: "bd-next".to_string(),
+                from_status: Some("open".to_string()),
+                to_status: "in_progress".to_string(),
+                capacity_kind: "group".to_string(),
+                capacity_name: "active_work".to_string(),
+                scope: "repository".to_string(),
+                scope_key: None,
+                counting_mode: "leaf_work".to_string(),
+                aggregate_parents_excluded: Some(2),
+                exempt: Some(1),
+                current: 2,
+                prospective: 3,
+                soft_limit: None,
+                hard_limit: 2,
+                policy_path: "workflow.capacity.groups.active_work".to_string(),
+            }),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("capacity evidence");
+        assert_eq!(context["counting_mode"], "leaf_work");
+        assert_eq!(context["aggregate_parents_excluded"], 2);
+        assert_eq!(context["exempt"], 1);
+        assert!(
+            err.to_string()
+                .contains("counting: leaf_work, aggregate-excluded: 2, exempt: 1"),
+            "hierarchy and exemption evidence missing from message: {err}"
         );
     }
 
@@ -1296,6 +1564,251 @@ mod tests {
         assert_eq!(
             context["wrapper_context"],
             "failed to rename recovered database"
+        );
+    }
+
+    #[test]
+    fn committed_artifact_error_preserves_nested_publication_evidence() {
+        let err = BeadsError::CommittedArtifactFailure {
+            operation: "flush".to_string(),
+            primary_path: ".beads/issues.jsonl".into(),
+            artifact_path: ".beads/manifest.json".into(),
+            source: Box::new(BeadsError::WithContext {
+                context: "publishing manifest generation".to_string(),
+                source: Box::new(BeadsError::JsonlPublishedButNotDurable {
+                    output_path: ".beads/manifest.json".into(),
+                    recovery_path: Some(".beads/manifest.json.recovery".into()),
+                    content_sha256: "a".repeat(64),
+                    source: io::Error::other("directory fsync failed"),
+                }),
+            }),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("artifact commit evidence");
+
+        assert_eq!(structured.code, ErrorCode::SyncConflict);
+        assert!(!structured.retryable);
+        assert_eq!(context["primary_committed"], true);
+        assert_eq!(context["namespace_changed"], true);
+        assert_eq!(context["artifact_commit_state"], "committed_not_durable");
+        assert_eq!(context["artifact_committed"], true);
+        assert_eq!(context["artifact_durable"], false);
+        assert_eq!(context["artifact_witnessed"], true);
+        assert_eq!(context["requires_reconciliation"], true);
+        assert_eq!(
+            context["source_context"]["wrapper_context"],
+            "publishing manifest generation"
+        );
+        assert_eq!(context["source_context"]["operation"], "jsonl_publication");
+    }
+
+    #[test]
+    fn committed_artifact_error_marks_prepublication_failure_as_not_committed() {
+        let err = BeadsError::CommittedArtifactFailure {
+            operation: "flush".to_string(),
+            primary_path: ".beads/issues.jsonl".into(),
+            artifact_path: ".beads/manifest.json".into(),
+            source: Box::new(io::Error::other("could not create staging file")),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("artifact commit evidence");
+
+        assert_eq!(context["primary_committed"], true);
+        assert_eq!(context["namespace_changed"], false);
+        assert_eq!(context["artifact_commit_state"], "not_committed");
+        assert_eq!(context["artifact_committed"], false);
+        assert!(context["artifact_durable"].is_null());
+        assert!(context["artifact_witnessed"].is_null());
+        assert_eq!(context["requires_reconciliation"], false);
+        assert!(context["source_context"].is_null());
+        assert_eq!(context["repair_artifact_only"], true);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn publication_errors_use_the_same_tri_state_direct_and_nested() {
+        struct Case {
+            name: &'static str,
+            error: fn() -> BeadsError,
+            commit_state: &'static str,
+            committed: Option<bool>,
+            durable: Option<bool>,
+            witnessed: Option<bool>,
+        }
+
+        fn not_durable_error() -> BeadsError {
+            BeadsError::JsonlPublishedButNotDurable {
+                output_path: ".beads/manifest.json".into(),
+                recovery_path: Some(".beads/manifest.json.recovery".into()),
+                content_sha256: "a".repeat(64),
+                source: io::Error::other("directory fsync failed"),
+            }
+        }
+
+        fn unwitnessed_error() -> BeadsError {
+            BeadsError::JsonlPublishedButUnwitnessed {
+                output_path: ".beads/manifest.json".into(),
+                recovery_path: Some(".beads/manifest.json.recovery".into()),
+                source: Box::new(io::Error::other("authority changed")),
+            }
+        }
+
+        fn conflict_error() -> BeadsError {
+            BeadsError::JsonlPublicationConflict {
+                output_path: ".beads/manifest.json".into(),
+                recovery_path: ".beads/manifest.json.recovery".into(),
+                message: "displaced generation did not match".to_string(),
+            }
+        }
+
+        fn assert_optional_bool(value: &Value, expected: Option<bool>, field: &str, case: &str) {
+            match expected {
+                Some(expected) => assert_eq!(
+                    value.as_bool(),
+                    Some(expected),
+                    "{case} should expose {field}={expected}"
+                ),
+                None => assert!(
+                    value.is_null(),
+                    "{case} should expose {field}=null, got {value}"
+                ),
+            }
+        }
+
+        let cases = [
+            Case {
+                name: "not_durable",
+                error: not_durable_error,
+                commit_state: "committed_not_durable",
+                committed: Some(true),
+                durable: Some(false),
+                witnessed: Some(true),
+            },
+            Case {
+                name: "unwitnessed",
+                error: unwitnessed_error,
+                commit_state: "published_unwitnessed",
+                committed: None,
+                durable: None,
+                witnessed: Some(false),
+            },
+            Case {
+                name: "conflict",
+                error: conflict_error,
+                commit_state: "publication_conflict",
+                committed: None,
+                durable: None,
+                witnessed: None,
+            },
+        ];
+
+        for case in cases {
+            let direct = StructuredError::from_error(&(case.error)());
+            let direct_context = direct.context.expect("direct publication evidence");
+            let nested = BeadsError::CommittedArtifactFailure {
+                operation: "flush".to_string(),
+                primary_path: ".beads/issues.jsonl".into(),
+                artifact_path: ".beads/manifest.json".into(),
+                source: Box::new((case.error)()),
+            };
+            let nested_context = StructuredError::from_error(&nested)
+                .context
+                .expect("nested publication evidence");
+
+            assert_eq!(direct.code, ErrorCode::SyncConflict);
+            assert!(!direct.retryable);
+            assert_eq!(direct_context["namespace_changed"], true);
+            assert_eq!(direct_context["artifact_commit_state"], case.commit_state);
+            assert_optional_bool(
+                &direct_context["artifact_committed"],
+                case.committed,
+                "artifact_committed",
+                case.name,
+            );
+            assert_optional_bool(
+                &direct_context["artifact_durable"],
+                case.durable,
+                "artifact_durable",
+                case.name,
+            );
+            assert_optional_bool(
+                &direct_context["artifact_witnessed"],
+                case.witnessed,
+                "artifact_witnessed",
+                case.name,
+            );
+            assert_eq!(direct_context["requires_reconciliation"], true);
+            assert!(
+                direct_context.get("primary_committed").is_none(),
+                "a direct artifact error must not claim a distinct primary commit"
+            );
+            for ambiguous_field in ["committed", "durable", "witnessed"] {
+                assert!(
+                    direct_context.get(ambiguous_field).is_none(),
+                    "direct publication evidence must use artifact-scoped field names"
+                );
+            }
+
+            assert_eq!(nested_context["primary_committed"], true);
+            for field in [
+                "namespace_changed",
+                "artifact_commit_state",
+                "artifact_committed",
+                "artifact_durable",
+                "artifact_witnessed",
+                "requires_reconciliation",
+            ] {
+                assert_eq!(
+                    nested_context[field], direct_context[field],
+                    "{} differs between direct and nested {field}",
+                    case.name
+                );
+                assert_eq!(
+                    nested_context["source_context"][field], direct_context[field],
+                    "{} source context differs from direct {field}",
+                    case.name
+                );
+            }
+
+            if case.committed.is_none() {
+                assert_ne!(
+                    direct_context["artifact_committed"].as_bool(),
+                    Some(true),
+                    "recovery must not interpret unknown direct commitment as confirmed"
+                );
+                assert_ne!(
+                    nested_context["artifact_committed"].as_bool(),
+                    Some(true),
+                    "recovery must not interpret unknown nested commitment as confirmed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn committed_state_error_preserves_nested_reconciliation_evidence() {
+        let err = BeadsError::CommittedStateUnwitnessed {
+            operation: "terminal sync merge adoption".to_string(),
+            source: Box::new(BeadsError::JsonlPublishedButUnwitnessed {
+                output_path: ".beads/issues.jsonl".into(),
+                recovery_path: Some(".beads/issues.jsonl.recovery".into()),
+                source: Box::new(io::Error::other("authority changed")),
+            }),
+        };
+
+        let structured = StructuredError::from_error(&err);
+        let context = structured.context.expect("committed state evidence");
+
+        assert_eq!(context["primary_commit_state"], "committed_unwitnessed");
+        assert_eq!(context["primary_committed"], true);
+        assert_eq!(context["primary_witnessed"], false);
+        assert_eq!(context["requires_reconciliation"], true);
+        assert_eq!(context["source_context"]["operation"], "jsonl_publication");
+        assert_eq!(
+            context["source_context"]["recovery_path"],
+            ".beads/issues.jsonl.recovery"
         );
     }
 

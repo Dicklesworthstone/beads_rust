@@ -378,11 +378,11 @@ fn e2e_routing_external_target_lock_blocks_routed_access() {
     );
     assert!(
         routed_show
-            .stderr
+            .stdout
             .contains("Routed external workspace is busy")
-            || routed_show.stderr.contains("target write lock"),
-        "expected target lock diagnostic, got stderr: {}",
-        routed_show.stderr
+            || routed_show.stdout.contains("target write lock"),
+        "expected target lock diagnostic, got stdout: {}",
+        routed_show.stdout
     );
 
     drop(lock_file);
@@ -1926,9 +1926,9 @@ fn e2e_routing_dep_add_rejects_direct_cross_project_target() {
         "dep add should reject bare cross-project targets"
     );
     assert!(
-        dep_add.stderr.contains("different projects") && dep_add.stderr.contains("external:"),
-        "unexpected stderr: {}",
-        dep_add.stderr
+        dep_add.stdout.contains("different projects") && dep_add.stdout.contains("external:"),
+        "unexpected stdout: {}",
+        dep_add.stdout
     );
 }
 
@@ -2336,8 +2336,13 @@ fn e2e_routing_label_add_failure_does_not_mutate_earlier_batches() {
         !label_add.status.success(),
         "expected routed label add with missing external issue to fail"
     );
+    // In JSON mode the structured error envelope is the whole of stdout
+    // (issue #336), so "no partial success output" means the payload is an
+    // error rather than a per-issue success list.
+    let label_add_json: Value = serde_json::from_str(label_add.stdout.trim())
+        .expect("failing routed label add should still emit one parseable JSON payload");
     assert!(
-        label_add.stdout.trim().is_empty(),
+        label_add_json.get("error").is_some(),
         "failing routed label add should not emit partial success output: {}",
         label_add.stdout
     );
@@ -3188,13 +3193,13 @@ fn e2e_routing_redirect_missing_target() {
     // Check that error messaging is clear when redirect/route fails
     if !show.status.success() {
         assert!(
-            show.stderr.contains("not found")
-                || show.stderr.contains("Redirect")
-                || show.stderr.contains("redirect")
-                || show.stderr.contains("Issue")
-                || show.stderr.contains("route"),
+            show.stdout.contains("not found")
+                || show.stdout.contains("Redirect")
+                || show.stdout.contains("redirect")
+                || show.stdout.contains("Issue")
+                || show.stdout.contains("route"),
             "Expected clear error about routing/redirect, got: {}",
-            show.stderr
+            show.stdout
         );
     }
     // If it succeeds (by falling back to local), that's also acceptable behavior
@@ -3518,9 +3523,9 @@ fn e2e_routing_not_initialized_error() {
         "Expected failure when not initialized"
     );
     assert!(
-        list.stderr.contains("not initialized")
-            || list.stderr.contains("br init")
-            || list.stderr.contains("NotInitialized"),
+        list.stdout.contains("not initialized")
+            || list.stdout.contains("br init")
+            || list.stdout.contains("NotInitialized"),
         "Expected clear error about initialization, got: {}",
         list.stderr
     );
@@ -3544,10 +3549,10 @@ fn e2e_routing_invalid_beads_dir_env() {
     );
     // Should fall back to discovery and fail with not initialized
     assert!(
-        list.stderr.contains("not initialized")
-            || list.stderr.contains("br init")
-            || list.stderr.contains("NotInitialized")
-            || list.stderr.contains("not found"),
+        list.stdout.contains("not initialized")
+            || list.stdout.contains("br init")
+            || list.stdout.contains("NotInitialized")
+            || list.stdout.contains("not found"),
         "Expected clear error, got: {}",
         list.stderr
     );
@@ -3597,9 +3602,9 @@ fn e2e_routing_show_external_issue_not_found() {
         "Expected failure for nonexistent issue"
     );
     assert!(
-        show.stderr.contains("not found")
-            || show.stderr.contains("Issue")
-            || show.stderr.contains("ext-nonexistent")
+        show.stdout.contains("not found")
+            || show.stdout.contains("Issue")
+            || show.stdout.contains("ext-nonexistent")
             || show.stderr.contains("No issue"),
         "Expected clear error about missing issue, got: {}",
         show.stderr

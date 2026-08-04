@@ -18,9 +18,13 @@
 
 mod common;
 
+#[cfg(unix)]
+use common::cli::{BrRun, extract_json_payload, run_br_with_env};
 use common::cli::{BrWorkspace, run_br};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -139,6 +143,573 @@ fn init_git_repo(workspace: &BrWorkspace) {
         .output()
         .expect("git commit");
     assert!(commit.status.success(), "initial commit failed");
+}
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+enum ExactGitEntry {
+    Directory { mode: u32 },
+    File { bytes: Vec<u8>, mode: u32 },
+    Symlink { target: PathBuf, mode: u32 },
+}
+
+#[cfg(unix)]
+fn snapshot_git_tree(root: &Path) -> BTreeMap<PathBuf, ExactGitEntry> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<PathBuf, ExactGitEntry>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut entries = fs::read_dir(directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|error| panic!("enumerate {}: {error}", directory.display()));
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("Git entry must remain under .git")
+                .to_path_buf();
+            let metadata = fs::symlink_metadata(&path)
+                .unwrap_or_else(|error| panic!("inspect {}: {error}", path.display()));
+            if metadata.file_type().is_symlink() {
+                snapshot.insert(
+                    relative,
+                    ExactGitEntry::Symlink {
+                        target: fs::read_link(&path)
+                            .unwrap_or_else(|error| panic!("readlink {}: {error}", path.display())),
+                        mode: metadata.permissions().mode(),
+                    },
+                );
+            } else if metadata.is_dir() {
+                snapshot.insert(
+                    relative,
+                    ExactGitEntry::Directory {
+                        mode: metadata.permissions().mode(),
+                    },
+                );
+                visit(root, &path, snapshot);
+            } else if metadata.is_file() {
+                snapshot.insert(
+                    relative,
+                    ExactGitEntry::File {
+                        bytes: fs::read(&path)
+                            .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+                        mode: metadata.permissions().mode(),
+                    },
+                );
+            } else {
+                panic!("unsupported .git entry type: {}", path.display());
+            }
+        }
+    }
+
+    let mut snapshot = BTreeMap::new();
+    let root_metadata =
+        fs::symlink_metadata(root).unwrap_or_else(|error| panic!("inspect .git root: {error}"));
+    assert!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        ".git root must be a real directory"
+    );
+    snapshot.insert(
+        PathBuf::new(),
+        ExactGitEntry::Directory {
+            mode: root_metadata.permissions().mode(),
+        },
+    );
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+#[cfg(unix)]
+fn changed_git_entries(
+    before: &BTreeMap<PathBuf, ExactGitEntry>,
+    after: &BTreeMap<PathBuf, ExactGitEntry>,
+) -> Vec<PathBuf> {
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .cloned()
+        .collect()
+}
+
+#[cfg(unix)]
+fn guarded_sync(
+    workspace: &BrWorkspace,
+    sentinel_path: &Path,
+    sentinel_dir: &Path,
+    args: &[String],
+    extra_env: &[(OsString, OsString)],
+    label: &str,
+) -> BrRun {
+    assert!(
+        !sentinel_path.exists(),
+        "Git PATH sentinel was already invoked before {label}"
+    );
+    let git_dir = workspace.root.join(".git");
+    let before = snapshot_git_tree(&git_dir);
+    let mut environment = extra_env.to_vec();
+    environment.push((
+        OsString::from("PATH"),
+        sentinel_dir.as_os_str().to_os_string(),
+    ));
+    let result = run_br_with_env(workspace, args.iter(), environment, label);
+    let after = snapshot_git_tree(&git_dir);
+    assert!(
+        !sentinel_path.exists(),
+        "SAFETY VIOLATION: {label} invoked the PATH sentinel named git"
+    );
+    assert!(
+        before == after,
+        "SAFETY VIOLATION: {label} changed byte-exact .git state: {:?}",
+        changed_git_entries(&before, &after)
+    );
+    result
+}
+
+#[cfg(unix)]
+fn strings(args: &[&str]) -> Vec<String> {
+    args.iter().map(ToString::to_string).collect()
+}
+
+/// One fail-closed matrix covers every sync operation, both status renderings,
+/// reconciliation plan/apply, and the external-JSONL path. Each invocation
+/// runs with a fake `git` first on PATH to detect ordinary executable-name
+/// dispatch and compares every byte and entry under `.git` before/after with no
+/// index/log/ref/object/config/HEAD exceptions. Static source/dependency guards
+/// cover absolute-path, shell, linked-library, and sibling-adapter authority.
+#[cfg(unix)]
+#[test]
+fn e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _log = common::test_log("e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation");
+    let workspace = BrWorkspace::new();
+    init_git_repo(&workspace);
+    let init = run_br(&workspace, ["init"], "matrix_init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let create = run_br(
+        &workspace,
+        ["create", "Sync safety matrix seed"],
+        "matrix_create",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+
+    let sentinel_dir = workspace.root.join("git-path-sentinel");
+    fs::create_dir(&sentinel_dir).expect("create Git PATH sentinel directory");
+    let sentinel_path = sentinel_dir.join("INVOKED");
+    let fake_git = sentinel_dir.join("git");
+    assert!(
+        !sentinel_path.to_string_lossy().contains('\''),
+        "temporary sentinel path unexpectedly contains a shell quote"
+    );
+    fs::write(
+        &fake_git,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 97\n",
+            sentinel_path.to_string_lossy()
+        ),
+    )
+    .expect("write fake git");
+    let mut permissions = fs::metadata(&fake_git)
+        .expect("fake git metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_git, permissions).expect("make fake git executable");
+
+    for (label, args) in [
+        (
+            "matrix_flush",
+            strings(&["sync", "--flush-only", "--force"]),
+        ),
+        (
+            "matrix_import",
+            strings(&["sync", "--import-only", "--force"]),
+        ),
+        (
+            "matrix_import_rebuild",
+            strings(&["sync", "--import-only", "--rebuild"]),
+        ),
+        (
+            "matrix_import_rename_prefix",
+            strings(&["sync", "--import-only", "--force", "--rename-prefix"]),
+        ),
+        (
+            "matrix_import_orphans_strict",
+            strings(&["sync", "--import-only", "--force", "--orphans", "strict"]),
+        ),
+        (
+            "matrix_import_orphans_resurrect",
+            strings(&["sync", "--import-only", "--force", "--orphans", "resurrect"]),
+        ),
+        (
+            "matrix_import_orphans_skip",
+            strings(&["sync", "--import-only", "--force", "--orphans", "skip"]),
+        ),
+        (
+            "matrix_import_orphans_allow",
+            strings(&["sync", "--import-only", "--force", "--orphans", "allow"]),
+        ),
+        (
+            "matrix_flush_manifest",
+            strings(&["sync", "--flush-only", "--force", "--manifest"]),
+        ),
+        (
+            "matrix_flush_policy_strict",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "strict",
+            ]),
+        ),
+        (
+            "matrix_flush_policy_best_effort",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "best-effort",
+            ]),
+        ),
+        (
+            "matrix_flush_policy_partial",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "partial",
+            ]),
+        ),
+        (
+            "matrix_flush_policy_required_core",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "required-core",
+            ]),
+        ),
+        ("matrix_status_human", strings(&["sync", "--status"])),
+        (
+            "matrix_status_json",
+            strings(&["sync", "--status", "--json"]),
+        ),
+        ("matrix_witness", strings(&["sync", "--witness", "--json"])),
+    ] {
+        let result = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            result.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            result.stdout,
+            result.stderr
+        );
+        if label == "matrix_status_human" {
+            assert!(
+                result.stdout.contains("VCS status: not probed"),
+                "human sync status omitted the stable VCS state:\n{}",
+                result.stdout
+            );
+            assert!(
+                result.stdout.contains("br vcs-status --json"),
+                "human sync status omitted the explicit diagnostic pointer:\n{}",
+                result.stdout
+            );
+        }
+    }
+
+    // These modes have distinct, supported JSONL-only implementations. A
+    // reviewed additive reconciliation is deliberately absent: it compares
+    // against and may apply to the durable database, so `--no-db` does not
+    // select another execution path for that mode.
+    for (label, args) in [
+        (
+            "matrix_no_db_flush",
+            strings(&["--no-db", "sync", "--flush-only", "--force"]),
+        ),
+        (
+            "matrix_no_db_import",
+            strings(&["--no-db", "sync", "--import-only"]),
+        ),
+        (
+            "matrix_no_db_status_human",
+            strings(&["--no-db", "sync", "--status"]),
+        ),
+        (
+            "matrix_no_db_status_json",
+            strings(&["--no-db", "sync", "--status", "--json"]),
+        ),
+        (
+            "matrix_no_db_witness",
+            strings(&["--no-db", "sync", "--witness", "--json"]),
+        ),
+    ] {
+        let result = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            result.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            result.stdout,
+            result.stderr
+        );
+        if label == "matrix_no_db_status_human" {
+            assert!(
+                result.stdout.contains("VCS status: not probed"),
+                "no-DB human sync status omitted the stable VCS state:\n{}",
+                result.stdout
+            );
+            assert!(
+                result.stdout.contains("br vcs-status --json"),
+                "no-DB human sync status omitted the explicit diagnostic pointer:\n{}",
+                result.stdout
+            );
+        }
+    }
+
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    fs::copy(&jsonl_path, workspace.root.join(".beads/beads.base.jsonl")).expect("seed merge base");
+    // Merge correctness has dedicated semantic tests. This matrix exercises
+    // every conflict-resolution dispatch policy under the no-process/no-.git
+    // authority sentinel, even when the converged fixture has no conflict.
+    for (label, args) in [
+        (
+            "matrix_merge_manual",
+            strings(&["sync", "--merge", "--json"]),
+        ),
+        (
+            "matrix_merge_force_db",
+            strings(&["sync", "--merge", "--force-db", "--json"]),
+        ),
+        (
+            "matrix_merge_force_jsonl",
+            strings(&["sync", "--merge", "--force-jsonl", "--json"]),
+        ),
+        (
+            "matrix_merge_force_newer",
+            strings(&["sync", "--merge", "--force", "--json"]),
+        ),
+    ] {
+        let merge = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            merge.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            merge.stdout,
+            merge.stderr
+        );
+    }
+    let no_db_merge = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["--no-db", "sync", "--merge", "--json"]),
+        &[],
+        "matrix_no_db_merge",
+    );
+    assert!(
+        no_db_merge.status.success(),
+        "no-DB merge failed\nstdout:\n{}\nstderr:\n{}",
+        no_db_merge.stdout,
+        no_db_merge.stderr
+    );
+
+    let plan = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["sync", "--reconcile-additive", "--json"]),
+        &[],
+        "matrix_reconcile_plan",
+    );
+    assert!(
+        plan.status.success(),
+        "reconcile plan failed\nstdout:\n{}\nstderr:\n{}",
+        plan.stdout,
+        plan.stderr
+    );
+    let plan: serde_json::Value =
+        serde_json::from_str(&extract_json_payload(&plan.stdout)).expect("reconcile plan JSON");
+    let plan_sha256 = plan["plan_sha256"]
+        .as_str()
+        .expect("reconcile plan token")
+        .to_string();
+    let apply_args = vec![
+        "sync".to_string(),
+        "--reconcile-additive".to_string(),
+        "--apply".to_string(),
+        "--expect-plan-sha256".to_string(),
+        plan_sha256,
+        "--json".to_string(),
+    ];
+    let apply = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &apply_args,
+        &[],
+        "matrix_reconcile_apply",
+    );
+    assert!(
+        apply.status.success(),
+        "reconcile apply failed\nstdout:\n{}\nstderr:\n{}",
+        apply.stdout,
+        apply.stderr
+    );
+
+    let external_dir = workspace.root.join("external-jsonl-target");
+    fs::create_dir(&external_dir).expect("create external JSONL directory");
+    let external_jsonl = external_dir.join("issues.jsonl");
+    let external_env = vec![(
+        OsString::from("BEADS_JSONL"),
+        external_jsonl.as_os_str().to_os_string(),
+    )];
+    let external = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["sync", "--flush-only", "--force", "--allow-external-jsonl"]),
+        &external_env,
+        "matrix_external_jsonl",
+    );
+    assert!(
+        external.status.success(),
+        "external JSONL sync failed\nstdout:\n{}\nstderr:\n{}",
+        external.stdout,
+        external.stderr
+    );
+    assert!(external_jsonl.is_file(), "external JSONL was not written");
+
+    for (label, args) in [
+        (
+            "matrix_external_jsonl_import",
+            strings(&["sync", "--import-only", "--force", "--allow-external-jsonl"]),
+        ),
+        (
+            "matrix_external_jsonl_witness",
+            strings(&["sync", "--witness", "--allow-external-jsonl", "--json"]),
+        ),
+        (
+            "matrix_external_jsonl_status",
+            strings(&["sync", "--status", "--allow-external-jsonl", "--json"]),
+        ),
+        (
+            "matrix_no_db_external_jsonl_status",
+            strings(&[
+                "--no-db",
+                "sync",
+                "--status",
+                "--allow-external-jsonl",
+                "--json",
+            ]),
+        ),
+        (
+            "matrix_no_db_external_jsonl_import",
+            strings(&[
+                "--no-db",
+                "sync",
+                "--import-only",
+                "--force",
+                "--allow-external-jsonl",
+            ]),
+        ),
+    ] {
+        let status = guarded_sync(
+            &workspace,
+            &sentinel_path,
+            &sentinel_dir,
+            &args,
+            &external_env,
+            label,
+        );
+        assert!(
+            status.status.success(),
+            "{label} failed\nstdout:\n{}\nstderr:\n{}",
+            status.stdout,
+            status.stderr
+        );
+        if label.contains("status") {
+            let payload: serde_json::Value =
+                serde_json::from_str(&extract_json_payload(&status.stdout))
+                    .expect("external JSONL status JSON");
+            assert_eq!(payload["git_export"]["available"], false, "{payload}");
+            assert_eq!(payload["git_export"]["reason"], "not_probed", "{payload}");
+            assert_eq!(
+                payload["git_export"]["diagnostic_command"], "br vcs-status --json",
+                "{payload}"
+            );
+        }
+    }
+
+    // Invalid combinations are part of the authority boundary too: they must
+    // fail before any future fallback or error-reporting path can delegate to
+    // Git. These cases cover clap-level and dispatch-level rejection.
+    for (label, args) in [
+        ("matrix_reject_no_mode", strings(&["sync"])),
+        (
+            "matrix_reject_force_db_without_merge",
+            strings(&["sync", "--flush-only", "--force-db"]),
+        ),
+        (
+            "matrix_reject_conflicting_merge_winners",
+            strings(&["sync", "--merge", "--force-db", "--force-jsonl"]),
+        ),
+        (
+            "matrix_reject_force_and_force_db",
+            strings(&["sync", "--merge", "--force", "--force-db"]),
+        ),
+        (
+            "matrix_reject_rebuild_flush",
+            strings(&["sync", "--flush-only", "--rebuild"]),
+        ),
+        (
+            "matrix_reject_multiple_modes",
+            strings(&["sync", "--status", "--import-only"]),
+        ),
+        (
+            "matrix_reject_invalid_error_policy",
+            strings(&[
+                "sync",
+                "--flush-only",
+                "--force",
+                "--error-policy",
+                "invalid",
+            ]),
+        ),
+        (
+            "matrix_reject_invalid_orphan_mode",
+            strings(&["sync", "--import-only", "--force", "--orphans", "invalid"]),
+        ),
+    ] {
+        let rejected = guarded_sync(&workspace, &sentinel_path, &sentinel_dir, &args, &[], label);
+        assert!(
+            !rejected.status.success(),
+            "{label} unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+            rejected.stdout,
+            rejected.stderr
+        );
+    }
+
+    let external_without_opt_in = guarded_sync(
+        &workspace,
+        &sentinel_path,
+        &sentinel_dir,
+        &strings(&["sync", "--status", "--json"]),
+        &external_env,
+        "matrix_reject_external_without_opt_in",
+    );
+    assert!(
+        !external_without_opt_in.status.success(),
+        "external status without explicit opt-in unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        external_without_opt_in.stdout,
+        external_without_opt_in.stderr
+    );
 }
 
 /// Regression test: sync export does not create git commits or mutate .git
@@ -702,12 +1273,14 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
 
     // Check extension matches
     const ALLOWED_EXTENSIONS: &[&str] = &[
-        "db",         // SQLite database
-        "db-journal", // SQLite rollback journal
-        "db-wal",     // SQLite WAL
-        "db-shm",     // SQLite shared memory
-        "jsonl",      // JSONL export
-        "jsonl.tmp",  // Atomic write temp files
+        "db",                 // SQLite database
+        "db-journal",         // SQLite rollback journal
+        "db-wal",             // SQLite WAL
+        "db-shm",             // SQLite shared memory
+        "db-fsqlite-ns-gate", // fsqlite multi-process namespace gate
+        "db-fsqlite-ns-use",  // fsqlite multi-process namespace use-count
+        "jsonl",              // JSONL export
+        "jsonl.tmp",          // Atomic write temp files
     ];
 
     for ext in ALLOWED_EXTENSIONS {
