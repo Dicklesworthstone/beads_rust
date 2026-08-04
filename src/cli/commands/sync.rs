@@ -2312,9 +2312,25 @@ fn execute_flush(
             )));
         }
 
-        // Certified: replace the anchor with the exact snapshot bytes (also
-        // covers the missing-anchor case).
-        refresh_base_snapshot_from_flushed_jsonl_snapshot(noop_source, &path_policy.beads_dir)?;
+        // Certified: ensure the anchor holds the exact snapshot bytes (also
+        // covers the missing-anchor case). A byte-identical regular-file
+        // anchor is left untouched so an idempotent no-op flush keeps its
+        // inode; anything else (missing, symlinked, byte-divergent — even
+        // whitespace-only drift the content hash cannot see) is replaced
+        // with the exact snapshot bytes.
+        let anchor_path = path_policy.beads_dir.join("beads.base.jsonl");
+        let snapshot_bytes = {
+            let mut bytes = Vec::with_capacity(usize::try_from(noop_source.size()).unwrap_or(0));
+            std::io::copy(&mut noop_source.reader(), &mut bytes).map_err(BeadsError::Io)?;
+            bytes
+        };
+        let anchor_is_exact = fs::symlink_metadata(&anchor_path)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+            && fs::read(&anchor_path).is_ok_and(|bytes| bytes == snapshot_bytes);
+        if !anchor_is_exact {
+            refresh_base_snapshot_from_flushed_jsonl_snapshot(noop_source, &path_policy.beads_dir)?;
+        }
 
         if use_json {
             let result = FlushResult {
