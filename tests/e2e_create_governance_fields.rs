@@ -15,7 +15,11 @@ fn show_issue(workspace: &BrWorkspace, id: &str) -> Value {
         "show_issue",
     );
     assert!(show.status.success(), "show failed: {}", show.stderr);
-    serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show JSON")
+    // `br show --json` emits an array of issues.
+    let mut issues: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show JSON");
+    assert_eq!(issues.len(), 1, "expected exactly one issue for {id}");
+    issues.remove(0)
 }
 
 fn jsonl_record_for(workspace: &BrWorkspace, id: &str) -> Value {
@@ -66,7 +70,9 @@ fn e2e_create_with_acceptance_criteria_and_agent_context() {
         Some("- [ ] guard refuses\n- [ ] test passes"),
         "create JSON output must carry acceptance criteria"
     );
-    let context_out = created["agent_context"].as_str().expect("agent_context in create JSON");
+    let context_out = created["agent_context"]
+        .as_str()
+        .expect("agent_context in create JSON");
     let context_json: Value = serde_json::from_str(context_out).expect("context is JSON");
     assert_eq!(context_json["workflow"].as_str(), Some("tdd"));
 
@@ -115,7 +121,10 @@ fn e2e_create_acceptance_alias() {
     assert!(create.status.success(), "create failed: {}", create.stderr);
     let id = parse_created_id(&create.stdout);
     let shown = show_issue(&workspace, &id);
-    assert_eq!(shown["acceptance_criteria"].as_str(), Some("- [ ] alias works"));
+    assert_eq!(
+        shown["acceptance_criteria"].as_str(),
+        Some("- [ ] alias works")
+    );
 }
 
 /// `--agent-context @file.json` and `@file.yaml` normalize exactly like
@@ -144,7 +153,11 @@ fn e2e_create_agent_context_file_forms() {
         ],
         "create_ctx_json",
     );
-    assert!(create_json.status.success(), "create failed: {}", create_json.stderr);
+    assert!(
+        create_json.status.success(),
+        "create failed: {}",
+        create_json.stderr
+    );
     let id_json = parse_created_id(&create_json.stdout);
     let ctx_json: Value = serde_json::from_str(
         show_issue(&workspace, &id_json)["agent_context"]
@@ -166,7 +179,11 @@ fn e2e_create_agent_context_file_forms() {
         ],
         "create_ctx_yaml",
     );
-    assert!(create_yaml.status.success(), "create failed: {}", create_yaml.stderr);
+    assert!(
+        create_yaml.status.success(),
+        "create failed: {}",
+        create_yaml.stderr
+    );
     let id_yaml = parse_created_id(&create_yaml.stdout);
     let ctx_yaml: Value = serde_json::from_str(
         show_issue(&workspace, &id_yaml)["agent_context"]
@@ -232,7 +249,13 @@ fn e2e_create_invalid_agent_context_leaves_no_trace() {
 
     let list = run_br(
         &workspace,
-        ["list", "--all", "--json", "--no-auto-flush", "--no-auto-import"],
+        [
+            "list",
+            "--all",
+            "--json",
+            "--no-auto-flush",
+            "--no-auto-import",
+        ],
         "list_after_invalid",
     );
     assert!(list.status.success(), "list failed: {}", list.stderr);
@@ -242,8 +265,8 @@ fn e2e_create_invalid_agent_context_leaves_no_trace() {
         list.stdout
     );
 
-    let jsonl = fs::read_to_string(workspace.root.join(".beads").join("issues.jsonl"))
-        .unwrap_or_default();
+    let jsonl =
+        fs::read_to_string(workspace.root.join(".beads").join("issues.jsonl")).unwrap_or_default();
     assert!(
         !jsonl.contains("Broken context"),
         "no JSONL record may exist after a rejected create"
@@ -251,7 +274,13 @@ fn e2e_create_invalid_agent_context_leaves_no_trace() {
 
     let status = run_br(
         &workspace,
-        ["sync", "--status", "--json", "--no-auto-flush", "--no-auto-import"],
+        [
+            "sync",
+            "--status",
+            "--json",
+            "--no-auto-flush",
+            "--no-auto-import",
+        ],
         "sync_status_after_invalid",
     );
     assert!(status.status.success(), "status failed: {}", status.stderr);
@@ -274,7 +303,12 @@ fn e2e_create_without_governance_flags_unchanged() {
 
     let create = run_br(
         &workspace,
-        ["create", "Plain issue", "--no-auto-flush", "--no-auto-import"],
+        [
+            "create",
+            "Plain issue",
+            "--no-auto-flush",
+            "--no-auto-import",
+        ],
         "create_plain",
     );
     assert!(create.status.success(), "create failed: {}", create.stderr);

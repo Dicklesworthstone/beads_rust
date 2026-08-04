@@ -519,16 +519,9 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("usernames".to_string());
     }
 
-    // 13. Mask version numbers
-    if config.mask_version_numbers && DOCTOR_BINARY_VERSION_OK_RE.is_match(&normalized) {
-        normalized = DOCTOR_BINARY_VERSION_OK_RE
-            .replace_all(
-                &normalized,
-                "OK binary_version: Running br X.Y.Z; no newer source-tree version detected",
-            )
-            .to_string();
-        log.push("doctor_binary_version".to_string());
-    }
+    // 13. Mask version numbers. (Whole doctor `binary_version` result lines
+    // are replaced outright by the host-tooling rule in step 13b, which
+    // subsumes the older OK-line version mask that lived here.)
     if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
         normalized = VERSION_NUM_RE
             .replace_all(&normalized, "$1 X.Y.Z")
@@ -873,17 +866,19 @@ mod golden_snapshot_tests {
 
     #[test]
     fn test_mask_doctor_binary_version_ok_variants() {
+        // Both OK-line variants collapse to the same host-independent form
+        // (the whole check-result line is host-dependent, so step 13b
+        // replaces it outright); no version number may survive.
         let outside_tree = TextSnapshot::golden(
             "OK binary_version: Running br 0.2.15; no beads_rust Cargo.toml reachable from .beads/ — not flagging",
         );
         let inside_tree = TextSnapshot::golden(
             "OK binary_version: Running br 0.2.19; matches (or is ahead of) Cargo.toml at /data/projects/beads_rust/Cargo.toml (0.2.19)",
         );
-        assert_eq!(
-            outside_tree.normalized,
-            "OK binary_version: Running br X.Y.Z; no newer source-tree version detected"
-        );
+        assert_eq!(outside_tree.normalized, "HOST-DEPENDENT binary_version");
         assert_eq!(inside_tree.normalized, outside_tree.normalized);
+        assert!(!outside_tree.normalized.contains("0.2.15"));
+        assert!(!inside_tree.normalized.contains("0.2.19"));
     }
 
     #[test]

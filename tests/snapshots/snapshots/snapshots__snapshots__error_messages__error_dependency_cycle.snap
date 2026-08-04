@@ -3,4 +3,4 @@ source: tests/snapshots/error_messages.rs
 expression: normalize_output(&output.stderr)
 ---
 Error: Cycle detected in dependencies: Adding dependency ID-REDACTED -> ID-REDACTED would create a cycle
-Hint: Remove one dependency to break the cycle
+Hint: Remove one dependency to break the cycle. Note: epic containment participates in blocking cycles — depending on an epic implies depending on its entire subtree, so the cycle may traverse ID-REDACTED edges that the message does not list (see docs/CLI_REFERENCE.md, `dep add`)

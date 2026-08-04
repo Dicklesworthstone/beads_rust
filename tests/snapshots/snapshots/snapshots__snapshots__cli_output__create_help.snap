@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots/cli_output.rs
-assertion_line: 65
 expression: normalize_output(&output.stdout)
 ---
 Create a new issue
@@ -66,6 +65,16 @@ Options:
 
   -s, --status <STATUS>
           Initial status (open, deferred, in_progress, closed)
+
+      --ID-REDACTED <ACCEPTANCE_CRITERIA>
+          Acceptance criteria recorded on the initial issue (beads_rust#408)
+
+          [alias: --acceptance]
+
+      --ID-REDACTED <AGENT_CONTEXT>
+          Set the initial `agent_context` ID-REDACTED JSON (beads_rust#408).
+
+          Accepts the same forms as `br update --ID-REDACTED`: inline JSON, `@path/to/file.json`, or `@path/to/file.yaml` (normalized to JSON). An empty string leaves the field unset. Invalid context is rejected before any issue, event, or JSONL record is created.
 
       --ID-REDACTED
           Preview without creating

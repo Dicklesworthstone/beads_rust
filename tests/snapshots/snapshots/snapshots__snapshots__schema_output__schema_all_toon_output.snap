@@ -5,6 +5,493 @@ expression: normalized_toon
 tool: br
 generated_at: "GENERATED_AT"
 schemas:
+  AdditiveReconcileReceipt:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: AdditiveReconcileReceipt
+    description: Complete hash-bound result for additive reconciliation planning/apply.
+    type: object
+    properties:
+      schema.type: string
+      algorithm.type: string
+      tool_version.type: string
+      plan_sha256.type: string
+      status:
+        "$ref": #/$defs/AdditiveReconcileStatus
+      workspace_path.type: string
+      workspace_path_sha256.type: string
+      workspace_identity_sha256.type: string
+      source_path.type: string
+      source_path_sha256.type: string
+      source_identity_sha256.type: string
+      database_path.type: string
+      database_path_sha256.type: string
+      database_identity_sha256.type[2]: string,"null"
+      write_lock_authority.type: string
+      write_lock_authority_sha256.type: string
+      database_authority_preserved_after_commit.type[2]: boolean,"null"
+      database_poststate_preserved_after_commit.type[2]: boolean,"null"
+      workspace_authority_preserved_after_commit.type[2]: boolean,"null"
+      source_preserved_after_commit.type[2]: boolean,"null"
+      foreign_keys_restored_after_commit.type[2]: boolean,"null"
+      postcommit_failures:
+        type: array
+        items:
+          "$ref": #/$defs/AdditivePostcommitFailure
+      database_user_version:
+        type: integer
+        format: uint32
+        minimum: 0
+      project_prefix.type[2]: string,"null"
+      source_raw_sha256:
+        description: SHA-256 of the exact source bytes.
+        type: string
+      source_content_sha256:
+        description: SHA-256 of trimmed nonblank JSONL records with canonical LF framing.
+        type: string
+      source_storage_projection_sha256:
+        description: SHA-256 of the deterministic storage-semantic projection of all source issues.
+        type: string
+      source_size:
+        type: integer
+        format: uint64
+        minimum: 0
+      source_mtime.type: string
+      poststate_timestamp:
+        description: "Deterministic timestamp used for recovery-owned bookkeeping rows.\nEqual to the reviewed source snapshot mtime."
+        type: string
+      source_issues:
+        type: integer
+        format: uint
+        minimum: 0
+      target_before:
+        "$ref": #/$defs/AdditiveDatabaseWitness
+      expected_target_after:
+        "$ref": #/$defs/AdditiveDatabaseWitness
+      target_after.anyOf[2]:
+        - "$ref": #/$defs/AdditiveDatabaseWitness
+        - type: "null"
+      health_before:
+        "$ref": #/$defs/AdditiveDatabaseHealth
+      health_after.anyOf[2]:
+        - "$ref": #/$defs/AdditiveDatabaseHealth
+        - type: "null"
+      created:
+        type: integer
+        format: uint
+        minimum: 0
+      created_issue_ids:
+        type: array
+        items.type: string
+      created_issue_ids_sha256.type: string
+      updated:
+        type: integer
+        format: uint
+        minimum: 0
+      updated_issue_ids:
+        type: array
+        items.type: string
+      updated_issue_ids_sha256.type: string
+      requested_source_authoritative_issue_ids:
+        description: "Exact override set supplied by the operator, whether or not each ID was applicable."
+        type: array
+        items.type: string
+      requested_source_authoritative_issue_ids_sha256.type: string
+      source_authoritative_issue_ids:
+        description: Applicable overrides actually used by this plan.
+        type: array
+        items.type: string
+      source_authoritative_issue_ids_sha256.type: string
+      scalar_updates:
+        type: array
+        items:
+          "$ref": #/$defs/AdditiveScalarUpdateWitness
+      scalar_updates_sha256.type: string
+      content_hash_repairs_planned:
+        type: integer
+        format: uint
+        minimum: 0
+      content_hash_repairs:
+        type: array
+        items:
+          "$ref": #/$defs/AdditiveContentHashRepairWitness
+      content_hash_repairs_sha256.type: string
+      content_hash_repair_issue_ids:
+        type: array
+        items.type: string
+      content_hash_repair_issue_ids_sha256.type: string
+      content_hash_repairs_applied:
+        type: integer
+        format: uint
+        minimum: 0
+      skipped_equal:
+        type: integer
+        format: uint
+        minimum: 0
+      equal_issue_ids:
+        type: array
+        items.type: string
+      equal_issue_ids_sha256.type: string
+      skipped_ephemeral:
+        type: integer
+        format: uint
+        minimum: 0
+      synchronized:
+        description: "Source issues proven equal to, created in, or updated in SQLite."
+        type: integer
+        format: uint
+        minimum: 0
+      export_hash_updates_planned:
+        type: integer
+        format: uint
+        minimum: 0
+      export_hashes_updated:
+        type: integer
+        format: uint
+        minimum: 0
+      dirty_markers_clear_planned:
+        type: integer
+        format: uint
+        minimum: 0
+      dirty_markers_cleared:
+        type: integer
+        format: uint
+        minimum: 0
+      conflicted:
+        description: Number of distinct issues involved in one or more conflicts.
+        type: integer
+        format: uint
+        minimum: 0
+      conflict_occurrences:
+        description: Total conflict observations across all reason buckets.
+        type: integer
+        format: uint
+        minimum: 0
+      deleted:
+        type: integer
+        format: uint
+        minimum: 0
+      db_only_preserved:
+        type: integer
+        format: uint
+        minimum: 0
+      db_only_issue_ids:
+        type: array
+        items.type: string
+      db_only_issue_ids_sha256.type: string
+      conflict_reasons:
+        type: object
+        additionalProperties:
+          type: integer
+          format: uint
+          minimum: 0
+      conflict_issue_ids:
+        type: array
+        items.type: string
+      conflict_issue_ids_sha256.type: string
+      conflict_issue_ids_truncated.type: boolean
+      conflict_witnesses:
+        type: array
+        items:
+          "$ref": #/$defs/AdditiveConflictWitness
+      conflict_witnesses_sha256.type: string
+      conflict_scalar_diffs:
+        type: array
+        items:
+          "$ref": #/$defs/AdditiveConflictScalarDiffWitness
+      conflict_scalar_diffs_sha256.type: string
+      conflict_relation_diffs:
+        type: array
+        items:
+          "$ref": #/$defs/AdditiveConflictRelationDiffWitness
+      conflict_relation_diffs_sha256.type: string
+      comment_id_remaps:
+        type: array
+        items:
+          "$ref": #/$defs/AdditiveCommentIdRemap
+      comment_id_remaps_sha256.type: string
+      preexisting_blocking_cycles:
+        description: Blocking-cycle components already present in the database.
+        type: integer
+        format: uint
+        minimum: 0
+      projected_blocking_cycles:
+        description: Blocking-cycle components in the database after applying the plan.
+        type: integer
+        format: uint
+        minimum: 0
+      new_blocking_cycles:
+        description: Projected blocking-cycle components not present before reconciliation.
+        type: integer
+        format: uint
+        minimum: 0
+      relations_before:
+        "$ref": #/$defs/AdditiveRelationCounts
+      relations_after:
+        "$ref": #/$defs/AdditiveRelationCounts
+      relation_rows_planned:
+        "$ref": #/$defs/AdditiveRelationCounts
+      relation_rows_applied:
+        "$ref": #/$defs/AdditiveRelationCounts
+      expected_issue_raw_payload_sha256.type: string
+      expected_issue_semantic_payload_sha256.type: string
+      expected_issue_content_hash_payload_sha256.type: string
+      expected_export_hash_payload_sha256.type: string
+      expected_dirty_payload_sha256.type: string
+      expected_metadata_payload_sha256.type: string
+      expected_blocked_cache_payload_sha256.type: string
+      expected_child_counter_payload_sha256.type: string
+      expected_sqlite_sequence_payload_sha256.type: string
+      events_before:
+        type: integer
+        format: uint
+        minimum: 0
+      events_after:
+        type: integer
+        format: uint
+        minimum: 0
+      event_payload_sha256_before.type: string
+      event_payload_sha256_after.type: string
+      cache_rebuild_planned.type: boolean
+      cache_rebuild_performed.type: boolean
+      metadata_update_planned.type: boolean
+      metadata_changed.type: boolean
+      jsonl_written.type: boolean
+      base_snapshot_used.type: boolean
+      merge_note_written.type: boolean
+    required[99]: schema,algorithm,tool_version,plan_sha256,status,workspace_path,workspace_path_sha256,workspace_identity_sha256,source_path,source_path_sha256,source_identity_sha256,database_path,database_path_sha256,write_lock_authority,write_lock_authority_sha256,postcommit_failures,database_user_version,source_raw_sha256,source_content_sha256,source_storage_projection_sha256,source_size,source_mtime,poststate_timestamp,source_issues,target_before,expected_target_after,health_before,created,created_issue_ids,created_issue_ids_sha256,updated,updated_issue_ids,updated_issue_ids_sha256,requested_source_authoritative_issue_ids,requested_source_authoritative_issue_ids_sha256,source_authoritative_issue_ids,source_authoritative_issue_ids_sha256,scalar_updates,scalar_updates_sha256,content_hash_repairs_planned,content_hash_repairs,content_hash_repairs_sha256,content_hash_repair_issue_ids,content_hash_repair_issue_ids_sha256,content_hash_repairs_applied,skipped_equal,equal_issue_ids,equal_issue_ids_sha256,skipped_ephemeral,synchronized,export_hash_updates_planned,export_hashes_updated,dirty_markers_clear_planned,dirty_markers_cleared,conflicted,conflict_occurrences,deleted,db_only_preserved,db_only_issue_ids,db_only_issue_ids_sha256,conflict_reasons,conflict_issue_ids,conflict_issue_ids_sha256,conflict_issue_ids_truncated,conflict_witnesses,conflict_witnesses_sha256,conflict_scalar_diffs,conflict_scalar_diffs_sha256,conflict_relation_diffs,conflict_relation_diffs_sha256,comment_id_remaps,comment_id_remaps_sha256,preexisting_blocking_cycles,projected_blocking_cycles,new_blocking_cycles,relations_before,relations_after,relation_rows_planned,relation_rows_applied,expected_issue_raw_payload_sha256,expected_issue_semantic_payload_sha256,expected_issue_content_hash_payload_sha256,expected_export_hash_payload_sha256,expected_dirty_payload_sha256,expected_metadata_payload_sha256,expected_blocked_cache_payload_sha256,expected_child_counter_payload_sha256,expected_sqlite_sequence_payload_sha256,events_before,events_after,event_payload_sha256_before,event_payload_sha256_after,cache_rebuild_planned,cache_rebuild_performed,metadata_update_planned,metadata_changed,jsonl_written,base_snapshot_used,merge_note_written
+    "$defs":
+      AdditiveReconcileStatus:
+        description: Lifecycle state of a reconciliation receipt.
+        oneOf[2]:
+          - type: string
+            enum[6]: conflicted,metadata_only_ready,no_changes,ready,applied_metadata_only,applied
+          - description: "The transaction committed, but one or more independently reported\nsource, authority, or connection postconditions failed afterward."
+            type: string
+            const: committed_with_postcondition_failures
+      AdditivePostcommitFailure:
+        description: Independently composable failure observed only after SQLite committed.
+        type: string
+        enum[5]: foreign_key_restoration,database_authority_changed,database_poststate_changed,workspace_authority_changed,source_witness_changed
+      AdditiveDatabaseWitness:
+        description: Hash-bound read-only database witness used to reject stale apply plans.
+        type: object
+        properties:
+          issues:
+            type: integer
+            format: uint
+            minimum: 0
+          issue_payload_sha256:
+            description: Digest of every raw issues-table column with explicit NULL framing.
+            type: string
+          issue_semantic_payload_sha256:
+            description: Digest of the storage-semantic hydrated issue projection.
+            type: string
+          issue_content_hashes:
+            type: integer
+            format: uint
+            minimum: 0
+          issue_content_hash_payload_sha256.type: string
+          relations:
+            "$ref": #/$defs/AdditiveRelationCounts
+          label_payload_sha256.type: string
+          dependency_payload_sha256.type: string
+          comment_payload_sha256.type: string
+          export_hashes:
+            type: integer
+            format: uint
+            minimum: 0
+          export_hash_payload_sha256.type: string
+          events:
+            type: integer
+            format: uint
+            minimum: 0
+          event_payload_sha256.type: string
+          dirty_issues:
+            type: integer
+            format: uint
+            minimum: 0
+          dirty_payload_sha256.type: string
+          metadata_rows:
+            type: integer
+            format: uint
+            minimum: 0
+          metadata_payload_sha256.type: string
+          stable_metadata:
+            description: "Metadata that must remain stable while a committed merge finalizes its\nexport. This excludes only the pending-receipt row and the documented\nexport-bookkeeping keys."
+            "$ref": #/$defs/AdditiveTableWitness
+          blocked_cache_entries:
+            type: integer
+            format: uint
+            minimum: 0
+          blocked_cache_payload_sha256.type: string
+          child_counter_entries:
+            type: integer
+            format: uint
+            minimum: 0
+          child_counter_payload_sha256.type: string
+          config:
+            "$ref": #/$defs/AdditiveTableWitness
+          close_metadata:
+            "$ref": #/$defs/AdditiveTableWitness
+          gate_results:
+            "$ref": #/$defs/AdditiveTableWitness
+          gate_result_history:
+            "$ref": #/$defs/AdditiveTableWitness
+          schema_catalog:
+            "$ref": #/$defs/AdditiveTableWitness
+          sqlite_sequence:
+            "$ref": #/$defs/AdditiveTableWitness
+          stored_jsonl_content_hash.type[2]: string,"null"
+          stored_jsonl_mtime.type[2]: string,"null"
+          stored_jsonl_size.type[2]: string,"null"
+          needs_flush.type[2]: string,"null"
+        required[28]: issues,issue_payload_sha256,issue_semantic_payload_sha256,issue_content_hashes,issue_content_hash_payload_sha256,relations,label_payload_sha256,dependency_payload_sha256,comment_payload_sha256,export_hashes,export_hash_payload_sha256,events,event_payload_sha256,dirty_issues,dirty_payload_sha256,metadata_rows,metadata_payload_sha256,stable_metadata,blocked_cache_entries,blocked_cache_payload_sha256,child_counter_entries,child_counter_payload_sha256,config,close_metadata,gate_results,gate_result_history,schema_catalog,sqlite_sequence
+      AdditiveRelationCounts:
+        description: Relation-row counts captured around additive reconciliation.
+        type: object
+        properties:
+          labels:
+            type: integer
+            format: uint
+            minimum: 0
+          dependencies:
+            type: integer
+            format: uint
+            minimum: 0
+          comments:
+            type: integer
+            format: uint
+            minimum: 0
+        required[3]: labels,dependencies,comments
+      AdditiveTableWitness:
+        description: Count and canonical payload digest for one complete database table.
+        type: object
+        properties:
+          rows:
+            type: integer
+            format: uint
+            minimum: 0
+          payload_sha256.type: string
+        required[2]: rows,payload_sha256
+      AdditiveDatabaseHealth:
+        description: Database-health gates captured before and after additive reconciliation.
+        type: object
+        properties:
+          integrity_messages:
+            type: array
+            items.type: string
+          foreign_key_violations:
+            type: array
+            items:
+              type: array
+              items.type: string
+        required[2]: integrity_messages,foreign_key_violations
+      AdditiveScalarUpdateWitness:
+        description: Hash-bound scalar-only repair for a shared issue ID.
+        type: object
+        properties:
+          issue_id.type: string
+          resolution:
+            "$ref": #/$defs/AdditiveScalarResolution
+          changed_fields:
+            type: array
+            items.type: string
+          diff_sha256.type: string
+          before_payload_sha256.type: string
+          after_payload_sha256.type: string
+          relation_payload_sha256.type: string
+        required[7]: issue_id,resolution,changed_fields,diff_sha256,before_payload_sha256,after_payload_sha256,relation_payload_sha256
+      AdditiveScalarResolution:
+        description: Evidence-backed reason a shared issue's scalar fields may be updated.
+        type: string
+        enum[2]: monotonic_closure,explicit_source_resolution
+      AdditiveContentHashRepairWitness:
+        description: Exact before/after witness for a repaired persisted content hash.
+        type: object
+        properties:
+          issue_id.type: string
+          before.type[2]: string,"null"
+          after.type: string
+        required[2]: issue_id,after
+      AdditiveConflictWitness:
+        description: Complete deterministic issue-to-reason conflict witness.
+        type: object
+        properties:
+          issue_id.type: string
+          reasons:
+            type: array
+            items.type: string
+          details:
+            type: array
+            items:
+              "$ref": #/$defs/AdditiveConflictDetailWitness
+        required[3]: issue_id,reasons,details
+      AdditiveConflictDetailWitness:
+        description: "Privacy-preserving, actionable evidence for one rejected source element.\n\nEmbedded relation values are not assumed to be validated issue IDs: an\nexternal target or malformed source can contain terminal control bytes or\na local path. All such related values, labels, external refs, dependency\nmetadata, and comment payloads are represented only by SHA-256."
+        type: object
+        properties:
+          reason.type: string
+          detail_kind.type: string
+          ordinal:
+            type[2]: integer,"null"
+            format: uint
+            minimum: 0
+          related_value_sha256:
+            type: array
+            items.type: string
+          validation_subcodes:
+            type: array
+            items.type: string
+          value_sha256.type[2]: string,"null"
+          detail_sha256.type: string
+        required[3]: reason,detail_kind,detail_sha256
+      AdditiveConflictScalarDiffWitness:
+        description: "Complete hash-bound scalar difference for a shared issue that was refused.\n\nPayload bodies remain private; field names and before/after/diff hashes let\nan operator prove exactly which reviewed scalar conflict a token covered."
+        type: object
+        properties:
+          issue_id.type: string
+          changed_fields:
+            type: array
+            items.type: string
+          diff_sha256.type: string
+          before_payload_sha256.type: string
+          after_payload_sha256.type: string
+        required[5]: issue_id,changed_fields,diff_sha256,before_payload_sha256,after_payload_sha256
+      AdditiveConflictRelationDiffWitness:
+        description: Privacy-preserving relation delta for a shared issue that was refused.
+        type: object
+        properties:
+          issue_id.type: string
+          changed_relation_classes:
+            type: array
+            items.type: string
+          before_counts:
+            "$ref": #/$defs/AdditiveRelationCounts
+          after_counts:
+            "$ref": #/$defs/AdditiveRelationCounts
+          before_payload_sha256.type: string
+          after_payload_sha256.type: string
+          added_element_sha256:
+            type: array
+            items.type: string
+          removed_element_sha256:
+            type: array
+            items.type: string
+          diff_sha256.type: string
+        required[9]: issue_id,changed_relation_classes,before_counts,after_counts,before_payload_sha256,after_payload_sha256,added_element_sha256,removed_element_sha256,diff_sha256
+      AdditiveCommentIdRemap:
+        description: Deterministic remap of a storage-local comment surrogate ID.
+        type: object
+        properties:
+          issue_id.type: string
+          old_id:
+            type: integer
+            format: int64
+          new_id:
+            type: integer
+            format: int64
+          logical_payload_sha256.type: string
+        required[4]: issue_id,old_id,new_id,logical_payload_sha256
   BlockedIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: BlockedIssueOutput
@@ -1881,6 +2368,83 @@ schemas:
         description: True when the node has children omitted by `--max-depth`.
         type: boolean
     required[7]: id,title,depth,parent_id,priority,status,truncated
+  VcsExportStatus:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: VcsExportStatus
+    description: "Explicit Git visibility for the configured JSONL export.\n\nRepository and index evidence remains available when a path-local\nworktree comparison is unsafe or unsupported. Raw worktree identities are\ncomputed in-process from one immutable, no-follow JSONL snapshot; Git\nfilters and text conversions are never invoked."
+    type: object
+    properties:
+      schema.type: string
+      requested.type: boolean
+      available.type: boolean
+      vcs.type: string
+      observation_atomic:
+        description: "False because HEAD, index, config, and worktree evidence are observed\nsequentially rather than under one transactional Git snapshot."
+        type: boolean
+      path_scope.type: string
+      path.type: string
+      timeout_ms:
+        type: integer
+        format: uint64
+        minimum: 0
+      duration_ms:
+        type: integer
+        format: uint64
+        minimum: 0
+      reason.type[2]: string,"null"
+      object_format.anyOf[2]:
+        - "$ref": #/$defs/GitObjectFormat
+        - type: "null"
+      tracked.type[2]: boolean,"null"
+      head.anyOf[2]:
+        - "$ref": #/$defs/GitPathIdentity
+        - type: "null"
+      index.anyOf[2]:
+        - "$ref": #/$defs/GitPathIdentity
+        - type: "null"
+      unmerged_index_stages:
+        type[2]: array,"null"
+        items:
+          "$ref": #/$defs/GitIndexStage
+      index_clean.type[2]: boolean,"null"
+      worktree_state.anyOf[2]:
+        - "$ref": #/$defs/WorktreeState
+        - type: "null"
+      worktree_clean.type[2]: boolean,"null"
+      worktree_comparison_reason.type[2]: string,"null"
+      worktree_raw_git_blob_hash.type[2]: string,"null"
+      worktree_raw_sha256.type[2]: string,"null"
+    required[9]: schema,requested,available,vcs,observation_atomic,path_scope,path,timeout_ms,duration_ms
+    "$defs":
+      GitObjectFormat:
+        description: Object format used by the selected Git repository.
+        type: string
+        enum[2]: sha1,sha256
+      GitPathIdentity:
+        description: Exact identity of one path in a Git tree or stage-zero index entry.
+        type: object
+        properties:
+          mode.type: string
+          object_type.type: string
+          object_id.type: string
+        required[3]: mode,object_type,object_id
+      GitIndexStage:
+        description: Exact identity of one unmerged index stage.
+        type: object
+        properties:
+          stage:
+            type: integer
+            format: uint8
+            minimum: 0
+            maximum: 255
+          mode.type: string
+          object_type.type: string
+          object_id.type: string
+        required[4]: stage,mode,object_type,object_id
+      WorktreeState:
+        description: Relationship between the securely captured JSONL leaf and the Git index.
+        type: string
+        enum[8]: clean,modified,deleted,untracked,ignored,unmerged,comparison_unavailable,absent
 commands:
   blocked:
     shape: array
@@ -1989,3 +2553,15 @@ commands:
     item_schema: Statistics
     error_envelope_on_stderr: false
     notes: Alias for `stats` — identical envelope.
+  "sync --reconcile-additive":
+    shape: object
+    jq_filter: .
+    item_schema: AdditiveReconcileReceipt
+    error_envelope_on_stderr: false
+    notes: Dry-run by default. Apply requires the exact plan_sha256 from an identically configured reviewed dry-run via --expect-plan-sha256. Structured machine-mode errors are currently emitted on stdout.
+  "vcs-status":
+    shape: object
+    jq_filter: .
+    item_schema: VcsExportStatus
+    error_envelope_on_stderr: false
+    notes: "Explicit bounded read-only Git diagnostic. It is isolated from sync, retains HEAD/index evidence when worktree comparison is unavailable, never executes Git content filters, and reports sequential evidence with observation_atomic=false. Structured machine-mode errors are currently emitted on stdout."

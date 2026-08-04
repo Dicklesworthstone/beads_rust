@@ -1,6 +1,5 @@
 ---
 source: tests/snapshots/cli_output.rs
-assertion_line: 160
 expression: normalize_output(&output.stdout)
 ---
 br doctor
@@ -12,6 +11,7 @@ OK doctor.runs_creatable
 OK permissions.recovery_dir
 OK permissions.write_lock
 OK permissions.root_gitignore
+OK permissions.db_sidecars
 OK permissions.config_yaml_secrets
 OK br_path_dupes
 OK gitignore.beads_inner_present
@@ -26,6 +26,7 @@ HOST-DEPENDENT binary_version
 OK write_lock: .beads/.write.lock is 0s old (within 300s threshold); not stale
 OK routes.targets: No local or town routes.jsonl present (route targets are optional)
 OK startup_cache.health
+OK sync.merge_pending: No pending sync merge requires artifact reconciliation
 OK permissions.jsonl_world_writable
 OK jsonl_crlf
 OK jsonl_bom

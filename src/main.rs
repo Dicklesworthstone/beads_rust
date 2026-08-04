@@ -1981,6 +1981,8 @@ mod tests {
             description_file: None,
             assignee: None,
             owner: None,
+            acceptance_criteria: None,
+            agent_context: None,
             labels: Vec::new(),
             parent: None,
             deps: Vec::new(),

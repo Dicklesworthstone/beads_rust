@@ -171,49 +171,13 @@ fn assert_noop_anchor_certification_failure(run: &BrRun, context: &str) {
     }
 }
 
-#[test]
-fn e2e_sync_status_git_export_committed_vs_dirty_jsonl() {
-    let _log = common::test_log("e2e_sync_status_git_export_committed_vs_dirty_jsonl");
-    let workspace = BrWorkspace::new();
-
-    git_ok(&workspace.root, &["init", "--initial-branch=main"]);
-
-    let init = run_br(&workspace, ["init"], "init");
-    assert!(init.status.success(), "init failed: {}", init.stderr);
-
-    let create = run_br(&workspace, ["create", "Git status issue"], "create");
-    assert!(create.status.success(), "create failed: {}", create.stderr);
-
-    let flush = run_br(&workspace, ["sync", "--flush-only"], "flush");
-    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
-
-    // Untracked JSONL: available, but not tracked and not worktree-clean.
-    let untracked = sync_status_json(&workspace, "status_untracked");
-    let git_export = &untracked["git_export"];
-    assert_eq!(git_export["available"], true, "{untracked}");
-    assert_eq!(git_export["tracked"], false, "{untracked}");
-    assert_eq!(git_export["worktree_clean"], false, "{untracked}");
-    assert_eq!(git_export["index_clean"], true, "{untracked}");
-    assert!(git_export["head_hash"].is_null(), "{untracked}");
-    assert!(git_export["worktree_hash"].is_string(), "{untracked}");
-
-    // Commit the JSONL exactly as it sits on disk. We avoid asserting
-    // byte-for-byte hash equality with a later status call because a
-    // `br sync --status` open may auto-export the JSONL with refreshed
-    // timestamps; instead we assert the structural git facts (tracked,
-    // and the reported HEAD blob hash agrees with git's own view).
-    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
-    git_ok(&workspace.root, &["add", ".beads/issues.jsonl"]);
-    git_ok(&workspace.root, &["commit", "-m", "track issues.jsonl"]);
-    let committed_head =
-        git_committed_blob_hash(&workspace.root, ".beads/issues.jsonl").expect("head blob hash");
-
-    let committed = sync_status_json(&workspace, "status_committed");
-    let git_export = &committed["git_export"];
-    assert_eq!(git_export["available"], true, "{committed}");
-    assert_eq!(git_export["tracked"], true, "{committed}");
-    // The reported HEAD blob hash must agree with what git records for
-    // the committed copy (independent of any worktree re-export jitter).
+/// Assert the `git_export` compatibility slot proves sync did NOT probe
+/// VCS state: exactly {available:false, reason:"not_probed",
+/// diagnostic_command:"br vcs-status --json"} and nothing else.
+fn assert_vcs_not_probed(status: &Value) {
+    let git_export = status["git_export"]
+        .as_object()
+        .expect("git_export compatibility object");
     assert_eq!(
         git_export
             .keys()

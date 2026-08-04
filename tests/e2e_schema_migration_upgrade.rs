@@ -41,7 +41,9 @@ fn install_fixture_workspace(workspace: &BrWorkspace, db_gz: &str, issues: &str,
 
     let mut decoder = GzDecoder::new(fs::File::open(fixture_dir().join(db_gz)).expect("open gz"));
     let mut db_bytes = Vec::new();
-    decoder.read_to_end(&mut db_bytes).expect("gunzip fixture db");
+    decoder
+        .read_to_end(&mut db_bytes)
+        .expect("gunzip fixture db");
     fs::write(beads_dir.join("beads.db"), &db_bytes).expect("write beads.db");
     fs::copy(fixture_dir().join(issues), beads_dir.join("issues.jsonl")).expect("copy jsonl");
     fs::copy(fixture_dir().join(config), beads_dir.join("config.yaml")).expect("copy config");
@@ -90,12 +92,7 @@ fn upgrade_fixture_end_to_end(
     // 1. Ordinary commands refuse and print the reviewed-migration remediation.
     let stats = run_br(
         &workspace,
-        [
-            "stats",
-            "--json",
-            "--no-auto-flush",
-            "--no-auto-import",
-        ],
+        ["stats", "--json", "--no-auto-flush", "--no-auto-import"],
         "stats_schema_mismatch",
     );
     assert!(
@@ -130,7 +127,11 @@ fn upgrade_fixture_end_to_end(
     );
     let plan_json: Value =
         serde_json::from_str(&extract_json_payload(&plan.stdout)).expect("plan JSON");
-    assert_eq!(plan_json["eligible"], Value::Bool(true), "{label}: plan not eligible");
+    assert_eq!(
+        plan_json["eligible"],
+        Value::Bool(true),
+        "{label}: plan not eligible"
+    );
     assert_eq!(plan_json["from_version"].as_u64(), Some(expected_from));
     assert_eq!(plan_json["to_version"].as_u64(), Some(17));
     let plan_token = plan_json["plan_token"]
@@ -162,7 +163,11 @@ fn upgrade_fixture_end_to_end(
     let applied_json: Value =
         serde_json::from_str(&extract_json_payload(&apply.stdout)).expect("applied JSON");
     let run_id = applied_json["run_id"].as_str().expect("run id").to_string();
-    assert_eq!(header_user_version(&db_path), 17, "{label}: post-apply schema");
+    assert_eq!(
+        header_user_version(&db_path),
+        17,
+        "{label}: post-apply schema"
+    );
     for table in [
         "gate_result_history",
         "capacity_exemptions",
@@ -178,12 +183,7 @@ fn upgrade_fixture_end_to_end(
     // 4. Tracker data survives and ordinary commands work again.
     let stats_after = run_br(
         &workspace,
-        [
-            "stats",
-            "--json",
-            "--no-auto-flush",
-            "--no-auto-import",
-        ],
+        ["stats", "--json", "--no-auto-flush", "--no-auto-import"],
         "stats_after_apply",
     );
     assert!(
@@ -210,7 +210,11 @@ fn upgrade_fixture_end_to_end(
         ],
         "list_after_apply",
     );
-    assert!(list.status.success(), "{label}: list failed: {}", list.stderr);
+    assert!(
+        list.status.success(),
+        "{label}: list failed: {}",
+        list.stderr
+    );
 
     // 5. The consumed receipt is stale: re-plan reports nothing to do, and
     //    re-applying the old token must be rejected without mutating.
@@ -226,7 +230,11 @@ fn upgrade_fixture_end_to_end(
         ],
         "replan_after_apply",
     );
-    assert!(replan.status.success(), "{label}: re-plan failed: {}", replan.stderr);
+    assert!(
+        replan.status.success(),
+        "{label}: re-plan failed: {}",
+        replan.stderr
+    );
     let replan_json: Value =
         serde_json::from_str(&extract_json_payload(&replan.stdout)).expect("replan JSON");
     assert_eq!(
@@ -299,11 +307,18 @@ fn upgrade_fixture_end_to_end(
         ],
         "plan_after_undo",
     );
-    assert!(plan2.status.success(), "{label}: plan after undo failed: {}", plan2.stderr);
+    assert!(
+        plan2.status.success(),
+        "{label}: plan after undo failed: {}",
+        plan2.stderr
+    );
     let plan2_json: Value =
         serde_json::from_str(&extract_json_payload(&plan2.stdout)).expect("plan2 JSON");
     assert_eq!(plan2_json["eligible"], Value::Bool(true));
-    let token2 = plan2_json["plan_token"].as_str().expect("token2").to_string();
+    let token2 = plan2_json["plan_token"]
+        .as_str()
+        .expect("token2")
+        .to_string();
     let apply2 = run_br(
         &workspace,
         [
