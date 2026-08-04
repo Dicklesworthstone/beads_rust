@@ -786,7 +786,11 @@ fn e2e_doctor_repair_preserves_unflushed_dirty_issues() {
             .expect("insert duplicate config row b");
     }
 
-    let repaired = run_br(&workspace, ["doctor", "--repair", "--json"], "doctor_repair");
+    let repaired = run_br(
+        &workspace,
+        ["doctor", "--repair", "--json"],
+        "doctor_repair",
+    );
     assert!(
         repaired.status.success(),
         "doctor --repair failed: stderr={}",

@@ -3342,12 +3342,14 @@ impl OpenStorageResult {
                         .to_string(),
                 })?;
         let export_config = ExportConfig {
-            // When needs_flush is set (e.g. after purge_issue), force must be
-            // true even if there are also dirty issues from related mutations
-            // (like dependency removal during --hard delete), so the safety
-            // guard does not block export of a DB that intentionally has fewer
-            // issues than the on-disk JSONL.
-            force: needs_flush,
+            // `needs_flush` is deliberately NOT passed as `force` (#405):
+            // doing so disabled the exporter's data-loss guards, and the
+            // import path also arms `needs_flush` when a local record wins
+            // over JSONL — a state in which a forced flush can destroy
+            // merged issues the DB never imported. The purge_issue flow that
+            // used to need force is handled by the purged-pending-export
+            // marker, which the guard subtracts from its loss computation.
+            force: false,
             is_default_path: self.paths.jsonl_path == self.paths.beads_dir.join("issues.jsonl"),
             beads_dir: Some(self.paths.beads_dir.clone()),
             allow_external_jsonl: self.allow_external_jsonl,

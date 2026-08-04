@@ -1169,6 +1169,14 @@ const CHILD_OPEN_BLOCKER_SUFFIX: &str = ":child-open";
 /// gate nor the start/claim gate treats it as a real blocker.
 const PARENT_BLOCKED_SUFFIX: &str = ":parent-blocked";
 const NEEDS_FLUSH_KEY: &str = "needs_flush";
+/// Metadata key holding a sorted JSON array of issue IDs that were
+/// intentionally hard-deleted (purged) from the database but may still be
+/// present in the on-disk JSONL. The exporter's stale-database data-loss
+/// guard subtracts these IDs from its "would lose issues" computation so a
+/// post-purge flush can legitimately write a JSONL with fewer issues without
+/// requiring blanket `force` semantics (#405). Cleared on successful export
+/// finalization.
+pub(crate) const PURGED_IDS_PENDING_EXPORT_KEY: &str = "purged_ids_pending_export";
 const METADATA_EMPTY_VALUE: &str = "";
 const METADATA_FALSE_VALUE: &str = "false";
 const KNOWN_METADATA_DEFAULTS: [(&str, &str); 7] = [
@@ -7330,6 +7338,12 @@ impl SqliteStorage {
                 &[SqliteValue::from(id)],
             )?;
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
+
+            // Record the intentional removal so the exporter's stale-database
+            // guard can distinguish "purged on purpose" from "never imported"
+            // (#405). Without this, a post-purge flush would need blanket
+            // force semantics, which disables the data-loss guard entirely.
+            Self::record_purged_id_pending_export_in_tx(conn, id)?;
 
             ctx.invalidate_cache();
             ctx.force_flush = true;
@@ -14475,6 +14489,55 @@ impl SqliteStorage {
             Err(FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Read the set of issue IDs that were intentionally purged (hard
+    /// deleted) but not yet flushed out of the on-disk JSONL (#405).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_purged_ids_pending_export(&self) -> Result<HashSet<String>> {
+        let Some(raw) = self.get_metadata(PURGED_IDS_PENDING_EXPORT_KEY)? else {
+            return Ok(HashSet::new());
+        };
+        let ids: Vec<String> = serde_json::from_str(&raw).map_err(BeadsError::from)?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Record, inside the purge transaction, that `id` was intentionally
+    /// removed from the database so the exporter's stale-database guard does
+    /// not count it as accidental data loss (#405).
+    fn record_purged_id_pending_export_in_tx(conn: &Connection, id: &str) -> Result<()> {
+        let existing = match conn.query_row_with_params(
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+            &[SqliteValue::from(PURGED_IDS_PENDING_EXPORT_KEY)],
+        ) {
+            Ok(row) => row
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .filter(|value| !value.is_empty())
+                .map(String::from),
+            Err(FrankenError::QueryReturnedNoRows) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mut ids: Vec<String> = match existing {
+            Some(raw) => serde_json::from_str(&raw).map_err(BeadsError::from)?,
+            None => Vec::new(),
+        };
+        if !ids.iter().any(|existing_id| existing_id == id) {
+            ids.push(id.to_string());
+            ids.sort_unstable();
+        }
+        let serialized = serde_json::to_string(&ids).map_err(BeadsError::from)?;
+        Self::upsert_metadata_key_in_tx(conn, PURGED_IDS_PENDING_EXPORT_KEY, &serialized)
+    }
+
+    /// Clear the purged-pending-export marker inside an export-finalization
+    /// transaction: once an export has published a JSONL snapshot, the purged
+    /// IDs are no longer present in it (#405).
+    pub(crate) fn clear_purged_ids_pending_export_in_tx(&self) -> Result<()> {
+        self.set_metadata_in_tx(PURGED_IDS_PENDING_EXPORT_KEY, "")
     }
 
     /// Set a metadata value.

@@ -40,7 +40,7 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, ReviewedSchemaMigrationEffects,
+    CURRENT_SCHEMA_VERSION, REVIEWED_MIGRATION_SOURCE_VERSIONS, ReviewedSchemaMigrationEffects,
     run_reviewed_schema_migration_steps_in_transaction, runtime_schema_compatible,
 };
 use crate::sync::DatabaseFamilyWriteLock;
@@ -327,10 +327,10 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
                 .to_string(),
         });
     }
-    if !matches!(from, 13 | 14) {
+    if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only for 13->{target} and 14->{target}; \
-             observed unsupported source version {from}"
+            "reviewed schema migration is available only from source schemas 13, 14, 15, and 16 \
+             to {target}; observed unsupported source version {from}"
         )));
     }
     if !integrity_clean && !integrity_check_is_repairable(&logical_witness.integrity_check) {

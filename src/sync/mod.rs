@@ -5274,6 +5274,7 @@ fn is_sync_merge_mutable_metadata_key(key: &str) -> bool {
             | METADATA_JSONL_SIZE
             | METADATA_LAST_EXPORT_TIME
             | "needs_flush"
+            | "purged_ids_pending_export"
     )
 }
 
@@ -5285,6 +5286,7 @@ fn is_sync_merge_export_metadata_key(key: &str) -> bool {
             | METADATA_JSONL_SIZE
             | METADATA_LAST_EXPORT_TIME
             | "needs_flush"
+            | "purged_ids_pending_export"
     )
 }
 
@@ -9756,9 +9758,16 @@ fn export_to_jsonl_with_policy_expected_authority(
         && let Some(previous_source) = previous_source
     {
         let (jsonl_count, jsonl_ids) = analyze_jsonl_snapshot(previous_source)?;
+        // IDs the operator intentionally hard-deleted (purged) are expected
+        // to disappear from the JSONL on the next export; they are not data
+        // loss (#405).
+        let purged_ids = storage.get_purged_ids_pending_export()?;
 
         // Check 1: prevent exporting empty database over non-empty JSONL
-        if export_ids.is_empty() && jsonl_count > 0 {
+        if export_ids.is_empty()
+            && jsonl_count > 0
+            && jsonl_ids.iter().any(|id| !purged_ids.contains(id))
+        {
             return Err(BeadsError::Config(format!(
                 "Refusing to export empty database over non-empty JSONL file.\n\
                  Database has 0 issues, JSONL has {jsonl_count} lines.\n\
@@ -9770,7 +9779,10 @@ fn export_to_jsonl_with_policy_expected_authority(
         // Check 2: prevent exporting stale database that would lose issues
         if !jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = export_ids.iter().cloned().collect();
-            let missing: Vec<_> = jsonl_ids.difference(&db_ids).collect();
+            let missing: Vec<_> = jsonl_ids
+                .difference(&db_ids)
+                .filter(|id| !purged_ids.contains(id.as_str()))
+                .collect();
 
             if !missing.is_empty() {
                 let mut missing_list = missing.into_iter().cloned().collect::<Vec<_>>();
@@ -10682,6 +10694,8 @@ pub(crate) fn finalize_export_under_authority(
         // Keep the row stable and clear the flag in place so ordinary export
         // cycles avoid delete+insert churn on the metadata B-tree.
         storage.set_metadata_in_tx("needs_flush", "false")?;
+        // The published snapshot no longer contains purged issues (#405).
+        storage.clear_purged_ids_pending_export_in_tx()?;
 
         Ok(())
     })?;
@@ -10959,6 +10973,8 @@ fn finalize_incremental_auto_flush(
             record_observed_jsonl_witness_in_tx(storage, observed_jsonl)?;
         }
         storage.set_metadata_in_tx("needs_flush", "false")?;
+        // The published snapshot no longer contains purged issues (#405).
+        storage.clear_purged_ids_pending_export_in_tx()?;
         Ok(())
     })?;
 
@@ -11617,12 +11633,15 @@ pub fn auto_flush(
     }
 
     // Configure export with defaults, including beads_dir for path validation.
-    // When needs_flush is set (e.g. after purge_issue), force must be true
-    // even if there are also dirty issues from related mutations (like
-    // dependency removal), so that the safety guard does not block export
-    // of a DB that intentionally has fewer issues than the on-disk JSONL.
+    // `needs_flush` is deliberately NOT passed as `force` (#405): doing so
+    // disabled the exporter's data-loss guards, and the import path also arms
+    // `needs_flush` when a local record wins over JSONL — a state in which a
+    // forced auto-flush can destroy merged issues the DB never imported. The
+    // purge_issue flow that used to need force is handled by the
+    // purged-pending-export marker, which the guard subtracts from its loss
+    // computation.
     let export_config = ExportConfig {
-        force: needs_flush,
+        force: false,
         beads_dir: Some(beads_dir.to_path_buf()),
         allow_external_jsonl,
         ..Default::default()

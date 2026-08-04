@@ -1821,8 +1821,12 @@ br doctor migrate-schema undo \
   --json
 ```
 
-`plan` currently accepts only the explicitly reviewed 13→current and
-14→current transitions. Its deterministic token binds the absolute database
+`plan` accepts the explicitly reviewed transitions from source schemas 13, 14,
+15 (the #388 gate-history schema), and 16 (the #384 capacity-exemptions schema
+created by the released v0.2.19 binary) to the current schema. Each source runs
+exactly the version-gated step chain it is missing — content-hash rebuild
+(13→14), transition-scoped gate history (→15), capacity exemptions (→16), and
+capacity occupancy (→17). Its deterministic token binds the absolute database
 path, a complete logical row/schema witness, and the exact migration forecast.
 The receipt reports every raw SQLite family member, but raw page/WAL/SHM/journal
 layout is deliberately not token-bound: process close and checkpoint may

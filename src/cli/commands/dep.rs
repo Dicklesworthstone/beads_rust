@@ -2796,10 +2796,18 @@ mod tests {
                 .unwrap();
         }
         for i in 0..RUNGS {
-            storage.add_dependency(&a[i], &b[i], "blocks", "tester").unwrap();
-            storage.add_dependency(&a[i], &c[i], "blocks", "tester").unwrap();
-            storage.add_dependency(&b[i], &a[i + 1], "blocks", "tester").unwrap();
-            storage.add_dependency(&c[i], &a[i + 1], "blocks", "tester").unwrap();
+            storage
+                .add_dependency(&a[i], &b[i], "blocks", "tester")
+                .unwrap();
+            storage
+                .add_dependency(&a[i], &c[i], "blocks", "tester")
+                .unwrap();
+            storage
+                .add_dependency(&b[i], &a[i + 1], "blocks", "tester")
+                .unwrap();
+            storage
+                .add_dependency(&c[i], &a[i + 1], "blocks", "tester")
+                .unwrap();
         }
 
         let total_issues = a.len() + b.len() + c.len();
@@ -2822,8 +2830,7 @@ mod tests {
             global.len()
         );
         // Every unique issue in the graph is present at least once.
-        let seen: std::collections::HashSet<&str> =
-            global.iter().map(|n| n.id.as_str()).collect();
+        let seen: std::collections::HashSet<&str> = global.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(
             seen.len(),
             total_issues,

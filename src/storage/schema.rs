@@ -802,6 +802,14 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
         .unwrap_or(0))
 }
 
+/// Source schema versions accepted by the reviewed, receipt-bound
+/// `br doctor migrate-schema` lifecycle. Every released schema since v13 must
+/// stay upgradeable here: 13/14 (pre-gate-history releases), 15 (the #388
+/// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
+/// capacity-exemptions schema created by the released v0.2.19 binary). See
+/// GitHub #398.
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 4] = [13, 14, 15, 16];
+
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
         BeadsError::internal(format!(
@@ -823,10 +831,10 @@ fn validate_reviewed_schema_migration(
              ({supported_target}), got {target_version}"
         )));
     }
-    if !matches!(from, 13 | 14) {
+    if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "schema migrate refused — only reviewed migrations 13->{supported_target} and \
-             14->{supported_target} are supported (got {from}->{target_version})"
+            "schema migrate refused — reviewed migrations are supported only from source \
+             schemas 13, 14, 15, and 16 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -844,17 +852,18 @@ fn validate_reviewed_schema_migration(
     Ok(())
 }
 
-/// Apply the reviewed v14/v15 migration steps inside the caller's transaction.
+/// Apply the reviewed migration steps inside the caller's transaction.
 ///
 /// This function never starts, commits, or rolls back a transaction. The caller
 /// must hold the database-family write authority and an active
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Only `13 -> CURRENT_SCHEMA_VERSION` and
-/// `14 -> CURRENT_SCHEMA_VERSION` are accepted. `marked_at` is written
-/// verbatim to every v14 `dirty_issues` row, making the bookkeeping timestamp
-/// explicit and reviewable.
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13, 14, 15, 16) are
+/// accepted, each running exactly the version-gated step chain up to
+/// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
+/// `dirty_issues` row rewritten by the v13 content-hash step, making the
+/// bookkeeping timestamp explicit and reviewable.
 ///
 /// # Errors
 ///
@@ -877,8 +886,27 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     };
 
     let gate_result_history_created = !table_exists(conn, "gate_result_history");
-    tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
-    apply_gate_result_history_migration_in_transaction(conn)?;
+    if from < 15 {
+        tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
+        apply_gate_result_history_migration_in_transaction(conn)?;
+    } else {
+        // A genuine v15/v16 database already carries the #388 gate-history
+        // schema; attest it instead of re-running the migration so drift is
+        // refused rather than silently papered over.
+        attest_gate_result_history_schema(conn)?;
+    }
+
+    if from < 16 {
+        tracing::info!(
+            "Migrating database to schema version 16 (capacity exemptions - GitHub #384 phase 4)"
+        );
+        apply_capacity_exemptions_migration_in_transaction(conn)?;
+    }
+
+    tracing::info!(
+        "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
+    );
+    apply_capacity_occupancy_migration_in_transaction(conn)?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -900,9 +928,10 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
 
 /// Compatibility wrapper for the existing doctor migration hook.
 ///
-/// The two reviewed paths supported by
-/// [`run_reviewed_schema_migration_steps_in_transaction`] (13/14 →
-/// `CURRENT_SCHEMA_VERSION`) run genuinely atomically in one
+/// The reviewed paths supported by
+/// [`run_reviewed_schema_migration_steps_in_transaction`]
+/// ([`REVIEWED_MIGRATION_SOURCE_VERSIONS`] → `CURRENT_SCHEMA_VERSION`) run
+/// genuinely atomically in one
 /// `BEGIN IMMEDIATE` transaction and cannot stamp an arbitrary target after
 /// running newer migrations. Every other version pair falls back to the
 /// general migration engine so legacy databases (pre-v13) keep an upgrade
@@ -925,7 +954,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
              ({supported_target}), got {target_version}"
         )));
     }
-    if matches!(from, 13 | 14) {
+    if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         let marked_at = Utc::now().to_rfc3339();
         validate_reviewed_schema_migration(conn, from, target_version, &marked_at)?;
 
@@ -1712,6 +1741,24 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
     let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
+    // v16/v17 capacity tables (#384). Checking them here means a database
+    // stamped at the current version but missing these tables (e.g. one
+    // produced by a pre-#398 reviewed migration, which never created them)
+    // is healed by `apply_schema` on the next open instead of failing at
+    // runtime with "no such table".
+    let capacity_ok = table_has_columns(
+        conn,
+        "capacity_exemptions",
+        &["issue_id", "capacity_kind", "capacity_name"],
+    ) && table_has_columns(
+        conn,
+        "capacity_exemption_history",
+        &["issue_id", "capacity_kind", "capacity_name", "action"],
+    ) && table_has_columns(
+        conn,
+        "capacity_occupancy",
+        &["issue_id", "actor", "harness", "session"],
+    );
     let indexes_ok = REQUIRED_RUNTIME_INDEXES
         .iter()
         .all(|index| index_exists(conn, index));
@@ -1730,6 +1777,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && blocked_cache_ok
         && child_counters_ok
         && gate_history_ok
+        && capacity_ok
         && indexes_ok;
 
     if !compatible {
@@ -1748,6 +1796,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             blocked_cache_ok,
             child_counters_ok,
             gate_history_ok,
+            capacity_ok,
             indexes_ok,
             "runtime schema compatibility check failed"
         );
@@ -2060,43 +2109,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 16 (capacity exemptions - GitHub #384 phase 4)"
         );
-        execute_batch(
-            conn,
-            r"
-            CREATE TABLE IF NOT EXISTS capacity_exemptions (
-                issue_id TEXT NOT NULL,
-                capacity_kind TEXT NOT NULL,
-                capacity_name TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                granted_by TEXT NOT NULL,
-                granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                expires_at DATETIME,
-                ended_at DATETIME,
-                ended_action TEXT,
-                ended_by TEXT,
-                PRIMARY KEY (issue_id, capacity_kind, capacity_name),
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_capacity_exemptions_capacity
-                ON capacity_exemptions(capacity_kind, capacity_name);
-            CREATE TABLE IF NOT EXISTS capacity_exemption_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                issue_id TEXT NOT NULL,
-                capacity_kind TEXT NOT NULL,
-                capacity_name TEXT NOT NULL,
-                action TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                reason TEXT,
-                actor TEXT NOT NULL,
-                expires_at DATETIME,
-                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
-                ON capacity_exemption_history(issue_id, id);
-        ",
-        )?;
+        apply_capacity_exemptions_migration_in_transaction(conn)?;
     }
 
     // v17 (GitHub #384 phase 5): capacity occupancy attribution. One row per
@@ -2107,26 +2120,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         tracing::info!(
             "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
         );
-        execute_batch(
-            conn,
-            r"
-            CREATE TABLE IF NOT EXISTS capacity_occupancy (
-                issue_id TEXT PRIMARY KEY,
-                actor TEXT,
-                agent_name TEXT,
-                harness TEXT,
-                session TEXT,
-                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_actor
-                ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_harness
-                ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
-                ON capacity_occupancy(session) WHERE session IS NOT NULL;
-        ",
-        )?;
+        apply_capacity_occupancy_migration_in_transaction(conn)?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -2452,6 +2446,77 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
 fn apply_gate_result_history_migration_in_transaction(conn: &Connection) -> Result<()> {
     execute_batch(conn, GATE_RESULT_HISTORY_MIGRATION_SQL)?;
     attest_gate_result_history_schema(conn)
+}
+
+/// v16 (GitHub #384 phase 4) migration step: audited issue-specific capacity
+/// exemptions. Pure additive — new tables/indexes only (`IF NOT EXISTS`), no
+/// row rewrites. Shared by the general migration engine and the reviewed
+/// `br doctor migrate-schema` path (#398).
+fn apply_capacity_exemptions_migration_in_transaction(conn: &Connection) -> Result<()> {
+    execute_batch(
+        conn,
+        r"
+        CREATE TABLE IF NOT EXISTS capacity_exemptions (
+            issue_id TEXT NOT NULL,
+            capacity_kind TEXT NOT NULL,
+            capacity_name TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            granted_by TEXT NOT NULL,
+            granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME,
+            ended_at DATETIME,
+            ended_action TEXT,
+            ended_by TEXT,
+            PRIMARY KEY (issue_id, capacity_kind, capacity_name),
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_capacity_exemptions_capacity
+            ON capacity_exemptions(capacity_kind, capacity_name);
+        CREATE TABLE IF NOT EXISTS capacity_exemption_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id TEXT NOT NULL,
+            capacity_kind TEXT NOT NULL,
+            capacity_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            reason TEXT,
+            actor TEXT NOT NULL,
+            expires_at DATETIME,
+            recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_capacity_exemption_history_issue
+            ON capacity_exemption_history(issue_id, id);
+    ",
+    )
+}
+
+/// v17 (GitHub #384 phase 5) migration step: capacity occupancy attribution.
+/// Pure additive — a new table plus partial indexes (`IF NOT EXISTS`).
+/// Shared by the general migration engine and the reviewed
+/// `br doctor migrate-schema` path (#398).
+fn apply_capacity_occupancy_migration_in_transaction(conn: &Connection) -> Result<()> {
+    execute_batch(
+        conn,
+        r"
+        CREATE TABLE IF NOT EXISTS capacity_occupancy (
+            issue_id TEXT PRIMARY KEY,
+            actor TEXT,
+            agent_name TEXT,
+            harness TEXT,
+            session TEXT,
+            recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_actor
+            ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_harness
+            ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_capacity_occupancy_session
+            ON capacity_occupancy(session) WHERE session IS NOT NULL;
+    ",
+    )
 }
 
 fn rebuild_content_hashes_for_current_format_in_transaction(
