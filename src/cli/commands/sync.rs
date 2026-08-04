@@ -1430,23 +1430,43 @@ fn execute_flush(
             }
         }
 
-        // Even with nothing to export, materialize a MISSING merge anchor
-        // from the clean JSONL (issue #378). The guards above already proved
-        // the JSONL is conflict-marker-free and not stale relative to the DB,
-        // so it is exactly the state the anchor should capture. This makes
-        // `br sync --flush-only` an idempotent recovery command for the
-        // doctor's `base_jsonl.missing_post_flush` finding. Best-effort: a
-        // failed anchor write must not fail an otherwise successful no-op
-        // flush.
-        if fs::symlink_metadata(path_policy.beads_dir.join("beads.base.jsonl")).is_err()
-            && let Err(error) =
-                refresh_base_snapshot_from_flushed_jsonl(jsonl_path, &path_policy.beads_dir)
-        {
-            warn!(
-                error = %error,
-                "Failed to materialize missing merge anchor during no-op flush"
-            );
+        // IDs/counts alone cannot prove that a same-ID JSONL record still
+        // matches the database. Immediately before touching the merge anchor,
+        // require the last certified semantic hash and compare it directly
+        // with the live file. Missing or mismatched evidence fails closed;
+        // --force deliberately takes the real-export path instead.
+        let stored_content_hash = storage
+            .get_metadata(METADATA_JSONL_CONTENT_HASH)?
+            .filter(|hash| !hash.trim().is_empty())
+            .ok_or_else(|| {
+                BeadsError::Config(
+                    "Cannot certify a no-op flush because the stored JSONL content hash is \
+                     missing. The merge anchor was not changed.\n\
+                     Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally \
+                     with `br sync --import-only --force`, or replace it from the database with \
+                     `br sync --flush-only --force`."
+                        .to_string(),
+                )
+            })?;
+        let observed_content_hash = compute_jsonl_hash(jsonl_path)?;
+        if observed_content_hash != stored_content_hash {
+            return Err(BeadsError::Config(format!(
+                "Refusing a no-op flush because the JSONL changed since its last certified \
+                 sync (stored hash {stored_content_hash}, observed hash \
+                 {observed_content_hash}). The merge anchor was not changed.\n\
+                 Inspect/reconcile with `br sync --merge`, accept the JSONL intentionally with \
+                 `br sync --import-only --force`, or replace it from the database with \
+                 `br sync --flush-only --force`."
+            )));
         }
+
+        // The copy helper independently binds its captured bytes to the same
+        // hash so a race between this direct check and publication also fails.
+        refresh_base_snapshot_from_flushed_jsonl(
+            jsonl_path,
+            &path_policy.beads_dir,
+            &stored_content_hash,
+        )?;
 
         if use_json {
             let result = FlushResult {
@@ -1498,7 +1518,23 @@ fn execute_flush(
         "Exported issues to JSONL"
     );
 
-    // Finalize export (clear dirty flags, update metadata)
+    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
+    // is the new common state future 3-way merges should diff against.
+    // Publish that anchor before clearing dirty/export metadata so an anchor
+    // publication failure remains recoverable by a later explicit flush.
+    // Partial exports retain their established behavior: they do not become
+    // the merge base, while finalize_export accounts for the rows that were
+    // successfully exported.
+    if !report.has_errors() {
+        refresh_base_snapshot_from_flushed_jsonl(
+            jsonl_path,
+            &path_policy.beads_dir,
+            &export_result.content_hash,
+        )?;
+    }
+
+    // Finalize export (clear dirty flags, update metadata) only after a clean
+    // export's anchor is durable.
     finalize_export(
         storage,
         &export_result,
@@ -1506,25 +1542,6 @@ fn execute_flush(
         jsonl_path,
     )?;
     info!("Export complete, cleared dirty flags");
-
-    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
-    // is the new common state future 3-way merges should diff against.
-    // Refresh the merge anchor to match (issue #378): historically only the
-    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
-    // permanently anchor-less and tripping the doctor's
-    // `base_jsonl.missing_post_flush` warning while `br sync --status`
-    // reported "In sync". Skip when the export had per-record errors — a
-    // partial export must not become the merge base. Best-effort: a failed
-    // anchor write must not fail an otherwise durable flush.
-    if !report.has_errors()
-        && let Err(error) =
-            refresh_base_snapshot_from_flushed_jsonl(jsonl_path, &path_policy.beads_dir)
-    {
-        warn!(
-            error = %error,
-            "Failed to refresh merge anchor after flush; `br doctor` may report base_jsonl findings"
-        );
-    }
 
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {

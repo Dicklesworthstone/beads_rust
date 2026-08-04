@@ -34,7 +34,7 @@ use indicatif::ProgressBar;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::RandomState};
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -4696,10 +4696,13 @@ fn sync_issue_relations(storage: &SqliteStorage, issue: &Issue) -> Result<()> {
 ///
 /// Returns an error if the file cannot be read.
 pub fn compute_jsonl_hash(path: &Path) -> Result<String> {
-    use std::io::BufRead;
     let file = std::fs::File::open(path)?;
     self::path::validate_jsonl_fd_metadata(&file, path)?;
     let mut reader = std::io::BufReader::new(file);
+    compute_jsonl_hash_from_reader(&mut reader)
+}
+
+fn compute_jsonl_hash_from_reader(reader: &mut impl BufRead) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut line_buf = Vec::with_capacity(4096);
 
@@ -5152,6 +5155,113 @@ pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Res
     save_base_snapshot(&issues, jsonl_dir)
 }
 
+#[cfg(unix)]
+fn same_regular_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_regular_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
+}
+
+#[cfg(unix)]
+fn same_regular_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    same_regular_file_identity(left, right)
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+        && left.ctime() == right.ctime()
+        && left.ctime_nsec() == right.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_regular_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    same_regular_file_identity(left, right)
+}
+
+fn require_regular_path_metadata(path: &Path, role: &str) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(BeadsError::Config(format!(
+            "{role} '{}' must be a regular file",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+fn revalidate_open_regular_file(
+    file: &File,
+    path: &Path,
+    captured: &fs::Metadata,
+    role: &str,
+) -> Result<()> {
+    let descriptor_metadata = file.metadata().map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to revalidate opened {role} '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if !descriptor_metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "Opened {role} '{}' is no longer a regular file",
+            path.display()
+        )));
+    }
+
+    let path_metadata = require_regular_path_metadata(path, role)?;
+    if !same_regular_file_identity(&descriptor_metadata, &path_metadata) {
+        return Err(BeadsError::Config(format!(
+            "{role} '{}' changed identity while publishing the merge anchor; retry the flush",
+            path.display()
+        )));
+    }
+    if !same_regular_file_observation(captured, &descriptor_metadata)
+        || !same_regular_file_observation(captured, &path_metadata)
+    {
+        return Err(BeadsError::Config(format!(
+            "{role} '{}' changed while publishing the merge anchor; retry the flush",
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn capture_regular_file(path: &Path, role: &str) -> Result<(File, fs::Metadata, Vec<u8>)> {
+    let path_metadata = require_regular_path_metadata(path, role)?;
+    let mut file = File::open(path)?;
+    self::path::validate_jsonl_fd_metadata(&file, path)?;
+    let descriptor_metadata = file.metadata()?;
+    if !same_regular_file_identity(&descriptor_metadata, &path_metadata) {
+        return Err(BeadsError::Config(format!(
+            "{role} '{}' changed identity while it was opened; retry the flush",
+            path.display()
+        )));
+    }
+
+    let expected_len = descriptor_metadata.len();
+    let initial_capacity = usize::try_from(expected_len.min(64 * 1024)).unwrap_or_default();
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    file.by_ref()
+        .take(expected_len.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_len {
+        return Err(BeadsError::Config(format!(
+            "{role} '{}' changed length while it was read; retry the flush",
+            path.display()
+        )));
+    }
+    revalidate_open_regular_file(&file, path, &descriptor_metadata, role)?;
+
+    Ok((file, descriptor_metadata, bytes))
+}
+
 /// Refresh `beads.base.jsonl` with the exact bytes of a finalized flush
 /// export (issue #378).
 ///
@@ -5163,20 +5273,114 @@ pub fn save_base_snapshot_from_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Res
 /// forever while `br sync --status` reported "In sync".
 ///
 /// This is a byte copy (not a parse + re-serialize) so the anchor matches the
-/// on-disk export exactly. The write goes through the same validated
-/// temp-file + durable-rename machinery as [`save_base_snapshot`], and a
-/// symlinked anchor is refused rather than followed (same attacker shape the
-/// doctor's `base_jsonl` check rejects).
+/// on-disk export exactly. `expected_content_hash` binds the captured bytes to
+/// the state certified by the caller. Existing anchors are read only up to
+/// the captured source length plus one byte, exact matches keep their inode,
+/// and stale/missing anchors go through the same validated temp-file +
+/// durable-rename machinery as [`save_base_snapshot`].
+///
+/// Safe `std` APIs do not provide a portable atomic no-follow/nonblocking
+/// open or a transaction coupling the final source/target path checks to
+/// `rename`. Consequently, a hostile same-user swap to a FIFO in the
+/// lstat/open window can still block, and a source mutation or target swap
+/// after the final pre-publication checks can only be detected by a later
+/// operation. A follow-up platform boundary should use no-follow/nonblocking
+/// descriptor opens plus rename-time identity validation; this safe
+/// implementation fails every race it can observe.
 ///
 /// # Errors
 ///
 /// Returns an error if the finalized JSONL cannot be read, the anchor path is
 /// unsafe (symlink / escapes the workspace), or the snapshot cannot be
 /// written durably.
-pub fn refresh_base_snapshot_from_flushed_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
+pub fn refresh_base_snapshot_from_flushed_jsonl(
+    jsonl_path: &Path,
+    jsonl_dir: &Path,
+    expected_content_hash: &str,
+) -> Result<()> {
+    if expected_content_hash.trim().is_empty() {
+        return Err(BeadsError::Config(
+            "Cannot publish a merge anchor without a non-empty certified JSONL hash".to_string(),
+        ));
+    }
+
+    let (source_file, source_metadata, bytes) =
+        capture_regular_file(jsonl_path, "Finalized JSONL")?;
     ensure_no_conflict_markers(jsonl_path)?;
-    let bytes = fs::read(jsonl_path)?;
+    revalidate_open_regular_file(
+        &source_file,
+        jsonl_path,
+        &source_metadata,
+        "Finalized JSONL",
+    )?;
+
+    let mut captured_reader = BufReader::new(bytes.as_slice());
+    let captured_hash = compute_jsonl_hash_from_reader(&mut captured_reader)?;
+    if captured_hash != expected_content_hash {
+        return Err(BeadsError::Config(format!(
+            "Finalized JSONL '{}' changed before merge-anchor publication \
+             (expected hash {expected_content_hash}, observed {captured_hash}); retry the flush",
+            jsonl_path.display()
+        )));
+    }
+
     let snapshot_path = jsonl_dir.join("beads.base.jsonl");
+
+    // Validate and read an existing anchor before allocating a temp file.
+    // Besides rejecting directories and symlinks without touching them, the
+    // byte comparison keeps an already-current anchor's inode stable across
+    // repeated no-op flushes.
+    match fs::symlink_metadata(&snapshot_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() {
+                return Err(BeadsError::Config(format!(
+                    "Merge anchor '{}' must be a regular file",
+                    snapshot_path.display()
+                )));
+            }
+
+            require_safe_sync_overwrite_path(
+                &snapshot_path,
+                jsonl_dir,
+                false,
+                "inspect base snapshot",
+            )?;
+            let mut snapshot_file = File::open(&snapshot_path)?;
+            path::validate_jsonl_fd_metadata(&snapshot_file, &snapshot_path)?;
+            let snapshot_metadata = snapshot_file.metadata()?;
+            if !same_regular_file_identity(&snapshot_metadata, &metadata) {
+                return Err(BeadsError::Config(format!(
+                    "Merge anchor '{}' changed identity while it was opened; retry the flush",
+                    snapshot_path.display()
+                )));
+            }
+
+            let mut existing = Vec::new();
+            snapshot_file
+                .by_ref()
+                .take(source_metadata.len().saturating_add(1))
+                .read_to_end(&mut existing)?;
+
+            if existing == bytes {
+                revalidate_open_regular_file(
+                    &snapshot_file,
+                    &snapshot_path,
+                    &snapshot_metadata,
+                    "Merge anchor",
+                )?;
+                revalidate_open_regular_file(
+                    &source_file,
+                    jsonl_path,
+                    &source_metadata,
+                    "Finalized JSONL",
+                )?;
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
     let (temp_path, temp_file) = create_base_snapshot_temp_file(&snapshot_path, jsonl_dir)?;
     let mut temp_guard = TempFileGuard::new(temp_path.clone());
     let mut writer = BufWriter::new(temp_file);
@@ -5186,6 +5390,12 @@ pub fn refresh_base_snapshot_from_flushed_jsonl(jsonl_path: &Path, jsonl_dir: &P
         .into_inner()
         .map_err(|e| BeadsError::Io(e.into_error()))?
         .sync_all()?;
+    revalidate_open_regular_file(
+        &source_file,
+        jsonl_path,
+        &source_metadata,
+        "Finalized JSONL",
+    )?;
     require_safe_sync_overwrite_path(&temp_path, jsonl_dir, false, "rename base snapshot")?;
     require_safe_sync_overwrite_path(&snapshot_path, jsonl_dir, false, "overwrite base snapshot")?;
     crate::util::durable_rename(&temp_path, &snapshot_path)?;
@@ -6256,6 +6466,41 @@ mod tests {
         let saved = base.get("bd-final").expect("saved base issue");
         assert_eq!(saved.comments.len(), 1);
         assert_eq!(saved.comments[0].body, "merge note written after report");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_refresh_base_snapshot_rejects_anchor_symlink_without_touching_target() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let outside_dir = temp.path().join("outside");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, "{\"id\":\"bd-current\"}\n").unwrap();
+
+        let outside_snapshot = outside_dir.join("captured.jsonl");
+        fs::write(&outside_snapshot, "do-not-touch\n").unwrap();
+        let snapshot_path = beads_dir.join("beads.base.jsonl");
+        symlink(&outside_snapshot, &snapshot_path).unwrap();
+
+        let expected_hash = compute_jsonl_hash(&jsonl_path).unwrap();
+        let err = refresh_base_snapshot_from_flushed_jsonl(&jsonl_path, &beads_dir, &expected_hash)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("regular file"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside_snapshot).unwrap(),
+            "do-not-touch\n",
+            "a symlinked anchor target must remain untouched"
+        );
+        assert!(
+            !export_temp_path(&snapshot_path).exists(),
+            "anchor validation must fail before allocating a temp file"
+        );
     }
 
     #[cfg(unix)]

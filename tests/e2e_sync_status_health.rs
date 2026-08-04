@@ -7,8 +7,16 @@
 
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use beads_rust::storage::SqliteStorage;
+use beads_rust::sync::{
+    METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
+    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, compute_jsonl_hash,
+};
+use common::cli::{BrRun, BrWorkspace, extract_json_payload, run_br};
 use serde_json::Value;
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -65,6 +73,102 @@ fn sync_status_json_no_auto_import(workspace: &BrWorkspace, label: &str) -> Valu
         status.stderr
     );
     serde_json::from_str(&extract_json_payload(&status.stdout)).expect("sync status json")
+}
+
+const CERTIFICATION_METADATA_KEYS: [&str; 6] = [
+    METADATA_JSONL_CONTENT_HASH,
+    METADATA_JSONL_MTIME,
+    METADATA_JSONL_SIZE,
+    METADATA_LAST_EXPORT_TIME,
+    METADATA_LAST_IMPORT_TIME,
+    "needs_flush",
+];
+
+#[derive(Debug, PartialEq, Eq)]
+struct SyncPersistenceSnapshot {
+    jsonl: Vec<u8>,
+    anchor: Vec<u8>,
+    metadata: BTreeMap<String, Option<String>>,
+}
+
+fn setup_certified_anchor_workspace(label: &str) -> (BrWorkspace, String) {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], &format!("{label}_init"));
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        ["create", "No-op anchor certification", "--json"],
+        &format!("{label}_create"),
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value =
+        serde_json::from_str(&extract_json_payload(&create.stdout)).expect("create JSON payload");
+    let issue_id = created["id"]
+        .as_str()
+        .expect("created issue id")
+        .to_string();
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--no-auto-import"],
+        &format!("{label}_baseline_flush"),
+    );
+    assert!(
+        flush.status.success(),
+        "baseline no-op flush failed: {}",
+        flush.stderr
+    );
+
+    let beads_dir = workspace.root.join(".beads");
+    assert_eq!(
+        std::fs::read(beads_dir.join("beads.base.jsonl")).expect("baseline anchor"),
+        std::fs::read(beads_dir.join("issues.jsonl")).expect("baseline JSONL"),
+        "baseline anchor must be certified and byte-exact"
+    );
+
+    (workspace, issue_id)
+}
+
+fn persistence_snapshot(workspace: &BrWorkspace) -> SyncPersistenceSnapshot {
+    let beads_dir = workspace.root.join(".beads");
+    let storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("open workspace db");
+    let metadata = CERTIFICATION_METADATA_KEYS
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_string(),
+                storage.get_metadata(key).expect("read sync metadata"),
+            )
+        })
+        .collect();
+
+    SyncPersistenceSnapshot {
+        jsonl: std::fs::read(beads_dir.join("issues.jsonl")).expect("read JSONL snapshot"),
+        anchor: std::fs::read(beads_dir.join("beads.base.jsonl")).expect("read anchor snapshot"),
+        metadata,
+    }
+}
+
+fn assert_noop_anchor_certification_failure(run: &BrRun, context: &str) {
+    assert!(
+        !run.status.success(),
+        "{context} unexpectedly succeeded\nstdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
+    let output = format!("{}\n{}", run.stdout, run.stderr);
+    for guidance in [
+        "merge anchor was not changed",
+        "br sync --merge",
+        "br sync --import-only --force",
+        "br sync --flush-only --force",
+    ] {
+        assert!(
+            output.contains(guidance),
+            "{context} should include {guidance:?} guidance: {output}"
+        );
+    }
 }
 
 #[test]
@@ -318,6 +422,47 @@ fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
         "anchor must match the live JSONL byte-for-byte after a no-op flush"
     );
 
+    // Exact-match no-op path: certifying an already-current regular anchor
+    // must not replace it. Inode stability makes the no-rewrite guarantee
+    // observable on Unix.
+    #[cfg(unix)]
+    let matching_anchor_inode = std::fs::metadata(&anchor_path)
+        .expect("matching anchor metadata")
+        .ino();
+    let flush_idempotent = run_br(&workspace, ["sync", "--flush-only"], "flush_idempotent");
+    assert!(
+        flush_idempotent.status.success(),
+        "idempotent no-op flush failed: {}",
+        flush_idempotent.stderr
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(&anchor_path)
+            .expect("idempotent anchor metadata")
+            .ino(),
+        matching_anchor_inode,
+        "an exact anchor must keep its inode across an idempotent no-op flush"
+    );
+
+    // Stale-anchor no-op path: the same recovery command must replace stale
+    // bytes even though there is still nothing to export from the database.
+    std::fs::write(
+        &anchor_path,
+        b"{\"id\":\"stale-anchor\",\"title\":\"must be replaced\"}\n",
+    )
+    .expect("write stale anchor");
+    let flush_stale = run_br(&workspace, ["sync", "--flush-only"], "flush_stale");
+    assert!(
+        flush_stale.status.success(),
+        "stale-anchor no-op flush failed: {}",
+        flush_stale.stderr
+    );
+    assert_eq!(
+        std::fs::read(&anchor_path).expect("read repaired anchor"),
+        std::fs::read(&jsonl_path).expect("read jsonl after stale repair"),
+        "a no-op flush must replace a stale merge anchor with exact JSONL bytes"
+    );
+
     // Real export path: a dirty issue forces an actual export, which must
     // refresh the anchor to the newly finalized JSONL.
     let create2 = run_br(&workspace, ["create", "Second issue"], "create2");
@@ -358,5 +503,177 @@ fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
     assert_eq!(
         anchor_check["status"], "ok",
         "doctor must not warn about a missing anchor after a flush: {anchor_check}"
+    );
+}
+
+#[test]
+fn e2e_noop_anchor_rejects_same_id_external_semantic_edit_without_mutation() {
+    let (workspace, issue_id) = setup_certified_anchor_workspace("same_id_semantic_edit");
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+
+    let mut records: Vec<Value> = std::fs::read_to_string(&jsonl_path)
+        .expect("read JSONL")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("parse JSONL record"))
+        .collect();
+    let edited = records
+        .iter_mut()
+        .find(|record| record["id"].as_str() == Some(issue_id.as_str()))
+        .expect("created issue in JSONL");
+    edited["title"] = Value::String("Externally edited same-ID title".to_string());
+    let edited_jsonl = format!(
+        "{}\n",
+        records
+            .iter()
+            .map(|record| serde_json::to_string(record).expect("serialize edited record"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    std::fs::write(&jsonl_path, edited_jsonl).expect("write same-ID semantic edit");
+
+    let before = persistence_snapshot(&workspace);
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "same_id_semantic_edit_flush",
+    );
+    assert_noop_anchor_certification_failure(&flush, "same-ID semantic edit");
+    let after = persistence_snapshot(&workspace);
+    assert_eq!(
+        after, before,
+        "failed no-op certification must preserve edited JSONL, prior anchor, and sync metadata"
+    );
+}
+
+#[test]
+fn e2e_noop_anchor_rejects_external_truncation_without_mutation() {
+    let (workspace, _issue_id) = setup_certified_anchor_workspace("external_truncation");
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    std::fs::write(&jsonl_path, b"").expect("truncate JSONL");
+
+    let before = persistence_snapshot(&workspace);
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "external_truncation_flush",
+    );
+    assert_noop_anchor_certification_failure(&flush, "external truncation");
+    let after = persistence_snapshot(&workspace);
+    assert_eq!(
+        after, before,
+        "failed truncation certification must preserve empty JSONL, prior anchor, and sync metadata"
+    );
+}
+
+#[test]
+fn e2e_noop_anchor_missing_cached_hash_fails_then_force_recovers() {
+    let (workspace, _issue_id) = setup_certified_anchor_workspace("missing_cached_hash");
+    let beads_dir = workspace.root.join(".beads");
+    let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("open workspace db");
+    assert!(
+        storage
+            .delete_metadata(METADATA_JSONL_CONTENT_HASH)
+            .expect("delete cached JSONL hash"),
+        "baseline should contain a cached JSONL hash"
+    );
+    drop(storage);
+
+    let before = persistence_snapshot(&workspace);
+    assert_eq!(
+        before.metadata[METADATA_JSONL_CONTENT_HASH], None,
+        "test precondition requires a missing cached hash"
+    );
+    let failed = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "missing_cached_hash_flush",
+    );
+    assert_noop_anchor_certification_failure(&failed, "missing cached hash");
+    let after_failure = persistence_snapshot(&workspace);
+    assert_eq!(
+        after_failure, before,
+        "missing-hash failure must preserve JSONL, anchor, and metadata"
+    );
+
+    let forced = run_br(
+        &workspace,
+        [
+            "sync",
+            "--flush-only",
+            "--force",
+            "--json",
+            "--no-auto-import",
+        ],
+        "missing_cached_hash_force",
+    );
+    assert!(
+        forced.status.success(),
+        "forced recovery failed: {}",
+        forced.stderr
+    );
+
+    let recovered = persistence_snapshot(&workspace);
+    assert_eq!(
+        recovered.anchor, recovered.jsonl,
+        "forced recovery must republish a byte-exact anchor"
+    );
+    let recovered_hash =
+        compute_jsonl_hash(&beads_dir.join("issues.jsonl")).expect("hash recovered JSONL");
+    assert_eq!(
+        recovered.metadata[METADATA_JSONL_CONTENT_HASH].as_deref(),
+        Some(recovered_hash.as_str()),
+        "forced recovery must restore the cached JSONL hash"
+    );
+}
+
+#[test]
+fn e2e_noop_anchor_accepts_whitespace_only_change_and_copies_exact_bytes() {
+    let (workspace, _issue_id) = setup_certified_anchor_workspace("whitespace_only");
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let anchor_path = beads_dir.join("beads.base.jsonl");
+    let original_jsonl = std::fs::read(&jsonl_path).expect("read baseline JSONL");
+    let mut whitespace_changed = b" \t\n\n".to_vec();
+    whitespace_changed.extend_from_slice(&original_jsonl);
+    whitespace_changed.extend_from_slice(b"\n\t \n");
+    std::fs::write(&jsonl_path, &whitespace_changed).expect("write whitespace-only change");
+    assert_ne!(
+        std::fs::read(&anchor_path).expect("read old anchor"),
+        whitespace_changed,
+        "test precondition requires byte drift"
+    );
+
+    let before = persistence_snapshot(&workspace);
+    assert_eq!(
+        compute_jsonl_hash(&jsonl_path).expect("hash whitespace-changed JSONL"),
+        before.metadata[METADATA_JSONL_CONTENT_HASH]
+            .as_deref()
+            .expect("stored baseline hash"),
+        "whitespace-only drift must retain semantic hash equality"
+    );
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "whitespace_only_flush",
+    );
+    assert!(
+        flush.status.success(),
+        "whitespace-only no-op flush failed: {}",
+        flush.stderr
+    );
+
+    let after = persistence_snapshot(&workspace);
+    assert_eq!(
+        after.jsonl, before.jsonl,
+        "successful certification must not rewrite the source JSONL"
+    );
+    assert_eq!(
+        after.anchor, before.jsonl,
+        "successful certification must copy the exact whitespace-changed bytes"
+    );
+    assert_eq!(
+        after.metadata, before.metadata,
+        "a no-op anchor repair must not mutate sync metadata"
     );
 }

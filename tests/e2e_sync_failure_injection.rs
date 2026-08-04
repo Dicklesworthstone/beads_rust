@@ -1165,6 +1165,146 @@ fn cli_sync_crash_boundary_matrix_preserves_artifacts() {
     artifacts.save();
 }
 
+/// A clean explicit flush must not clear dirty/export metadata until its
+/// merge anchor is durable. Use a directory at the anchor path as a
+/// deterministic publication failure, then move that blocker aside and prove
+/// the same dirty workspace can be retried without deleting evidence.
+#[test]
+fn cli_sync_flush_anchor_publication_failure_retains_dirty_state_and_retries() {
+    let _log = common::test_log(
+        "cli_sync_flush_anchor_publication_failure_retains_dirty_state_and_retries",
+    );
+    let mut artifacts =
+        FailureTestArtifacts::new("cli_sync_flush_anchor_publication_failure_retry");
+
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "anchor_failure_init");
+    assert_run_success(&init, "anchor failure init");
+
+    let create = run_br(
+        &workspace,
+        ["create", "Anchor publication failure", "--json"],
+        "anchor_failure_create",
+    );
+    assert_run_success(&create, "anchor failure create");
+    let create_json = parse_stdout_json(&create, "anchor failure create");
+    let issue_id = create_json["id"].as_str().unwrap_or("").to_string();
+    assert!(
+        !issue_id.is_empty(),
+        "create should report an issue id in stdout: {}",
+        create.stdout
+    );
+
+    flush_and_assert_clean(&workspace, "anchor_failure_baseline_flush");
+
+    let beads_dir = workspace.root.join(".beads");
+    let jsonl_path = beads_dir.join("issues.jsonl");
+    let anchor_path = beads_dir.join("beads.base.jsonl");
+    let retained_anchor_path = beads_dir.join("beads.base.pre-blocker.jsonl");
+    let retained_blocker_path = beads_dir.join("beads.base.directory-blocker.retained");
+    let baseline_status = sync_status_json(&workspace, "anchor_failure_baseline_status");
+    let baseline_last_export_time = baseline_status["last_export_time"].clone();
+    let baseline_content_hash = baseline_status["jsonl_content_hash"].clone();
+
+    let update = run_br(
+        &workspace,
+        [
+            "update",
+            &issue_id,
+            "--title",
+            "Anchor publication retry",
+            "--json",
+            "--no-auto-flush",
+        ],
+        "anchor_failure_dirty_update",
+    );
+    assert_run_success(&update, "anchor failure dirty update");
+    let dirty_before = sync_status_json(&workspace, "anchor_failure_dirty_before_publication");
+    assert!(
+        dirty_count(&dirty_before) > 0,
+        "the precondition must include a dirty row: {dirty_before}"
+    );
+
+    fs::rename(&anchor_path, &retained_anchor_path).expect("retain prior regular anchor");
+    fs::create_dir(&anchor_path).expect("plant directory anchor blocker");
+
+    let failed_flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "anchor_failure_flush",
+    );
+    artifacts.log("failed_flush_stdout", &failed_flush.stdout);
+    artifacts.log("failed_flush_stderr", &failed_flush.stderr);
+    assert_run_failure(&failed_flush, "directory-blocked anchor flush");
+    let failure_output = format!("{}\n{}", failed_flush.stdout, failed_flush.stderr);
+    assert!(
+        failure_output.contains("beads.base.jsonl") && failure_output.contains("regular file"),
+        "anchor publication failure should identify the non-regular anchor: {failure_output}"
+    );
+
+    let exported = read_jsonl_values(&jsonl_path, "failed anchor publication JSONL");
+    assert!(
+        exported.iter().any(|issue| {
+            issue["id"].as_str() == Some(issue_id.as_str())
+                && issue["title"].as_str() == Some("Anchor publication retry")
+        }),
+        "the JSONL should contain the durable export even though anchor publication failed: {exported:?}"
+    );
+
+    let failed_status_run = run_br(
+        &workspace,
+        ["sync", "--status", "--json", "--no-auto-import"],
+        "anchor_failure_status_after_failure",
+    );
+    assert_run_success(&failed_status_run, "status after anchor failure");
+    let failed_status = parse_stdout_json(&failed_status_run, "status after anchor failure");
+    assert!(
+        dirty_count(&failed_status) > 0,
+        "anchor publication failure must retain dirty metadata: {failed_status}"
+    );
+    assert_eq!(
+        failed_status["last_export_time"], baseline_last_export_time,
+        "anchor publication failure must not advance last_export_time"
+    );
+    assert_eq!(
+        failed_status["jsonl_content_hash"], baseline_content_hash,
+        "anchor publication failure must not certify the new JSONL hash"
+    );
+
+    fs::rename(&anchor_path, &retained_blocker_path)
+        .expect("retain directory blocker for postmortem evidence");
+    let retry = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json", "--no-auto-import"],
+        "anchor_failure_retry",
+    );
+    artifacts.log("retry_stdout", &retry.stdout);
+    artifacts.log("retry_stderr", &retry.stderr);
+    assert_run_success(&retry, "anchor publication retry");
+
+    let recovered_status = sync_status_json(&workspace, "anchor_failure_recovered_status");
+    assert_clean_status(&recovered_status, "anchor publication retry");
+    assert_eq!(
+        fs::read(&anchor_path).expect("read recovered anchor"),
+        fs::read(&jsonl_path).expect("read recovered JSONL"),
+        "successful retry must publish an exact merge anchor"
+    );
+    assert!(
+        retained_anchor_path.is_file(),
+        "the prior anchor must remain retained beside the recovered anchor"
+    );
+    assert!(
+        retained_blocker_path.is_dir(),
+        "the directory blocker must remain retained for postmortem evidence"
+    );
+
+    artifacts.log(
+        "verification",
+        "PASSED: anchor failure retained dirty metadata and retry published the exact anchor",
+    );
+    artifacts.save();
+}
+
 /// Test: A killed `sync --flush-only` process must not silently mark dirty
 /// state as exported or mutate JSONL before it owns the write-side lock.
 #[test]
