@@ -1661,6 +1661,7 @@ pub const fn command_requests_robot_json(cmd: &Commands) -> bool {
         Commands::Changelog(args) => args.robot,
         Commands::Sync(args) => args.robot,
         Commands::VcsStatus(args) => args.robot,
+        Commands::Doctor(args) => args.robot_triage,
         Commands::Dep { command } => match command {
             DepCommands::Import(args) => args.robot,
             DepCommands::Add(_)

@@ -14535,9 +14535,16 @@ impl SqliteStorage {
 
     /// Clear the purged-pending-export marker inside an export-finalization
     /// transaction: once an export has published a JSONL snapshot, the purged
-    /// IDs are no longer present in it (#405).
+    /// IDs are no longer present in it (#405). Deletes the row outright so
+    /// the metadata table keeps its historical shape (e.g. the sync-merge
+    /// finalization witness's exact export-metadata row count) whenever no
+    /// purge is pending.
     pub(crate) fn clear_purged_ids_pending_export_in_tx(&self) -> Result<()> {
-        self.set_metadata_in_tx(PURGED_IDS_PENDING_EXPORT_KEY, "")
+        self.conn.execute_with_params(
+            "DELETE FROM metadata WHERE key = ?",
+            &[SqliteValue::from(PURGED_IDS_PENDING_EXPORT_KEY)],
+        )?;
+        Ok(())
     }
 
     /// Set a metadata value.
