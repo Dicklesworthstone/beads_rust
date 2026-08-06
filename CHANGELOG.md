@@ -15,6 +15,24 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.22 -- 2026-08-06 (Release)
+
+Windows companion fix to v0.2.21 (GitHub #412 follow-up).
+
+### Windows database-identity witness no longer tracks content
+
+- On Windows the database-inode authority witnessed file identity as
+  `(length, mtime)` — values the SQLite engine changes on every write — so
+  after v0.2.21 removed the whole-file lock conflict, the very next check
+  failed with "Database inode changed while its write authority was held"
+  and Windows workspaces were still unusable after `br init`. The witness now
+  uses the file creation time, which is stable across in-place writes and
+  changes on atomic replacement, matching the (dev, inode) semantics the
+  authority has always used on Unix. Linux and macOS binaries are unchanged
+  apart from the version number.
+
+---
+
 ## v0.2.21 -- 2026-08-05 (Release)
 
 Emergency fix for a v0.2.20 regression that made workspaces unusable on

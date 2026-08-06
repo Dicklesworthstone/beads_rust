@@ -3557,14 +3557,37 @@ fn additive_file_identity(path: &Path) -> Result<(u64, u64)> {
     Ok(additive_metadata_identity(&metadata))
 }
 
+/// Windows/fallback file-identity witness.
+///
+/// GitHub #412 follow-up: the previous `(len, modified)` witness was
+/// *content-sensitive* — the SQLite engine mutates the database's length and
+/// mtime on every write, so the database-inode authority immediately reported
+/// "Database inode changed while its write authority was held" on the first
+/// mutating open. (On v0.2.20 this was masked by the whole-file mandatory
+/// lock failing even earlier.)
+///
+/// Identity must be stable across in-place writes and change on file
+/// *replacement*. Creation time has exactly those semantics on Windows: it
+/// survives writes and renames of the same file, while atomic replacement
+/// (rename of a freshly created temp file over the destination — the only
+/// replacement mechanism the sync layer uses) installs a file whose creation
+/// time differs. Timestamps carry 100ns resolution, so an accidental
+/// collision between the displaced file and its replacement is negligible.
+/// When the filesystem cannot report a creation time, fall back to the
+/// modified time rather than a constant so distinct files still tend to
+/// differ.
 #[cfg(not(unix))]
 fn additive_metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos() as u64);
-    (metadata.len(), modified)
+    #[allow(clippy::cast_possible_truncation)]
+    fn nanos(time: std::io::Result<std::time::SystemTime>) -> Option<u64> {
+        time.ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as u64)
+    }
+    let created = nanos(metadata.created())
+        .or_else(|| nanos(metadata.modified()))
+        .unwrap_or(0);
+    (created, u64::from(metadata.file_type().is_file()))
 }
 
 #[cfg(not(unix))]
