@@ -1143,8 +1143,21 @@ pub struct MsgArgs {
     /// Recipient prefix (e.g., "arc1").
     pub to: String,
 
-    /// Message body. If omitted, read from stdin.
+    /// Message body. If omitted, read from stdin. A sole `-` is the
+    /// same request as omitting BODY: read from stdin (this is the
+    /// conventional stdin marker, not a literal dash).
     pub body: Vec<String>,
+
+    /// Read the message body from a file (`-` for stdin).
+    ///
+    /// Mutually exclusive with a positional BODY — passing both is a
+    /// usage error rather than a silent pick. If FILE names a real
+    /// path, any content piped on stdin is ignored: the explicit flag
+    /// always wins over an unread pipe. Trailing newlines are stripped
+    /// from the body, as they are for piped input (`-`, `--file -`, and
+    /// `< file` all agree byte-for-byte on this).
+    #[arg(short = 'f', long = "file", value_name = "FILE")]
+    pub file: Option<PathBuf>,
 
     /// Reply to an existing message; chains via in_reply_to.
     #[arg(long)]

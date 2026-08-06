@@ -78,6 +78,27 @@ where
     )
 }
 
+/// Like `run_br_with_stdin`, but also sets environment variables -- for
+/// commands (like `bd msg`) whose identity resolution needs
+/// `BD_AGENT_ID` and whose body also needs to come from stdin in the
+/// same invocation.
+pub fn run_br_with_env_and_stdin<I, S, E, K, V>(
+    workspace: &BrWorkspace,
+    args: I,
+    env_vars: E,
+    input: &str,
+    label: &str,
+) -> BrRun
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+    E: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    run_br_full(workspace, args, env_vars, Some(input), label)
+}
+
 /// Run `br` with args passed VERBATIM \u2014 no `--prefix bd` auto-injection.
 ///
 /// Use this (never the shimmed helpers above) for regression tests that

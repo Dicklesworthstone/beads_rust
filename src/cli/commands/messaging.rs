@@ -73,10 +73,7 @@ pub fn execute_msg(args: &MsgArgs, cli: &config::CliOverrides, ctx: &OutputConte
     // reads the watchers table), so this must come after `open_storage`.
     let from = config::resolve_agent_identity_with_storage(&storage_ctx.storage)?;
 
-    let body = resolve_body(&args.body)?;
-    if body.trim().is_empty() {
-        return Err(BeadsError::validation("body", "message body is empty"));
-    }
+    let body = resolve_body(args)?;
 
     if let Some(reply) = &args.reply {
         if storage_ctx.storage.get_message(reply)?.is_none() {
@@ -205,10 +202,7 @@ pub fn execute_admin_msg(
         ));
     }
 
-    let body = resolve_body(&args.body)?;
-    if body.trim().is_empty() {
-        return Err(BeadsError::validation("body", "message body is empty"));
-    }
+    let body = resolve_body(args)?;
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
     let mut storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
@@ -416,15 +410,128 @@ fn pick_message_id(
     ))
 }
 
-fn resolve_body(words: &[String]) -> Result<String> {
-    if !words.is_empty() {
-        return Ok(words.join(" "));
+/// Resolve the message body from the positional words or `--file`,
+/// mirroring `bd comments add`'s flag semantics with one deliberate
+/// difference (documented on [`crate::cli::MsgArgs::file`] and below).
+///
+/// Sources, in the order they're distinguished:
+///
+/// - **both** a positional body and `--file`: a usage error. Two bodies
+///   supplied at once must never be resolved by silently preferring
+///   one — that is exactly the kind of ambiguity this surface exists to
+///   refuse.
+/// - **positional, single `-`**: the conventional stdin marker. This is
+///   the fix for the historic footgun where a piped `bd msg to -`
+///   stored the literal two-byte string `"-"` and reported success —
+///   three real sends were lost to it before anyone noticed. Multi-word
+///   positional bodies are unaffected (`bd msg to - decided` is text
+///   starting with a dash, not a stdin request, matching `bd comments
+///   add`'s treatment of a leading dash as content).
+/// - **positional, anything else**: literal text, `join(" ")`,
+///   unchanged from today.
+/// - **`--file -`**: read from stdin.
+/// - **`--file <path>`**: read that file. Any content sitting unread on
+///   stdin is deliberately ignored — the explicit flag always wins over
+///   an unread pipe rather than blending the two or guessing.
+/// - **neither**: read from stdin (today's `bd msg <target> < file`
+///   path, unchanged).
+///
+/// All three stdin-shaped forms above, plus `--file <path>`, normalize
+/// identically (trailing `\n` stripped, matching what the bare-stdin
+/// path has always done) so the same body produces the same stored
+/// message regardless of which of the four carried it in. This is the
+/// one place this command's semantics diverge from `bd comments add`'s
+/// `--file`, which reads raw and keeps the trailing newline: `bd
+/// comments add` has no pre-existing bare-stdin behavior to stay
+/// consistent with, `bd msg` does, and byte-for-byte agreement with
+/// that existing path was called out explicitly as a requirement.
+/// Literal positional text is never normalized this way, matching
+/// today's behavior exactly.
+///
+/// Every source is checked for an empty result (after trimming
+/// whitespace) and refused by name — an empty send is never intended,
+/// and silently accepting one is the exact hole a mandatory shell-side
+/// `[ -n "$BODY" ]` guard exists to plug for exactly this command.
+///
+/// # Errors
+///
+/// Returns a validation error if both a body and `--file` are given, if
+/// `--file` names a path that cannot be read, if the resolved body is
+/// empty, or if a stdin read is attempted while stdin is a terminal.
+fn resolve_body(args: &MsgArgs) -> Result<String> {
+    let has_positional = !args.body.is_empty();
+
+    let (raw, label): (String, String) = match (has_positional, args.file.as_deref()) {
+        (true, Some(_)) => {
+            return Err(BeadsError::validation(
+                "body",
+                "provide either a message body or --file, not both",
+            ));
+        }
+        (true, None) => {
+            if args.body.len() == 1 && args.body[0] == "-" {
+                (read_stdin_body()?, "stdin".to_string())
+            } else {
+                let text = args.body.join(" ");
+                if text.trim().is_empty() {
+                    return Err(BeadsError::validation("body", "message body is empty"));
+                }
+                return Ok(text);
+            }
+        }
+        (false, Some(path)) if path == std::path::Path::new("-") => {
+            (read_stdin_body()?, "stdin".to_string())
+        }
+        (false, Some(path)) => {
+            let content = std::fs::read_to_string(path).map_err(|e| {
+                BeadsError::validation("file", format!("cannot read {}: {e}", path.display()))
+            })?;
+            (
+                normalize_stream_body(&content),
+                format!("--file {}", path.display()),
+            )
+        }
+        (false, None) => (read_stdin_body()?, "stdin".to_string()),
+    };
+
+    if raw.trim().is_empty() {
+        return Err(BeadsError::validation(
+            "body",
+            format!("message body is empty (read from {label})"),
+        ));
+    }
+    Ok(raw)
+}
+
+/// Read the message body from stdin, refusing a terminal outright.
+///
+/// A bare `-` (or an omitted body, or `--file -`) reading from an
+/// attached terminal has no content to receive: it is neither a
+/// literal dash nor something to wait on — the historic bug this
+/// command is being fixed for is exactly a case where an ambiguous
+/// input was resolved by guessing instead of refusing, so the terminal
+/// case is refused rather than left to hang or to silently read
+/// whatever is typed.
+fn read_stdin_body() -> Result<String> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        return Err(BeadsError::validation(
+            "body",
+            "refusing to read the message body from a terminal — pipe input, \
+             redirect a file, or pass --file <path>",
+        ));
     }
     let mut buf = String::new();
     std::io::stdin()
         .read_to_string(&mut buf)
         .map_err(BeadsError::from)?;
-    Ok(buf.trim_end_matches('\n').to_string())
+    Ok(normalize_stream_body(&buf))
+}
+
+/// Strip trailing newlines the same way the bare-stdin path always has,
+/// so every stream-shaped body source agrees byte-for-byte.
+fn normalize_stream_body(raw: &str) -> String {
+    raw.trim_end_matches('\n').to_string()
 }
 
 /// Maximum body length (in characters) shown before a message is
@@ -536,8 +643,56 @@ mod tests {
 
     #[test]
     fn resolve_body_joins_words() {
-        let words = vec!["hello".to_string(), "world".to_string()];
-        assert_eq!(resolve_body(&words).unwrap(), "hello world");
+        let args = MsgArgs {
+            to: "target".to_string(),
+            body: vec!["hello".to_string(), "world".to_string()],
+            ..MsgArgs::default()
+        };
+        assert_eq!(resolve_body(&args).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn resolve_body_rejects_body_and_file_together() {
+        let args = MsgArgs {
+            to: "target".to_string(),
+            body: vec!["inline".to_string()],
+            file: Some(std::path::PathBuf::from("/dev/null")),
+            ..MsgArgs::default()
+        };
+        let err = resolve_body(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("not both"),
+            "expected a not-both usage error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_body_rejects_empty_literal() {
+        let args = MsgArgs {
+            to: "target".to_string(),
+            body: vec!["   ".to_string()],
+            ..MsgArgs::default()
+        };
+        let err = resolve_body(&args).unwrap_err();
+        assert!(
+            err.to_string().contains("empty"),
+            "expected an empty-body error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_body_rejects_missing_file() {
+        let args = MsgArgs {
+            to: "target".to_string(),
+            file: Some(std::path::PathBuf::from("/no/such/path/for/msg/test")),
+            ..MsgArgs::default()
+        };
+        let err = resolve_body(&args).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("/no/such/path/for/msg/test"),
+            "error must name the missing path, got: {text}"
+        );
     }
 
     #[test]
