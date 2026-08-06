@@ -16,6 +16,7 @@ use crate::config::{
     resolve_actor,
 };
 use crate::error::Result;
+use crate::exit::{ExitKind, exit_with_status};
 use crate::output::OutputContext;
 use rich_rust::prelude::*;
 use serde_json::json;
@@ -390,7 +391,7 @@ fn get_config_value(
         }
     } else {
         eprintln!("Config key not found: {key}");
-        std::process::exit(1);
+        exit_with_status(1, ExitKind::Failure, "CONFIG_KEY_NOT_FOUND");
     }
 
     Ok(())

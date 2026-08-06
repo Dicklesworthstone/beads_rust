@@ -96,7 +96,16 @@ fn structured_error(stderr: &str) -> Value {
     let start = stderr.find('{').unwrap_or_else(|| {
         panic!("no JSON error envelope in stderr: {stderr}");
     });
-    let envelope: Value = serde_json::from_str(&stderr[start..]).expect("structured error json");
+    // Read the FIRST JSON value from the brace and ignore the rest: stderr is a
+    // mixed stream (diagnostics, the envelope, trailing logs, and the
+    // `br: FAILED (CODE, exit N)` banner), so `from_str` on the remainder of
+    // the stream fails on the trailing bytes. Same idiom as
+    // `tests/e2e_close_truth.rs::envelope` and `e2e_errors::parse_error_json`.
+    let envelope: Value = serde_json::Deserializer::from_str(&stderr[start..])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("no json after the opening brace: {stderr}"))
+        .expect("structured error json");
     let inner = envelope["error"].clone();
     assert!(
         inner.is_object(),

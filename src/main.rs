@@ -1,13 +1,14 @@
 use beads_rust::cli::commands;
 use beads_rust::cli::{Cli, Commands};
 use beads_rust::config;
+use beads_rust::exit::{ExitKind, exit_with_status};
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
 use beads_rust::sync::{auto_flush, auto_import_if_stale};
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write as _};
 use std::path::Path;
 use tracing::debug;
 
@@ -60,14 +61,75 @@ use tracing::debug;
 /// rows. The mutation itself was committed to SQLite before any output was
 /// printed. Nor is it a new exposure — the previous behaviour (`abort()`)
 /// skipped the flush just as abruptly, only with a core dump attached.
+///
+/// # The failure banner, and why the order inside this hook matters
+///
+/// This hook also covers the one nonzero exit path that is not a
+/// `std::process::exit` call: a fatal panic. The broken-pipe check must stay
+/// **first**. `br list | head -1` is the most common pipeline in this fleet and
+/// it arrives here as a panic; if the banner were emitted for "a panic
+/// happened" rather than for the status being exited with, that entirely normal
+/// command would start printing `br: FAILED (PANIC, ...)`.
+///
+/// The rule that keeps this correct is in `beads_rust::exit`: the banner is a
+/// function of the exit status. The broken-pipe branch exits **0** and so is
+/// silent, by the same rule that makes every other zero exit silent — not by a
+/// special case anyone has to remember.
 fn install_broken_pipe_guard() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if is_broken_pipe_panic(info) {
-            std::process::exit(0);
+            // Status 0: a reader that left early is not a failure, so this
+            // emits no banner. Routed through the funnel so that stays true
+            // for the same reason it is true everywhere else.
+            exit_with_status(0, ExitKind::Notice, "BROKEN_PIPE");
         }
         default_hook(info);
+
+        // After the default hook, so the banner is genuinely the last line:
+        // the panic message is already on stderr and nothing else will be
+        // written before the process dies.
+        if beads_rust::exit::panic_is_fatal() {
+            beads_rust::exit::emit_exit_banner(
+                ExitKind::Failure,
+                beads_rust::exit::PANIC,
+                beads_rust::exit::panic_exit_status(),
+            );
+        }
     }));
+}
+
+/// Panic on demand so the panic banner is end-to-end testable.
+///
+/// This exists **solely** so `tests/e2e_fail_banner.rs` can assert that a
+/// process dying by panic still emits the final banner — the most catastrophic
+/// exit path, and the one where a confusing scrollback costs the most. There is
+/// no other way to reach a panic from `br`'s own inputs, and behaviour in a
+/// death path that has only ever been reasoned about is exactly what this
+/// feature exists to stop trusting.
+///
+/// Gated on `debug_assertions`, so it cannot exist in the shipped release
+/// binary. (The abort-profile verification described in that test builds
+/// release *with* debug assertions on via `--config` to reach it.)
+///
+/// `BD_PANIC_FOR_TEST=partial-stdout` additionally leaves an unterminated line
+/// in stdout's buffer first. That is the *only* way to observe the
+/// `stdout().flush()` inside [`beads_rust::exit::emit_exit_banner`]: stdout is a
+/// `LineWriter`, so buffered bytes are only ever pending when a printer stopped
+/// mid-line, and no command in the tree today both stops mid-line and then
+/// fails. Without that flush the pending bytes are emitted by std's exit cleanup
+/// *after* the banner (under unwinding) or dropped entirely (under
+/// `panic = "abort"`) — the first of which is precisely the "banner is usually
+/// last" outcome this feature must not ship.
+#[cfg(debug_assertions)]
+fn maybe_panic_for_test() {
+    let Some(mode) = std::env::var_os("BD_PANIC_FOR_TEST") else {
+        return;
+    };
+    if mode == *"partial-stdout" {
+        print!("PARTIAL-STDOUT-NO-NEWLINE");
+    }
+    panic!("BD_PANIC_FOR_TEST: deliberate panic for the failure-banner test");
 }
 
 /// Is this panic a failed write caused by the reader going away?
@@ -111,9 +173,12 @@ fn is_broken_pipe_panic(info: &std::panic::PanicHookInfo<'_>) -> bool {
 fn main() {
     install_broken_pipe_guard();
 
+    #[cfg(debug_assertions)]
+    maybe_panic_for_test();
+
     CompleteEnv::with_factory(Cli::command).complete();
 
-    let cli = Cli::parse();
+    let cli = parse_cli();
     let output_ctx = OutputContext::from_args(&cli);
 
     // Initialize logging
@@ -483,6 +548,33 @@ fn run_auto_flush(overrides: &config::CliOverrides) {
     }
 }
 
+/// Parse the command line, routing clap's own failure through the exit funnel.
+///
+/// `Cli::parse()` cannot be used: on a usage error it calls
+/// `std::process::exit` from inside clap, which would leave `br list --nope`
+/// (exit 2) as the one everyday failure with no banner. `try_parse` hands the
+/// error back so the exit goes through [`exit_with_status`] like every other.
+///
+/// `--help` and `--version` also arrive here as `Err`, with exit code 0; they
+/// are printed and exited zero, so they get no banner — again by the status
+/// rule, not by a special case.
+fn parse_cli() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            let code = err.exit_code();
+            // clap picks the right stream itself: stdout for help/version,
+            // stderr for usage errors.
+            let _ = err.print();
+            if code == 0 {
+                let _ = io::stdout().flush();
+                std::process::exit(0);
+            }
+            exit_with_status(code, ExitKind::Failure, beads_rust::exit::USAGE_ERROR)
+        }
+    }
+}
+
 /// Handle errors with structured output support.
 ///
 /// When --json is set or stdout is not a TTY, outputs structured JSON to stderr.
@@ -507,7 +599,9 @@ fn handle_error(err: &BeadsError, json_mode: bool) -> ! {
         eprintln!("{}", structured.to_human(use_color));
     }
 
-    std::process::exit(exit_code);
+    // The envelope above is what a truncating filter cuts the top off; the
+    // banner emitted by the funnel is what survives it.
+    exit_with_status(exit_code, ExitKind::Failure, structured.code.as_str());
 }
 
 fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {

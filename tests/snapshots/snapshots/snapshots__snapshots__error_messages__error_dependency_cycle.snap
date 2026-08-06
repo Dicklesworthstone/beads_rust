@@ -13,3 +13,4 @@ expression: normalize_output(&output.stderr)
     }
   }
 }
+br: FAILED (CYCLE_DETECTED, exit 5)

@@ -5,6 +5,7 @@
 use crate::cli::LintArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::exit::{ExitKind, exit_with_status};
 use crate::model::{Issue, IssueType, Status};
 use crate::output::OutputContext;
 use crate::storage::{ListFilters, SqliteStorage};
@@ -110,7 +111,7 @@ pub fn execute(
         if summary.results.is_empty() {
             return Ok(());
         }
-        std::process::exit(summary.exit_code(false));
+        exit_with_status(summary.exit_code(false), ExitKind::Failure, LINT_WARNINGS);
     }
 
     if ctx.is_rich() {
@@ -138,8 +139,20 @@ pub fn execute(
         }
     }
 
-    std::process::exit(summary.exit_code(false));
+    exit_with_status(summary.exit_code(false), ExitKind::Failure, LINT_WARNINGS);
 }
+
+/// Banner label for `br lint`'s nonzero exit.
+///
+/// Not an `ErrorCode`: nothing in the runtime went wrong, so reusing one of the
+/// shared codes would make a lint verdict indistinguishable from an operational
+/// error to an agent grepping the banner.
+///
+/// [`ExitKind::Failure`] rather than `Notice`, though, because the nonzero
+/// status *is* lint's verdict that the tree did not pass — every caller (CI,
+/// an agent gating on it) treats it as a failed check, so "FAILED" is the true
+/// statement here, unlike `version --check`'s update-available.
+const LINT_WARNINGS: &str = "LINT_WARNINGS";
 
 fn render_lint_rich(summary: &LintSummary, ctx: &OutputContext) {
     let theme = ctx.theme();

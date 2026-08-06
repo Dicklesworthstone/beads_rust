@@ -11,3 +11,4 @@ expression: normalize_output(&output.stderr)
     "context": null
   }
 }
+br: FAILED (NOT_INITIALIZED, exit 2)

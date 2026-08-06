@@ -13,3 +13,4 @@ expression: normalize_output(&output.stderr)
     }
   }
 }
+br: FAILED (SELF_DEPENDENCY, exit 5)

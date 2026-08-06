@@ -17,7 +17,7 @@ mod common;
 
 use common::cli::{BrWorkspace, run_br};
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -136,6 +136,59 @@ fn assert_clean_pipe_death(status: std::process::ExitStatus, what: &str) {
              acceptable here"
         );
     }
+}
+
+/// A vanished reader must stay SILENT — no failure banner.
+///
+/// `br` now writes a self-identifying final line to stderr on every nonzero
+/// exit (`src/exit.rs`), and the broken-pipe guard above is reached *through a
+/// panic*. If that banner were emitted for "a panic happened" rather than for
+/// the status being exited with, `br list | head -1` — the most common pipeline
+/// in this fleet — would start announcing `br: FAILED (PANIC, ...)` on a
+/// completely normal operation. That would be a louder regression than the
+/// silent-failure bug the banner exists to fix.
+///
+/// The guard exits **zero**, so by the rule that the banner is a function of the
+/// exit status it must produce nothing at all. Asserted on stderr being *empty*,
+/// not merely banner-free, because that is the observable an operator or an
+/// agent actually reacts to.
+#[cfg(unix)]
+#[test]
+fn a_vanished_reader_prints_nothing_at_all() {
+    let workspace = BrWorkspace::new();
+    seed(&workspace);
+
+    // `sh` rather than the harness: the point is a real `| head -1`, and the
+    // harness sets RUST_LOG=debug, which would fill stderr with tracing output
+    // and make "stderr is empty" untestable.
+    let out: Output = Command::new("sh")
+        .arg("-c")
+        .arg(r#""$BR" list --limit 1000 | head -1 >/dev/null; echo "status=$?""#)
+        .current_dir(&workspace.root)
+        .env("BR", assert_cmd::cargo::cargo_bin!("br"))
+        .env("HOME", &workspace.root)
+        .env("NO_COLOR", "1")
+        .env("BD_AGENT_ID", "bptest")
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("run sh");
+
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.is_empty(),
+        "`br list | head -1` is a normal operation and must print nothing to \
+         stderr; got {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("FAILED"),
+        "the failure banner must never fire on a broken pipe: {stderr:?}"
+    );
+
+    // The pipeline's own status is `head`'s, so this asserts only that the shell
+    // saw a normal completion — `br`'s own status is what the assertions above
+    // cover.
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(stdout.contains("status=0"), "unexpected: {stdout:?}");
 }
 
 /// Abort. Hardcoded rather than pulled from `libc`, which this crate does not

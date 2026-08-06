@@ -18,3 +18,4 @@ YYYY-MM-DDTHH:MM:SS DEBUG beads_rust::sync: src/sync/mod.rs:LINE: Auto-import co
     }
   }
 }
+br: FAILED (ISSUE_NOT_FOUND, exit 3)

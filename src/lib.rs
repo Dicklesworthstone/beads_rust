@@ -13,6 +13,7 @@
 //! - [`sync`] - JSONL import/export operations
 //! - [`config`] - Configuration management
 //! - [`error`] - Error types and handling
+//! - [`exit`] - The process-exit funnel and the nonzero-exit failure banner
 //! - [`format`] - Output formatting (text, JSON)
 //! - [`util`] - Utility functions (hashing, time, paths)
 
@@ -23,6 +24,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod exit;
 pub mod format;
 pub mod logging;
 pub mod model;

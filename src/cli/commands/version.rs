@@ -2,11 +2,11 @@
 
 use crate::cli::VersionArgs;
 use crate::error::Result;
+use crate::exit::{ExitKind, exit_with_status};
 use crate::output::{OutputContext, OutputMode};
 use rich_rust::prelude::*;
 use serde::Serialize;
 use std::fmt::Write as _;
-use std::process;
 
 #[derive(Serialize)]
 struct VersionOutput<'a> {
@@ -207,7 +207,7 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
             } else {
                 eprintln!("Error checking for updates: {e}");
             }
-            process::exit(2);
+            exit_with_status(2, ExitKind::Failure, "UPDATE_CHECK_FAILED");
         }
     };
 
@@ -233,7 +233,17 @@ fn execute_update_check(current_version: &str, ctx: &OutputContext) {
     }
 
     if update_available {
-        process::exit(1);
+        // `Notice`, not `Failure`: nothing failed. `--check` uses exit 1 to
+        // *report* that a newer release exists, so a `FAILED` banner would
+        // state a reason that is not the reason. The banner still appears —
+        // exempting it would reintroduce "some nonzero exits are silent" — it
+        // just tells the truth:
+        //     br: UPDATE_AVAILABLE (exit 1)
+        //
+        // (That `--check` signals a normal result with a nonzero status at all
+        // is questionable, since nonzero conventionally means failure, but it
+        // is pre-existing behaviour and out of scope here.)
+        exit_with_status(1, ExitKind::Notice, "UPDATE_AVAILABLE");
     }
 }
 

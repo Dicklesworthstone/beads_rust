@@ -3,6 +3,7 @@
 use crate::config;
 use crate::config::routing::follow_redirects;
 use crate::error::Result;
+use crate::exit::{ExitKind, exit_with_status};
 use crate::output::OutputContext;
 use crate::util::parse_id;
 use rich_rust::prelude::*;
@@ -143,7 +144,7 @@ fn handle_missing_beads(ctx: &OutputContext) -> Result<()> {
         eprintln!("No beads directory found.");
         eprintln!("Run `br init` to create one.");
     }
-    std::process::exit(1);
+    exit_with_status(1, ExitKind::Failure, "NO_BEADS_DIR");
 }
 
 /// Render location info as a rich panel.

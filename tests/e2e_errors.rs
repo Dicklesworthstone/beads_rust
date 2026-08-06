@@ -512,24 +512,32 @@ fn e2e_lint_skips_types_without_required_sections() {
 
 // === Structured JSON Error Output Tests ===
 
-/// Parse structured error JSON from stderr.
-/// This handles the case where log lines may precede the JSON output.
+/// Parse the structured error envelope out of stderr.
+///
+/// **stderr is a mixed stream, not a JSON document, and never was one.** It
+/// carries, in order: tracing output and human diagnostics (`warning: ct-1 is
+/// already 'closed' ...`), the JSON envelope, and then whatever the command
+/// logs on the way out — a trailing `DEBUG ... Auto-flush` line, and, since the
+/// failure banner landed, `br: FAILED (CODE, exit N)`.
+///
+/// This helper used to try `from_str` on the whole stream and then on
+/// everything from the first `{` to EOF. That is tolerant of *leading* noise
+/// only — which is itself evidence that someone hit the leading case and
+/// patched the reader rather than fixing the premise. Any trailing byte broke
+/// it, and trailing bytes already occurred before the banner existed
+/// (`br close <already-closed> --json` logs after the envelope; `jq .` on that
+/// stderr exits 5 today).
+///
+/// So: find the envelope's opening brace and read exactly the *first* JSON
+/// value from there, ignoring anything after it. This is the idiom
+/// `tests/e2e_close_truth.rs::envelope` already uses; this helper simply
+/// predates it.
 fn parse_error_json(stderr: &str) -> Option<Value> {
-    // First try parsing the whole stderr as JSON
-    if let Ok(json) = serde_json::from_str(stderr) {
-        return Some(json);
-    }
-
-    // If that fails, look for a JSON object starting with '{'
-    // This handles cases where log lines precede the JSON output
-    if let Some(start) = stderr.find('{') {
-        let json_part = &stderr[start..];
-        if let Ok(json) = serde_json::from_str(json_part) {
-            return Some(json);
-        }
-    }
-
-    None
+    let start = stderr.find('{')?;
+    serde_json::Deserializer::from_str(&stderr[start..])
+        .into_iter()
+        .next()?
+        .ok()
 }
 
 /// Verify error JSON has required fields.
@@ -1214,4 +1222,286 @@ fn e2e_error_text_json_parity_validation() {
         verify_error_structure(&json),
         "JSON error should have required fields"
     );
+}
+
+// =============================================================================
+// The stderr contract: a MIXED STREAM, and never a single JSON document
+// =============================================================================
+
+/// stderr carries diagnostics, then the envelope, then trailing output — and it
+/// did so *before* the failure banner existed.
+///
+/// This is the premise the documented recipe in `docs/agent/ERRORS.md` used to
+/// rest on (`br ... 2>err.json; jq . err.json`). It has been false for as long
+/// as `close` has printed `warning:` lines: `jq .` on that stderr exits 5.
+/// `parse_error_json` was written tolerant of *leading* noise only, which is the
+/// fossil of someone hitting the first half of this and patching the reader
+/// instead of the premise.
+///
+/// Three shapes, three different generators, pinned separately because a fix
+/// for one does not imply the others:
+///
+/// - **(a) the negative control**: envelope alone, no leading noise. It passes
+///   with any reader, including a broken one, and it is the case a natural test
+///   would have chosen — which is exactly why this survived.
+/// - **(b) one warning, then the envelope.**
+/// - **(c) two warnings, then the envelope.** One invocation can emit the
+///   contention warning more than once.
+///
+/// All three carry the banner as a trailing line, so each also pins the other
+/// end of the stream.
+///
+/// Why this is more than tidiness: the warning generator is a *contention*
+/// warning ("another agent may be working on this issue"). The envelope becomes
+/// unparseable precisely on the concurrency paths — two agents colliding on one
+/// bead — which is when the exact error detail matters most and when nobody is
+/// watching the scrollback. The parse breaks in inverse proportion to how much
+/// you need it.
+#[test]
+fn envelope_is_readable_under_every_leading_noise_shape() {
+    struct Shape {
+        name: &'static str,
+        args: Vec<String>,
+        warnings: usize,
+        code: &'static str,
+        exit: i32,
+    }
+
+    let _log = common::test_log("envelope_is_readable_under_every_leading_noise_shape");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init: {}", init.stderr);
+
+    // A blocked issue gives a nonzero close, and an already-closed issue gives
+    // the contention warning. Repeating the closed id repeats the warning.
+    let blocker = create_issue(&workspace, "blocker", "noise_blocker");
+    let blocked = create_issue(&workspace, "blocked", "noise_blocked");
+    let dep = run_br(
+        &workspace,
+        ["dep", "add", &blocked, &blocker],
+        "noise_dep_add",
+    );
+    assert!(dep.status.success(), "dep add: {}", dep.stderr);
+
+    let closed = create_issue(&workspace, "already closed", "noise_closed");
+    let first = run_br(&workspace, ["close", &closed], "noise_close_first");
+    assert!(first.status.success(), "first close: {}", first.stderr);
+
+    let shapes = vec![
+        Shape {
+            name: "(a) negative control: envelope alone, no leading noise",
+            args: vec!["show".into(), "bd-nonexistent".into(), "--json".into()],
+            warnings: 0,
+            code: "ISSUE_NOT_FOUND",
+            exit: 3,
+        },
+        Shape {
+            name: "(b) one warning, then the envelope",
+            args: vec![
+                "close".into(),
+                closed.clone(),
+                blocked.clone(),
+                "--json".into(),
+            ],
+            warnings: 1,
+            code: "NOTHING_TO_DO",
+            exit: 3,
+        },
+        Shape {
+            name: "(c) two warnings, then the envelope",
+            args: vec![
+                "close".into(),
+                closed.clone(),
+                closed.clone(),
+                blocked.clone(),
+                "--json".into(),
+            ],
+            warnings: 2,
+            code: "NOTHING_TO_DO",
+            exit: 3,
+        },
+    ];
+
+    for shape in shapes {
+        let label = format!("noise_shape_{}", shape.warnings);
+        let result = run_br(&workspace, &shape.args, &label);
+        let stderr = &result.stderr;
+        let what = shape.name;
+
+        assert_eq!(
+            result.status.code(),
+            Some(shape.exit),
+            "{what}: exit code: {stderr}"
+        );
+
+        let warnings = stderr
+            .lines()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.starts_with("warning:")
+            })
+            .count();
+        assert_eq!(
+            warnings, shape.warnings,
+            "{what}: expected {} warning line(s); if a generator changed, this \
+             test's premise moved and the counts need re-deriving: {stderr}",
+            shape.warnings
+        );
+
+        // The reader must scan to the first '{'. Nothing weaker works: dropping
+        // a fixed number of leading lines is defeated by shape (c), and
+        // matching a case-sensitive `warning:` prefix is defeated by the
+        // capital-W generator (see the fixture test below).
+        let json = parse_error_json(stderr)
+            .unwrap_or_else(|| panic!("{what}: envelope must be extractable: {stderr}"));
+        assert_eq!(json["error"]["code"], shape.code, "{what}: envelope code");
+        assert!(
+            verify_error_structure(&json),
+            "{what}: envelope shape: {json}"
+        );
+
+        // And the banner is the last line of that stream, whatever preceded it.
+        let last = stderr.lines().next_back().unwrap_or_default();
+        assert!(
+            last.contains(&format!("FAILED ({}, exit {})", shape.code, shape.exit)),
+            "{what}: banner must be last: {stderr}"
+        );
+
+        // Shape (a) is the control: it is the one a broken reader also passes.
+        if shape.warnings == 0 {
+            assert!(
+                stderr.starts_with('{'),
+                "{what}: the control must have no leading noise, otherwise it \
+                 is not controlling for anything: {stderr}"
+            );
+        }
+    }
+}
+
+/// The reader itself, against every noise shape the tree can produce — including
+/// **mixed capitalisation**, which no CLI path can currently put in front of a
+/// JSON error envelope but which the tree is one refactor away from producing.
+///
+/// There are two warning generators with different spellings:
+/// `src/cli/commands/update.rs` writes lowercase `warning:` unconditionally,
+/// while `src/output/context.rs` writes capital `Warning:` and is suppressed in
+/// JSON mode. So a reader that matched `^warning:` case-sensitively would pass
+/// every end-to-end test above and still break the day the other generator
+/// reaches a JSON error path. Fixtures, not invocations, are the honest way to
+/// pin that: this test says what the reader must tolerate rather than what the
+/// binary happens to emit today.
+#[test]
+fn envelope_reader_tolerates_mixed_capitalisation_and_trailing_noise() {
+    let _log = common::test_log("envelope_reader_tolerates_mixed_capitalisation_and_trailing_noise");
+    let envelope = "{\n  \"error\": {\n    \"code\": \"NOTHING_TO_DO\",\n    \
+                    \"message\": \"m\",\n    \"retryable\": false\n  }\n}\n";
+    let lower = "warning: ct-1 is already 'closed' (set 50m ago by 'toad') — \
+                 another agent may be working on this issue\n";
+    let upper = "Warning: invalid label 'a b': labels may not contain spaces\n";
+    let log = "2026-08-06T16:41:14.666352Z  INFO beads_rust::cli::commands::close: \
+               src/cli/commands/close.rs:151: Executing close command\n";
+    let trailing_log = "2026-08-06T16:41:14.676425Z DEBUG beads_rust::sync: \
+                        src/sync/mod.rs:1853: Auto-flush: no dirty issues, skipping\n";
+    let banner = "br: FAILED (NOTHING_TO_DO, exit 3)\n";
+
+    let leading: Vec<(&str, String)> = vec![
+        ("nothing", String::new()),
+        ("a log line", log.to_string()),
+        ("one lowercase warning", lower.to_string()),
+        ("two lowercase warnings", format!("{lower}{lower}")),
+        ("lowercase then capital", format!("{lower}{upper}")),
+        ("capital then lowercase", format!("{upper}{lower}")),
+        ("logs and both spellings", format!("{log}{upper}{lower}")),
+    ];
+    let trailing: Vec<(&str, String)> = vec![
+        ("nothing", String::new()),
+        ("the banner", banner.to_string()),
+        ("a log line", trailing_log.to_string()),
+        ("a log line then the banner", format!("{trailing_log}{banner}")),
+    ];
+
+    for (before_name, before) in &leading {
+        for (after_name, after) in &trailing {
+            let stderr = format!("{before}{envelope}{after}");
+            let json = parse_error_json(&stderr).unwrap_or_else(|| {
+                panic!("reader failed with {before_name} before and {after_name} after: {stderr}")
+            });
+            assert_eq!(
+                json["error"]["code"], "NOTHING_TO_DO",
+                "wrong value extracted with {before_name} before and {after_name} after"
+            );
+        }
+    }
+}
+
+/// The trailing-noise half of the contract, demonstrated with NO banner in the
+/// picture at all — this exit is 0.
+///
+/// `br close <already-closed> --json` prints a `warning:` line, then a
+/// `notice` envelope, then a `DEBUG ... Auto-flush` line from the sync layer on
+/// the way out. That trailing line has been there far longer than the failure
+/// banner, and it is why `jq . err.json` — the recipe `docs/agent/ERRORS.md`
+/// used to document — exits 5 on a perfectly ordinary command.
+///
+/// So this test earns the `parse_error_json` fix independently of the banner:
+/// revert the helper to its leading-noise-only form and it fails here even on a
+/// binary built before the banner existed (verified both ways).
+#[test]
+fn envelope_extraction_survives_trailing_logs_with_no_banner() {
+    let _log = common::test_log("envelope_extraction_survives_trailing_logs_with_no_banner");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init: {}", init.stderr);
+
+    let id = create_issue(&workspace, "already closed thing", "trailing_create");
+    let first = run_br(&workspace, ["close", &id], "trailing_close_first");
+    assert!(first.status.success(), "first close: {}", first.stderr);
+
+    let result = run_br(&workspace, ["close", &id, "--json"], "trailing_close_again");
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "closing an already-closed issue is not a failure: {}",
+        result.stderr
+    );
+
+    let stderr = &result.stderr;
+
+    // No banner: this exit is 0. Whatever trails the envelope here is not ours.
+    assert!(
+        !stderr.contains("FAILED ("),
+        "exit 0 must not carry a failure banner: {stderr}"
+    );
+
+    // Something trails the envelope anyway.
+    assert!(
+        !stderr.trim_end().ends_with('}'),
+        "expected the sync layer to log after the envelope; if this ever stops \
+         being true, trailing-tolerance in parse_error_json is still required \
+         by the banner, but this test no longer proves it independently: \
+         {stderr}"
+    );
+
+    // The documented recipe's premise, false without any help from us.
+    assert!(
+        serde_json::from_str::<Value>(stderr).is_err(),
+        "stderr parsed as a single JSON document, which docs/agent/ERRORS.md \
+         used to assume: {stderr}"
+    );
+
+    // And the envelope is extractable regardless.
+    let json = parse_error_json(stderr).expect("envelope must survive the trailing logs");
+    assert_eq!(json["notice"]["code"], "ALREADY_SATISFIED");
+}
+
+/// Create an issue and return its id.
+fn create_issue(workspace: &BrWorkspace, title: &str, label: &str) -> String {
+    let out = run_br(workspace, ["create", title, "--json"], label);
+    assert!(out.status.success(), "create failed: {}", out.stderr);
+    let payload = extract_json_payload(&out.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("create json");
+    json["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no id in create output: {json}"))
+        .to_string()
 }

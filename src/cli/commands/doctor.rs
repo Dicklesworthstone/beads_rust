@@ -4,6 +4,7 @@
 
 use crate::config;
 use crate::error::Result;
+use crate::exit::{ExitKind, exit_with_status};
 use crate::output::OutputContext;
 use crate::sync::{
     PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
@@ -806,7 +807,7 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
             checks,
         };
         print_report(&report, ctx)?;
-        std::process::exit(1);
+        exit_with_status(1, ExitKind::Failure, DOCTOR_FAILED);
     };
 
     let paths = match config::resolve_paths(&beads_dir, cli.db.as_ref()) {
@@ -824,7 +825,7 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
                 checks,
             };
             print_report(&report, ctx)?;
-            std::process::exit(1);
+            exit_with_status(1, ExitKind::Failure, DOCTOR_FAILED);
         }
     };
 
@@ -905,11 +906,18 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     print_report(&report, ctx)?;
 
     if !report.ok {
-        std::process::exit(1);
+        exit_with_status(1, ExitKind::Failure, DOCTOR_FAILED);
     }
 
     Ok(())
 }
+
+/// Banner label for `br doctor`'s nonzero exit: at least one check errored.
+///
+/// `doctor` prints its (possibly JSON) report to stdout *before* exiting, which
+/// makes it the sharpest test of the banner's ordering guarantee — see
+/// `tests/e2e_fail_banner.rs`.
+const DOCTOR_FAILED: &str = "DOCTOR_CHECKS_FAILED";
 
 #[cfg(test)]
 mod tests {
