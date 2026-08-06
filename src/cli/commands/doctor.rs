@@ -13753,6 +13753,34 @@ mod tests {
         );
     }
 
+    /// GitHub #412 secondary regression: a stale-schema database must surface
+    /// as `SchemaMismatch` (routing to the reviewed migration guidance), never
+    /// as a generic "database is busy" that leaves migration unreachable.
+    #[test]
+    fn pending_sync_merge_authority_inspector_surfaces_schema_mismatch_for_stale_schema() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage.execute_raw("PRAGMA user_version = 16").unwrap();
+        }
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &db_path,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+
+        let err = inspect_pending_sync_merge_under_authority(&db_path, &authority).unwrap_err();
+
+        assert!(
+            matches!(err, BeadsError::SchemaMismatch { found: 16, .. }),
+            "stale schema must surface as SchemaMismatch, not engine contention: {err}"
+        );
+    }
+
     #[test]
     fn pending_sync_merge_read_only_inspector_distinguishes_legacy_and_malformed() {
         let legacy = TempDir::new().unwrap();

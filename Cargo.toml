@@ -191,7 +191,10 @@ self_update = [
 # `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
 
 [lints.rust]
-unsafe_code = "forbid"
+# Deny (not forbid): `sync::db_inode_lock` carries the crate's single
+# sanctioned `#[allow(unsafe_code)]` for the SQLite-compatible database-inode
+# range lock (no safe wrapper exists on macOS/Windows). See GitHub #412.
+unsafe_code = "deny"
 
 [lints.clippy]
 pedantic = { level = "deny", priority = -1 }

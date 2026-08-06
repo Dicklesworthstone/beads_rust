@@ -7,6 +7,7 @@
 //! - Collision detection during imports
 //! - Path validation and allowlist enforcement
 
+mod db_inode_lock;
 pub mod history;
 pub mod path;
 pub mod witness;
@@ -202,7 +203,40 @@ pub fn blocking_write_lock_with_timeout(
         true,
         "workspace write lock",
         false,
+        ExclusiveLockMechanism::LockSidecar,
     )
+}
+
+/// Mechanism used to place an exclusive advisory lock on a file.
+///
+/// Dedicated lock sidecars (`.write.lock`, `.br-db-write-*.lock`, JSONL
+/// authority sidecars) use the whole-file OS primitive behind
+/// [`File::try_lock`]. The SQLite database inode itself (and replacement
+/// candidates destined to become it) MUST use the SQLite-compatible one-byte
+/// range lock instead: on macOS/BSD a whole-file `flock` collides with the
+/// engine's POSIX record locks even within one process, and on Windows a
+/// whole-file `LockFileEx` is mandatory and blocks the engine's reads
+/// outright (GitHub #412). See [`db_inode_lock`] for the full story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExclusiveLockMechanism {
+    /// Whole-file lock via [`File::try_lock`] — for dedicated lock sidecars
+    /// that no other subsystem ever locks.
+    LockSidecar,
+    /// One-byte range lock at [`db_inode_lock::DATABASE_INODE_LOCK_OFFSET`] —
+    /// for any inode a SQLite engine may open.
+    DatabaseInode,
+}
+
+/// Non-blocking exclusive lock attempt through the selected mechanism.
+#[allow(clippy::incompatible_msrv)]
+fn try_lock_exclusive(
+    file: &File,
+    mechanism: ExclusiveLockMechanism,
+) -> std::result::Result<(), TryLockError> {
+    match mechanism {
+        ExclusiveLockMechanism::LockSidecar => file.try_lock(),
+        ExclusiveLockMechanism::DatabaseInode => db_inode_lock::try_lock_database_inode(file),
+    }
 }
 
 /// Acquire an advisory lock on the exact database inode used by a reviewed
@@ -212,6 +246,9 @@ pub fn blocking_write_lock_with_timeout(
 /// It is required for configured external databases because two independent
 /// workspaces can legitimately route to the same database while owning
 /// different workspace lock files.
+///
+/// The lock is a SQLite-compatible byte-range lock, never a whole-file lock:
+/// the engine holds its own advisory locks on this inode (GitHub #412).
 fn blocking_database_file_lock_with_timeout(
     database_path: &Path,
     lock_timeout_ms: Option<u64>,
@@ -223,6 +260,7 @@ fn blocking_database_file_lock_with_timeout(
         create_if_missing,
         "database write authority",
         true,
+        ExclusiveLockMechanism::DatabaseInode,
     )
 }
 
@@ -567,7 +605,10 @@ impl DatabaseFamilyWriteLock {
                     )));
                 }
             };
-            match candidate_file.try_lock() {
+            // The candidate becomes the live database inode on rename, so it
+            // must carry the SQLite-compatible range lock, never a whole-file
+            // lock (GitHub #412).
+            match try_lock_exclusive(&candidate_file, ExclusiveLockMechanism::DatabaseInode) {
                 Ok(()) => {}
                 Err(TryLockError::WouldBlock) => {
                     return Err(BeadsError::SyncConflict {
@@ -995,6 +1036,7 @@ pub fn blocking_jsonl_family_write_lock_with_timeout(
         true,
         "JSONL-family write lock",
         true,
+        ExclusiveLockMechanism::LockSidecar,
     )?;
     let canonical_after = canonical_database_authority_key(jsonl_path)?;
     if canonical_after != canonical_jsonl_path {
@@ -1054,6 +1096,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
         true,
         "database-family write lock",
         true,
+        ExclusiveLockMechanism::LockSidecar,
     )?;
     let (database_lock, database_identity) = match fs::symlink_metadata(&canonical_database_path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -1145,6 +1188,7 @@ fn open_and_lock_regular_file(
     create_if_missing: bool,
     role: &str,
     redact_path: bool,
+    mechanism: ExclusiveLockMechanism,
 ) -> Result<File> {
     let lock_path_display = if redact_path {
         database_path_descriptor(lock_path)
@@ -1216,7 +1260,7 @@ fn open_and_lock_regular_file(
     let _ = opened_metadata;
 
     // Fast path: non-blocking try for the common uncontended case.
-    match file.try_lock() {
+    match try_lock_exclusive(&file, mechanism) {
         Ok(()) => {
             verify_locked_file_identity(&file, lock_path, role, redact_path)?;
             return Ok(file);
@@ -1248,7 +1292,7 @@ fn open_and_lock_regular_file(
         let remaining = timeout.saturating_sub(start.elapsed());
         thread::sleep(remaining.min(WRITE_LOCK_POLL_INTERVAL));
 
-        match file.try_lock() {
+        match try_lock_exclusive(&file, mechanism) {
             Ok(()) => {
                 verify_locked_file_identity(&file, lock_path, role, redact_path)?;
                 return Ok(file);
@@ -14798,6 +14842,111 @@ mod tests {
         let err = blocking_write_lock(&beads_dir).unwrap_err();
         assert!(err.to_string().contains("unsafe workspace write lock path"));
         assert_eq!(fs::read(&target).unwrap(), b"sentinel");
+    }
+
+    /// GitHub #412 regression: the database-family authority must never hold
+    /// a whole-file lock on the database inode. Under v0.2.20 it held
+    /// `flock(LOCK_EX)` there, so this flock probe returned `WouldBlock` even
+    /// on Linux. The probe is Linux-only because on macOS/BSD an `flock`
+    /// probe legitimately conflicts with the authority's `fcntl` range lock
+    /// (one shared kernel lock table).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::incompatible_msrv)]
+    fn database_family_authority_does_not_whole_file_lock_the_database_inode() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        drop(SqliteStorage::open(&db_path).expect("create fresh database"));
+
+        let _authority =
+            blocking_database_family_write_lock_with_timeout(&beads_dir, &db_path, Some(2_000))
+                .expect("family authority");
+
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .expect("probe open");
+        assert!(
+            probe.try_lock().is_ok(),
+            "database inode must not be whole-file locked while the family authority is held"
+        );
+    }
+
+    /// GitHub #412 regression: the engine must be able to open and query the
+    /// database while the family authority is held — the startup
+    /// pending-sync-merge gate and every mutating command do exactly this.
+    /// On macOS/BSD the former whole-file `flock` made every engine open fail
+    /// with "Database error: database is busy" on a freshly-initialised
+    /// workspace; on Windows the whole-file mandatory lock made even the
+    /// schema header unreadable.
+    #[test]
+    fn engine_opens_and_queries_under_held_family_authority() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir = temp_dir.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        drop(SqliteStorage::open(&db_path).expect("create fresh database"));
+
+        let authority = Arc::new(
+            blocking_database_family_write_lock_with_timeout(&beads_dir, &db_path, Some(2_000))
+                .expect("family authority"),
+        );
+
+        // Read-only startup-gate flow (the first command #412 reported broken).
+        let inspection =
+            SqliteStorage::inspect_pending_sync_merge_under_authority(&db_path, &authority).expect(
+                "pending sync-merge inspection must not mistake the held authority for \
+                     engine contention",
+            );
+        assert!(
+            matches!(
+                inspection,
+                crate::storage::sqlite::PendingSyncMergeInspection::Absent
+            ),
+            "fresh database must have no pending sync merge"
+        );
+
+        // Writable engine open under the same held authority (the normal
+        // mutating-command flow after the gate passes).
+        let mut storage =
+            SqliteStorage::open(&db_path).expect("writable engine open under family authority");
+        storage.attach_write_authority(Arc::clone(&authority));
+        storage
+            .inspect_pending_sync_merge()
+            .expect("engine read transaction under held family authority");
+    }
+
+    /// GitHub #412 companion: switching the inode lock from a whole-file
+    /// `flock` to a SQLite-compatible byte-range lock must not weaken the
+    /// hard-link-alias exclusion the inode authority exists to provide
+    /// (GitHub #405): a second workspace routing to the same physical inode
+    /// through a hard link must still fail to acquire authority.
+    #[cfg(unix)]
+    #[test]
+    fn family_authority_still_excludes_hard_link_aliases() {
+        let temp_dir = TempDir::new().unwrap();
+        let beads_dir_a = temp_dir.path().join("a");
+        let beads_dir_b = temp_dir.path().join("b");
+        fs::create_dir_all(&beads_dir_a).unwrap();
+        fs::create_dir_all(&beads_dir_b).unwrap();
+        let db_a = beads_dir_a.join("beads.db");
+        let db_b = beads_dir_b.join("beads.db");
+        drop(SqliteStorage::open(&db_a).expect("create fresh database"));
+        fs::hard_link(&db_a, &db_b).expect("hard link alias");
+
+        let _authority_a =
+            blocking_database_family_write_lock_with_timeout(&beads_dir_a, &db_a, Some(2_000))
+                .expect("first family authority");
+
+        let err = blocking_database_family_write_lock_with_timeout(&beads_dir_b, &db_b, Some(50))
+            .expect_err("hard-link alias must not acquire a second authority");
+        assert!(
+            err.to_string().contains("Timed out"),
+            "alias acquisition must time out on the shared inode lock: {err}"
+        );
     }
 
     #[test]

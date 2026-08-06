@@ -19,7 +19,11 @@
 //! - [`util`] - Utility functions (hashing, time, paths)
 //! - [`write_combining`] - Compatibility contracts for future write combining
 
-#![forbid(unsafe_code)]
+// Deny (not forbid) so the single sanctioned exemption in
+// `sync::db_inode_lock` — the SQLite-compatible database-inode range lock,
+// which has no safe wrapper on macOS/Windows — can carry a scoped
+// `#[allow(unsafe_code)]`. Everything else must stay free of `unsafe`.
+#![deny(unsafe_code)]
 // Lint configuration is in Cargo.toml [lints.clippy] section
 #![allow(clippy::module_name_repetitions)]
 

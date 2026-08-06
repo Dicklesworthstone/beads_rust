@@ -15,6 +15,35 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.2.21 -- 2026-08-05 (Release)
+
+Emergency fix for a v0.2.20 regression that made workspaces unusable on
+macOS and Windows.
+
+### Database-family authority no longer fights the SQLite engine
+
+- v0.2.20's database-family write authority locked the database inode with a
+  whole-file OS lock (`flock` on Unix, whole-file `LockFileEx` on Windows).
+  The SQLite engine holds its own advisory locks on that same inode, and on
+  macOS/BSD `flock` and POSIX record locks share one kernel lock table (they
+  conflict even within a single process), while on Windows `LockFileEx` is
+  mandatory and blocked even schema-header reads. Every command after
+  `br init` failed with `Database error: database is busy` (macOS) or
+  `database schema is missing or unreadable` (Windows); Linux was unaffected
+  only because `flock` and record locks never interact there
+  ([#412](https://github.com/Dicklesworthstone/beads_rust/issues/412)).
+- The inode authority is now a one-byte range lock at `i64::MAX - 1` — an
+  offset the engine never locks and no database ever reaches — via
+  `fcntl(F_OFD_SETLK)` on Unix and a one-byte `LockFileEx` on Windows.
+  Hard-link-alias exclusion (the reason the inode lock exists) is preserved
+  and now covered by a regression test, as is engine open/query under a held
+  authority.
+- The same conflict masked stale-schema detection: a pre-v17 database now
+  surfaces the reviewed `SchemaMismatch` migration guidance again instead of
+  an unactionable "busy" error that also blocked `br doctor`.
+
+---
+
 ## v0.2.19 -- 2026-07-11 (Release)
 
 This release restores downloadable binaries after the tag-only `v0.2.18` cut
