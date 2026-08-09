@@ -57,12 +57,19 @@ You need to track issues for your project, but:
 
 ```bash
 br init                              # Initialize in your repo
+br init --redirect                   # Share the primary worktree's tracker
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
 br coordination status --json        # Inspect hidden in-progress claims
 br close br-abc123                   # Close when done; JSONL auto-flushes by default
 br sync --flush-only                 # Optional final export check before git commit
 ```
+
+For linked worktrees, redirect the secondary worktree to the primary
+worktree's complete tracker instead of creating another database. See
+[Shared br Workspaces Across Git Worktrees](docs/WORKTREE_REDIRECTS.md) for
+safe adoption, Claude/Worktrunk integration, and explicit raw-Git hook
+activation.
 
 ### Why br?
 

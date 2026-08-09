@@ -23,6 +23,7 @@ use crate::format::{
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
+use crate::redirect::RedirectReceipt;
 use crate::sync::AdditiveReconcileReceipt;
 use crate::{config, output};
 use chrono::{DateTime, Utc};
@@ -214,6 +215,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 schema_for_output::<AdditiveReconcileReceipt>(),
             );
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+            schemas.insert("RedirectReceipt", schema_for_output::<RedirectReceipt>());
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
         }
         SchemaTarget::Issue => {
@@ -258,6 +260,9 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::VcsStatus => {
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+        }
+        SchemaTarget::RedirectReceipt => {
+            schemas.insert("RedirectReceipt", schema_for_output::<RedirectReceipt>());
         }
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
@@ -327,6 +332,20 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
             ),
         },
     );
+    let redirect_receipt = CommandShape {
+        shape: "object",
+        jq_filter: ".",
+        items_at: None,
+        item_schema: Some("RedirectReceipt"),
+        error_envelope_on_stderr: true,
+        notes: Some(
+            "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never \
+             mutates the canonical target, and reports created, unchanged, primary_owner, or \
+             refused.",
+        ),
+    };
+    commands.insert("init --redirect", redirect_receipt.clone());
+    commands.insert("redirect set", redirect_receipt);
 
     commands
 }
@@ -607,6 +626,20 @@ mod tests {
             !shape.error_envelope_on_stderr,
             "top-level structured CLI errors are emitted on stdout"
         );
+    }
+
+    #[test]
+    fn redirect_receipt_schema_and_command_shapes_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::RedirectReceipt);
+        assert!(schemas.contains_key("RedirectReceipt"));
+
+        let commands = build_commands(SchemaTarget::Commands);
+        for name in ["init --redirect", "redirect set"] {
+            let shape = commands.get(name).expect("redirect command shape");
+            assert_eq!(shape.shape, "object");
+            assert_eq!(shape.item_schema, Some("RedirectReceipt"));
+            assert!(shape.error_envelope_on_stderr);
+        }
     }
 
     #[test]

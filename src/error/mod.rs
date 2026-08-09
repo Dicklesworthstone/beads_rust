@@ -202,6 +202,13 @@ pub enum BeadsError {
     #[error("Configuration error: {0}")]
     Config(String),
 
+    /// Redirect setup was deliberately refused before changing local routing.
+    #[error("Redirect refused: {reason}")]
+    RedirectRefused {
+        reason: String,
+        receipt: Box<crate::redirect::RedirectReceipt>,
+    },
+
     /// External command failed or returned unusable output.
     #[error("External command failed: {command}: {reason}")]
     ExternalCommand { command: String, reason: String },

@@ -1908,6 +1908,60 @@ schemas:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
           - type: string
+  RedirectReceipt:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: RedirectReceipt
+    description: Durable result of a redirect setup request.
+    type: object
+    properties:
+      schema:
+        description: Machine-contract identifier.
+        type: string
+      source_workspace:
+        description: Local workspace that owns the redirect file.
+        type: string
+      requested_target:
+        description: "Exact target supplied by the operator, or null for automatic discovery."
+        type[2]: string,"null"
+      target_mode:
+        description: Whether the target was explicit or discovered from Git metadata.
+        "$ref": #/$defs/RedirectTargetMode
+      final_target:
+        description: Terminal canonical workspace after following redirect chains.
+        type: string
+      redirect_path:
+        description: Local redirect file that was created or inspected.
+        type: string
+      disposition:
+        description: "`created`, `unchanged`, `primary_owner`, or `refused`."
+        "$ref": #/$defs/RedirectDisposition
+      changed:
+        description: Whether this invocation created the redirect.
+        type: boolean
+      primary_worktree:
+        description: Whether the caller already owns the terminal canonical workspace.
+        type: boolean
+      existing_state_acknowledged:
+        description: Whether material local state was explicitly acknowledged.
+        type: boolean
+      dormant_artifacts:
+        description: Preserved local artifacts that become dormant behind the redirect.
+        type: array
+        items.type: string
+    required[11]: schema,source_workspace,requested_target,target_mode,final_target,redirect_path,disposition,changed,primary_worktree,existing_state_acknowledged,dormant_artifacts
+    "$defs":
+      RedirectTargetMode:
+        description: How a redirect target was selected.
+        oneOf[2]{description,type,const}:
+          The operator supplied the exact beads directory.,string,explicit
+          The primary worktree was discovered from Git administrative metadata.,string,automatic
+      RedirectDisposition:
+        description: Observable redirect setup outcome.
+        oneOf[4]{description,type,const}:
+          A new redirect was published.,string,created
+          An existing redirect already selected the requested authority.,string,unchanged
+          The local workspace is itself the selected authority.,string,primary_owner
+          Setup was refused without changing local routing.,string,refused
   StaleIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: StaleIssue
@@ -2499,6 +2553,12 @@ commands:
     jq_filter: .
     error_envelope_on_stderr: false
     notes: "Workspace info object (paths, mode, config snapshot)."
+  "init --redirect":
+    shape: object
+    jq_filter: .
+    item_schema: RedirectReceipt
+    error_envelope_on_stderr: true
+    notes: "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never mutates the canonical target, and reports created, unchanged, primary_owner, or refused."
   "label list":
     shape: array
     jq_filter: ".[]"
@@ -2517,6 +2577,12 @@ commands:
     items_at: .
     item_schema: ReadyIssue
     error_envelope_on_stderr: false
+  "redirect set":
+    shape: object
+    jq_filter: .
+    item_schema: RedirectReceipt
+    error_envelope_on_stderr: true
+    notes: "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never mutates the canonical target, and reports created, unchanged, primary_owner, or refused."
   "robot-docs guide":
     shape: object
     jq_filter: .

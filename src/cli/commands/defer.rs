@@ -1188,7 +1188,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -1226,7 +1226,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -1264,7 +1264,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let issue_id = {
@@ -1315,7 +1315,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db")).expect("storage");
@@ -1354,7 +1354,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new()?;
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx)?;
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx)?;
 
         let beads_dir = temp.path().join(".beads");
         let mut storage = SqliteStorage::open(&beads_dir.join("beads.db"))?;

@@ -132,6 +132,10 @@ const FEATURES: &[FeatureCapability] = &[
         description: "br coordination status diagnoses hidden or stale in-progress claims.",
     },
     FeatureCapability {
+        name: "shared_worktree_workspace",
+        description: "Secondary Git worktrees can safely redirect their entire .beads workspace to one canonical authority.",
+    },
+    FeatureCapability {
         name: "mcp_stdio_optional",
         description: "Binaries built with the mcp feature can serve a stdio MCP API.",
     },
@@ -501,6 +505,10 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         ],
         "config" => &["br config get output.format --json"],
         "history" => &["br history list --json"],
+        "redirect" => &[
+            "br redirect set --allow-existing --json",
+            "br redirect set /absolute/path/to/primary/.beads --allow-existing --json",
+        ],
         _ => &[],
     }
 }
@@ -551,6 +559,16 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Ordinary commands never cross a schema-version boundary implicitly.",
             "Use `doctor migrate-schema plan --json` before apply; apply requires the exact state-bound plan token.",
             "Migration undo refuses changed post-migration data, quarantines the displaced family without deletion, and is resumable.",
+        ],
+        "init" => &[
+            "Ordinary init creates a tracker; `init --redirect` creates only a local redirect file and never mutates or repairs the target.",
+            "Omit the redirect target only for a standard linked Git worktree layout; otherwise provide the exact initialized .beads path.",
+            "Redirect setup never launches Git, installs hooks, imports JSONL, or migrates a target schema.",
+        ],
+        "redirect" | "redirect set" => &[
+            "Existing material local state is preserved and requires explicit `--allow-existing` acknowledgement before it becomes dormant.",
+            "Matching repeated requests are no-ops; conflicting redirects are preserved and rejected.",
+            "There is no redirect-removal command in this contract.",
         ],
         "search" => &[
             "Search is read-only; prefer `--format json` or `--format toon` for parsing.",
@@ -837,8 +855,27 @@ fn command_contract(name: &str) -> CommandContract {
         "init" => CommandContract {
             operation: "write",
             workspace: "none",
-            machine_output: &["text"],
-            examples: &["br init --prefix br"],
+            machine_output: &["json", "text"],
+            examples: &[
+                "br init --prefix br",
+                "br init --redirect --json",
+                "br init --redirect /absolute/path/to/primary/.beads --json",
+            ],
+        },
+        "redirect set" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &[
+                "br redirect set --allow-existing --json",
+                "br redirect set /absolute/path/to/primary/.beads --allow-existing --json",
+            ],
+        },
+        "redirect" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: parent_examples(name),
         },
         "create" => CommandContract {
             operation: "write",
@@ -1160,6 +1197,32 @@ mod tests {
                 .safety_notes
                 .iter()
                 .any(|note| note.contains("never cross a schema-version boundary"))
+        );
+    }
+
+    #[test]
+    fn redirect_capability_exposes_receipts_and_preservation_boundaries() {
+        let init = command_contract("init");
+        assert!(init.machine_output.contains(&"json"));
+        assert!(
+            init.examples
+                .iter()
+                .any(|example| example.contains("init --redirect --json"))
+        );
+
+        let detail = command_detail_for_path("redirect set").expect("redirect set detail");
+        assert_eq!(detail.operation, "write");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("--allow-existing"))
+        );
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("no redirect-removal"))
         );
     }
 }

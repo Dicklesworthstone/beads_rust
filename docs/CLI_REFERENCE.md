@@ -151,6 +151,7 @@ br init [OPTIONS]
 | `--prefix <PREFIX>` | Issue ID prefix (e.g., "bd", "proj") |
 | `--force` | Overwrite existing database |
 | `--backend <BACKEND>` | Backend type placeholder; currently ignored and always uses SQLite |
+| `--redirect [<BEADS_DIR>]` | Create only a worktree redirect; omit the target to discover the primary Git worktree |
 
 **Examples:**
 ```bash
@@ -163,6 +164,24 @@ br init --prefix myproj
 # Force reinitialize
 br init --force
 ```
+
+Redirect initialization creates no database and does not mutate or repair the
+target. See [Shared br Workspaces Across Git Worktrees](WORKTREE_REDIRECTS.md)
+for automatic discovery, exact targets, lifecycle automation, bypasses, and
+recovery.
+
+### redirect set
+
+Route an already initialized worktree to a canonical tracker while preserving
+all local artifacts as dormant state.
+
+```bash
+br redirect set [<BEADS_DIR>] [--allow-existing]
+```
+
+The target is optional for standard linked Git worktrees. Material local state
+requires `--allow-existing`; the command never deletes, moves, or overwrites
+that state. Use global `--json` for the `br.redirect.v1` receipt.
 
 ---
 
@@ -1885,8 +1904,8 @@ br schema [TARGET] [OPTIONS]
 
 **Targets:** `all`, `issue`, `issue-with-counts`, `issue-details`,
 `ready-issue`, `stale-issue`, `blocked-issue`, `tree-node`, `statistics`,
-`coordination-status`, `additive-reconciliation`, `vcs-status`, `error`, and
-`commands`.
+`coordination-status`, `additive-reconciliation`, `vcs-status`,
+`redirect-receipt`, `error`, and `commands`.
 
 **Options:**
 | Option | Description |

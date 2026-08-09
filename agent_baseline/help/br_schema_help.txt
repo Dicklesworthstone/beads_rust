@@ -19,6 +19,7 @@ Arguments:
           - tree-node:           Dependency tree node
           - statistics:          Stats output
           - coordination-status: Coordination status output
+          - redirect-receipt:    Worktree redirect setup receipt
           - error:               Structured error envelope (stderr JSON when robot mode or non-TTY)
           - commands:            Per-command JSON output envelope map (top-level shape + jq filter per command)
 

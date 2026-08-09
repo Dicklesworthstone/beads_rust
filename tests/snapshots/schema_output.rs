@@ -26,6 +26,7 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "IssueDetails",
     "IssueWithCounts",
     "ReadyIssue",
+    "RedirectReceipt",
     "StaleIssue",
     "Statistics",
     "SyncReconcileReceipt",

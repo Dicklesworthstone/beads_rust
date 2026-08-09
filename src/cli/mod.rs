@@ -849,6 +849,15 @@ pub enum Commands {
         /// Backend type (ignored, always sqlite)
         #[arg(long)]
         backend: Option<String>,
+
+        /// Route this worktree to an existing .beads workspace
+        #[arg(
+            long,
+            value_name = "BEADS_DIR",
+            num_args = 0..=1,
+            conflicts_with_all = ["prefix", "force", "backend"]
+        )]
+        redirect: Option<Option<PathBuf>>,
     },
 
     /// Manage labels
@@ -877,6 +886,12 @@ pub enum Commands {
 
     /// List ready issues (open, unblocked, not deferred)
     Ready(ReadyArgs),
+
+    /// Manage worktree workspace redirects
+    Redirect {
+        #[command(subcommand)]
+        command: RedirectCommands,
+    },
 
     /// Reopen an issue
     Reopen(ReopenArgs),
@@ -1001,6 +1016,25 @@ EXAMPLES:
 
     /// Show the active .beads directory
     Where,
+}
+
+/// Worktree redirect management commands.
+#[derive(Subcommand, Debug)]
+pub enum RedirectCommands {
+    /// Route this worktree to an existing canonical beads workspace
+    Set(RedirectSetArgs),
+}
+
+/// Arguments for `br redirect set`.
+#[derive(Args, Debug)]
+pub struct RedirectSetArgs {
+    /// Exact .beads target; omit to discover the primary Git worktree
+    #[arg(value_name = "BEADS_DIR")]
+    pub target: Option<PathBuf>,
+
+    /// Acknowledge that material local tracker state will become dormant
+    #[arg(long)]
+    pub allow_existing: bool,
 }
 
 /// Arguments for the completions command.
@@ -1521,6 +1555,8 @@ pub enum SchemaTarget {
     AdditiveReconciliation,
     /// Explicit VCS export-status diagnostic
     VcsStatus,
+    /// Worktree redirect setup receipt
+    RedirectReceipt,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)

@@ -1,0 +1,2 @@
+# Route newly created worktrees to the primary worktree's tracker before later setup runs.
+pre-start = "if ! br init --redirect >/dev/null 2>&1; then printf '%s\\n' 'WARNING: br init --redirect failed; recover manually with br init --redirect /exact/path/to/.beads (exact .beads path).' >&2; fi"

@@ -479,7 +479,13 @@ fn main() {
             prefix,
             force,
             backend: _,
-        } => commands::init::execute(prefix, force, None, &output_ctx),
+            redirect,
+        } => commands::init::execute(prefix, force, redirect, None, &output_ctx),
+        Commands::Redirect { command } => match command {
+            beads_rust::cli::RedirectCommands::Set(args) => {
+                commands::redirect::execute_set(&args, &output_ctx)
+            }
+        },
         Commands::Create(args) => {
             execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
         }
@@ -1118,7 +1124,7 @@ const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
         return true;
     }
     match cmd {
-        Commands::Init { .. } => true,
+        Commands::Init { redirect, .. } => redirect.is_none(),
         Commands::Sync(args) => {
             args.flush_only || args.import_only || (args.reconcile_additive && args.apply)
         }
@@ -1362,7 +1368,10 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Audit { .. }
         | Commands::Info(_)
         | Commands::Where
-        | Commands::Init { .. } => true,
+        | Commands::Init { redirect: None, .. } => true,
+        Commands::Init {
+            redirect: Some(_), ..
+        } => false,
         Commands::Doctor(args) => doctor_subcommand_needs_write_lock(args),
         Commands::Sync(args) => sync_mode_opens_storage(args),
         Commands::Config { command } => !matches!(
@@ -1413,6 +1422,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }
+        | Commands::Redirect { .. }
         | Commands::Sync(_)
         | Commands::Doctor(_)
         | Commands::Info(_)

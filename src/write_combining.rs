@@ -1861,6 +1861,7 @@ mod tests {
                 prefix: None,
                 force: false,
                 backend: None,
+                redirect: None,
             }),
             CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
         );

@@ -37,6 +37,7 @@ Commands:
   q             Quick capture (create issue, print ID only)
   query         Manage saved queries
   ready         List ready issues (open, unblocked, not deferred)
+  redirect      Manage worktree workspace redirects
   reopen        Reopen an issue
   ID-REDACTED    Print concise ID-REDACTED docs for automation agents
   scheduler     Rank ready work for agent swarms with explainable evidence

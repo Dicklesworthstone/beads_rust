@@ -104,19 +104,27 @@ fn write_init_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Execute the init command.
+/// Execute initialization with the optional worktree redirect mode.
 ///
 /// # Errors
 ///
-/// Returns an error if the directory or database cannot be created.
+/// Returns an error if ordinary initialization or redirect setup fails.
 #[allow(clippy::too_many_lines)]
 pub fn execute(
     prefix: Option<String>,
     force: bool,
+    redirect: Option<Option<PathBuf>>,
     root_dir: Option<&Path>,
     ctx: &OutputContext,
 ) -> Result<()> {
     let base_dir = root_dir.unwrap_or_else(|| Path::new("."));
+    if let Some(target) = redirect {
+        let receipt = target.map_or_else(
+            || crate::redirect::init_with_automatic_target(base_dir),
+            |target| crate::redirect::init_with_explicit_target(base_dir, &target),
+        )?;
+        return super::redirect::render_receipt(&receipt, ctx);
+    }
     let beads_dir = resolve_init_beads_dir(base_dir);
 
     let mut created_dir = false;
@@ -453,7 +461,7 @@ mod tests {
         info!("test_init_creates_beads_directory: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result = execute(None, false, None, Some(temp_dir.path()), &ctx);
 
         assert!(result.is_ok());
         assert!(temp_dir.path().join(".beads").exists());
@@ -479,7 +487,7 @@ mod tests {
         symlink(&outside_target, &config_path).unwrap();
 
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result = execute(None, false, None, Some(temp_dir.path()), &ctx);
 
         assert!(result.is_ok());
         assert!(
@@ -509,7 +517,7 @@ mod tests {
         symlink(&outside_target, &metadata_path).unwrap();
 
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = execute(None, true, Some(temp_dir.path()), &ctx);
+        let result = execute(None, true, None, Some(temp_dir.path()), &ctx);
 
         assert!(result.is_ok());
         assert!(
@@ -537,12 +545,12 @@ mod tests {
         init_logging();
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        execute(None, false, Some(temp_dir.path()), &ctx).unwrap();
+        execute(None, false, None, Some(temp_dir.path()), &ctx).unwrap();
 
         let metadata_path = temp_dir.path().join(".beads/metadata.json");
         fs::set_permissions(&metadata_path, fs::Permissions::from_mode(0o600)).unwrap();
 
-        execute(None, true, Some(temp_dir.path()), &ctx).unwrap();
+        execute(None, true, None, Some(temp_dir.path()), &ctx).unwrap();
 
         let mode = fs::metadata(&metadata_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "force init should preserve metadata mode");
@@ -554,7 +562,13 @@ mod tests {
         info!("test_init_with_prefix: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        let result = execute(Some("test".to_string()), false, Some(temp_dir.path()), &ctx);
+        let result = execute(
+            Some("test".to_string()),
+            false,
+            None,
+            Some(temp_dir.path()),
+            &ctx,
+        );
 
         assert!(result.is_ok());
 
@@ -574,11 +588,11 @@ mod tests {
         let ctx = OutputContext::from_flags(false, false, true);
 
         // First init should succeed
-        let result1 = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result1 = execute(None, false, None, Some(temp_dir.path()), &ctx);
         assert!(result1.is_ok());
 
         // Second init without force should fail
-        let result2 = execute(None, false, Some(temp_dir.path()), &ctx);
+        let result2 = execute(None, false, None, Some(temp_dir.path()), &ctx);
 
         assert!(result2.is_err());
         assert!(matches!(
@@ -599,6 +613,7 @@ mod tests {
         execute(
             Some("first".to_string()),
             false,
+            None,
             Some(temp_dir.path()),
             &ctx,
         )
@@ -608,6 +623,7 @@ mod tests {
         let result = execute(
             Some("second".to_string()),
             true,
+            None,
             Some(temp_dir.path()),
             &ctx,
         );
@@ -628,7 +644,7 @@ mod tests {
         info!("test_metadata_json_content: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        execute(None, false, Some(temp_dir.path()), &ctx).unwrap();
+        execute(None, false, None, Some(temp_dir.path()), &ctx).unwrap();
 
         let metadata_path = temp_dir.path().join(".beads/metadata.json");
         let content = fs::read_to_string(metadata_path).unwrap();
@@ -645,7 +661,7 @@ mod tests {
         info!("test_gitignore_excludes_db_files: starting");
         let temp_dir = TempDir::new().unwrap();
         let ctx = OutputContext::from_flags(false, false, true);
-        execute(None, false, Some(temp_dir.path()), &ctx).unwrap();
+        execute(None, false, None, Some(temp_dir.path()), &ctx).unwrap();
 
         let gitignore_path = temp_dir.path().join(".beads/.gitignore");
         let content = fs::read_to_string(gitignore_path).unwrap();

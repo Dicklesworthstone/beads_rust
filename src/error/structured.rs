@@ -902,6 +902,19 @@ impl StructuredError {
                 })),
             ),
             BeadsError::Config(_) => (ErrorCode::ConfigError, None),
+            BeadsError::RedirectRefused { reason, receipt } => {
+                let mut context = serde_json::to_value(receipt.as_ref()).unwrap_or_else(|_| {
+                    json!({
+                        "schema": "br.redirect.v1",
+                        "disposition": "refused",
+                        "changed": false,
+                    })
+                });
+                if let Value::Object(object) = &mut context {
+                    object.insert("refusal_reason".to_string(), Value::String(reason.clone()));
+                }
+                (ErrorCode::ConfigError, Some(context))
+            }
             BeadsError::ExternalCommand { command, reason } => (
                 ErrorCode::IoError,
                 Some(json!({"command": command, "reason": reason})),

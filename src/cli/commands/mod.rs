@@ -41,6 +41,7 @@ pub mod orphans;
 pub mod q;
 pub mod query;
 pub mod ready;
+pub mod redirect;
 pub mod reopen;
 pub mod robot_docs;
 pub mod scheduler;
