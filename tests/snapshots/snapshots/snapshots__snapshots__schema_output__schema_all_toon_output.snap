@@ -2557,7 +2557,7 @@ commands:
     shape: object
     jq_filter: .
     item_schema: RedirectReceipt
-    error_envelope_on_stderr: true
+    error_envelope_on_stderr: false
     notes: "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never mutates the canonical target, and reports created, unchanged, primary_owner, or refused."
   "label list":
     shape: array
@@ -2581,7 +2581,7 @@ commands:
     shape: object
     jq_filter: .
     item_schema: RedirectReceipt
-    error_envelope_on_stderr: true
+    error_envelope_on_stderr: false
     notes: "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never mutates the canonical target, and reports created, unchanged, primary_owner, or refused."
   "robot-docs guide":
     shape: object

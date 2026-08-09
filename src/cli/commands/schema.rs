@@ -337,7 +337,7 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
         jq_filter: ".",
         items_at: None,
         item_schema: Some("RedirectReceipt"),
-        error_envelope_on_stderr: true,
+        error_envelope_on_stderr: false,
         notes: Some(
             "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never \
              mutates the canonical target, and reports created, unchanged, primary_owner, or \
@@ -638,7 +638,10 @@ mod tests {
             let shape = commands.get(name).expect("redirect command shape");
             assert_eq!(shape.shape, "object");
             assert_eq!(shape.item_schema, Some("RedirectReceipt"));
-            assert!(shape.error_envelope_on_stderr);
+            assert!(
+                !shape.error_envelope_on_stderr,
+                "redirect refusals use the top-level structured CLI stdout stream"
+            );
         }
     }
 

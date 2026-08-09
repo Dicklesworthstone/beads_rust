@@ -7,8 +7,9 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br, run_br_with_env};
 use serde_json::Value;
+use std::fs;
 #[cfg(feature = "self_update")]
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 #[cfg(feature = "self_update")]
 use toon_rust::options::KeyFoldingMode;
 use toon_rust::try_decode as parse_toon;
@@ -61,6 +62,74 @@ fn e2e_schema_vcs_shape_matches_live_success_and_error_streams() {
     let error: Value = serde_json::from_str(&extract_json_payload(&error.stdout))
         .expect("VCS error JSON on stdout");
     assert!(error.get("error").is_some(), "{error}");
+}
+
+#[test]
+fn e2e_schema_redirect_shape_matches_live_refusal_stream() {
+    let _log = common::test_log("e2e_schema_redirect_shape_matches_live_refusal_stream");
+    let canonical = BrWorkspace::new();
+    let canonical_init = run_br(&canonical, ["init"], "schema_redirect_canonical_init");
+    assert!(
+        canonical_init.status.success(),
+        "canonical init failed: {}",
+        canonical_init.stderr
+    );
+
+    let local = BrWorkspace::new();
+    let local_init = run_br(&local, ["init"], "schema_redirect_local_init");
+    assert!(
+        local_init.status.success(),
+        "local init failed: {}",
+        local_init.stderr
+    );
+
+    let schemas = run_br(
+        &local,
+        ["schema", "commands", "--format", "json"],
+        "schema_redirect_commands",
+    );
+    assert!(schemas.status.success(), "{}", schemas.stderr);
+    let schemas: Value =
+        serde_json::from_str(&extract_json_payload(&schemas.stdout)).expect("schema commands JSON");
+    for command in ["init --redirect", "redirect set"] {
+        let shape = &schemas["commands"][command];
+        assert_eq!(
+            shape["error_envelope_on_stderr"], false,
+            "{command} must advertise the direct CLI refusal stream: {shape}"
+        );
+    }
+
+    let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("agent_baseline/schemas/schema_all.json");
+    let baseline: Value = serde_json::from_slice(&fs::read(&baseline_path).unwrap())
+        .expect("checked-in agent schema baseline JSON");
+    for command in ["init --redirect", "redirect set"] {
+        assert_eq!(
+            baseline["commands"][command]["error_envelope_on_stderr"], false,
+            "checked-in {command} contract must use the stdout refusal stream"
+        );
+    }
+
+    let target = canonical.root.join(".beads").canonicalize().unwrap();
+    let target = target.to_string_lossy().into_owned();
+    let refusal = run_br(
+        &local,
+        ["init", "--redirect", target.as_str(), "--json"],
+        "schema_redirect_live_refusal",
+    );
+    assert!(
+        !refusal.status.success(),
+        "initialized local state must refuse"
+    );
+    assert!(
+        refusal.stderr.is_empty(),
+        "structured redirect refusal must not use stderr: {}",
+        refusal.stderr
+    );
+    let refusal: Value = serde_json::from_str(&extract_json_payload(&refusal.stdout))
+        .expect("redirect refusal JSON on stdout");
+    assert_eq!(refusal["error"]["context"]["schema"], "br.redirect.v1");
+    assert_eq!(refusal["error"]["context"]["disposition"], "refused");
 }
 
 #[test]
