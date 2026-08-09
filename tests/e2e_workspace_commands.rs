@@ -7,7 +7,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
 use fsqlite::Connection;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 
 // ============================================================================
@@ -35,6 +35,67 @@ fn e2e_init_new_workspace() {
     // Verify database file exists
     let db_path = beads_dir.join("beads.db");
     assert!(db_path.exists(), "beads.db should exist");
+}
+
+#[test]
+fn e2e_list_rebuilds_missing_database_from_jsonl() {
+    let _log = common::test_log("e2e_list_rebuilds_missing_database_from_jsonl");
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    fs::write(
+        beads_dir.join("config.yaml"),
+        "issue_prefix: rebuilt\nissue-prefix: rebuilt\nsync: {}\n",
+    )
+    .expect("write config");
+    fs::write(
+        beads_dir.join("metadata.json"),
+        "{\n  \"database\": \"beads.db\",\n  \"jsonl_export\": \"issues.jsonl\"\n}\n",
+    )
+    .expect("write metadata");
+    let issue = json!({
+        "id": "rebuilt-abc12",
+        "title": "Imported from JSONL-only checkout",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "task",
+        "created_at": "2026-08-06T00:00:00Z",
+        "created_by": "tester",
+        "updated_at": "2026-08-06T00:00:00Z",
+        "labels": [],
+        "ephemeral": false,
+        "pinned": false,
+        "is_template": false,
+        "dependencies": [],
+        "comments": []
+    });
+    fs::write(beads_dir.join("issues.jsonl"), format!("{issue}\n")).expect("write JSONL");
+
+    let listed = run_br(
+        &workspace,
+        ["list", "--json"],
+        "list_rebuild_missing_database",
+    );
+    assert!(
+        listed.status.success(),
+        "list should rebuild a missing database: stdout='{}' stderr='{}'",
+        listed.stdout,
+        listed.stderr
+    );
+    assert!(
+        !listed.stderr.contains("sync-merge state is unknown"),
+        "missing database must not be misclassified as an unknown pending merge: {}",
+        listed.stderr
+    );
+    assert!(
+        beads_dir.join("beads.db").is_file(),
+        "list auto-import should create the database"
+    );
+    let issues = parse_list_issues(&listed.stdout);
+    assert!(
+        issues.iter().any(|row| row["id"] == "rebuilt-abc12"),
+        "list should include the JSONL issue: {issues:?}"
+    );
 }
 
 #[test]
