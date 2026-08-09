@@ -57,11 +57,13 @@ Important boundaries:
 
 - `br` never performs workflow git operations, releases, pull requests, network
   dispatches, or upstream lookups automatically.
-- Agents run workflow proof Cargo targets directly through RCH; local shell
-  verifier scripts are operator shortcuts and may call Cargo internally.
-- Whole-crate `cargo check --all-targets` and
-  `cargo clippy --all-targets -- -D warnings` are required when Rust code
-  changes, and must be offloaded through RCH in agent sessions.
+- Agents run workflow proof Cargo targets through the repository build-limit
+  wrapper; local verifier scripts are operator shortcuts and may call Cargo
+  internally.
+- Whole-crate `./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo
+  check --all-targets` and `./scripts/with-build-limits.sh env
+  CARGO_BUILD_JOBS=2 cargo clippy --all-targets -- -D warnings`
+  are required when Rust code changes.
 - Run `git diff --check`, `actionlint` when available, the relevant workflow
   harnesses, and `ubs` on changed workflow-related files before committing.
 
@@ -70,6 +72,33 @@ Important boundaries:
 ## Toolchain: Rust & Cargo
 
 We only use **Cargo** in this project, NEVER any other package manager.
+
+### Mandatory Portable Build Resource Limits
+
+Every agent command that invokes Cargo, directly or through another script,
+must run through `scripts/with-build-limits.sh`. On Linux, the wrapper derives
+the process's effective CPU and memory authority, gives the command half of
+each by default, and contains the complete process tree in a transient cgroup.
+On macOS it retains the conservative Cargo settings and reduced priority while
+reporting that cgroup isolation is unavailable.
+
+```bash
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo check --all-targets
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test --all-features
+./scripts/with-build-limits.sh --plan
+./scripts/with-build-limits.sh --check
+```
+
+The defaults are two Cargo jobs, four release codegen units, and disabled
+release LTO. `BR_BUILD_CPU_SHARE`, `BR_BUILD_MEMORY_MAX_SHARE`, and
+`BR_BUILD_MEMORY_HIGH_SHARE` adjust the containment ratios within inherited
+authority. `BR_BUILD_CARGO_JOBS`, `BR_BUILD_CODEGEN_UNITS`, and `BR_BUILD_LTO`
+adjust the conservative Cargo policy. Invalid values and ratios that exceed
+inherited authority are rejected. See `./scripts/with-build-limits.sh --help`
+for the accepted ranges.
+
+Bare Cargo commands and RCH are not part of the agent validation path for this
+repository.
 
 - **Edition:** Rust 2024 (nightly required — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
@@ -149,13 +178,13 @@ We do not care about backwards compatibility—we're in early development with n
 
 ```bash
 # Check for compiler errors and warnings
-cargo check --all-targets
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo check --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --all-targets -- -D warnings
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo clippy --all-targets -- -D warnings
 
 # Verify formatting
-cargo fmt --check
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
@@ -177,21 +206,21 @@ Integration and end-to-end tests live in the `tests/` directory.
 
 ```bash
 # Run all tests
-cargo test
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test
 
 # Run with output
-cargo test -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test -- --nocapture
 
 # Run tests for a specific module
-cargo test storage
-cargo test cli
-cargo test sync
-cargo test format
-cargo test model
-cargo test validation
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test storage
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test cli
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test sync
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test format
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test model
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test validation
 
 # Run tests with all features enabled
-cargo test --all-features
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test --all-features
 ```
 
 ### Test Categories
@@ -394,7 +423,7 @@ When modifying sync-related code (`src/sync/`, `src/cli/commands/sync.rs`), you 
 Quick summary:
 1. **No git operations** — Static check: `grep -rn 'Command::new.*git' src/sync/`
 2. **Path allowlist** — Verify only `.beads/` files are touched
-3. **Run safety tests** — `cargo test e2e_sync --release`
+3. **Run safety tests** — `./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test e2e_sync --release`
 4. **Review logs** — Check for unexpected safety events
 5. **Update docs** — If behavior changed
 
@@ -461,8 +490,9 @@ use MCP tools/resources/prompts instead of shelling out. It is optional and only
 exists in binaries built with the `mcp` feature:
 
 ```bash
-MCP_TARGET="${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}/rch_target_beads_rust_${AGENT_NAME:-agent}"
-rch exec -- env CARGO_TARGET_DIR="$MCP_TARGET" cargo build --release --features mcp
+MCP_TARGET="${TMPDIR:-/tmp}/br_mcp_target_${AGENT_NAME:-agent}"
+./scripts/with-build-limits.sh env CARGO_TARGET_DIR="$MCP_TARGET" \
+  cargo build --release --features mcp
 RUST_LOG=error "$MCP_TARGET/release/br" serve --actor "${AGENT_NAME:-mcp}"
 ```
 
@@ -759,30 +789,12 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 
 ---
 
-## RCH — Remote Compilation Helper
+## Local Build Containment
 
-RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.
-
-**RCH is installed at `~/.local/bin/rch` and is hooked into Claude Code's PreToolUse automatically.** Most of the time you don't need to do anything if you are Claude Code — builds are intercepted and offloaded transparently.
-
-To manually offload a build:
-```bash
-rch exec -- cargo build --release
-rch exec -- cargo test
-rch exec -- cargo clippy
-```
-
-Quick commands:
-```bash
-rch doctor                    # Health check
-rch workers probe --all       # Test connectivity to all 8 workers
-rch status                    # Overview of current state
-rch queue                     # See active/waiting builds
-```
-
-If rch or its workers are unavailable, it fails open — builds run locally as normal.
-
-**Note for Codex/GPT-5.2:** Codex does not have the automatic PreToolUse hook, but you can (and should) still manually offload compute-intensive compilation commands using `rch exec -- <command>`. This avoids local resource contention when multiple agents are building simultaneously.
+Agent builds run locally through `scripts/with-build-limits.sh`. Do not invoke
+RCH for repository validation. The wrapper fails clearly when it cannot provide
+the documented platform contract instead of silently running an uncontained
+Linux build.
 
 ---
 
