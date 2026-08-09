@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if ! br init --redirect >/dev/null 2>&1; then printf '%s\\n' '{\"systemMessage\":\"WARNING: br init --redirect failed; recover manually in this worktree with br init --redirect /exact/path/to/.beads (exact .beads path).\"}'; fi",
+            "command": "if ! br init --redirect >/dev/null 2>&1; then printf '%s\\n' '{\"systemMessage\":\"WARNING: br init --redirect failed. Ensure br is on PATH and rerun it here for details; use an exact .beads path when discovery fails, or after inspecting initialized local state explicitly run br redirect set /exact/path/to/.beads --allow-existing.\"}'; fi",
             "timeout": 10
           }
         ]

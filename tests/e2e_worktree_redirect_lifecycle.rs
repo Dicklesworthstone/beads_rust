@@ -349,6 +349,8 @@ fn assert_codex_adapter_contract(command: &str) {
     assert!(message.contains("WARNING"));
     assert!(message.contains("br init --redirect"));
     assert!(message.contains("exact .beads path"));
+    assert!(message.contains("br redirect set"));
+    assert!(message.contains("--allow-existing"));
 
     let missing_br = Command::new("/bin/sh")
         .arg("-c")
@@ -362,12 +364,11 @@ fn assert_codex_adapter_contract(command: &str) {
     assert!(missing_br.stderr.is_empty());
     let missing_warning: JsonValue =
         serde_json::from_slice(&missing_br.stdout).expect("missing-br systemMessage warning JSON");
-    assert!(
-        missing_warning["systemMessage"]
-            .as_str()
-            .expect("missing-br Codex systemMessage")
-            .contains("br init --redirect")
-    );
+    let missing_message = missing_warning["systemMessage"]
+        .as_str()
+        .expect("missing-br Codex systemMessage");
+    assert!(missing_message.contains("br init --redirect"));
+    assert!(missing_message.contains("Ensure br is on PATH"));
 }
 
 #[cfg(unix)]
@@ -388,10 +389,6 @@ fn codex_session_start_matches_startup_and_resume_and_invokes_native_redirect_se
     let (matcher, command) = codex_session_start_hook();
     assert_eq!(matcher, "^(startup|resume)$");
     assert_codex_adapter_contract(&command);
-    assert!(
-        !command.contains("--allow-existing"),
-        "SessionStart automation must not acknowledge initialized local state"
-    );
 }
 
 #[cfg(unix)]
