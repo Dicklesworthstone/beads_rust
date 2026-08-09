@@ -68,8 +68,8 @@ br sync --flush-only                 # Optional final export check before git co
 For linked worktrees, redirect the secondary worktree to the primary
 worktree's complete tracker instead of creating another database. See
 [Shared br Workspaces Across Git Worktrees](docs/WORKTREE_REDIRECTS.md) for
-safe adoption, Claude/Worktrunk integration, and explicit raw-Git hook
-activation.
+safe adoption, default Codex SessionStart routing, Claude/Worktrunk
+integration, and explicit raw-Git hook activation.
 
 ### Why br?
 

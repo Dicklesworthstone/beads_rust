@@ -1,0 +1,17 @@
+{
+  "description": "Share the primary br workspace in Codex worktrees.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^(startup|resume)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if ! br init --redirect >/dev/null 2>&1; then printf '%s\\n' '{\"systemMessage\":\"WARNING: br init --redirect failed; recover manually in this worktree with br init --redirect /exact/path/to/.beads (exact .beads path).\"}'; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -186,6 +186,38 @@ fn claude_command() -> String {
         .to_string()
 }
 
+fn codex_session_start_hook() -> (String, String) {
+    let contents = fs::read_to_string(repository_root().join(".codex/hooks.json"))
+        .expect("read repository Codex hooks");
+    let parsed: JsonValue = serde_json::from_str(&contents).expect("parse Codex hooks JSON");
+    let events = parsed["hooks"]
+        .as_object()
+        .expect("Codex hooks must be grouped by event");
+    assert_eq!(
+        events.keys().collect::<Vec<_>>(),
+        ["SessionStart"],
+        "Codex redirect setup must not add unrelated lifecycle behavior"
+    );
+    let entries = events["SessionStart"]
+        .as_array()
+        .expect("Codex SessionStart hook entries");
+    assert_eq!(entries.len(), 1, "one SessionStart matcher group expected");
+    let entry = &entries[0];
+    let matcher = entry["matcher"]
+        .as_str()
+        .expect("Codex SessionStart source matcher")
+        .to_string();
+    let hooks = entry["hooks"]
+        .as_array()
+        .expect("Codex SessionStart command hooks");
+    assert_eq!(hooks.len(), 1, "one SessionStart command expected");
+    let command = hooks[0]["command"]
+        .as_str()
+        .expect("Codex SessionStart command hook")
+        .to_string();
+    (matcher, command)
+}
+
 #[cfg(unix)]
 fn run_adapter(command: &str, cwd: &Path, fake_status: i32) -> (Output, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
@@ -268,6 +300,77 @@ fn assert_adapter_contract(command: &str) {
 }
 
 #[cfg(unix)]
+fn assert_codex_adapter_contract(command: &str) {
+    assert!(command.contains("br init --redirect"));
+    assert!(!command.contains("setup_br_worktree"));
+    assert!(!command.contains("setup-br-worktree"));
+    for unrelated in [".env", "cargo ", "git ", "make "] {
+        assert!(
+            !command.contains(unrelated),
+            "adapter must not perform unrelated setup: {command}"
+        );
+    }
+
+    let fixture = TempDir::new().unwrap();
+    let worktree = fixture.path().join("created-worktree");
+    fs::create_dir(&worktree).unwrap();
+    let (success, success_log) = run_adapter(command, &worktree, 0);
+    assert!(success.status.success());
+    assert!(
+        success.stdout.is_empty(),
+        "successful setup should be quiet"
+    );
+    assert!(
+        success.stderr.is_empty(),
+        "successful setup should be quiet"
+    );
+    assert_eq!(
+        fs::read_to_string(success_log.with_extension("cwd"))
+            .unwrap()
+            .trim(),
+        worktree.to_string_lossy()
+    );
+    assert_eq!(
+        fs::read_to_string(success_log.with_extension("args")).unwrap(),
+        "init\n--redirect\n"
+    );
+
+    let (failure, _) = run_adapter(command, &worktree, 7);
+    assert!(
+        failure.status.success(),
+        "Codex SessionStart must fail open"
+    );
+    assert!(failure.stderr.is_empty());
+    let warning: JsonValue =
+        serde_json::from_slice(&failure.stdout).expect("Codex systemMessage warning JSON");
+    let message = warning["systemMessage"]
+        .as_str()
+        .expect("Codex systemMessage warning");
+    assert!(message.contains("WARNING"));
+    assert!(message.contains("br init --redirect"));
+    assert!(message.contains("exact .beads path"));
+
+    let missing_br = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(&worktree)
+        .env_clear()
+        .env("PATH", "/missing-br")
+        .output()
+        .expect("run Codex adapter without br");
+    assert!(missing_br.status.success(), "missing br must fail open");
+    assert!(missing_br.stderr.is_empty());
+    let missing_warning: JsonValue =
+        serde_json::from_slice(&missing_br.stdout).expect("missing-br systemMessage warning JSON");
+    assert!(
+        missing_warning["systemMessage"]
+            .as_str()
+            .expect("missing-br Codex systemMessage")
+            .contains("br init --redirect")
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn worktrunk_pre_start_invokes_native_redirect_setup_and_fails_open() {
     assert_adapter_contract(&worktrunk_command());
@@ -277,6 +380,68 @@ fn worktrunk_pre_start_invokes_native_redirect_setup_and_fails_open() {
 #[test]
 fn claude_enter_worktree_invokes_native_redirect_setup_and_fails_open() {
     assert_adapter_contract(&claude_command());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_session_start_matches_startup_and_resume_and_invokes_native_redirect_setup() {
+    let (matcher, command) = codex_session_start_hook();
+    assert_eq!(matcher, "^(startup|resume)$");
+    assert_codex_adapter_contract(&command);
+    assert!(
+        !command.contains("--allow-existing"),
+        "SessionStart automation must not acknowledge initialized local state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_session_start_is_quiet_and_idempotent_in_primary_and_linked_worktrees() {
+    let (fixture, historical) = setup_git_repository();
+    let repository = fixture.path();
+    let (_, codex) = codex_session_start_hook();
+    let home = isolated_home(repository);
+
+    let primary = run_real_adapter(&codex, repository, &home);
+    assert_success(&primary, "Codex SessionStart in primary worktree");
+    assert!(primary.stdout.is_empty());
+    assert!(primary.stderr.is_empty());
+    assert!(!repository.join(".beads/redirect").exists());
+
+    let linked = repository.join("codex-worktree");
+    let created = run_git(
+        repository,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--detach"),
+            linked.as_os_str(),
+            OsStr::new(&historical),
+        ],
+        Some(&br_path()),
+    );
+    assert_success(&created, "create Codex-managed linked worktree");
+    assert!(!linked.join(".beads/redirect").exists());
+
+    let startup = run_real_adapter(&codex, &linked, &home);
+    assert_success(&startup, "Codex startup redirect setup");
+    assert!(startup.stdout.is_empty());
+    assert!(startup.stderr.is_empty());
+    assert_redirect_target(&linked, &repository.join(".beads"));
+
+    let redirect_path = linked.join(".beads/redirect");
+    let redirect_bytes = fs::read(&redirect_path).unwrap();
+    let redirect_modified = fs::metadata(&redirect_path).unwrap().modified().unwrap();
+    let resume = run_real_adapter(&codex, &linked, &home);
+    assert_success(&resume, "Codex resume redirect setup");
+    assert!(resume.stdout.is_empty());
+    assert!(resume.stderr.is_empty());
+    assert_eq!(fs::read(&redirect_path).unwrap(), redirect_bytes);
+    assert_eq!(
+        fs::metadata(&redirect_path).unwrap().modified().unwrap(),
+        redirect_modified,
+        "Codex resume must not rewrite an existing same-target redirect"
+    );
 }
 
 #[cfg(unix)]
@@ -457,7 +622,7 @@ fn native_git_dispatcher_warns_open_and_no_checkout_supports_manual_recovery() {
 
 #[cfg(unix)]
 #[test]
-fn git_worktrunk_and_claude_converge_on_one_mutable_tracker_authority() {
+fn git_worktrunk_claude_and_codex_converge_on_one_mutable_tracker_authority() {
     let (fixture, historical) = setup_git_repository();
     let repository = fixture.path();
     assert_success(
@@ -484,13 +649,23 @@ fn git_worktrunk_and_claude_converge_on_one_mutable_tracker_authority() {
     let redirect_modified = fs::metadata(&redirect_path).unwrap().modified().unwrap();
     let worktrunk = worktrunk_command();
     let claude = claude_command();
+    let (_, codex) = codex_session_start_hook();
     let home = isolated_home(repository);
-    let (worktrunk_result, claude_result) = std::thread::scope(|scope| {
+    let (worktrunk_result, claude_result, codex_result) = std::thread::scope(|scope| {
         let worktrunk_run = scope.spawn(|| run_real_adapter(&worktrunk, &linked, &home));
         let claude_run = scope.spawn(|| run_real_adapter(&claude, &linked, &home));
-        (worktrunk_run.join().unwrap(), claude_run.join().unwrap())
+        let codex_run = scope.spawn(|| run_real_adapter(&codex, &linked, &home));
+        (
+            worktrunk_run.join().unwrap(),
+            claude_run.join().unwrap(),
+            codex_run.join().unwrap(),
+        )
     });
-    for (name, output) in [("Worktrunk", worktrunk_result), ("Claude", claude_result)] {
+    for (name, output) in [
+        ("Worktrunk", worktrunk_result),
+        ("Claude", claude_result),
+        ("Codex", codex_result),
+    ] {
         assert_success(&output, &format!("{name} duplicate lifecycle adapter"));
         assert!(output.stdout.is_empty(), "{name} success must be quiet");
         assert!(output.stderr.is_empty(), "{name} success must be quiet");
@@ -609,4 +784,27 @@ fn redirect_help_schema_capabilities_and_completions_are_discoverable() {
             .lines()
             .any(|candidate| candidate == "redirect")
     );
+}
+
+#[test]
+fn codex_operator_docs_cover_trust_bypasses_and_recovery_boundaries() {
+    let docs = fs::read_to_string(repository_root().join("docs/WORKTREE_REDIRECTS.md"))
+        .expect("read worktree redirect documentation");
+    for required in [
+        "default repository-owned path",
+        "enabled by default",
+        "exact hook definition",
+        "`/hooks`",
+        "`startup` and `resume`",
+        "`clear` or `compact`",
+        "`--dangerously-bypass-hook-trust`",
+        "historical revisions",
+        "`br redirect set --allow-existing`",
+        "https://developers.openai.com/codex/hooks",
+    ] {
+        assert!(
+            docs.contains(required),
+            "Codex operator documentation must cover {required}"
+        );
+    }
 }
