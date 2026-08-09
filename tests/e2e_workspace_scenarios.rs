@@ -277,6 +277,84 @@ fn scenario_init_redirect_explicit_target_routes_without_mutating_target() {
 }
 
 #[test]
+fn scenario_init_redirect_preserves_recognized_non_material_siblings() {
+    let canonical = BrWorkspace::new();
+    let canonical_init = run_br(&canonical, ["init"], "init_non_material_canonical");
+    assert!(
+        canonical_init.status.success(),
+        "canonical init failed: {}",
+        canonical_init.stderr
+    );
+    let canonical_beads = canonical.root.join(".beads").canonicalize().unwrap();
+    let target = canonical_beads.to_string_lossy().into_owned();
+
+    let secondary = BrWorkspace::new();
+    let secondary_beads = secondary.root.join(".beads");
+    fs::create_dir(&secondary_beads).unwrap();
+    for (name, contents) in [
+        (".gitignore", b"*.db\n".as_slice()),
+        ("config.yaml", b"issue-prefix: dormant\n".as_slice()),
+        ("metadata.json", br#"{"database":"beads.db"}"#.as_slice()),
+        ("issues.jsonl", b"{\"id\":\"dormant-1\"}\n".as_slice()),
+        ("interactions.jsonl", b"{\"kind\":\"dormant\"}\n".as_slice()),
+        ("README.md", b"# Dormant tracker documentation\n".as_slice()),
+    ] {
+        fs::write(secondary_beads.join(name), contents).unwrap();
+    }
+    let dormant_before = regular_file_contents(&secondary_beads);
+
+    let setup = run_br(
+        &secondary,
+        ["init", "--redirect", target.as_str(), "--json"],
+        "init_redirect_non_material_siblings",
+    );
+    assert!(
+        setup.status.success(),
+        "redirect init failed: stdout={} stderr={}",
+        setup.stdout,
+        setup.stderr
+    );
+    let receipt = parse_json_stdout(&setup.stdout, "non-material redirect receipt");
+    assert_eq!(receipt["disposition"], "created");
+    assert_eq!(receipt["existing_state_acknowledged"], false);
+    let dormant = receipt["dormant_artifacts"].as_array().unwrap();
+    for expected in [
+        ".gitignore",
+        "config.yaml",
+        "metadata.json",
+        "issues.jsonl",
+        "interactions.jsonl",
+        "README.md",
+    ] {
+        assert!(
+            dormant
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|path| path.ends_with(expected)),
+            "receipt must inventory {expected}: {dormant:?}"
+        );
+    }
+
+    let mut dormant_after = regular_file_contents(&secondary_beads);
+    dormant_after.remove("redirect");
+    assert_eq!(dormant_after, dormant_before);
+
+    let repeated = run_br(
+        &secondary,
+        ["init", "--redirect", target.as_str()],
+        "init_redirect_non_material_siblings_human_noop",
+    );
+    assert!(repeated.status.success(), "{}", repeated.stderr);
+    for expected in ["issues.jsonl", "interactions.jsonl", "README.md"] {
+        assert!(
+            repeated.stdout.contains(expected),
+            "human no-op receipt must inventory {expected}: {}",
+            repeated.stdout
+        );
+    }
+}
+
+#[test]
 fn scenario_init_redirect_concurrent_same_target_converges() {
     let canonical = BrWorkspace::new();
     let canonical_init = run_br(&canonical, ["init"], "init_canonical_concurrent");

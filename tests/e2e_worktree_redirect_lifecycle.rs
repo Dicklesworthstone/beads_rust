@@ -72,9 +72,27 @@ fn setup_git_repository() -> (TempDir, String) {
         ),
         "configure user email",
     );
+    let initialized = Command::new(br_binary())
+        .args(["init", "--prefix", "shared"])
+        .current_dir(repository)
+        .env("HOME", isolated_home(repository))
+        .env("BEADS_DIR", repository.join(".beads"))
+        .output()
+        .expect("initialize canonical tracker");
+    assert_success(&initialized, "initialize canonical tracker");
+    fs::write(
+        repository.join(".beads/interactions.jsonl"),
+        "{\"kind\":\"tracked-history\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        repository.join(".beads/README.md"),
+        "# Tracked tracker documentation\n",
+    )
+    .unwrap();
     fs::write(repository.join("tracked.txt"), "historical\n").unwrap();
     assert_success(
-        &run_git(repository, ["add", "tracked.txt"], None),
+        &run_git(repository, ["add", "tracked.txt", ".beads"], None),
         "stage historical fixture",
     );
     assert_success(
@@ -87,15 +105,6 @@ fn setup_git_repository() -> (TempDir, String) {
         .unwrap()
         .trim()
         .to_string();
-
-    let initialized = Command::new(br_binary())
-        .args(["init", "--prefix", "shared"])
-        .current_dir(repository)
-        .env("HOME", isolated_home(repository))
-        .env("BEADS_DIR", repository.join(".beads"))
-        .output()
-        .expect("initialize canonical tracker");
-    assert_success(&initialized, "initialize canonical tracker");
 
     fs::write(repository.join("tracked.txt"), "current\n").unwrap();
     assert_success(
@@ -521,11 +530,23 @@ fn git_worktrunk_and_claude_converge_on_one_mutable_tracker_authority() {
             .any(|issue| issue["title"] == "Unified worktree authority")
     );
 
-    let local_entries = fs::read_dir(linked.join(".beads"))
+    let mut local_entries = fs::read_dir(linked.join(".beads"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
-    assert_eq!(local_entries, [OsStr::new("redirect")]);
+    local_entries.sort();
+    assert_eq!(
+        local_entries,
+        [
+            OsStr::new(".gitignore"),
+            OsStr::new("README.md"),
+            OsStr::new("config.yaml"),
+            OsStr::new("interactions.jsonl"),
+            OsStr::new("issues.jsonl"),
+            OsStr::new("metadata.json"),
+            OsStr::new("redirect"),
+        ]
+    );
     assert_redirect_target(&linked, &repository.join(".beads"));
 }
 

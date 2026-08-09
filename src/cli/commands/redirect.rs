@@ -41,15 +41,6 @@ pub(crate) fn render_receipt(receipt: &RedirectReceipt, ctx: &OutputContext) -> 
                     receipt.source_workspace.display(),
                     receipt.final_target.display()
                 );
-                if receipt.existing_state_acknowledged {
-                    println!(
-                        "Acknowledged {} preserved dormant local artifact(s)",
-                        receipt.dormant_artifacts.len()
-                    );
-                    for artifact in &receipt.dormant_artifacts {
-                        println!("  {}", artifact.display());
-                    }
-                }
             }
             RedirectDisposition::Unchanged => println!(
                 "Worktree redirect already configured: {} -> {}",
@@ -65,6 +56,25 @@ pub(crate) fn render_receipt(receipt: &RedirectReceipt, ctx: &OutputContext) -> 
                 receipt.source_workspace.display()
             ),
         },
+    }
+    if !receipt.dormant_artifacts.is_empty()
+        && matches!(
+            ctx.mode(),
+            OutputMode::Rich | OutputMode::Plain | OutputMode::Toon
+        )
+    {
+        let qualifier = if receipt.existing_state_acknowledged {
+            "Acknowledged"
+        } else {
+            "Preserved"
+        };
+        println!(
+            "{qualifier} {} dormant local artifact(s)",
+            receipt.dormant_artifacts.len()
+        );
+        for artifact in &receipt.dormant_artifacts {
+            println!("  {}", artifact.display());
+        }
     }
     Ok(())
 }

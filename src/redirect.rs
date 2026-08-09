@@ -212,17 +212,17 @@ fn init_with_target(base_dir: &Path, requested_target: Option<&Path>) -> Result<
         });
     }
 
-    if let Err(error) = prepare_fresh_source_workspace(&source_workspace) {
+    let dormant_artifacts = prepare_fresh_source_workspace(&source_workspace).map_err(|error| {
         let dormant_artifacts = safely_inventory_refused_fresh_source(&source_workspace);
-        return Err(map_deliberate_refusal(
+        map_deliberate_refusal(
             error,
             &source_workspace,
             &requested_target,
             target_mode,
             &final_target,
             &dormant_artifacts,
-        ));
-    }
+        )
+    })?;
     let redirect_path = source_workspace.join("redirect");
     let changed =
         publish_redirect(&source_workspace, &redirect_path, &final_target).map_err(|error| {
@@ -232,7 +232,7 @@ fn init_with_target(base_dir: &Path, requested_target: Option<&Path>) -> Result<
                 &requested_target,
                 target_mode,
                 &final_target,
-                &[],
+                &dormant_artifacts,
             )
         })?;
 
@@ -251,7 +251,7 @@ fn init_with_target(base_dir: &Path, requested_target: Option<&Path>) -> Result<
         changed,
         primary_worktree: false,
         existing_state_acknowledged: false,
-        dormant_artifacts: Vec::new(),
+        dormant_artifacts,
     })
 }
 
@@ -427,18 +427,16 @@ fn is_material_local_artifact(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or("");
     if name == ".gitignore"
-        || matches!(name, "config.yaml" | "metadata.json")
+        || matches!(
+            name,
+            "config.yaml" | "metadata.json" | "issues.jsonl" | "beads.jsonl" | "interactions.jsonl"
+        )
         || matches!(
             path.extension().and_then(|value| value.to_str()),
             Some("md" | "yaml" | "yml")
         )
     {
         return false;
-    }
-    if matches!(name, "issues.jsonl" | "beads.jsonl") {
-        return fs::read(path)
-            .map(|contents| contents.iter().any(|byte| !byte.is_ascii_whitespace()))
-            .unwrap_or(true);
     }
     true
 }
@@ -625,7 +623,7 @@ fn validate_initialized_target(target: &Path) -> Result<()> {
     })
 }
 
-fn prepare_fresh_source_workspace(source_workspace: &Path) -> Result<()> {
+fn prepare_fresh_source_workspace(source_workspace: &Path) -> Result<Vec<PathBuf>> {
     match fs::symlink_metadata(source_workspace) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(BeadsError::Config(format!(
@@ -634,32 +632,40 @@ fn prepare_fresh_source_workspace(source_workspace: &Path) -> Result<()> {
             )));
         }
         Ok(_) => {
-            for entry in fs::read_dir(source_workspace)? {
-                let entry = entry?;
-                let file_name = entry.file_name();
-                let file_name = file_name.to_string_lossy();
-                let is_redirect_staging_file =
-                    file_name.starts_with(".redirect.") && file_name.ends_with(".tmp");
-                if file_name != "redirect" && !is_redirect_staging_file {
-                    return Err(BeadsError::Config(format!(
-                        "Redirect initialization requires a fresh workspace; '{}' already exists. Use `br redirect set --allow-existing` to acknowledge preserved local state",
-                        entry.path().display()
-                    )));
-                }
+            let dormant_artifacts = inventory_dormant_artifacts(source_workspace)?;
+            let material_artifacts = dormant_artifacts
+                .iter()
+                .filter(|path| is_material_local_artifact(path))
+                .collect::<Vec<_>>();
+            if !material_artifacts.is_empty() {
+                return Err(BeadsError::Config(format!(
+                    "Redirect initialization requires a fresh workspace without material local tracker state; '{}' already contains: {}. All preserved dormant artifacts: {}. Use `br redirect set --allow-existing` to acknowledge preserved local state",
+                    source_workspace.display(),
+                    material_artifacts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    dormant_artifacts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
             }
+            Ok(dormant_artifacts)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match fs::create_dir(source_workspace) {
-                Ok(()) => {}
+                Ok(()) => Ok(Vec::new()),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return prepare_fresh_source_workspace(source_workspace);
+                    prepare_fresh_source_workspace(source_workspace)
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => Err(error.into()),
             }
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 fn publish_redirect(
@@ -750,7 +756,7 @@ mod tests {
         let database = fixture.path().join("beads.db");
         let unknown = fixture.path().join("unknown.bin");
         fs::write(&config, b"issue-prefix: br\n").unwrap();
-        fs::write(&issues, b" \n\t").unwrap();
+        fs::write(&issues, b"{\"id\":\"br-1\"}\n").unwrap();
         fs::write(&database, b"sqlite").unwrap();
         fs::write(&unknown, b"unknown").unwrap();
 
@@ -758,9 +764,6 @@ mod tests {
         assert!(!is_material_local_artifact(&issues));
         assert!(is_material_local_artifact(&database));
         assert!(is_material_local_artifact(&unknown));
-
-        fs::write(&issues, b"{\"id\":\"br-1\"}\n").unwrap();
-        assert!(is_material_local_artifact(&issues));
     }
 
     #[test]
