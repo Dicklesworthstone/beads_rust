@@ -139,7 +139,7 @@ walkdir = "2.5"
 insta = { version = "1.48", features = ["json", "yaml"] }
 proptest = "1.11"
 rand = "0.10"
-toml = "=1.1.2"
+toml = "=1.1.4"
 
 [[bench]]
 name = "storage_perf"
