@@ -53,3 +53,9 @@ sync_base.jsonl
 # contributors to accidentally commit upstream issue databases.
 # The JSONL files (issues.jsonl, interactions.jsonl) and config files
 # are tracked by git by default since no pattern above ignores them.
+
+# br fsqlite-ns VFS sidecars — per-machine runtime state, like -wal/-shm.
+# Covers beads.db-fsqlite-ns-{gate,use} and vacuum copies named
+# .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
