@@ -466,7 +466,9 @@ fn render_blocked_rich(
             "No blocked issues",
             Style::new().bold().color(color("green")),
         );
-        console.print_renderable(&text);
+        // `print_text` honors the Text's line ending; `print_renderable`
+        // drops it, collapsing successive records onto one line (#421).
+        console.print_text(&text);
         return;
     }
 
@@ -475,7 +477,7 @@ fn render_blocked_rich(
     header.append_styled("\u{1f6ab} ", Style::new().color(color("red")));
     header.append_styled("Blocked issues", Style::new().bold().color(color("red")));
     header.append_styled(&format!(" ({})", blocked_issues.len()), Style::new().dim());
-    console.print_renderable(&header);
+    console.print_text(&header);
     console.print("");
 
     for bi in blocked_issues {
@@ -509,12 +511,12 @@ fn render_blocked_rich(
         line.append(": ");
         line.append(&title);
         line.append_styled(&format!(" [{} blockers]", blocker_count), count_style);
-        console.print_renderable(&line);
+        console.print_text(&line);
 
         if verbose {
             let mut blocked_label = Text::new("");
             blocked_label.append_styled("  Blocked by:", Style::new().dim());
-            console.print_renderable(&blocked_label);
+            console.print_text(&blocked_label);
 
             for blocker_ref in &bi.blocked_by {
                 let blocker_id = blocker_id_from_ref(blocker_ref);
@@ -542,7 +544,7 @@ fn render_blocked_rich(
                 } else {
                     blocker_line.append_styled(" (not found)", Style::new().dim());
                 }
-                console.print_renderable(&blocker_line);
+                console.print_text(&blocker_line);
             }
         } else {
             let mut detail = Text::new("");
@@ -551,7 +553,7 @@ fn render_blocked_rich(
                 &format!("[{}]", blocked_id_list_text(&bi.blocked_by)),
                 Style::new().color(color("yellow")),
             );
-            console.print_renderable(&detail);
+            console.print_text(&detail);
         }
     }
 }
