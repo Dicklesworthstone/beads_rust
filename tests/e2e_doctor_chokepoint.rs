@@ -1809,6 +1809,7 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().to_path_buf();
