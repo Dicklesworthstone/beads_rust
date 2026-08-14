@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
-use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
+use fastmcp_rust::{Cx, McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
 
 use crate::error::StructuredError;
@@ -1271,6 +1271,19 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .prompt(prompts::PolishBacklogPrompt::new(state))
         .build();
 
-    server.run_transport_returning(StdioTransport::stdio());
+    // The stdio transport observes `cx.is_cancel_requested()` between its
+    // read polls, so translating br's cooperative shutdown flag
+    // (SIGINT/SIGTERM/SIGHUP; see `crate::shutdown`) into a Cx cancellation
+    // lets `br serve` return through `main` and run every destructor (WAL
+    // flush on drop, #270) instead of waiting on transport EOF detection.
+    let serve_cx = Cx::for_request();
+    let watcher_cx = serve_cx.clone();
+    std::thread::spawn(move || {
+        while !crate::shutdown::is_requested() {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        watcher_cx.set_cancel_requested(true);
+    });
+    server.run_transport_returning_with_cx(&serve_cx, StdioTransport::stdio());
     Ok(())
 }
