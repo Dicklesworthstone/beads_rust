@@ -1047,6 +1047,10 @@ const fn should_acquire_startup_write_lock(
     command_needs_write_lock || should_preopen_storage
 }
 
+// The startup gate genuinely composes four independent boolean facts; a
+// struct would only rename them without adding meaning at the single call
+// site.
+#[allow(clippy::fn_params_excessive_bools)]
 const fn startup_database_authority_required(
     no_db: bool,
     ordinary_database_authority_required: bool,
