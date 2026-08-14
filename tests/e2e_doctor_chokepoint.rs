@@ -1869,7 +1869,10 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     );
     assert_eq!(plan_json["eligible"], true);
     assert_eq!(plan_json["from_version"], 14);
-    assert_eq!(plan_json["to_version"], 15);
+    assert_eq!(
+        plan_json["to_version"],
+        beads_rust::storage::schema::CURRENT_SCHEMA_VERSION
+    );
     let token = plan_json["plan_token"]
         .as_str()
         .expect("plan token")
@@ -1906,7 +1909,10 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         .as_str()
         .expect("migration run id")
         .to_string();
-    assert_eq!(db_user_version(&db_path), 15);
+    assert_eq!(
+        db_user_version(&db_path),
+        i64::from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION)
+    );
     let run_dir = root
         .join(".beads/.br_recovery/schema-migrations")
         .join(&run_id);
@@ -1942,7 +1948,10 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         String::from_utf8_lossy(&undo_plan.stdout),
         String::from_utf8_lossy(&undo_plan.stderr)
     );
-    assert_eq!(db_user_version(&db_path), 15);
+    assert_eq!(
+        db_user_version(&db_path),
+        i64::from(beads_rust::storage::schema::CURRENT_SCHEMA_VERSION)
+    );
 
     let undo = br_cmd(&root)
         .args(["doctor", "migrate-schema", "undo", &run_id, "--json"])
