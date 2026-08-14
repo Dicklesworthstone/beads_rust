@@ -15,7 +15,27 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.3.1 -- 2026-08-14 (Release)
+## v0.3.2 -- 2026-08-14 (Release)
+
+Correctness follow-up to the v0.3.1 stabilization tag. The complete
+all-features suite exposed a low-frequency scratch-database open failure under
+high parallel load before v0.3.1 was published, so the immutable fix ships as
+the next patch version rather than rewriting that tag.
+
+### Fixed
+
+- Ephemeral `SqliteStorage::open_memory()` databases now retry a bounded eight
+  times when FrankenSQLite transiently returns `CannotOpen` for br's generated
+  `beads_mem_<pid>_<counter>.db` path. Each failed attempt is fully cleaned and
+  retried with a new unique path; every other error still returns immediately.
+  This closes intermittent `sync --import-only --force` and deterministic merge
+  failures seen only when the full integration matrix opened many scratch
+  databases concurrently.
+- Workspace-evolution failures now include the child command's stdout, stderr,
+  and log path instead of reporting only exit code 2, preserving the evidence
+  needed to distinguish storage failures from assertion failures.
+
+## v0.3.1 -- 2026-08-14 (Tag)
 
 Same-day follow-up to v0.3.0: asupersync moved to 0.4.4, the lockfile was
 refreshed to latest-compatible across the graph, and two load-sensitive
