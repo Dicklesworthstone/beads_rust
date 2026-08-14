@@ -200,7 +200,8 @@ pub fn execute(
 *.db
 *.db-journal
 *.db-shm
-*.db-wal
+# -wal plus fsqlite 0.2+'s -wal-cert / -wal-cert-head durability sidecars
+*.db-wal*
 # fsqlite multi-process namespace sidecars (-fsqlite-ns-gate / -fsqlite-ns-use)
 *.db-fsqlite-*
 
@@ -217,8 +218,8 @@ last-touched
 
 # DB-family recovery artifacts (truncated WAL/SHM, quarantined sidecars)
 # — same lifecycle as .br_history/, written by recovery paths and
-# `br doctor --repair`. Filename suffix `.truncated-wal` slips past the
-# generic `*.db-wal` glob above, so it needs an explicit entry (#271).
+# `br doctor --repair`. Recovery artifacts live under their own directory
+# rather than relying on the database globs above (#271).
 .br_recovery/
 
 # Sync state (local-only, per-machine)
@@ -652,7 +653,10 @@ mod tests {
 
         assert!(content.contains("*.db"));
         assert!(content.contains("*.db-journal"));
-        assert!(content.contains("*.db-wal"));
+        assert!(
+            content.lines().any(|line| line.trim() == "*.db-wal*"),
+            "init must ignore classic WAL files and fsqlite WAL certificate sidecars: {content}"
+        );
         assert!(content.contains("*.db-shm"));
         assert!(
             content.lines().any(|line| line.trim() == ".write.lock"),
