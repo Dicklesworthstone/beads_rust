@@ -40,6 +40,18 @@ release-gate tests were repaired.
 
 ### Fixed
 
+- v0.3.0's `darwin_amd64` release asset (and its `darwin_x86_64` alias)
+  contained an arm64 binary: the local-release pipeline built the Intel slot
+  on an Apple Silicon host without forcing `--target x86_64-apple-darwin`,
+  so Intel Macs downloaded a binary that cannot run. The v0.3.0 assets were
+  rebuilt from the same tag and replaced in place (checksums regenerated,
+  Rosetta-verified), and the release pipeline now pins the cross target for
+  the darwin/amd64 slot. v0.2.22 and earlier were unaffected (CI built them
+  with explicit targets).
+- The installer's `/tmp/br-install.lock` now honors `TMPDIR` (POSIX
+  convention), and the installer test suite plants its deliberately stale
+  lock inside a per-test TMPDIR — parallel installer tests could previously
+  race each other's recovery of the shared planted lock.
 - The concurrent `sync --flush-only` failure-injection scenario now drains
   both subprocesses simultaneously. Previously, inherited verbose dependency
   tracing could fill the lock holder's captured stderr while the harness was
