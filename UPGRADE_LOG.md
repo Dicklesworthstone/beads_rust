@@ -4,7 +4,7 @@
 
 ## Summary
 
-- **Updated:** fsqlite family (15 crates) 0.1.18 → 0.3.1; new direct `asupersync =0.4.3`; 10 minor/patch lockfile bumps | **Skipped:** 2 (with reasons) | **Failed:** 0
+- **Updated:** fsqlite family (15 crates) 0.1.18 → 0.3.1; new direct `asupersync =0.4.3`; FastMCP's asupersync line 0.3.9 → 0.3.10; 11 minor/patch lockfile bumps | **Skipped:** 2 (with reasons) | **Failed:** 0
 
 ## Discovery
 
@@ -28,6 +28,11 @@
 
 - clap 4.6.4 → 4.6.6, clap_complete 4.6.7 → 4.6.9, schemars 1.2.1 → 1.2.2, similar 3.1.1 → 3.1.2 (manifest floors + lock).
 - toml (dev-dependency, exact pin) =1.1.2 → =1.1.4.
+- FastMCP's independent asupersync line 0.3.9 → 0.3.10, including its
+  `franken-{kernel,evidence,decision}` 0.3.10 family and consolidated crypto
+  dependency graph.
+- lru 0.18.1 → 0.18.2 for fsqlite-core/fsqlite-planner, fixing
+  RUSTSEC-2026-0253's panic-safety use-after-free in `LruCache::pop`.
 - Lockfile-only refreshes: thiserror 2.0.20, libc 0.2.189, once_cell 1.21.4, regex 1.13.1, flate2 1.1.9.
 - **Breaking:** none found for this project's usage in any of these lines.
 
@@ -44,6 +49,11 @@
 ## Needs Attention
 
 - `fastmcp-rust`: republish against asupersync 0.4.x will let the `mcp` feature collapse to a single asupersync (tracked informally; sibling checkout already pins =0.4.3 at version 0.3.2, unpublished).
+- `rich_rust 0.2.2` retains lru 0.16.4, which cargo-audit reports under the
+  same informational panic-safety advisory. Its caches use ordinary
+  `String`/`Style` keys rather than caller-provided panicking `Drop` types;
+  upgrading requires a new `rich_rust` release because 0.2.2 constrains lru
+  to the 0.16 line.
 
 ## Validation
 
