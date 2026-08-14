@@ -15,7 +15,24 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
-## v0.3.0 -- 2026-08-14 (Release)
+## v0.3.1 -- 2026-08-14 (Release)
+
+Release-gate correction over the unpublished v0.3.0 stabilization tag.
+
+### Fixed
+
+- The concurrent `sync --flush-only` failure-injection scenario now drains
+  both subprocesses simultaneously. Previously, inherited verbose dependency
+  tracing could fill the lock holder's captured stderr while the harness was
+  synchronously waiting on the losing child, creating a test-only pipe/lock
+  deadlock. The repair was verified with a live GDB backtrace and 50 repeated
+  contention runs.
+- The sync-merge receipt boundary scenario now asserts its actual semantic
+  precondition (`receipt cutoff < tombstone expiry`) instead of requiring an
+  arbitrary five seconds of unused headroom, removing load-sensitive false
+  failures without weakening the post-expiry replay proof.
+
+## v0.3.0 -- 2026-08-14 (Tag)
 
 Storage-engine generation upgrade: FrankenSQLite 0.1.18 → 0.3.1 with the
 asupersync 0.4.3 runtime, plus the accumulated test/lint debt cleanup from
