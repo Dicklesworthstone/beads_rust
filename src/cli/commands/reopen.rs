@@ -205,8 +205,14 @@ fn execute_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<ReopenResult> {
-    let _routed_write_lock =
+    let routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
+    // Reuse the routed authority for the storage open below; acquiring the
+    // same database-family lock from a second descriptor in this process
+    // would self-deadlock until the lock timeout (#409 routed cluster).
+    let mut route_cli = cli.clone();
+    routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
+    let cli = &route_cli;
     let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
     auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
 
