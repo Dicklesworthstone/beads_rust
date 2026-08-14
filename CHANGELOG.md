@@ -17,7 +17,23 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ## v0.3.1 -- 2026-08-14 (Release)
 
-Release-gate correction over the unpublished v0.3.0 stabilization tag.
+Same-day follow-up to v0.3.0: asupersync moved to 0.4.4, the lockfile was
+refreshed to latest-compatible across the graph, and two load-sensitive
+release-gate tests were repaired.
+
+### Dependencies
+
+- asupersync 0.4.3 → 0.4.4 (with its franken-kernel/evidence/decision
+  family). Upstream 0.4.x preserves the 0.4.3 public API; the notable 0.4.4
+  change (spawned-task results surviving cancellation acknowledgement) does
+  not affect br's block_on bridge, which spawns no tasks.
+- Full `cargo update` lockfile refresh: ~45 transitive crates to latest
+  compatible (aho-corasick 1.1.5, aws-lc-rs 1.18, blake3 1.8.6, cc 1.4.3,
+  futures 0.3.34 family, http 1.5, icu 2.3 family, and others). Direct
+  dependencies were already at latest stable (sha2 0.11, rand 0.10,
+  signal-hook 0.4.4, similar 3.1.2); the deliberate holdouts remain
+  self_update (pre-release pin), cap-primitives (=4.0.2 by design), and
+  fastmcp-rust's own asupersync 0.3.10 line (awaiting its 0.4.x republish).
 
 ### Fixed
 
@@ -32,7 +48,7 @@ Release-gate correction over the unpublished v0.3.0 stabilization tag.
   arbitrary five seconds of unused headroom, removing load-sensitive false
   failures without weakening the post-expiry replay proof.
 
-## v0.3.0 -- 2026-08-14 (Tag)
+## v0.3.0 -- 2026-08-14 (Release)
 
 Storage-engine generation upgrade: FrankenSQLite 0.1.18 → 0.3.1 with the
 asupersync 0.4.3 runtime, plus the accumulated test/lint debt cleanup from
