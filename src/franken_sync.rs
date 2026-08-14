@@ -72,9 +72,15 @@ fn drive<T>(future: impl Future<Output = T>) -> T {
 /// refresh, and retries once. Plan-time resolution failures have no side
 /// effects, so the retry is safe.
 fn schema_stale(err: &FrankenError) -> bool {
+    // `SchemaChanged` is the engine's explicit stale-schema-cookie signal
+    // (a plan compiled against a schema image another connection has since
+    // replaced); the upstream error-taxonomy recipe for it is exactly the
+    // re-prepare + single retry this facade already performs for the
+    // name-resolution staleness shapes below.
     matches!(
         err,
-        FrankenError::NoSuchTable { .. }
+        FrankenError::SchemaChanged
+            | FrankenError::NoSuchTable { .. }
             | FrankenError::NoSuchColumn { .. }
             | FrankenError::NoSuchIndex { .. }
     )
@@ -95,6 +101,7 @@ fn retry_busy_recovery<T>(
 ) -> Result<T, FrankenError> {
     const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
     const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+    // ubs:ignore — this monotonic clock bounds retries; it generates no token or randomness.
     let start = std::time::Instant::now();
     let mut backoff = std::time::Duration::from_millis(5);
     loop {
@@ -469,6 +476,11 @@ mod tests {
             .query_row("PRAGMA fsqlite.concurrent_mode")
             .expect("query compat engine mode");
         assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
+    fn schema_changed_enters_the_stale_schema_retry_path() {
+        assert!(schema_stale(&FrankenError::SchemaChanged));
     }
 
     #[test]

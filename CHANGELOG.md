@@ -187,6 +187,18 @@ below.
   libc 0.2.189, once_cell 1.21.4, regex 1.13.1, flate2 1.1.9, lru 0.18.2
   for RUSTSEC-2026-0253). Supersedes Dependabot PR #425.
 
+### Validation
+
+- Full `cargo test --all-features --no-fail-fast` on the release tree:
+  21,490 passed, 0 failed (doctests included), up from 21,415 passed /
+  70 failed at the start of the migration wave.
+- `cargo clippy --all-targets --all-features -- -D warnings` clean
+  (pedantic + nursery at deny); `cargo fmt --check` clean.
+- Repo `.beads` database migrated v15 → v17 through the reviewed
+  `doctor migrate-schema` plan/apply workflow (rehearsed on an isolated
+  copy first; receipts under `.beads/.br_recovery/schema-migrations/`,
+  post-apply integrity verified with both engines).
+
 ---
 
 ## v0.2.22 -- 2026-08-06 (Release)

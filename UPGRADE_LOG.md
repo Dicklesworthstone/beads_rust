@@ -70,5 +70,6 @@
   179/179, `e2e_sync_status_health` 166/166, `e2e_sync_artifacts` 169/169,
   doctor fixture suite 65/65, storage_deps + e2e_relations cycle clusters
   green.
-- Full `cargo test --all-features --no-fail-fast`: final counts recorded in
-  the release notes for v0.3.0.
+- Full `cargo test --all-features --no-fail-fast` on the settled tree:
+  **21,490 passed, 0 failed** across every test binary (doctests included),
+  up from 21,415 passed / 70 failed at the start of the migration wave.
