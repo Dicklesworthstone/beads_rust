@@ -37,8 +37,8 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI
-clap = { version = "4.6.4", features = ["derive", "env", "unstable-ext"] }
-clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
+clap = { version = "4.6.6", features = ["derive", "env", "unstable-ext"] }
+clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
@@ -105,7 +105,7 @@ dunce = "1.0.5"
 once_cell = "1.21"
 regex = "1.13"
 shell-words = "1.1.1"
-similar = "3.1.1"
+similar = "3.1.2"
 tempfile = "3.27"
 unicode-width = "0.2.2"
 
@@ -146,7 +146,7 @@ walkdir = "2.5"
 insta = { version = "1.48", features = ["json", "yaml"] }
 proptest = "1.11"
 rand = "0.10"
-toml = "=1.1.2"
+toml = "=1.1.4"
 
 [[bench]]
 name = "storage_perf"
