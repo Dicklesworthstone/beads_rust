@@ -257,6 +257,12 @@ pub struct PreparedStatement<'conn> {
 }
 
 impl PreparedStatement<'_> {
+    /// Render the compiled program for diagnostics (sync in fsqlite).
+    #[must_use]
+    pub fn explain(&self) -> String {
+        self.inner.explain()
+    }
+
     /// Query, returning all rows.
     pub fn query(&self) -> Result<Vec<Row>, FrankenError> {
         drive(self.inner.query())

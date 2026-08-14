@@ -58,10 +58,12 @@ fsqlite-ast = "0.3.1"
 fsqlite-mvcc = "0.3.1"
 fsqlite-observability = "0.3.1"
 
-# Async runtime driving fsqlite 0.3's async engine API from br's synchronous
-# storage layer (src/franken_sync.rs block_on bridge). fsqlite 0.3.1 requires
-# asupersync >=0.4.3,<0.5; the caret req keeps br in that same family.
-asupersync = "0.4.3"
+# Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
+# completion behind the synchronous `franken_sync::Connection` bridge.
+# Pinned =0.4.3 to match the fsqlite family's asupersync requirement exactly
+# (single asupersync in the graph). default-features = false mirrors fsqlite's
+# own dependency spec.
+asupersync = { version = "=0.4.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
