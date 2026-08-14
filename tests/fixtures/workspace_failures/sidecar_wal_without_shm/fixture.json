@@ -1,8 +1,8 @@
 {
   "name": "sidecar_wal_without_shm",
   "family": "sidecar_mismatch",
-  "description": "The workspace includes a stray WAL sidecar without a matching SHM sidecar or coordinated writer state.",
-  "expected_classification": "degraded",
+  "description": "The workspace includes a FrankenSQLite WAL sidecar without a matching SHM sidecar, the engine's normal process-local WAL-index layout.",
+  "expected_classification": "healthy",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
@@ -14,20 +14,21 @@
     },
     {
       "surface": "doctor",
-      "outcome": "reports_errors"
+      "outcome": "doctor_clean"
     },
     {
       "surface": "doctor --repair",
-      "outcome": "repair_applied"
+      "outcome": "repair_noop"
     },
     {
       "surface": "sync --status",
       "outcome": "status_in_sync"
     }
   ],
-  "source_hint": "Represents the stale or missing sidecar family called out in beads_rust-rsei.2.1.",
+  "source_hint": "Locks the FrankenSQLite 0.3.1 contract that WAL-without-SHM is expected because the WAL index is process-local.",
   "notes": [
-    "The database file itself is healthy so future tests can isolate how startup reacts to sidecar mismatch.",
-    "The WAL payload is intentionally synthetic and small."
+    "The database file itself is healthy and every surface must remain operable.",
+    "Doctor reports the layout as informational and must not quarantine the WAL.",
+    "The opposite SHM-without-WAL layout remains covered by orphan_shm_sidecar as a real degraded mismatch."
   ]
 }

@@ -101,15 +101,17 @@ fn walk_workspace_hashes(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, St
     for entry in fs::read_dir(dir).expect("read_dir") {
         let entry = entry.expect("dir entry");
         let path = entry.path();
-        // Skip the doctor artifact tree and the SQLite write lock — the
-        // lock is a runtime artifact whose existence depends on whether
-        // anything has opened the DB and is not part of the workspace
-        // state we want to round-trip.
+        // Skip the doctor artifact tree and the persistent advisory lock
+        // sidecars — the locks are runtime artifacts whose existence
+        // depends on whether anything has acquired workspace/DB-family
+        // authority (every locking command materializes them lazily and
+        // they are never removed by design; see GH #412) and are not part
+        // of the workspace state we want to round-trip.
         let rel = path.strip_prefix(root).unwrap();
         if rel.starts_with(".doctor") {
             continue;
         }
-        if rel == Path::new(".beads/.write.lock") {
+        if rel.parent() == Some(Path::new(".beads")) && is_runtime_lock_sidecar_name(rel) {
             continue;
         }
         let ft = entry.file_type().expect("file_type");
@@ -120,6 +122,24 @@ fn walk_workspace_hashes(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, St
             out.insert(rel.to_path_buf(), sha256_hex(&bytes));
         }
     }
+}
+
+/// True for the advisory lock sidecars the runtime materializes lazily on
+/// first lock acquisition and intentionally never deletes: `.write.lock`,
+/// `.sync.lock`, and the per-family `.br-db-write-<sha>.lock` /
+/// `.br-jsonl-write-<sha>.lock` authority sidecars (GH #412).
+// The runtime emits these sidecar names as fixed lowercase literals, so
+// exact-case `ends_with` is the correct semantic (clippy would prefer a
+// case-insensitive Path::extension() comparison).
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn is_runtime_lock_sidecar_name(rel: &Path) -> bool {
+    let Some(name) = rel.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == ".write.lock"
+        || name == ".sync.lock"
+        || (name.ends_with(".lock")
+            && (name.starts_with(".br-db-write-") || name.starts_with(".br-jsonl-write-")))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -184,14 +204,20 @@ fn doctor_check<'a>(payload: &'a Value, name: &str) -> &'a Value {
 
 fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
     let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    beads_rust::storage::schema::apply_schema(&conn).expect("apply current schema");
     conn.execute(
-        "CREATE TABLE blocked_issues_cache (
+        "CREATE TABLE IF NOT EXISTS blocked_issues_cache (
             issue_id TEXT PRIMARY KEY,
             blocked_by TEXT NOT NULL,
             blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     )
     .unwrap();
+    // The canonical schema declares blocked_issues_cache.issue_id as a
+    // foreign key into issues(id) and apply_schema enables enforcement on
+    // this connection, so the cache row needs a real parent issue.
+    conn.execute("INSERT INTO issues(id, title) VALUES ('bd-1', 'chokepoint seed issue')")
+        .unwrap();
     conn.execute(&format!(
         "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
          VALUES ('bd-1', '{blocked_by}', '2026-05-01 00:00:00')"

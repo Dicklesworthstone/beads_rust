@@ -1038,8 +1038,12 @@ fn e2e_sync_import_force_preserves_integrity_and_close_works() {
     for sidecar in [
         "beads.db",
         "beads.db-wal",
+        "beads.db-wal-cert",
+        "beads.db-wal-cert-head",
         "beads.db-shm",
         "beads.db-journal",
+        "beads.db-fsqlite-ns-gate",
+        "beads.db-fsqlite-ns-use",
     ] {
         let path = beads_dir.join(sidecar);
         if path.exists() {

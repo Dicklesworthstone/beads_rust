@@ -14,6 +14,19 @@ cd "$target_dir"
 # is not evidence of an orphan.
 export BR_DOCTOR_STALE_LOCK_THRESHOLD_SECS=0
 
+assert_lock_identity_preserved() {
+  [ -f .fixture_lock_identity ] || {
+    echo "ASSERT FAIL[$stage]: missing baseline lock identity" >&2
+    exit 1
+  }
+  expected_identity=$(cat .fixture_lock_identity)
+  actual_identity=$(stat -c '%d:%i' .beads/.write.lock)
+  if [ "$actual_identity" != "$expected_identity" ]; then
+    echo "ASSERT FAIL[$stage]: lock identity changed $expected_identity -> $actual_identity" >&2
+    exit 1
+  fi
+}
+
 case "$stage" in
   detect)
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
@@ -29,9 +42,9 @@ case "$stage" in
     # The classification must come from the probe, not the mtime heuristic.
     echo "$out" | jq -e '
       .checks[] | select(.name == "write_lock")
-      | (.details.reason == "probe_acquired_free" or .details.reason == "probe_would_block_live_holder")
+      | (.details.reason == "probe_acquired_free" or .details.reason == "persistent_advisory_inode")
     ' >/dev/null || {
-      echo "ASSERT FAIL[$stage]: details.reason != probe_acquired_free" >&2
+      echo "ASSERT FAIL[$stage]: write-lock probe reason was not recognized" >&2
       echo "$out" | jq '.checks[] | select(.name == "write_lock") | .details' >&2
       exit 1
     }

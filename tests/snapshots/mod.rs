@@ -403,6 +403,8 @@ impl TextDiff {
 /// Apply normalization with logging of what was changed.
 #[allow(clippy::too_many_lines)]
 fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<String>) {
+    const VCS_STATUS_SENTINEL: &str = "BR_VCS_STATUS_COMMAND_SENTINEL";
+
     let mut normalized = text.to_string();
     let mut log = Vec::new();
 
@@ -444,7 +446,13 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
 
     // 6. Redact issue IDs
     if config.redact_ids && ID_RE.is_match(&normalized) {
+        // `vcs-status` has the same lexical shape as a configurable issue ID,
+        // but it is a stable command name and must remain visible in CLI help
+        // snapshots. Protect it across the deliberately broad legacy ID
+        // redactor rather than weakening ID coverage for letter-only IDs.
+        normalized = normalized.replace("vcs-status", VCS_STATUS_SENTINEL);
         normalized = ID_RE.replace_all(&normalized, "ID-REDACTED").to_string();
+        normalized = normalized.replace(VCS_STATUS_SENTINEL, "vcs-status");
         log.push("issue_ids".to_string());
     }
 

@@ -488,6 +488,12 @@ impl IsolatedDataset {
         &self.root
     }
 
+    /// Upgrade the isolated copy through br's reviewed schema-migration
+    /// workflow. The source dataset remains untouched.
+    pub fn migrate_to_current_schema(&self) -> std::io::Result<()> {
+        migrate_workspace_to_current_schema(&self.root)
+    }
+
     /// Get path to log directory (creates if needed).
     pub fn log_dir(&self) -> PathBuf {
         let dir = self.root.join("test-artifacts");
@@ -508,6 +514,75 @@ impl IsolatedDataset {
     }
 }
 
+/// Upgrade a copied fixture through the public plan/apply workflow.
+pub fn migrate_workspace_to_current_schema(root: &Path) -> std::io::Result<()> {
+    let binary = assert_cmd::cargo::cargo_bin!("br");
+    let plan = std::process::Command::new(binary)
+        .args(["doctor", "migrate-schema", "plan", "--json"])
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .output()?;
+    if !plan.status.success() {
+        let plan_stdout = String::from_utf8_lossy(&plan.stdout);
+        let plan_stderr = String::from_utf8_lossy(&plan.stderr);
+        // Sources below the reviewed-migration floor (schemas before 13) have
+        // no reviewed plan/apply pair, so `plan` refuses outright instead of
+        // reporting an ineligible plan. Surface that refusal as
+        // `ErrorKind::Unsupported` so callers can fall back to the JSONL-only
+        // rebuild contract instead of treating it as a harness failure.
+        if plan_stdout.contains("unsupported source version")
+            || plan_stderr.contains("unsupported source version")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "schema migration plan refused pre-floor source: stdout={plan_stdout} stderr={plan_stderr}"
+                ),
+            ));
+        }
+        return Err(std::io::Error::other(format!(
+            "schema migration plan failed: stdout={plan_stdout} stderr={plan_stderr}"
+        )));
+    }
+    let plan_json: serde_json::Value = serde_json::from_slice(&plan.stdout).map_err(|error| {
+        std::io::Error::other(format!(
+            "schema migration plan emitted invalid JSON ({error}): {}",
+            String::from_utf8_lossy(&plan.stdout)
+        ))
+    })?;
+    if plan_json
+        .get("eligible")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return Ok(());
+    }
+    let token = plan_json
+        .get("plan_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| std::io::Error::other("eligible migration plan omitted plan_token"))?;
+    let apply = std::process::Command::new(binary)
+        .args([
+            "doctor",
+            "migrate-schema",
+            "apply",
+            "--plan-token",
+            token,
+            "--json",
+        ])
+        .current_dir(root)
+        .env("NO_COLOR", "1")
+        .output()?;
+    if !apply.status.success() {
+        return Err(std::io::Error::other(format!(
+            "schema migration apply failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&apply.stdout),
+            String::from_utf8_lossy(&apply.stderr)
+        )));
+    }
+    Ok(())
+}
+
 /// Copy a directory recursively, respecting the sync allowlist.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
@@ -526,7 +601,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
 
         // Skip SQLite sidecars (will be regenerated)
-        if name.ends_with("-wal") || name.ends_with("-shm") || name.ends_with("-journal") {
+        if name.ends_with("-wal")
+            || name.ends_with("-wal-cert")
+            || name.ends_with("-wal-cert-head")
+            || name.ends_with("-shm")
+            || name.ends_with("-journal")
+            || name.ends_with("-fsqlite-ns-gate")
+            || name.ends_with("-fsqlite-ns-use")
+        {
             continue;
         }
 

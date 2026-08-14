@@ -62,7 +62,11 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
 fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
     let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
 
-    require_contains(&workflow, r#"ASSET_VERSION="${GITHUB_REF_NAME#v}""#)?;
+    // The tag may arrive from a tag push (GITHUB_REF_NAME) or the
+    // workflow_dispatch `tag` input; either way the asset version strips
+    // the leading `v` before any file name is built.
+    require_contains(&workflow, r#"TAG="${INPUT_TAG:-$GITHUB_REF_NAME}""#)?;
+    require_contains(&workflow, r#"ASSET_VERSION="${TAG#v}""#)?;
     require_contains(
         &workflow,
         "br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}",
@@ -114,7 +118,11 @@ fn reliability_override_fragment_requires_reason_and_records_summary() -> Result
 
 #[test]
 fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> {
-    let script = release_step_script("Validate required artifacts present")?;
+    // The step reads its version from the `asset_version` step output — a
+    // GitHub expression bash cannot evaluate — so substitute the fixture's
+    // known version before running the fragment.
+    let script = release_step_script("Validate required artifacts present")?
+        .replace("${{ steps.asset_version.outputs.asset_version }}", "9.9.9");
     let fixture = WorkflowFixture::new()?;
     fixture.create_artifacts_dir()?;
     for platform in REQUIRED_PLATFORMS {

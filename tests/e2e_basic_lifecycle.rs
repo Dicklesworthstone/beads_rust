@@ -759,11 +759,38 @@ fn json_stdout_write_failure_exits_with_io_error() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
     let _log =
         common::test_log("e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths");
     let fixture = isolated_workspace_failure_fixture("metadata_custom_paths")
         .expect("metadata_custom_paths fixture");
+    let staged_legacy_db =
+        match common::dataset_registry::migrate_workspace_to_current_schema(&fixture.root) {
+            Ok(()) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                // The checked-in fixture's custom.db predates the reviewed
+                // schema-migration floor (header user_version 4; reviewed plans
+                // exist only for sources 13..=16), so no in-place upgrade path
+                // exists for it. Under the current startup contract an
+                // exactly-missing database beside a live JSONL export is no
+                // longer a fail-closed pending-merge refusal: it auto-rebuilds
+                // at the current schema (commit 23cd3659). Stage the legacy
+                // database aside inside this isolated copy — preserving its
+                // bytes for inspection — so the smoke exercises that supported
+                // JSONL-only path while still proving env-sensitive custom
+                // paths are honored.
+                let legacy_db = fixture.root.join(".beads").join("custom.db");
+                let staged = fixture
+                    .root
+                    .join(".beads")
+                    .join("custom.db.pre-reviewed-schema.bak");
+                fs::rename(&legacy_db, &staged)
+                    .expect("stage pre-floor custom.db aside for JSONL-only rebuild");
+                true
+            }
+            Err(error) => panic!("migrate metadata_custom_paths fixture: {error}"),
+        };
 
     let runner_root = fixture.root.join("ambient-env-smoke");
     fs::create_dir_all(&runner_root).expect("create smoke runner root");
@@ -781,6 +808,23 @@ fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
             ("BR_OUTPUT_FORMAT".to_string(), "json".to_string()),
         ]
     };
+
+    if staged_legacy_db {
+        // `info` reads the database without recovery, so give the JSONL-only
+        // workspace one storage-opening command to auto-rebuild custom.db at
+        // the current schema before the smoke assertions run against it.
+        let rebuild_cmd = run_br_smoke_at_root_with_env(
+            &runner_root,
+            ["sync", "--status"],
+            smoke_env(),
+            "non_hermetic_rebuild_current_schema_from_jsonl",
+        );
+        assert!(
+            rebuild_cmd.status.success(),
+            "JSONL-only auto-rebuild smoke failed: {}",
+            rebuild_cmd.stderr
+        );
+    }
 
     let where_cmd = run_br_smoke_at_root_with_env(
         &runner_root,

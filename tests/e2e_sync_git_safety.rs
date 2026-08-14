@@ -1237,6 +1237,16 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
     if filename.ends_with(".jsonl.tmp") {
         return true;
     }
+    for prefix in [".br-db-write-", ".br-jsonl-write-"] {
+        if let Some(digest) = filename
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(".lock"))
+            && digest.len() == 24
+            && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return true;
+        }
+    }
     if let Some(prefix) = filename.strip_suffix(".tmp")
         && let Some((base, pid)) = prefix.rsplit_once(".jsonl.")
         && !base.is_empty()
@@ -1276,6 +1286,8 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         "db",                 // SQLite database
         "db-journal",         // SQLite rollback journal
         "db-wal",             // SQLite WAL
+        "db-wal-cert",        // fsqlite parallel-WAL durability certificate
+        "db-wal-cert-head",   // fsqlite checkpoint hand-off head
         "db-shm",             // SQLite shared memory
         "db-fsqlite-ns-gate", // fsqlite multi-process namespace gate
         "db-fsqlite-ns-use",  // fsqlite multi-process namespace use-count

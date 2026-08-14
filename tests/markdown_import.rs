@@ -681,14 +681,14 @@ invalid-type:bd-123
         "create_bad_dep",
     );
     assert!(
-        output.status.success(),
-        "create should succeed with warnings"
+        !output.status.success(),
+        "a declared dependency that cannot be materialized must fail (#368)"
     );
     assert!(
-        output
-            .stderr
-            .contains("Issue not found: invalid-type:bd-123"),
-        "expected warning for missing issue id"
+        output.stderr.contains("unresolved dependency")
+            && output.stderr.contains("invalid-type:bd-123"),
+        "expected precise warning for missing dependency: {}",
+        output.stderr
     );
 }
 
@@ -719,10 +719,10 @@ fn test_markdown_import_all_failed_returns_error() {
         !output.status.success(),
         "all-failed markdown import should return an error"
     );
+    let diagnostics = format!("{}{}", output.stdout, output.stderr);
     assert!(
-        output.stderr.contains("failed to create any issues from"),
-        "expected summary failure, got: {}",
-        output.stderr
+        diagnostics.contains("failed to create any issues from"),
+        "expected summary failure, got: {diagnostics}"
     );
 
     let list = run_br(

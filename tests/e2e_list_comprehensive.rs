@@ -1113,19 +1113,24 @@ fn e2e_list_custom_status() {
     let _log = common::test_log("e2e_list_custom_status");
     let (workspace, _ids) = setup_diverse_workspace();
 
-    let list = run_br(
+    // An unknown status value is rejected rather than silently matching
+    // zero issues (#418): a typo must be distinguishable from a genuinely
+    // empty result.
+    let unknown = run_br(
         &workspace,
         ["list", "--status", "invalid_status"],
-        "list_custom_status",
+        "list_unknown_status",
     );
     assert!(
-        list.status.success(),
-        "list with custom status should succeed (custom statuses are allowed)"
+        !unknown.status.success(),
+        "unknown status must be rejected (#418); stdout: {} stderr: {}",
+        unknown.stdout,
+        unknown.stderr
     );
+    let combined = format!("{}{}", unknown.stdout, unknown.stderr);
     assert!(
-        list.stdout.trim().is_empty(),
-        "list with unknown custom status should return an empty plain-text result: {}",
-        list.stdout
+        combined.contains("unknown status"),
+        "rejection should name the unknown status: {combined}"
     );
 }
 

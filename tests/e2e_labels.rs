@@ -798,6 +798,9 @@ fn e2e_harness_label_list_all_real_dataset() {
     // Create isolated copy of beads_rust dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should create isolated beads_rust");
+    isolated
+        .migrate_to_current_schema()
+        .expect("migrate isolated beads_rust dataset");
 
     // Run list-all on the isolated dataset
     let output = Command::new(assert_cmd::cargo::cargo_bin!("br"))
@@ -949,6 +952,9 @@ fn e2e_harness_label_rename_real_dataset() {
     // Create isolated copy of beads_rust dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should create isolated beads_rust");
+    isolated
+        .migrate_to_current_schema()
+        .expect("migrate isolated beads_rust dataset");
 
     // First, list all labels to find one we can rename
     let list_output = Command::new(assert_cmd::cargo::cargo_bin!("br"))

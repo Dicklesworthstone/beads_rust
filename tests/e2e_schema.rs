@@ -875,7 +875,9 @@ fn e2e_robot_docs_guide_text_is_concise() {
     assert!(lines <= 80, "guide should stay concise, got {lines} lines");
     assert!(run.stdout.contains("br capabilities --format json"));
     assert!(run.stdout.contains("br ready --json"));
-    assert!(run.stdout.contains("br never runs git"));
+    // The guide's non-invasiveness promise ("Normal issue and sync paths
+    // never run git. Only an explicit br vcs-status request ...").
+    assert!(run.stdout.contains("never run git"));
 }
 
 #[test]
@@ -930,10 +932,17 @@ fn agent_baseline_snapshots_match_current_binary() {
 
 #[cfg(feature = "self_update")]
 fn compare_agent_baseline_help(workspace: &BrWorkspace) {
-    compare_text_baseline(
-        "help/br_help.txt",
-        &run_success(workspace, ["--help"], "baseline_help"),
-    );
+    let help = run_success(workspace, ["--help"], "baseline_help");
+    // The checked-in baseline records the default feature surface. The
+    // all-features gate adds the optional MCP `serve` command, which is
+    // verified by MCP-specific tests rather than changing this baseline.
+    let help = help
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("serve "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    compare_text_baseline("help/br_help.txt", &help);
     compare_text_baseline(
         "help/br_list_help.txt",
         &run_success(workspace, ["list", "--help"], "baseline_list_help"),
@@ -1241,6 +1250,12 @@ fn normalize_version_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.remove("branch");
         object.remove("commit");
+        if let Some(features) = object.get_mut("features").and_then(Value::as_array_mut) {
+            // Agent baselines intentionally document the default feature
+            // surface. The all-features gate adds MCP independently, just as
+            // it adds the optional `serve` help entry filtered above.
+            features.retain(|feature| feature.as_str() != Some("mcp"));
+        }
         for key in ["build", "rust_version", "target"] {
             if object.contains_key(key) {
                 object.insert(key.to_string(), Value::String(format!("<{key}>")));

@@ -541,6 +541,9 @@ fn e2e_history_restore_with_real_dataset() {
     // Create isolated workspace from real dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should copy beads_rust dataset");
+    isolated
+        .migrate_to_current_schema()
+        .expect("migrate isolated beads_rust dataset");
 
     // Write test summary for debugging
     let _summary_path = isolated.write_summary().expect("write summary");
@@ -618,6 +621,9 @@ fn e2e_history_prune_with_real_dataset() {
     // Create isolated workspace from real dataset
     let isolated = IsolatedDataset::from_dataset(KnownDataset::BeadsRust)
         .expect("should copy beads_rust dataset");
+    isolated
+        .migrate_to_current_schema()
+        .expect("migrate isolated beads_rust dataset");
 
     let workspace = BrWorkspace {
         temp_dir: isolated.temp_dir,

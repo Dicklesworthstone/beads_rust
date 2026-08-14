@@ -112,12 +112,32 @@ fn clear_inherited_br_env(command: &mut std::process::Command) {
     }
 }
 
+/// Resolve the canonical bv install rather than trusting bare PATH order.
+///
+/// Operator machines can carry stray, years-old `bv` binaries earlier in
+/// PATH (a 0.13.0 copy inside a node toolchain bin dir was observed shadowing
+/// the real 0.19.0 install), which fails these goldens with output from a
+/// binary the goldens were never generated against. Mirror the operator's
+/// own shell-function preference order, then fall back to PATH lookup.
+fn bv_program() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .into_iter()
+        .flat_map(|home| {
+            [".local/bin/bv", ".bun/bin/bv", "go/bin/bv", ".cargo/bin/bv"]
+                .into_iter()
+                .map(move |relative| home.join(relative))
+        })
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("bv"))
+}
+
 fn run_bv<I, S>(workspace: &BrWorkspace, args: I) -> BvRun
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = std::process::Command::new("bv");
+    let mut command = std::process::Command::new(bv_program());
     command.current_dir(&workspace.root);
     command.args(args);
     clear_inherited_br_env(&mut command);

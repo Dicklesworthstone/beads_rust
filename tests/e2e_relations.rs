@@ -18,6 +18,67 @@ fn parse_created_id(stdout: &str) -> String {
     id_part.trim().to_string()
 }
 
+/// Inject a two-issue blocking cycle through the synced JSONL.
+///
+/// Every interactive surface (`dep add`, `dep import`) refuses a blocking
+/// cycle at insert time, but a JSONL produced elsewhere can carry one and
+/// `sync --import-only` round-trips it losslessly — that is the graph shape
+/// `br dep cycles` exists to diagnose.
+fn import_blocking_cycle(workspace: &BrWorkspace, issue_a_id: &str, issue_b_id: &str, label: &str) {
+    let flush = run_br(
+        workspace,
+        ["sync", "--flush-only"],
+        &format!("{label}_flush"),
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let jsonl_path = workspace.root.join(".beads").join("issues.jsonl");
+    let raw = fs::read_to_string(&jsonl_path).expect("read exported jsonl");
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut issue: Value = serde_json::from_str(line).expect("parse exported issue row");
+        let id = issue["id"].as_str().expect("issue id").to_string();
+        let counterpart = if id == issue_a_id {
+            Some(issue_b_id)
+        } else if id == issue_b_id {
+            Some(issue_a_id)
+        } else {
+            None
+        };
+        if let Some(depends_on) = counterpart {
+            issue["dependencies"] = serde_json::json!([{
+                "issue_id": id,
+                "depends_on_id": depends_on,
+                "type": "blocks",
+                "created_at": issue["created_at"],
+                "created_by": "cycle-fixture",
+                "metadata": "{}",
+                "thread_id": ""
+            }]);
+            // An unchanged issue row is skipped by the import merge (its
+            // embedded dependencies included), so mark the row updated.
+            issue["updated_at"] = serde_json::json!("2027-01-01T00:00:00Z");
+        }
+        lines.push(serde_json::to_string(&issue).expect("serialize issue row"));
+    }
+    fs::write(&jsonl_path, lines.join("\n") + "\n").expect("write cyclic jsonl");
+
+    let import = run_br(
+        workspace,
+        ["sync", "--import-only"],
+        &format!("{label}_import"),
+    );
+    assert!(
+        import.status.success(),
+        "sync --import-only failed: {} {}",
+        import.stdout,
+        import.stderr
+    );
+}
+
 #[test]
 fn e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it() {
     common::init_test_logging();
@@ -43,34 +104,22 @@ fn e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it() {
     );
     let issue_b_id = parse_created_id(&issue_b.stdout);
 
-    let add_a_b = run_br(
-        &workspace,
-        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
-        "add_a_b_related",
-    );
-    assert!(
-        add_a_b.status.success(),
-        "add A->B failed: {}",
-        add_a_b.stderr
-    );
-    let add_b_a = run_br(
-        &workspace,
-        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
-        "add_b_a_related",
-    );
-    assert!(
-        add_b_a.status.success(),
-        "add B->A failed: {}",
-        add_b_a.stderr
-    );
+    // GH#391: only *blocking* edges participate in cycle detection, and every
+    // interactive surface (`dep add`, `dep import`) refuses a blocking cycle
+    // at insert time, so build the cycle through `sync --import-only` (synced
+    // JSONL deliberately round-trips cyclic graphs losslessly).
+    import_blocking_cycle(&workspace, &issue_a_id, &issue_b_id, "archived_cycle");
 
-    let close_a = run_br(&workspace, ["close", &issue_a_id], "close_a");
+    // Inside a blocking cycle neither member can close normally (each is
+    // blocked by the other), so archiving the cycle requires --force — the
+    // same escape an operator uses on a real workspace.
+    let close_a = run_br(&workspace, ["close", &issue_a_id, "--force"], "close_a");
     assert!(
         close_a.status.success(),
         "close A failed: {}",
         close_a.stderr
     );
-    let close_b = run_br(&workspace, ["close", &issue_b_id], "close_b");
+    let close_b = run_br(&workspace, ["close", &issue_b_id, "--force"], "close_b");
     assert!(
         close_b.status.success(),
         "close B failed: {}",
@@ -157,29 +206,12 @@ fn e2e_dep_cycles_active_cycle_exits_nonzero() {
     );
     let issue_b_id = parse_created_id(&issue_b.stdout);
 
-    // `related` edges can close a cycle without br refusing the edge (only
-    // `blocks` cycles are rejected at insert time), leaving an active cycle the
-    // detector reports.
-    let add_a_b = run_br(
-        &workspace,
-        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
-        "add_a_b_related",
-    );
-    assert!(
-        add_a_b.status.success(),
-        "add A->B failed: {}",
-        add_a_b.stderr
-    );
-    let add_b_a = run_br(
-        &workspace,
-        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
-        "add_b_a_related",
-    );
-    assert!(
-        add_b_a.status.success(),
-        "add B->A failed: {}",
-        add_b_a.stderr
-    );
+    // GH#391: only *blocking* edges participate in cycle detection, and every
+    // interactive surface (`dep add`, `dep import`) refuses a blocking cycle
+    // at insert time. A synced JSONL can still carry one, so build the cycle
+    // through `sync --import-only` — the surface whose data the detector
+    // exists to diagnose.
+    import_blocking_cycle(&workspace, &issue_a_id, &issue_b_id, "active_cycle");
 
     // JSON surface: cycle data preserved AND non-zero exit.
     let json = run_br(&workspace, ["dep", "cycles", "--json"], "cycles_json");

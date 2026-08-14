@@ -58,6 +58,8 @@ fn is_binary(path: &std::path::Path) -> bool {
 
 fn is_transient_sqlite(name: &str) -> bool {
     name.ends_with("-wal")
+        || name.ends_with("-wal-cert")
+        || name.ends_with("-wal-cert-head")
         || name.ends_with("-shm")
         || name.ends_with("-journal")
         // fsqlite's multi-process namespace sidecars are engine-managed and

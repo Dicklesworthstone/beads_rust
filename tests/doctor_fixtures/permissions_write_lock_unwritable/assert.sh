@@ -48,6 +48,8 @@ case "$stage" in
     fi
 
     out=$("$tool_bin" doctor --json 2>/dev/null) || true
+    # The startup error names the lock as "write lock" (pre-#412) or
+    # "workspace write lock" (post-#412 family-authority split); accept both.
     echo "$out" | jq -e '
       .ok == false
       and .workspace_health == "degraded"
@@ -55,7 +57,8 @@ case "$stage" in
         | select(.status == "warn")
         | select(.details.mode_octal == "444")
         | select(.details.finding_id == "fm-state_files-orphaned-write-lock")
-        | select(.details.startup_error | contains("Failed to open write lock")))
+        | select(.details.startup_error
+            | (contains("Failed to open") and contains("write lock"))))
     ' >/dev/null || {
       echo "ASSERT FAIL[$stage]: plain doctor did not emit permissions.write_lock diagnostic" >&2
       echo "$out" | jq '.' >&2
@@ -73,7 +76,7 @@ case "$stage" in
       .ok == false
       and .code == "concurrency_lost"
       and .exit_code == 5
-      and (.detail | contains("Failed to open write lock"))
+      and (.detail | (contains("Failed to open") and contains("write lock")))
     ' "$target_dir/_diag/repair.json" >/dev/null || {
       echo "ASSERT FAIL[$stage]: --repair did not refuse with concurrency_lost" >&2
       cat "$target_dir/_diag/repair.json" >&2

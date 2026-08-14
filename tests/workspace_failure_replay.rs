@@ -23,7 +23,7 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
     let log_dir = root.join("logs");
     fs::create_dir_all(&log_dir).expect("log dir");
 
-    FixtureWorkspace {
+    let fixture = FixtureWorkspace {
         metadata,
         beads_dir,
         workspace: BrWorkspace {
@@ -31,7 +31,236 @@ fn fixture_workspace(name: &str) -> FixtureWorkspace {
             root,
             log_dir,
         },
+    };
+
+    match name {
+        "db_jsonl_disagreement" => prepare_current_db_jsonl_disagreement(&fixture),
+        "duplicate_config_rows" => prepare_current_duplicate_config_rows(&fixture),
+        "journal_sidecar_leftover" => prepare_current_journal_sidecar_leftover(&fixture),
+        "jsonl_conflict_markers" => prepare_current_jsonl_conflict_markers(&fixture),
+        "metadata_custom_paths" => prepare_current_metadata_custom_paths(&fixture),
+        "orphan_shm_sidecar" => prepare_current_orphan_shm_sidecar(&fixture),
+        "orphaned_lock_file" => {
+            prepare_current_database(&fixture, "orphaned_lock_current_schema_import");
+            mark_database_needs_flush(&current_database_path(&fixture));
+        }
+        "sidecar_wal_without_shm" => prepare_current_wal_without_shm(&fixture),
+        _ => {}
     }
+
+    fixture
+}
+
+fn prepare_current_db_jsonl_disagreement(fixture: &FixtureWorkspace) {
+    let jsonl_path = fixture.beads_dir.join("issues.jsonl");
+    let full_jsonl = fs::read_to_string(&jsonl_path).expect("read drift fixture JSONL");
+    let seed_record = full_jsonl
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .expect("drift fixture should contain a seed record");
+
+    // The checked-in fixture predates the reviewed migration floor (schema
+    // 4), so current startup correctly refuses to mutate it. Preserve that
+    // historical family in the ephemeral copy, build a current database from
+    // the seed record through the public import surface, then restore the full
+    // two-record JSONL. The resulting current-schema workspace still carries
+    // the exact DB/JSONL disagreement this fixture exists to exercise.
+    preserve_legacy_database_family(fixture, &current_database_path(fixture));
+
+    let full_backup = fixture.beads_dir.join("issues.fixture-full.jsonl");
+    fs::rename(&jsonl_path, &full_backup).expect("preserve full fixture JSONL");
+    fs::write(&jsonl_path, format!("{seed_record}\n")).expect("write seed-only fixture JSONL");
+
+    import_current_database(fixture, "db_jsonl_disagreement_current_schema_import");
+
+    let seed_backup = fixture.beads_dir.join("issues.fixture-seed.jsonl");
+    fs::rename(&jsonl_path, seed_backup).expect("preserve seed-only fixture JSONL");
+    fs::rename(full_backup, &jsonl_path).expect("restore full drift fixture JSONL");
+    // `sync --status` distinguishes this one-sided disagreement using the
+    // export timestamp as well as the content witness. Rewrite the exact
+    // preserved bytes after the current database is created so the fixture
+    // truthfully presents JSONL as the newer side.
+    fs::write(jsonl_path, full_jsonl).expect("refresh full drift fixture timestamp");
+}
+
+fn prepare_current_duplicate_config_rows(fixture: &FixtureWorkspace) {
+    // The checked-in database is intentionally historical (schema 4), but
+    // the recovery surface under test is duplicate config rows, not an
+    // unsupported schema jump. Rebuild from the fixture's public JSONL, then
+    // inject exactly that higher-level invariant violation into schema 17.
+    preserve_legacy_database_family(fixture, &current_database_path(fixture));
+    import_current_database(fixture, "duplicate_config_rows_current_schema_import");
+
+    let db_path = fixture.beads_dir.join("beads.db");
+    let connection = beads_rust::franken_sync::Connection::open(db_path.display().to_string())
+        .expect("open current duplicate-config fixture database");
+    connection
+        .execute("DELETE FROM config WHERE key = 'issue_prefix'")
+        .expect("clear imported issue prefix");
+    connection
+        .execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'fixture-alt')")
+        .expect("insert first duplicate config row");
+    connection
+        .execute("INSERT INTO config (key, value) VALUES ('issue_prefix', 'workspace')")
+        .expect("insert second duplicate config row");
+    connection
+        .close()
+        .expect("close duplicate-config fixture database");
+}
+
+fn prepare_current_journal_sidecar_leftover(fixture: &FixtureWorkspace) {
+    let db_path = current_database_path(fixture);
+    let journal_path = PathBuf::from(format!("{}-journal", db_path.display()));
+    let mut journal = fs::read(&journal_path).expect("read historical rollback journal fixture");
+    assert!(
+        !journal.is_empty(),
+        "rollback journal fixture must not be empty"
+    );
+
+    prepare_current_database(fixture, "journal_sidecar_current_schema_import");
+    mark_database_needs_flush(&db_path);
+    preserve_generated_artifact(fixture, &journal_path);
+
+    // SQLite's PERSIST commit marker is the first journal byte. A zero byte
+    // makes the retained journal definitively non-hot, so FrankenSQLite can
+    // open the healthy database without mistaking arbitrary garbage for a
+    // crash-recovery authority. Doctor still sees the retained sidecar and
+    // reports the external-interference anomaly this fixture owns.
+    journal[0] = 0;
+    fs::write(journal_path, journal).expect("write non-hot rollback journal fixture");
+}
+
+fn prepare_current_jsonl_conflict_markers(fixture: &FixtureWorkspace) {
+    let jsonl_path = fixture.beads_dir.join("issues.jsonl");
+    let conflict_jsonl = fs::read_to_string(&jsonl_path).expect("read conflict fixture JSONL");
+    let seed_record = conflict_jsonl
+        .lines()
+        .find(|line| line.trim_start().starts_with('{'))
+        .expect("conflict fixture should retain a valid seed record");
+
+    preserve_legacy_database_family(fixture, &current_database_path(fixture));
+    let conflict_backup = fixture.beads_dir.join("issues.fixture-conflict.jsonl");
+    fs::rename(&jsonl_path, &conflict_backup).expect("preserve conflict fixture JSONL");
+    fs::write(&jsonl_path, format!("{seed_record}\n")).expect("write conflict seed JSONL");
+    import_current_database(fixture, "jsonl_conflict_current_schema_import");
+    mark_database_needs_flush(&current_database_path(fixture));
+
+    let seed_backup = fixture.beads_dir.join("issues.fixture-seed.jsonl");
+    fs::rename(&jsonl_path, seed_backup).expect("preserve conflict seed JSONL");
+    fs::rename(conflict_backup, &jsonl_path).expect("restore conflict fixture JSONL");
+    fs::write(jsonl_path, conflict_jsonl).expect("refresh conflict fixture timestamp");
+}
+
+fn prepare_current_metadata_custom_paths(fixture: &FixtureWorkspace) {
+    let db_path = current_database_path(fixture);
+    prepare_current_database(fixture, "metadata_custom_paths_current_schema_import");
+    mark_database_needs_flush(&db_path);
+}
+
+fn prepare_current_orphan_shm_sidecar(fixture: &FixtureWorkspace) {
+    let db_path = current_database_path(fixture);
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let shm = fs::read(&shm_path).expect("read historical orphan SHM fixture");
+
+    prepare_current_database(fixture, "orphan_shm_current_schema_import");
+    mark_database_needs_flush(&db_path);
+    preserve_generated_artifact(
+        fixture,
+        &PathBuf::from(format!("{}-wal", db_path.display())),
+    );
+    preserve_generated_artifact(fixture, &shm_path);
+    fs::write(shm_path, shm).expect("restore orphan SHM fixture");
+}
+
+fn prepare_current_wal_without_shm(fixture: &FixtureWorkspace) {
+    let db_path = current_database_path(fixture);
+    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+    let wal = fs::read(&wal_path).expect("read historical WAL-only fixture");
+
+    prepare_current_database(fixture, "wal_without_shm_current_schema_import");
+    preserve_generated_artifact(
+        fixture,
+        &PathBuf::from(format!("{}-shm", db_path.display())),
+    );
+    preserve_generated_artifact(fixture, &wal_path);
+    fs::write(wal_path, wal).expect("restore WAL-only fixture");
+}
+
+fn prepare_current_database(fixture: &FixtureWorkspace, label: &str) {
+    let db_path = current_database_path(fixture);
+    preserve_legacy_database_family(fixture, &db_path);
+    import_current_database(fixture, label);
+}
+
+fn current_database_path(fixture: &FixtureWorkspace) -> PathBuf {
+    if fixture.metadata.name == "metadata_custom_paths" {
+        fixture.beads_dir.join("custom.db")
+    } else {
+        fixture.beads_dir.join("beads.db")
+    }
+}
+
+fn preserve_legacy_database_family(fixture: &FixtureWorkspace, db_path: &Path) {
+    let legacy_dir = fixture.beads_dir.join(".fixture_legacy_database_family");
+    fs::create_dir_all(&legacy_dir).expect("create legacy fixture directory");
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("fixture database path should have a UTF-8 file name");
+    let sidecar_prefix = format!("{db_name}-");
+    let mut database_family = fs::read_dir(&fixture.beads_dir)
+        .expect("read fixture directory")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name == db_name || name.starts_with(&sidecar_prefix))
+        })
+        .collect::<Vec<_>>();
+    database_family.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in database_family {
+        fs::rename(entry.path(), legacy_dir.join(entry.file_name()))
+            .expect("preserve legacy database family");
+    }
+}
+
+fn preserve_generated_artifact(fixture: &FixtureWorkspace, path: &Path) {
+    if fs::symlink_metadata(path).is_err() {
+        return;
+    }
+    let archive = fixture.beads_dir.join(".fixture_current_import_artifacts");
+    fs::create_dir_all(&archive).expect("create current-import artifact archive");
+    let file_name = path
+        .file_name()
+        .expect("generated fixture artifact should have a file name");
+    fs::rename(path, archive.join(file_name)).expect("preserve current-import artifact");
+}
+
+fn mark_database_needs_flush(db_path: &Path) {
+    let connection = beads_rust::franken_sync::Connection::open(db_path.display().to_string())
+        .expect("open current fixture database for DB-newer witness");
+    connection
+        .execute("DELETE FROM metadata WHERE key = 'needs_flush'")
+        .expect("clear imported needs_flush witness");
+    connection
+        .execute("INSERT INTO metadata (key, value) VALUES ('needs_flush', 'true')")
+        .expect("mark current fixture database newer than JSONL");
+    connection.close().expect("close DB-newer fixture database");
+}
+
+fn import_current_database(fixture: &FixtureWorkspace, label: &str) {
+    let import = run_br(
+        &fixture.workspace,
+        ["sync", "--import-only", "--json"],
+        label,
+    );
+    assert!(
+        import.status.success(),
+        "current-schema fixture import failed: stdout={} stderr={}",
+        import.stdout,
+        import.stderr
+    );
 }
 
 fn parse_stdout_json(run: &BrRun, context: &str) -> Value {
@@ -321,9 +550,14 @@ fn assert_doctor_reliability_audit(fixture: &FixtureWorkspace, context: &str, js
 
     match fixture.metadata.family.as_str() {
         "sidecar_mismatch" => {
+            let sidecar_message = doctor_check(json, "db.sidecars")["message"]
+                .as_str()
+                .unwrap_or("");
             assert!(
-                has_code("sidecar_mismatch") || has_code("database_corrupt"),
-                "{context} should surface sidecar or WAL-corruption diagnostics: {json}"
+                has_code("sidecar_mismatch")
+                    || has_code("database_corrupt")
+                    || sidecar_message.contains("expected for frankensqlite"),
+                "{context} should surface a real sidecar fault or explicitly classify the WAL-only family as expected for FrankenSQLite: {json}"
             );
         }
         "malformed_jsonl" => {

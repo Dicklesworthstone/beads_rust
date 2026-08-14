@@ -3,7 +3,7 @@ source: tests/golden_beads_init.rs
 expression: listing
 ---
 .beads/
-  .gitignore  (938 bytes)
+  .gitignore  (1002 bytes)
   beads.db  [binary]
   config.yaml  (92 bytes)
   issues.jsonl  (0 bytes)

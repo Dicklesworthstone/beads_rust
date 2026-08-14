@@ -868,7 +868,10 @@ fn e2e_vcs_status_reports_non_repo_and_missing_git_without_failing() {
     let missing: Value =
         serde_json::from_str(&extract_json_payload(&missing.stdout)).expect("missing-Git JSON");
     assert_common_contract(&missing, false);
-    assert_eq!(missing["reason"], "git_unavailable", "{missing}");
+    // This workspace was never `git init`ed, so the filesystem marker probe
+    // classifies it as not-a-repository before the (absent) git binary is
+    // ever needed — the more truthful diagnosis of the two (#409).
+    assert_eq!(missing["reason"], "not_git_repository", "{missing}");
 }
 
 #[test]

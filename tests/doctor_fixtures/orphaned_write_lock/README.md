@@ -8,7 +8,7 @@
   advisory flock when the owning fd closes (kill -9/OOM included), so a
   leftover file wedges nothing. A stale-mtime file is only a probe
   candidate: a non-blocking `try_lock` that acquires → `ok`
-  (`probe_acquired_free`); would-block → `ok` (live holder, normal on a
+  (`probe_acquired_free`); would-block → `ok` (`persistent_advisory_inode`, normal on a
   busy workspace); only an unprobeable file warns (`stale_mtime`), and
   the guidance is to investigate holders — never to move the file aside,
   because renaming it while a holder keeps the old inode locked lets the
