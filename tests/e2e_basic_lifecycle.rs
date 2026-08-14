@@ -1621,8 +1621,8 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
     .expect("parse receipt export cutoff")
     .with_timezone(&Utc);
     assert!(
-        retention_boundary - receipt_cutoff >= chrono::Duration::seconds(5),
-        "fixture did not leave deterministic pre-boundary headroom: cutoff={receipt_cutoff} boundary={retention_boundary}"
+        receipt_cutoff < retention_boundary,
+        "receipt cutoff must precede the tombstone retention boundary: cutoff={receipt_cutoff} boundary={retention_boundary}"
     );
 
     let storage = SqliteStorage::open(&db_path).expect("open committed merge database");

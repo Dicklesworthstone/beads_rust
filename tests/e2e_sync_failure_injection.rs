@@ -1502,8 +1502,20 @@ fn cli_sync_flush_concurrent_export_race_serializes_jsonl_sidecars() {
 
     drop(write_lock);
 
-    let output_a = flush_a.wait_with_output().expect("collect first flush");
-    let output_b = flush_b.wait_with_output().expect("collect second flush");
+    // Drain both children concurrently. Either child may win `.write.lock`,
+    // and verbose dependency tracing can fill that winner's captured stderr
+    // before it releases the lock. Sequential `wait_with_output` calls would
+    // then wait on the losing child while leaving the winner's pipe full.
+    let collect_a = thread::spawn(move || flush_a.wait_with_output());
+    let collect_b = thread::spawn(move || flush_b.wait_with_output());
+    let output_a = collect_a
+        .join()
+        .expect("first flush collector panicked")
+        .expect("collect first flush");
+    let output_b = collect_b
+        .join()
+        .expect("second flush collector panicked")
+        .expect("collect second flush");
     artifacts.log("flush_a_stdout", &String::from_utf8_lossy(&output_a.stdout));
     artifacts.log("flush_a_stderr", &String::from_utf8_lossy(&output_a.stderr));
     artifacts.log("flush_b_stdout", &String::from_utf8_lossy(&output_b.stdout));
