@@ -2403,7 +2403,38 @@ fn execute_flush(
         "Exported issues to JSONL"
     );
 
-    // Finalize export (clear dirty flags, update metadata)
+    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
+    // is the new common state future 3-way merges should diff against.
+    // Refresh the merge anchor to match (issue #378): historically only the
+    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
+    // permanently anchor-less and tripping the doctor's
+    // `base_jsonl.missing_post_flush` warning while `br sync --status`
+    // reported "In sync". Skip when the export had per-record errors — a
+    // partial export must not become the merge base. Publish the anchor
+    // BEFORE clearing dirty/export metadata so an anchor publication failure
+    // keeps the workspace dirty and remains recoverable by a later explicit
+    // flush: certifying "In sync" over a stale anchor would hand future
+    // 3-way merges the wrong ancestor. (This fail-closed ordering shipped in
+    // 5414143b alongside the failure-injection coverage; the 77ae88ff
+    // tree-preference merge silently reverted it to the older best-effort
+    // wording while keeping the test.)
+    if !report.has_errors() {
+        refresh_base_snapshot_from_flushed_jsonl_snapshot(
+            export_result.published_source()?,
+            &path_policy.beads_dir,
+        )
+        .map_err(|source| BeadsError::WithContext {
+            context: format!(
+                "Failed to publish the merge anchor {} for the flushed JSONL; \
+                 dirty/export metadata was retained so this flush can be retried",
+                path_policy.beads_dir.join("beads.base.jsonl").display()
+            ),
+            source: Box::new(source),
+        })?;
+    }
+
+    // Finalize export (clear dirty flags, update metadata) only after a
+    // clean export's anchor is durable.
     finalize_export_under_authority(
         storage,
         &export_result,
@@ -2416,27 +2447,6 @@ fn execute_flush(
         source: Box::new(source),
     })?;
     info!("Export complete, cleared dirty flags");
-
-    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
-    // is the new common state future 3-way merges should diff against.
-    // Refresh the merge anchor to match (issue #378): historically only the
-    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
-    // permanently anchor-less and tripping the doctor's
-    // `base_jsonl.missing_post_flush` warning while `br sync --status`
-    // reported "In sync". Skip when the export had per-record errors — a
-    // partial export must not become the merge base. Best-effort: a failed
-    // anchor write must not fail an otherwise durable flush.
-    if !report.has_errors()
-        && let Err(error) = refresh_base_snapshot_from_flushed_jsonl_snapshot(
-            export_result.published_source()?,
-            &path_policy.beads_dir,
-        )
-    {
-        warn!(
-            error = %error,
-            "Failed to refresh merge anchor after flush; `br doctor` may report base_jsonl findings"
-        );
-    }
 
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {
