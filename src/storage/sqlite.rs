@@ -2419,20 +2419,37 @@ impl SqliteStorage {
     /// Returns an error if the connection cannot be established.
     pub fn open_memory() -> Result<Self> {
         static MEM_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let count = MEM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
+        const OPEN_ATTEMPTS: usize = 8;
+        const BACKOFF_CAP: Duration = Duration::from_millis(100);
 
-        // Build the storage on a fallible path so that any failure after the
-        // file has been created still removes it (the partial `Connection` /
-        // file would otherwise be orphaned without a live `Drop` to clean it).
-        match Self::build_memory(&path) {
-            Ok(storage) => Ok(storage),
-            Err(e) => {
-                remove_temp_db_files(&path);
-                Err(e)
+        let mut backoff = Duration::from_millis(2);
+        for attempt in 0..OPEN_ATTEMPTS {
+            let count = MEM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("beads_mem_{}_{}.db", std::process::id(), count));
+
+            // Build the storage on a fallible path so that any failure after
+            // the file has been created still removes it (the partial
+            // `Connection` / file would otherwise be orphaned without a live
+            // `Drop` to clean it).
+            match Self::build_memory(&path) {
+                Ok(storage) => return Ok(storage),
+                Err(error) => {
+                    remove_temp_db_files(&path);
+                    let retryable = matches!(
+                        &error,
+                        BeadsError::Database(FrankenError::CannotOpen { .. })
+                    );
+                    if !retryable || attempt + 1 == OPEN_ATTEMPTS {
+                        return Err(error);
+                    }
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                }
             }
         }
+
+        unreachable!("the bounded scratch-database open loop always returns")
     }
 
     fn build_memory(path: &Path) -> Result<Self> {

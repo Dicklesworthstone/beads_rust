@@ -2458,8 +2458,16 @@ fn execute_workspace_evolution_command(
 
     if !matched_expectation {
         return Err(std::io::Error::other(format!(
-            "workspace evolution step `{}` expected {:?}, got exit {}",
-            command.command.label, command.expected, result.exit_code
+            "workspace evolution step `{}` expected {:?}, got exit {}\n\
+             stdout:\n{}\n\
+             stderr:\n{}\n\
+             command log: {}",
+            command.command.label,
+            command.expected,
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+            result.log_path.display()
         )));
     }
 
