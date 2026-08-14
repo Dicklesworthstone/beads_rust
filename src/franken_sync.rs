@@ -3,7 +3,7 @@
 //! fsqlite 0.2 made every engine entry point `async` with `!Send` futures
 //! (the engine is `Rc<RefCell<..>>` internally; it was already `!Send` at
 //! 0.1.x — only the call shape changed), and fsqlite 0.3 moved the runtime
-//! family to asupersync 0.4.3. br's storage layer is fully synchronous, so
+//! family to asupersync 0.4.4. br's storage layer is fully synchronous, so
 //! this module preserves the pre-0.2 blocking call shape by driving each
 //! engine future to completion on the calling thread with a private
 //! current-thread `asupersync` runtime (the proven sqlmodel/cass
