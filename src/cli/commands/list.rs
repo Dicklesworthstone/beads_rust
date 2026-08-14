@@ -69,6 +69,7 @@ fn execute_inner(
 
     // Build filter from args
     let mut filters = build_filters(args)?;
+    validate_status_filter(&filters, storage, &storage_ctx.paths.beads_dir)?;
     let client_filters = needs_client_filters(args);
 
     // Determine output format early so we know whether to run a count query.
@@ -432,6 +433,60 @@ fn issue_with_batched_relation_metadata(
         dependency_count,
         dependent_count,
     }
+}
+
+/// Reject status filter values that no surface of this workspace knows about.
+///
+/// `Status::from_str` never fails — unknown values become `Status::Custom` so
+/// policy-configured workflow statuses keep working. Without this check a
+/// typo like `--status zzzz` silently matches zero issues with exit code 0,
+/// indistinguishable from a genuinely empty result (#418). A custom status is
+/// accepted when the workflow policy declares it or when at least one issue
+/// in the database currently carries it.
+fn validate_status_filter(
+    filters: &ListFilters,
+    storage: &crate::storage::SqliteStorage,
+    beads_dir: &std::path::Path,
+) -> Result<()> {
+    let Some(statuses) = filters.statuses.as_ref() else {
+        return Ok(());
+    };
+    let customs: Vec<&str> = statuses
+        .iter()
+        .filter_map(|status| match status {
+            Status::Custom(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .collect();
+    if customs.is_empty() {
+        return Ok(());
+    }
+    let mut known: HashSet<String> = crate::close_policy::load_for_beads_dir(beads_dir)?
+        .workflow
+        .statuses
+        .iter()
+        .map(|status| status.to_lowercase())
+        .collect();
+    known.extend(
+        storage
+            .distinct_statuses()?
+            .iter()
+            .map(|status| status.to_lowercase()),
+    );
+    for custom in customs {
+        if !known.contains(&custom.to_lowercase()) {
+            return Err(BeadsError::Validation {
+                field: "status".to_string(),
+                reason: format!(
+                    "unknown status '{custom}'. Built-in statuses: open, in_progress, \
+                     blocked, deferred, draft, closed, tombstone, pinned. Custom statuses \
+                     must be declared in .beads/policy.yaml (workflow.statuses) or exist \
+                     on at least one issue. Use --status all to include every status"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Convert CLI args to storage filter.

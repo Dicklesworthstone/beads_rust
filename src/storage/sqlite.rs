@@ -8537,6 +8537,23 @@ impl SqliteStorage {
         self.count_default_visible_text_groups("status", "status")
     }
 
+    /// Every status value currently present in the issues table, including
+    /// custom workflow statuses and terminal states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn distinct_statuses(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query("SELECT DISTINCT status FROM issues ORDER BY status")?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Count default-visible issues grouped by issue type.
     ///
     /// # Errors
