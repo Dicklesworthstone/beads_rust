@@ -27,7 +27,7 @@ use crate::sync::{
     validate_sync_path, validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
-use fsqlite::{Connection, Row};
+use crate::franken_sync::{Connection, Row};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -13479,7 +13479,7 @@ mod tests {
     use crate::storage::SqliteStorage;
     use assert_cmd::Command as AssertCommand;
     use chrono::Utc;
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

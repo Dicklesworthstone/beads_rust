@@ -42,21 +42,26 @@ clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.18"
-fsqlite-types = "0.1.18"
-fsqlite-error = "0.1.18"
-fsqlite-core = "0.1.18"
-fsqlite-func = "0.1.18"
-fsqlite-vdbe = "0.1.18"
-fsqlite-vfs = "0.1.18"
-fsqlite-pager = "0.1.18"
-fsqlite-parser = "0.1.18"
-fsqlite-planner = "0.1.18"
-fsqlite-wal = "0.1.18"
-fsqlite-btree = "0.1.18"
-fsqlite-ast = "0.1.18"
-fsqlite-mvcc = "0.1.18"
-fsqlite-observability = "0.1.18"
+fsqlite = "0.3.1"
+fsqlite-types = "0.3.1"
+fsqlite-error = "0.3.1"
+fsqlite-core = "0.3.1"
+fsqlite-func = "0.3.1"
+fsqlite-vdbe = "0.3.1"
+fsqlite-vfs = "0.3.1"
+fsqlite-pager = "0.3.1"
+fsqlite-parser = "0.3.1"
+fsqlite-planner = "0.3.1"
+fsqlite-wal = "0.3.1"
+fsqlite-btree = "0.3.1"
+fsqlite-ast = "0.3.1"
+fsqlite-mvcc = "0.3.1"
+fsqlite-observability = "0.3.1"
+
+# Async runtime driving fsqlite 0.3's async engine API from br's synchronous
+# storage layer (src/franken_sync.rs block_on bridge). fsqlite 0.3.1 requires
+# asupersync >=0.4.3,<0.5; the caret req keeps br in that same family.
+asupersync = "0.4.3"
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }

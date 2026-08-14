@@ -6,7 +6,7 @@
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{TimeZone, Utc};
-use fsqlite::Connection;
+use beads_rust::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use insta::assert_snapshot;
 use serde_json::Value;

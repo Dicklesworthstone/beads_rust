@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::format::sanitize_terminal_inline;
 use crate::output::OutputContext;
 use crate::util::parse_id;
-use fsqlite::Connection;
+use crate::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde::Serialize;

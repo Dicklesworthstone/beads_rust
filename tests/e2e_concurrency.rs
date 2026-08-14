@@ -11,7 +11,7 @@ mod common;
 
 use assert_cmd::Command;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
-use fsqlite::Connection;
+use beads_rust::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};

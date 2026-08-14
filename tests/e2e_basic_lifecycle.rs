@@ -11,7 +11,7 @@ use common::cli::{
 };
 use common::isolated_workspace_failure_fixture;
 #[cfg(target_os = "linux")]
-use fsqlite::Connection;
+use beads_rust::franken_sync::Connection;
 #[cfg(target_os = "linux")]
 use fsqlite_types::SqliteValue;
 use serde_json::Value;

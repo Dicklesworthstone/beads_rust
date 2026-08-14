@@ -34,6 +34,7 @@ pub mod config;
 pub mod coordination;
 pub mod error;
 pub mod format;
+pub mod franken_sync;
 pub mod health;
 pub mod inheritance;
 pub mod logging;

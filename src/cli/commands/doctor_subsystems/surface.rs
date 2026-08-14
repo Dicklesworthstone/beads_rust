@@ -1011,7 +1011,7 @@ fn restore_one(
 /// All snapshots inside ONE record are replayed inside ONE transaction
 /// so the restore is atomic across tables.
 fn restore_db_exec(repo_root: &Path, record: &StoredActionRecord, target: PathBuf) -> UndoStep {
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
 
     if record.db_snapshots.is_empty() {
         return UndoStep {
@@ -1145,7 +1145,7 @@ fn validate_db_snapshot_envelopes(
 }
 
 fn replay_db_snapshot_envelopes(
-    conn: &fsqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     envelopes: &[DbSnapshotEnvelope],
 ) -> std::result::Result<(), String> {
     for env in envelopes {
@@ -1156,7 +1156,7 @@ fn replay_db_snapshot_envelopes(
 }
 
 fn delete_db_snapshot_region(
-    conn: &fsqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     env: &DbSnapshotEnvelope,
 ) -> std::result::Result<(), String> {
     let predicate = env.predicate.as_deref().unwrap_or("").trim();
@@ -1172,7 +1172,7 @@ fn delete_db_snapshot_region(
 }
 
 fn insert_db_snapshot_rows(
-    conn: &fsqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     env: &DbSnapshotEnvelope,
 ) -> std::result::Result<(), String> {
     use fsqlite_types::value::SqliteValue;
@@ -1205,7 +1205,7 @@ fn insert_db_snapshot_rows(
 }
 
 fn finish_db_replay(
-    conn: fsqlite::Connection,
+    conn: crate::franken_sync::Connection,
     record: &StoredActionRecord,
     replay_result: std::result::Result<(), String>,
 ) -> UndoStep {

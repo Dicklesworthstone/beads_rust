@@ -34,7 +34,7 @@ use assert_cmd::Command;
 use beads_rust::cli::commands::doctor_subsystems::mutate::{
     Capabilities, DbArg, MutateContext, Op, mutate,
 };
-use fsqlite::Connection;
+use beads_rust::franken_sync::Connection;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;

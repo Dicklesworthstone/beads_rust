@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
-use fsqlite::Connection;
-use fsqlite::compat::{OpenFlags, open_with_flags};
+use crate::franken_sync::Connection;
+use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

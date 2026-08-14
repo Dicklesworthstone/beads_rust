@@ -42,7 +42,7 @@ use beads_rust::util::hex_encode;
 use chrono::Utc;
 use common::binary_discovery::discover_binaries;
 use common::dataset_registry::KnownDataset;
-use fsqlite::Connection;
+use beads_rust::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

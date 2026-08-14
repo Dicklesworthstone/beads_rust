@@ -38,14 +38,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "aead"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1973cfbc1a2daf9cf550e74e1f088c28e7f7d8c1e1418fb6c9dc5184b7e84c99"
+dependencies = [
+ "crypto-common 0.2.2",
+ "inout 0.2.2",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
- "cipher",
+ "cipher 0.4.4",
  "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8eb277bec05f56a0e0591f155a484cbd0f4f07ff2905051a48c72f004f7ed58"
+dependencies = [
+ "cipher 0.5.2",
+ "cpubits",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -54,11 +75,25 @@ version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "831010a0f742e1209b3bcea8fab6a8e149051ba6099432c8cb2cc117dec3ead1"
 dependencies = [
- "aead",
- "aes",
- "cipher",
- "ctr",
- "ghash",
+ "aead 0.5.2",
+ "aes 0.8.4",
+ "cipher 0.4.4",
+ "ctr 0.9.2",
+ "ghash 0.5.1",
+ "subtle",
+]
+
+[[package]]
+name = "aes-gcm"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
+dependencies = [
+ "aead 0.6.1",
+ "aes 0.9.2",
+ "cipher 0.5.2",
+ "ctr 0.10.1",
+ "ghash 0.6.0",
  "subtle",
 ]
 
@@ -217,24 +252,23 @@ version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe"
 dependencies = [
- "aes-gcm",
- "asupersync-macros",
- "base64",
+ "aes-gcm 0.10.3",
+ "asupersync-macros 0.3.9",
+ "base64 0.22.1",
  "bincode-next",
- "chacha20poly1305",
+ "chacha20poly1305 0.10.1",
  "crc32fast",
  "crossbeam-deque",
  "crossbeam-queue",
- "franken-decision",
- "franken-evidence",
- "franken-kernel",
+ "franken-decision 0.3.9",
+ "franken-evidence 0.3.9",
+ "franken-kernel 0.3.9",
  "futures-lite",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",
  "hex",
  "hkdf",
  "hmac 0.13.0",
- "io-uring",
  "js-sys",
  "libc",
  "memchr",
@@ -271,6 +305,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "asupersync"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b5c1591494d83c382a0ac874d35748fcae8d61b572706ac54d52eedb56f5c30"
+dependencies = [
+ "aes-gcm 0.11.0",
+ "asupersync-macros 0.4.3",
+ "base64 0.23.1",
+ "bincode-next",
+ "chacha20poly1305 0.11.0",
+ "crc32fast",
+ "crossbeam-queue",
+ "franken-decision 0.4.3",
+ "franken-evidence 0.4.3",
+ "franken-kernel 0.4.3",
+ "futures-lite",
+ "getrandom 0.4.3",
+ "hashbrown 0.17.1",
+ "hex",
+ "hmac 0.13.0",
+ "js-sys",
+ "libc",
+ "memchr",
+ "nix",
+ "nkeys",
+ "parking_lot",
+ "pin-project",
+ "polling",
+ "prost",
+ "rmp-serde",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "signal-hook 0.4.4",
+ "slab",
+ "smallvec",
+ "socket2",
+ "subtle",
+ "sysinfo",
+ "tempfile",
+ "thiserror",
+ "unicode-normalization",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "windows-sys 0.61.2",
+ "xattr",
+ "zeroize",
+]
+
+[[package]]
 name = "asupersync-macros"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -279,6 +366,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "asupersync-macros"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b13b28681c37cd5db603b5868be85a67cd4a1c39d09842eee66e60a254830c15"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -338,6 +436,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -349,6 +453,7 @@ version = "0.2.22"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "asupersync 0.4.3",
  "cap-primitives",
  "chrono",
  "clap",
@@ -498,6 +603,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -642,7 +748,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
 dependencies = [
  "cfg-if",
- "cipher",
+ "cipher 0.4.4",
  "cpufeatures 0.2.17",
 ]
 
@@ -653,6 +759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d524456ba66e72eb8b115ff89e01e497f8e6d11d78b70b1aa13c0fbd97540a81"
 dependencies = [
  "cfg-if",
+ "cipher 0.5.2",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
 ]
@@ -663,11 +770,23 @@ version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
 dependencies = [
- "aead",
+ "aead 0.5.2",
  "chacha20 0.9.1",
- "cipher",
- "poly1305",
+ "cipher 0.4.4",
+ "poly1305 0.8.0",
  "zeroize",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead 0.6.1",
+ "chacha20 0.10.1",
+ "cipher 0.5.2",
+ "poly1305 0.9.1",
 ]
 
 [[package]]
@@ -718,8 +837,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common 0.1.7",
- "inout",
+ "inout 0.1.4",
  "zeroize",
+]
+
+[[package]]
+name = "cipher"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
+dependencies = [
+ "block-buffer 0.12.1",
+ "crypto-common 0.2.2",
+ "inout 0.2.2",
 ]
 
 [[package]]
@@ -908,6 +1038,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpubits"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,7 +1198,9 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
+ "getrandom 0.4.3",
  "hybrid-array",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1071,7 +1209,16 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
- "cipher",
+ "cipher 0.4.4",
+]
+
+[[package]]
+name = "ctr"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baaca1c4b237092596f64d571e9db6ce4109c4ef9742e27590f1709594461f21"
+dependencies = [
+ "cipher 0.5.2",
 ]
 
 [[package]]
@@ -1330,6 +1477,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -1454,7 +1602,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1484,7 +1632,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc16031e7043c93f6e842fdbc12e8a964b3a0f3211b32e81db880a249ec8dd49"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.9",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1520,7 +1668,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4edda6aeb1e22dc7d2fd9efc217707703d901bfc2bfcf74009fa9a118a535ca1"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.9",
  "log",
  "serde",
  "serde_json",
@@ -1543,7 +1691,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00336699203935ff5790d08d2968a90eecf0e2437c1dd5d67b327f522df7162a"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "fastmcp-core",
  "regex",
  "serde",
@@ -1556,7 +1704,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d59b34628877ed2537237774b8429ea9498c30d421760ac5235176c1e79fba7a"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.9",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-derive",
@@ -1573,8 +1721,8 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88118d8b23da59e23582d6effc2f595e762ddf50f0fecb971982cca2ba609b9a"
 dependencies = [
- "asupersync",
- "base64",
+ "asupersync 0.3.9",
+ "base64 0.22.1",
  "chrono",
  "fastmcp-client",
  "fastmcp-console",
@@ -1595,7 +1743,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9bbd0cd007bf11dd69f1553f19ffec962531cb19be36d087f8b79b04234592"
 dependencies = [
- "asupersync",
+ "asupersync 0.3.9",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.4.3",
@@ -1684,8 +1832,19 @@ version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "763ba284c68c173e3c5b3147b214bd115c1be55bc04f79738027b2a9a5037eb0"
 dependencies = [
- "franken-evidence",
- "franken-kernel",
+ "franken-evidence 0.3.9",
+ "franken-kernel 0.3.9",
+ "serde",
+]
+
+[[package]]
+name = "franken-decision"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4821cef9dc50a45fa2b26df2d870d7740cfa3cb9c2cc710c9fb27427b9bd5a36"
+dependencies = [
+ "franken-evidence 0.4.3",
+ "franken-kernel 0.4.3",
  "serde",
 ]
 
@@ -1700,10 +1859,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "franken-evidence"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24b72f93a1034d50cf79842adc07c25f7500f3beb48b916fc53554a36c94ad7a"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "franken-kernel"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7cd75f374e2b7ba2316b3c11987b410ba0487211d5d868ade5f66bb7a6d3cb2"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "franken-kernel"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2d195e41be1387e7e9eecf85cd04159f9ce627d816ce8775b29a7ee8784ccc5"
 dependencies = [
  "serde",
 ]
@@ -1727,10 +1905,11 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsqlite"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f435691003b177a1a0d68bb81728de5e87c1de00ae47547fbc7e3a25a4f4d2ff"
+checksum = "b39c43fac86ad6354ec1db9fac96b5dbac6caca3811f39a0acf8bf10cd1df5a2"
 dependencies = [
+ "asupersync 0.4.3",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-ext-fts5",
@@ -1739,22 +1918,24 @@ dependencies = [
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
+ "tracing",
 ]
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe8b28d4404f5baa18a653d8f96f988044c42d854599d80ac278218649479446"
+checksum = "41389cd0a521f48a80f6965878bc559c8671011ab7dd6e1c39f8b7e115311ff5"
 dependencies = [
  "fsqlite-types",
+ "smallvec",
 ]
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce11c03e70c66d71c93f92c9aaf7f44b41c54f3a48756eb71f6be5623f8aef98"
+checksum = "aaebf438829768fd48bc7c0587e1e1c9d14a64e8b6413d009cd16dc7029c763d"
 dependencies = [
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -1770,11 +1951,11 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe3a07e669a99db9a7ae5283e1e45a9fd1307a159721c5596e7ef52641c0b89"
+checksum = "8a0a0ef2ded9d5d4ad518ed04667bb70692a1add132451667fc165cb2bb6b620"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "foldhash 0.2.0",
  "fsqlite-ast",
@@ -1808,18 +1989,18 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2875c9829b5f5007d2b272bdb885cc8f5162d2dbb40b723da403e46850d9f09d"
+checksum = "befedcf60e8ce70cbd5c22ed4a1ce2c031b57c8dcd998ff694b5aeab8d20d1d3"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb5bd22a07903516af039311605f0e1adcdf3457501365d2818ea45f27186e61"
+checksum = "f98d9fc7110113c5ac3a48982aeccec3322cfba92f613423c58b8bbad054a0fe"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1830,9 +2011,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4b5e6b9a3ac7167a6b745a91366d16ce54b69ed272de20c9fe7920c8d8a2a8a"
+checksum = "a6b4df52079b451252d20a0259edc2fbdfde4df3becf0c98fe675345f88b7d2b"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1842,9 +2023,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76a5044ec7596a659e479f73cbea805db0ad2942f79b3771a2d96c1e65b65ec8"
+checksum = "dbce0c78222feff76722460a3df776c2aabc452cf9ece1f671e8d6e29d181b4c"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1855,9 +2036,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58f39c4df9a23d234abc1c2d503feaa2325ae6eb2dc6502269a77a8ff4daf644"
+checksum = "2f5f5e22ad252ad5f5f9550cc00c833839960f89b93177ff19fa742d81f4d0d5"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1869,9 +2050,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2414ea06788926be6dbd389b803c8f34c16a8678a0cf9f3f51bfd4c8d3225f57"
+checksum = "d726ac8e2903d8215ae1d56fd631d4d578e47423e4f7a8d045a75953f7b24716"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1880,9 +2061,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2911c4b35d57a21aeb1f7d1a393cc8b35f463ccc837a9b23bf4c41c041fff628"
+checksum = "f2edbc24fa6502085f37de75ab9a087b2d755a2104111349f52844db8d07bf53"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1892,11 +2073,11 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a07bd0b4bc84e5ad1d3ab58481f1a77be3691aaf497e5e0ff4ca0853e29775b3"
+checksum = "6bc0cfb1467a6c61b0e1f66398214f565ac25c88924a48c198807ea3a63670b3"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "crc32c",
  "crossbeam-epoch",
@@ -1911,15 +2092,16 @@ dependencies = [
  "parking_lot",
  "serde",
  "smallvec",
+ "thiserror",
  "tracing",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c10003d6b84ff417bfa216806fa36277b4f7007d239a57d7087584d4ebb50fb"
+checksum = "f8bec974a12173e056a660a31b8d6700baa64cf49f0ad22a1636577362a6d5c5"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1929,14 +2111,15 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f17019166d79696465658d2b51e14e47fc59ef502f8d8593d6ce8bd3917dcaa6"
+checksum = "a62c6812e99b77538d493285d0c7323cd38f6c78e1ccff5e07ae5e77ddaad7c1"
 dependencies = [
  "argon2",
+ "asupersync 0.4.3",
  "blake3",
  "bumpalo",
- "chacha20poly1305",
+ "chacha20poly1305 0.11.0",
  "dashmap",
  "foldhash 0.2.0",
  "fsqlite-error",
@@ -1953,9 +2136,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "080519d9a421b58a2257a63ba46c5ff4a060b7e717c09c6eb0fb90032f7cff7a"
+checksum = "83373fbe1e30e6640619e2eed49e8d725013f654e432df94aa5d44cc4df67840"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1967,9 +2150,9 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5c5d875aa5a8116769ab1186a45fcdc5c61a4cbe4cefb7f682de78bef01da82"
+checksum = "7898513a55fc66158996a05c4737186ca140a4b903ab26a8a177e787677664bc"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1985,11 +2168,11 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14da6afaa2a35ee502ee2aae343aa1f53fec9250410ec6443f95570307f2f3e9"
+checksum = "77505eee79afadeac6db6ca6a2bf7f9b54789b131014779f8161641c0358ef17"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "bitflags 2.13.1",
  "blake3",
  "fsqlite-error",
@@ -2005,11 +2188,11 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20c2fba6081e82c9ed5066897c52ef334b982a058124b53c00e43f671372bb85"
+checksum = "4ef287d462897c1d56067c829ad66abd0173f6d89ec877568c9232877b87889e"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -2028,18 +2211,18 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd9bbb8f5b935d4d8787ece931272be36a47ee613ed753fbf967534e4d6c333a"
+checksum = "1584984a84a08e6d5461a64d2be769f4a82ebf48875c4c46fda0bb5e00d6931c"
 dependencies = [
  "advisory-lock",
- "asupersync",
+ "asupersync 0.4.3",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
+ "io-uring",
  "libc",
  "nix",
- "pollster",
  "smallvec",
  "tracing",
  "windows-sys 0.61.2",
@@ -2047,11 +2230,11 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.1.19"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66e6018d5d1dfc1b74fe91db09223353c5b77dc2d8897e9c61fd176e144e9df9"
+checksum = "309fbee02289fac914450d6ca6f3f445a535cf243c27fd21bc4d7013e24b9f3c"
 dependencies = [
- "asupersync",
+ "asupersync 0.4.3",
  "blake3",
  "crc32c",
  "fsqlite-error",
@@ -2191,7 +2374,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
- "polyval",
+ "polyval 0.6.2",
+]
+
+[[package]]
+name = "ghash"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2eecf2d5dc9b66b732b97707a0210906b1d30523eb773193ab777c0c84b3e8d5"
+dependencies = [
+ "polyval 0.7.3",
 ]
 
 [[package]]
@@ -2903,7 +3095,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a791e6620676a875f362f3156ed213e73ca099a09bf992c18812abe65cc37b1"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3996,7 +4188,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -4185,6 +4377,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "inout"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
+dependencies = [
+ "hybrid-array",
 ]
 
 [[package]]
@@ -4810,7 +5011,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4969,12 +5170,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pollster"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
-
-[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4982,7 +5177,17 @@ checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
 dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
- "universal-hash",
+ "universal-hash 0.5.1",
+]
+
+[[package]]
+name = "poly1305"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
+dependencies = [
+ "cpufeatures 0.3.0",
+ "universal-hash 0.6.1",
 ]
 
 [[package]]
@@ -4994,7 +5199,18 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "opaque-debug",
- "universal-hash",
+ "universal-hash 0.5.1",
+]
+
+[[package]]
+name = "polyval"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0fa31d631f2b2cb2a544d0aa321ce847a94764d701ca2becc411138b93d49cd"
+dependencies = [
+ "cpubits",
+ "cpufeatures 0.3.0",
+ "universal-hash 0.6.1",
 ]
 
 [[package]]
@@ -5224,7 +5440,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5446,7 +5662,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -5569,7 +5785,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5638,7 +5854,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6215,10 +6431,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6625,6 +6841,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "universal-hash"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4987bdc12753382e0bec4a65c50738ffaabc998b9cdd1f952fb5f39b0048a96"
+dependencies = [
+ "crypto-common 0.2.2",
+ "ctutils",
+]
+
+[[package]]
 name = "unsafe-libyaml-norway"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6648,7 +6874,7 @@ version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "cookie_store",
  "encoding_rs",
  "flate2",
@@ -6670,7 +6896,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e994ba84b0bd1b1b0cf92878b7ef898a5c1760108fe7b6010327e274917a808c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "http",
  "httparse",
  "log",
@@ -6990,7 +7216,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7382,7 +7608,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a55ebb27e67d9a9d116dd3a19637ee8cc0570c8ef816fb504c453f15448c99"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "ed25519-dalek",
  "thiserror",
 ]
@@ -7416,83 +7642,3 @@ dependencies = [
  "log",
  "simd-adler32",
 ]
-
-[[patch.unused]]
-name = "fsqlite"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-ast"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-btree"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-core"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-error"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-ext-fts5"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-ext-icu"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-ext-json"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-ext-misc"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-ext-rtree"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-func"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-mvcc"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-observability"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-pager"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-parser"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-planner"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-types"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-vdbe"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-vfs"
-version = "0.2.0"
-
-[[patch.unused]]
-name = "fsqlite-wal"
-version = "0.2.0"

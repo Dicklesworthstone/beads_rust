@@ -701,7 +701,7 @@ pub fn mutate(ctx: &MutateContext, path: &Path, op: Op) -> Result<ActionResult, 
 ///    before any SQL runs.
 ///    For `DbMigrate`: snapshot the entire DB file verbatim to
 ///    `<run-dir>/backups/db/beads.db.pre-migrate`.
-/// 3. Open a writable `fsqlite::Connection`, run the work inside
+/// 3. Open a writable `crate::franken_sync::Connection`, run the work inside
 ///    the migration hook. On any error, restore from the pre-migrate
 ///    snapshot and return without writing an `actions.jsonl` line.
 /// 4. Compute `after_hash` from the post-COMMIT DB file SHA-256.
@@ -874,7 +874,7 @@ fn sha256_file_hex_prefixed(path: &Path) -> std::io::Result<String> {
 ///
 /// ## Single-connection contract (round-2 fresh-eyes fix)
 ///
-/// The snapshot SELECTs run on the **same** `fsqlite::Connection` and
+/// The snapshot SELECTs run on the **same** `crate::franken_sync::Connection` and
 /// **inside** the same `BEGIN IMMEDIATE` transaction as the mutating
 /// SQL. This closes the dual-connection race window that existed when
 /// snapshotting used a separate connection: an external writer could
@@ -895,7 +895,7 @@ fn run_db_exec(
     affected_tables: &[String],
     affected_predicate: Option<&str>,
 ) -> Result<Vec<DbSnapshotArtifact>, BeadsError> {
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
 
     // Pre-flight identifier validation so we fail fast before opening
     // the DB connection. Mirrors the protection on the SELECT path.
@@ -989,7 +989,7 @@ pub(crate) struct DbSnapshotArtifact {
 }
 
 fn snapshot_db_table(
-    conn: &fsqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     backups_db: &Path,
     table: &str,
     affected_predicate: Option<&str>,
@@ -1110,7 +1110,7 @@ fn validate_identifier(ident: &str) -> Result<(), BeadsError> {
 /// Resolve the column-name vector for `table` via `PRAGMA
 /// table_info`. Returns an error if the table does not exist.
 fn collect_column_names(
-    conn: &fsqlite::Connection,
+    conn: &crate::franken_sync::Connection,
     table: &str,
 ) -> Result<Vec<String>, BeadsError> {
     use fsqlite_types::value::SqliteValue;
@@ -1175,7 +1175,7 @@ fn run_db_migrate(
     from: u32,
     to: u32,
 ) -> Result<Option<()>, BeadsError> {
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
     use fsqlite_types::value::SqliteValue;
 
     if to <= from {
@@ -1508,7 +1508,7 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
     use std::io::BufRead;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

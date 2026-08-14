@@ -611,7 +611,7 @@ mod tests {
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
     use fsqlite_error::FrankenError;
     use std::fs;
     use std::path::Path;

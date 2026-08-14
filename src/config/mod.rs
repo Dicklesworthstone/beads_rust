@@ -5582,7 +5582,7 @@ mod tests {
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use fsqlite::Connection;
+    use crate::franken_sync::Connection;
     use tempfile::TempDir;
 
     struct RelationRichFixture {
@@ -8725,7 +8725,7 @@ routing:
         let _ = fs::remove_file(&journal_path);
 
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
-            let conn = fsqlite::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            let conn = crate::franken_sync::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
             let row = conn.query_row("SELECT value FROM config WHERE key = 'issue_prefix'")?;
             Ok(row
                 .get(0)
