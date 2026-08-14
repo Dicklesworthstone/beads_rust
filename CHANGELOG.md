@@ -27,6 +27,9 @@ release-gate tests were repaired.
   family). Upstream 0.4.x preserves the 0.4.3 public API; the notable 0.4.4
   change (spawned-task results surviving cancellation acknowledgement) does
   not affect br's block_on bridge, which spawns no tasks.
+- Pinned the Rust toolchain to `nightly-2026-08-13` so local, RCH, and
+  cross-platform release builds use the same compiler, rustfmt, and Clippy
+  lint inventory instead of resolving a host-dependent floating nightly.
 - Full `cargo update` lockfile refresh: ~45 transitive crates to latest
   compatible (aho-corasick 1.1.5, aws-lc-rs 1.18, blake3 1.8.6, cc 1.4.3,
   futures 0.3.34 family, http 1.5, icu 2.3 family, and others). Direct
