@@ -60,6 +60,7 @@ fn human_witness_value_digest(value: Option<&str>) -> (usize, String) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn additive_conflict_human_lines(
     receipt: &AdditiveReconcileReceipt,
     witness_limit: usize,
@@ -698,6 +699,7 @@ fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
 /// `--merge --rebuild` combination must return an error without having
 /// touched the DB family — otherwise the validation message arrives after
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
+#[allow(clippy::too_many_lines)]
 pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
     if args.apply && !args.reconcile_additive {
         return Err(BeadsError::Validation {
@@ -1086,7 +1088,7 @@ fn finalize_sync_dispatch_completion(
             &mut open_result.storage,
             &open_result.paths.db_path,
             published_source,
-            pending_merge,
+            &pending_merge,
             open_result.no_db,
         )
         .map_err(|source| BeadsError::CommittedStateUnwitnessed {
@@ -1105,7 +1107,7 @@ fn finalize_pending_sync_merge_after_adoption(
     storage: &mut crate::storage::SqliteStorage,
     db_path: &Path,
     published_source: &JsonlSourceSnapshot,
-    pending: PendingSyncMergeCompletion,
+    pending: &PendingSyncMergeCompletion,
     no_db: bool,
 ) -> Result<()> {
     let receipt = &pending.receipt;
@@ -1282,6 +1284,7 @@ fn sync_operation(args: &SyncArgs) -> SyncOperation {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_additive_reconcile_receipt(
     receipt: &AdditiveReconcileReceipt,
     ctx: &OutputContext,

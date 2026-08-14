@@ -162,7 +162,7 @@ impl PendingSyncMergeState {
         }
     }
 
-    fn legacy(metadata_key: String, row_count: usize, diagnostic: String) -> Self {
+    fn legacy(metadata_key: String, row_count: usize, diagnostic: &str) -> Self {
         Self {
             condition: PendingSyncMergeCondition::Legacy,
             metadata_key,
@@ -196,7 +196,7 @@ impl PendingSyncMergeState {
                 metadata_key,
                 row_count,
                 diagnostic,
-            } => Some(Self::legacy(metadata_key, row_count, diagnostic)),
+            } => Some(Self::legacy(metadata_key, row_count, &diagnostic)),
             PendingSyncMergeInspection::Malformed {
                 metadata_key,
                 diagnostic,
@@ -6144,9 +6144,10 @@ fn fix_db_sidecar_modes_if_warned(
                 continue;
             }
             let current = meta.permissions().mode();
-            // Already owner-only — TOCTOU defense (the storage layer may have
-            // self-healed it between detection and repair).
-            if (current & 0o077) == 0 {
+            // Already owner-only (group/other bits all clear) — TOCTOU defense
+            // (the storage layer may have self-healed it between detection and
+            // repair).
+            if current.trailing_zeros() >= 6 {
                 continue;
             }
             let new_mode = current & !0o077;
@@ -11175,6 +11176,7 @@ fn check_sync_metadata(
 /// "index <name> contains rowid N for a table row that does not
 /// satisfy the partial index predicate" — that's older SQLite not
 /// validating partial predicates on `integrity_check`.
+#[allow(clippy::too_many_lines)]
 fn execute_repair_indexes(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
@@ -12091,7 +12093,7 @@ fn inspect_existing_doctor_database(
     mode: DoctorInspectionMode,
     checks: &mut Vec<CheckResult>,
 ) {
-    match config::with_database_family_snapshot(db_path, |snapshot_db_path| {
+    if let Err(err) = config::with_database_family_snapshot(db_path, |snapshot_db_path| {
         let conn = Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
         let _ = conn.execute("PRAGMA busy_timeout=30000");
         if let Err(err) = required_schema_checks(&conn, checks) {
@@ -12157,23 +12159,16 @@ fn inspect_existing_doctor_database(
         conn.close()?;
         Ok(())
     }) {
-        Ok(()) => {
-            if mode == DoctorInspectionMode::Full {
-                check_sqlite_cli_integrity(db_path, checks);
-            }
-        }
-        Err(err) => {
-            push_check(
-                checks,
-                "db.open",
-                CheckStatus::Error,
-                Some(format!("Failed to open DB snapshot for inspection: {err}")),
-                Some(serde_json::json!({ "path": db_path.display().to_string() })),
-            );
-            if mode == DoctorInspectionMode::Full {
-                check_sqlite_cli_integrity(db_path, checks);
-            }
-        }
+        push_check(
+            checks,
+            "db.open",
+            CheckStatus::Error,
+            Some(format!("Failed to open DB snapshot for inspection: {err}")),
+            Some(serde_json::json!({ "path": db_path.display().to_string() })),
+        );
+    }
+    if mode == DoctorInspectionMode::Full {
+        check_sqlite_cli_integrity(db_path, checks);
     }
 }
 
@@ -12182,6 +12177,11 @@ fn inspect_existing_doctor_database(
 /// # Errors
 ///
 /// Returns an error if report serialization fails or if IO operations fail.
+///
+/// # Panics
+///
+/// Panics if the internal invariant that the repair write authority is
+/// acquired before the pending-merge gate is violated.
 #[allow(clippy::too_many_lines)]
 pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     // WP6: dispatch to the agent-ergonomics surface when a subcommand is

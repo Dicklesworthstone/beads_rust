@@ -2781,11 +2781,12 @@ mod tests {
         // paths. Without a global expansion guard the traversal emitted
         // 2^(depth/2+2)-3 nodes and exhausted memory. With expansion-once the
         // node count is bounded by the number of edges regardless of depth.
+        const RUNGS: usize = 20;
+
         init_test_logging();
         info!("test_dep_tree_diamond_graph_is_bounded: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
-        const RUNGS: usize = 20;
         let a: Vec<String> = (0..=RUNGS).map(|i| format!("bd-a{i:03}")).collect();
         let b: Vec<String> = (0..RUNGS).map(|i| format!("bd-b{i:03}")).collect();
         let c: Vec<String> = (0..RUNGS).map(|i| format!("bd-c{i:03}")).collect();

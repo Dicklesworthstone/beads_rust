@@ -214,6 +214,9 @@ uninlined_format_args = { level = "allow", priority = 1 }
 useless_let_if_seq = { level = "allow", priority = 1 }
 format_push_string = { level = "allow", priority = 1 }
 # Stylistic nursery/pedantic lints that don't reflect real defects
+# assert_is_empty: new in the 2026-08 nightly clippy; rewriting thousands of
+# test `assert!(x.is_empty())` calls into `assert_eq!` is churn, not safety.
+assert_is_empty = { level = "allow", priority = 1 }
 option_if_let_else = { level = "allow", priority = 1 }
 map_unwrap_or = { level = "allow", priority = 1 }
 similar_names = { level = "allow", priority = 1 }
