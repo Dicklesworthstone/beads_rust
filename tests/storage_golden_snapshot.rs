@@ -3,10 +3,10 @@
 //! The snapshot intentionally masks volatile timestamps while preserving the
 //! row shape, event sequence, content hash, and JSONL field layout.
 
+use beads_rust::franken_sync::Connection;
 use beads_rust::model::{Issue, IssueType, Priority, Status};
 use beads_rust::storage::{IssueUpdate, SqliteStorage};
 use chrono::{TimeZone, Utc};
-use beads_rust::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use insta::assert_snapshot;
 use serde_json::Value;

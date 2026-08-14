@@ -125,7 +125,7 @@ pub(crate) fn verify_jsonl_source_snapshot_current(
     jsonl_authority.verify_jsonl_authority()?;
     let pinned_source = jsonl_authority.pinned_name_for_target(source.display_path())?;
     verify_expected_jsonl_source_state_observed(
-        pinned_source.capture_optional()?,
+        pinned_source.capture_optional()?.as_ref(),
         None,
         Some(&source.state_witness()),
     )
@@ -138,19 +138,19 @@ fn verify_expected_jsonl_source_state(
     expected_previous_source: Option<&JsonlSourceStateWitness>,
 ) -> Result<()> {
     verify_expected_jsonl_source_state_observed(
-        capture_optional_jsonl_source(path)?,
+        capture_optional_jsonl_source(path)?.as_ref(),
         expected_previous_content_sha256,
         expected_previous_source,
     )
 }
 
 fn verify_expected_jsonl_source_state_observed(
-    observed_source: Option<JsonlSourceSnapshot>,
+    observed_source: Option<&JsonlSourceSnapshot>,
     expected_previous_content_sha256: Option<&Option<String>>,
     expected_previous_source: Option<&JsonlSourceStateWitness>,
 ) -> Result<()> {
     if let Some(expected_previous) = expected_previous_source {
-        let observed = observed_source.as_ref().map_or(
+        let observed = observed_source.map_or(
             JsonlSourceStateWitness::Missing,
             JsonlSourceSnapshot::state_witness,
         );
@@ -161,9 +161,7 @@ fn verify_expected_jsonl_source_state_observed(
             });
         }
     } else if let Some(expected_previous) = expected_previous_content_sha256 {
-        let observed = observed_source
-            .as_ref()
-            .map(|source| source.content_sha256().to_string());
+        let observed = observed_source.map(|source| source.content_sha256().to_string());
         if &observed != expected_previous {
             return Err(BeadsError::SyncConflict {
                 message: "JSONL changed on disk since the exporting session loaded it; refusing a stale atomic replacement"
@@ -279,9 +277,9 @@ struct DatabaseInodeAuthority {
 /// hard-link aliases once the file exists.
 #[derive(Debug)]
 pub struct DatabaseFamilyWriteLock {
-    _workspace_lock: File,
+    workspace_lock: File,
     workspace_lock_path: PathBuf,
-    _authority_lock: File,
+    authority_lock: File,
     authority_lock_path: PathBuf,
     database_authority: std::sync::Mutex<DatabaseInodeAuthority>,
     authority_path_sha256: String,
@@ -299,7 +297,7 @@ pub struct DatabaseFamilyWriteLock {
 /// from the canonical destination path remains stable across that rename.
 #[derive(Debug)]
 pub struct JsonlFamilyWriteLock {
-    _authority_lock: File,
+    authority_lock: File,
     authority_lock_path: PathBuf,
     authority_path_sha256: String,
     routed_jsonl_path: PathBuf,
@@ -361,7 +359,7 @@ impl JsonlFamilyWriteLock {
 
     pub fn verify_jsonl_authority(&self) -> Result<()> {
         verify_locked_file_identity(
-            &self._authority_lock,
+            &self.authority_lock,
             &self.authority_lock_path,
             "JSONL-family write lock",
             true,
@@ -428,13 +426,13 @@ impl DatabaseFamilyWriteLock {
 
     fn verify_common_authority(&self) -> Result<()> {
         verify_locked_file_identity(
-            &self._workspace_lock,
+            &self.workspace_lock,
             &self.workspace_lock_path,
             "workspace write lock",
             false,
         )?;
         verify_locked_file_identity(
-            &self._authority_lock,
+            &self.authority_lock,
             &self.authority_lock_path,
             "database-family write lock",
             true,
@@ -456,6 +454,9 @@ impl DatabaseFamilyWriteLock {
     /// would hide the missing-database recovery branch from startup. The caller
     /// creates/rebuilds under the stable sidecar, then calls
     /// [`Self::rebind_database_inode_after_authorized_replace`].
+    // The inode-authority mutex must span the missing-database filesystem
+    // check below so the observed state cannot race a concurrent bind.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn bind_database_inode_for_mutation(&self) -> Result<bool> {
         self.verify_common_authority()?;
         let database_authority =
@@ -551,6 +552,7 @@ impl DatabaseFamilyWriteLock {
             database_authority.retired_locks.push(previous_lock);
         }
         database_authority.identity = Some(replacement_identity);
+        drop(database_authority);
         Ok(())
     }
 
@@ -654,6 +656,7 @@ impl DatabaseFamilyWriteLock {
             database_authority.retired_locks.push(previous_lock);
         }
         database_authority.identity = Some(replacement_identity);
+        drop(database_authority);
         Ok(())
     }
 
@@ -661,13 +664,13 @@ impl DatabaseFamilyWriteLock {
     /// irreversibly accepted the replacement.
     pub(crate) fn finalize_database_replacement(&self) -> Result<()> {
         self.verify_database_authority()?;
-        let mut database_authority =
-            self.database_authority
-                .lock()
-                .map_err(|_| BeadsError::SyncConflict {
-                    message: "Database inode authority state was poisoned".to_string(),
-                })?;
-        database_authority.retired_locks.clear();
+        self.database_authority
+            .lock()
+            .map_err(|_| BeadsError::SyncConflict {
+                message: "Database inode authority state was poisoned".to_string(),
+            })?
+            .retired_locks
+            .clear();
         Ok(())
     }
 
@@ -725,6 +728,7 @@ impl DatabaseFamilyWriteLock {
         }
         database_authority.identity = Some(target_identity);
         database_authority.retired_locks.clear();
+        drop(database_authority);
         Ok(())
     }
 
@@ -770,6 +774,7 @@ impl DatabaseFamilyWriteLock {
             database_authority.retired_locks.push(previous_lock);
         }
         database_authority.identity = Some(replacement_identity);
+        drop(database_authority);
         Ok(())
     }
 
@@ -800,6 +805,7 @@ impl DatabaseFamilyWriteLock {
         database_authority.lock = None;
         database_authority.identity = None;
         database_authority.retired_locks.clear();
+        drop(database_authority);
         Ok(())
     }
 
@@ -1052,7 +1058,7 @@ pub fn blocking_jsonl_family_write_lock_with_timeout(
         });
     }
     let authority = JsonlFamilyWriteLock {
-        _authority_lock: authority_lock,
+        authority_lock,
         authority_lock_path,
         authority_path_sha256,
         routed_jsonl_path: jsonl_path.to_path_buf(),
@@ -1072,6 +1078,7 @@ pub fn database_write_authority_sha256(database_path: &Path) -> Result<String> {
 
 /// Acquire the common database-family authority honored by CLI, MCP, recovery,
 /// and reviewed reconciliation mutation paths.
+#[allow(clippy::too_many_lines)]
 pub fn blocking_database_family_write_lock_with_timeout(
     beads_dir: &Path,
     database_path: &Path,
@@ -1165,9 +1172,9 @@ pub fn blocking_database_family_write_lock_with_timeout(
         _ => unreachable!("database inode authority lock and identity must be paired"),
     }
     Ok(DatabaseFamilyWriteLock {
-        _workspace_lock: workspace_lock,
+        workspace_lock,
         workspace_lock_path,
-        _authority_lock: authority_lock,
+        authority_lock,
         authority_lock_path: authority_path,
         database_authority: std::sync::Mutex::new(DatabaseInodeAuthority {
             lock: database_lock,
@@ -1182,6 +1189,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn open_and_lock_regular_file(
     lock_path: &Path,
     lock_timeout_ms: Option<u64>,
@@ -1541,6 +1549,7 @@ fn published_but_unwitnessed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_staged_jsonl_conditionally(
     temp_path: &Path,
     temp_guard: TempFileGuard,
@@ -1608,7 +1617,7 @@ pub(crate) fn publish_staged_file_conditionally(
     Ok(publication.into_receipt(output_path, content_sha256))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn publish_staged_jsonl_conditionally_with_hooks<Hook, SyncParent>(
     temp_path: &Path,
     mut temp_guard: TempFileGuard,
@@ -1633,12 +1642,12 @@ where
     let output_name = jsonl_authority.pinned_name_for_target(output_path)?;
     let staged_name = jsonl_authority.pinned_sibling(temp_path)?;
     verify_expected_jsonl_source_state_observed(
-        output_name.capture_optional()?,
+        output_name.capture_optional()?.as_ref(),
         None,
         Some(expected_previous_state),
     )?;
     verify_expected_jsonl_source_state_observed(
-        staged_name.capture_optional()?,
+        staged_name.capture_optional()?.as_ref(),
         None,
         Some(&staged_source.state_witness()),
     )?;
@@ -2905,6 +2914,7 @@ impl SyncMergePendingReceipt {
         Ok(finalized)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn validate(&self) -> Result<()> {
         if self.schema_version != 2 || self.intent.schema_version != 2 {
             return Err(BeadsError::SyncConflict {
@@ -3769,6 +3779,7 @@ pub fn apply_reviewed_additive_reconcile(
 /// terminal workspace, canonical database-family sidecar, and database path.
 /// Standalone library callers use [`apply_reviewed_additive_reconcile`], which
 /// acquires and owns the same composite authority itself.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn apply_reviewed_additive_reconcile_under_authority(
     request: &ReviewedAdditiveReconcileRequest,
     retained_write_authority: Option<&Arc<DatabaseFamilyWriteLock>>,
@@ -4085,6 +4096,7 @@ fn additive_test_drift_schema_before_transaction(storage: &SqliteStorage) -> Res
     Ok(())
 }
 
+#[allow(clippy::incompatible_msrv)]
 fn acquire_reviewed_additive_source_lock(input_path: &Path) -> Result<File> {
     let descriptor = additive_path_descriptor(input_path, "source");
     let mut options = OpenOptions::new();
@@ -4680,6 +4692,7 @@ impl<'de> Deserialize<'de> for DuplicateKeyRejectingJson {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
     const ISSUE_FIELDS: &[&str] = &[
         "id",
@@ -4891,6 +4904,7 @@ fn parse_strict_additive_issue(trimmed: &str, line_num: usize) -> Result<Issue> 
     Ok(issue)
 }
 
+#[allow(clippy::too_many_lines)]
 fn additive_source_snapshot(
     input_path: &Path,
     config: &AdditiveReconcileConfig,
@@ -5153,6 +5167,7 @@ fn additive_raw_rows_by_text_key(
     Ok(rows_by_key)
 }
 
+#[allow(clippy::too_many_lines)]
 fn additive_database_witness(
     storage: &SqliteStorage,
     issues: &BTreeMap<String, Issue>,
@@ -5873,7 +5888,7 @@ fn record_additive_conflict(
         reason,
         "issue",
         None,
-        Vec::new(),
+        &[],
         None,
     )
 }
@@ -5886,7 +5901,7 @@ fn record_additive_conflict_detail(
     reason: &str,
     detail_kind: &str,
     ordinal: Option<usize>,
-    related_values: Vec<String>,
+    related_values: &[String],
     sensitive_value: Option<&str>,
 ) -> Result<()> {
     record_additive_conflict_detail_with_subcodes(
@@ -5910,7 +5925,7 @@ fn record_additive_conflict_detail_with_subcodes(
     reason: &str,
     detail_kind: &str,
     ordinal: Option<usize>,
-    related_values: Vec<String>,
+    related_values: &[String],
     mut validation_subcodes: Vec<String>,
     sensitive_value: Option<&str>,
 ) -> Result<()> {
@@ -6215,6 +6230,7 @@ pub fn plan_additive_reconcile(
     Ok(plan)
 }
 
+#[allow(clippy::too_many_lines)]
 fn plan_additive_reconcile_in_snapshot(
     storage: &SqliteStorage,
     input_path: &Path,
@@ -6324,7 +6340,7 @@ fn plan_additive_reconcile_in_snapshot(
                 "duplicate_source_external_ref",
                 "external_ref",
                 None,
-                Vec::new(),
+                &[],
                 issue.external_ref.as_deref(),
             )?;
             issue_has_conflict = true;
@@ -6343,7 +6359,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "ambiguous_database_external_ref",
                     "external_ref",
                     None,
-                    Vec::new(),
+                    &[],
                     Some(external_ref),
                 )?;
                 issue_has_conflict = true;
@@ -6357,7 +6373,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "external_ref_owned_by_other_id",
                     "external_ref",
                     None,
-                    vec![existing_id.clone()],
+                    std::slice::from_ref(existing_id),
                     Some(external_ref),
                 )?;
                 issue_has_conflict = true;
@@ -6373,7 +6389,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "duplicate_label",
                     "label",
                     Some(label_ordinal),
-                    Vec::new(),
+                    &[],
                     Some(label),
                 )?;
                 issue_has_conflict = true;
@@ -6391,7 +6407,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "dependency_source_id_mismatch",
                     "dependency",
                     Some(dependency_ordinal),
-                    vec![dependency.issue_id.clone()],
+                    std::slice::from_ref(&dependency.issue_id),
                     None,
                 )?;
                 issue_has_conflict = true;
@@ -6404,7 +6420,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "self_dependency",
                     "dependency",
                     Some(dependency_ordinal),
-                    vec![dependency.depends_on_id.clone()],
+                    std::slice::from_ref(&dependency.depends_on_id),
                     None,
                 )?;
                 issue_has_conflict = true;
@@ -6417,7 +6433,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "duplicate_dependency_target",
                     "dependency",
                     Some(dependency_ordinal),
-                    vec![dependency.depends_on_id.clone()],
+                    std::slice::from_ref(&dependency.depends_on_id),
                     None,
                 )?;
                 issue_has_conflict = true;
@@ -6432,7 +6448,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "invalid_dependency_metadata",
                     "dependency_metadata",
                     Some(dependency_ordinal),
-                    vec![dependency.depends_on_id.clone()],
+                    std::slice::from_ref(&dependency.depends_on_id),
                     dependency.metadata.as_deref(),
                 )?;
                 issue_has_conflict = true;
@@ -6452,7 +6468,7 @@ fn plan_additive_reconcile_in_snapshot(
                         "external_parent_child_endpoint",
                         "parent_child_dependency",
                         Some(dependency_ordinal),
-                        vec![dependency.depends_on_id.clone()],
+                        std::slice::from_ref(&dependency.depends_on_id),
                         None,
                     )?;
                     issue_has_conflict = true;
@@ -6468,7 +6484,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "orphan_dependency_target",
                     "dependency",
                     Some(dependency_ordinal),
-                    vec![dependency.depends_on_id.clone()],
+                    std::slice::from_ref(&dependency.depends_on_id),
                     None,
                 )?;
                 issue_has_conflict = true;
@@ -6482,7 +6498,7 @@ fn plan_additive_reconcile_in_snapshot(
                 "multiple_parent_child_dependencies",
                 "parent_child_set",
                 None,
-                parent_candidates,
+                &parent_candidates,
                 None,
             )?;
             issue_has_conflict = true;
@@ -6501,7 +6517,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "comment_source_id_mismatch",
                     "comment",
                     Some(comment_ordinal),
-                    vec![comment.issue_id.clone()],
+                    std::slice::from_ref(&comment.issue_id),
                     Some(&canonical_comment_payload),
                 )?;
                 issue_has_conflict = true;
@@ -6521,7 +6537,7 @@ fn plan_additive_reconcile_in_snapshot(
                     "invalid_comment",
                     "comment_validation",
                     Some(comment_ordinal),
-                    Vec::new(),
+                    &[],
                     additive_comment_validation_subcodes(&validation_errors),
                     Some(&canonical_comment_payload),
                 )?;
@@ -6761,7 +6777,7 @@ fn plan_additive_reconcile_in_snapshot(
                 "projected_blocking_cycle",
                 "blocking_cycle",
                 None,
-                cycle.clone(),
+                cycle,
                 None,
             )?;
         }
@@ -7528,6 +7544,7 @@ fn require_reviewed_additive_schema_version(
 ///
 /// Returns an error if the plan has conflicts, either witness drifted, or any
 /// transactional invariant fails.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn apply_additive_reconcile(
     storage: &mut SqliteStorage,
     input_path: &Path,
@@ -7953,7 +7970,9 @@ pub(crate) fn apply_additive_reconcile(
             AdditiveReconcileStatus::Applied
         };
         receipt.events_after = target_after.events;
-        receipt.event_payload_sha256_after = target_after.event_payload_sha256.clone();
+        receipt
+            .event_payload_sha256_after
+            .clone_from(&target_after.event_payload_sha256);
         receipt.target_after = Some(target_after);
         receipt.health_after = None;
         receipt.cache_rebuild_performed = plan.receipt.cache_rebuild_planned;
@@ -8550,16 +8569,28 @@ pub fn preflight_import(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<PreflightResult> {
-    preflight_import_impl(input_path, None, config, expected_prefix)
+    Ok(preflight_import_impl(
+        input_path,
+        None,
+        config,
+        expected_prefix,
+    ))
 }
 
-#[allow(clippy::too_many_lines)]
+// Preflight itself is infallible; the `Result` signature is the crate-wide
+// contract relied on by callers outside this module (e.g. `config::mod`).
+#[allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
 pub(crate) fn preflight_import_snapshot(
     source: &JsonlSourceSnapshot,
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<PreflightResult> {
-    preflight_import_impl(source.display_path(), Some(source), config, expected_prefix)
+    Ok(preflight_import_impl(
+        source.display_path(),
+        Some(source),
+        config,
+        expected_prefix,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8568,7 +8599,7 @@ fn preflight_import_impl(
     source: Option<&JsonlSourceSnapshot>,
     config: &ImportConfig,
     expected_prefix: Option<&str>,
-) -> Result<PreflightResult> {
+) -> PreflightResult {
     let mut result = PreflightResult::new();
 
     tracing::debug!(
@@ -8635,7 +8666,7 @@ fn preflight_import_impl(
                     "Use a path within .beads/ directory or set --allow-external-jsonl.",
                 ));
                 tracing::debug!(path = %input_path.display(), error = %e, "Path validation: FAIL");
-                return Ok(result);
+                return result;
             }
         }
     }
@@ -8686,7 +8717,7 @@ fn preflight_import_impl(
         ));
         tracing::debug!(path = %input_path.display(), "File readable check: FAIL (not found)");
         // Return early since we can't do further checks without the file
-        return Ok(result);
+        return result;
     }
 
     // Check 4: No merge conflict markers
@@ -8879,7 +8910,7 @@ fn preflight_import_impl(
         "Import preflight complete"
     );
 
-    Ok(result)
+    result
 }
 
 /// Conflict marker kind.
@@ -9701,6 +9732,7 @@ pub(crate) fn export_to_jsonl_with_policy_expected_under_authorities(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn export_to_jsonl_with_policy_expected_authority(
     storage: &SqliteStorage,
     output_path: &Path,
@@ -12789,6 +12821,9 @@ fn compute_jsonl_hash_from_reader(mut reader: impl BufRead) -> Result<String> {
     Ok(hex_encode(&hasher.finalize()))
 }
 
+// Infallible today, but callers outside this module (`cli::commands::sync`)
+// consume the fallible signature; keep `Result` to avoid a cross-file change.
+#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn compute_jsonl_snapshot_content_hash(source: &JsonlSourceSnapshot) -> Result<String> {
     Ok(source.content_sha256().to_string())
 }
@@ -14662,6 +14697,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_finalization_requires_exact_metadata_cardinality_and_mtime() {
         let storage = SqliteStorage::open_memory().unwrap();
         let database_before = capture_sync_database_witness(&storage).unwrap();

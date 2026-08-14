@@ -2364,7 +2364,7 @@ where
     let mut file = opened.into_file();
     let mut hasher = Sha256::new();
     let mut remaining = before_metadata.len();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     while remaining > 0 {
         ensure_jsonl_capture_deadline(deadline)?;
         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
@@ -2590,6 +2590,15 @@ mod tests {
     fn deadline_aware_snapshot_refuses_expired_and_overrun_reads() {
         use std::io::Read;
 
+        struct SlowReader;
+        impl Read for SlowReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                buffer[0] = b'x';
+                Ok(1)
+            }
+        }
+
         let (_temp, beads_dir) = setup_test_beads_dir();
         let path = beads_dir.join("issues.jsonl");
         std::fs::write(&path, b"{\"id\":\"br-timeout\"}\n").expect("write JSONL fixture");
@@ -2603,15 +2612,6 @@ mod tests {
             ),
             "unexpected expired-deadline error: {expired}"
         );
-
-        struct SlowReader;
-        impl Read for SlowReader {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                buffer[0] = b'x';
-                Ok(1)
-            }
-        }
 
         let mut reader = DeadlineReader {
             inner: SlowReader,

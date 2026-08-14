@@ -1,9 +1,9 @@
 //! CLI definitions and entry point.
 
+use crate::franken_sync::Connection;
 use clap::builder::StyledStr;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use crate::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use serde::Deserialize;
 use std::collections::BTreeSet;

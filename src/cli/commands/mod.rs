@@ -607,11 +607,11 @@ mod tests {
     };
     use crate::config::{CliOverrides, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
+    use crate::franken_sync::Connection;
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
-    use crate::franken_sync::Connection;
     use fsqlite_error::FrankenError;
     use std::fs;
     use std::path::Path;

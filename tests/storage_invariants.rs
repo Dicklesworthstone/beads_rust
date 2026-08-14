@@ -1,10 +1,10 @@
 mod common;
 
+use beads_rust::franken_sync::Connection;
 use beads_rust::model::{DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::{ListFilters, ReadyFilters, ReadySortPolicy};
 use chrono::{Duration, Utc};
 use common::{fixtures, test_db, test_db_with_dir};
-use beads_rust::franken_sync::Connection;
 use fsqlite_types::SqliteValue;
 use std::collections::HashSet;
 

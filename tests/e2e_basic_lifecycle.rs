@@ -1,5 +1,7 @@
 mod common;
 
+#[cfg(target_os = "linux")]
+use beads_rust::franken_sync::Connection;
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 #[cfg(target_os = "linux")]
@@ -10,8 +12,6 @@ use common::cli::{
     run_br_smoke_at_root_with_env,
 };
 use common::isolated_workspace_failure_fixture;
-#[cfg(target_os = "linux")]
-use beads_rust::franken_sync::Connection;
 #[cfg(target_os = "linux")]
 use fsqlite_types::SqliteValue;
 use serde_json::Value;
@@ -1440,6 +1440,7 @@ fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
     let _log = common::test_log("e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff");
     let workspace = BrWorkspace::new();

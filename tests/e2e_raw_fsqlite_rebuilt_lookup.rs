@@ -1,8 +1,8 @@
 mod common;
 
+use beads_rust::franken_sync::Connection;
 use beads_rust::storage::SqliteStorage;
 use common::cli::{BrWorkspace, run_br};
-use beads_rust::franken_sync::Connection;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use serde_json::Value;

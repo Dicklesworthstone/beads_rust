@@ -10,6 +10,7 @@ use crate::cli::commands::doctor_subsystems::refuse_gates::{self, GateOutcome};
 use crate::cli::commands::doctor_subsystems::run_dir::{self, RunDir};
 use crate::config;
 use crate::error::{BeadsError, Result};
+use crate::franken_sync::{Connection, Row};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
@@ -27,7 +28,6 @@ use crate::sync::{
     validate_sync_path, validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
-use crate::franken_sync::{Connection, Row};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -13474,12 +13474,12 @@ fn emit_flat_robot_triage(report: &DoctorReport) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::franken_sync::Connection;
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use assert_cmd::Command as AssertCommand;
     use chrono::Utc;
-    use crate::franken_sync::Connection;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

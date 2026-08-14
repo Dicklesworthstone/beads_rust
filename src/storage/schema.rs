@@ -1,7 +1,7 @@
 //! Database schema definitions and migration logic.
 
-use chrono::Utc;
 use crate::franken_sync::Connection;
+use chrono::Utc;
 use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
@@ -3578,6 +3578,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_reviewed_migration_refuses_9_to_10_without_applying_later_steps() {
         // The explicit reviewed migration hook is deliberately not the
         // automatic open-time migration ladder. A request for the old 9->10

@@ -10,8 +10,8 @@
 mod common;
 
 use assert_cmd::Command;
-use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use beads_rust::franken_sync::Connection;
+use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
@@ -561,7 +561,9 @@ fn e2e_mutating_command_fails_when_write_lock_path_unusable() {
     );
     let combined = format!("{}{}", create.stdout, create.stderr);
     assert!(
-        combined.contains("Failed to open write lock") && combined.contains(".write.lock"),
+        (combined.contains("Refusing unsafe workspace write lock path")
+            || combined.contains("Failed to open write lock"))
+            && combined.contains(".write.lock"),
         "error should explain the unusable write lock path: {combined}"
     );
 
@@ -640,6 +642,7 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
 #[test]
 #[cfg(unix)]
 #[allow(clippy::incompatible_msrv)]
+#[allow(clippy::too_many_lines)]
 fn e2e_doctor_reports_live_write_lock_without_mutating_workspace() {
     use std::os::unix::fs::MetadataExt;
 

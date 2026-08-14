@@ -1542,6 +1542,9 @@ pub(crate) fn repair_database_from_jsonl_snapshot_with_import_config(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Takes `ImportConfig` by value for external callers (cli/commands/sync.rs);
+// the internal impl only borrows it.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority(
     beads_dir: &Path,
     db_path: &Path,
@@ -1558,7 +1561,7 @@ pub(crate) fn repair_database_from_jsonl_snapshot_with_import_config_under_write
             db_path,
             lock_timeout,
             bootstrap_layer,
-            import_config,
+            &import_config,
             source,
             jsonl_authority,
             write_authority,
@@ -1573,7 +1576,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_deferred(
     db_path: &Path,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -1597,7 +1600,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
     db_path: &Path,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -1634,7 +1637,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
                 db_path,
                 lock_timeout,
                 source,
-                &import_config,
+                import_config,
                 &prefix,
                 write_authority,
             )?;
@@ -2961,8 +2964,8 @@ pub struct OpenStorageResult {
     pub storage: SqliteStorage,
     pub paths: ConfigPaths,
     pub no_db: bool,
-    _write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
-    _jsonl_write_authority: Option<Arc<crate::sync::JsonlFamilyWriteLock>>,
+    write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
+    jsonl_write_authority: Option<Arc<crate::sync::JsonlFamilyWriteLock>>,
     /// True when the SQLite DB file was just rebuilt from JSONL during this
     /// `open_storage_with_cli` call (either because the file didn't exist, or
     /// because a recoverable anomaly was detected after opening). Callers that
@@ -2997,7 +3000,7 @@ impl OpenStorageResult {
         (
             &mut self.storage,
             source,
-            self._jsonl_write_authority.as_deref(),
+            self.jsonl_write_authority.as_deref(),
         )
     }
 
@@ -3020,7 +3023,7 @@ impl OpenStorageResult {
             &mut self.storage,
             source,
             &self.loaded_jsonl_state,
-            self._jsonl_write_authority.as_deref(),
+            self.jsonl_write_authority.as_deref(),
         )
     }
 
@@ -3094,7 +3097,7 @@ impl OpenStorageResult {
             ));
         }
         let write_authority =
-            self._write_authority
+            self.write_authority
                 .clone()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Database recovery requires an owned database-family authority"
@@ -3143,7 +3146,7 @@ impl OpenStorageResult {
                 &self.paths.db_path,
                 self.resolved_lock_timeout,
                 &self.bootstrap_layer,
-                import_config,
+                &import_config,
                 &source,
                 &jsonl_authority,
                 &write_authority,
@@ -3161,13 +3164,13 @@ impl OpenStorageResult {
         }
         self.loaded_jsonl_state = source.state_witness();
         self.loaded_jsonl_source = RetainedJsonlSource::Present(source);
-        self._jsonl_write_authority = Some(jsonl_authority);
+        self.jsonl_write_authority = Some(jsonl_authority);
         self.auto_rebuilt = true;
         Ok(())
     }
 
     pub(crate) fn verify_retained_jsonl_source_current(&self) -> Result<()> {
-        let Some(jsonl_authority) = self._jsonl_write_authority.as_deref() else {
+        let Some(jsonl_authority) = self.jsonl_write_authority.as_deref() else {
             return Ok(());
         };
         match &self.loaded_jsonl_source {
@@ -3195,15 +3198,15 @@ impl OpenStorageResult {
         source: Arc<JsonlSourceSnapshot>,
         owned_authority: Option<crate::sync::JsonlFamilyWriteLock>,
     ) -> Result<()> {
-        if self._jsonl_write_authority.is_some() && owned_authority.is_some() {
+        if self.jsonl_write_authority.is_some() && owned_authority.is_some() {
             return Err(BeadsError::SyncConflict {
                 message:
                     "Published JSONL adoption received a second authority while startup still retains one"
                         .to_string(),
             });
         }
-        if self._jsonl_write_authority.is_none() {
-            self._jsonl_write_authority = Some(match owned_authority {
+        if self.jsonl_write_authority.is_none() {
+            self.jsonl_write_authority = Some(match owned_authority {
                 Some(authority) => Arc::new(authority),
                 None => Arc::new(crate::sync::blocking_jsonl_family_write_lock_with_timeout(
                     &self.paths.jsonl_path,
@@ -3212,7 +3215,7 @@ impl OpenStorageResult {
             });
         }
         let authority = self
-            ._jsonl_write_authority
+            .jsonl_write_authority
             .as_deref()
             .expect("published JSONL adoption retains an authority");
         verify_jsonl_source_snapshot_current(&source, authority)?;
@@ -3226,7 +3229,7 @@ impl OpenStorageResult {
         expected_authority_sha256: &str,
     ) -> Result<()> {
         let authority =
-            self._jsonl_write_authority
+            self.jsonl_write_authority
                 .as_deref()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Published JSONL adoption did not retain its JSONL-family authority"
@@ -3250,7 +3253,7 @@ impl OpenStorageResult {
     }
 
     pub(crate) fn discard_pending_recovery_backup(&mut self) -> Result<()> {
-        if let Some(write_authority) = self._write_authority.as_ref() {
+        if let Some(write_authority) = self.write_authority.as_ref() {
             write_authority.finalize_database_replacement()?;
         }
         self.pending_recovery_backup = None;
@@ -3279,7 +3282,7 @@ impl OpenStorageResult {
         }
         if had_original_database_family {
             let write_authority =
-                self._write_authority
+                self.write_authority
                     .as_ref()
                     .ok_or_else(|| {
                         BeadsError::SyncConflict {
@@ -3302,7 +3305,7 @@ impl OpenStorageResult {
             write_authority.verify_database_authority()?;
             restored_storage.attach_write_authority(Arc::clone(write_authority));
             self.storage = restored_storage;
-        } else if let Some(write_authority) = self._write_authority.as_ref() {
+        } else if let Some(write_authority) = self.write_authority.as_ref() {
             write_authority.clear_database_inode_after_authorized_remove()?;
         }
         self.loaded_jsonl_state = JsonlSourceStateWitness::Missing;
@@ -3334,7 +3337,7 @@ impl OpenStorageResult {
 
         let history_config = self.resolved_history_config();
         let jsonl_write_authority =
-            self._jsonl_write_authority
+            self.jsonl_write_authority
                 .as_ref()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Mutating no-DB session has no retained JSONL-family write authority"
@@ -3525,7 +3528,7 @@ fn open_storage_with_owned_write_authority(
             Some(authority),
             allow_external_jsonl,
         )?;
-        result._write_authority = Some(Arc::clone(authority));
+        result.write_authority = Some(Arc::clone(authority));
         return Ok(result);
     }
     if cli.holds_write_lock_for(&startup.paths.beads_dir) {
@@ -3562,7 +3565,7 @@ fn open_storage_with_owned_write_authority(
         Some(&authority),
         allow_external_jsonl,
     )?;
-    result._write_authority = Some(authority);
+    result.write_authority = Some(authority);
     Ok(result)
 }
 
@@ -3592,7 +3595,7 @@ pub fn open_storage_with_startup_config_under_write_lock(
         Some(authority),
         false,
     )?;
-    result._write_authority = Some(Arc::clone(authority));
+    result.write_authority = Some(Arc::clone(authority));
     Ok(result)
 }
 
@@ -3697,6 +3700,7 @@ fn open_sqlite_storage_for_startup(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn open_storage_with_startup_config_impl(
     startup: StartupConfig,
     cli: &CliOverrides,
@@ -3784,8 +3788,8 @@ fn open_storage_with_startup_config_impl(
             storage,
             paths,
             no_db,
-            _write_authority: None,
-            _jsonl_write_authority: jsonl_write_authority,
+            write_authority: None,
+            jsonl_write_authority,
             auto_rebuilt: false,
             allow_external_jsonl,
             startup_layers,
@@ -3836,8 +3840,8 @@ fn open_storage_with_startup_config_impl(
             storage: sqlite_open.storage,
             paths,
             no_db,
-            _write_authority: owned_write_authority,
-            _jsonl_write_authority: jsonl_write_authority,
+            write_authority: owned_write_authority,
+            jsonl_write_authority,
             auto_rebuilt: sqlite_open.auto_rebuilt,
             allow_external_jsonl,
             startup_layers,
@@ -5579,10 +5583,10 @@ fn yaml_scalar_to_string(value: &serde_yml::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::franken_sync::Connection;
     use crate::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
     use chrono::Utc;
-    use crate::franken_sync::Connection;
     use tempfile::TempDir;
 
     struct RelationRichFixture {
@@ -8725,7 +8729,9 @@ routing:
         let _ = fs::remove_file(&journal_path);
 
         let prefix = with_database_family_snapshot(&db_path, |snapshot_db_path| {
-            let conn = crate::franken_sync::Connection::open(snapshot_db_path.to_string_lossy().into_owned())?;
+            let conn = crate::franken_sync::Connection::open(
+                snapshot_db_path.to_string_lossy().into_owned(),
+            )?;
             let row = conn.query_row("SELECT value FROM config WHERE key = 'issue_prefix'")?;
             Ok(row
                 .get(0)
