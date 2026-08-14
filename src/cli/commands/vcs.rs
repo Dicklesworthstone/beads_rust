@@ -600,32 +600,32 @@ fn read_head_identity(
         return Err(CollectionFailure::Semantic("probe_failed"));
     }
     parse_head_identity(&output.stdout, object_format)
-        .ok_or(CollectionFailure::Semantic("probe_failed"))
 }
 
 fn parse_head_identity(
     output: &[u8],
     object_format: GitObjectFormat,
-) -> Option<Option<GitPathIdentity>> {
+) -> std::result::Result<Option<GitPathIdentity>, CollectionFailure> {
+    const FAILURE: CollectionFailure = CollectionFailure::Semantic("probe_failed");
     if output.is_empty() {
-        return Some(None);
+        return Ok(None);
     }
-    let records = split_nul_records(output)?;
+    let records = split_nul_records(output).ok_or(FAILURE)?;
     if records.len() != 1 {
-        return None;
+        return Err(FAILURE);
     }
-    let (metadata, path) = records[0].split_once_byte(b'\t')?;
+    let (metadata, path) = records[0].split_once_byte(b'\t').ok_or(FAILURE)?;
     if path.is_empty() {
-        return None;
+        return Err(FAILURE);
     }
     let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
     if fields.len() != 3 {
-        return None;
+        return Err(FAILURE);
     }
-    Some(Some(GitPathIdentity {
-        mode: parse_git_mode(fields[0])?,
-        object_type: parse_object_type(fields[1])?,
-        object_id: parse_object_id(fields[2], object_format)?,
+    Ok(Some(GitPathIdentity {
+        mode: parse_git_mode(fields[0]).ok_or(FAILURE)?,
+        object_type: parse_object_type(fields[1]).ok_or(FAILURE)?,
+        object_id: parse_object_id(fields[2], object_format).ok_or(FAILURE)?,
     }))
 }
 
@@ -787,7 +787,7 @@ fn hash_snapshot_with<D: Digest>(
     hasher.update(format!("blob {}\0", source.size()).as_bytes());
     let mut reader = source.reader();
     let mut remaining = source.size();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     while remaining > 0 {
         if Instant::now() >= deadline {
             return Err(ProbeFailure::TimedOut);
@@ -1077,7 +1077,8 @@ fn read_core_autocrlf(
         Some(1) => Ok(false),
         Some(0) => match trim_ascii(&output.stdout).to_ascii_lowercase().as_slice() {
             b"false" | b"no" | b"off" | b"0" => Ok(false),
-            b"true" | b"yes" | b"on" | b"1" | b"input" => Ok(true),
+            // "true", "yes", "on", "1", "input", and any unrecognized value
+            // all imply checkout/commit transformation.
             _ => Ok(true),
         },
         _ => Err(CollectionFailure::Semantic("probe_failed")),
@@ -1683,7 +1684,7 @@ mod tests {
 
         let mut index = b"100644 ".to_vec();
         index.extend_from_slice(oid);
-        index.extend_from_slice(b" 1\t.beads/issues.jsonl\0100755 ");
+        index.extend_from_slice(b" 1\t.beads/issues.jsonl\x00100755 ");
         index.extend_from_slice(oid);
         index.extend_from_slice(b" 2\t.beads/issues.jsonl\0");
         let parsed =
@@ -1935,7 +1936,7 @@ mod tests {
             result.expect_err("oversized output must be rejected"),
             ProbeFailure::OutputLimit
         );
-        assert!(MAX_CAPTURE_BYTES_PER_STREAM < 4096 * 32);
+        const { assert!(MAX_CAPTURE_BYTES_PER_STREAM < 4096 * 32) };
     }
 
     #[cfg(unix)]
