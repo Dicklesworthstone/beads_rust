@@ -18,7 +18,7 @@
 
 - **Breaking (upstream 0.2.0):** the entire engine API became `async fn` with `!Send` futures (`Connection::open`, `execute*`, `query*`, `prepare`, `close*`, `compat::open_with_flags`).
 - **Breaking (upstream 0.3.0):** the runtime family moved from asupersync 0.3.10 to `>=0.4.3,<0.5`; 0.3.x and 0.4.x asupersync types are non-interchangeable.
-- **Migration:** added `src/franken_sync.rs`, a synchronous facade that drives every engine future to completion on the calling thread via a thread-local current-thread `asupersync` Runtime (`Runtime::block_on`; the proven cass/sqlmodel bridge pattern). The runtime is taken out of its slot while polling so reentrant SQL builds a fresh runtime instead of re-entering `block_on`. The facade carries a bounded `BusyRecovery` retry (restores 0.1.x observable behavior around fsqlite 0.2+ ns-lifecycle recovery windows) and a stale-schema `prepare()`-refresh retry (fsqlite 0.2.1+ cross-connection DDL visibility). All `Connection`/`Row` imports across storage, sync, config, doctor subsystems, CLI, and integration tests moved to `crate::franken_sync::` / `beads_rust::franken_sync::`; `Row`, `SqliteValue`, and `FrankenError` re-export unchanged. `Drop` drives a best-effort close so writes through a dropped connection stay visible to later opens (#270 contract).
+- **Migration:** added `src/franken_sync.rs`, a synchronous facade that drives every engine future to completion on the calling thread via a thread-local current-thread `asupersync` Runtime (`Runtime::block_on`; the proven cass/sqlmodel bridge pattern). The runtime is taken out of its slot while polling so reentrant SQL builds a fresh runtime instead of re-entering `block_on`. The facade carries a bounded `BusyRecovery` retry (restores 0.1.x observable behavior around fsqlite 0.2+ ns-lifecycle recovery windows) and a stale-schema `prepare()`-refresh retry (fsqlite 0.2.1+ cross-connection DDL visibility). All `Connection`/`Row` imports across storage, sync, config, doctor subsystems, CLI, and integration tests moved to `crate::franken_sync::` / `beads_rust::franken_sync::`; `Row`, `SqliteValue`, and `FrankenError` re-export unchanged. Every writable open, including the explicit read-write compatibility path used by reconciliation, selects serialized engine mode to match br's workspace write lock. Missing-database recovery now quarantines all orphaned fsqlite 0.3 sidecars into verified backups before rebuilding from JSONL. `Drop` drives a best-effort close so writes through a dropped connection stay visible to later opens (#270 contract).
 - **asupersync:** new direct dependency `asupersync = { version = "=0.4.3", default-features = false }`, exactly matching the fsqlite family requirement so one runtime version serves the whole default graph.
 - **mcp feature caveat:** published `fastmcp-rust 0.3.2` still requires `asupersync ^0.3.4`, so `--features mcp` builds carry both asupersync 0.3.x and 0.4.3 (they are distinct crates under Cargo's 0.x rules and coexist). This resolves to a single 0.4.3 line once fastmcp republishes against 0.4.x.
 - **Engine-fix relevance:** fsqlite 0.3.0/0.3.1 fix the allocator page-aliasing, committed-freelist resurrection, and concurrent-writer EOF-growth corruption classes plus concurrent-open `BusyRecovery` fail-fasts — the classes behind beads_rust issues #426 and #428 and the concurrent-open regression that blocked the earlier (abandoned) `harmonize/vlsf2` migration attempt.
@@ -58,6 +58,17 @@
 ## Validation
 
 - `cargo check --all-targets` passed after the migration.
-- `cargo fmt` applied; `cargo fmt --check` pending final confirmation.
-- `cargo clippy --all-targets -- -D warnings`: in progress at the time of this entry; final result recorded in the release notes.
-- Full test suite: in progress at the time of this entry; final result recorded in the release notes.
+- `cargo fmt --check` clean.
+- `cargo clippy --all-targets --all-features -- -D warnings` clean
+  (pedantic + nursery at deny).
+- `br serve` SIGINT shutdown test passes
+  (`e2e_mcp_shutdown::serve_sigint_returns_through_main_and_preserves_reopenable_db`)
+  after fixing a same-process write-lock self-deadlock that predated the
+  engine upgrade.
+- Targeted regression suites on the settled tree: `e2e_read_only_fast_open`
+  160/160, `e2e_sync_reconcile` 180/180, `e2e_sync_failure_injection`
+  179/179, `e2e_sync_status_health` 166/166, `e2e_sync_artifacts` 169/169,
+  doctor fixture suite 65/65, storage_deps + e2e_relations cycle clusters
+  green.
+- Full `cargo test --all-features --no-fail-fast`: final counts recorded in
+  the release notes for v0.3.0.
