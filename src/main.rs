@@ -88,7 +88,7 @@ fn main() {
         && !matches!(cli.command, Commands::Doctor(_))
         && let Some(paths) = ctx.paths.as_ref()
     {
-        match commands::doctor::inspect_pending_sync_merge_at_path(&paths.db_path) {
+        match inspect_pending_sync_merge_for_startup(&paths.db_path) {
             Ok(Some(state)) => {
                 emit_pending_sync_merge_warning(&state, json_error_mode);
                 pending_merge_warning_emitted = true;
@@ -251,7 +251,7 @@ fn main() {
                 color_error_mode,
             )
         });
-        match inspect_pending_sync_merge_for_no_db_write(&paths.db_path, authority) {
+        match inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority) {
             Ok(Some(state)) => handle_error(
                 &pending_sync_merge_no_db_refusal_error(&state),
                 json_error_mode,
@@ -292,10 +292,7 @@ fn main() {
                 color_error_mode,
             )
         });
-        match commands::doctor::inspect_pending_sync_merge_under_authority(
-            &paths.db_path,
-            authority,
-        ) {
+        match inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority) {
             Ok(Some(state))
                 if pending_merge_disposition == PendingMergeStartupDisposition::Refuse =>
             {
@@ -1232,10 +1229,28 @@ fn pending_sync_merge_no_db_refusal_error(
     }
 }
 
-fn inspect_pending_sync_merge_for_no_db_write(
+fn inspect_pending_sync_merge_for_startup(
+    db_path: &Path,
+) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
+    // A missing database is the normal pre-import state for a JSONL-only
+    // checkout and cannot contain a pending merge receipt, so the advisory
+    // startup inspection must not push such workspaces into degraded
+    // read-only mode (#414, #409 cluster A). Doctor still reports the
+    // missing database as a finding through its stricter public inspector.
+    match fs::symlink_metadata(db_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        _ => commands::doctor::inspect_pending_sync_merge_at_path(db_path),
+    }
+}
+
+fn inspect_pending_sync_merge_for_startup_under_authority(
     db_path: &Path,
     authority: &Arc<beads_rust::sync::DatabaseFamilyWriteLock>,
 ) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
+    // Binding an exactly absent database under the held family authority
+    // makes that absence definitive for the startup gate. The subsequent
+    // writable open may then initialize/import it without leaving an
+    // unchecked replacement window.
     if authority.bind_database_inode_for_mutation()? {
         authority.verify_database_authority()?;
         return Ok(None);
@@ -2747,7 +2762,7 @@ mod tests {
         );
 
         assert!(
-            inspect_pending_sync_merge_for_no_db_write(&db_path, &authority)
+            inspect_pending_sync_merge_for_startup_under_authority(&db_path, &authority)
                 .unwrap()
                 .is_none(),
             "an exact missing DB cannot contain a pending receipt"
@@ -2764,6 +2779,23 @@ mod tests {
             "missing-DB classification must permit ordinary no-DB JSONL work"
         );
         assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn startup_advisory_allows_exact_missing_database() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+
+        assert!(
+            inspect_pending_sync_merge_for_startup(&db_path)
+                .unwrap()
+                .is_none(),
+            "a JSONL-only checkout must be allowed to initialize its database"
+        );
+        assert!(
+            !db_path.exists(),
+            "advisory inspection must remain read-only"
+        );
     }
 
     #[test]
@@ -2792,9 +2824,10 @@ mod tests {
                 .unwrap(),
             );
 
-            let state = inspect_pending_sync_merge_for_no_db_write(&db_path, &authority)
-                .unwrap()
-                .expect("pending state must refuse no-DB writer");
+            let state =
+                inspect_pending_sync_merge_for_startup_under_authority(&db_path, &authority)
+                    .unwrap()
+                    .expect("pending state must refuse no-DB writer");
             let err = pending_sync_merge_no_db_refusal_error(&state);
 
             assert_eq!(state.condition_name(), expected_condition);
