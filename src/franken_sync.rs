@@ -108,15 +108,51 @@ fn retry_busy_recovery<T>(
     }
 }
 
+/// Bounded retry for the engine's transient errors on one statement.
+///
+/// `BusyRecovery` is always retried (see [`retry_busy_recovery`]).
+/// `BusySnapshot` is first-committer-wins loss at commit; the engine
+/// contract says "retry the whole transaction". When the connection was in
+/// autocommit before the statement ran, the statement IS the whole
+/// transaction, so retrying it here is exactly that contract. Inside an
+/// explicit transaction the error is surfaced instead: only the caller can
+/// re-run its transaction body.
+fn retry_transient<T>(
+    conn: &fsqlite::Connection,
+    mut attempt: impl FnMut() -> Result<T, FrankenError>,
+) -> Result<T, FrankenError> {
+    const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const BACKOFF_CAP: std::time::Duration = std::time::Duration::from_millis(250);
+    let was_autocommit = !conn.in_transaction();
+    let start = std::time::Instant::now();
+    let mut backoff = std::time::Duration::from_millis(5);
+    loop {
+        match attempt() {
+            Err(error) => {
+                let retryable = matches!(error, FrankenError::BusyRecovery)
+                    || (matches!(error, FrankenError::BusySnapshot { .. })
+                        && was_autocommit
+                        && !conn.in_transaction());
+                if !retryable || start.elapsed() >= RETRY_BUDGET {
+                    return Err(error);
+                }
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+            ok => return ok,
+        }
+    }
+}
+
 macro_rules! with_engine_retries {
     ($conn:expr, $sql:expr, $attempt:expr) => {{
-        let first = retry_busy_recovery(|| $attempt);
+        let first = retry_transient(&$conn, || $attempt);
         match first {
             Err(ref err) if schema_stale(err) => {
                 // `prepare` refreshes the schema image from the shared
                 // publication plane even when it ultimately fails to resolve.
                 let _ = drive($conn.prepare($sql));
-                retry_busy_recovery(|| $attempt)
+                retry_transient(&$conn, || $attempt)
             }
             other => other,
         }
@@ -144,9 +180,21 @@ impl std::fmt::Debug for Connection {
 impl Connection {
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
-        Ok(Self {
-            inner: drive(fsqlite::Connection::open(path))?,
-        })
+        let inner = drive(fsqlite::Connection::open(path))?;
+        Self::from_inner(inner, true)
+    }
+
+    fn from_inner(inner: fsqlite::Connection, serialized: bool) -> Result<Self, FrankenError> {
+        let connection = Self { inner };
+        if !serialized {
+            return Ok(connection);
+        }
+        // br already serializes mutations through its workspace write lock
+        // and owns whole-transaction retries. Keep the engine on SQLite's
+        // single-writer semantics so a schema rebuild cannot be rejected by
+        // MVCC validation against its own INSERT..SELECT + DROP write set.
+        connection.execute("PRAGMA fsqlite.concurrent_mode = OFF")?;
+        Ok(connection)
     }
 
     /// Access the wrapped async connection (escape hatch for callers that
@@ -306,9 +354,9 @@ pub mod compat {
     /// Open a database with rusqlite-style open flags (synchronous form of
     /// [`fsqlite::compat::open_with_flags`]).
     pub fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection, FrankenError> {
-        Ok(Connection {
-            inner: drive(fsqlite::compat::open_with_flags(path, flags))?,
-        })
+        let serialized = flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE);
+        let inner = drive(fsqlite::compat::open_with_flags(path, flags))?;
+        Connection::from_inner(inner, serialized)
     }
 }
 
@@ -353,6 +401,74 @@ mod tests {
             .query_row_with_params(&[SqliteValue::from("a")])
             .expect("query");
         assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(1));
+    }
+
+    #[test]
+    fn string_in_list_predicates_match_equality_forms() {
+        let conn = Connection::open(":memory:").expect("open in-memory database");
+        conn.execute("CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, type TEXT)")
+            .expect("create");
+        for (a, b, t) in [
+            ("i1", "i2", "blocks"),
+            ("i2", "i1", "blocks"),
+            ("i3", "i1", "related"),
+            ("i4", "i1", "waits-for"),
+        ] {
+            conn.execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES (?1, ?2, ?3)",
+                &[
+                    SqliteValue::from(a),
+                    SqliteValue::from(b),
+                    SqliteValue::from(t),
+                ],
+            )
+            .expect("insert");
+        }
+        // The dependency-cycle graph loader depends on bare full-scan
+        // string IN-list predicates returning exactly the equality union.
+        let in_list = conn
+            .query(
+                "SELECT issue_id, depends_on_id FROM dependencies \
+                 WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')",
+            )
+            .expect("in-list query");
+        assert_eq!(in_list.len(), 3, "IN-list must match blocks + waits-for");
+        let eq = conn
+            .query("SELECT issue_id FROM dependencies WHERE type = 'blocks'")
+            .expect("equality query");
+        assert_eq!(eq.len(), 2, "equality predicate must see both blocks rows");
+        let or_form = conn
+            .query(
+                "SELECT issue_id FROM dependencies \
+                 WHERE type = 'blocks' OR type = 'conditional-blocks' OR type = 'waits-for'",
+            )
+            .expect("or query");
+        assert_eq!(or_form.len(), 3, "OR form must agree with the IN form");
+    }
+
+    #[test]
+    fn connections_default_to_serialized_engine_mode() {
+        let conn = Connection::open(":memory:").expect("open in-memory database");
+        let row = conn
+            .query_row("PRAGMA fsqlite.concurrent_mode")
+            .expect("query engine mode");
+        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(0));
+    }
+
+    #[test]
+    fn writable_compat_connections_use_serialized_engine_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("compat.db");
+        let path = db.to_string_lossy().into_owned();
+        let initial = Connection::open(path.clone()).expect("create compat database");
+        initial.close().expect("close initial connection");
+
+        let conn = compat::open_with_flags(&path, compat::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .expect("open writable compat connection");
+        let row = conn
+            .query_row("PRAGMA fsqlite.concurrent_mode")
+            .expect("query compat engine mode");
+        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(0));
     }
 
     #[test]
