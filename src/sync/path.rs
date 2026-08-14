@@ -16,6 +16,8 @@
 //! |---------|---------|
 //! | `.beads/*.db` | `SQLite` database files |
 //! | `.beads/*.db-wal` | `SQLite` WAL files |
+//! | `.beads/*.db-wal-cert` | fsqlite parallel-WAL durability certificates |
+//! | `.beads/*.db-wal-cert-head` | fsqlite checkpoint hand-off head |
 //! | `.beads/*.db-shm` | `SQLite` shared memory files |
 //! | `.beads/*.db-journal` | `SQLite` rollback journals |
 //! | `.beads/*.db-fsqlite-ns-gate` | fsqlite multi-process namespace gate |
@@ -85,6 +87,8 @@ fn external_path_descriptor(path: &Path) -> String {
 pub const ALLOWED_EXTENSIONS: &[&str] = &[
     "db",                 // SQLite database
     "db-wal",             // SQLite WAL
+    "db-wal-cert",        // fsqlite 0.2+ parallel-WAL durability certificates
+    "db-wal-cert-head",   // fsqlite 0.2+ checkpoint hand-off head
     "db-shm",             // SQLite shared memory
     "db-journal",         // SQLite rollback journal
     "db-fsqlite-ns-gate", // fsqlite multi-process namespace gate
@@ -633,10 +637,21 @@ pub fn validate_sync_path_with_external(
     } else {
         path.to_path_buf()
     };
+    // A dotdot-carrying path that physically resolves inside `.beads/`
+    // (e.g. `--db root/x/../.beads/beads.db`) must classify as internal:
+    // the raw form never prefix-matches the canonicalized beads_dir, and
+    // misclassifying it external refused valid workspaces (#409 routing
+    // cluster). Lexical normalization only widens into the *stricter*
+    // internal branch, whose validate_sync_path re-normalizes and runs the
+    // symlink-escape checks itself.
+    let normalized_resolved = normalize_path_lexically(&resolved_path);
     let is_internal = path.starts_with(beads_dir)
         || path.starts_with(&canonical_beads)
         || resolved_path.starts_with(beads_dir)
-        || resolved_path.starts_with(&canonical_beads);
+        || resolved_path.starts_with(&canonical_beads)
+        || normalized_resolved.as_deref().is_some_and(|normalized| {
+            normalized.starts_with(beads_dir) || normalized.starts_with(&canonical_beads)
+        });
 
     // CRITICAL: Git paths are ALWAYS rejected, even with allow_external. Do
     // not disclose an absolute external path while reporting that rejection.

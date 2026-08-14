@@ -18132,7 +18132,9 @@ impl SqliteStorage {
     /// Inspect pending-sync-merge state on an existing current-schema database
     /// while a caller-owned database-family authority prevents replacement.
     ///
-    /// Missing databases, stale/future schemas, route mismatches, open errors,
+    /// A definitively missing file or a file that cannot possibly be SQLite
+    /// cannot contain a pending receipt and is classified `Absent`. Valid
+    /// SQLite files with stale/future schemas, route mismatches, open errors,
     /// query errors, and receipt validation failures all fail closed. The
     /// read-only storage carries the caller's authority, so
     /// `with_read_transaction` verifies it before the transaction, immediately
@@ -18150,13 +18152,19 @@ impl SqliteStorage {
             });
         }
         if authority.bind_database_inode_for_mutation()? {
-            return Err(BeadsError::SyncConflict {
-                message:
-                    "Pending sync-merge state is unknown because the authorized database is missing"
-                        .to_string(),
-            });
+            authority.verify_database_authority()?;
+            return Ok(PendingSyncMergeInspection::Absent);
         }
         authority.verify_database_authority()?;
+        let mut header = [0_u8; 16];
+        let is_sqlite = std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .is_ok()
+            && &header == b"SQLite format 3\0";
+        authority.verify_database_authority()?;
+        if !is_sqlite {
+            return Ok(PendingSyncMergeInspection::Absent);
+        }
         let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {

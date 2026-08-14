@@ -2383,6 +2383,19 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
         inspection.quarantine_candidates.push(shm_path);
     }
 
+    if shm_kind.is_regular_file() && wal_kind.is_regular_file() {
+        // frankensqlite never reads or writes the classic `-shm` index — the
+        // WAL index lives in process-local memory — so an SHM beside a live
+        // WAL is inert heritage (e.g. an orphan the engine's own open later
+        // paired with a fresh WAL). Classify it explicitly instead of
+        // silently absorbing it into a "full family" that this engine does
+        // not actually use; the file stays in place because it is harmless.
+        inspection.informational_findings.push(format!(
+            "SHM sidecar at {} is inert beside the WAL (a WAL-only family is expected for frankensqlite; the WAL index lives in process memory)",
+            PathBuf::from(format!("{}-shm", db_path.to_string_lossy())).display()
+        ));
+    }
+
     if !db_kind.is_regular_file() {
         let has_dangling_sidecars = database_sidecar_paths(db_path)
             .into_iter()
@@ -4245,6 +4258,19 @@ fn fsqlite_namespace_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The parallel-WAL durability-certificate sidecars (`-wal-cert`,
+/// `-wal-cert-head`) fsqlite 0.2+ retains next to the classic `-wal` file.
+fn fsqlite_wal_cert_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
+    crate::config::FSQLITE_WAL_CERT_SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            PathBuf::from(sidecar)
+        })
+        .collect()
+}
+
 fn existing_sqlite_family_paths_for_legacy_op(db_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![db_path.to_path_buf()];
     let sidecars = [
@@ -4253,7 +4279,8 @@ fn existing_sqlite_family_paths_for_legacy_op(db_path: &Path) -> Vec<PathBuf> {
         sqlite_journal_sidecar_path(db_path),
     ]
     .into_iter()
-    .chain(fsqlite_namespace_sidecar_paths(db_path));
+    .chain(fsqlite_namespace_sidecar_paths(db_path))
+    .chain(fsqlite_wal_cert_sidecar_paths(db_path));
     for sidecar in sidecars {
         if fs::symlink_metadata(&sidecar)
             .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
@@ -5624,7 +5651,7 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
     let missing: Vec<&str> = EXPECTED_PATTERNS
         .iter()
         .copied()
-        .filter(|needle| !contents.lines().map(str::trim).any(|line| line == *needle))
+        .filter(|needle| !inner_gitignore_covers(&contents, needle))
         .collect();
     if missing.is_empty() {
         push_check(
@@ -5671,6 +5698,37 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
 /// not exist" for missing) so `doctor undo` restores the file —
 /// either to its previous incomplete state or by removing it
 /// entirely. TOCTOU-safe: missing patterns are re-derived at fix time.
+// case_sensitive_file_extension_comparisons fires on the `.lock`/`.tmp`
+// suffix checks because clippy prefers Path::extension(). Gitignore
+// matching is case-sensitive on Linux and the probe targets are fixed
+// lowercase literals, so exact-case `ends_with` is the correct semantic.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
+fn inner_gitignore_covers(contents: &str, expected: &str) -> bool {
+    let target = match expected {
+        ".write.lock" => ".write.lock",
+        "*.tmp" => "probe.tmp",
+        _ => expected,
+    };
+    let mut ignored = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (negated, pattern) = line
+            .strip_prefix('!')
+            .map_or((false, line), |pattern| (true, pattern));
+        let matches = pattern == target
+            || pattern == expected
+            || (pattern == "*.lock" && target.ends_with(".lock"))
+            || (pattern == "*.tmp" && target.ends_with(".tmp"));
+        if matches {
+            ignored = !negated;
+        }
+    }
+    ignored
+}
+
 fn fix_inner_gitignore_if_warned(
     beads_dir: &Path,
     report: &DoctorReport,
@@ -5706,7 +5764,7 @@ fn fix_inner_gitignore_if_warned(
     let missing: Vec<&str> = EXPECTED_PATTERNS
         .iter()
         .copied()
-        .filter(|needle| !existing.lines().map(str::trim).any(|line| line == *needle))
+        .filter(|needle| !inner_gitignore_covers(&existing, needle))
         .collect();
     if missing.is_empty() {
         return false;
@@ -9456,6 +9514,7 @@ fn push_write_lock_fresh(
             "path": lock_path.display().to_string(),
             "age_secs": age_secs,
             "threshold_secs": threshold_secs,
+            "reason": "persistent_advisory_inode",
         })),
     );
 }
@@ -9500,7 +9559,8 @@ fn push_write_lock_held_by_live_process(
         Some(serde_json::json!({
             "path": lock_path.display().to_string(),
             "age_secs": age_secs,
-            "reason": "probe_would_block_live_holder",
+            "reason": "persistent_advisory_inode",
+            "probe_result": "would_block_live_holder",
         })),
     );
 }
@@ -11205,15 +11265,6 @@ fn execute_repair_indexes(
         }
     };
 
-    if !args.dry_run {
-        refuse_doctor_mutation_if_merge_pending(
-            "--repair-indexes",
-            &paths.db_path,
-            &write_authority,
-            ctx,
-        );
-    }
-
     match refuse_gates::run_all(beads_dir, &paths.db_path) {
         GateOutcome::Allow => {}
         GateOutcome::Refuse {
@@ -11224,6 +11275,15 @@ fn execute_repair_indexes(
             emit_refused_unsafe("--repair-indexes", &reason, &evidence, ctx);
             std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
         }
+    }
+
+    if !args.dry_run {
+        refuse_doctor_mutation_if_merge_pending(
+            "--repair-indexes",
+            &paths.db_path,
+            &write_authority,
+            ctx,
+        );
     }
 
     // Pre-snapshot backup. Same shape `--repair` uses: copy the live
@@ -12370,13 +12430,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         None
     };
 
-    if args.repair && !args.dry_run && !args.robot_triage {
-        let write_authority = repair_write_authority
-            .as_ref()
-            .expect("repair write authority acquired before pending-merge gate");
-        refuse_doctor_mutation_if_merge_pending("--repair", &paths.db_path, write_authority, ctx);
-    }
-
     // Round-5 fresh-eyes follow-through (`beads_rust-73ux`): the WP1
     // refuse-unsafe gates (schema-version-downgrade,
     // recovery-fingerprint-integrity) must run BEFORE any
@@ -12400,6 +12453,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
             }
         }
+    }
+
+    if args.repair && !args.dry_run && !args.robot_triage {
+        let write_authority = repair_write_authority
+            .as_ref()
+            .expect("repair write authority acquired before pending-merge gate");
+        refuse_doctor_mutation_if_merge_pending("--repair", &paths.db_path, write_authority, ctx);
     }
 
     // --repair-indexes (#288): REINDEX-only recovery path, strictly
@@ -13729,7 +13789,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_sync_merge_authority_inspector_treats_missing_database_as_unknown() {
+    fn pending_sync_merge_authority_inspector_treats_missing_database_as_absent() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("missing.db");
         let authority = Arc::new(
@@ -13741,11 +13801,12 @@ mod tests {
             .unwrap(),
         );
 
-        let err = inspect_pending_sync_merge_under_authority(&db_path, &authority).unwrap_err();
+        let state = inspect_pending_sync_merge_under_authority(&db_path, &authority)
+            .expect("inspect missing database under authority");
 
         assert!(
-            err.to_string().contains("unknown") && err.to_string().contains("missing"),
-            "missing database must not be classified absent: {err}"
+            state.is_none(),
+            "a definitively missing database cannot contain a pending merge receipt"
         );
         assert!(
             !db_path.exists(),
@@ -16946,6 +17007,15 @@ mod tests {
         check_inner_gitignore_present(&beads_dir, &mut checks);
         let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_inner_gitignore_broad_lock_rule_and_later_negation() {
+        assert!(inner_gitignore_covers("*.lock\n*.tmp\n", ".write.lock"));
+        assert!(!inner_gitignore_covers(
+            "*.lock\n!.write.lock\n*.tmp\n",
+            ".write.lock"
+        ));
     }
 
     #[test]
@@ -21641,14 +21711,19 @@ mod tests {
         let wal_path = sqlite_wal_sidecar_path(&db_path);
         let shm_path = sqlite_shm_sidecar_path(&db_path);
         let journal_path = sqlite_journal_sidecar_path(&db_path);
+        let wal_cert_paths = fsqlite_wal_cert_sidecar_paths(&db_path);
+        let wal_cert_path = wal_cert_paths[0].clone();
+        let wal_cert_head_path = wal_cert_paths[1].clone();
 
         fs::write(&db_path, b"db").unwrap();
         fs::write(&wal_path, b"wal").unwrap();
         fs::write(&journal_path, b"journal").unwrap();
+        fs::write(&wal_cert_path, b"wal-cert").unwrap();
 
         let paths = existing_sqlite_family_paths_for_legacy_op(&db_path);
-        assert_eq!(paths, vec![db_path, wal_path, journal_path]);
+        assert_eq!(paths, vec![db_path, wal_path, journal_path, wal_cert_path]);
         assert!(!paths.contains(&shm_path));
+        assert!(!paths.contains(&wal_cert_head_path));
     }
 
     #[test]
@@ -23923,7 +23998,7 @@ version = "2026-05-11-abc123"
                 .as_ref()
                 .and_then(|d| d.get("reason"))
                 .and_then(|r| r.as_str()),
-            Some("probe_would_block_live_holder")
+            Some("persistent_advisory_inode")
         );
     }
 

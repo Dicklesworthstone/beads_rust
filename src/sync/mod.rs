@@ -1199,7 +1199,11 @@ fn open_and_lock_regular_file(
     mechanism: ExclusiveLockMechanism,
 ) -> Result<File> {
     let lock_path_display = if redact_path {
-        database_path_descriptor(lock_path)
+        if role.starts_with("JSONL-") {
+            additive_path_descriptor(lock_path, "jsonl-authority")
+        } else {
+            database_path_descriptor(lock_path)
+        }
     } else {
         lock_path.display().to_string()
     };
@@ -1294,7 +1298,11 @@ fn open_and_lock_regular_file(
 
     loop {
         if start.elapsed() >= timeout {
-            return Err(write_lock_timeout_error(&lock_path_display, timeout_ms));
+            return Err(write_lock_timeout_error(
+                &lock_path_display,
+                role,
+                timeout_ms,
+            ));
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
@@ -1324,7 +1332,11 @@ fn verify_locked_file_identity(
     redact_path: bool,
 ) -> Result<()> {
     let lock_path_display = if redact_path {
-        database_path_descriptor(lock_path)
+        if role.starts_with("JSONL-") {
+            additive_path_descriptor(lock_path, "jsonl-authority")
+        } else {
+            database_path_descriptor(lock_path)
+        }
     } else {
         lock_path.display().to_string()
     };
@@ -1352,10 +1364,10 @@ fn verify_locked_file_identity(
     Ok(())
 }
 
-fn write_lock_timeout_error(lock_path_display: &str, timeout_ms: u64) -> BeadsError {
+fn write_lock_timeout_error(lock_path_display: &str, role: &str, timeout_ms: u64) -> BeadsError {
     BeadsError::Config(format!(
-        "Timed out after {timeout_ms}ms waiting for write lock at {}. \
-         Another br process may be holding .write.lock; retry after it exits or investigate a stuck process.",
+        "Timed out after {timeout_ms}ms waiting for write lock ({role}) at {}. \
+         Another br process may be holding that authority; retry after it exits or investigate a stuck process.",
         lock_path_display
     ))
 }

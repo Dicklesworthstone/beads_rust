@@ -238,10 +238,13 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER NOT NULL DEFAULT 0,
         pinned INTEGER NOT NULL DEFAULT 0,
         is_template INTEGER NOT NULL DEFAULT 0,
-        -- source_repo_path is appended at the end (after is_template) to match
-        -- the position SQLite assigns to ALTER TABLE ADD COLUMN on existing DBs.
-        -- This keeps `EXPECTED_ISSUE_COLUMN_ORDER` consistent for both freshly-
-        -- created and migrated databases. See #289 for context.
+        -- The repo-path column is appended at the end (after the template
+        -- flag) to match the position SQLite assigns to ALTER TABLE ADD
+        -- COLUMN on existing DBs. This keeps `EXPECTED_ISSUE_COLUMN_ORDER`
+        -- consistent for both freshly-created and migrated databases.
+        -- Column names are deliberately not repeated in these comments:
+        -- fsqlite 0.3+ stores the CREATE TABLE text faithfully (comments
+        -- included), and schema audits count declaration tokens. See #289.
         source_repo_path TEXT,
         -- agent_context (schema v11, #297) carries canonical-JSON governing
         -- instructions inherited by descendants on br update --status

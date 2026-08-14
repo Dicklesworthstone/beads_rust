@@ -189,8 +189,15 @@ impl ConfigPaths {
     /// Returns an error if metadata cannot be read.
     pub fn resolve(beads_dir: &Path, db_override: Option<&PathBuf>) -> Result<Self> {
         let metadata = Metadata::load(beads_dir)?;
-        let db_path = resolve_db_path(beads_dir, &metadata, db_override);
-        let jsonl_path = resolve_jsonl_path(beads_dir, &metadata, db_override);
+        // Resolve an explicit database authority once before deriving either
+        // member of the DB/JSONL family. Keeping a raw `subdir/../.beads`
+        // spelling here made the database and its sibling JSONL disagree
+        // with the already-canonical workspace route, and the JSONL safety
+        // boundary then correctly refused the surviving traversal token.
+        let normalized_db_override = db_override.map(|path| normalize_db_override_path(path));
+        let normalized_db_override_ref = normalized_db_override.as_ref();
+        let db_path = resolve_db_path(beads_dir, &metadata, normalized_db_override_ref);
+        let jsonl_path = resolve_jsonl_path(beads_dir, &metadata, normalized_db_override_ref);
 
         Ok(Self {
             beads_dir: beads_dir.to_path_buf(),
@@ -229,6 +236,23 @@ impl ConfigPaths {
     pub fn project_config_path(&self) -> Option<PathBuf> {
         Some(self.beads_dir.join("config.yaml"))
     }
+}
+
+fn normalize_db_override_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = dunce::canonicalize(path) {
+        return canonical;
+    }
+
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+
+    dunce::canonicalize(parent)
+        .map(|canonical_parent| canonical_parent.join(file_name))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Discover the active `.beads` directory.
@@ -676,6 +700,34 @@ fn open_sqlite_storage_with_recovery_after_fast_open_miss(
             message: "Writable fast-open fallback has no database authority".to_string(),
         })?;
     let database_was_missing = effective_authority.bind_database_inode_for_mutation()?;
+    // Read-only fast-open commands legitimately skip the startup
+    // pending-merge gate, so this writable fallback must re-impose the same
+    // barriers under the authority it just acquired, before any open that
+    // could recover or migrate: a valid database on a stale schema routes to
+    // the reviewed migration workflow instead of auto-migrating, and a
+    // pending sync merge refuses writable recovery until `br sync --merge`
+    // reconciles it. Missing files and non-SQLite bytes classify Absent and
+    // keep the normal recovery path.
+    if !database_was_missing {
+        match SqliteStorage::inspect_pending_sync_merge_under_authority(
+            &paths.db_path,
+            effective_authority,
+        ) {
+            Ok(crate::storage::sqlite::PendingSyncMergeInspection::Absent) => {}
+            Ok(pending) => {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing writable fast-open fallback because {}; run `br sync --merge` to resume and verify artifact reconciliation first",
+                        pending.diagnostic()
+                    ),
+                });
+            }
+            Err(error @ BeadsError::SchemaMismatch { .. }) => {
+                return Err(error.reviewed_schema_migration_required());
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let open_result = if database_was_missing && paths.jsonl_path.is_file() {
         open_when_db_file_is_missing(
             beads_dir,
@@ -2377,6 +2429,10 @@ fn actual_child_counters(storage: &SqliteStorage) -> Result<HashMap<String, u32>
 pub(crate) const FSQLITE_NAMESPACE_SIDECAR_SUFFIXES: &[&str] =
     &["-fsqlite-ns-gate", "-fsqlite-ns-use"];
 
+/// The parallel-WAL durability-certificate sidecars fsqlite 0.2+ maintains
+/// next to the classic `-wal` file.
+pub(crate) const FSQLITE_WAL_CERT_SIDECAR_SUFFIXES: &[&str] = &["-wal-cert", "-wal-cert-head"];
+
 /// The classic SQLite sidecars.
 pub(crate) const CLASSIC_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 
@@ -2385,6 +2441,7 @@ pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static st
     CLASSIC_SIDECAR_SUFFIXES
         .iter()
         .chain(FSQLITE_NAMESPACE_SIDECAR_SUFFIXES.iter())
+        .chain(FSQLITE_WAL_CERT_SIDECAR_SUFFIXES.iter())
 }
 
 /// Best-effort removal of every engine sidecar belonging to `db_path`.
@@ -2778,13 +2835,13 @@ pub(crate) fn recovery_dir_for_db_path(db_path: &Path, beads_dir: &Path) -> Path
 }
 
 fn database_family_paths(db_path: &Path) -> Vec<PathBuf> {
-    let db_string = db_path.to_string_lossy();
-    vec![
-        db_path.to_path_buf(),
-        PathBuf::from(format!("{db_string}-wal")),
-        PathBuf::from(format!("{db_string}-shm")),
-        PathBuf::from(format!("{db_string}-journal")),
-    ]
+    std::iter::once(db_path.to_path_buf())
+        .chain(db_sidecar_suffixes().map(|suffix| {
+            let mut sidecar = db_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            PathBuf::from(sidecar)
+        }))
+        .collect()
 }
 
 fn copy_database_family_to_directory(db_path: &Path, destination_dir: &Path) -> Result<PathBuf> {
@@ -3277,7 +3334,12 @@ impl OpenStorageResult {
             .files
             .iter()
             .any(|(_, backup)| fs::symlink_metadata(backup).is_ok());
-        if backup_artifacts_remain {
+        // A missing original database has no backup artifacts, but the fresh
+        // placeholder family still has to be staged out of the routed path
+        // before its inode authority can be cleared. When an original family
+        // did exist, only attempt restoration while its verified backups are
+        // still present; otherwise preserve the current path fail-closed.
+        if !had_original_database_family || backup_artifacts_remain {
             restore_database_family_after_failed_rebuild(&backup_set)?;
         }
         if had_original_database_family {
@@ -4433,6 +4495,18 @@ impl CliOverrides {
     ) {
         self.held_write_lock_beads_dir = Some(beads_dir.to_path_buf());
         self.held_write_authority = Some(Arc::clone(guard));
+    }
+
+    /// Drop this override set's share of the database-family authority.
+    ///
+    /// The marker holds a live `Arc` clone of the flock guard, so a caller
+    /// that releases its own guard but keeps a marked `CliOverrides` alive
+    /// would silently keep the workspace lock held. Long-lived commands that
+    /// only needed startup authority for a gate check (e.g. `br serve`) must
+    /// clear the marker alongside dropping the guard.
+    pub fn clear_database_family_lock_marker(&mut self) {
+        self.held_write_lock_beads_dir = None;
+        self.held_write_authority = None;
     }
 
     #[must_use]
@@ -7761,8 +7835,6 @@ routing:
     }
 
     #[test]
-    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
-                pre-merge snapshot); tracked for completion by the owning workstream"]
     fn deferred_recovery_restore_for_missing_db_cleans_up_fresh_database_family() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -8182,6 +8254,72 @@ routing:
 
         assert_eq!(issue.title, "Recovered from JSONL only");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn missing_db_recovery_quarantines_orphaned_fsqlite_sidecars() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        write_single_issue_jsonl(&jsonl_path, "bd-sidecars", "Recovered after sidecars");
+
+        let orphan_sidecars: &[(&str, &[u8])] = &[
+            ("-wal-cert", b"orphan-wal-cert"),
+            ("-wal-cert-head", b"orphan-wal-cert-head"),
+            ("-fsqlite-ns-gate", b"orphan-ns-gate"),
+            ("-fsqlite-ns-use", b"orphan-ns-use"),
+        ];
+        for (suffix, sentinel) in orphan_sidecars {
+            let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+            fs::write(path, sentinel).expect("write orphaned engine sidecar");
+        }
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("bd-sidecars")
+            .expect("query issue")
+            .expect("issue should exist after rebuild");
+        assert_eq!(issue.title, "Recovered after sidecars");
+        drop(storage_ctx);
+
+        let recovery_dir = beads_dir.join(RECOVERY_DIR_NAME);
+        for (suffix, sentinel) in orphan_sidecars {
+            let original_name = format!("beads.db{suffix}");
+            let backups: Vec<_> = fs::read_dir(&recovery_dir)
+                .expect("list recovery dir")
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(&format!("{original_name}."))
+                                && Path::new(name)
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("bak"))
+                        })
+                })
+                .collect();
+            assert_eq!(backups.len(), 1, "{original_name} backup count");
+            assert_eq!(
+                fs::read(&backups[0]).expect("read quarantined sidecar"),
+                *sentinel,
+                "{original_name} bytes must be preserved"
+            );
+
+            let live_path = beads_dir.join(&original_name);
+            if live_path.exists() {
+                assert_ne!(
+                    fs::read(&live_path).expect("read replacement sidecar"),
+                    *sentinel,
+                    "the orphaned {original_name} must not remain live"
+                );
+            }
+        }
     }
 
     #[test]
