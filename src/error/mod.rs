@@ -291,6 +291,24 @@ pub enum BeadsError {
 }
 
 impl BeadsError {
+    /// Route a schema-version mismatch into the reviewed migration workflow.
+    ///
+    /// Ordinary commands never migrate an existing tracker database in place;
+    /// both the startup pending-merge gate and the read-only fast-open
+    /// writable fallback wrap the raw [`Self::SchemaMismatch`] with this
+    /// operator guidance so every refusal names the same explicit,
+    /// receipt-bound path.
+    #[must_use]
+    pub fn reviewed_schema_migration_required(self) -> Self {
+        Self::WithContext {
+            context: "ordinary commands never migrate an existing tracker database; run \
+                      `br doctor migrate-schema plan` and review its receipt before applying the \
+                      explicit migration"
+                .to_string(),
+            source: Box::new(self),
+        }
+    }
+
     /// Returns true if the error is transient and can be retried.
     #[must_use]
     pub fn is_transient(&self) -> bool {

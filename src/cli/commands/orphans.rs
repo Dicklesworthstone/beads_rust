@@ -123,12 +123,13 @@ fn execute_inner(
     beads_dir: &Path,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    // beads_rust-750p: orphans must auto-import a newer JSONL before
-    // scanning issue state, so JSONL-only closures (e.g. from `git pull`)
-    // are reflected in the orphan list. We only do this on the
-    // non-preloaded path; the preloaded path was opened by main.rs
-    // (potentially in read_only_fast_open mode) and routes through its
-    // own auto-import probe in the startup phase.
+    // beads_rust-750p: ordinary orphans scans must auto-import a newer JSONL
+    // before scanning issue state, so JSONL-only closures (e.g. from `git
+    // pull`) are reflected in the orphan list. An explicit read-only fast
+    // open (`--no-auto-import --no-auto-flush`) instead preserves that
+    // contract here: open the current database read-only and do not join the
+    // workspace writer queue. The preloaded path was already handled by
+    // main.rs under the same policy.
     //
     // CONCURRENCY NOTE: We do NOT acquire the project's `.write.lock`
     // explicitly here. This deviates from the audit/close/etc. flows in
@@ -145,14 +146,10 @@ fn execute_inner(
     let owned_storage_ctx = if preloaded_storage_ctx.is_some() {
         None
     } else {
-        // Open with a writable cli (clear read_only_fast_open) so the
-        // auto-import probe + import can mutate the DB. Without this,
-        // the read-only fast-path connection raises "Bad file descriptor"
-        // when imports try to write.
-        let mut writable_cli = cli.clone();
-        writable_cli.read_only_fast_open = false;
-        let mut ctx_owned = config::open_storage_with_cli(beads_dir, &writable_cli)?;
-        crate::cli::commands::auto_import_storage_ctx_if_stale(&mut ctx_owned, &writable_cli)?;
+        let mut ctx_owned = config::open_storage_with_cli(beads_dir, cli)?;
+        if !cli.read_only_fast_open {
+            crate::cli::commands::auto_import_storage_ctx_if_stale(&mut ctx_owned, cli)?;
+        }
         Some(ctx_owned)
     };
     let storage_ctx = preloaded_storage_ctx

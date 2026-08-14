@@ -70,6 +70,17 @@ fn main() {
     let needs_preopened_storage_context = should_auto_import_now || should_auto_flush_now;
     let mut should_preopen_storage =
         should_preopen_storage(storage_enabled, needs_preopened_storage_context);
+    // `br serve` runs a long-lived MCP server that opens storage and performs
+    // import/flush around each request itself. A preopened storage context
+    // would own the database-family authority for the server's whole
+    // lifetime, deadlocking the server's own same-process per-request
+    // acquisitions and starving other workspace writers, so serve never
+    // preopens (its pending-merge startup gate below still runs).
+    #[cfg(feature = "mcp")]
+    if matches!(cli.command, Commands::Serve(_)) {
+        should_auto_import_now = false;
+        should_preopen_storage = false;
+    }
     let command_needs_write_lock = needs_write_lock(&cli.command);
     let no_db_jsonl_write = ctx.no_db() && no_db_jsonl_write_intent(&cli.command);
 
@@ -279,6 +290,11 @@ fn main() {
             || pending_merge_mutation_gate_required)
         && pending_merge_disposition != PendingMergeStartupDisposition::Resume
         && !matches!(cli.command, Commands::Doctor(_))
+        // Read-only fast-open runs without the family authority; the
+        // advisory path-only inspection above already classified pending
+        // state for it, and a fast-open miss reacquires the authority (and
+        // with it this definitive gate) before any writable fallback.
+        && !(write_lock.is_none() && ctx.overrides.read_only_fast_open)
         && let Some(paths) = ctx.paths.as_ref()
     {
         let authority = write_lock.as_ref().unwrap_or_else(|| {
@@ -334,6 +350,25 @@ fn main() {
     {
         overrides.mark_database_family_lock_held(beads_dir, write_lock);
     }
+
+    // `br serve` only acquires startup authority for the pending-merge
+    // mutation gate above. The server outlives startup, its bootstrap and
+    // MCP mutation handlers take the same `.write.lock` flock through fresh
+    // descriptors (a same-process conflict, not reentrant), and holding the
+    // authority for the server's lifetime would also starve every other
+    // workspace writer. The gate verdict is final here, so release both the
+    // guard and the marked `Arc` clone before dispatch.
+    #[cfg(feature = "mcp")]
+    let write_lock = if matches!(cli.command, Commands::Serve(_)) {
+        overrides.clear_database_family_lock_marker();
+        ctx.overrides.clear_database_family_lock_marker();
+        // Shadowing alone would keep the old binding — and its flock — alive
+        // until `main` returns; move it out and release it now.
+        drop(write_lock);
+        None
+    } else {
+        write_lock
+    };
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -1042,9 +1077,16 @@ const fn sync_mode_opens_storage(args: &beads_rust::cli::SyncArgs) -> bool {
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
-    _read_only_fast_open: bool,
+    read_only_fast_open: bool,
 ) -> bool {
-    command_needs_write_lock || should_preopen_storage
+    // Read-only fast-open commands try the current-schema read-only engine
+    // path before joining the writer-lock queue (1b75961a, reverted by the
+    // 251b501b rescue merge and restored here). A fast-open miss clears
+    // `read_only_fast_open` and reacquires the family authority inside
+    // config before any recovery or writable fallback, and pending-merge
+    // mutation gates still force the lock through
+    // `startup_database_authority_required`.
+    !read_only_fast_open && (command_needs_write_lock || should_preopen_storage)
 }
 
 // The startup gate genuinely composes four independent boolean facts; a
@@ -1212,13 +1254,7 @@ fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeSt
 }
 
 fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {
-    BeadsError::WithContext {
-        context: "ordinary commands never migrate an existing tracker database; run \
-                  `br doctor migrate-schema plan` and review its receipt before applying the \
-                  explicit migration"
-            .to_string(),
-        source: Box::new(source),
-    }
+    source.reviewed_schema_migration_required()
 }
 
 fn pending_sync_merge_no_db_refusal_error(
@@ -1670,7 +1706,9 @@ fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bo
     let BeadsError::Config(message) = err else {
         return false;
     };
-    message.contains("Failed to open write lock") && write_lock_lacks_owner_write(lock_path)
+    (message.contains("Failed to open write lock")
+        || message.contains("Failed to open workspace write lock"))
+        && write_lock_lacks_owner_write(lock_path)
 }
 
 fn is_write_lock_contention_error(lock_path: &Path, err: &BeadsError) -> bool {
@@ -1678,7 +1716,7 @@ fn is_write_lock_contention_error(lock_path: &Path, err: &BeadsError) -> bool {
         return false;
     };
     message.contains("Timed out after")
-        && message.contains("waiting for write lock at")
+        && message.contains("waiting for write lock")
         && message.contains(lock_path.to_string_lossy().as_ref())
 }
 
@@ -2678,14 +2716,14 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_holds_authority_before_any_fallback() {
+    fn read_only_fast_open_defers_startup_write_lock_until_fallback() {
         assert!(
-            should_acquire_startup_write_lock(true, false, true),
-            "read-only fast-open commands need authority before the live pending-saga gate"
+            !should_acquire_startup_write_lock(true, false, true),
+            "read-only fast-open commands try the current-schema read-only DB before joining the writer lock path"
         );
         assert!(
-            should_acquire_startup_write_lock(true, true, true),
-            "fast-open misses must not reach writable fallback without preexisting authority"
+            !should_acquire_startup_write_lock(true, true, true),
+            "auto-import probes can use read-only fast-open first; fast-open misses reacquire the lock before writable fallback"
         );
         assert!(
             should_acquire_startup_write_lock(false, true, false),
@@ -3413,8 +3451,8 @@ mod tests {
         assert!(should_acquire_startup_write_lock(true, false, false));
         assert!(should_acquire_startup_write_lock(true, true, false));
         assert!(!should_acquire_startup_write_lock(false, false, false));
-        assert!(should_acquire_startup_write_lock(false, true, true));
-        assert!(should_acquire_startup_write_lock(true, false, true));
-        assert!(should_acquire_startup_write_lock(true, true, true));
+        assert!(!should_acquire_startup_write_lock(false, true, true));
+        assert!(!should_acquire_startup_write_lock(true, false, true));
+        assert!(!should_acquire_startup_write_lock(true, true, true));
     }
 }
