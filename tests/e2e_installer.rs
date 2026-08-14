@@ -58,6 +58,10 @@ fn run_installer(temp_dir: &TempDir, args: &[&str], env_vars: HashMap<&str, &str
     cmd.env("HOME", temp_dir.path());
     cmd.env("DEST", &dest_dir);
     cmd.env("NO_GUM", "1"); // Disable fancy output for test parsing
+    // Private per-test lock path: install.sh derives its install lock from
+    // TMPDIR, and the shared /tmp lock otherwise lets parallel installer
+    // tests race each other's (deliberately planted) stale locks.
+    cmd.env("TMPDIR", temp_dir.path());
     cmd.current_dir(temp_dir.path());
 
     // Clear potentially interfering variables
@@ -538,11 +542,11 @@ fn e2e_installer_lock_prevents_concurrent() {
 
     let temp = TempDir::new().expect("temp dir");
 
-    // Create a stale lock directory
-    let lock_dir = PathBuf::from("/tmp/br-install.lock.d");
-
-    // Clean up any existing lock first
-    let _ = fs::remove_dir_all(&lock_dir);
+    // Create a stale lock directory inside this test's private TMPDIR
+    // (run_installer points TMPDIR at the temp dir, and install.sh derives
+    // its lock from TMPDIR), so parallel installer tests cannot race the
+    // deliberately planted stale lock.
+    let lock_dir = temp.path().join("br-install.lock.d");
 
     // Create lock with a PID that doesn't exist
     fs::create_dir_all(&lock_dir).expect("create lock dir");

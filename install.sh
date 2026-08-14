@@ -123,7 +123,10 @@ CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 INSECURE_SKIP_CHECKSUM=0
-LOCK_FILE="/tmp/br-install.lock"
+# Honor TMPDIR (POSIX convention) so sandboxed/hermetic environments get a
+# private lock; default environments keep the shared /tmp lock that protects
+# against genuinely concurrent installs.
+LOCK_FILE="${TMPDIR:-/tmp}/br-install.lock"
 NO_GUM=0
 SKIP_SKILLS=0
 # Per-skill opt-ins. Default is to NOT install the bd-to-br-migration skill
