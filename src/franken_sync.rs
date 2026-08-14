@@ -360,12 +360,15 @@ mod tests {
         // A bridge call issued while another bridge call's runtime is checked
         // out must not panic or deadlock (the thread-local slot is empty, so
         // a fresh runtime is built).
-        let conn = Connection::open(":memory:").expect("open in-memory database");
-        conn.execute("CREATE TABLE t (k INTEGER)").expect("create");
-        let nested = Connection::open(":memory:").expect("nested open");
-        nested.execute("CREATE TABLE u (k INTEGER)").expect("nested create");
-        drop(nested);
-        conn.execute("INSERT INTO t (k) VALUES (1)").expect("insert");
-        assert_eq!(conn.query("SELECT k FROM t").expect("query").len(), 1);
+        let row_count = drive(async {
+            let conn = Connection::open(":memory:").expect("nested open");
+            conn.execute("CREATE TABLE t (k INTEGER)")
+                .expect("nested create");
+            conn.execute("INSERT INTO t (k) VALUES (1)")
+                .expect("nested insert");
+            conn.query("SELECT k FROM t").expect("nested query").len()
+        });
+
+        assert_eq!(row_count, 1);
     }
 }
