@@ -40,6 +40,11 @@ sync_base.jsonl
 # Local history backups
 .br_history/
 
+# Local recovery backups (schema-migration receipts, pre-repair copies)
+# — same lifecycle as .br_history/, written by recovery paths and
+# per-machine only
+.br_recovery/
+
 # bv (beads viewer) lock file
 .bv.lock
 
