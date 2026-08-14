@@ -60,10 +60,10 @@ fsqlite-observability = "0.3.1"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
-# Pinned =0.4.3 to match the fsqlite family's asupersync requirement exactly
+# Pinned =0.4.4 to match the fsqlite family's asupersync requirement exactly
 # at that seam. The optional `mcp` feature independently retains FastMCP's
 # asupersync 0.3.x line. default-features = false mirrors fsqlite's own spec.
-asupersync = { version = "=0.4.3", default-features = false }
+asupersync = { version = "=0.4.4", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
