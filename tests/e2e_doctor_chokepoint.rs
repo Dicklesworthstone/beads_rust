@@ -172,6 +172,9 @@ fn parse_trailing_json(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("parse JSON failed ({e}): {}", &trimmed[start..]))
 }
 
+// Retained helper: not referenced by the current test set (pre-existing on
+// main; kept per the suite's convention for shared doctor fixture helpers).
+#[allow(dead_code)]
 fn doctor_check<'a>(payload: &'a Value, name: &str) -> &'a Value {
     payload["checks"]
         .as_array()

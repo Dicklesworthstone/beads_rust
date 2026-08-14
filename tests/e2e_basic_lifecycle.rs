@@ -1612,9 +1612,12 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .count(),
-        committed_receipt["jsonl_after_issue_count"]
-            .as_u64()
-            .expect("receipt issue count") as usize
+        usize::try_from(
+            committed_receipt["jsonl_after_issue_count"]
+                .as_u64()
+                .expect("receipt issue count"),
+        )
+        .expect("receipt issue count fits usize")
     );
     let reviewed_digest = Sha256::digest(&receipt_reviewed_bytes);
     assert_eq!(
@@ -1668,6 +1671,7 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses() {
     let _log = common::test_log(
         "e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses",
@@ -1946,6 +1950,7 @@ fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human() {
     let _log = common::test_log(
         "e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human",
@@ -2799,6 +2804,7 @@ fn e2e_sync_status_json() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "init_additive_reconciliation");

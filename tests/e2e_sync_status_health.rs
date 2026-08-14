@@ -20,6 +20,9 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 
+// Retained helpers: not referenced by the current test set (pre-existing on
+// main; kept per the suite's convention for shared git fixture helpers).
+#[allow(dead_code)]
 fn git(root: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .args([
@@ -38,6 +41,7 @@ fn git(root: &Path, args: &[&str]) -> std::process::Output {
         .expect("run git")
 }
 
+#[allow(dead_code)]
 fn git_ok(root: &Path, args: &[&str]) {
     let out = git(root, args);
     assert!(
