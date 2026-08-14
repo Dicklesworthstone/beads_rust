@@ -2805,38 +2805,28 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
 
     let create = run_br(
         &workspace,
-        [
-            "create",
-            "Database audit seed",
-            "--id",
-            "bd-db-seed",
-            "--no-auto-flush",
-        ],
+        ["create", "Database audit seed", "--no-auto-flush"],
         "create_additive_database_seed",
     );
     assert_br_success(&create, "create additive database seed");
+    let database_seed_id = parse_created_id(&create.stdout);
     let create_db_only = run_br(
         &workspace,
-        [
-            "create",
-            "Database-only preserved row",
-            "--id",
-            "bd-db-only",
-            "--no-auto-flush",
-        ],
+        ["create", "Database-only preserved row", "--no-auto-flush"],
         "create_additive_database_only_row",
     );
     assert_br_success(
         &create_db_only,
         "create additive database-only preserved row",
     );
+    let database_only_id = parse_created_id(&create_db_only.stdout);
 
     let beads_dir = workspace.root.join(".beads");
     let db_path = beads_dir.join("beads.db");
     let jsonl_path = beads_dir.join("issues.jsonl");
     let storage = SqliteStorage::open(&db_path).expect("open additive database before plan");
     let database_seed = storage
-        .get_issue("bd-db-seed")
+        .get_issue(&database_seed_id)
         .expect("read database seed")
         .expect("database seed exists");
     let events_before = storage.get_all_events(0).expect("read events before plan");
@@ -3024,14 +3014,14 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
     );
     assert!(
         storage
-            .get_issue("bd-db-seed")
+            .get_issue(&database_seed_id)
             .expect("read preserved database seed")
             .is_some(),
         "pre-existing database issue must be preserved"
     );
     assert!(
         storage
-            .get_issue("bd-db-only")
+            .get_issue(&database_only_id)
             .expect("read database-only issue")
             .is_some(),
         "database-only issue must be preserved"
