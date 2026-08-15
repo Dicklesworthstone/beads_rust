@@ -305,7 +305,7 @@ fn discover_beads_dir_candidate_with_env_and_ceiling(
         return validate_explicit_beads_dir(path, "BEADS_DIR");
     }
 
-    if let Some(canonical) = canonical_git_beads_dir(start)? {
+    if let Some(canonical) = canonical_git_beads_dir(start, discovery_ceiling)? {
         return Ok(canonical);
     }
 
@@ -337,7 +337,10 @@ fn discover_beads_dir_candidate_with_env_and_ceiling(
 
 /// Resolve project state through Git's common directory so linked worktrees
 /// cannot accidentally use a copied or stale `.beads` directory.
-fn canonical_git_beads_dir(start: Option<&Path>) -> Result<Option<PathBuf>> {
+fn canonical_git_beads_dir(
+    start: Option<&Path>,
+    discovery_ceiling: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     let start = match start {
         Some(path) => path.to_path_buf(),
         None => env::current_dir()?,
@@ -362,9 +365,21 @@ fn canonical_git_beads_dir(start: Option<&Path>) -> Result<Option<PathBuf>> {
         ])
         .output();
     let Ok(output) = output else {
+        if git_marker_exists(&work_dir, discovery_ceiling) {
+            return Err(BeadsError::Config(
+                "Cannot execute Git while resolving canonical Beads state".to_string(),
+            ));
+        }
         return Ok(None);
     };
     if !output.status.success() {
+        if git_marker_exists(&work_dir, discovery_ceiling) {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Err(BeadsError::Config(format!(
+                "Git failed while resolving canonical Beads state: {}",
+                detail.trim().chars().take(500).collect::<String>()
+            )));
+        }
         return Ok(None);
     }
 
@@ -401,6 +416,9 @@ fn canonical_git_beads_dir(start: Option<&Path>) -> Result<Option<PathBuf>> {
             common_dir.display()
         ))
     })?;
+    if discovery_ceiling.is_some_and(|ceiling| !project_root.starts_with(ceiling)) {
+        return Ok(None);
+    }
     let beads_dir = project_root.join(".beads");
     let required = ["beads.db", "issues.jsonl", "config.yaml", "metadata.json"];
     let missing: Vec<&str> = required
@@ -416,6 +434,18 @@ fn canonical_git_beads_dir(start: Option<&Path>) -> Result<Option<PathBuf>> {
     }
 
     Ok(Some(beads_dir))
+}
+
+fn git_marker_exists(start: &Path, discovery_ceiling: Option<&Path>) -> bool {
+    let mut current = start.to_path_buf();
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        if discovery_ceiling.is_some_and(|ceiling| current == ceiling) || !current.pop() {
+            return false;
+        }
+    }
 }
 
 /// Discover beads directory, using `--db` path if provided.
@@ -6368,6 +6398,116 @@ labels:
 
         let discovered = discover_beads_dir(Some(&nested)).expect("discover");
         assert_eq!(discovered, beads_dir);
+    }
+
+    // Guards: linked worktrees use the canonical checkout's complete Beads bundle,
+    // never a tracked or copied decoy in the linked worktree.
+    #[test]
+    fn discover_beads_dir_in_worktree_uses_git_common_dir() {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let lane = temp.path().join("lane");
+        fs::create_dir_all(&repo).expect("create repo");
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        let canonical = repo.join(".beads");
+        fs::create_dir_all(&canonical).expect("create canonical beads");
+        for name in ["beads.db", "issues.jsonl", "config.yaml", "metadata.json"] {
+            fs::write(canonical.join(name), "canonical").expect("write artifact");
+        }
+        fs::write(repo.join("tracked.txt"), "base").expect("write tracked file");
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["add", "."])
+                .status()
+                .expect("git add")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["commit", "-m", "base"])
+                .status()
+                .expect("git commit")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", lane.to_str().expect("lane path")])
+                .status()
+                .expect("git worktree")
+                .success()
+        );
+        fs::write(lane.join(".beads").join("issues.jsonl"), "decoy").expect("write decoy");
+
+        let discovered = discover_beads_dir(Some(&lane)).expect("discover canonical beads");
+
+        assert_eq!(discovered, canonical);
+    }
+
+    // Guards: partial canonical state fails closed instead of mixing artifacts.
+    #[test]
+    fn discover_beads_dir_in_git_repo_rejects_incomplete_bundle() {
+        let temp = TempDir::new().expect("tempdir");
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(temp.path())
+                .args(["init"])
+                .status()
+                .expect("git init")
+                .success()
+        );
+        fs::create_dir_all(temp.path().join(".beads")).expect("create beads");
+        fs::write(temp.path().join(".beads/issues.jsonl"), "").expect("write jsonl");
+
+        let error = discover_beads_dir(Some(temp.path())).expect_err("partial bundle must fail");
+
+        assert!(
+            error.to_string().contains("incomplete"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("beads.db"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // Guards: a broken Git worktree marker cannot fall back to a plausible local decoy.
+    #[test]
+    fn discover_beads_dir_rejects_git_failure_instead_of_local_decoy() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join(".git"), "not a valid gitdir file").expect("write marker");
+        let decoy = temp.path().join(".beads");
+        fs::create_dir_all(&decoy).expect("create decoy");
+        for name in ["beads.db", "issues.jsonl", "config.yaml", "metadata.json"] {
+            fs::write(decoy.join(name), "decoy").expect("write decoy artifact");
+        }
+
+        let error = discover_beads_dir(Some(temp.path())).expect_err("broken Git must fail closed");
+
+        assert!(
+            error.to_string().contains("Git failed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
