@@ -136,6 +136,8 @@ fn init_fixture() -> RichFixture {
             "comments",
             "add",
             &show_id,
+            "--author",
+            "ubuntu",
             "A stable comment keeps the show panel exercising comment rendering.",
         ],
     );
