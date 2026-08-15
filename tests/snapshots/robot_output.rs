@@ -18,6 +18,7 @@ use std::sync::LazyLock;
 // outputs are normalized only for wall-clock metadata, elapsed timings,
 // external bv version/reporting hints, stale-day wording, and score fields that
 // include current-date urgency.
+const BV_GOLDEN_VERSION: &str = "bv v0.19.0";
 const ROBOT_JSONL_FIXTURE: &str = r#"{"id":"bd-blocker","title":"00 Blocking Root","description":"Unblocks dependent work","status":"open","priority":0,"issue_type":"task","created_at":"2026-02-01T00:00:00Z","created_by":"fixture","updated_at":"2026-02-01T00:00:00Z","source_repo":".","labels":["core"],"compaction_level":0,"original_size":0}
 {"id":"bd-ready-p0","title":"01 Ready Critical Unassigned","status":"open","priority":0,"issue_type":"bug","created_at":"2026-02-02T00:00:00Z","created_by":"fixture","updated_at":"2026-02-02T00:00:00Z","source_repo":".","labels":["ops","agent"],"compaction_level":0,"original_size":0}
 {"id":"bd-ready-p1-assigned","title":"02 Ready Assigned Feature","status":"open","priority":1,"issue_type":"feature","assignee":"alice","owner":"owner@example.com","created_at":"2026-02-03T00:00:00Z","created_by":"fixture","updated_at":"2026-02-03T00:00:00Z","source_repo":".","labels":["frontend"],"compaction_level":0,"original_size":0}
@@ -112,24 +113,24 @@ fn clear_inherited_br_env(command: &mut std::process::Command) {
     }
 }
 
-/// Resolve the canonical bv install rather than trusting bare PATH order.
-///
-/// Operator machines can carry stray, years-old `bv` binaries earlier in
-/// PATH (a 0.13.0 copy inside a node toolchain bin dir was observed shadowing
-/// the real 0.19.0 install), which fails these goldens with output from a
-/// binary the goldens were never generated against. Mirror the operator's
-/// own shell-function preference order, then fall back to PATH lookup.
-fn bv_program() -> std::path::PathBuf {
-    std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .into_iter()
-        .flat_map(|home| {
-            [".local/bin/bv", ".bun/bin/bv", "go/bin/bv", ".cargo/bin/bv"]
-                .into_iter()
-                .map(move |relative| home.join(relative))
-        })
-        .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| std::path::PathBuf::from("bv"))
+/// Refuse to compare snapshots against an arbitrary `bv` release. Exact
+/// external-output goldens are meaningful only when the producer is pinned.
+fn assert_bv_golden_version() {
+    let output = std::process::Command::new("bv")
+        .arg("--version")
+        .output()
+        .expect("run bv --version before robot goldens");
+    assert!(
+        output.status.success(),
+        "bv --version failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        BV_GOLDEN_VERSION,
+        "bv robot goldens require {BV_GOLDEN_VERSION}; install that exact version before running them"
+    );
 }
 
 fn run_bv<I, S>(workspace: &BrWorkspace, args: I) -> BvRun
@@ -137,7 +138,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut command = std::process::Command::new(bv_program());
+    assert_bv_golden_version();
+    let mut command = std::process::Command::new("bv");
     command.current_dir(&workspace.root);
     command.args(args);
     clear_inherited_br_env(&mut command);
