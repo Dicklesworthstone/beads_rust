@@ -22,6 +22,16 @@ all-features suite exposed a low-frequency scratch-database open failure under
 high parallel load before v0.3.1 was published, so the immutable fix ships as
 the next patch version rather than rewriting that tag.
 
+### Validation
+
+- Full `cargo test --all-features --no-fail-fast` on the release tree
+  (4104c31e): 21,491 passed, 0 failed (doctests included).
+- Release assets arch-verified per platform: the darwin_amd64 slot is a
+  genuine x86_64 Mach-O built with the pinned cross target and executes
+  under Rosetta; linux musl binaries are statically linked; the linux_amd64
+  asset was download-verified against SHA256SUMS with a full init/create
+  round-trip.
+
 ### Fixed
 
 - Ephemeral `SqliteStorage::open_memory()` databases now retry a bounded eight
