@@ -41,6 +41,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -304,6 +305,10 @@ fn discover_beads_dir_candidate_with_env_and_ceiling(
         return validate_explicit_beads_dir(path, "BEADS_DIR");
     }
 
+    if let Some(canonical) = canonical_git_beads_dir(start)? {
+        return Ok(canonical);
+    }
+
     let mut current = match start {
         Some(path) => path.to_path_buf(),
         None => env::current_dir()?,
@@ -328,6 +333,89 @@ fn discover_beads_dir_candidate_with_env_and_ceiling(
     }
 
     Err(BeadsError::NotInitialized)
+}
+
+/// Resolve project state through Git's common directory so linked worktrees
+/// cannot accidentally use a copied or stale `.beads` directory.
+fn canonical_git_beads_dir(start: Option<&Path>) -> Result<Option<PathBuf>> {
+    let start = match start {
+        Some(path) => path.to_path_buf(),
+        None => env::current_dir()?,
+    };
+    let work_dir = if start.is_dir() {
+        start
+    } else {
+        start
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or(BeadsError::NotInitialized)?
+    };
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&work_dir)
+        .args([
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--is-bare-repository",
+            "--git-common-dir",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let inside_worktree = lines.next() == Some("true");
+    let is_bare = lines.next() == Some("true");
+    let Some(common_dir_text) = lines.next().filter(|value| !value.is_empty()) else {
+        return Err(BeadsError::Config(
+            "Git did not report a common directory for Beads discovery".to_string(),
+        ));
+    };
+    if is_bare || !inside_worktree {
+        return Err(BeadsError::Config(
+            "Beads commands require a non-bare Git worktree".to_string(),
+        ));
+    }
+
+    let reported = PathBuf::from(common_dir_text);
+    let common_dir = if reported.is_absolute() {
+        reported
+    } else {
+        work_dir.join(reported)
+    };
+    let common_dir = dunce::canonicalize(&common_dir).map_err(|error| {
+        BeadsError::Config(format!(
+            "Cannot resolve Git common directory '{}': {error}",
+            common_dir.display()
+        ))
+    })?;
+    let project_root = common_dir.parent().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Git common directory '{}' has no project root",
+            common_dir.display()
+        ))
+    })?;
+    let beads_dir = project_root.join(".beads");
+    let required = ["beads.db", "issues.jsonl", "config.yaml", "metadata.json"];
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|name| !beads_dir.join(name).is_file())
+        .collect();
+    if !missing.is_empty() {
+        return Err(BeadsError::Config(format!(
+            "Canonical Beads directory '{}' is incomplete; missing {}",
+            beads_dir.display(),
+            missing.join(", ")
+        )));
+    }
+
+    Ok(Some(beads_dir))
 }
 
 /// Discover beads directory, using `--db` path if provided.
