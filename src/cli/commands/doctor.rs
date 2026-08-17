@@ -17216,8 +17216,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        // Only .write.lock, missing *.tmp.
-        fs::write(beads_dir.join(".gitignore"), b".write.lock\n").unwrap();
+        // Everything except *.tmp.
+        let contents = inner_gitignore_all_append_patterns()
+            .into_iter()
+            .filter(|pattern| *pattern != "*.tmp")
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(beads_dir.join(".gitignore"), contents).unwrap();
 
         let mut checks = Vec::new();
         check_inner_gitignore_present(&beads_dir, &mut checks);
