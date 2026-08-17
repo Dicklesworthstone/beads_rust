@@ -816,6 +816,51 @@ mod tests {
     }
 
     #[test]
+    fn test_search_matches_comment_bodies() {
+        // beads_rust#416: a token that exists only in a comment body must be
+        // findable — agent workflows put durable handoffs in comments.
+        let mut storage = SqliteStorage::open_memory().expect("db");
+        let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
+
+        let commented = make_issue("bd-101", "comment search boundary", Some("control text"), t1);
+        let control = make_issue("bd-102", "unrelated", None, t2);
+        storage.create_issue(&commented, "tester").expect("create");
+        storage.create_issue(&control, "tester").expect("create");
+        storage
+            .add_comment("bd-101", "tester", "Comment-Only-Token-20260807 lives here")
+            .expect("comment");
+
+        let filters = ListFilters::default();
+
+        // Case-insensitive comment-body match on the default path.
+        let results = storage
+            .search_issues("comment-only-token-20260807", &filters)
+            .expect("search");
+        let ids: Vec<String> = results.into_iter().map(|issue| issue.id).collect();
+        assert_eq!(ids, vec!["bd-101".to_string()]);
+
+        // The default-visible limited-page fast path must agree.
+        let limited = ListFilters {
+            limit: Some(10),
+            ..ListFilters::default()
+        };
+        let results = storage
+            .search_issues("comment-only-token-20260807", &limited)
+            .expect("limited search");
+        let ids: Vec<String> = results.into_iter().map(|issue| issue.id).collect();
+        assert_eq!(ids, vec!["bd-101".to_string()]);
+
+        // A token in no comment or field still returns nothing.
+        assert!(
+            storage
+                .search_issues("token-that-matches-nothing", &filters)
+                .expect("empty search")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn issue_with_counts_applies_relation_metadata() {
         let issue = make_issue("bd-001", "Search result", None, Utc::now());
         let mut relation_metadata = SearchRelationMetadata {
