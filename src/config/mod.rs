@@ -309,14 +309,37 @@ fn discover_beads_dir_candidate_with_env_and_ceiling(
         None => env::current_dir()?,
     };
 
+    // First `.git` FILE seen on the walk: the marker of a linked git
+    // worktree (a primary checkout has a `.git` directory). Used for the
+    // common-dir fallback below when the walk finds no workspace at all.
+    let mut linked_worktree_git_file: Option<PathBuf> = None;
+
     loop {
         let candidate = current.join(".beads");
         if candidate.is_dir() {
+            // Linked-worktree resolution (GitHub #429's underlying bug): a
+            // fresh linked worktree checks out the TRACKED half of `.beads`
+            // (issues.jsonl, metadata.json, config.yaml) but not the local
+            // database. Treating that snapshot as a workspace would rebuild
+            // a private database from potentially stale JSONL and split
+            // state from the primary checkout. When the candidate has no
+            // local database and no explicit redirect, resolve through the
+            // worktree's `.git` file to the primary checkout's `.beads`.
+            if let Some(primary) = linked_worktree_primary_beads_dir(&current, &candidate) {
+                return Ok(primary);
+            }
             return Ok(candidate);
         }
         let candidate_underscore = current.join("_beads");
         if candidate_underscore.is_dir() {
             return Ok(candidate_underscore);
+        }
+
+        if linked_worktree_git_file.is_none() {
+            let git_path = current.join(".git");
+            if git_path.is_file() {
+                linked_worktree_git_file = Some(git_path);
+            }
         }
 
         if discovery_ceiling.is_some_and(|ceiling| current == ceiling) {
@@ -327,7 +350,129 @@ fn discover_beads_dir_candidate_with_env_and_ceiling(
         }
     }
 
+    // No workspace anywhere up the walk, but we passed a linked-worktree
+    // marker: worktrees checked out OUTSIDE the primary tree (e.g.
+    // `git worktree add ../feature-x`) cannot reach the primary `.beads`
+    // by walking up, so resolve it through the worktree's gitdir instead.
+    if let Some(git_file) = linked_worktree_git_file
+        && let Some(primary) = primary_beads_dir_from_git_file(&git_file)
+    {
+        return Ok(primary);
+    }
+
     Err(BeadsError::NotInitialized)
+}
+
+/// Decide whether a discovered `.beads` candidate inside a linked git
+/// worktree should resolve to the primary checkout's `.beads` instead.
+///
+/// Returns `Some(primary)` only when ALL of the following hold, keeping the
+/// resolution conservative:
+///
+/// - `workspace_root/.git` is a FILE (linked-worktree marker; the primary
+///   checkout has a `.git` directory and is unaffected);
+/// - the candidate has no explicit `redirect` file (an explicit redirect is
+///   the operator's decision and is honored by `routing::follow_redirects`);
+/// - the candidate has no local database (a worktree where `br init` ran, or
+///   that already imported once, keeps its own store — no rug-pull);
+/// - the primary checkout's `.beads` actually exists and is a different
+///   directory.
+///
+/// Never spawns git: the primary checkout is derived by parsing the
+/// worktree's `.git` file and gitdir `commondir` pointer.
+fn linked_worktree_primary_beads_dir(workspace_root: &Path, candidate: &Path) -> Option<PathBuf> {
+    let git_file = workspace_root.join(".git");
+    if !git_file.is_file() {
+        return None;
+    }
+    if candidate.join("redirect").is_file() {
+        return None;
+    }
+    if workspace_has_local_database(candidate) {
+        return None;
+    }
+    let primary = primary_beads_dir_from_git_file(&git_file)?;
+    let same = match (dunce::canonicalize(&primary), dunce::canonicalize(candidate)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => primary == *candidate,
+    };
+    if same { None } else { Some(primary) }
+}
+
+/// True when the workspace has its own local database file — i.e. it is a
+/// real initialized workspace rather than a tracked-artifact-only snapshot.
+///
+/// The database filename comes from `metadata.json`'s `database` key,
+/// defaulting to `beads.db` when metadata is absent or unreadable.
+fn workspace_has_local_database(beads_dir: &Path) -> bool {
+    let db_name = fs::read_to_string(beads_dir.join("metadata.json"))
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        .and_then(|value| {
+            value
+                .get("database")
+                .and_then(|db| db.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "beads.db".to_string());
+    beads_dir.join(db_name).is_file()
+}
+
+/// Resolve the primary checkout's `.beads` directory from a linked git
+/// worktree's `.git` file, without spawning git.
+///
+/// The `.git` file contains `gitdir: <path-to>/.git/worktrees/<name>`; the
+/// gitdir's `commondir` file (written by git for every linked worktree)
+/// points back at the shared `.git` directory, whose parent is the primary
+/// working tree. Falls back to stripping a trailing `worktrees/<name>` when
+/// `commondir` is missing. Bare repositories (common dir not named `.git`)
+/// resolve to `None` — there is no primary working tree to share.
+fn primary_beads_dir_from_git_file(git_file: &Path) -> Option<PathBuf> {
+    let contents = fs::read_to_string(git_file).ok()?;
+    let gitdir = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    if gitdir.is_empty() {
+        return None;
+    }
+    let gitdir_path = {
+        let raw = Path::new(gitdir);
+        if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            git_file.parent()?.join(raw)
+        }
+    };
+
+    let common_git_dir = fs::read_to_string(gitdir_path.join("commondir"))
+        .ok()
+        .and_then(|pointer| {
+            let trimmed = pointer.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let raw = Path::new(trimmed);
+            if raw.is_absolute() {
+                Some(raw.to_path_buf())
+            } else {
+                Some(gitdir_path.join(raw))
+            }
+        })
+        .or_else(|| {
+            let worktrees = gitdir_path.parent()?;
+            if worktrees.file_name()? == "worktrees" {
+                worktrees.parent().map(Path::to_path_buf)
+            } else {
+                None
+            }
+        })?;
+    let common_git_dir = dunce::canonicalize(&common_git_dir).unwrap_or(common_git_dir);
+    if common_git_dir.file_name()? != ".git" {
+        return None;
+    }
+    let primary = common_git_dir.parent()?.join(".beads");
+    if primary.is_dir() { Some(primary) } else { None }
 }
 
 /// Discover beads directory, using `--db` path if provided.
@@ -6260,6 +6405,110 @@ labels:
 
         let discovered = discover_beads_dir(Some(temp.path())).expect("discover");
         assert_eq!(discovered, beads_dir);
+    }
+
+    /// Lay out `<root>/primary` (a fake primary checkout with a `.git`
+    /// directory and an initialized `.beads`) plus `<root>/wt` (a fake
+    /// linked worktree whose `.git` FILE points at
+    /// `primary/.git/worktrees/wt`, with a `commondir` pointer the way git
+    /// writes it). Returns `(primary_beads, worktree_root)`.
+    fn linked_worktree_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let primary = root.join("primary");
+        let primary_beads = primary.join(".beads");
+        fs::create_dir_all(&primary_beads).expect("primary beads");
+        fs::write(primary_beads.join("beads.db"), b"db").expect("primary db");
+        let wt_gitdir = primary.join(".git").join("worktrees").join("wt");
+        fs::create_dir_all(&wt_gitdir).expect("worktree gitdir");
+        fs::write(wt_gitdir.join("commondir"), "../..\n").expect("commondir");
+
+        let worktree = root.join("wt");
+        fs::create_dir_all(&worktree).expect("worktree root");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", wt_gitdir.display()),
+        )
+        .expect("worktree .git file");
+        (primary_beads, worktree)
+    }
+
+    #[test]
+    fn discover_resolves_linked_worktree_tracked_snapshot_to_primary() {
+        // GitHub #429's underlying bug: a linked worktree checks out the
+        // tracked half of `.beads` (metadata.json, issues.jsonl) but no
+        // database; discovery must bind to the primary checkout instead of
+        // rebuilding a private database from the stale snapshot.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
+        let (primary_beads, worktree) = linked_worktree_fixture(temp.path());
+        let wt_beads = worktree.join(".beads");
+        fs::create_dir_all(&wt_beads).expect("wt beads");
+        fs::write(wt_beads.join("metadata.json"), "{\"database\": \"beads.db\"}")
+            .expect("wt metadata");
+        fs::write(wt_beads.join("issues.jsonl"), "").expect("wt jsonl");
+
+        let discovered = discover_beads_dir(Some(&worktree)).expect("discover");
+        assert_eq!(
+            dunce::canonicalize(discovered).expect("canon discovered"),
+            dunce::canonicalize(primary_beads).expect("canon primary")
+        );
+    }
+
+    #[test]
+    fn discover_keeps_linked_worktree_workspace_with_local_database() {
+        // A worktree that ran `br init` (or already imported once) owns its
+        // database; discovery must not rug-pull it to the primary checkout.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
+        let (_primary_beads, worktree) = linked_worktree_fixture(temp.path());
+        let wt_beads = worktree.join(".beads");
+        fs::create_dir_all(&wt_beads).expect("wt beads");
+        fs::write(wt_beads.join("metadata.json"), "{\"database\": \"beads.db\"}")
+            .expect("wt metadata");
+        fs::write(wt_beads.join("beads.db"), b"db").expect("wt db");
+
+        let discovered = discover_beads_dir(Some(&worktree)).expect("discover");
+        assert_eq!(discovered, wt_beads);
+    }
+
+    #[test]
+    fn discover_resolves_sibling_worktree_without_beads_to_primary() {
+        // `git worktree add ../feature-x` on a project that does NOT track
+        // `.beads`: the walk finds nothing, but the `.git` file identifies
+        // the primary checkout.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
+        let (primary_beads, worktree) = linked_worktree_fixture(temp.path());
+
+        let discovered = discover_beads_dir(Some(&worktree)).expect("discover");
+        assert_eq!(
+            dunce::canonicalize(discovered).expect("canon discovered"),
+            dunce::canonicalize(primary_beads).expect("canon primary")
+        );
+    }
+
+    #[test]
+    fn discover_prefers_explicit_worktree_redirect_over_common_dir() {
+        // An explicit `.beads/redirect` is the operator's routing decision;
+        // the linked-worktree resolution must stand aside and let
+        // `routing::follow_redirects` handle it.
+        let temp = crate::util::test_helpers::isolated_temp_dir();
+        let (primary_beads, worktree) = linked_worktree_fixture(temp.path());
+        let elsewhere = temp.path().join("elsewhere").join(".beads");
+        fs::create_dir_all(&elsewhere).expect("elsewhere beads");
+        let wt_beads = worktree.join(".beads");
+        fs::create_dir_all(&wt_beads).expect("wt beads");
+        fs::write(
+            wt_beads.join("redirect"),
+            format!("{}\n", elsewhere.display()),
+        )
+        .expect("redirect file");
+
+        let discovered = discover_beads_dir(Some(&worktree)).expect("discover");
+        assert_eq!(
+            dunce::canonicalize(discovered).expect("canon discovered"),
+            dunce::canonicalize(&elsewhere).expect("canon elsewhere")
+        );
+        assert_ne!(
+            dunce::canonicalize(&primary_beads).ok(),
+            dunce::canonicalize(&elsewhere).ok()
+        );
     }
 
     #[test]
