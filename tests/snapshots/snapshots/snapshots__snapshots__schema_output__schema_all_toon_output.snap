@@ -1543,6 +1543,11 @@ schemas:
         anyOf[2]:
           - "$ref": #/$defs/RollupSummary
           - type: "null"
+      inherited_context:
+        description: "Inherited governing context from ancestor beads (beads_rust#297).\nPresent only when the project has opted in to inherited-context\nemission and an ancestor supplies `agent_context`; populated for\nJSON/TOON output so structured consumers receive the same governing\ncontext that text mode renders (beads_rust#430)."
+        type: array
+        items:
+          "$ref": #/$defs/InheritedBlock
     required[8]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level
     "$defs":
       Status:
@@ -1662,6 +1667,26 @@ schemas:
               format: uint32
               minimum: 0
         required[2]: status,descendants
+      InheritedBlock:
+        description: One ancestor block in the inherited-context emission.
+        type: object
+        properties:
+          source_id:
+            description: "The ancestor's bead id (e.g. \"bd-abc123\")."
+            type: string
+          source_role:
+            description: "\"epic\" when the ancestor is the root and has `issue_type = epic`,\n\"root\" when the ancestor is the root but not an epic,\n\"parent\" when the ancestor is the immediate parent."
+            type: string
+          source_title:
+            description: The ancestor's title for human-readable headings.
+            type: string
+          field_used:
+            description: "Which field on the ancestor supplied the content (e.g.\n\"agent_context\"). Per-config-field-list resolution: in a future\nextension callers can configure `[agent_context, design]` and\nthe first present wins."
+            type: string
+          content:
+            description: "The raw content, as stored. For `agent_context` this is the\ncanonical JSON string; downstream renderers can parse it for\npretty-printing."
+            type: string
+        required[5]: source_id,source_role,source_title,field_used,content
   IssueWithCounts:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: IssueWithCounts

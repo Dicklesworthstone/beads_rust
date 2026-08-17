@@ -6465,7 +6465,10 @@ labels:
         fs::write(wt_beads.join("beads.db"), b"db").expect("wt db");
 
         let discovered = discover_beads_dir(Some(&worktree)).expect("discover");
-        assert_eq!(discovered, wt_beads);
+        assert_eq!(
+            dunce::canonicalize(discovered).expect("canon discovered"),
+            dunce::canonicalize(wt_beads).expect("canon wt beads")
+        );
     }
 
     #[test]
