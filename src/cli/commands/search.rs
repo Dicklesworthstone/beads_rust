@@ -1,6 +1,7 @@
 //! Search command implementation.
 //!
-//! Classic bd-style LIKE search across title/description/id with list-like filters.
+//! Classic bd-style substring search across title/description/id — plus
+//! comment bodies (beads_rust#416) — with list-like filters.
 
 use crate::cli::{
     DEFAULT_LIST_OFFSET, DEFAULT_SEARCH_LIMIT, ListArgs, OutputFormat, SearchArgs,

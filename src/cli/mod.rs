@@ -898,7 +898,7 @@ pub enum Commands {
     /// Use at your own risk.
     Schema(SchemaArgs),
 
-    /// Search issues
+    /// Search issues (matches title, description, id, and comment text)
     Search(SearchArgs),
 
     /// Show issue details

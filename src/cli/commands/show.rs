@@ -134,6 +134,22 @@ fn execute_routed(
                     None
                 },
             )?;
+            let mut batch_details = batch_details;
+            attach_inherited_context(
+                &mut batch_details,
+                &batch_beads_dir,
+                &batch_cli,
+                if use_preloaded {
+                    preloaded_storage
+                } else {
+                    None
+                },
+                if use_preloaded {
+                    preloaded_storage_ctx
+                } else {
+                    None
+                },
+            );
             routed_details.push((batch.issue_inputs, batch_details));
         }
         let details_list =
@@ -232,6 +248,46 @@ fn requested_target_ids(args: &ShowArgs, beads_dir: &Path) -> Result<Vec<String>
     Ok(target_ids)
 }
 
+/// Populate each issue's `inherited_context` field with the ancestor
+/// `agent_context` blocks (beads_rust#297) so JSON/TOON output carries the
+/// same governing context that text mode renders (beads_rust#430).
+///
+/// No-op unless the project has opted in to inherited-context emission.
+/// Prefers the caller's preloaded storage; falls back to a transient
+/// read connection, and silently skips on open failure — the inherited
+/// blocks are an optional enrichment, not worth failing the whole show.
+/// Unlike the text renderer, blocks are NOT deduplicated across issues:
+/// each structured record must be complete on its own for programmatic
+/// consumers.
+fn attach_inherited_context(
+    details_list: &mut [IssueDetails],
+    beads_dir: &Path,
+    cli: &config::CliOverrides,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) {
+    if details_list.is_empty() || !crate::inheritance::is_enabled(beads_dir) {
+        return;
+    }
+    let transient_ctx = if preloaded_storage.is_none() && preloaded_storage_ctx.is_none() {
+        config::open_storage_with_cli(beads_dir, cli).ok()
+    } else {
+        None
+    };
+    let Some(storage) = preloaded_storage
+        .or_else(|| preloaded_storage_ctx.map(|ctx| &ctx.storage))
+        .or_else(|| transient_ctx.as_ref().map(|ctx| &ctx.storage))
+    else {
+        return;
+    };
+    for details in details_list.iter_mut() {
+        if let Ok(blocks) = crate::inheritance::collect_inherited_blocks(storage, &details.issue.id)
+        {
+            details.inherited_context = blocks;
+        }
+    }
+}
+
 fn execute_inner(
     args: &ShowArgs,
     cli: &config::CliOverrides,
@@ -240,7 +296,7 @@ fn execute_inner(
     preloaded_storage: Option<&SqliteStorage>,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    let (details_list, use_color) = load_issue_details_for_route(
+    let (mut details_list, use_color) = load_issue_details_for_route(
         args,
         cli,
         beads_dir,
@@ -257,6 +313,20 @@ fn execute_inner(
 
     if matches!(ctx.mode(), OutputMode::Quiet) {
         return Ok(());
+    }
+    // beads_rust#430: structured output must carry the same inherited
+    // governing context that text mode renders, as a structured field.
+    if matches!(
+        output_format,
+        crate::cli::OutputFormat::Json | crate::cli::OutputFormat::Toon
+    ) {
+        attach_inherited_context(
+            &mut details_list,
+            beads_dir,
+            cli,
+            preloaded_storage,
+            preloaded_storage_ctx,
+        );
     }
     match output_format {
         crate::cli::OutputFormat::Json => {
@@ -782,6 +852,7 @@ fn build_issue_details_from_exact_jsonl_index(
         // Rollup derives from the local database; JSONL fallback paths
         // deliberately omit it.
         rollup: None,
+        inherited_context: Vec::new(),
     })
 }
 
@@ -854,6 +925,7 @@ fn build_issue_details_from_jsonl(
         // Rollup derives from the local database; JSONL fallback paths
         // deliberately omit it.
         rollup: None,
+        inherited_context: Vec::new(),
     })
 }
 
@@ -1524,6 +1596,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
             rollup: None,
+            inherited_context: Vec::new(),
         };
         let json = serde_json::to_string_pretty(&vec![details]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1561,6 +1634,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
             rollup: None,
+            inherited_context: Vec::new(),
         };
         let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
@@ -1597,6 +1671,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
             rollup: None,
+            inherited_context: Vec::new(),
         };
 
         let output = format_issue_details(&details, false, false);
@@ -1800,6 +1875,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
             rollup: None,
+            inherited_context: Vec::new(),
         };
         let local_last = IssueDetails {
             issue: make_test_issue("bd-local-2", "Local last"),
@@ -1810,6 +1886,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
             rollup: None,
+            inherited_context: Vec::new(),
         };
         let external_middle = IssueDetails {
             issue: make_test_issue("ext-middle", "External middle"),
@@ -1820,6 +1897,7 @@ mod tests {
             events: Vec::new(),
             parent: None,
             rollup: None,
+            inherited_context: Vec::new(),
         };
 
         let ordered = reorder_details_by_requested_inputs(

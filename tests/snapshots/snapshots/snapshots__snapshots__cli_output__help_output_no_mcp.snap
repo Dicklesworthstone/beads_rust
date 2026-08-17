@@ -41,7 +41,7 @@ Commands:
   ID-REDACTED    Print concise ID-REDACTED docs for automation agents
   scheduler     Rank ready work for agent swarms with explainable evidence
   schema        Emit JSON Schemas and ID-REDACTED output envelope shapes (for agent/tooling integration)
-  search        Search issues
+  search        Search issues (matches title, description, id, and comment text)
   show          Show issue details
   stale         List stale issues
   stats         Show project statistics

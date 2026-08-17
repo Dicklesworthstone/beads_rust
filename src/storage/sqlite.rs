@@ -1513,6 +1513,19 @@ enum SearchIssueProjection {
     CommandText,
 }
 
+/// Shared case-insensitive needle match used by every `br search` query path.
+///
+/// Matches the issue's title, description, and id, plus the bodies of its
+/// comments (beads_rust#416): agent workflows put durable handoffs and
+/// decisions in comments, so a comment-only token must still be findable.
+/// Binds four identical lowercase needle parameters.
+const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
+     OR instr(lower(description), ?) > 0 \
+     OR instr(lower(id), ?) > 0 \
+     OR EXISTS (SELECT 1 FROM comments \
+                WHERE comments.issue_id = issues.id \
+                  AND instr(lower(comments.text), ?) > 0))";
+
 #[derive(Clone, Copy)]
 enum BlockedIssueProjection {
     Full,
@@ -8994,10 +9007,10 @@ impl SqliteStorage {
             params.push(SqliteValue::from(ts.to_rfc3339()));
         }
 
-        sql.push_str(
-            " AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)",
-        );
+        sql.push_str(" AND ");
+        sql.push_str(SEARCH_NEEDLE_PREDICATE);
         let needle = trimmed.to_ascii_lowercase();
+        params.push(SqliteValue::from(needle.as_str()));
         params.push(SqliteValue::from(needle.as_str()));
         params.push(SqliteValue::from(needle.as_str()));
         params.push(SqliteValue::from(needle));
@@ -9109,12 +9122,13 @@ impl SqliteStorage {
             "SELECT 1 FROM issues
              WHERE {status_filter}
                AND (is_template = 0 OR is_template IS NULL)
-               AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)
+               AND {SEARCH_NEEDLE_PREDICATE}
              LIMIT 1"
         );
         let rows = self.conn.query_with_params(
             &sql,
             &[
+                SqliteValue::from(needle),
                 SqliteValue::from(needle),
                 SqliteValue::from(needle),
                 SqliteValue::from(needle),
@@ -9139,7 +9153,7 @@ impl SqliteStorage {
               AND {status_filter}
               AND (is_template = 0 OR is_template IS NULL)
               AND {priority_predicate}
-              AND (instr(lower(title), ?) > 0 OR instr(lower(description), ?) > 0 OR instr(lower(id), ?) > 0)
+              AND {SEARCH_NEEDLE_PREDICATE}
               ORDER BY {order_by}
               LIMIT {limit}",
             projection.select_clause()
@@ -9148,6 +9162,7 @@ impl SqliteStorage {
             &sql,
             &[
                 SqliteValue::from(i64::from(priority_value)),
+                SqliteValue::from(needle),
                 SqliteValue::from(needle),
                 SqliteValue::from(needle),
                 SqliteValue::from(needle),
@@ -14806,6 +14821,7 @@ impl SqliteStorage {
             events,
             parent,
             rollup,
+            inherited_context: Vec::new(),
         }))
     }
 

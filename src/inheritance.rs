@@ -37,7 +37,7 @@ use crate::model::{Issue, IssueType};
 use crate::storage::sqlite::SqliteStorage;
 
 /// One ancestor block in the inherited-context emission.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct InheritedBlock {
     /// The ancestor's bead id (e.g. "bd-abc123").
     pub source_id: String,
