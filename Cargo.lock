@@ -270,9 +270,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.4"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c53eee30b6bef44faeabf2ca88e98680e81e3527452bb811491161377de17a35"
+checksum = "58465f2cbc04317c79f29b2a595901c935deccdbe6bb9c9268280ea6e289385d"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -280,9 +280,9 @@ dependencies = [
  "chacha20poly1305",
  "crc32fast",
  "crossbeam-queue",
- "franken-decision 0.4.4",
- "franken-evidence 0.4.4",
- "franken-kernel 0.4.4",
+ "franken-decision 0.4.6",
+ "franken-evidence 0.4.6",
+ "franken-kernel 0.4.6",
  "futures-lite",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",
@@ -405,7 +405,7 @@ version = "0.3.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "cap-primitives",
  "chrono",
  "clap",
@@ -1746,12 +1746,12 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.4"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ea97cf32e8847a084dccfb4f29332e4351aadb3f8685b50b1144ecee9d0a4b5"
+checksum = "b036d12c4e625afae9d7b946347aad70f8456dfbe87254fbe5d92aa35b348cd5"
 dependencies = [
- "franken-evidence 0.4.4",
- "franken-kernel 0.4.4",
+ "franken-evidence 0.4.6",
+ "franken-kernel 0.4.6",
  "serde",
 ]
 
@@ -1767,9 +1767,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.4"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4832bb8c44a6ec2a58bae9349353eed8ad0cfb6330f2616a05279ac5d7f6146"
+checksum = "8d01fabec5c859c6607f07a0a6b362396c2c6028d63571939f4f6eea6b474a15"
 dependencies = [
  "serde",
  "serde_json",
@@ -1786,9 +1786,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.4"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a327f092ec1ad7d17692fbcd490a9b53e5659ede88abd2351443a38723fe0ce"
+checksum = "14dcddbb62c252d9837a20147fad802229ff0231663f61433d3fb96a764c3fb9"
 dependencies = [
  "serde",
 ]
@@ -1816,7 +1816,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39c43fac86ad6354ec1db9fac96b5dbac6caca3811f39a0acf8bf10cd1df5a2"
 dependencies = [
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-ext-fts5",
@@ -1862,7 +1862,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a0a0ef2ded9d5d4ad518ed04667bb70692a1add132451667fc165cb2bb6b620"
 dependencies = [
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "blake3",
  "foldhash 0.2.0",
  "fsqlite-ast",
@@ -1984,7 +1984,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bc0cfb1467a6c61b0e1f66398214f565ac25c88924a48c198807ea3a63670b3"
 dependencies = [
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "blake3",
  "crc32c",
  "crossbeam-epoch",
@@ -2023,7 +2023,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a62c6812e99b77538d493285d0c7323cd38f6c78e1ccff5e07ae5e77ddaad7c1"
 dependencies = [
  "argon2",
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "blake3",
  "bumpalo",
  "chacha20poly1305",
@@ -2079,7 +2079,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77505eee79afadeac6db6ca6a2bf7f9b54789b131014779f8161641c0358ef17"
 dependencies = [
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "bitflags 2.13.1",
  "blake3",
  "fsqlite-error",
@@ -2099,7 +2099,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ef287d462897c1d56067c829ad66abd0173f6d89ec877568c9232877b87889e"
 dependencies = [
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -2123,7 +2123,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1584984a84a08e6d5461a64d2be769f4a82ebf48875c4c46fda0bb5e00d6931c"
 dependencies = [
  "advisory-lock",
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
@@ -2141,7 +2141,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "309fbee02289fac914450d6ca6f3f445a535cf243c27fd21bc4d7013e24b9f3c"
 dependencies = [
- "asupersync 0.4.4",
+ "asupersync 0.4.5",
  "blake3",
  "crc32c",
  "fsqlite-error",
