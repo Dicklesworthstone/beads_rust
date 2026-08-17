@@ -9,8 +9,12 @@ expression: contents
 *.db-shm
 # -wal plus fsqlite 0.2+'s -wal-cert / -wal-cert-head durability sidecars
 *.db-wal*
-# fsqlite multi-process namespace sidecars (-fsqlite-ns-gate / -fsqlite-ns-use)
-*.db-fsqlite-*
+# fsqlite multi-process namespace sidecars (-fsqlite-ns-gate / -fsqlite-ns-use),
+# including the `.<db>.schema-migration-<run>.vacuum-*` copies left by
+# `br doctor migrate-schema` (#427)
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+*.vacuum-wal-cert*
 
 # Lock files
 .write.lock

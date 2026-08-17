@@ -5575,7 +5575,6 @@ fn fix_jsonl_world_writable_if_warned(
 /// appending the canonical patterns. Symlinked ignore files remain
 /// operator-managed because replacing them would stomp intent.
 fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
-    const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
     let path = beads_dir.join(".gitignore");
     let meta = match fs::symlink_metadata(&path) {
         Ok(meta) => meta,
@@ -5591,11 +5590,11 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
                 Some(serde_json::json!({
                     "path": path.display().to_string(),
                     "kind": "missing",
-                    "expected_patterns": EXPECTED_PATTERNS,
+                    "expected_patterns": inner_gitignore_all_append_patterns(),
                     "remediation": format!(
                         "Create {} with at least: {}",
                         path.display(),
-                        EXPECTED_PATTERNS.join(", ")
+                        inner_gitignore_all_append_patterns().join(", ")
                     ),
                 })),
             );
@@ -5626,11 +5625,11 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
             Some(serde_json::json!({
                 "path": path.display().to_string(),
                 "kind": "symlink",
-                "expected_patterns": EXPECTED_PATTERNS,
+                "expected_patterns": inner_gitignore_all_append_patterns(),
                 "remediation": format!(
                     "Replace {} with a regular file containing at least: {}",
                     path.display(),
-                    EXPECTED_PATTERNS.join(", ")
+                    inner_gitignore_all_append_patterns().join(", ")
                 ),
             })),
         );
@@ -5648,11 +5647,7 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
         );
         return;
     };
-    let missing: Vec<&str> = EXPECTED_PATTERNS
-        .iter()
-        .copied()
-        .filter(|needle| !inner_gitignore_covers(&contents, needle))
-        .collect();
+    let missing = inner_gitignore_missing_patterns(&contents);
     if missing.is_empty() {
         push_check(
             checks,
@@ -5698,17 +5693,108 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
 /// not exist" for missing) so `doctor undo` restores the file —
 /// either to its previous incomplete state or by removing it
 /// entirely. TOCTOU-safe: missing patterns are re-derived at fix time.
-// case_sensitive_file_extension_comparisons fires on the `.lock`/`.tmp`
-// suffix checks because clippy prefers Path::extension(). Gitignore
-// matching is case-sensitive on Linux and the probe targets are fixed
-// lowercase literals, so exact-case `ends_with` is the correct semantic.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
-fn inner_gitignore_covers(contents: &str, expected: &str) -> bool {
-    let target = match expected {
-        ".write.lock" => ".write.lock",
-        "*.tmp" => "probe.tmp",
-        _ => expected,
-    };
+/// One canonical `.beads/.gitignore` coverage expectation (GitHub #427).
+///
+/// Coverage is judged by PROBES — representative artifact filenames that
+/// must all be ignored — so operator-authored equivalents (e.g. a broad
+/// `*.db?*` or `*.lock`) satisfy an expectation without textual equality
+/// with `append_pattern`. When any probe is uncovered, `doctor --repair`
+/// appends `append_pattern`.
+struct InnerGitignoreExpectation {
+    /// Pattern appended by `doctor --repair` when coverage is missing.
+    append_pattern: &'static str,
+    /// Representative direct-child filenames that must be ignored.
+    probes: &'static [&'static str],
+}
+
+/// The database-artifact family plus the original transient-state rules.
+///
+/// GitHub #427: fsqlite 0.3 grew `-wal-cert`/`-wal-cert-head` durability
+/// certificates, `-fsqlite-ns-gate`/`-fsqlite-ns-use` namespace sidecars,
+/// and `br doctor migrate-schema` leaves `.<db>.schema-migration-<run>.
+/// vacuum-*` copies. Older repositories whose `.beads/.gitignore` predates
+/// these artifacts would show them as untracked changes; doctor now
+/// actively reconciles coverage instead of only writing rules at init.
+const INNER_GITIGNORE_EXPECTATIONS: &[InnerGitignoreExpectation] = &[
+    InnerGitignoreExpectation {
+        append_pattern: "*.db",
+        probes: &["beads.db"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*.db-journal",
+        probes: &["beads.db-journal"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*.db-shm",
+        probes: &["beads.db-shm"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*.db-wal*",
+        probes: &[
+            "beads.db-wal",
+            "beads.db-wal-cert",
+            "beads.db-wal-cert-head",
+        ],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*-fsqlite-ns-gate",
+        probes: &[
+            "beads.db-fsqlite-ns-gate",
+            ".beads.db.schema-migration-20260101T000000.000000Z-0-0.vacuum-fsqlite-ns-gate",
+        ],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*-fsqlite-ns-use",
+        probes: &[
+            "beads.db-fsqlite-ns-use",
+            ".beads.db.schema-migration-20260101T000000.000000Z-0-0.vacuum-fsqlite-ns-use",
+        ],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*.vacuum-wal-cert*",
+        probes: &[
+            ".beads.db.schema-migration-20260101T000000.000000Z-0-0.vacuum-wal-cert",
+            ".beads.db.schema-migration-20260101T000000.000000Z-0-0.vacuum-wal-cert-head",
+        ],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: ".write.lock",
+        probes: &[".write.lock"],
+    },
+    InnerGitignoreExpectation {
+        append_pattern: "*.tmp",
+        probes: &["probe.tmp"],
+    },
+];
+
+/// Every append pattern doctor knows how to maintain, for remediation text.
+fn inner_gitignore_all_append_patterns() -> Vec<&'static str> {
+    INNER_GITIGNORE_EXPECTATIONS
+        .iter()
+        .map(|expectation| expectation.append_pattern)
+        .collect()
+}
+
+/// Append patterns whose coverage is missing from `contents`.
+fn inner_gitignore_missing_patterns(contents: &str) -> Vec<&'static str> {
+    INNER_GITIGNORE_EXPECTATIONS
+        .iter()
+        .filter(|expectation| {
+            expectation
+                .probes
+                .iter()
+                .any(|probe| !inner_gitignore_ignores_probe(contents, probe))
+        })
+        .map(|expectation| expectation.append_pattern)
+        .collect()
+}
+
+/// Whether the ignore file `contents` ignore a direct-child file named
+/// `probe`. Gitignore semantics for the subset that matters here: last
+/// matching rule wins, `!` negates, `#` comments, a leading `/` anchors to
+/// the `.beads/` directory (equivalent for direct children), trailing-`/`
+/// directory rules and nested (`a/b`) rules never match a file probe.
+fn inner_gitignore_ignores_probe(contents: &str, probe: &str) -> bool {
     let mut ignored = false;
     for raw_line in contents.lines() {
         let line = raw_line.trim();
@@ -5718,15 +5804,46 @@ fn inner_gitignore_covers(contents: &str, expected: &str) -> bool {
         let (negated, pattern) = line
             .strip_prefix('!')
             .map_or((false, line), |pattern| (true, pattern));
-        let matches = pattern == target
-            || pattern == expected
-            || (pattern == "*.lock" && target.ends_with(".lock"))
-            || (pattern == "*.tmp" && target.ends_with(".tmp"));
-        if matches {
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        if pattern.is_empty() || pattern.ends_with('/') || pattern.contains('/') {
+            continue;
+        }
+        if gitignore_glob_matches(pattern, probe) {
             ignored = !negated;
         }
     }
     ignored
+}
+
+/// Minimal single-segment gitignore glob: `*` matches any run (including
+/// empty), `?` matches exactly one character, everything else is literal.
+/// Character classes are treated literally — none of the canonical
+/// patterns use them, and a literal mismatch merely means doctor appends a
+/// redundant-but-correct rule.
+fn gitignore_glob_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let name = name.as_bytes();
+    let (mut p, mut n) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((star_p, star_n)) = star {
+            p = star_p + 1;
+            n = star_n + 1;
+            star = Some((star_p, star_n + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 fn fix_inner_gitignore_if_warned(
@@ -5735,7 +5852,6 @@ fn fix_inner_gitignore_if_warned(
     ctx: &OutputContext,
     session: Option<&mut DoctorRepairSession>,
 ) -> bool {
-    const EXPECTED_PATTERNS: &[&str] = &[".write.lock", "*.tmp"];
     let has_warning = report
         .checks
         .iter()
@@ -5761,11 +5877,7 @@ fn fix_inner_gitignore_if_warned(
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(_) => return false,
     };
-    let missing: Vec<&str> = EXPECTED_PATTERNS
-        .iter()
-        .copied()
-        .filter(|needle| !inner_gitignore_covers(&existing, needle))
-        .collect();
+    let missing = inner_gitignore_missing_patterns(&existing);
     if missing.is_empty() {
         return false;
     }
@@ -16997,11 +17109,14 @@ mod tests {
 
     #[test]
     fn test_check_inner_gitignore_present_complete_ok() {
-        // Complete .gitignore with all expected patterns → ok.
+        // Complete .gitignore covering every expectation → ok. Written as
+        // the canonical append patterns themselves, which must always
+        // self-satisfy their own probes.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
-        fs::write(beads_dir.join(".gitignore"), b".write.lock\n*.tmp\n").unwrap();
+        let contents = inner_gitignore_all_append_patterns().join("\n") + "\n";
+        fs::write(beads_dir.join(".gitignore"), contents).unwrap();
 
         let mut checks = Vec::new();
         check_inner_gitignore_present(&beads_dir, &mut checks);
@@ -17010,12 +17125,89 @@ mod tests {
     }
 
     #[test]
+    fn test_check_inner_gitignore_operator_megamix_equivalents_are_ok() {
+        // GitHub #427: operator-authored equivalents (broad `*.db?*`,
+        // `*.lock`, `*-fsqlite-ns-*` generics) must satisfy coverage via
+        // probes without textual equality with the canonical patterns.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(
+            beads_dir.join(".gitignore"),
+            b"*.db\n*.db?*\n*-fsqlite-ns-gate\n*-fsqlite-ns-use\n*.lock\n*.tmp\n",
+        )
+        .unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok), "{check:?}");
+    }
+
+    #[test]
+    fn test_check_inner_gitignore_flags_missing_db_artifact_family() {
+        // A pre-fsqlite-0.3 ignore file (bare `*.db` only) must warn and
+        // name the sidecar/vacuum patterns it is missing.
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        fs::write(beads_dir.join(".gitignore"), b"*.db\n.write.lock\n*.tmp\n").unwrap();
+
+        let mut checks = Vec::new();
+        check_inner_gitignore_present(&beads_dir, &mut checks);
+        let check = find_check(&checks, "gitignore.beads_inner_present").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Warn), "{check:?}");
+        let missing: Vec<String> = check
+            .details
+            .as_ref()
+            .and_then(|d| d.get("missing_patterns"))
+            .and_then(|v| v.as_array())
+            .map(|patterns| {
+                patterns
+                    .iter()
+                    .filter_map(|p| p.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for expected in [
+            "*.db-wal*",
+            "*-fsqlite-ns-gate",
+            "*-fsqlite-ns-use",
+            "*.vacuum-wal-cert*",
+        ] {
+            assert!(
+                missing.iter().any(|p| p == expected),
+                "expected {expected} in missing patterns, got {missing:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_inner_gitignore_broad_lock_rule_and_later_negation() {
-        assert!(inner_gitignore_covers("*.lock\n*.tmp\n", ".write.lock"));
-        assert!(!inner_gitignore_covers(
+        assert!(inner_gitignore_ignores_probe("*.lock\n*.tmp\n", ".write.lock"));
+        assert!(!inner_gitignore_ignores_probe(
             "*.lock\n!.write.lock\n*.tmp\n",
             ".write.lock"
         ));
+    }
+
+    #[test]
+    fn test_gitignore_glob_matches_semantics() {
+        // `*` spans any run including empty; `?` is exactly one char.
+        assert!(gitignore_glob_matches("*.db?*", "beads.db-wal"));
+        assert!(gitignore_glob_matches(
+            "*.db?*",
+            ".beads.db.schema-migration-20260101T000000.000000Z-0-0.vacuum-fsqlite-ns-gate"
+        ));
+        assert!(!gitignore_glob_matches("*.db?*", "beads.db"));
+        assert!(gitignore_glob_matches("*.db", "beads.db"));
+        assert!(gitignore_glob_matches(
+            "*-fsqlite-ns-gate",
+            "beads.db-fsqlite-ns-gate"
+        ));
+        assert!(!gitignore_glob_matches("*.tmp", "probe.tmpx"));
+        assert!(gitignore_glob_matches("probe.?mp", "probe.tmp"));
+        assert!(!gitignore_glob_matches("probe.?mp", "probe.mp"));
     }
 
     #[test]
