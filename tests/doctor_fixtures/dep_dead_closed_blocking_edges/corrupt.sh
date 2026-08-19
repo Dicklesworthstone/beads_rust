@@ -4,13 +4,14 @@
 #     fm-dependencies-fully-unblocked-open-issues (P3) — issue #350
 #     dependency-graph JSONL audit.
 #
-# Plants the canonical stale-edge shape with nothing but public CLI
-# commands: an open issue whose only `blocks` dependency targets a
-# blocker that has since been closed. The edge is dead (its blocker is
-# terminal) AND the open issue is fully unblocked (every declared
-# blocker is dead), so one planted state fires both detect-only checks:
-#   - dep.dead_closed_blocking_edges  (warn)
-#   - dep.fully_unblocked_open        (warn)
+# Plants the canonical completed-dependency shape with nothing but
+# public CLI commands: an open issue whose only `blocks` dependency
+# targets a blocker that has since been closed. The edge is SATISFIED
+# (its blocker is present and terminal) AND the open issue is fully
+# unblocked, so one planted state exercises both detect-only checks in
+# their #432 benign form:
+#   - dep.dead_closed_blocking_edges  (ok + satisfied_blockers details)
+#   - dep.fully_unblocked_open        (ok + ready details)
 
 set -euo pipefail
 target_dir="${1:?usage: corrupt.sh <target_dir>}"
@@ -52,8 +53,8 @@ if [ -z "$blocker_id" ] || [ -z "$blocked_id" ]; then
 fi
 
 # blocked depends on blocker (forward `blocks` edge), then the blocker
-# closes WITHOUT the edge being removed — the exact hygiene gap the
-# #350 audit exists to surface.
+# closes WITHOUT the edge being removed — the normal completion of work
+# (#432): the audit must report it as informational, never degrade it.
 "$tool_bin" dep add "$blocked_id" "$blocker_id" >/dev/null 2>&1
 "$tool_bin" close "$blocker_id" --reason "fixture: blocker completed" >/dev/null 2>&1
 "$tool_bin" sync --flush-only >/dev/null 2>&1

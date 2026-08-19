@@ -182,7 +182,9 @@ fn e2e_show_json_carries_inherited_context_as_structured_field() {
         });
     assert_eq!(blocks.len(), 1, "one inherited block:\n{}", show.stdout);
     assert_eq!(
-        blocks[0].get("source_id").and_then(serde_json::Value::as_str),
+        blocks[0]
+            .get("source_id")
+            .and_then(serde_json::Value::as_str),
         Some(epic_id.as_str()),
         "inherited block must name the governing epic:\n{}",
         show.stdout

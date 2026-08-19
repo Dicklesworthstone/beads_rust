@@ -12008,21 +12008,37 @@ fn inspect_doctor_jsonl(
     (jsonl_path, jsonl_count)
 }
 
-/// #350: audit the dependency graph from the JSONL source of truth and surface
-/// two actionable findings:
+/// #350 (+ #432 severity split): audit the dependency graph from the JSONL
+/// source of truth and surface two findings:
 ///
 /// - `dep.dead_closed_blocking_edges`: open issues with a blocking dependency
-///   whose target is closed/tombstoned or entirely absent from the JSONL
-///   ("dead" edges that no longer reflect a live blocker).
+///   whose target is closed/tombstoned ("satisfied" — the normal end state of
+///   completed work, reported `Ok` with details) or entirely absent from the
+///   JSONL ("dangling" — a real defect, reported `Warn`). #432: the two are
+///   opposite conditions and must never share one severity; only dangling
+///   edges degrade the check, and `details` always carries both partitions
+///   (`satisfied_blockers` / `dangling_blockers`) so consumers never have to
+///   re-read the database to tell them apart.
 /// - `dep.fully_unblocked_open`: open issues that DO declare blocking
-///   dependencies but where EVERY blocker is now closed/tombstoned/absent —
-///   i.e. they are actually ready to work but may not be surfaced as such.
+///   dependencies but where EVERY blocker is now closed/tombstoned/absent.
+///   #432: an issue whose blockers all completed is the benign steady state,
+///   not a defect — it is reported `Ok` with details, split into `ready`
+///   (satisfies every `br ready` condition derivable from the record) and
+///   `excluded` (deliberately kept off the ready queue: claimed, deferred,
+///   pinned, ephemeral/wisp, template, custom status — with the reason
+///   named). The one derivable inconsistency — status still `blocked` while
+///   no live blocker remains — is reported `Warn` (`stale_blocked`).
 ///
 /// "Open" here means non-terminal (not `closed`/`tombstone`) and non-draft —
 /// the same work-surface notion `br ready` uses. Blocking edge types are the
 /// model's canonical blocking set (`DependencyType::is_blocking`). External
 /// targets (`external:` prefix) are not treated as dead, since `br` cannot
 /// know their state.
+///
+/// The `Ok`-with-details shape follows the established `db.sidecars` /
+/// `db.no_db_mode` pattern: fully visible and machine-readable without
+/// degrading a healthy workspace (`doctor.ok` treats every warn as a failed
+/// health check, #292).
 fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
     let issues = match read_jsonl_issues_for_graph(path) {
         Ok(issues) => issues,
@@ -12049,19 +12065,25 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
 
     // A blocker is "live" (still blocking) when it exists AND is non-terminal.
     // A blocker is "dead" when its target is terminal OR absent (and not an
-    // external ref, whose state `br` cannot resolve).
-    let blocker_is_dead = |target: &str| -> bool {
+    // external ref, whose state `br` cannot resolve). #432: the two dead
+    // states are opposite conditions — a present-but-terminal blocker is a
+    // SATISFIED dependency (the normal end of completed work), while an
+    // absent one is a DANGLING edge (points at nothing) — so classify rather
+    // than collapse.
+    let blocker_fate = |target: &str| -> BlockerFate {
         if target.starts_with("external:") {
-            return false;
+            return BlockerFate::Live;
         }
         match status_by_id.get(target) {
-            Some(status) => status.is_terminal(),
-            None => true,
+            Some(status) if status.is_terminal() => BlockerFate::Satisfied,
+            Some(_) => BlockerFate::Live,
+            None => BlockerFate::Dangling,
         }
     };
 
     let mut dead_edge_issues: Vec<serde_json::Value> = Vec::new();
-    let mut fully_unblocked_issues: Vec<String> = Vec::new();
+    let mut dangling_edge_issue_ids: Vec<String> = Vec::new();
+    let mut fully_unblocked_issues: Vec<FullyUnblockedIssue> = Vec::new();
 
     for issue in &issues {
         // Only audit open (non-terminal, non-draft) issues — the work surface.
@@ -12096,28 +12118,110 @@ fn check_dependency_graph_jsonl(path: &Path, checks: &mut Vec<CheckResult>) {
             continue;
         }
 
-        let dead: Vec<&str> = blocking_targets
-            .iter()
-            .copied()
-            .filter(|target| blocker_is_dead(target))
-            .collect();
+        let mut satisfied: Vec<&str> = Vec::new();
+        let mut dangling: Vec<&str> = Vec::new();
+        for target in &blocking_targets {
+            match blocker_fate(target) {
+                BlockerFate::Live => {}
+                BlockerFate::Satisfied => satisfied.push(target),
+                BlockerFate::Dangling => dangling.push(target),
+            }
+        }
+        let dead_count = satisfied.len() + dangling.len();
 
-        if !dead.is_empty() {
+        if dead_count > 0 {
+            // `dead_blockers` is retained for consumers of the pre-#432
+            // shape; `satisfied_blockers`/`dangling_blockers` carry the
+            // discrimination.
+            let mut dead: Vec<&str> = Vec::with_capacity(dead_count);
+            dead.extend(&satisfied);
+            dead.extend(&dangling);
             dead_edge_issues.push(serde_json::json!({
                 "id": issue.id,
                 "dead_blockers": dead,
+                "satisfied_blockers": satisfied,
+                "dangling_blockers": dangling,
             }));
+            if !dangling.is_empty() {
+                dangling_edge_issue_ids.push(issue.id.clone());
+            }
         }
 
         // Fully unblocked: every declared blocker is dead (closed/absent), so
         // nothing live remains to block this open issue.
-        if dead.len() == blocking_targets.len() {
-            fully_unblocked_issues.push(issue.id.clone());
+        if dead_count == blocking_targets.len() {
+            fully_unblocked_issues.push(classify_fully_unblocked(issue));
         }
     }
 
-    emit_dead_closed_blocking_edges(&dead_edge_issues, checks);
+    emit_dead_closed_blocking_edges(&dead_edge_issues, &dangling_edge_issue_ids, checks);
     emit_fully_unblocked_open(&fully_unblocked_issues, checks);
+}
+
+/// #432: classification of a dead blocking edge's target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockerFate {
+    /// Present and non-terminal (or an `external:` ref br cannot resolve) —
+    /// still a real blocker.
+    Live,
+    /// Present and closed/tombstoned — the dependency was satisfied. Benign.
+    Satisfied,
+    /// Absent from the JSONL entirely — the edge points at nothing. A defect.
+    Dangling,
+}
+
+/// #432: a fully-unblocked open issue plus its readiness classification,
+/// derived purely from fields on the already-deserialized record (the same
+/// conditions `br ready` applies, minus the blocked cache — which is exactly
+/// what the graph audit has just recomputed as empty).
+struct FullyUnblockedIssue {
+    id: String,
+    /// Reasons this issue is deliberately excluded from `br ready` despite
+    /// having no live blockers (claimed, deferred, pinned, ...). Empty =
+    /// the issue satisfies every derivable ready condition.
+    excluded_reasons: Vec<&'static str>,
+    /// True when status is still `blocked` although no live blocker remains —
+    /// the one derivable real inconsistency in this check.
+    stale_blocked: bool,
+}
+
+fn classify_fully_unblocked(issue: &crate::model::Issue) -> FullyUnblockedIssue {
+    use crate::model::Status;
+    let mut excluded_reasons: Vec<&'static str> = Vec::new();
+    let mut stale_blocked = false;
+    match &issue.status {
+        Status::Open => {}
+        Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
+        Status::Blocked => stale_blocked = true,
+        Status::Deferred => excluded_reasons.push("status deferred"),
+        Status::Pinned => excluded_reasons.push("status pinned"),
+        Status::Custom(_) => excluded_reasons.push("custom status"),
+        // Terminal and draft statuses were filtered out before this point.
+        Status::Closed | Status::Tombstone | Status::Draft => {}
+    }
+    if issue
+        .defer_until
+        .is_some_and(|until| until > chrono::Utc::now())
+    {
+        excluded_reasons.push("defer_until in the future");
+    }
+    if issue.pinned {
+        excluded_reasons.push("pinned");
+    }
+    if issue.ephemeral {
+        excluded_reasons.push("ephemeral");
+    }
+    if issue.id.contains("-wisp-") {
+        excluded_reasons.push("wisp");
+    }
+    if issue.is_template {
+        excluded_reasons.push("template");
+    }
+    FullyUnblockedIssue {
+        id: issue.id.clone(),
+        excluded_reasons,
+        stale_blocked,
+    }
 }
 
 /// Read and parse JSONL issue records for the dependency-graph audit, skipping
@@ -12141,8 +12245,14 @@ fn read_jsonl_issues_for_graph(path: &Path) -> Result<Vec<crate::model::Issue>> 
     Ok(issues)
 }
 
+/// #432: dangling edges (blocker absent from the JSONL) are the defect and
+/// warn; satisfied edges (blocker present and closed) are the normal end
+/// state of completed work and are reported `Ok` with full details. Both
+/// partitions are always carried in `details.issues[]` so a consumer never
+/// has to re-read the database to separate them.
 fn emit_dead_closed_blocking_edges(
     dead_edge_issues: &[serde_json::Value],
+    dangling_edge_issue_ids: &[String],
     checks: &mut Vec<CheckResult>,
 ) {
     if dead_edge_issues.is_empty() {
@@ -12155,28 +12265,54 @@ fn emit_dead_closed_blocking_edges(
         );
         return;
     }
-    let ids: Vec<&str> = dead_edge_issues
-        .iter()
-        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
-        .collect();
+    if dangling_edge_issue_ids.is_empty() {
+        // Every dead edge is a satisfied dependency — benign steady state.
+        // Do NOT recommend `br dep remove` here: satisfied edges are project
+        // history (`br dep tree` displays them), and closing work regenerates
+        // the state (#432, and the #426 bulk-delete incident).
+        push_check(
+            checks,
+            "dep.dead_closed_blocking_edges",
+            CheckStatus::Ok,
+            Some(format!(
+                "{} open issue(s) have blocking edges whose blockers are closed (satisfied dependencies — the normal result of completing work)",
+                dead_edge_issues.len()
+            )),
+            Some(serde_json::json!({
+                "count": dead_edge_issues.len(),
+                "issues": dead_edge_issues,
+                "dangling_count": 0,
+                "note": "Satisfied edges record completed dependencies and need no action; removing them would delete dependency history.",
+            })),
+        );
+        return;
+    }
     push_check(
         checks,
         "dep.dead_closed_blocking_edges",
         CheckStatus::Warn,
         Some(format!(
-            "{} open issue(s) have dead blocking edges (blocker closed or missing): {}",
-            dead_edge_issues.len(),
-            ids.join(", ")
+            "{} open issue(s) have dangling blocking edges (blocker absent from JSONL): {}",
+            dangling_edge_issue_ids.len(),
+            dangling_edge_issue_ids.join(", ")
         )),
         Some(serde_json::json!({
             "count": dead_edge_issues.len(),
             "issues": dead_edge_issues,
-            "remediation": "Remove or update the stale `blocks`/dependency edges (e.g. `br dep remove`) so the blocker reflects a live issue.",
+            "dangling_count": dangling_edge_issue_ids.len(),
+            "remediation": "Remove or update the dangling `blocks`/dependency edges (e.g. `br dep remove`) so each blocker reflects an existing issue. Edges whose blockers are merely closed (`satisfied_blockers`) are history and should be left alone.",
         })),
     );
 }
 
-fn emit_fully_unblocked_open(fully_unblocked: &[String], checks: &mut Vec<CheckResult>) {
+/// #432: an open issue whose blockers all completed is the benign steady
+/// state (`Ok` with details, split into `ready` and deliberately `excluded`);
+/// the one derivable defect — status still `blocked` with no live blocker —
+/// warns.
+fn emit_fully_unblocked_open(
+    fully_unblocked: &[FullyUnblockedIssue],
+    checks: &mut Vec<CheckResult>,
+) {
     if fully_unblocked.is_empty() {
         push_check(
             checks,
@@ -12187,20 +12323,71 @@ fn emit_fully_unblocked_open(fully_unblocked: &[String], checks: &mut Vec<CheckR
         );
         return;
     }
+    let ids: Vec<&str> = fully_unblocked
+        .iter()
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let stale_blocked: Vec<&str> = fully_unblocked
+        .iter()
+        .filter(|issue| issue.stale_blocked)
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let ready: Vec<&str> = fully_unblocked
+        .iter()
+        .filter(|issue| !issue.stale_blocked && issue.excluded_reasons.is_empty())
+        .map(|issue| issue.id.as_str())
+        .collect();
+    let excluded: Vec<serde_json::Value> = fully_unblocked
+        .iter()
+        .filter(|issue| !issue.stale_blocked && !issue.excluded_reasons.is_empty())
+        .map(|issue| {
+            serde_json::json!({
+                "id": issue.id,
+                "reasons": issue.excluded_reasons,
+            })
+        })
+        .collect();
+    let details = serde_json::json!({
+        "count": fully_unblocked.len(),
+        "issues": ids,
+        "ready": ready,
+        "excluded": excluded,
+        "stale_blocked": stale_blocked,
+    });
+    if stale_blocked.is_empty() {
+        push_check(
+            checks,
+            "dep.fully_unblocked_open",
+            CheckStatus::Ok,
+            Some(format!(
+                "{} open issue(s) have all blockers completed ({} ready to work, {} deliberately excluded from ready)",
+                fully_unblocked.len(),
+                ready.len(),
+                excluded.len()
+            )),
+            Some(details),
+        );
+        return;
+    }
+    let mut details = details;
+    if let Some(map) = details.as_object_mut() {
+        map.insert(
+            "remediation".to_string(),
+            serde_json::Value::String(
+                "These issues have status `blocked` but no live blocker remains — update their status (e.g. `br update <id> --status open`) so they surface as ready.".to_string(),
+            ),
+        );
+    }
     push_check(
         checks,
         "dep.fully_unblocked_open",
         CheckStatus::Warn,
         Some(format!(
-            "{} open issue(s) are fully unblocked (all blockers closed) but may not be surfaced as ready: {}",
-            fully_unblocked.len(),
-            fully_unblocked.join(", ")
+            "{} open issue(s) still have status `blocked` although every blocker is closed or absent: {}",
+            stale_blocked.len(),
+            stale_blocked.join(", ")
         )),
-        Some(serde_json::json!({
-            "count": fully_unblocked.len(),
-            "issues": fully_unblocked,
-            "remediation": "These issues are ready to work — run `br ready` to confirm, or check status fields if they were manually set to `blocked`.",
-        })),
+        Some(details),
     );
 }
 
@@ -14398,24 +14585,68 @@ mod tests {
         let mut checks = Vec::new();
         check_dependency_graph_jsonl(&jsonl, &mut checks);
 
+        // #432: the dead-edge check warns because bd-c's blocker is DANGLING
+        // (absent from the JSONL). Satisfied edges (bd-a, bd-d -> bd-closed)
+        // are carried in details but do not on their own degrade the check.
         let dead = find_check(&checks, "dep.dead_closed_blocking_edges").expect("dead-edge check");
         assert_eq!(dead.status, CheckStatus::Warn, "{dead:?}");
-        let dead_count = dead
-            .details
-            .as_ref()
-            .and_then(|d| d.get("count"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap();
-        // bd-a, bd-c, bd-d each have >=1 dead blocking edge.
-        assert_eq!(dead_count, 3, "expected 3 issues with dead edges: {dead:?}");
+        let details = dead.details.as_ref().unwrap();
+        // bd-a, bd-c, bd-d each have >=1 dead blocking edge (compat count).
+        assert_eq!(
+            details.get("count").and_then(serde_json::Value::as_u64),
+            Some(3),
+            "expected 3 issues with dead edges: {dead:?}"
+        );
+        assert_eq!(
+            details
+                .get("dangling_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "only bd-c has a dangling blocker: {dead:?}"
+        );
+        // The warn message names only the dangling issue.
+        let message = dead.message.as_deref().unwrap();
+        assert!(message.contains("bd-c"), "{message}");
+        assert!(!message.contains("bd-a"), "{message}");
+        // Per-issue partitions discriminate satisfied vs dangling.
+        let issues = details.get("issues").and_then(serde_json::Value::as_array);
+        let entry = |id: &str| -> &serde_json::Value {
+            issues
+                .unwrap()
+                .iter()
+                .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                .unwrap_or_else(|| panic!("no dead-edge entry for {id}: {dead:?}"))
+        };
+        assert_eq!(
+            entry("bd-a").get("satisfied_blockers").unwrap(),
+            &serde_json::json!(["bd-closed"])
+        );
+        assert_eq!(
+            entry("bd-a").get("dangling_blockers").unwrap(),
+            &serde_json::json!([])
+        );
+        assert_eq!(
+            entry("bd-c").get("dangling_blockers").unwrap(),
+            &serde_json::json!(["bd-missing"])
+        );
+        assert_eq!(
+            entry("bd-c").get("satisfied_blockers").unwrap(),
+            &serde_json::json!([])
+        );
+        // Pre-#432 compat key still carries the union.
+        assert_eq!(
+            entry("bd-d").get("dead_blockers").unwrap(),
+            &serde_json::json!(["bd-closed"])
+        );
 
+        // #432: fully-unblocked open issues in plain `open` status are the
+        // benign steady state — Ok with details, all listed as ready.
         let unblocked =
             find_check(&checks, "dep.fully_unblocked_open").expect("fully-unblocked check");
-        assert_eq!(unblocked.status, CheckStatus::Warn, "{unblocked:?}");
-        let unblocked_ids: Vec<String> = unblocked
-            .details
-            .as_ref()
-            .and_then(|d| d.get("issues"))
+        assert_eq!(unblocked.status, CheckStatus::Ok, "{unblocked:?}");
+        let udetails = unblocked.details.as_ref().unwrap();
+        let unblocked_ids: Vec<String> = udetails
+            .get("issues")
             .and_then(serde_json::Value::as_array)
             .unwrap()
             .iter()
@@ -14440,6 +14671,114 @@ mod tests {
             "{unblocked_ids:?}"
         );
         assert_eq!(unblocked_ids.len(), 2, "{unblocked_ids:?}");
+        assert_eq!(
+            udetails.get("ready").unwrap(),
+            &serde_json::json!(["bd-a", "bd-c"]),
+            "{unblocked:?}"
+        );
+        assert_eq!(
+            udetails.get("stale_blocked").unwrap(),
+            &serde_json::json!([]),
+            "{unblocked:?}"
+        );
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_satisfied_only_reports_ok_with_details() {
+        // #432 core scenario: `create` / `dep add` / `close` and nothing
+        // else. The blocker is present and closed — a satisfied dependency —
+        // so BOTH checks must be Ok (doctor.ok stays true) while still
+        // carrying full machine-readable details.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let issues = vec![issue_with_blockers("bd-dep", Status::Open, &["bd-done"]), {
+            let mut closed = sample_issue("bd-done", "bd-done");
+            closed.status = Status::Closed;
+            closed.closed_at = Some(Utc::now());
+            closed
+        }];
+        write_issues_jsonl(&jsonl, &issues);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
+        assert_eq!(dead.status, CheckStatus::Ok, "{dead:?}");
+        let details = dead.details.as_ref().unwrap();
+        assert_eq!(
+            details
+                .get("dangling_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        let entry = &details.get("issues").unwrap().as_array().unwrap()[0];
+        assert_eq!(
+            entry.get("satisfied_blockers").unwrap(),
+            &serde_json::json!(["bd-done"])
+        );
+        // The benign path must NOT steer operators toward `br dep remove`
+        // (#432 / the #426 bulk-delete incident).
+        assert!(details.get("remediation").is_none(), "{dead:?}");
+        assert!(
+            !dead
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("dep remove"),
+            "{dead:?}"
+        );
+
+        let unblocked = find_check(&checks, "dep.fully_unblocked_open").unwrap();
+        assert_eq!(unblocked.status, CheckStatus::Ok, "{unblocked:?}");
+        assert_eq!(
+            unblocked.details.as_ref().unwrap().get("ready").unwrap(),
+            &serde_json::json!(["bd-dep"])
+        );
+    }
+
+    #[test]
+    fn test_dep_graph_jsonl_stale_blocked_status_warns() {
+        // #432: status still `blocked` while every blocker is closed is the
+        // one derivable real inconsistency — it warns. A deliberately
+        // deferred issue with the same graph shape is excluded-with-reason,
+        // not a finding.
+        let temp = TempDir::new().unwrap();
+        let jsonl = temp.path().join("issues.jsonl");
+        let issues = vec![
+            issue_with_blockers("bd-stale", Status::Blocked, &["bd-done"]),
+            issue_with_blockers("bd-deferred", Status::Deferred, &["bd-done"]),
+            {
+                let mut closed = sample_issue("bd-done", "bd-done");
+                closed.status = Status::Closed;
+                closed.closed_at = Some(Utc::now());
+                closed
+            },
+        ];
+        write_issues_jsonl(&jsonl, &issues);
+
+        let mut checks = Vec::new();
+        check_dependency_graph_jsonl(&jsonl, &mut checks);
+
+        let unblocked = find_check(&checks, "dep.fully_unblocked_open").unwrap();
+        assert_eq!(unblocked.status, CheckStatus::Warn, "{unblocked:?}");
+        let details = unblocked.details.as_ref().unwrap();
+        assert_eq!(
+            details.get("stale_blocked").unwrap(),
+            &serde_json::json!(["bd-stale"])
+        );
+        let excluded = details.get("excluded").unwrap().as_array().unwrap();
+        assert_eq!(excluded.len(), 1, "{unblocked:?}");
+        assert_eq!(
+            excluded[0].get("id").and_then(serde_json::Value::as_str),
+            Some("bd-deferred")
+        );
+        let message = unblocked.message.as_deref().unwrap();
+        assert!(message.contains("bd-stale"), "{message}");
+        assert!(!message.contains("bd-deferred"), "{message}");
+
+        // Satisfied-only edges: the dead-edge check stays Ok.
+        let dead = find_check(&checks, "dep.dead_closed_blocking_edges").unwrap();
+        assert_eq!(dead.status, CheckStatus::Ok, "{dead:?}");
     }
 
     #[test]
@@ -17184,7 +17523,10 @@ mod tests {
 
     #[test]
     fn test_inner_gitignore_broad_lock_rule_and_later_negation() {
-        assert!(inner_gitignore_ignores_probe("*.lock\n*.tmp\n", ".write.lock"));
+        assert!(inner_gitignore_ignores_probe(
+            "*.lock\n*.tmp\n",
+            ".write.lock"
+        ));
         assert!(!inner_gitignore_ignores_probe(
             "*.lock\n!.write.lock\n*.tmp\n",
             ".write.lock"
