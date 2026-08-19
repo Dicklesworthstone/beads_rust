@@ -392,7 +392,10 @@ fn linked_worktree_primary_beads_dir(workspace_root: &Path, candidate: &Path) ->
         return None;
     }
     let primary = primary_beads_dir_from_git_file(&git_file)?;
-    let same = match (dunce::canonicalize(&primary), dunce::canonicalize(candidate)) {
+    let same = match (
+        dunce::canonicalize(&primary),
+        dunce::canonicalize(candidate),
+    ) {
         (Ok(a), Ok(b)) => a == b,
         _ => primary == *candidate,
     };
@@ -472,7 +475,11 @@ fn primary_beads_dir_from_git_file(git_file: &Path) -> Option<PathBuf> {
         return None;
     }
     let primary = common_git_dir.parent()?.join(".beads");
-    if primary.is_dir() { Some(primary) } else { None }
+    if primary.is_dir() {
+        Some(primary)
+    } else {
+        None
+    }
 }
 
 /// Discover beads directory, using `--db` path if provided.
@@ -6441,8 +6448,11 @@ labels:
         let (primary_beads, worktree) = linked_worktree_fixture(temp.path());
         let wt_beads = worktree.join(".beads");
         fs::create_dir_all(&wt_beads).expect("wt beads");
-        fs::write(wt_beads.join("metadata.json"), "{\"database\": \"beads.db\"}")
-            .expect("wt metadata");
+        fs::write(
+            wt_beads.join("metadata.json"),
+            "{\"database\": \"beads.db\"}",
+        )
+        .expect("wt metadata");
         fs::write(wt_beads.join("issues.jsonl"), "").expect("wt jsonl");
 
         let discovered = discover_beads_dir(Some(&worktree)).expect("discover");
@@ -6460,8 +6470,11 @@ labels:
         let (_primary_beads, worktree) = linked_worktree_fixture(temp.path());
         let wt_beads = worktree.join(".beads");
         fs::create_dir_all(&wt_beads).expect("wt beads");
-        fs::write(wt_beads.join("metadata.json"), "{\"database\": \"beads.db\"}")
-            .expect("wt metadata");
+        fs::write(
+            wt_beads.join("metadata.json"),
+            "{\"database\": \"beads.db\"}",
+        )
+        .expect("wt metadata");
         fs::write(wt_beads.join("beads.db"), b"db").expect("wt db");
 
         let discovered = discover_beads_dir(Some(&worktree)).expect("discover");

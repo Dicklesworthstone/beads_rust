@@ -823,7 +823,12 @@ mod tests {
         let t1 = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
         let t2 = Utc.with_ymd_and_hms(2025, 1, 2, 0, 0, 0).unwrap();
 
-        let commented = make_issue("bd-101", "comment search boundary", Some("control text"), t1);
+        let commented = make_issue(
+            "bd-101",
+            "comment search boundary",
+            Some("control text"),
+            t1,
+        );
         let control = make_issue("bd-102", "unrelated", None, t2);
         storage.create_issue(&commented, "tester").expect("create");
         storage.create_issue(&control, "tester").expect("create");
