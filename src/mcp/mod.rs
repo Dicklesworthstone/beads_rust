@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
-use fastmcp_rust::{Cx, McpError, McpErrorCode, McpResult, StdioTransport};
+use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
 
 use crate::error::StructuredError;
@@ -1173,6 +1173,21 @@ pub struct ServeArgs {
 ///
 /// Returns an error if the beads workspace is not initialised or storage
 /// cannot be opened.
+/// Build the runtime-backed serve context.
+///
+/// asupersync 0.4.8 gates `Cx::for_request()` behind `test-internals`; the
+/// production ambient-free entry is a runtime-minted request Cx. The returned
+/// runtime object must outlive the serve loop, so the caller keeps it alive.
+fn build_serve_cx() -> crate::Result<(asupersync::runtime::Runtime, fastmcp_rust::Cx)> {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .map_err(|e| {
+            BeadsError::Config(format!("failed to build asupersync runtime for serve: {e}"))
+        })?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    Ok((runtime, cx))
+}
+
 pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::Result<()> {
     let beads_dir = config::discover_beads_dir_with_cli(overrides)?;
     let startup = config::load_startup_config_with_paths(&beads_dir, overrides.db.as_ref())?;
@@ -1222,7 +1237,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         read_snapshot_cache: mcp_read_snapshot_cache_from_env(),
     });
 
-    let server = fastmcp_rust::Server::new("br", env!("CARGO_PKG_VERSION"))
+    let server = fastmcp_rust::modern::ServerBuilder::new("br", env!("CARGO_PKG_VERSION"))
         .instructions(
             "beads_rust (br) issue tracker MCP server.\n\n\
              Use tools to query, create, and manage issues. All mutations are \
@@ -1276,7 +1291,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
     // (SIGINT/SIGTERM/SIGHUP; see `crate::shutdown`) into a Cx cancellation
     // lets `br serve` return through `main` and run every destructor (WAL
     // flush on drop, #270) instead of waiting on transport EOF detection.
-    let serve_cx = Cx::for_request();
+    let (_serve_runtime, serve_cx) = build_serve_cx()?;
     let watcher_cx = serve_cx.clone();
     std::thread::spawn(move || {
         while !crate::shutdown::is_requested() {
@@ -1284,6 +1299,8 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         }
         watcher_cx.set_cancel_requested(true);
     });
-    server.run_transport_returning_with_cx(&serve_cx, StdioTransport::stdio());
+    server
+        .run_transport_returning_with_cx(&serve_cx, StdioTransport::stdio())
+        .map_err(|e| BeadsError::Config(format!("MCP serve transport failed: {e}")))?;
     Ok(())
 }

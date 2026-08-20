@@ -42,28 +42,29 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.3.1"
-fsqlite-types = "0.3.1"
-fsqlite-error = "0.3.1"
-fsqlite-core = "0.3.1"
-fsqlite-func = "0.3.1"
-fsqlite-vdbe = "0.3.1"
-fsqlite-vfs = "0.3.1"
-fsqlite-pager = "0.3.1"
-fsqlite-parser = "0.3.1"
-fsqlite-planner = "0.3.1"
-fsqlite-wal = "0.3.1"
-fsqlite-btree = "0.3.1"
-fsqlite-ast = "0.3.1"
-fsqlite-mvcc = "0.3.1"
-fsqlite-observability = "0.3.1"
+fsqlite = "0.3.6"
+fsqlite-types = "0.3.6"
+fsqlite-error = "0.3.6"
+fsqlite-core = "0.3.6"
+fsqlite-func = "0.3.6"
+fsqlite-vdbe = "0.3.6"
+fsqlite-vfs = "0.3.6"
+fsqlite-pager = "0.3.6"
+fsqlite-parser = "0.3.6"
+fsqlite-planner = "0.3.6"
+fsqlite-wal = "0.3.6"
+fsqlite-btree = "0.3.6"
+fsqlite-ast = "0.3.6"
+fsqlite-mvcc = "0.3.6"
+fsqlite-observability = "0.3.6"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
-# Pinned =0.4.5 to match the fsqlite family's asupersync requirement exactly
-# at that seam. The optional `mcp` feature independently retains FastMCP's
-# asupersync 0.3.x line. default-features = false mirrors fsqlite's own spec.
-asupersync = { version = "=0.4.5", default-features = false }
+# Pinned =0.4.8 to match both the fsqlite family's requirement
+# (>=0.4.3,<0.5) and fastmcp-rust 0.6.0's exact =0.4.8 pin, so `--features
+# mcp` builds carry a single asupersync version (beads_rust-fiop).
+# default-features = false mirrors fsqlite's own spec.
+asupersync = { version = "=0.4.8", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -93,7 +94,7 @@ crossterm = "0.29"
 # Rich terminal output (sibling project). Keep syntax highlighting out of the
 # release build until the upstream syntect stack drops unmaintained transitive
 # crates.
-rich_rust = { version = "0.2.2", features = ["markdown", "json", "backtrace"] }
+rich_rust = { version = "0.2.3", features = ["markdown", "json", "backtrace"] }
 
 # TOON format support (sibling project)
 toon_rust = { version = "0.2.3", package = "tru" }
@@ -113,7 +114,7 @@ unicode-width = "0.2.2"
 semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.3.2", optional = true }
+fastmcp-rust = { version = "0.6.0", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
@@ -138,6 +139,10 @@ mimalloc = "0.1.52"
 vergen-gix = { version = "10.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
+# Re-enables `Cx::for_testing()` / `Cx::for_request()` for this crate's own
+# test builds; asupersync 0.4.8 gates those constructors behind
+# `test-internals` so production consumers cannot mint ambient authority.
+asupersync = { version = "=0.4.8", default-features = false, features = ["test-internals"] }
 assert_cmd = "2.2.2"
 flate2 = "1.1"
 predicates = "3.1.4"
@@ -185,8 +190,8 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.1, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.3.2 — are published on crates.io, so this crate
+# All dependencies — fsqlite 0.3.6, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.6.0 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`

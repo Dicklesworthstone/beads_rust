@@ -2789,10 +2789,11 @@ impl ToolHandler for ManageDependenciesTool {
             annotations: Some(ToolAnnotations {
                 read_only: None,
                 destructive: Some(false),
+                // Mixed batch: list is read-only, add is idempotent, remove is
+                // not — so no single idempotent hint applies. The tool only
+                // touches the local workspace (closed world).
                 idempotent: None,
-                open_world_hint: Some(
-                    "list action is read-only; add is idempotent; remove is not".into(),
-                ),
+                open_world_hint: Some(false),
             }),
         }
     }
