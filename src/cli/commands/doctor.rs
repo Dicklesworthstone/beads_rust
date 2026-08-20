@@ -6579,11 +6579,18 @@ fn check_write_lock_writable(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     };
     if meta.file_type().is_symlink() || !meta.is_file() {
+        // The non-regular shape itself is flagged (as an error) by the
+        // `write_lock` check; stay Ok here so one defect is not
+        // double-counted, but say why the permission probe is skipped.
         push_check(
             checks,
             "permissions.write_lock",
             CheckStatus::Ok,
-            None,
+            Some(
+                ".beads/.write.lock is not a regular file; permission probe skipped \
+                 (the write_lock check reports the non-regular node itself)"
+                    .to_string(),
+            ),
             None,
         );
         return;
@@ -9477,11 +9484,14 @@ const DEFAULT_STALE_LOCK_THRESHOLD_SECS: u64 = 300;
 /// Detect-only. The doctor NEVER removes or renames `.write.lock`.
 ///
 /// Status mapping:
-/// - `ok` — file missing; not a regular file (sibling detectors own
-///   those); mtime within threshold; probe acquired (free); or probe
-///   would-block (live holder).
+/// - `ok` — file missing; mtime within threshold; probe acquired (free);
+///   or probe would-block (live holder).
 /// - `warn` — mtime in the future (clock skew), or mtime older than the
 ///   threshold AND the probe could not run.
+/// - `error` — the node is not a regular file (symlink, directory, fifo,
+///   device, socket): fail closed (beads_rust-5sej). Startup would follow
+///   a symlink here, so the shape itself is the defect. Classified from
+///   lstat only; the target is never traversed and the node never moved.
 fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let lock_path = beads_dir.join(".write.lock");
 
@@ -9490,11 +9500,14 @@ fn check_orphaned_write_lock(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
         return;
     };
 
-    // Symlinks are the sibling FM's job
-    // (fm-concurrency_primitives-write-lock-toctou). Skip silently
-    // here so we don't double-flag.
+    // Fail closed on any non-regular node (beads_rust-5sej): startup's
+    // `OpenOptions` on the lock path follows a symlink, so a symlinked
+    // `.write.lock` silently relocates mutual exclusion to the target
+    // inode, and a directory/fifo/device node breaks acquisition
+    // outright. Classified via lstat only — the target is never
+    // traversed and the node is never touched.
     if !meta.file_type().is_file() {
-        push_write_lock_non_file(&meta, checks);
+        push_write_lock_non_file(&lock_path, &meta, checks);
         return;
     }
 
@@ -9564,16 +9577,52 @@ fn push_write_lock_missing(checks: &mut Vec<CheckResult>) {
     );
 }
 
-fn push_write_lock_non_file(meta: &fs::Metadata, checks: &mut Vec<CheckResult>) {
+/// Stable classification of a non-regular lock node's shape, from lstat
+/// metadata only (no target traversal).
+fn write_lock_node_kind(file_type: fs::FileType) -> &'static str {
+    if file_type.is_symlink() {
+        return "symlink";
+    }
+    if file_type.is_dir() {
+        return "directory";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            return "fifo";
+        }
+        if file_type.is_socket() {
+            return "socket";
+        }
+        if file_type.is_block_device() {
+            return "block_device";
+        }
+        if file_type.is_char_device() {
+            return "char_device";
+        }
+    }
+    "unknown"
+}
+
+fn push_write_lock_non_file(lock_path: &Path, meta: &fs::Metadata, checks: &mut Vec<CheckResult>) {
+    let kind = write_lock_node_kind(meta.file_type());
     push_check(
         checks,
         "write_lock",
-        CheckStatus::Ok,
+        CheckStatus::Error,
         Some(format!(
-            ".beads/.write.lock is not a regular file (file_type: {:?}); deferring to sibling detectors",
-            meta.file_type(),
+            ".beads/.write.lock is a {kind}, not a regular file; a symlinked or otherwise \
+             non-regular lock node silently relocates or breaks workspace mutual exclusion. \
+             Verify no live writer is running, then move the node aside manually — \
+             br never modifies the lock node itself; the next mutating call recreates a \
+             regular lock file"
         )),
-        None,
+        Some(serde_json::json!({
+            "path": lock_path.display().to_string(),
+            "reason": "non_regular_lock_node",
+            "node_kind": kind,
+        })),
     );
 }
 
@@ -24453,8 +24502,11 @@ version = "2026-05-11-abc123"
         );
     }
 
+    /// beads_rust-5sej: a symlinked lock node is the defect itself (startup
+    /// `OpenOptions` follows it), so doctor fails closed with a typed
+    /// diagnostic instead of deferring to a detector that does not exist.
     #[test]
-    fn check_orphaned_write_lock_symlink_defers() {
+    fn check_orphaned_write_lock_symlink_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let beads_dir = tmp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
@@ -24465,9 +24517,67 @@ version = "2026-05-11-abc123"
         check_orphaned_write_lock(&beads_dir, &mut checks);
         let check = find_check(&checks, "write_lock").expect("write_lock present");
         assert!(
-            matches!(check.status, CheckStatus::Ok),
-            "symlink .write.lock should defer to TOCTOU detector; got {:?}",
+            matches!(check.status, CheckStatus::Error),
+            "symlink .write.lock must fail closed; got {:?}",
             check.status
+        );
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("reason").and_then(|v| v.as_str()),
+            Some("non_regular_lock_node")
+        );
+        assert_eq!(
+            details.get("node_kind").and_then(|v| v.as_str()),
+            Some("symlink")
+        );
+        // Fail-closed classification must not traverse or disturb either
+        // the symlink or its target.
+        let lock_meta = fs::symlink_metadata(beads_dir.join(".write.lock")).unwrap();
+        assert!(lock_meta.file_type().is_symlink());
+        assert!(target.exists());
+    }
+
+    /// beads_rust-5sej: a directory in the lock slot breaks acquisition
+    /// outright and must fail closed with the same typed diagnostic.
+    #[test]
+    fn check_orphaned_write_lock_directory_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(beads_dir.join(".write.lock")).unwrap();
+        let mut checks = Vec::new();
+        check_orphaned_write_lock(&beads_dir, &mut checks);
+        let check = find_check(&checks, "write_lock").expect("write_lock present");
+        assert!(matches!(check.status, CheckStatus::Error), "{check:?}");
+        let details = check.details.as_ref().expect("details");
+        assert_eq!(
+            details.get("node_kind").and_then(|v| v.as_str()),
+            Some("directory")
+        );
+        // Doctor never removes or renames the node.
+        assert!(beads_dir.join(".write.lock").is_dir());
+    }
+
+    /// beads_rust-5sej: the permissions probe defers to the write_lock
+    /// check for non-regular nodes instead of silently reporting Ok with
+    /// no message.
+    #[test]
+    fn check_write_lock_writable_defers_on_symlink_with_message() {
+        let tmp = TempDir::new().unwrap();
+        let beads_dir = tmp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let target = beads_dir.join("target_file");
+        fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, beads_dir.join(".write.lock")).unwrap();
+        let mut checks = Vec::new();
+        check_write_lock_writable(&beads_dir, &mut checks);
+        let check = find_check(&checks, "permissions.write_lock").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
+        assert!(
+            check
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("not a regular file")),
+            "{check:?}"
         );
     }
 
