@@ -654,7 +654,12 @@ fn assert_surface_outcome(
             assert_sqlite_header(&resolved_database_path(fixture, "resolved_db"), &context);
         }
         WorkspaceFailureCommandOutcome::DoctorClean => {
-            assert!(run.status.success(), "{context} failed: {}", run.stderr);
+            assert!(
+                run.status.success(),
+                "{context} failed\nstdout={}\nstderr={}",
+                run.stdout,
+                run.stderr
+            );
             let json = parse_stdout_json(&run, &context);
             assert_doctor_clean_surface(fixture, &context, &json);
         }

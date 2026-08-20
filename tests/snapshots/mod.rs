@@ -595,6 +595,52 @@ fn normalize_id_string(s: &str) -> String {
     id_re.replace_all(s, "ISSUE_ID").to_string()
 }
 
+/// insta-safe JSON snapshot wrapper.
+///
+/// fsqlite-ext-json 0.3.6+ turns on serde_json's `arbitrary_precision`
+/// feature for the whole build (Cargo feature unification). Under that
+/// feature `serde_json::Number` serializes through *foreign* serializers —
+/// like insta's Content model — as a private newtype struct, leaking
+/// `{"$serde_json::private::Number": "2"}` into snapshots even though
+/// serde_json's own output bytes (what `br --json` actually prints) are
+/// unchanged. Re-emit every number as a primitive i64/u64/f64 so the
+/// goldens stay byte-identical regardless of that feature flag.
+pub struct SnapshotJson<'a>(pub &'a Value);
+
+impl serde::Serialize for SnapshotJson<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Null => serializer.serialize_unit(),
+            Value::Bool(b) => serializer.serialize_bool(*b),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    serializer.serialize_i64(i)
+                } else if let Some(u) = n.as_u64() {
+                    serializer.serialize_u64(u)
+                } else {
+                    serializer.serialize_f64(n.as_f64().unwrap_or(f64::NAN))
+                }
+            }
+            Value::String(s) => serializer.serialize_str(s),
+            Value::Array(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(&SnapshotJson(item))?;
+                }
+                seq.end()
+            }
+            Value::Object(map) => {
+                let mut m = serializer.serialize_map(Some(map.len()))?;
+                for (key, value) in map {
+                    m.serialize_entry(key, &SnapshotJson(value))?;
+                }
+                m.end()
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn normalize_json(json: &Value) -> Value {
     match json {

@@ -1,5 +1,5 @@
 use super::common::cli::run_br;
-use super::{create_issue, init_workspace, normalize_json};
+use super::{SnapshotJson, create_issue, init_workspace, normalize_json};
 use insta::{assert_json_snapshot, assert_snapshot};
 use serde_json::Value;
 use std::fs;
@@ -53,7 +53,7 @@ fn snapshot_list_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("list_json_output", normalize_json(&json));
+    assert_json_snapshot!("list_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn snapshot_show_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("show_json_output", normalize_json(&json));
+    assert_json_snapshot!("show_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn snapshot_ready_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("ready_json_output", normalize_json(&json));
+    assert_json_snapshot!("ready_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn snapshot_blocked_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("blocked_json_output", normalize_json(&json));
+    assert_json_snapshot!("blocked_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -200,7 +200,10 @@ fn snapshot_list_with_filters_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("list_filtered_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "list_filtered_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -212,7 +215,7 @@ fn snapshot_stats_json() {
     assert!(output.status.success());
     // Parse the JSON string into Value before passing to normalize_json
     let json: serde_json::Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("stats_json_output", normalize_json(&json));
+    assert_json_snapshot!("stats_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -239,7 +242,7 @@ fn snapshot_create_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("create_json_output", normalize_json(&json));
+    assert_json_snapshot!("create_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -259,7 +262,7 @@ fn snapshot_update_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("update_json_output", normalize_json(&json));
+    assert_json_snapshot!("update_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -279,7 +282,7 @@ fn snapshot_close_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("close_json_output", normalize_json(&json));
+    assert_json_snapshot!("close_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -300,7 +303,7 @@ fn snapshot_dep_list_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("dep_list_json_output", normalize_json(&json));
+    assert_json_snapshot!("dep_list_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -317,7 +320,7 @@ fn snapshot_search_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("search_json_output", normalize_json(&json));
+    assert_json_snapshot!("search_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -334,7 +337,7 @@ fn snapshot_count_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("count_json_output", normalize_json(&json));
+    assert_json_snapshot!("count_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -360,7 +363,10 @@ fn snapshot_count_grouped_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("count_grouped_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "count_grouped_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -376,7 +382,7 @@ fn snapshot_stale_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("stale_json_output", normalize_json(&json));
+    assert_json_snapshot!("stale_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -396,7 +402,10 @@ fn snapshot_comments_json() {
     );
 
     let add_json: Value = serde_json::from_str(&add.stdout).expect("parse json");
-    assert_json_snapshot!("comments_add_json_output", normalize_json(&add_json));
+    assert_json_snapshot!(
+        "comments_add_json_output",
+        SnapshotJson(&normalize_json(&add_json))
+    );
 
     let list = run_br(
         &workspace,
@@ -410,7 +419,10 @@ fn snapshot_comments_json() {
     );
 
     let list_json: Value = serde_json::from_str(&list.stdout).expect("parse json");
-    assert_json_snapshot!("comments_list_json_output", normalize_json(&list_json));
+    assert_json_snapshot!(
+        "comments_list_json_output",
+        SnapshotJson(&normalize_json(&list_json))
+    );
 }
 
 #[test]
@@ -430,7 +442,10 @@ fn snapshot_label_json() {
     );
 
     let add_json: Value = serde_json::from_str(&add.stdout).expect("parse json");
-    assert_json_snapshot!("label_add_json_output", normalize_json(&add_json));
+    assert_json_snapshot!(
+        "label_add_json_output",
+        SnapshotJson(&normalize_json(&add_json))
+    );
 
     let list = run_br(
         &workspace,
@@ -444,7 +459,10 @@ fn snapshot_label_json() {
     );
 
     let list_json: Value = serde_json::from_str(&list.stdout).expect("parse json");
-    assert_json_snapshot!("label_list_json_output", normalize_json(&list_json));
+    assert_json_snapshot!(
+        "label_list_json_output",
+        SnapshotJson(&normalize_json(&list_json))
+    );
 
     let list_all = run_br(
         &workspace,
@@ -458,7 +476,10 @@ fn snapshot_label_json() {
     );
 
     let list_all_json: Value = serde_json::from_str(&list_all.stdout).expect("parse json");
-    assert_json_snapshot!("label_list_all_json_output", normalize_json(&list_all_json));
+    assert_json_snapshot!(
+        "label_list_all_json_output",
+        SnapshotJson(&normalize_json(&list_all_json))
+    );
 }
 
 #[test]
@@ -473,7 +494,7 @@ fn snapshot_orphans_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("orphans_json_output", normalize_json(&json));
+    assert_json_snapshot!("orphans_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 #[test]
@@ -496,7 +517,7 @@ fn snapshot_graph_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("graph_json_output", normalize_json(&json));
+    assert_json_snapshot!("graph_json_output", SnapshotJson(&normalize_json(&json)));
 }
 
 // ============================================================================
@@ -515,7 +536,10 @@ fn snapshot_list_empty_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("list_empty_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "list_empty_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -530,7 +554,10 @@ fn snapshot_ready_empty_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("ready_empty_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "ready_empty_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -545,7 +572,10 @@ fn snapshot_blocked_empty_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("blocked_empty_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "blocked_empty_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -565,7 +595,10 @@ fn snapshot_search_no_match_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("search_no_match_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "search_no_match_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -584,7 +617,10 @@ fn snapshot_stale_empty_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("stale_empty_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "stale_empty_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -599,7 +635,10 @@ fn snapshot_count_empty_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("count_empty_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "count_empty_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 // ============================================================================
@@ -640,7 +679,10 @@ fn snapshot_list_priority_ordering_json() {
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
     let normalized = normalize_json(&json);
-    assert_json_snapshot!("list_priority_ordering_json_output", normalized);
+    assert_json_snapshot!(
+        "list_priority_ordering_json_output",
+        SnapshotJson(&normalized)
+    );
 
     // Also verify ordering programmatically: priorities should be ascending
     if let Value::Array(items) = &json {
@@ -693,7 +735,10 @@ fn snapshot_ready_priority_ordering_json() {
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
     let normalized = normalize_json(&json);
-    assert_json_snapshot!("ready_priority_ordering_json_output", normalized);
+    assert_json_snapshot!(
+        "ready_priority_ordering_json_output",
+        SnapshotJson(&normalized)
+    );
 
     // Ready uses hybrid sort: P0/P1 first, then others by created_at ASC.
     // The snapshot locks down the exact ordering. Verify P0/P1 appear before P2+.
@@ -738,7 +783,7 @@ fn snapshot_show_multiple_ids_json() {
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
     let normalized = normalize_json(&json);
-    assert_json_snapshot!("show_multiple_ids_json_output", normalized);
+    assert_json_snapshot!("show_multiple_ids_json_output", SnapshotJson(&normalized));
 
     // Verify we got exactly 2 results
     if let Value::Array(items) = &json {
@@ -776,7 +821,10 @@ fn snapshot_count_grouped_by_type_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("count_grouped_by_type_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "count_grouped_by_type_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 }
 
 #[test]
@@ -811,7 +859,7 @@ fn snapshot_count_grouped_by_priority_json() {
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
     assert_json_snapshot!(
         "count_grouped_by_priority_json_output",
-        normalize_json(&json)
+        SnapshotJson(&normalize_json(&json))
     );
 }
 
@@ -837,7 +885,10 @@ fn snapshot_graph_all_json() {
     );
 
     let json: Value = serde_json::from_str(&output.stdout).expect("parse json");
-    assert_json_snapshot!("graph_all_json_output", normalize_json(&json));
+    assert_json_snapshot!(
+        "graph_all_json_output",
+        SnapshotJson(&normalize_json(&json))
+    );
 
     // Suppress unused variable warning
     let _ = root2;

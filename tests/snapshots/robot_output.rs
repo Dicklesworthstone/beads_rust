@@ -115,11 +115,21 @@ fn clear_inherited_br_env(command: &mut std::process::Command) {
 
 /// Refuse to compare snapshots against an arbitrary `bv` release. Exact
 /// external-output goldens are meaningful only when the producer is pinned.
-fn assert_bv_golden_version() {
-    let output = std::process::Command::new("bv")
-        .arg("--version")
-        .output()
-        .expect("run bv --version before robot goldens");
+///
+/// Returns `false` (caller skips) when `bv` is not installed at all — a
+/// bare build worker cannot compare external-producer goldens, matching
+/// the jq-skip precedent in the doctor fixture suite. A *present but
+/// wrong-version* `bv` still fails loudly: silently skipping there would
+/// hide golden drift on developer machines.
+fn assert_bv_golden_version() -> bool {
+    let output = match std::process::Command::new("bv").arg("--version").output() {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("[skip] bv not on PATH; install bv {BV_GOLDEN_VERSION} to run robot goldens");
+            return false;
+        }
+        Err(error) => panic!("run bv --version before robot goldens: {error}"),
+    };
     assert!(
         output.status.success(),
         "bv --version failed:\nstdout:\n{}\nstderr:\n{}",
@@ -131,14 +141,18 @@ fn assert_bv_golden_version() {
         BV_GOLDEN_VERSION,
         "bv robot goldens require {BV_GOLDEN_VERSION}; install that exact version before running them"
     );
+    true
 }
 
-fn run_bv<I, S>(workspace: &BrWorkspace, args: I) -> BvRun
+/// Returns `None` when `bv` is not installed (caller skips the golden).
+fn run_bv<I, S>(workspace: &BrWorkspace, args: I) -> Option<BvRun>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    assert_bv_golden_version();
+    if !assert_bv_golden_version() {
+        return None;
+    }
     let mut command = std::process::Command::new("bv");
     command.current_dir(&workspace.root);
     command.args(args);
@@ -149,11 +163,11 @@ where
     let output = command
         .output()
         .expect("run bv; install bv to update robot goldens");
-    BvRun {
+    Some(BvRun {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         status: output.status,
-    }
+    })
 }
 
 fn assert_valid_json(raw: &str, context: &str) {
@@ -286,7 +300,9 @@ fn robot_golden_ready_output() {
 fn robot_golden_bv_next_output() {
     let workspace = init_robot_golden_workspace();
 
-    let output = run_bv(&workspace, ["--robot-next"]);
+    let Some(output) = run_bv(&workspace, ["--robot-next"]) else {
+        return;
+    };
     assert!(
         output.status.success(),
         "bv --robot-next failed: {}",
@@ -302,7 +318,9 @@ fn robot_golden_bv_next_output() {
 fn robot_golden_bv_triage_output() {
     let workspace = init_robot_golden_workspace();
 
-    let output = run_bv(&workspace, ["--robot-triage"]);
+    let Some(output) = run_bv(&workspace, ["--robot-triage"]) else {
+        return;
+    };
     assert!(
         output.status.success(),
         "bv --robot-triage failed: {}",
@@ -318,7 +336,9 @@ fn robot_golden_bv_triage_output() {
 fn robot_golden_bv_plan_output() {
     let workspace = init_robot_golden_workspace();
 
-    let output = run_bv(&workspace, ["--robot-plan"]);
+    let Some(output) = run_bv(&workspace, ["--robot-plan"]) else {
+        return;
+    };
     assert!(
         output.status.success(),
         "bv --robot-plan failed: {}",
