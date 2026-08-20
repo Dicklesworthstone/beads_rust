@@ -47,7 +47,10 @@ fn doctor_fails_loudly_when_write_lock_is_a_directory() {
     }
     fs::create_dir(&lock).expect("plant directory lock node");
 
-    let out = br_cmd(ws).arg("doctor").output().expect("br doctor spawned");
+    let out = br_cmd(ws)
+        .arg("doctor")
+        .output()
+        .expect("br doctor spawned");
     assert!(
         !out.status.success(),
         "doctor must fail closed on a directory .write.lock; stdout={} stderr={}",
@@ -76,7 +79,14 @@ fn mutating_command_fails_loudly_when_write_lock_is_a_directory() {
     fs::create_dir(&lock).expect("plant directory lock node");
 
     let out = br_cmd(ws)
-        .args(["create", "should not land", "--type", "task", "--priority", "2"])
+        .args([
+            "create",
+            "should not land",
+            "--type",
+            "task",
+            "--priority",
+            "2",
+        ])
         .output()
         .expect("br create spawned");
     assert!(

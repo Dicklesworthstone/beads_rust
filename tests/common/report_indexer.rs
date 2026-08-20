@@ -946,7 +946,13 @@ mod tests {
 
     #[test]
     fn test_artifact_dir_not_found() {
-        let indexer = ArtifactIndexer::new("/nonexistent/path");
+        // A fixed literal like "/nonexistent/path" is not guaranteed absent:
+        // earlier root-run tests actually created that directory on shared
+        // build workers, failing this assertion fleet-wide. Derive a path
+        // inside a fresh tempdir that provably does not exist.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("definitely-absent-artifact-root");
+        let indexer = ArtifactIndexer::new(&missing);
         let result = indexer.generate_report();
 
         assert!(matches!(result, Err(IndexerError::ArtifactDirNotFound(_))));
