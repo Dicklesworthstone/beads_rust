@@ -42,7 +42,21 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.3.6"
+# Default features minus `json`: fsqlite-ext-json 0.3.7 enables
+# serde_json/arbitrary_precision, which leaks
+# `$serde_json::private::Number` maps whenever a serde_json::Value is
+# serialized through a non-serde_json Serializer (TOON, insta, ...).
+# br issues no JSON1 SQL, so the extension is dead weight with a real
+# output-fidelity cost. (The optional `mcp` feature still unifies the
+# flag in via fastmcp 0.6 — tracked upstream.)
+fsqlite = { version = "0.3.6", default-features = false, features = [
+    "native",
+    "linux-asupersync-uring",
+    "fts5",
+    "rtree",
+    "icu",
+    "misc",
+] }
 fsqlite-types = "0.3.6"
 fsqlite-error = "0.3.6"
 fsqlite-core = "0.3.6"
