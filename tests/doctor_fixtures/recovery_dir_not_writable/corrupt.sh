@@ -12,11 +12,6 @@ cd "$target_dir"
 
 "$tool_bin" init --quiet 2>&1
 
-{
-    printf '.write.lock\n'
-    printf '*.tmp\n'
-} > .beads/.gitignore
-
 mkdir -p .beads/.br_recovery
 printf 'fixture-seed\n' > .beads/.br_recovery/sentinel.txt
 chmod 0555 .beads/.br_recovery

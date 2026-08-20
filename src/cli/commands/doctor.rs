@@ -7945,10 +7945,15 @@ fn check_sqlite_cli_integrity(db_path: &Path, checks: &mut Vec<CheckResult>) {
             if message.contains("No such file or directory")
                 || message.contains("failed to run sqlite3") =>
         {
+            // An absent sqlite3 CLI is a benign host state, not a workspace
+            // defect: the built-in fsqlite integrity check above still ran.
+            // Warn here would pin `doctor.ok = false` (`!has_non_ok`, #292)
+            // on every machine without sqlite3 in PATH — the same
+            // benign-state-reported-as-warn class as #432.
             push_check(
                 checks,
                 "sqlite3.integrity_check",
-                CheckStatus::Warn,
+                CheckStatus::Ok,
                 Some("sqlite3 not available; skipping orthogonal integrity validation".to_string()),
                 None,
             );
@@ -12190,14 +12195,14 @@ fn classify_fully_unblocked(issue: &crate::model::Issue) -> FullyUnblockedIssue 
     let mut excluded_reasons: Vec<&'static str> = Vec::new();
     let mut stale_blocked = false;
     match &issue.status {
-        Status::Open => {}
+        // Open is ready; terminal and draft statuses were filtered out
+        // before this point.
+        Status::Open | Status::Closed | Status::Tombstone | Status::Draft => {}
         Status::InProgress => excluded_reasons.push("claimed (status in_progress)"),
         Status::Blocked => stale_blocked = true,
         Status::Deferred => excluded_reasons.push("status deferred"),
         Status::Pinned => excluded_reasons.push("status pinned"),
         Status::Custom(_) => excluded_reasons.push("custom status"),
-        // Terminal and draft statuses were filtered out before this point.
-        Status::Closed | Status::Tombstone | Status::Draft => {}
     }
     if issue
         .defer_until
@@ -14558,6 +14563,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_dep_graph_jsonl_flags_dead_edges_and_fully_unblocked() {
         // #350: fixture graph —
         //  bd-a (open) blocked_by bd-closed (closed)  -> dead edge + fully unblocked

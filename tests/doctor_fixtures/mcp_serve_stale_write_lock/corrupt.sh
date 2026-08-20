@@ -16,11 +16,6 @@ cd "$target_dir"
 "$tool_bin" init --quiet 2>&1
 "$tool_bin" create --title "mcp stale lock seed" --type task --priority 2 --json >/dev/null
 
-{
-    printf '.write.lock\n'
-    printf '*.tmp\n'
-} > .beads/.gitignore
-
 : > .beads/.write.lock
 printf '99999999\n' > .beads/.write.lock.holder.pid
 touch -d '2024-01-01T00:00:00Z' .beads/.write.lock
