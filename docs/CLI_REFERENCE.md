@@ -1489,6 +1489,20 @@ br sync --status
 
 # Explicitly inspect the JSONL export's Git visibility
 br vcs-status --json
+```
+
+`br sync --status` also runs a cheap DB↔JSONL **coverage probe**: the
+exportable DB issue count (tombstones included, ephemerals/wisps excluded)
+is compared against the JSONL's unique id count. When the byte/hash signals
+say "current" but the sets differ — e.g. stored metadata lies about a
+partial or lost import — the status reports **coverage drift** instead of
+"In sync" (JSON: `coverage: {db_exportable_issues, jsonl_unique_ids}` and
+`coverage_drift: true`) and points at `br sync --reconcile --dry-run`
+(lossless) or `br sync --import-only --rebuild` (JSONL-authoritative).
+The `--import-only` stored-hash shortcut applies the same invariant and
+falls through to a real additive import instead of skipping.
+
+```bash
 
 # Export with verbose logging
 br sync --flush-only -v

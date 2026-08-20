@@ -377,27 +377,11 @@ fn build_false_equal_workspace(ws: &BrWorkspace, label: &str) -> (Vec<String>, S
 }
 
 #[test]
-fn import_only_is_blind_to_false_equal_but_dry_run_sees_it() {
+fn import_only_heals_false_equal_and_dry_run_sees_it() {
     let ws = BrWorkspace::new();
     let (jsonl_only_ids, newer_shared_id) = build_false_equal_workspace(&ws, "blind");
 
-    // Plain import skips: the stored hash matches, so the divergence is
-    // structurally invisible to --import-only.
-    let import = run_br(&ws, ["sync", "--import-only", "--json"], "blind_import");
-    assert!(import.status.success(), "import failed: {}", import.stderr);
-    let import_json = parse_json_value(&import.stdout);
-    assert_eq!(
-        import_json["created"].as_u64(),
-        Some(0),
-        "plain import must skip in the false-equal state: {import_json}"
-    );
-    assert_eq!(
-        issue_count(&ws, "blind_count"),
-        3,
-        "import must not recover"
-    );
-
-    // Dry-run reconcile sees through it.
+    // Dry-run reconcile sees through the false-equal state.
     let receipt = reconcile_receipt(&ws, true, "blind_dry");
     assert_eq!(
         receipt["schema_version"].as_str(),
@@ -430,6 +414,23 @@ fn import_only_is_blind_to_false_equal_but_dry_run_sees_it() {
         updated_ids,
         vec![newer_shared_id.as_str()],
         "updated preview ids"
+    );
+
+    // `beads_rust-jdmh`: the stored-hash shortcut is no longer blind — the
+    // coverage invariant rejects the uncovered hash match and the plain
+    // import falls through and heals the divergence additively.
+    let import = run_br(&ws, ["sync", "--import-only", "--json"], "blind_import");
+    assert!(import.status.success(), "import failed: {}", import.stderr);
+    let import_json = parse_json_value(&import.stdout);
+    assert_eq!(
+        import_json["created"].as_u64(),
+        Some(2),
+        "import must heal the false-equal state: {import_json}"
+    );
+    assert_eq!(
+        issue_count(&ws, "blind_count"),
+        5,
+        "import must recover the JSONL-only rows"
     );
 }
 
@@ -1479,13 +1480,10 @@ fn cass_shaped_fixture_recovers_exactly() {
     write_jsonl_lines(&ws, &lines);
     plant_false_equal_metadata(&ws);
 
-    // Sanity: plain import is blind to the divergence.
-    let import = run_br(&ws, ["sync", "--import-only", "--json"], "cass_blind");
-    assert!(import.status.success());
-    assert_eq!(
-        parse_json_value(&import.stdout)["created"].as_u64(),
-        Some(0)
-    );
+    // Note: a plain `--import-only` would no longer be blind here — the
+    // `beads_rust-jdmh` coverage invariant rejects the uncovered hash match
+    // and heals the state — so this fixture goes straight to reconcile to
+    // keep the divergence intact for the receipt assertions.
 
     // Dry-run: exact counts, zero mutation.
     let before_hashes = hash_files_under(&beads_dir(&ws));

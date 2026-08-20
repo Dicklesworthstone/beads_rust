@@ -374,6 +374,15 @@ pub struct SyncStatus {
     /// Anomaly evidence backing `workspace_health`, in the same shape
     /// doctor emits (`anomalies[].code` / `severity` / `message`).
     pub reliability_audit: ReliabilityAuditRecord,
+    /// DB↔JSONL coverage probe (`beads_rust-jdmh`). Absent when the JSONL
+    /// is missing or unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<SyncCoverageProbe>,
+    /// True when `coverage` shows the DB and JSONL hold different issue
+    /// sets even though the timestamp/hash signals report "in sync" —
+    /// recover with `br sync --reconcile` (lossless) or
+    /// `--import-only --rebuild` (JSONL-authoritative).
+    pub coverage_drift: bool,
     /// Stable VCS-observation slot for the canonical JSONL export.
     ///
     /// Sync deliberately never probes Git. The object therefore reports
@@ -1748,6 +1757,63 @@ fn classify_sync_status_workspace(
     WorkspaceClassification::from_anomalies(anomalies)
 }
 
+/// Cheap DB↔JSONL coverage probe (`beads_rust-jdmh`).
+///
+/// The stored-hash shortcut proves the JSONL bytes are unchanged since the
+/// last *recorded* import — not that this database ever ingested them. Stored
+/// metadata that lies about a partial or lost import makes `--status` and the
+/// `--import-only` shortcut assert health over a DB that is missing rows the
+/// JSONL holds (GH escalation from jeffreys-skills.md, 2026-07-26 incident:
+/// 101 missing issues under "Status: In sync"). Comparing the exportable DB
+/// issue count against the JSONL's unique id count catches that state for
+/// the cost of one COUNT(*) and one line scan.
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncCoverageProbe {
+    /// Issues the DB would export (tombstones included; ephemerals/wisps excluded).
+    pub db_exportable_issues: usize,
+    /// Unique `id` values among the JSONL's parseable lines.
+    pub jsonl_unique_ids: usize,
+}
+
+impl SyncCoverageProbe {
+    #[must_use]
+    pub const fn drifted(&self) -> bool {
+        self.db_exportable_issues != self.jsonl_unique_ids
+    }
+}
+
+/// Count unique issue ids in a readable JSONL stream. Best-effort: returns
+/// `None` on read failures or lines without a string `id`, so callers degrade
+/// to legacy behavior instead of failing a read-only diagnostic.
+fn jsonl_unique_id_count<R: std::io::BufRead>(reader: R) -> Option<usize> {
+    let mut ids: HashSet<String> = HashSet::new();
+    for line in reader.lines() {
+        let line = line.ok()?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        ids.insert(value.get("id")?.as_str()?.to_string());
+    }
+    Some(ids.len())
+}
+
+/// Build the coverage probe for `--status` from the JSONL path on disk.
+/// Best-effort; `None` when the JSONL is absent or unreadable.
+fn compute_status_coverage_probe(
+    storage: &crate::storage::SqliteStorage,
+    jsonl_path: &Path,
+) -> Option<SyncCoverageProbe> {
+    let file = File::open(jsonl_path).ok()?;
+    let jsonl_unique_ids = jsonl_unique_id_count(BufReader::new(file))?;
+    let db_exportable_issues = storage.count_exportable_issues().ok()?;
+    Some(SyncCoverageProbe {
+        db_exportable_issues,
+        jsonl_unique_ids,
+    })
+}
+
 /// Execute the --status subcommand.
 fn execute_status(
     storage: &crate::storage::SqliteStorage,
@@ -1787,6 +1853,20 @@ fn execute_status(
         },
     );
 
+    let coverage = if jsonl_exists {
+        compute_status_coverage_probe(storage, jsonl_path)
+    } else {
+        None
+    };
+    let coverage_drift = coverage.as_ref().is_some_and(SyncCoverageProbe::drifted);
+    if coverage_drift && let Some(probe) = coverage.as_ref() {
+        warn!(
+            db_exportable_issues = probe.db_exportable_issues,
+            jsonl_unique_ids = probe.jsonl_unique_ids,
+            "Coverage drift: DB and JSONL hold different issue sets despite hash/timestamp signals"
+        );
+    }
+
     let status = SyncStatus {
         dirty_count,
         last_export_time,
@@ -1797,6 +1877,8 @@ fn execute_status(
         db_newer: staleness.db_newer,
         workspace_health: classification.health.to_string(),
         reliability_audit,
+        coverage,
+        coverage_drift,
         git_export: GitExportStatus::not_probed(),
     };
     debug!(
@@ -1833,6 +1915,18 @@ fn execute_status(
             println!("  Status: JSONL is newer (import recommended)");
         } else if status.db_newer {
             println!("  Status: Database is newer (export recommended)");
+        } else if status.coverage_drift {
+            if let Some(probe) = &status.coverage {
+                println!(
+                    "  Status: COVERAGE DRIFT — JSONL has {} unique ids but the database holds {} exportable issues",
+                    probe.jsonl_unique_ids, probe.db_exportable_issues
+                );
+            } else {
+                println!("  Status: COVERAGE DRIFT — DB and JSONL hold different issue sets");
+            }
+            println!(
+                "  Recover: `br sync --reconcile --dry-run` (lossless preview) or `br sync --import-only --rebuild` (JSONL-authoritative)"
+            );
         } else {
             println!("  Status: In sync");
         }
@@ -1858,6 +1952,12 @@ fn render_status_rich(status: &SyncStatus, ctx: &OutputContext) {
             "⬆",
             "Database is newer (export recommended)",
             theme.warning.clone(),
+        )
+    } else if status.coverage_drift {
+        (
+            "✗",
+            "Coverage drift: DB and JSONL hold different issue sets (see `br sync --reconcile --dry-run`)",
+            theme.error.clone(),
         )
     } else {
         ("✓", "In sync", theme.success.clone())
@@ -3216,7 +3316,39 @@ fn execute_import(
         if let (Some(import_time), Some(stored)) = (last_import_time, stored_hash) {
             // Check if JSONL content hash matches
             let current_hash = source_content_hash.clone();
-            if current_hash == stored {
+            let coverage_probe = if current_hash == stored {
+                // Coverage invariant (`beads_rust-jdmh`): a matching stored
+                // hash proves the JSONL bytes are unchanged since the last
+                // *recorded* import, not that this DB ingested them. If the
+                // exportable DB issue count disagrees with the JSONL's
+                // unique id count, the shortcut would assert health over a
+                // partial/lost import — fall through to the real (additive,
+                // never-deleting) import body instead.
+                jsonl_unique_id_count(source.reader()).map(|jsonl_unique_ids| {
+                    storage
+                        .count_exportable_issues()
+                        .map(|db_exportable_issues| SyncCoverageProbe {
+                            db_exportable_issues,
+                            jsonl_unique_ids,
+                        })
+                })
+            } else {
+                None
+            };
+            let coverage_drift = matches!(
+                coverage_probe,
+                Some(Ok(ref probe)) if probe.drifted()
+            );
+            if coverage_drift {
+                if let Some(Ok(probe)) = &coverage_probe {
+                    warn!(
+                        db_exportable_issues = probe.db_exportable_issues,
+                        jsonl_unique_ids = probe.jsonl_unique_ids,
+                        "Stored-hash shortcut rejected: DB does not cover the JSONL issue set; running full import"
+                    );
+                }
+            }
+            if current_hash == stored && !coverage_drift {
                 debug!(
                     path = %jsonl_path.display(),
                     last_import = %import_time,
