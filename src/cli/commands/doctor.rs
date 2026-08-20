@@ -4273,10 +4273,18 @@ fn fsqlite_wal_cert_sidecar_paths(db_path: &Path) -> Vec<PathBuf> {
 
 fn existing_sqlite_family_paths_for_legacy_op(db_path: &Path) -> Vec<PathBuf> {
     let mut paths = vec![db_path.to_path_buf()];
+    // fsqlite 0.3.6+ engine-upgrade bookkeeping lives beside the DB and
+    // belongs to the same mutation-audit family.
+    let migration_state = {
+        let mut sidecar = db_path.as_os_str().to_os_string();
+        sidecar.push(".fsqlite-migration-state");
+        PathBuf::from(sidecar)
+    };
     let sidecars = [
         sqlite_wal_sidecar_path(db_path),
         sqlite_shm_sidecar_path(db_path),
         sqlite_journal_sidecar_path(db_path),
+        migration_state,
     ]
     .into_iter()
     .chain(fsqlite_namespace_sidecar_paths(db_path))

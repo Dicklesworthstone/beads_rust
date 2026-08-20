@@ -8376,14 +8376,22 @@ impl SqliteStorage {
 
         let labels_and = filters.labels.as_deref().unwrap_or(&[]);
         let labels_or = filters.labels_or.as_deref().unwrap_or(&[]);
-        let label_filters_can_use_uncorrelated_in =
-            filters.statuses.as_ref().is_none_or(Vec::is_empty)
-                && filters.types.as_ref().is_none_or(Vec::is_empty)
-                && filters.priorities.as_ref().is_none_or(Vec::is_empty)
-                && filters.assignee.is_none()
-                && filters.title_contains.is_none()
-                && filters.updated_before.is_none()
-                && filters.updated_after.is_none();
+        // fsqlite 0.3.6 regression: `SELECT COUNT(*) ... WHERE id IN
+        // (SELECT ... GROUP BY ... HAVING ...)` evaluates to NULL (minimal
+        // repro in the frankensqlite escalation, beads_rust-ro3m), which
+        // `unwrap_or(0)` below would silently report as zero. The bare
+        // membership subquery is unaffected, so multi-label AND counting
+        // routes through the two-step candidate-ids path instead of the
+        // uncorrelated IN fast path.
+        let multi_label_and = unique_label_refs(labels_and).len() > 1;
+        let label_filters_can_use_uncorrelated_in = !multi_label_and
+            && filters.statuses.as_ref().is_none_or(Vec::is_empty)
+            && filters.types.as_ref().is_none_or(Vec::is_empty)
+            && filters.priorities.as_ref().is_none_or(Vec::is_empty)
+            && filters.assignee.is_none()
+            && filters.title_contains.is_none()
+            && filters.updated_before.is_none()
+            && filters.updated_after.is_none();
         let label_candidate_ids = if label_filters_can_use_uncorrelated_in {
             None
         } else {
