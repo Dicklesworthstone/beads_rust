@@ -208,6 +208,8 @@ pub fn execute(
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
 *.vacuum-wal-cert*
+# fsqlite 0.3.6+ engine-upgrade bookkeeping written beside the database
+*.fsqlite-migration-state
 
 # Lock files
 .write.lock

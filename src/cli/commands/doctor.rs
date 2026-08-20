@@ -5757,6 +5757,13 @@ const INNER_GITIGNORE_EXPECTATIONS: &[InnerGitignoreExpectation] = &[
             ".beads.db.schema-migration-20260101T000000.000000Z-0-0.vacuum-wal-cert-head",
         ],
     },
+    // fsqlite 0.3.6+ records engine-upgrade bookkeeping beside the DB in
+    // `<db>.fsqlite-migration-state`; without a rule it shows up as an
+    // untracked file in every pre-0.3.6 repository.
+    InnerGitignoreExpectation {
+        append_pattern: "*.fsqlite-migration-state",
+        probes: &["beads.db.fsqlite-migration-state"],
+    },
     InnerGitignoreExpectation {
         append_pattern: ".write.lock",
         probes: &[".write.lock"],

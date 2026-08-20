@@ -38,3 +38,10 @@ redirect
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# fsqlite sidecar families (post-#427 doctor expectations)
+*.db-wal*
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+*.vacuum-wal-cert*
+*.fsqlite-migration-state
