@@ -1814,6 +1814,28 @@ fn compute_status_coverage_probe(
     })
 }
 
+/// Compute the `--status` coverage probe and drift flag, logging drift.
+fn status_coverage(
+    storage: &crate::storage::SqliteStorage,
+    jsonl_path: &Path,
+    jsonl_exists: bool,
+) -> (Option<SyncCoverageProbe>, bool) {
+    let coverage = if jsonl_exists {
+        compute_status_coverage_probe(storage, jsonl_path)
+    } else {
+        None
+    };
+    let coverage_drift = coverage.as_ref().is_some_and(SyncCoverageProbe::drifted);
+    if coverage_drift && let Some(probe) = coverage.as_ref() {
+        warn!(
+            db_exportable_issues = probe.db_exportable_issues,
+            jsonl_unique_ids = probe.jsonl_unique_ids,
+            "Coverage drift: DB and JSONL hold different issue sets despite hash/timestamp signals"
+        );
+    }
+    (coverage, coverage_drift)
+}
+
 /// Execute the --status subcommand.
 fn execute_status(
     storage: &crate::storage::SqliteStorage,
@@ -1853,19 +1875,7 @@ fn execute_status(
         },
     );
 
-    let coverage = if jsonl_exists {
-        compute_status_coverage_probe(storage, jsonl_path)
-    } else {
-        None
-    };
-    let coverage_drift = coverage.as_ref().is_some_and(SyncCoverageProbe::drifted);
-    if coverage_drift && let Some(probe) = coverage.as_ref() {
-        warn!(
-            db_exportable_issues = probe.db_exportable_issues,
-            jsonl_unique_ids = probe.jsonl_unique_ids,
-            "Coverage drift: DB and JSONL hold different issue sets despite hash/timestamp signals"
-        );
-    }
+    let (coverage, coverage_drift) = status_coverage(storage, jsonl_path, jsonl_exists);
 
     let status = SyncStatus {
         dirty_count,
@@ -3339,14 +3349,12 @@ fn execute_import(
                 coverage_probe,
                 Some(Ok(ref probe)) if probe.drifted()
             );
-            if coverage_drift {
-                if let Some(Ok(probe)) = &coverage_probe {
-                    warn!(
-                        db_exportable_issues = probe.db_exportable_issues,
-                        jsonl_unique_ids = probe.jsonl_unique_ids,
-                        "Stored-hash shortcut rejected: DB does not cover the JSONL issue set; running full import"
-                    );
-                }
+            if coverage_drift && let Some(Ok(probe)) = &coverage_probe {
+                warn!(
+                    db_exportable_issues = probe.db_exportable_issues,
+                    jsonl_unique_ids = probe.jsonl_unique_ids,
+                    "Stored-hash shortcut rejected: DB does not cover the JSONL issue set; running full import"
+                );
             }
             if current_hash == stored && !coverage_drift {
                 debug!(
