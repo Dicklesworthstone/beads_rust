@@ -15,3 +15,5 @@ Reference docs (deeper, more verbose):
 
 - CLI flags/commands: `docs/CLI_REFERENCE.md`
 - Agent integration guide: `docs/AGENT_INTEGRATION.md`
+
+For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
