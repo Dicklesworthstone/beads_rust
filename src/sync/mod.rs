@@ -17433,8 +17433,14 @@ mod tests {
         assert!(publication.atomicity.is_downgraded());
         assert_eq!(publication.atomicity.as_str(), "replace-under-authority");
         assert_eq!(fs::read(&output_path).unwrap(), b"{\"id\":\"new\"}\n");
-        assert!(!temp_path.exists(), "staged file must have been renamed into place");
-        assert_eq!(sync_calls, 1, "no displaced generation means no cleanup fsync");
+        assert!(
+            !temp_path.exists(),
+            "staged file must have been renamed into place"
+        );
+        assert_eq!(
+            sync_calls, 1,
+            "no displaced generation means no cleanup fsync"
+        );
         assert!(publication.cleanup_durable);
         assert!(publication.retained_recovery_path.is_none());
         assert_eq!(
