@@ -2391,6 +2391,36 @@ fn jsonl_fd_stability_witness(metadata: &std::fs::Metadata) -> Result<(u64, Syst
     ))
 }
 
+/// Open the anonymous, never-linked file that backs an immutable JSONL
+/// snapshot.
+///
+/// The backing lives beside the source (its parent directory is exactly where
+/// `br` already holds write authority for locks, temp exports, and history),
+/// so a sandbox that confines `br` to the workspace — Landlock via `nono`,
+/// for one (#436) — never sees a write outside the tree. The process-wide
+/// temp directory is only a fallback for read-only checkouts whose `.beads/`
+/// cannot host even an unlinked file. `tempfile` uses `O_TMPFILE` where the
+/// filesystem supports it and otherwise creates and immediately unlinks a
+/// random name, so nothing is left behind on either route.
+fn open_private_snapshot_backing(parent: Option<&Path>) -> std::io::Result<File> {
+    let beside_source = parent
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(tempfile::tempfile_in);
+    match beside_source {
+        Some(Ok(file)) => Ok(file),
+        Some(Err(beside_error)) => tempfile::tempfile().map_err(|global_error| {
+            std::io::Error::new(
+                global_error.kind(),
+                format!(
+                    "neither the source directory ({beside_error}) nor the temp directory \
+                     ({global_error}) could host the snapshot"
+                ),
+            )
+        }),
+        None => tempfile::tempfile(),
+    }
+}
+
 /// Captures one exact, stable JSONL source generation without following
 /// symlinks.
 ///
@@ -2421,7 +2451,7 @@ where
     let before_metadata = regular_jsonl_fd_metadata(opened.as_file(), path)?;
     let before_witness = jsonl_fd_stability_witness(&before_metadata)?;
     ensure_jsonl_capture_deadline(deadline)?;
-    let mut backing = tempfile::tempfile().map_err(|error| {
+    let mut backing = open_private_snapshot_backing(path.parent()).map_err(|error| {
         BeadsError::Config(format!(
             "Could not create private backing for JSONL source {}: {error}",
             external_path_descriptor(path)
@@ -4160,5 +4190,55 @@ mod tests {
             git_result.is_err(),
             "explicit external must STILL reject .git/* even with allow_external=true; got {git_result:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_snapshot_backing_lives_beside_the_source_and_is_never_linked() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("create temp directory");
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir(&beads_dir).expect("create .beads");
+
+        let mut backing = open_private_snapshot_backing(Some(&beads_dir))
+            .expect("backing beside the source must open");
+        assert_eq!(
+            backing.metadata().expect("backing metadata").dev(),
+            std::fs::metadata(&beads_dir)
+                .expect(".beads metadata")
+                .dev(),
+            "the backing must be allocated on the source's own filesystem"
+        );
+        assert!(
+            std::fs::read_dir(&beads_dir)
+                .expect("list .beads")
+                .next()
+                .is_none(),
+            "an anonymous backing must leave no directory entry behind"
+        );
+        backing
+            .write_all(b"{\"id\":\"x\"}\n")
+            .expect("write backing");
+        backing.seek(SeekFrom::Start(0)).expect("rewind backing");
+        let mut contents = String::new();
+        backing
+            .read_to_string(&mut contents)
+            .expect("read backing back");
+        assert_eq!(contents, "{\"id\":\"x\"}\n");
+    }
+
+    #[test]
+    fn private_snapshot_backing_falls_back_to_the_temp_directory() {
+        let temp = TempDir::new().expect("create temp directory");
+        let missing_parent = temp.path().join("does-not-exist");
+
+        open_private_snapshot_backing(Some(&missing_parent))
+            .expect("an unusable source directory must fall back to the temp directory");
+        open_private_snapshot_backing(Some(Path::new("")))
+            .expect("an empty (relative) parent must fall back to the temp directory");
+        open_private_snapshot_backing(None)
+            .expect("no parent at all must fall back to the temp directory");
     }
 }
