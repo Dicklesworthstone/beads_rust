@@ -2612,7 +2612,7 @@ fn execute_flush(
     let publication_atomicity = export_result
         .publication
         .as_ref()
-        .map(|receipt| receipt.atomicity())
+        .map(crate::sync::ExportPublicationReceipt::atomicity)
         .filter(|atomicity| atomicity.is_downgraded())
         .map(|atomicity| atomicity.as_str().to_string());
     let result = FlushResult {

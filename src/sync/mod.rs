@@ -1468,13 +1468,26 @@ enum ConditionalNamespaceChange {
     ReplacedUnderAuthority,
 }
 
-/// Test-only fault injection: pretend the filesystem rejects flagged
-/// `renameat2` the way WSL2 9p/DrvFS does (#419), so the witness-checked
-/// fallback can be exercised on filesystems that support the atomic path.
+// Test-only fault injection: pretend the filesystem rejects flagged
+// `renameat2` the way WSL2 9p/DrvFS does (#419), so the witness-checked
+// fallback can be exercised on filesystems that support the atomic path.
 #[cfg(test)]
 thread_local! {
     static FORCE_FLAGGED_RENAME_UNSUPPORTED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test-only fault injection is asking this thread to treat the
+/// flagged rename as unsupported. Always `false` outside test builds, so the
+/// production path never pays for or branches on it.
+#[cfg(test)]
+fn flagged_rename_forced_unsupported() -> bool {
+    FORCE_FLAGGED_RENAME_UNSUPPORTED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn flagged_rename_forced_unsupported() -> bool {
+    false
 }
 
 /// Whether `renameat2`-style flags were refused by the filesystem rather than
@@ -1567,18 +1580,18 @@ fn perform_conditional_namespace_change(
         }
     };
 
-    let flagged_rename = renameat_with(
-        staged_name.parent().as_file(),
-        staged_name.leaf(),
-        output_name.parent().as_file(),
-        output_name.leaf(),
-        flags,
-    );
-    #[cfg(test)]
-    let flagged_rename = if FORCE_FLAGGED_RENAME_UNSUPPORTED.with(std::cell::Cell::get) {
+    // The injected failure must pre-empt the real syscall: a flagged rename
+    // that already succeeded cannot be "retried" by the fallback.
+    let flagged_rename = if flagged_rename_forced_unsupported() {
         Err(rustix::io::Errno::INVAL)
     } else {
-        flagged_rename
+        renameat_with(
+            staged_name.parent().as_file(),
+            staged_name.leaf(),
+            output_name.parent().as_file(),
+            output_name.leaf(),
+            flags,
+        )
     };
 
     match flagged_rename {
@@ -17516,7 +17529,7 @@ mod tests {
         // The pre-commit hook runs after the publication's entry witness check
         // and immediately before the namespace change, so this mutation can
         // only be caught by the fallback's own re-verification.
-        let error = publish_staged_jsonl_conditionally_with(
+        let result = publish_staged_jsonl_conditionally_with(
             &temp_path,
             TempFileGuard::new(temp_path.clone()),
             &output_path,
@@ -17529,8 +17542,10 @@ mod tests {
                 Ok(())
             },
             |_| Ok(()),
-        )
-        .expect_err("a changed destination must refuse the non-atomic fallback");
+        );
+        let Err(error) = result else {
+            panic!("a changed destination must refuse the non-atomic fallback");
+        };
 
         assert!(
             matches!(error, BeadsError::SyncConflict { .. }),
