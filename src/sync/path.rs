@@ -1074,35 +1074,80 @@ impl PinnedJsonlName {
     }
 }
 
+/// Open flags for the retained directory capability at the end of a stable
+/// route: a real read handle, because callers `fstat`, `fsync`, and `openat`
+/// through it.
+#[cfg(unix)]
+const STABLE_ROUTE_DIRECTORY_FLAGS: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
+    .union(rustix::fs::OFlags::DIRECTORY)
+    .union(rustix::fs::OFlags::NOFOLLOW)
+    .union(rustix::fs::OFlags::CLOEXEC)
+    .union(rustix::fs::OFlags::NONBLOCK);
+
+/// Open flags for the intermediate components of a stable route (the
+/// filesystem root and every ancestor above the pinned directory).
+///
+/// These handles exist only to anchor the next `openat` step, so on Linux they
+/// are `O_PATH` handles: the kernel resolves them without granting read access
+/// and without consulting LSM `file_open` hooks, which keeps the traversal
+/// working under Landlock-style sandboxes that deny `READ_DIR` on `/` (#436).
+/// `O_PATH | O_DIRECTORY | O_NOFOLLOW` still fails with `ENOTDIR` on a symlink
+/// or non-directory component, so the no-symlink traversal guarantee is kept.
+/// Other Unix targets have no `O_PATH`, so they keep using read handles.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const STABLE_ROUTE_TRAVERSAL_FLAGS: rustix::fs::OFlags = rustix::fs::OFlags::PATH
+    .union(rustix::fs::OFlags::DIRECTORY)
+    .union(rustix::fs::OFlags::NOFOLLOW)
+    .union(rustix::fs::OFlags::CLOEXEC);
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const STABLE_ROUTE_TRAVERSAL_FLAGS: rustix::fs::OFlags = STABLE_ROUTE_DIRECTORY_FLAGS;
+
 #[cfg(unix)]
 fn open_jsonl_directory_via_stable_route(
     display_path: &Path,
     absolute_directory: &Path,
 ) -> Result<File> {
-    use rustix::fs::{CWD, Mode, OFlags, openat};
+    use rustix::fs::{CWD, Mode, openat};
     use rustix::io::Errno;
 
     let descriptor = external_path_descriptor(display_path);
-    let directory_flags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-    let mut route = openat(CWD, "/", directory_flags, Mode::empty()).map_err(|error| {
-        BeadsError::Config(format!(
-            "Could not open the filesystem root while pinning JSONL parent {descriptor}: {error}"
-        ))
-    })?;
     let mut components = absolute_directory.components();
     if !matches!(components.next(), Some(std::path::Component::RootDir)) {
         return Err(BeadsError::Config(format!(
             "Could not anchor JSONL parent {descriptor} at the filesystem root"
         )));
     }
+    let mut names = Vec::new();
     for component in components {
         let std::path::Component::Normal(name) = component else {
             return Err(BeadsError::Config(format!(
                 "JSONL parent {descriptor} contains an unsupported filesystem route component"
             )));
         };
-        route = match openat(&route, name, directory_flags, Mode::empty()) {
+        names.push(name);
+    }
+
+    // Only the final component becomes the retained capability; the root and
+    // every ancestor are traversal-only anchors.
+    let root_flags = if names.is_empty() {
+        STABLE_ROUTE_DIRECTORY_FLAGS
+    } else {
+        STABLE_ROUTE_TRAVERSAL_FLAGS
+    };
+    let mut route = openat(CWD, "/", root_flags, Mode::empty()).map_err(|error| {
+        BeadsError::Config(format!(
+            "Could not open the filesystem root while pinning JSONL parent {descriptor}: {error}"
+        ))
+    })?;
+    let last_index = names.len().saturating_sub(1);
+    for (index, name) in names.iter().copied().enumerate() {
+        let flags = if index == last_index {
+            STABLE_ROUTE_DIRECTORY_FLAGS
+        } else {
+            STABLE_ROUTE_TRAVERSAL_FLAGS
+        };
+        route = match openat(&route, name, flags, Mode::empty()) {
             Ok(next) => next,
             Err(error) if error == Errno::LOOP || error == Errno::NOTDIR => {
                 return Err(BeadsError::Config(format!(
@@ -2003,14 +2048,17 @@ fn open_jsonl_source_via_stable_route(path: &Path, absolute_path: &Path) -> Resu
     use rustix::io::Errno;
 
     let descriptor = external_path_descriptor(path);
-    let directory_flags =
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
     let leaf_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-    let mut route = openat(CWD, "/", directory_flags, Mode::empty()).map_err(|error| {
-        BeadsError::Config(format!(
-            "Could not open the filesystem root while securing JSONL source {descriptor}: {error}"
-        ))
-    })?;
+    // Every directory on the way to the leaf is a traversal-only anchor (see
+    // `STABLE_ROUTE_TRAVERSAL_FLAGS`); only the regular-file leaf is opened
+    // for reading.
+    let mut route = openat(CWD, "/", STABLE_ROUTE_TRAVERSAL_FLAGS, Mode::empty()).map_err(
+        |error| {
+            BeadsError::Config(format!(
+                "Could not open the filesystem root while securing JSONL source {descriptor}: {error}"
+            ))
+        },
+    )?;
     let mut components = absolute_path.components().peekable();
     if !matches!(components.next(), Some(std::path::Component::RootDir)) {
         return Err(BeadsError::Config(format!(
@@ -2024,7 +2072,11 @@ fn open_jsonl_source_via_stable_route(path: &Path, absolute_path: &Path) -> Resu
             )));
         };
         let is_leaf = components.peek().is_none();
-        let flags = if is_leaf { leaf_flags } else { directory_flags };
+        let flags = if is_leaf {
+            leaf_flags
+        } else {
+            STABLE_ROUTE_TRAVERSAL_FLAGS
+        };
         route = match openat(&route, name, flags, Mode::empty()) {
             Ok(next) => next,
             Err(Errno::NOENT) if is_leaf => return Ok(None),
