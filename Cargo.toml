@@ -80,7 +80,7 @@ fsqlite-observability = "0.3.6"
 # (>=0.4.3,<0.5) and fastmcp-rust 0.6.0's exact =0.4.8 pin, so `--features
 # mcp` builds carry a single asupersync version (beads_rust-fiop).
 # default-features = false mirrors fsqlite's own spec.
-asupersync = { version = "=0.4.8", default-features = false }
+asupersync = { version = "=0.4.9", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -146,7 +146,7 @@ signal-hook = "0.4.4"
 [target.'cfg(windows)'.dependencies]
 # Capability-relative Windows filesystem access. Pin exactly because the
 # no-follow/open-at implementation is part of sync's hostile-path boundary.
-cap-primitives = "=4.0.2"
+cap-primitives = "=4.0.3"
 
 [target.'cfg(not(windows))'.dependencies]
 mimalloc = "0.1.52"
@@ -158,7 +158,7 @@ vergen-gix = { version = "10.0", features = ["build", "cargo", "rustc"] }
 # Re-enables `Cx::for_testing()` / `Cx::for_request()` for this crate's own
 # test builds; asupersync 0.4.8 gates those constructors behind
 # `test-internals` so production consumers cannot mint ambient authority.
-asupersync = { version = "=0.4.8", default-features = false, features = ["test-internals"] }
+asupersync = { version = "=0.4.9", default-features = false, features = ["test-internals"] }
 assert_cmd = "2.2.2"
 flate2 = "1.1"
 predicates = "3.1.4"
