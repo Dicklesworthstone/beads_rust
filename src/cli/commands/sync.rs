@@ -207,6 +207,13 @@ pub struct FlushResult {
     pub errors: Vec<ExportError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_path: Option<String>,
+    /// Present only when the JSONL could not be published through the atomic
+    /// flagged-rename protocol (#419): the filesystem (WSL2 9p/DrvFS, for
+    /// one) refused it, so the staged file was installed with a
+    /// witness-checked plain rename under the held write authority. Absent
+    /// means the publication was atomic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication_atomicity: Option<String>,
 }
 
 /// Result of an import operation.
@@ -2457,6 +2464,7 @@ fn execute_flush(
                 success_rate: 1.0,
                 errors: Vec::new(),
                 manifest_path: None,
+                publication_atomicity: None,
             };
             ctx.json_pretty(&result);
         } else if should_render_human_sync_output(ctx, use_json) {
@@ -2598,6 +2606,15 @@ fn execute_flush(
 
     // Output result
     let cleared_dirty = export_result.exported_marked_at.len();
+    // Only a downgraded publication is worth a field: the atomic protocol is
+    // the documented default, and keeping the field absent leaves every
+    // existing `--json` consumer and golden untouched (#419).
+    let publication_atomicity = export_result
+        .publication
+        .as_ref()
+        .map(|receipt| receipt.atomicity())
+        .filter(|atomicity| atomicity.is_downgraded())
+        .map(|atomicity| atomicity.as_str().to_string());
     let result = FlushResult {
         exported_issues: report.issues_exported,
         exported_dependencies: report.dependencies_exported,
@@ -2609,6 +2626,7 @@ fn execute_flush(
         success_rate: report.success_rate(),
         errors: report.errors.clone(),
         manifest_path,
+        publication_atomicity,
     };
 
     if use_json {
@@ -2663,6 +2681,13 @@ fn execute_flush(
         }
         if let Some(ref path) = result.manifest_path {
             println!("Wrote manifest to {path}");
+        }
+        if let Some(ref atomicity) = result.publication_atomicity {
+            println!(
+                "Publication downgraded to {atomicity}: this filesystem does not support \
+                 flagged rename, so the JSONL was installed with a witness-checked plain \
+                 rename under the write lock"
+            );
         }
         if report.has_errors() {
             println!();
@@ -2810,6 +2835,16 @@ fn render_flush_result_rich(result: &FlushResult, errors: &[ExportError], ctx: &
         text.append("\n");
         text.append_styled("Manifest      ", theme.dimmed.clone());
         text.append_styled(path, theme.muted.clone());
+    }
+
+    // Non-atomic publication downgrade (#419)
+    if let Some(ref atomicity) = result.publication_atomicity {
+        text.append("\n");
+        text.append_styled("Publication   ", theme.dimmed.clone());
+        text.append_styled(
+            &format!("{atomicity} (filesystem lacks flagged rename)"),
+            theme.warning.clone(),
+        );
     }
 
     let panel = Panel::from_rich_text(&text, ctx.width())
