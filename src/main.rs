@@ -44,6 +44,11 @@ fn main() {
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
         eprintln!("Failed to initialize logging: {e}");
     }
+    // Text-mode commands are Unix filters: a reader that closes the pipe
+    // early must end the process quietly, not as a SIGABRT core dump (#434).
+    if should_restore_default_sigpipe(&cli, json_error_mode) {
+        beads_rust::shutdown::restore_default_sigpipe();
+    }
     if let Commands::Sync(args) = &cli.command
         && let Err(error) = beads_rust::cli::commands::sync::validate_sync_mode_args(args)
     {
@@ -1608,6 +1613,31 @@ fn should_render_errors_as_json_with_env(
 
 fn should_render_errors_as_json(cli: &Cli) -> bool {
     should_render_errors_as_json_with_env(cli, OutputFormat::from_env())
+}
+
+/// Whether this invocation should let a closed stdout pipe terminate the
+/// process the way every other Unix filter does (`br list | head`), instead
+/// of panicking inside `println!` and aborting with SIGABRT under
+/// `panic = "abort"` (#434).
+///
+/// `structured_output` is the same verdict that routes errors to JSON: when
+/// it is set, output streams through the JSON/TOON writers, which already
+/// classify a broken pipe as a non-error and exit 0, so that contract is
+/// preserved. `br serve` keeps `EPIPE` as an error so its stdio transport can
+/// shut the server down cooperatively. Everything else prints through bare
+/// `println!` sites that cannot classify `EPIPE`, so the kernel's default
+/// `SIGPIPE` action is the only disposition that ends them cleanly.
+const fn should_restore_default_sigpipe(cli: &Cli, structured_output: bool) -> bool {
+    if structured_output {
+        return false;
+    }
+    #[cfg(feature = "mcp")]
+    if matches!(cli.command, Commands::Serve(_)) {
+        return false;
+    }
+    #[cfg(not(feature = "mcp"))]
+    let _ = cli;
+    true
 }
 
 const fn should_color_human_errors(
@@ -3398,6 +3428,65 @@ mod tests {
     fn should_render_errors_as_json_for_doctor_robot_triage() {
         let cli = Cli::parse_from(["br", "doctor", "--robot-triage"]);
         assert!(should_render_errors_as_json_with_env(&cli, None));
+    }
+
+    #[test]
+    fn restores_default_sigpipe_for_text_output_commands() {
+        for argv in [
+            vec!["br", "list"],
+            vec!["br", "ready"],
+            vec!["br", "lint"],
+            vec!["br", "list", "--format", "csv"],
+            vec!["br", "update", "bd-one", "--priority", "2"],
+            vec!["br", "--quiet", "list"],
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            let structured = should_render_errors_as_json_with_env(&cli, None);
+            assert!(
+                !structured,
+                "{argv:?} is a text-output command and must not be classified as structured"
+            );
+            assert!(
+                should_restore_default_sigpipe(&cli, structured),
+                "{argv:?} must die quietly by SIGPIPE like any Unix filter (#434)"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_sigpipe_ignored_for_structured_output_commands() {
+        for (argv, env_format) in [
+            (vec!["br", "list", "--json"], None),
+            (vec!["br", "--json", "list"], None),
+            (vec!["br", "list", "--format", "json"], None),
+            (vec!["br", "list", "--format", "toon"], None),
+            (vec!["br", "ready", "--robot"], None),
+            (vec!["br", "doctor", "--robot-triage"], None),
+            (vec!["br", "list"], Some(OutputFormat::Json)),
+            (vec!["br", "list"], Some(OutputFormat::Toon)),
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            let structured = should_render_errors_as_json_with_env(&cli, env_format);
+            assert!(
+                structured,
+                "{argv:?} with env {env_format:?} must be classified as structured output"
+            );
+            assert!(
+                !should_restore_default_sigpipe(&cli, structured),
+                "{argv:?} streams JSON/TOON and must keep the exit-0 broken-pipe contract"
+            );
+        }
+    }
+
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn keeps_sigpipe_ignored_for_the_mcp_server() {
+        let cli = Cli::parse_from(["br", "serve"]);
+        let structured = should_render_errors_as_json_with_env(&cli, None);
+        assert!(
+            !should_restore_default_sigpipe(&cli, structured),
+            "br serve must see EPIPE as an error so the stdio transport can shut down cooperatively"
+        );
     }
 
     #[test]

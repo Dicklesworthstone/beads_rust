@@ -219,9 +219,11 @@ self_update = [
 # `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
 
 [lints.rust]
-# Deny (not forbid): `sync::db_inode_lock` carries the crate's single
-# sanctioned `#[allow(unsafe_code)]` for the SQLite-compatible database-inode
-# range lock (no safe wrapper exists on macOS/Windows). See GitHub #412.
+# Deny (not forbid): two sanctioned `#[allow(unsafe_code)]` carve-outs exist —
+# `sync::db_inode_lock` for the SQLite-compatible database-inode range lock
+# (no safe wrapper exists on macOS/Windows, GitHub #412) and
+# `shutdown::restore_default_sigpipe_unix` for the one-line `signal(SIGPIPE,
+# SIG_DFL)` that keeps `br list | head` from aborting (GitHub #434).
 unsafe_code = "deny"
 
 [lints.clippy]

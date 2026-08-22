@@ -60,6 +60,47 @@ pub fn install() {
     install_unix();
 }
 
+/// Restore the kernel's default `SIGPIPE` disposition (terminate the
+/// process) for filter-style text output (#434). No-op on non-Unix targets.
+///
+/// The Rust runtime ignores `SIGPIPE` before `main` runs, so a write to a
+/// closed pipe returns `EPIPE`, which `println!` turns into a panic — and
+/// `panic = "abort"` turns that panic into `SIGABRT` plus a core dump, after
+/// the requested output was already delivered (`br list | head`). With the
+/// default disposition the kernel ends the process on the first such write,
+/// exactly like `cat`, `grep`, or `rg` in the same pipeline (exit status
+/// `128 + 13`).
+///
+/// Callers decide *whether* this applies: structured JSON/TOON output
+/// streams through writers that already classify a broken pipe as a
+/// non-error, and `br serve` needs `EPIPE` as an error so its stdio
+/// transport can shut down cooperatively, so both keep `SIGPIPE` ignored.
+/// Like the second-strike path above, an immediate kill skips `Drop`; the
+/// abort it replaces never ran destructors either.
+pub fn restore_default_sigpipe() {
+    #[cfg(unix)]
+    restore_default_sigpipe_unix();
+}
+
+/// The crate denies `unsafe_code`; this is the second sanctioned carve-out
+/// (after `sync::db_inode_lock`). Installing `SIG_DFL` keeps no handler alive
+/// and manages no memory, so `signal(2)` cannot violate a Rust invariant here.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn restore_default_sigpipe_unix() {
+    // SAFETY: `SIG_DFL` is a constant disposition rather than a function
+    // pointer, so there is no handler whose lifetime or async-signal-safety
+    // must be upheld, and `SIGPIPE` is a valid signal number on every Unix
+    // target this crate builds for.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    if previous == libc::SIG_ERR {
+        tracing::warn!(
+            "failed to restore the default SIGPIPE disposition; a closed stdout pipe will \
+             abort instead of terminating quietly"
+        );
+    }
+}
+
 /// Returns `true` once any registered signal has been observed.
 #[must_use]
 pub fn is_requested() -> bool {
