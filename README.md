@@ -398,8 +398,27 @@ The resource surface is `beads://project/info`, `beads://issues/{id}`,
 
 ```bash
 br --version
-# br 0.3.2
+# br 0.4.0
 ```
+
+### Verify Release Signatures
+
+Release archives from v0.4.0 onward ship a `.minisig` sidecar signed with
+the `br` release key (minisign key ID `31BE80055F619CBB`):
+
+```bash
+minisign -Vm br-<version>-<platform>.tar.gz \
+  -P 'RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF'
+```
+
+Every asset also has a mandatory `.sha256` sidecar, which the install
+script verifies automatically.
+
+> **Key history:** releases before v0.4.0 either shipped no `.minisig` or
+> were signed during a CI-secret era whose key (documented at the time as
+> `RWSp4vEO…`) is no longer recoverable; signatures from that era should be
+> considered unverifiable (see GitHub #411). The key above is the sole
+> current trust anchor.
 
 ---
 
