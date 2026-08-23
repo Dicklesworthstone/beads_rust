@@ -87,7 +87,7 @@ pub fn dispatch_subcommand(
         DoctorSubcommand::Health(a) => {
             let code = execute_health(a, &repo_root)?;
             if code != 0 {
-                std::process::exit(code);
+                crate::shutdown::exit_process(code);
             }
             Ok(())
         }

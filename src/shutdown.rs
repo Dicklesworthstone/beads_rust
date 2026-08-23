@@ -181,6 +181,49 @@ fn install_unix() {
         });
 }
 
+/// Terminate the process with `code`, guaranteeing the exit code survives
+/// teardown. This is the single exit funnel for every deliberate process
+/// exit; call it only after the caller has dropped (or deliberately
+/// forfeited) any [`crate::storage::SqliteStorage`] whose WAL should be
+/// checkpointed, exactly as with [`std::process::exit`].
+///
+/// # Why not `std::process::exit` on Windows (GitHub #439)
+///
+/// On Windows, `std::process::exit` reaches the CRT `exit()` path, which
+/// eventually calls `ExitProcess`. `ExitProcess` first terminates every
+/// other thread in the process and only then runs atexit callbacks and
+/// TLS/FLS destructors on the calling thread. Any of those destructors that
+/// joins one of the just-terminated threads finds a thread that never ran
+/// its Rust epilogue, which trips std's `JoinInner::join` integrity check
+/// ("threads should not terminate unexpectedly") and aborts with
+/// `0xC0000409` — corrupting the exit code of otherwise-successful
+/// commands. `TerminateProcess` on our own handle sets the exit code and
+/// skips that teardown entirely. Rust destructors were never going to run
+/// on this path anyway (they don't under `std::process::exit` either), so
+/// the only cleanup we owe here is flushing the std stream buffers, which
+/// this function does on every platform before exiting.
+pub fn exit_process(code: i32) -> ! {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(windows)]
+    {
+        // SAFETY: `GetCurrentProcess` returns the pseudo-handle for this
+        // process, which is always valid to pass to `TerminateProcess`.
+        // Terminating our own process is the entire point; buffers were
+        // flushed above and no Rust invariants outlive the process.
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                code as u32,
+            );
+        }
+        // TerminateProcess only returns on failure; fall through to the
+        // standard path rather than looping.
+    }
+    std::process::exit(code);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
