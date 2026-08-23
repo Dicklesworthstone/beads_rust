@@ -15,6 +15,130 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.4.0 -- 2026-08-22 (Release)
+
+Restricted-filesystem robustness wave plus one CLI capability. The headline
+fixes make `br` behave correctly where the filesystem is not a friendly
+local ext4/APFS mount: sandboxed (Landlock/locked-down) environments, WSL2
+DrvFS/9p mounts, and plain Unix pipelines. Version moves to 0.4.0 for the
+new comment-search/`show` surface and the dependency-line moves below (the
+storage stack steps to fsqlite 0.3.6 and the MCP feature to fastmcp-rust
+0.7.0); CLI behavior is otherwise compatible apart from the fixes.
+
+### Comment search and inherited context in `show` ([6b6a860f](https://github.com/Dicklesworthstone/beads_rust/commit/6b6a860f))
+
+- `br search` now matches comment bodies, not just issue title/body fields.
+- `br show --json` emits the structured `inherited_context` chain, so agents
+  can read root-item context (the binding-rules pattern) without walking the
+  dependency graph themselves. Golden coverage pins both surfaces
+  ([7b72f7d2](https://github.com/Dicklesworthstone/beads_rust/commit/7b72f7d2)).
+
+### Die like a Unix filter, not with a core dump (GitHub #434, [80ee8690](https://github.com/Dicklesworthstone/beads_rust/commit/80ee8690))
+
+- `br list | head` (any text-mode output into a closed pipe) previously
+  aborted with SIGABRT: Rust ignores SIGPIPE, bare `println!` panics on
+  EPIPE, and the `panic="abort"` profile turned that into an abort with a
+  macOS crash report. Text-mode commands now restore `SIGPIPE` to
+  `SIG_DFL` at startup and die silently by signal 13 like every other Unix
+  filter.
+- The robot contracts are unchanged: `--json`, `--toon`, and robot output
+  keep the deliberate exit-0-on-EPIPE contract from
+  [d14ec978](https://github.com/Dicklesworthstone/beads_rust/commit/d14ec978),
+  and `br serve` keeps treating EPIPE as a hard error. The restore is the
+  crate's second sanctioned `unsafe_code` carve-out, documented in
+  Cargo.toml.
+
+### Locked-down and sandboxed environments (GitHub #436, [f0fb2dec](https://github.com/Dicklesworthstone/beads_rust/commit/f0fb2dec), [5614bd40](https://github.com/Dicklesworthstone/beads_rust/commit/5614bd40))
+
+- Stable-route traversal opened `/` and every ancestor directory
+  `O_RDONLY`; under a Landlock (or similar) policy that only grants the
+  workspace, that read of `/` was refused and sync failed outright. On
+  Linux the traversal anchors now open `O_PATH|O_DIRECTORY|O_NOFOLLOW`,
+  which performs no readable open at all (symlink hostility checks are
+  preserved); macOS/BSD behavior is unchanged.
+- The immutable JSONL snapshot backing was an anonymous tempfile in
+  `TMPDIR` — outside the sandbox grant. It is now allocated beside the
+  JSONL inside `.beads/`, falling back to `TMPDIR` only if the workspace
+  refuses it.
+
+### WSL2 DrvFS/9p export publication (GitHub #419, [ca316245](https://github.com/Dicklesworthstone/beads_rust/commit/ca316245), [4ed3b1af](https://github.com/Dicklesworthstone/beads_rust/commit/4ed3b1af))
+
+- `br sync --flush-only` on 9p/DrvFS failed with EINVAL: the filesystem
+  rejects flagged (`RENAME_NOREPLACE`-style) renames, so the
+  `beads.base.jsonl` anchor was never written and orphaned `.tmp` files
+  accumulated. Publication now falls back to a witness-re-verified plain
+  rename when the flagged rename reports
+  EINVAL/ENOSYS/ENOTSUP/EOPNOTSUPP — destination errors still surface, and
+  a planted-negative test proves the fallback refuses to clobber a
+  destination that was mutated underneath it.
+- Downgraded publications are visible, not silent: `FlushResult` carries
+  `publication_atomicity: "replace_under_authority"` (emitted only when
+  downgraded), with a matching text/rich warning line. Issue #419 stays
+  open until the fix is confirmed on real WSL2 by the reporter.
+
+### Linked git worktrees resolve to the primary checkout (GitHub #429, [44c7a6f0](https://github.com/Dicklesworthstone/beads_rust/commit/44c7a6f0))
+
+- In a linked worktree, `.beads` discovery followed the worktree's own
+  root and produced a second, divergent workspace. Discovery now resolves
+  through `.git`-file indirection to the primary checkout's `.beads`.
+
+### Doctor accuracy
+
+- Satisfied blockers report Ok; only genuinely dangling edges warn
+  (GitHub #432, [1b385c23](https://github.com/Dicklesworthstone/beads_rust/commit/1b385c23)).
+- Vacuum/namespace sidecars are recognized by probing, not by textual
+  pattern match (GitHub #427, [7a1a990e](https://github.com/Dicklesworthstone/beads_rust/commit/7a1a990e)).
+- A non-regular `.write.lock` node (symlink, directory, FIFO) fails closed
+  ([2f32dcfc](https://github.com/Dicklesworthstone/beads_rust/commit/2f32dcfc));
+  an absent `sqlite3` CLI is reported as benign host state rather than a
+  warning ([5e638d23](https://github.com/Dicklesworthstone/beads_rust/commit/5e638d23)).
+- The fsqlite 0.3.6 migration-state sidecar family is created, audited,
+  and repaired alongside the database
+  ([d2148c72](https://github.com/Dicklesworthstone/beads_rust/commit/d2148c72),
+  [42a4b1f2](https://github.com/Dicklesworthstone/beads_rust/commit/42a4b1f2)).
+
+### Sync integrity
+
+- Stored-hash health is rejected when the database does not cover the
+  JSONL's ids, so a partially-imported workspace can no longer pass the
+  freshness check on hashes alone
+  ([876663fc](https://github.com/Dicklesworthstone/beads_rust/commit/876663fc)).
+
+### Dependencies
+
+- Storage engine: fsqlite 0.3.6 (registry graph), with fsqlite's `json`
+  default feature disabled so serde_json's Number representation stays out
+  of TOON output
+  ([57a16b2b](https://github.com/Dicklesworthstone/beads_rust/commit/57a16b2b),
+  [ee081bb0](https://github.com/Dicklesworthstone/beads_rust/commit/ee081bb0)),
+  plus a workaround for fsqlite 0.3.6's NULL `COUNT(*)` over grouped
+  IN-subqueries ([42a4b1f2](https://github.com/Dicklesworthstone/beads_rust/commit/42a4b1f2)).
+- Runtime lockstep: asupersync `=0.4.9` and cap-primitives `=4.0.3`
+  ([d1d64bc7](https://github.com/Dicklesworthstone/beads_rust/commit/d1d64bc7)),
+  with the optional `mcp` feature moved to fastmcp-rust 0.7.0 — the
+  published release that shares the `=0.4.9` pin. (The asupersync bump
+  alone had left the crates.io graph unresolvable: fastmcp-rust 0.6.0
+  exact-pins `=0.4.8`.)
+
+### Validation
+
+- Full `cargo test --all-features --no-fail-fast` on the release tree
+  (linux x86_64, 128-core builder): **21,992 passed, 117 ignored** across 149
+  test binaries plus doctests. Six initial failures, all dispositioned:
+  two version-propagation tests (plugin manifest, agent-baseline
+  `version.json`) exposed an incomplete bump and were fixed by completing
+  it — their binaries re-ran green (177 + 174 passed); three bv
+  robot-goldens hard-require exactly bv v0.19.0 (the host had v0.20.0) and
+  pass with v0.19.0 pinned on PATH (260 passed); one linked-worktree
+  vcs-status test fails on hosts with git-lfs filters registered in
+  system/global gitconfig — reproduced identically at the pre-release
+  commit 5614bd40, i.e. pre-existing and environment-coupled, tracked in a
+  follow-up issue.
+- `cargo clippy` at `-D warnings` and rustfmt clean via the dsr quality
+  gate on the release tree.
+
+---
+
 ## v0.3.2 -- 2026-08-14 (Release)
 
 Correctness follow-up to the v0.3.1 stabilization tag. The complete

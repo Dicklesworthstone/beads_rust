@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -76,8 +76,8 @@ fsqlite-observability = "0.3.6"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
-# Pinned =0.4.8 to match both the fsqlite family's requirement
-# (>=0.4.3,<0.5) and fastmcp-rust 0.6.0's exact =0.4.8 pin, so `--features
+# Pinned =0.4.9 to match both the fsqlite family's requirement
+# (>=0.4.3,<0.5) and fastmcp-rust 0.7.0's exact =0.4.9 pin, so `--features
 # mcp` builds carry a single asupersync version (beads_rust-fiop).
 # default-features = false mirrors fsqlite's own spec.
 asupersync = { version = "=0.4.9", default-features = false }
@@ -130,7 +130,7 @@ unicode-width = "0.2.2"
 semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "0.6.0", optional = true }
+fastmcp-rust = { version = "0.7.0", optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
@@ -207,7 +207,7 @@ self_update = [
 # NOTE: no `[patch.crates-io]` here.
 #
 # All dependencies — fsqlite 0.3.6, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.6.0 — are published on crates.io, so this crate
+# fastmcp-rust 0.7.0 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`
