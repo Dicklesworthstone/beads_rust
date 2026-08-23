@@ -4051,3 +4051,115 @@ fn e2e_json_failure_emits_parseable_json_on_stdout() {
         "human-mode error should be on stderr"
     );
 }
+
+#[test]
+fn e2e_sync_rebuild_accepts_legacy_prefixed_ids_without_renaming() {
+    // Regression for GitHub #440: on a migrated workspace whose issues.jsonl
+    // mixes legacy `<project>-<n>` ids with `bd-*` ids, ANY path that
+    // re-ingests the workspace's own sidecar (automatic post-write recovery,
+    // `br sync --import-only --rebuild`) used to fail with
+    // "Prefix mismatch at line N: expected 'bd', found issue '<legacy id>'",
+    // blocking every CLI write path. The configured prefix is the default for
+    // NEW ids, not a project-wide invariant: recovery must round-trip mixed
+    // prefixes untouched, exactly like auto-import and reconcile already do.
+    let _log = common::test_log("e2e_sync_rebuild_accepts_legacy_prefixed_ids_without_renaming");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let legacy_seed = run_br(&workspace, ["create", "Legacy seed"], "create_legacy");
+    assert!(
+        legacy_seed.status.success(),
+        "create failed: {}",
+        legacy_seed.stderr
+    );
+    let original_id = parse_created_id(&legacy_seed.stdout);
+
+    let native = run_br(&workspace, ["create", "Native seed"], "create_native");
+    assert!(native.status.success(), "create failed: {}", native.stderr);
+    let native_id = parse_created_id(&native.stdout);
+
+    let flush = run_br(&workspace, ["sync", "--flush-only"], "sync_flush");
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+
+    // Simulate the migrated workspace: rewrite one issue's id in the sidecar
+    // to a legacy project-scoped prefix that does not match the configured
+    // `bd` prefix.
+    let legacy_id = "midas_edge-0077";
+    let issues_path = workspace.root.join(".beads").join("issues.jsonl");
+    let jsonl = fs::read_to_string(&issues_path).expect("read issues jsonl");
+    assert!(
+        jsonl.contains(&original_id),
+        "flushed JSONL should contain the created id"
+    );
+    fs::write(&issues_path, jsonl.replace(&original_id, legacy_id)).expect("rewrite jsonl");
+
+    // Delegated rebuild runs the exact same repair path automatic post-write
+    // recovery uses (`recover_database_from_jsonl`).
+    let rebuild = run_br(
+        &workspace,
+        [
+            "sync",
+            "--import-only",
+            "--rebuild",
+            "--json",
+            "--no-auto-import",
+            "--no-auto-flush",
+        ],
+        "sync_rebuild_legacy_prefix",
+    );
+    assert!(
+        rebuild.status.success(),
+        "rebuild over a mixed-prefix JSONL must succeed without renaming: stdout={} stderr={}",
+        rebuild.stdout,
+        rebuild.stderr
+    );
+
+    // The legacy id must survive verbatim (no rename), alongside the native id.
+    let show_legacy = run_br(&workspace, ["show", legacy_id, "--json"], "show_legacy");
+    assert!(
+        show_legacy.status.success(),
+        "legacy-prefixed issue must be queryable after rebuild: {}",
+        show_legacy.stderr
+    );
+    let payload = extract_json_payload(&show_legacy.stdout);
+    let value: Value = serde_json::from_str(&payload).expect("parse show json");
+    let record = if value.is_array() {
+        value
+            .as_array()
+            .and_then(|entries| entries.first())
+            .cloned()
+            .expect("show payload should contain the issue")
+    } else {
+        value
+    };
+    assert_eq!(
+        record.get("id").and_then(Value::as_str),
+        Some(legacy_id),
+        "legacy id must round-trip unchanged through recovery"
+    );
+
+    let show_native = run_br(&workspace, ["show", &native_id, "--json"], "show_native");
+    assert!(
+        show_native.status.success(),
+        "native-prefixed issue must survive the rebuild: {}",
+        show_native.stderr
+    );
+
+    // And a subsequent write on the mixed-prefix workspace must work.
+    let comment = run_br(
+        &workspace,
+        ["comments", "add", legacy_id, "still writable"],
+        "comment_after_rebuild",
+    );
+    assert!(
+        comment.status.success(),
+        "writes must work on a mixed-prefix workspace: {}",
+        comment.stderr
+    );
+}
