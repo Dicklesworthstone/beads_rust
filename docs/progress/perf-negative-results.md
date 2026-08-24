@@ -440,3 +440,86 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** uncommitted candidates; manually reversed by pass 37
 
+### 2026-08-24 — Sparse blocked-command hydration — within-noise
+
+- **Hypothesis:** Loading blocked-cache rows first, hydrating only matching issues by primary key, and attaching blockers in Rust would beat the generic joined `BlockedIssueProjection::Command` path.
+- **Workload(s) probed:** Exact tracked `blocked --json` fixture on quiet `ts2`; 50 forward-order plus 50 reverse-order observations per binary, with byte-identical output.
+- **Measurement summary:** The retained binary measured median/p95 `90.151460/110.391281 ms`; the candidate measured `88.819926/103.596584 ms`, improvements of only `1.4770%/6.1551%`. The bootstrap candidate/retained median-ratio interval `0.866156..1.084900` included parity. Pass 40 restored the retained bytes.
+- **Outcome:** within-noise
+- **Scratch worktree:** uncommitted shared-tree candidate; the durable A/B command layout is embedded in the profile artifacts
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass39-forward.json` and `pass39-reverse.json`
+- **Retry-condition predicate:** Retry only if a current higher-cardinality blocked-cache profile attributes at least `10%` of end-to-end latency to joined issue hydration and the same-host candidate clears both median and p95 by at least `10%` with byte-identical output.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** uncommitted candidate; manually reversed by pass 40
+
+### 2026-08-24 — Tagged `UNION ALL` relation counts — rejected
+
+- **Hypothesis:** Combining dependency and dependent grouped counts into one tagged `UNION ALL` statement per chunk would remove one fsqlite dispatch while preserving the two indexed branches.
+- **Workload(s) probed:** Exact tracked `search rust --json` fixture; 50 forward-order plus 50 reverse-order observations per binary, with byte-identical output. Shared list/ready/scheduler countermetrics were not run after the focused gate failed.
+- **Measurement summary:** The retained binary measured median/p95 `78.377390/100.351210 ms`; the candidate measured `73.712952/99.582108 ms`, improvements of only `5.9513%/0.7664%`, below both predeclared `10%` gates. Pass 43 restored the exact retained file bytes.
+- **Outcome:** rejected
+- **Scratch worktree:** uncommitted shared-tree candidate; the durable A/B command layout is embedded in the profile artifacts
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass42-forward.json` and `pass42-reverse.json`
+- **Retry-condition predicate:** Retry only if a current profile attributes at least `10%` of end-to-end latency to the paired relation-count dispatches on at least two shared callsites; any fused form must then clear both median and p95 by at least `10%` and keep every shared-callsite countermetric within `5%`.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** uncommitted candidate; manually reversed by pass 43
+
+### 2026-08-24 — Stats-stage optimization search — no-op
+
+- **Hypothesis:** Current `stats` latency contains a safe application-owned query or serialization stage large enough for a `10%` end-to-end lever.
+- **Workload(s) probed:** Retained binary and exact 970-issue fixture; `stats --no-activity --json` on `ts2` for 30 timed runs after five warmups, plus RSS and syscall probes on `csd`.
+- **Measurement summary:** Mean/median/p95 were `49.585/47.632/56.528 ms`; stdout was one 281-byte write with SHA-256 `5424d8be00faa1a2dc9809c3c55c54fc1e52fe10e1461147451abed9f12f9d54`, stderr was empty, and peak RSS was `71,452 KiB`. Of 275 traced writes, 274 were eight-byte runtime wakeups. The top syscall shares were runtime coordination, while symbol sampling was blocked by `perf_event_paranoid=4`; no safe application-owned `>=10%` stage was established.
+- **Outcome:** no-op; no source edit
+- **Scratch worktree:** not applicable; read-only profiles remain under `/tmp/beads_rust_pass44_stats` on the named remote hosts
+- **Profile evidence:** `.beads/issues.jsonl` comment `875` on `beads_rust-7kw0`; raw remote profiles were not copied into the repository
+- **Retry-condition predicate:** Retry only if a symbol-capable profile attributes at least `10%` to one application-owned stats stage, or fsqlite exposes a safe batched/prepared dispatch seam; require exact output parity and `>=10%` median and p95 improvement.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** none
+
+### 2026-08-24 — Unlimited JSON list projection trim — no-op
+
+- **Hypothesis:** Unlimited JSON list latency contains a list-owned serialization or projection stage large enough to justify a narrower projection.
+- **Workload(s) probed:** Retained binary and exact 970-issue fixture on `ts2`; 30 timed observations of the unlimited JSON list producing 969 issues and `2,250,274` stdout bytes.
+- **Measurement summary:** Median/p95/max were `52.784/58.428/73.217 ms`, peak RSS was `74,456 KiB`, the recorded stdout SHA-256 prefix was `a0698146` (the tracker comment did not retain the full digest), stderr was empty, and core fixture hashes were unchanged. Large-output latency only marginally exceeded the much smaller pass-33 list window; a speculative JSON projection scored `1.33` and risked schema parity, so it did not meet the implementation threshold.
+- **Outcome:** no-op; no source edit
+- **Scratch worktree:** not applicable; read-only profile on `ts2`
+- **Profile evidence:** `.beads/issues.jsonl` comment `876` on `beads_rust-7kw0`; no raw pass-45 profile was persisted in the repository
+- **Retry-condition predicate:** Retry only when same-host stage attribution assigns at least `10%` to a list-owned stage; require byte-identical output plus `>=10%` improvement in both median and p95.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** none
+
+### 2026-08-24 — Small-candidate scheduler optimization search — no-op
+
+- **Hypothesis:** The current 15-candidate scheduler path contains avoidable scheduler-owned hydration, evidence, or rationale work large enough for a narrow optimization.
+- **Workload(s) probed:** Retained pass-33 scheduler observations on the exact binary/fixture: 20 timed runs at fresh one-minute load `0.28`.
+- **Measurement summary:** Mean/median/p95/max were `60.679/59.978/64.226/65.846 ms`; RSS median/p95 were `82,662/85,724 KiB`, stdout was `33,283` bytes, and stderr was empty. Only the expected 40-byte namespace lease marker changed. With 15 candidates, targeted queries correctly remain below the 96-candidate full-scan threshold; deferred scheduler work and relation-count fusion were already rejected. A quiet Callgrind gate was unavailable, so no causal profile claim was made.
+- **Outcome:** no-op; no source edit
+- **Scratch worktree:** not applicable; read-only retained matrix evidence
+- **Profile evidence:** `.beads/issues.jsonl` comment `877` on `beads_rust-7kw0`; no fresh pass-46 Callgrind artifact exists
+- **Retry-condition predicate:** Retry only on a quiet host when a profile attributes at least `10%` to one scheduler-owned stage on a representative candidate window; require normalized output parity and `>=10%` median and p95 improvement.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** none
+
+### 2026-08-24 — Full-graph dependency pruning or fusion — no-op
+
+- **Hypothesis:** `graph --all --json` contains graph-owned serialization or dependency-query work that can be safely pruned or fused for a `10%` end-to-end win.
+- **Workload(s) probed:** Retained pass-33 timing on the exact 970-issue fixture, plus a fresh quiet-`csd` Callgrind run of `graph --all --json` with exact baseline output.
+- **Measurement summary:** Pass-33 median/p95 were `49.716/73.792 ms`. Fresh Callgrind recorded `70,255,251` instructions: `Connection::query` was `56.05%` inclusive, `list_graph_issues_for_command_output` `35.00%`, `get_all_dependency_records` `22.15%`, and startup open `10.68%`; `graph_all` self-time was only `0.029%` and graph-node serialization `0.061%`. The 4,346-byte stdout SHA-256 `10df446253da672c2a808211ee7d115bfd9a45e5f2197277543004e6979c179a` matched baseline and core hashes were unchanged. No candidate scored at least `2.0`.
+- **Outcome:** no-op; no source edit
+- **Scratch worktree:** not applicable; read-only remote Callgrind profile on `csd`
+- **Profile evidence:** pass-47 remote Callgrind summary supplied to `beads_rust-7kw0`; the raw profile was not persisted in the repository
+- **Retry-condition predicate:** Retry only if a larger or sparser exact corpus proves excluded dependency rows or graph-owned work account for at least `10%`, or a new API removes a full query without query fusion; preserve exact graph bytes and core state.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** none
+
+### 2026-08-24 — Current seven-command convergence matrix — no-op
+
+- **Hypothesis:** Reprofiling the retained tree across the representative read-command matrix would expose a new application-owned hotspot after the accepted storage, startup, and fresh-import changes.
+- **Workload(s) probed:** Retained binary SHA-256 `1bb9c55460626874e2f9c4d801e614ea6d429b59be5bc048adc1f93870fa1e88` and frozen 970-line JSONL SHA-256 `27cc0c760d83a08af9bc8f62e3a895b77ade80dd4f037d04c75e232a02884115` on `ts2`; seven command families, 12 timed runs after two warmups at one-minute load `6.64..6.70`.
+- **Measurement summary:** Median/p95 were list `45.1/72.6 ms`, ready `51.7/76.1 ms`, stats `46.2/61.4 ms`, search `88.4/118.2 ms`, blocked `65.1/84.4 ms`, scheduler `57.5/62.1 ms`, and graph `46.9/65.5 ms`. With only 12 samples, reported p95 is the sample maximum and has low tail precision. Six static outputs exactly matched frozen hashes; normalized scheduler output matched SHA-256 `713d377c364a67287283ba2d0a0f749badcb48b0ca5045a70481059ca8934eea`. Binary, JSONL, and database hashes were unchanged. Search ranked slowest, but this ranking is not causal evidence and its measured relation-count fusion had already failed both retention gates.
+- **Outcome:** no-op; scoped optimization-search convergence only, not full-gauntlet convergence or certification
+- **Scratch worktree:** not applicable; remote evidence remains at `/tmp/beads_rust_pass48_ts2_20260824T0311`
+- **Profile evidence:** remote pass-48 matrix summary; raw timing files were not persisted in the repository
+- **Retry-condition predicate:** Retry only when a fresh current profile attributes at least `10%` of end-to-end latency to one new application-owned hotspot. For search, pair no-match and broad-positive shapes and exclude the already-rejected priority-bucket and relation-count-fusion approaches.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** none
