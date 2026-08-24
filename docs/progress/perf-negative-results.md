@@ -379,3 +379,15 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Retry-condition predicate:** Retry only with an expanded storage/config/doctor surface and a retention-capable, non-fallback current-schema read-only probe that returns both classification and reusable storage while preserving absent, valid, legacy, malformed, duplicate, stale-schema, symlink, and fast-open-miss behavior.
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** uncommitted; no source edit
+
+### 2026-08-23 — Retained pending-merge connection for fast-open `ready` — reverted
+
+- **Hypothesis:** Returning the advisory pending-merge inspector's already-open read-only storage handle and consuming it in `ready` would eliminate one complete fsqlite open without changing receipt authority or fallback behavior.
+- **Workload(s) probed:** Exact tracked 970-issue database; `br --no-auto-import --no-auto-flush ready --limit 0 --json`; quiet 64-core `csd` host; 50 forward-order plus 50 reverse-order Hyperfine observations per binary; byte-identical stdout and empty stderr; matched Callgrind and one-shot `/usr/bin/time -v` probes.
+- **Measurement summary:** The order-balanced baseline median was `66.797326 ms` with p95 `71.106062 ms`; the candidate median was `61.688038 ms` with p95 `66.377561 ms`, improvements of `7.6489%` and `6.6499%`. A 100,000-resample bootstrap put the candidate/baseline median ratio at `0.915933..0.934663`, excluding parity. Callgrind instructions fell from `197,179,916` to `186,230,101` (`5.55%`), and one-shot maximum RSS fell from `100,208 KiB` to `91,524 KiB` (`8.67%`). The effect was real but missed the predeclared retention requirement of at least `10%` improvement in both median and p95, so pass 3 manually reversed only the pass-2 source hunks.
+- **Outcome:** reverted
+- **Scratch worktree:** build source `/tmp/beads_rust_perf_20260824_pass02b` on `ts1`; A/B fixture `/tmp/beads_rust_ab_20260824_pass02` on `csd`
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass02-ab-forward.json`, `pass02-ab-reverse.json`, `pass02-baseline-callgrind.stderr`, `pass02-candidate-callgrind.stderr`, `pass02-baseline-time.txt`, and `pass02-candidate-time.txt`
+- **Retry-condition predicate:** Retry only after a fresh profile identifies a broader or materially simpler startup connection-reuse lever plausibly clearing both `10%` gates without widening receipt authority, fallback behavior, or the command surface.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** attempted in `1f9f43d24a050a6a2494d31f83f3e1f0759f6d32`; source hunks reversed by pass 3 pending a normal corrective commit

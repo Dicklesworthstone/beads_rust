@@ -97,7 +97,6 @@ fn main() {
     // owns a richer dedicated finding/refusal surface.
     let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
     let mut pending_merge_warning_emitted = false;
-    let mut retained_pending_merge_storage = None;
     if ctx.is_initialized()
         && !ctx.no_db()
         && (command_needs_write_lock || should_preopen_storage)
@@ -106,26 +105,18 @@ fn main() {
         && let Some(paths) = ctx.paths.as_ref()
     {
         match inspect_pending_sync_merge_for_startup(&paths.db_path) {
-            Ok(Some(inspection)) => {
-                if let Some(state) = inspection.state.as_ref() {
-                    emit_pending_sync_merge_warning(state, json_error_mode);
-                    pending_merge_warning_emitted = true;
-                    // Read-only commands remain available, but their convenience
-                    // auto-import and every command-local storage fallback must
-                    // not advance either side of the saga. Force current-schema
-                    // read-only storage even when the user did not pass the
-                    // normal explicit stale/flush opt-outs.
-                    should_auto_import_now = false;
-                    force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
-                    should_preopen_storage =
-                        storage_enabled && supports_read_only_fast_open(&cli.command);
-                }
-                retained_pending_merge_storage = retain_pending_merge_storage_for_ready(
-                    &cli.command,
-                    should_preopen_storage,
-                    ctx.overrides.read_only_fast_open,
-                    inspection.storage,
-                );
+            Ok(Some(state)) => {
+                emit_pending_sync_merge_warning(&state, json_error_mode);
+                pending_merge_warning_emitted = true;
+                // Read-only commands remain available, but their convenience
+                // auto-import and every command-local storage fallback must
+                // not advance either side of the saga. Force current-schema
+                // read-only storage even when the user did not pass the
+                // normal explicit stale/flush opt-outs.
+                should_auto_import_now = false;
+                force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
+                should_preopen_storage =
+                    storage_enabled && supports_read_only_fast_open(&cli.command);
             }
             Ok(None) => {}
             Err(error) => {
@@ -699,17 +690,6 @@ fn main() {
                     &output_ctx,
                     beads_dir,
                     res,
-                )
-            } else if let (Some(storage), Some(beads_dir)) = (
-                retained_pending_merge_storage.as_ref(),
-                ctx.beads_dir.as_ref(),
-            ) {
-                commands::ready::execute_with_storage(
-                    &args,
-                    &overrides,
-                    &output_ctx,
-                    beads_dir,
-                    storage,
                 )
             } else {
                 commands::ready::execute(&args, cli.json, &overrides, &output_ctx)
@@ -1304,19 +1284,9 @@ fn pending_sync_merge_no_db_refusal_error(
     }
 }
 
-fn retain_pending_merge_storage_for_ready(
-    command: &Commands,
-    phase_two_preopens_storage: bool,
-    read_only_fast_open: bool,
-    storage: beads_rust::storage::SqliteStorage,
-) -> Option<beads_rust::storage::SqliteStorage> {
-    (!phase_two_preopens_storage && read_only_fast_open && matches!(command, Commands::Ready(_)))
-        .then_some(storage)
-}
-
 fn inspect_pending_sync_merge_for_startup(
     db_path: &Path,
-) -> Result<Option<commands::doctor::PendingSyncMergeReadOnlyInspection>> {
+) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
     // A missing database is the normal pre-import state for a JSONL-only
     // checkout and cannot contain a pending merge receipt, so the advisory
     // startup inspection must not push such workspaces into degraded
@@ -1324,8 +1294,7 @@ fn inspect_pending_sync_merge_for_startup(
     // missing database as a finding through its stricter public inspector.
     match fs::symlink_metadata(db_path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        _ => commands::doctor::inspect_pending_sync_merge_at_path_retaining_storage(db_path)
-            .map(Some),
+        _ => commands::doctor::inspect_pending_sync_merge_at_path(db_path),
     }
 }
 
@@ -2908,55 +2877,6 @@ mod tests {
         assert!(
             !db_path.exists(),
             "advisory inspection must remain read-only"
-        );
-    }
-
-    #[test]
-    fn startup_advisory_reuses_classifying_storage_only_for_fast_open_ready() {
-        let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("beads.db");
-        drop(beads_rust::storage::SqliteStorage::open(&db_path).unwrap());
-        let inspection = inspect_pending_sync_merge_for_startup(&db_path)
-            .unwrap()
-            .expect("current-schema database retains its advisory handle");
-        assert!(inspection.state.is_none());
-
-        let ready = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "ready"]).command;
-        let retained =
-            retain_pending_merge_storage_for_ready(&ready, false, true, inspection.storage)
-                .expect("fast-open ready without a phase-two preopen reuses advisory storage");
-        assert_eq!(retained.count_issues().unwrap(), 0);
-
-        assert!(
-            retain_pending_merge_storage_for_ready(
-                &ready,
-                true,
-                true,
-                beads_rust::storage::SqliteStorage::open_memory().unwrap(),
-            )
-            .is_none(),
-            "phase two remains authoritative when it preopens storage"
-        );
-        assert!(
-            retain_pending_merge_storage_for_ready(
-                &ready,
-                false,
-                false,
-                beads_rust::storage::SqliteStorage::open_memory().unwrap(),
-            )
-            .is_none(),
-            "normal writable/recovery startup must not reuse advisory storage"
-        );
-        let list = Cli::parse_from(["br", "--no-auto-import", "--no-auto-flush", "list"]).command;
-        assert!(
-            retain_pending_merge_storage_for_ready(
-                &list,
-                false,
-                true,
-                beads_rust::storage::SqliteStorage::open_memory().unwrap(),
-            )
-            .is_none(),
-            "this pass changes only the profiled ready dispatch"
         );
     }
 
