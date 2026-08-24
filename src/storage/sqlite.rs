@@ -11007,13 +11007,32 @@ impl SqliteStorage {
         }
 
         let parent_sql = if blocking_only {
+            // CASE is lazy: when the indexed external-child range is empty,
+            // fsqlite does not execute the disproportionately expensive epic
+            // join. Keeping both branches in one statement avoids paying a
+            // second query setup cost when an external child does exist.
             "SELECT 1
-             FROM dependencies d INDEXED BY idx_dependencies_issue
-             JOIN issues p ON d.depends_on_id = p.id
-             WHERE d.issue_id >= 'external:'
-               AND d.issue_id < 'external;'
-               AND d.type = 'parent-child'
-               AND p.issue_type = 'epic'
+             WHERE CASE
+                 WHEN EXISTS (
+                     SELECT 1
+                     FROM dependencies INDEXED BY idx_dependencies_issue
+                     WHERE issue_id >= 'external:'
+                       AND issue_id < 'external;'
+                       AND type = 'parent-child'
+                     LIMIT 1
+                 )
+                 THEN EXISTS (
+                     SELECT 1
+                     FROM dependencies d INDEXED BY idx_dependencies_issue
+                     JOIN issues p ON d.depends_on_id = p.id
+                     WHERE d.issue_id >= 'external:'
+                       AND d.issue_id < 'external;'
+                       AND d.type = 'parent-child'
+                       AND p.issue_type = 'epic'
+                     LIMIT 1
+                 )
+                 ELSE 0
+             END
              LIMIT 1"
         } else {
             "SELECT 1
@@ -22449,6 +22468,87 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "depends_on_id"));
+    }
+
+    #[test]
+    fn test_has_external_dependencies_preserves_empty_direct_and_malformed_target_semantics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 3, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-direct", "Direct", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        assert!(!storage.has_external_dependencies(true).unwrap());
+        assert!(!storage.has_external_dependencies(false).unwrap());
+
+        storage
+            .add_dependency("bd-direct", "external:project:related", "related", "tester")
+            .unwrap();
+        assert!(!storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+
+        storage
+            .add_dependency(
+                "bd-direct",
+                "external::malformed-project",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        assert!(storage.has_external_dependencies(true).unwrap());
+    }
+
+    #[test]
+    fn test_has_external_dependencies_checks_all_external_parent_child_candidates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let task_parent = make_issue(
+            "bd-task-parent",
+            "Task parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut epic_parent = make_issue(
+            "bd-epic-parent",
+            "Epic parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        epic_parent.issue_type = IssueType::Epic;
+        storage.create_issue(&task_parent, "tester").unwrap();
+        storage.create_issue(&epic_parent, "tester").unwrap();
+
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:aaa:task-child",
+            "bd-task-parent",
+            t1,
+        );
+        insert_external_parent_child_dependency(
+            &storage,
+            "external::malformed-epic-child",
+            "bd-epic-parent",
+            t1,
+        );
+
+        assert!(storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+    }
+
+    #[test]
+    fn test_has_external_dependencies_propagates_guard_index_errors() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .conn
+            .execute("DROP INDEX idx_dependencies_issue")
+            .unwrap();
+
+        assert!(storage.has_external_dependencies(true).is_err());
     }
 
     #[test]
