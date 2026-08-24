@@ -3016,9 +3016,8 @@ mod tests {
         drop(bootstrap);
 
         let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
-        let mut fast_storage = Some(
-            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"),
-        );
+        let mut fast_storage =
+            Some(config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"));
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 &beads_dir,
@@ -3063,9 +3062,8 @@ mod tests {
             .expect("plant pending receipt");
         drop(writable);
 
-        let mut fast_storage = Some(
-            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"),
-        );
+        let mut fast_storage =
+            Some(config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"));
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 &beads_dir,
@@ -3164,9 +3162,8 @@ mod tests {
         fs::create_dir(&paths.jsonl_path).expect("plant non-regular JSONL path");
 
         let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
-        let mut fast_storage = Some(
-            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"),
-        );
+        let mut fast_storage =
+            Some(config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"));
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 &beads_dir,

@@ -222,12 +222,7 @@ fn status_and_report_commands() -> Vec<MatrixCommand> {
         ),
         exact_command(
             "orphans_robot_explicit_stale_opt_out",
-            strings([
-                "--no-auto-import",
-                "--no-auto-flush",
-                "orphans",
-                "--robot",
-            ]),
+            strings(["--no-auto-import", "--no-auto-flush", "orphans", "--robot"]),
         ),
     ]
 }

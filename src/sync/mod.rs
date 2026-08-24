@@ -14977,6 +14977,73 @@ mod tests {
         (temp, beads_dir, jsonl_path, authority, storage, witness)
     }
 
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))]
+    #[test]
+    fn database_candidate_no_replace_preserves_an_existing_target() {
+        let temp = TempDir::new().unwrap();
+        let candidate = temp.path().join("candidate.db");
+        let target = temp.path().join("target.db");
+        fs::write(&candidate, b"candidate generation").unwrap();
+        fs::write(&target, b"concurrent generation").unwrap();
+
+        let error = install_database_candidate_no_replace(&candidate, &target)
+            .expect_err("atomic no-replace install must reject an existing target");
+
+        assert!(
+            matches!(&error, BeadsError::SyncConflict { .. }),
+            "existing-target rejection should be reported as a sync conflict: {error}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"concurrent generation");
+        assert_eq!(fs::read(&candidate).unwrap(), b"candidate generation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_authority_rejects_replacement_with_equal_creation_time() {
+        use std::os::windows::fs::FileTimesExt;
+
+        let temp = TempDir::new().unwrap();
+        let authority_path = temp.path().join("authority.lock");
+        let displaced_path = temp.path().join("displaced.lock");
+        fs::write(&authority_path, b"held generation").unwrap();
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&authority_path)
+            .unwrap();
+        let held_created = held.metadata().unwrap().created().unwrap();
+
+        fs::rename(&authority_path, &displaced_path).unwrap();
+        fs::write(&authority_path, b"replacement generation").unwrap();
+        let replacement = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&authority_path)
+            .unwrap();
+        replacement
+            .set_times(std::fs::FileTimes::new().set_creation_time(held_created))
+            .unwrap();
+        assert_eq!(
+            replacement.metadata().unwrap().created().unwrap(),
+            held_created,
+            "the mutation must defeat the former creation-time identity witness"
+        );
+
+        let error = verify_locked_file_identity(
+            &held,
+            &authority_path,
+            "test authority",
+            false,
+        )
+        .expect_err("stable handle identity must reject the distinct replacement");
+        assert!(error.to_string().contains("identity changed"));
+    }
+
     #[test]
     fn sync_merge_receipt_hash_domains_are_stable_and_distinct() {
         let payload = ("identical receipt payload", 7_u64);

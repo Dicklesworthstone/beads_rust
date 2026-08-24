@@ -268,7 +268,11 @@ fn ready_cli_text_explains_when_filters_hide_ready_work() {
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
-    let created = run_br(&workspace, ["create", "Unassigned ready work"], "create_ready");
+    let created = run_br(
+        &workspace,
+        ["create", "Unassigned ready work"],
+        "create_ready",
+    );
     assert!(
         created.status.success(),
         "create failed: {}",
@@ -282,7 +286,9 @@ fn ready_cli_text_explains_when_filters_hide_ready_work() {
     );
     assert!(result.status.success(), "ready failed: {}", result.stderr);
     assert!(
-        result.stdout.contains("No ready issues match the requested filters"),
+        result
+            .stdout
+            .contains("No ready issues match the requested filters"),
         "filtered empty output must identify the filter mismatch: {}",
         result.stdout
     );

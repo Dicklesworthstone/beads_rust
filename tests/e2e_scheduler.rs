@@ -230,10 +230,7 @@ fn scheduler_surfaces_a_custom_only_ready_status_group() {
     );
     assert_eq!(json["candidate_count"], 1);
     assert_eq!(json["recommendations"][0]["issue"]["id"], candidate);
-    assert_eq!(
-        json["recommendations"][0]["issue"]["status"],
-        "rework"
-    );
+    assert_eq!(json["recommendations"][0]["issue"]["status"], "rework");
 }
 
 #[test]

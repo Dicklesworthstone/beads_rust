@@ -28350,7 +28350,9 @@ mod tests {
 
         let storage = SqliteStorage::open_current_read_only(&db_path)
             .unwrap()
-            .expect("the exact-version read-only handle is still needed for pending-state inspection");
+            .expect(
+                "the exact-version read-only handle is still needed for pending-state inspection",
+            );
         assert!(
             !storage.fast_open_runtime_schema_is_compatible(),
             "the fast-open caller must route runtime-incomplete schemas through ordinary healing"
@@ -31098,11 +31100,7 @@ mod tests {
             (ReadyIssueProjection::Summary, "summary"),
         ] {
             let issues = storage
-                .get_ready_issues_with_projection(
-                    &filters,
-                    ReadySortPolicy::Oldest,
-                    projection,
-                )
+                .get_ready_issues_with_projection(&filters, ReadySortPolicy::Oldest, projection)
                 .unwrap();
             assert_eq!(issues.len(), 1, "{name} projection lost custom-only work");
             assert_eq!(issues[0].id, "bd-rework-only");
