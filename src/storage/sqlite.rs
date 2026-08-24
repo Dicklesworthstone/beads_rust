@@ -1538,6 +1538,30 @@ struct ReadyReadinessProbe {
     blocked_cache_stale: bool,
 }
 
+fn effective_ready_statuses(filters: &ReadyFilters) -> Vec<String> {
+    let mut statuses = if filters.ready_statuses.is_empty() {
+        vec!["open".to_string()]
+    } else {
+        filters.ready_statuses.clone()
+    };
+    if filters.include_deferred
+        && !statuses
+            .iter()
+            .any(|status| status.eq_ignore_ascii_case("deferred"))
+    {
+        statuses.push("deferred".to_string());
+    }
+    statuses
+}
+
+fn ready_status_sql_literals(filters: &ReadyFilters) -> String {
+    effective_ready_statuses(filters)
+        .iter()
+        .map(|status| format!("'{}'", status.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct IssueDetailRelationPresence {
     has_labels: bool,
     has_dependencies: bool,
@@ -2026,18 +2050,15 @@ impl SqliteStorage {
         }
     }
 
-    fn ready_readiness_probe(&self, include_deferred: bool) -> Result<ReadyReadinessProbe> {
-        let sql = if include_deferred {
+    fn ready_readiness_probe(&self, filters: &ReadyFilters) -> Result<ReadyReadinessProbe> {
+        let status_literals = ready_status_sql_literals(filters);
+        let sql = format!(
             "SELECT
-                EXISTS(SELECT 1 FROM issues WHERE status IN ('open', 'deferred') LIMIT 1),
+                EXISTS(SELECT 1 FROM issues WHERE status IN ({status_literals}) LIMIT 1),
                 COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
-        } else {
-            "SELECT
-                EXISTS(SELECT 1 FROM issues WHERE status = 'open' LIMIT 1),
-                COALESCE((SELECT value = ? FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1), 0)"
-        };
+        );
         let row = self.conn.query_row_with_params(
-            sql,
+            &sql,
             &[
                 SqliteValue::from(BLOCKED_CACHE_STATE_STALE),
                 SqliteValue::from(BLOCKED_CACHE_STATE_KEY),
@@ -2376,6 +2397,22 @@ impl SqliteStorage {
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
         }))
+    }
+
+    pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
+        // Current-version databases created by the pre-#398 reviewed
+        // migration could lack the v16/v17 capacity tables while retaining
+        // the current version stamp. Keep the common fast path to one
+        // nonmutating statement, but validate every column used at runtime so
+        // those historical databases fall back to the full schema healer.
+        self.conn
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT issue_id, capacity_kind, capacity_name FROM capacity_exemptions LIMIT 0),
+                    EXISTS(SELECT issue_id, capacity_kind, capacity_name, action FROM capacity_exemption_history LIMIT 0),
+                    EXISTS(SELECT issue_id, actor, harness, session FROM capacity_occupancy LIMIT 0)",
+            )
+            .is_ok()
     }
 
     /// Open an existing current-schema database for a token-bound recovery write.
@@ -9184,10 +9221,12 @@ impl SqliteStorage {
         Ok(issues)
     }
 
-    /// Get ready issues (unblocked, not deferred, not pinned, not ephemeral).
+    /// Get ready issues (configured ready status, unblocked, not time-deferred,
+    /// not pinned, not ephemeral).
     ///
     /// Ready definition:
-    /// 1. Status is `open` by default, or `deferred` when `include_deferred` is set
+    /// 1. Status belongs to the configured ready group (`open` by default), with
+    ///    `deferred` added when `include_deferred` is set
     /// 2. NOT in `blocked_issues_cache`
     /// 3. `defer_until` is NULL or <= now (unless `include_deferred`)
     /// 4. `pinned = 0` (not pinned)
@@ -9246,7 +9285,7 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
         projection: ReadyIssueProjection,
     ) -> Result<Vec<Issue>> {
-        let readiness = self.ready_readiness_probe(filters.include_deferred)?;
+        let readiness = self.ready_readiness_probe(filters)?;
         if !readiness.has_candidate_status {
             return Ok(Vec::new());
         }
@@ -9378,18 +9417,6 @@ impl SqliteStorage {
         // behavior (in_progress means already claimed). `--include-deferred`
         // additionally folds in `deferred` without double-counting it if the
         // configured group already lists it.
-        let mut ready_statuses: Vec<String> = if filters.ready_statuses.is_empty() {
-            vec!["open".to_string()]
-        } else {
-            filters.ready_statuses.clone()
-        };
-        if filters.include_deferred
-            && !ready_statuses
-                .iter()
-                .any(|status| status.eq_ignore_ascii_case("deferred"))
-        {
-            ready_statuses.push("deferred".to_string());
-        }
         // The status list is inlined as SQL string literals rather than bound
         // `?` params. Status values are internal, validated, lowercased policy
         // names (never raw user input reaching SQL), and the embedded fsqlite
@@ -9400,13 +9427,11 @@ impl SqliteStorage {
         // single-`open` case byte-identical to the pre-#354 literal and keeps
         // widened groups index-coverable. Single quotes are still escaped
         // defensively in case a project configures an exotic custom status.
-        {
-            let escaped: Vec<String> = ready_statuses
-                .iter()
-                .map(|status| format!("'{}'", status.replace('\'', "''")))
-                .collect();
-            let _ = write!(sql, " AND status IN ({})", escaped.join(","));
-        }
+        let _ = write!(
+            sql,
+            " AND status IN ({})",
+            ready_status_sql_literals(filters)
+        );
 
         // Ready condition 2: blocked issues are filtered in SQL when the cache
         // is healthy; fallback callers filter them in Rust after directly
@@ -28306,6 +28331,33 @@ mod tests {
     }
 
     #[test]
+    fn test_open_current_read_only_reports_runtime_incomplete_current_schema() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("readonly_runtime_incomplete.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("DROP TABLE capacity_occupancy")
+                .unwrap();
+            assert_eq!(
+                connection_user_version(&storage.conn),
+                Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()),
+                "the fixture must retain the current version stamp"
+            );
+        }
+
+        let storage = SqliteStorage::open_current_read_only(&db_path)
+            .unwrap()
+            .expect("the exact-version read-only handle is still needed for pending-state inspection");
+        assert!(
+            !storage.fast_open_runtime_schema_is_compatible(),
+            "the fast-open caller must route runtime-incomplete schemas through ordinary healing"
+        );
+    }
+
+    #[test]
     fn test_reviewed_reconcile_opens_decline_unknown_future_schema() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("reviewed_future_schema.db");
@@ -31015,6 +31067,47 @@ mod tests {
         // in_progress stays out; statuses are preserved.
         let rework = res.iter().find(|i| i.id == "bd-rework").unwrap();
         assert_eq!(rework.status.as_str(), "rework");
+    }
+
+    #[test]
+    fn test_ready_custom_only_group_surfaces_candidates_in_every_projection() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        storage
+            .create_issue(
+                &make_issue(
+                    "bd-rework-only",
+                    "Rework only",
+                    Status::Custom("rework".to_string()),
+                    2,
+                    None,
+                    now,
+                    None,
+                ),
+                "tester",
+            )
+            .unwrap();
+
+        let filters = ReadyFilters {
+            ready_statuses: vec!["rework".to_string()],
+            ..Default::default()
+        };
+        for (projection, name) in [
+            (ReadyIssueProjection::Full, "full"),
+            (ReadyIssueProjection::Command, "command"),
+            (ReadyIssueProjection::Summary, "summary"),
+        ] {
+            let issues = storage
+                .get_ready_issues_with_projection(
+                    &filters,
+                    ReadySortPolicy::Oldest,
+                    projection,
+                )
+                .unwrap();
+            assert_eq!(issues.len(), 1, "{name} projection lost custom-only work");
+            assert_eq!(issues[0].id, "bd-rework-only");
+            assert_eq!(issues[0].status.as_str(), "rework");
+        }
     }
 
     #[test]

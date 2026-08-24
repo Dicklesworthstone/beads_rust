@@ -53,10 +53,11 @@
 //! surrounding authority state machine (`retired_locks`, rebind, restore) is
 //! unchanged.
 //!
-//! This module is the crate's single sanctioned `unsafe` exemption: the two
-//! syscalls (`fcntl` / `LockFileEx`) have no safe wrapper covering OFD locks
-//! on macOS (`nix` gates `F_OFD_SETLK` to linux/android) or byte-range locks
-//! on Windows. Everything else in the crate remains `#![deny(unsafe_code)]`.
+//! This module is the crate's single sanctioned `unsafe` exemption. Its small
+//! syscall surface (`fcntl`, `LockFileEx`, and Windows `MoveFileExW` without
+//! replacement) has no safe standard-library wrapper with the required lock
+//! and no-clobber semantics. Everything else in the crate remains
+//! `#![deny(unsafe_code)]`.
 
 use std::fs::{File, TryLockError};
 
@@ -115,6 +116,47 @@ pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
         // POSIX allows either EAGAIN or EACCES for a held conflicting lock.
         Some(code) if code == libc::EAGAIN || code == libc::EACCES => Err(TryLockError::WouldBlock),
         _ => Err(TryLockError::Error(error)),
+    }
+}
+
+/// Atomically move a pre-locked database candidate to a missing Windows name.
+///
+/// `std::fs::rename` explicitly replaces an existing destination, while the
+/// fresh-database installer must never clobber a file that appears after its
+/// last advisory absence check. `MoveFileExW` without
+/// `MOVEFILE_REPLACE_EXISTING` supplies the required atomic no-replace
+/// decision. `MOVEFILE_WRITE_THROUGH` keeps the prior durable-install intent.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn rename_database_candidate_no_replace(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    fn nul_terminated(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+        let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "database replacement path contains an embedded NUL",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    let from = nul_terminated(from)?;
+    let to = nul_terminated(to)?;
+    // SAFETY: both buffers are NUL-terminated and remain alive for the entire
+    // synchronous call. No replacement flag is supplied, so Windows performs
+    // one atomic missing-destination check and fails if `to` already exists.
+    let moved = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 

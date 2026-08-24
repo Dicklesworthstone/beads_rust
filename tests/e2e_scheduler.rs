@@ -177,6 +177,16 @@ fn scheduler_json_ranks_ready_bottlenecks_with_evidence() {
         recommendations[0]["evidence"]["dependency_impact"]["dependent_count"],
         1
     );
+    assert_eq!(
+        recommendations[0]["issue"]["labels"],
+        serde_json::json!(["core"]),
+        "scheduler issue payload must carry the same labels used by scoring"
+    );
+    assert_eq!(
+        recommendations[0]["evidence"]["domain_contention"]["labels"],
+        recommendations[0]["issue"]["labels"],
+        "scheduler evidence and issue payload must not contradict each other"
+    );
     assert!(
         recommendations[0]["score"].as_i64().unwrap()
             > recommendations[1]["score"].as_i64().unwrap(),
@@ -185,6 +195,44 @@ fn scheduler_json_ranks_ready_bottlenecks_with_evidence() {
     assert_eq!(
         json["fallback_policy"]["sort"],
         "priority ASC, created_at ASC, id ASC"
+    );
+}
+
+#[test]
+fn scheduler_surfaces_a_custom_only_ready_status_group() {
+    let _log = common::test_log("scheduler_surfaces_a_custom_only_ready_status_group");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let candidate = create_issue(&workspace, "Rework candidate", "1");
+    let update = run_br(
+        &workspace,
+        ["update", &candidate, "--status", "rework"],
+        "candidate_to_rework",
+    );
+    assert!(
+        update.status.success(),
+        "update to rework failed: {}",
+        update.stderr
+    );
+    let policy_path = workspace.root.join(".beads").join("policy.yaml");
+    fs::write(
+        policy_path,
+        "workflow:\n  status_groups:\n    ready: [rework]\n",
+    )
+    .expect("write custom-only ready policy");
+
+    let json = scheduler_json(
+        &workspace,
+        &["scheduler", "--json", "--limit", "1"],
+        "scheduler_custom_only_ready",
+    );
+    assert_eq!(json["candidate_count"], 1);
+    assert_eq!(json["recommendations"][0]["issue"]["id"], candidate);
+    assert_eq!(
+        json["recommendations"][0]["issue"]["status"],
+        "rework"
     );
 }
 

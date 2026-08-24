@@ -262,6 +262,38 @@ fn ready_cli_text_reports_no_ready_issues_when_work_exists() {
 }
 
 #[test]
+fn ready_cli_text_explains_when_filters_hide_ready_work() {
+    let _log = common::test_log("ready_cli_text_explains_when_filters_hide_ready_work");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let created = run_br(&workspace, ["create", "Unassigned ready work"], "create_ready");
+    assert!(
+        created.status.success(),
+        "create failed: {}",
+        created.stderr
+    );
+
+    let result = run_br(
+        &workspace,
+        ["ready", "--assignee", "nobody"],
+        "ready_filtered_empty",
+    );
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("No ready issues match the requested filters"),
+        "filtered empty output must identify the filter mismatch: {}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("all remaining work is blocked"),
+        "filtered empty output must not misdiagnose visible ready work: {}",
+        result.stdout
+    );
+}
+
+#[test]
 fn ready_cli_filters_by_assignee() {
     let _log = common::test_log("ready_cli_filters_by_assignee");
     let (workspace, ids) = setup_workspace_with_issues();
@@ -1224,6 +1256,43 @@ fn ready_configured_group_surfaces_rework_e2e() {
         Some("rework"),
         "returned issue must preserve its real status"
     );
+}
+
+#[test]
+fn ready_custom_only_group_surfaces_rework_e2e() {
+    let _log = common::test_log("ready_custom_only_group_surfaces_rework_e2e");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let rework = run_br(
+        &workspace,
+        ["create", "Only rework candidate", "-t", "task"],
+        "c_rework_only",
+    );
+    let rework_id = parse_created_id(&rework.stdout);
+    let update = run_br(
+        &workspace,
+        ["update", &rework_id, "--status", "rework"],
+        "to_rework_only",
+    );
+    assert!(
+        update.status.success(),
+        "update to rework failed: {}",
+        update.stderr
+    );
+    write_policy(
+        &workspace,
+        "workflow:\n  status_groups:\n    ready: [rework]\n",
+    );
+
+    let result = run_br(&workspace, ["ready", "--json"], "ready_custom_only");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    let payload = extract_json_payload(&result.stdout);
+    let issues: Vec<Value> = serde_json::from_str(&payload).expect("valid json");
+    assert_eq!(issues.len(), 1, "custom-only ready group lost its sole row");
+    assert_eq!(issues[0]["id"], rework_id);
+    assert_eq!(issues[0]["status"], "rework");
 }
 
 #[test]

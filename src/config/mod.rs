@@ -3864,7 +3864,7 @@ fn open_sqlite_storage_for_startup(
         Ok((result, None))
     } else if options.read_only_fast_open {
         match SqliteStorage::open_current_read_only(&paths.db_path) {
-            Ok(Some(storage)) => Ok((
+            Ok(Some(storage)) if storage.fast_open_runtime_schema_is_compatible() => Ok((
                 SqliteRecoveryOpenResult {
                     storage,
                     auto_rebuilt: false,
@@ -3873,7 +3873,7 @@ fn open_sqlite_storage_for_startup(
                 },
                 None,
             )),
-            Ok(None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
+            Ok(Some(_)) | Ok(None) => open_sqlite_storage_with_recovery_after_fast_open_miss(
                 beads_dir,
                 paths,
                 lock_timeout,
@@ -8667,6 +8667,33 @@ routing:
 
         assert_eq!(issue.title, "Recovered from JSONL only");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn read_only_fast_open_heals_runtime_incomplete_current_schema_under_authority() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        drop(SqliteStorage::open(&db_path).expect("initialize current schema"));
+
+        let fixture = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("open runtime-incomplete fixture");
+        fixture
+            .execute("DROP TABLE capacity_occupancy")
+            .expect("drop required runtime table");
+        fixture.close().expect("close fixture");
+
+        let cli = CliOverrides {
+            read_only_fast_open: true,
+            ..CliOverrides::default()
+        };
+        let opened = open_storage_with_cli(&beads_dir, &cli)
+            .expect("fast-open miss should heal under database-family authority");
+        assert!(
+            opened.storage.fast_open_runtime_schema_is_compatible(),
+            "ordinary fallback must restore all current runtime schema objects"
+        );
     }
 
     #[test]

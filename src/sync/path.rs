@@ -1618,6 +1618,25 @@ impl PinnedJsonlName {
         Ok(Some(OpenedJsonlSource { file, identity }))
     }
 
+    /// Opens a regular Windows leaf for an exact authority identity check.
+    ///
+    /// Database and lock-sidecar handles legitimately remain open for writing
+    /// while their authority is re-witnessed. Share reads and writes so this
+    /// probe composes with those handles, but deliberately omit delete sharing:
+    /// the opened leaf cannot be renamed or replaced until its stable file ID
+    /// has been compared with the retained authority handle.
+    pub(super) fn open_optional_regular_for_authority_identity(
+        &self,
+    ) -> Result<Option<OpenedJsonlSource>> {
+        let share_mode = Self::FILE_SHARE_READ | Self::FILE_SHARE_WRITE;
+        let Some(file) = self.open_relative_regular_once_with_share_mode(share_mode)? else {
+            return Ok(None);
+        };
+        let identity = windows_jsonl_file_identity(&file, &self.display_path)?;
+        self.verify_relative_identity_with_share_mode(identity, share_mode)?;
+        Ok(Some(OpenedJsonlSource { file, identity }))
+    }
+
     /// Creates a new regular Windows sibling relative to the retained parent.
     ///
     /// `CREATE_NEW` provides the exact no-clobber allocation guarantee. The
@@ -1857,7 +1876,7 @@ pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
         display_path: absolute_target,
     };
     pinned.parent.verify_route()?;
-    let _ = pinned.open_optional_regular()?;
+    let _ = pinned.open_optional_regular_for_authority_identity()?;
     pinned.parent.verify_route()?;
     Ok(pinned)
 }
@@ -1929,7 +1948,7 @@ fn jsonl_file_identity(metadata: &std::fs::Metadata) -> JsonlFileIdentity {
 }
 
 #[cfg(windows)]
-fn windows_jsonl_file_identity(file: &File, path: &Path) -> Result<JsonlFileIdentity> {
+pub(super) fn windows_jsonl_file_identity(file: &File, path: &Path) -> Result<JsonlFileIdentity> {
     use cap_primitives::fs::{_WindowsByHandle, Metadata};
 
     let descriptor = external_path_descriptor(path);

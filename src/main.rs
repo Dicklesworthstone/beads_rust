@@ -456,21 +456,21 @@ fn main() {
                 };
             }
 
-            // The first read-only probe is deliberately advisory: JSONL or
-            // the pending-merge receipt can change before we join the writer
-            // queue. Reclassify both under the database-family authority
-            // before dropping the read-only handle or opening anything that
-            // can recover, migrate, or import. A pending/uncertain receipt
-            // fails closed to the already-open read-only command; a JSONL
-            // change that disappeared while waiting avoids the writable
-            // reopen entirely.
+            // The first read-only probe is deliberately advisory: JSONL, the
+            // pending-merge receipt, or even the canonical database inode can
+            // change before we join the writer queue. Reopen the canonical
+            // database under the acquired family authority, then reclassify
+            // both freshness and pending state on that protected handle. A
+            // classified pending receipt keeps the command read-only; probe
+            // uncertainty is an error because serving the database anyway
+            // could return stale state.
             if ctx.overrides.read_only_fast_open
-                && let (Some(res), Some(authority)) =
-                    (storage_result.as_ref(), auto_import_write_lock.as_ref())
+                && let Some(authority) = auto_import_write_lock.as_ref()
             {
-                match reprobe_fast_open_auto_import_under_authority(
-                    res,
+                match reopen_and_reprobe_fast_open_auto_import_under_authority(
+                    &mut storage_result,
                     paths,
+                    &ctx.overrides,
                     authority,
                     allow_external_jsonl,
                 ) {
@@ -484,10 +484,7 @@ fn main() {
                         }
                         should_attempt_auto_import = false;
                     }
-                    Err(error) => {
-                        emit_pending_sync_merge_inspection_warning(&error, json_error_mode);
-                        should_attempt_auto_import = false;
-                    }
+                    Err(error) => handle_error(&error, json_error_mode, color_error_mode),
                 }
             }
         }
@@ -1357,18 +1354,38 @@ enum FastOpenAutoImportReprobe {
     Pending(commands::doctor::PendingSyncMergeState),
 }
 
-fn reprobe_fast_open_auto_import_under_authority(
-    storage_result: &config::OpenStorageResult,
+fn reopen_and_reprobe_fast_open_auto_import_under_authority(
+    storage_result: &mut Option<config::OpenStorageResult>,
     paths: &config::ConfigPaths,
+    overrides: &config::CliOverrides,
     authority: &Arc<beads_rust::sync::DatabaseFamilyWriteLock>,
     allow_external_jsonl: bool,
 ) -> Result<FastOpenAutoImportReprobe> {
+    let mut canonical_overrides = overrides.clone();
+    canonical_overrides.read_only_fast_open = true;
+    canonical_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
+
+    // The pre-lock read-only connection may refer to an inode that a writer
+    // replaced while this process waited for authority. Never make a
+    // post-lock freshness decision through that orphaned handle.
+    drop(storage_result.take());
+    *storage_result = Some(config::open_storage_with_cli(
+        &paths.beads_dir,
+        &canonical_overrides,
+    )?);
+
     if let Some(state) =
         inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority)?
     {
         return Ok(FastOpenAutoImportReprobe::Pending(state));
     }
 
+    let Some(storage_result) = storage_result.as_ref() else {
+        return Err(BeadsError::SyncConflict {
+            message: "Canonical fast-open storage disappeared before the protected freshness probe"
+                .to_string(),
+        });
+    };
     if auto_import_probe(
         &storage_result.storage,
         &paths.beads_dir,
@@ -1629,7 +1646,6 @@ const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
         | Commands::Stale(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
-        | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
         | Commands::Comments(beads_rust::cli::CommentsArgs {
             command: None | Some(beads_rust::cli::CommentCommands::List(_)),
             ..
@@ -2689,7 +2705,10 @@ mod tests {
         assert!(build_cli_overrides(&graph).read_only_fast_open);
 
         let orphans = Cli::parse_from(["br", "orphans"]);
-        assert!(build_cli_overrides(&orphans).read_only_fast_open);
+        assert!(
+            !build_cli_overrides(&orphans).read_only_fast_open,
+            "bare orphans owns a command-local auto-import and cannot receive preopened fast storage"
+        );
 
         let epic_status = Cli::parse_from(["br", "epic", "status"]);
         assert!(build_cli_overrides(&epic_status).read_only_fast_open);
@@ -2997,8 +3016,9 @@ mod tests {
         drop(bootstrap);
 
         let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
-        let fast_storage =
-            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage");
+        let mut fast_storage = Some(
+            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"),
+        );
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 &beads_dir,
@@ -3008,9 +3028,10 @@ mod tests {
             .expect("database authority"),
         );
         assert!(matches!(
-            reprobe_fast_open_auto_import_under_authority(
-                &fast_storage,
+            reopen_and_reprobe_fast_open_auto_import_under_authority(
+                &mut fast_storage,
                 &paths,
+                &fast_overrides,
                 &authority,
                 false,
             )
@@ -3020,9 +3041,10 @@ mod tests {
 
         fs::write(&paths.jsonl_path, b"{\"id\":\"br-new\"}\n").expect("write newer JSONL");
         assert!(matches!(
-            reprobe_fast_open_auto_import_under_authority(
-                &fast_storage,
+            reopen_and_reprobe_fast_open_auto_import_under_authority(
+                &mut fast_storage,
                 &paths,
+                &fast_overrides,
                 &authority,
                 false,
             )
@@ -3041,8 +3063,9 @@ mod tests {
             .expect("plant pending receipt");
         drop(writable);
 
-        let fast_storage =
-            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage");
+        let mut fast_storage = Some(
+            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"),
+        );
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(
                 &beads_dir,
@@ -3052,15 +3075,118 @@ mod tests {
             .expect("database authority"),
         );
         assert!(matches!(
-            reprobe_fast_open_auto_import_under_authority(
-                &fast_storage,
+            reopen_and_reprobe_fast_open_auto_import_under_authority(
+                &mut fast_storage,
                 &paths,
+                &fast_overrides,
                 &authority,
                 false,
             )
             .expect("pending reprobe"),
             FastOpenAutoImportReprobe::Pending(_)
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fast_open_import_reprobe_reopens_the_canonical_database_inode() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let mut bootstrap =
+            config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+                .expect("bootstrap storage");
+        bootstrap
+            .storage
+            .set_metadata("fast_open_inode_marker", "old")
+            .expect("mark original database");
+        let paths = bootstrap.paths.clone();
+        drop(bootstrap);
+
+        let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
+        let mut fast_storage = Some(
+            config::open_storage_with_cli(&beads_dir, &fast_overrides)
+                .expect("open original database read-only"),
+        );
+
+        let displaced_path = beads_dir.join("beads.displaced.db");
+        fs::rename(&paths.db_path, &displaced_path).expect("displace original database");
+        let mut replacement = beads_rust::storage::SqliteStorage::open(&paths.db_path)
+            .expect("create canonical replacement");
+        replacement
+            .set_metadata("fast_open_inode_marker", "replacement")
+            .expect("mark replacement database");
+        drop(replacement);
+
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(1_000),
+            )
+            .expect("database authority"),
+        );
+        assert!(matches!(
+            reopen_and_reprobe_fast_open_auto_import_under_authority(
+                &mut fast_storage,
+                &paths,
+                &fast_overrides,
+                &authority,
+                false,
+            )
+            .expect("canonical reprobe"),
+            FastOpenAutoImportReprobe::Current
+        ));
+        assert_eq!(
+            fast_storage
+                .as_ref()
+                .expect("canonical storage retained")
+                .storage
+                .get_metadata("fast_open_inode_marker")
+                .expect("read canonical marker")
+                .as_deref(),
+            Some("replacement"),
+            "the protected reprobe must replace the pre-lock orphaned handle"
+        );
+    }
+
+    #[test]
+    fn fast_open_import_reprobe_propagates_jsonl_probe_errors() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let bootstrap = config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+            .expect("bootstrap storage");
+        let paths = bootstrap.paths.clone();
+        drop(bootstrap);
+        fs::create_dir(&paths.jsonl_path).expect("plant non-regular JSONL path");
+
+        let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
+        let mut fast_storage = Some(
+            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"),
+        );
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(1_000),
+            )
+            .expect("database authority"),
+        );
+
+        let result = reopen_and_reprobe_fast_open_auto_import_under_authority(
+            &mut fast_storage,
+            &paths,
+            &fast_overrides,
+            &authority,
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "a non-regular JSONL path must remain an error after authority acquisition"
+        );
     }
 
     #[test]

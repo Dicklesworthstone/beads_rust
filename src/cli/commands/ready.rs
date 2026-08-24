@@ -1,7 +1,7 @@
 //! Ready command implementation.
 //!
-//! Shows issues ready to work on next: open, unblocked, not deferred, not pinned,
-//! not ephemeral.
+//! Shows issues ready to work on next: in the configured ready status group,
+//! unblocked, not time-deferred, not pinned, and not ephemeral.
 
 use super::{auto_import_external_projects_if_stale, resolve_issue_id};
 use crate::cli::{
@@ -222,7 +222,7 @@ fn execute_inner(
             };
             let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
             if ready_issues.is_empty() {
-                println!("{}", empty_ready_message(storage)?);
+                println!("{}", empty_ready_message(storage, &filters)?);
             } else if matches!(ctx.mode(), OutputMode::Rich) {
                 let columns = IssueTableColumns {
                     id: true,
@@ -293,13 +293,36 @@ fn hydrate_ready_labels(storage: &SqliteStorage, issues: &mut [crate::model::Iss
     Ok(())
 }
 
-fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
+fn empty_ready_message(
+    storage: &SqliteStorage,
+    filters: &ReadyFilters,
+) -> Result<&'static str> {
+    if ready_filters_are_restrictive(filters) {
+        return Ok("✨ No ready issues match the requested filters or configured ready status group");
+    }
     let has_non_closed_issues = storage.has_active_issues()?;
     Ok(if has_non_closed_issues {
         "✨ No ready issues — all remaining work is blocked, deferred, or in progress"
     } else {
         "✨ All work complete — no issues to work on"
     })
+}
+
+fn ready_filters_are_restrictive(filters: &ReadyFilters) -> bool {
+    let default_ready_group = filters.ready_statuses.is_empty()
+        || (filters.ready_statuses.len() == 1
+            && filters.ready_statuses[0].eq_ignore_ascii_case("open"));
+    filters.assignee.is_some()
+        || filters.unassigned
+        || !filters.labels_and.is_empty()
+        || !filters.labels_or.is_empty()
+        || filters.types.as_ref().is_some_and(|types| !types.is_empty())
+        || filters
+            .priorities
+            .as_ref()
+            .is_some_and(|priorities| !priorities.is_empty())
+        || filters.parent.is_some()
+        || !default_ready_group
 }
 
 fn get_ready_issues_for_output(
@@ -412,6 +435,23 @@ mod tests {
         assert_eq!(p[1].0, 1);
         assert_eq!(p[2].0, 2);
         info!("test_parse_priorities: assertions passed");
+    }
+
+    #[test]
+    fn restrictive_ready_filter_detection_distinguishes_the_default_queue() {
+        assert!(!ready_filters_are_restrictive(&ReadyFilters::default()));
+        assert!(!ready_filters_are_restrictive(&ReadyFilters {
+            ready_statuses: vec!["OPEN".to_string()],
+            ..ReadyFilters::default()
+        }));
+        assert!(ready_filters_are_restrictive(&ReadyFilters {
+            assignee: Some("nobody".to_string()),
+            ..ReadyFilters::default()
+        }));
+        assert!(ready_filters_are_restrictive(&ReadyFilters {
+            ready_statuses: vec!["rework".to_string()],
+            ..ReadyFilters::default()
+        }));
     }
 
     #[test]

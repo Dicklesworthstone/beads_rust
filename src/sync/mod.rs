@@ -262,6 +262,53 @@ fn blocking_database_file_lock_with_timeout(
     )
 }
 
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+    match renameat_with(CWD, candidate, CWD, target, RenameFlags::NOREPLACE) {
+        Ok(()) => crate::util::sync_parent_directory(target).map_err(BeadsError::Io),
+        Err(error) if error == rustix::io::Errno::EXIST => Err(BeadsError::SyncConflict {
+            message:
+                "Database appeared before the atomic no-replace installation; refusing to overwrite it"
+                    .to_string(),
+        }),
+        Err(error) if flagged_rename_unsupported(error) => Err(BeadsError::Config(format!(
+            "Filesystem does not support the atomic no-replace operation required to install a fresh database: {}",
+            std::io::Error::from(error)
+        ))),
+        Err(error) => Err(BeadsError::Io(std::io::Error::from(error))),
+    }
+}
+
+#[cfg(windows)]
+fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Result<()> {
+    match db_inode_lock::rename_database_candidate_no_replace(candidate, target) {
+        Ok(()) => crate::util::sync_parent_directory(target).map_err(BeadsError::Io),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(BeadsError::SyncConflict {
+                message:
+                    "Database appeared before the atomic no-replace installation; refusing to overwrite it"
+                        .to_string(),
+            })
+        }
+        Err(error) => Err(BeadsError::Io(error)),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    windows
+)))]
+fn install_database_candidate_no_replace(_candidate: &Path, _target: &Path) -> Result<()> {
+    Err(BeadsError::Config(
+        "This platform does not provide the atomic no-replace primitive required to install a fresh database"
+            .to_string(),
+    ))
+}
+
 #[derive(Debug)]
 struct DatabaseInodeAuthority {
     lock: Option<File>,
@@ -522,7 +569,11 @@ impl DatabaseFamilyWriteLock {
                 message: "Authorized database replacement did not leave a regular file".to_string(),
             });
         }
-        let current_identity = additive_metadata_identity(&current_metadata);
+        let current_identity = authority_path_identity(
+            &self.canonical_database_path,
+            "replaced database authority",
+            &database_path_descriptor(&self.canonical_database_path),
+        )?;
         if database_authority.identity == Some(current_identity) {
             let database_lock =
                 database_authority
@@ -547,19 +598,12 @@ impl DatabaseFamilyWriteLock {
             Some(self.remaining_lock_timeout_ms()),
             false,
         )?;
-        verify_locked_file_identity(
+        let replacement_identity = verify_locked_file_identity(
             &replacement_lock,
             &self.canonical_database_path,
             "replacement database write authority",
             true,
         )?;
-        let replacement_identity =
-            additive_metadata_identity(&replacement_lock.metadata().map_err(|error| {
-                BeadsError::Config(format!(
-                    "Could not witness replacement database authority {}: {error}",
-                    database_path_descriptor(&self.canonical_database_path)
-                ))
-            })?);
         if let Some(previous_lock) = database_authority.lock.replace(replacement_lock) {
             database_authority.retired_locks.push(previous_lock);
         }
@@ -584,11 +628,21 @@ impl DatabaseFamilyWriteLock {
                 .map_err(|_| BeadsError::SyncConflict {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
-        if fs::symlink_metadata(&self.canonical_database_path).is_ok() {
-            return Err(BeadsError::SyncConflict {
-                message: "Refusing to install an empty database replacement over an existing path"
-                    .to_string(),
-            });
+        match fs::symlink_metadata(&self.canonical_database_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(BeadsError::SyncConflict {
+                    message:
+                        "Refusing to install an empty database replacement over an existing path"
+                            .to_string(),
+                });
+            }
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "Could not inspect fresh database installation target {}: {error}",
+                    database_path_descriptor(&self.canonical_database_path)
+                )));
+            }
         }
 
         let parent = self.canonical_database_path.parent().ok_or_else(|| {
@@ -639,13 +693,25 @@ impl DatabaseFamilyWriteLock {
                 }
             }
             candidate_file.sync_all()?;
-            if fs::symlink_metadata(&self.canonical_database_path).is_ok() {
-                return Err(BeadsError::SyncConflict {
-                    message: "Database appeared before the locked replacement was installed"
-                        .to_string(),
-                });
+            match fs::symlink_metadata(&self.canonical_database_path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    return Err(BeadsError::SyncConflict {
+                        message: "Database appeared before the locked replacement was installed"
+                            .to_string(),
+                    });
+                }
+                Err(error) => {
+                    return Err(BeadsError::Config(format!(
+                        "Could not re-inspect fresh database installation target {}: {error}",
+                        database_path_descriptor(&self.canonical_database_path)
+                    )));
+                }
             }
-            crate::util::durable_rename(&candidate, &self.canonical_database_path)?;
+            install_database_candidate_no_replace(
+                &candidate,
+                &self.canonical_database_path,
+            )?;
             installed = Some(candidate_file);
             break;
         }
@@ -654,18 +720,12 @@ impl DatabaseFamilyWriteLock {
                 "Could not allocate a unique locked database replacement candidate".to_string(),
             )
         })?;
-        verify_locked_file_identity(
+        let replacement_identity = verify_locked_file_identity(
             &replacement_lock,
             &self.canonical_database_path,
             "installed database replacement authority",
             true,
         )?;
-        let replacement_identity =
-            additive_metadata_identity(&replacement_lock.metadata().map_err(|error| {
-                BeadsError::Config(format!(
-                    "Could not witness installed database replacement: {error}"
-                ))
-            })?);
         if let Some(previous_lock) = database_authority.lock.replace(replacement_lock) {
             database_authority.retired_locks.push(previous_lock);
         }
@@ -705,20 +765,12 @@ impl DatabaseFamilyWriteLock {
                     message: "Fresh database replacement witness has no held inode authority"
                         .to_string(),
                 })?;
-        verify_locked_file_identity(
+        let current_identity = verify_locked_file_identity(
             database_lock,
             &self.canonical_database_path,
             "fresh database replacement authority",
             true,
         )?;
-        let current_identity = additive_metadata_identity(
-            &fs::metadata(&self.canonical_database_path).map_err(|error| {
-                BeadsError::Config(format!(
-                    "Could not re-witness fresh database replacement {}: {error}",
-                    database_path_descriptor(&self.canonical_database_path)
-                ))
-            })?,
-        );
         if database_authority.identity != Some(current_identity)
             || current_identity != witness.installed_identity
         {
@@ -749,8 +801,11 @@ impl DatabaseFamilyWriteLock {
     /// rolled back into place.
     pub(crate) fn restore_retained_database_inode_after_authorized_replace(&self) -> Result<()> {
         self.verify_common_authority()?;
-        let target_metadata = fs::metadata(&self.canonical_database_path)?;
-        let target_identity = additive_metadata_identity(&target_metadata);
+        let target_identity = authority_path_identity(
+            &self.canonical_database_path,
+            "restored database write authority",
+            &database_path_descriptor(&self.canonical_database_path),
+        )?;
         let mut database_authority =
             self.database_authority
                 .lock()
@@ -777,14 +832,20 @@ impl DatabaseFamilyWriteLock {
             return Ok(());
         }
 
-        let retained_index = database_authority
-            .retired_locks
-            .iter()
-            .position(|lock| {
-                lock.metadata()
-                    .is_ok_and(|metadata| additive_metadata_identity(&metadata) == target_identity)
-            })
-            .ok_or_else(|| BeadsError::SyncConflict {
+        let mut retained_index = None;
+        for (index, lock) in database_authority.retired_locks.iter().enumerate() {
+            let identity = authority_file_identity(
+                lock,
+                &self.canonical_database_path,
+                "retained database write authority",
+                &database_path_descriptor(&self.canonical_database_path),
+            )?;
+            if identity == target_identity {
+                retained_index = Some(index);
+                break;
+            }
+        }
+        let retained_index = retained_index.ok_or_else(|| BeadsError::SyncConflict {
                 message: "Restored database inode was not retained under lock".to_string(),
             })?;
         let restored_lock = database_authority.retired_locks.swap_remove(retained_index);
@@ -823,18 +884,12 @@ impl DatabaseFamilyWriteLock {
     /// hard-link aliases never observe the new inode without its authority.
     pub(crate) fn adopt_locked_database_replacement(&self, replacement_lock: File) -> Result<()> {
         self.verify_common_authority()?;
-        verify_locked_file_identity(
+        let replacement_identity = verify_locked_file_identity(
             &replacement_lock,
             &self.canonical_database_path,
             "installed database replacement authority",
             true,
         )?;
-        let replacement_identity =
-            additive_metadata_identity(&replacement_lock.metadata().map_err(|error| {
-                BeadsError::Config(format!(
-                    "Could not witness installed database replacement: {error}"
-                ))
-            })?);
         let mut database_authority =
             self.database_authority
                 .lock()
@@ -889,20 +944,12 @@ impl DatabaseFamilyWriteLock {
                     message: "Database inode authority state was poisoned".to_string(),
                 })?;
         if let Some(database_lock) = database_authority.lock.as_ref() {
-            verify_locked_file_identity(
+            let current_identity = verify_locked_file_identity(
                 database_lock,
                 &self.canonical_database_path,
                 "database write authority",
                 true,
             )?;
-            let current_identity = additive_metadata_identity(
-                &fs::metadata(&self.canonical_database_path).map_err(|error| {
-                    BeadsError::Config(format!(
-                        "Could not re-witness canonical database authority {}: {error}",
-                        database_path_descriptor(&self.canonical_database_path)
-                    ))
-                })?,
-            );
             if database_authority.identity != Some(current_identity) {
                 return Err(BeadsError::SyncConflict {
                     message: "Database inode changed while its write authority was held"
@@ -1189,13 +1236,12 @@ pub fn blocking_database_family_write_lock_with_timeout(
                 Some(remaining_timeout_ms()),
                 false,
             )?;
-            let identity =
-                additive_metadata_identity(&database_lock.metadata().map_err(|error| {
-                    BeadsError::Config(format!(
-                        "Could not witness canonical database authority {}: {error}",
-                        database_path_descriptor(&canonical_database_path)
-                    ))
-                })?);
+            let identity = authority_file_identity(
+                &database_lock,
+                &canonical_database_path,
+                "database write authority",
+                &database_path_descriptor(&canonical_database_path),
+            )?;
             (Some(database_lock), Some(identity))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
@@ -1214,19 +1260,13 @@ pub fn blocking_database_family_write_lock_with_timeout(
     }
     match (&database_lock, database_identity) {
         (Some(database_lock), Some(identity)) => {
-            verify_locked_file_identity(
+            let observed_identity = verify_locked_file_identity(
                 database_lock,
                 &canonical_after,
                 "database write authority",
                 true,
             )?;
-            if additive_metadata_identity(&fs::metadata(&canonical_after).map_err(|error| {
-                BeadsError::Config(format!(
-                    "Could not re-witness canonical database authority {}: {error}",
-                    database_path_descriptor(&canonical_after)
-                ))
-            })?) != identity
-            {
+            if observed_identity != identity {
                 return Err(BeadsError::SyncConflict {
                     message: "Database inode changed while acquiring its write authority"
                         .to_string(),
@@ -1396,12 +1436,92 @@ fn open_and_lock_regular_file(
     }
 }
 
+fn authority_file_identity(
+    file: &File,
+    authority_path: &Path,
+    role: &str,
+    path_display: &str,
+) -> Result<(u64, u64)> {
+    let metadata = file.metadata().map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to witness locked {role} at {path_display}: {error}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(BeadsError::Config(format!(
+            "Locked {role} at {path_display} is not a regular file"
+        )));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        let identity = path::windows_jsonl_file_identity(file, authority_path)?;
+        Ok((identity.device_id(), identity.inode()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = authority_path;
+        Err(BeadsError::Config(format!(
+            "Stable file-handle identity for {role} at {path_display} is unavailable on this platform"
+        )))
+    }
+}
+
+fn authority_path_identity(
+    authority_path: &Path,
+    role: &str,
+    path_display: &str,
+) -> Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(authority_path).map_err(|error| {
+            BeadsError::Config(format!(
+                "Failed to re-witness locked {role} at {path_display}: {error}"
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(BeadsError::Config(format!(
+                "Locked {role} path at {path_display} changed to a symlink or special file"
+            )));
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        let pinned = pin_jsonl_target(authority_path)?;
+        let opened = pinned
+            .open_optional_regular_for_authority_identity()?
+            .ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "Locked {role} path disappeared at {path_display}"
+                ))
+            })?;
+        let identity = opened.identity();
+        Ok((identity.device_id(), identity.inode()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = authority_path;
+        Err(BeadsError::Config(format!(
+            "Stable routed identity for {role} at {path_display} is unavailable on this platform"
+        )))
+    }
+}
+
 fn verify_locked_file_identity(
     file: &File,
     lock_path: &Path,
     role: &str,
     redact_path: bool,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let lock_path_display = if redact_path {
         if role.starts_with("JSONL-") {
             additive_path_descriptor(lock_path, "jsonl-authority")
@@ -1411,28 +1531,15 @@ fn verify_locked_file_identity(
     } else {
         lock_path.display().to_string()
     };
-    let opened = file.metadata().map_err(|error| {
-        BeadsError::Config(format!(
-            "Failed to witness locked {role} at {}: {error}",
-            lock_path_display
-        ))
-    })?;
-    let current = fs::symlink_metadata(lock_path).map_err(|error| {
-        BeadsError::Config(format!(
-            "Failed to re-witness locked {role} at {}: {error}",
-            lock_path_display
-        ))
-    })?;
-    if current.file_type().is_symlink()
-        || !current.is_file()
-        || additive_metadata_identity(&opened) != additive_metadata_identity(&current)
-    {
+    let opened = authority_file_identity(file, lock_path, role, &lock_path_display)?;
+    let current = authority_path_identity(lock_path, role, &lock_path_display)?;
+    if opened != current {
         return Err(BeadsError::Config(format!(
             "{role} identity changed before lock authority was established at {}",
             lock_path_display
         )));
     }
-    Ok(())
+    Ok(opened)
 }
 
 fn write_lock_timeout_error(lock_path_display: &str, role: &str, timeout_ms: u64) -> BeadsError {

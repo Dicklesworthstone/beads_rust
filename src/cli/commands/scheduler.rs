@@ -426,7 +426,11 @@ fn score_candidate(
 
     let issue_id = issue.id.clone();
     let issue_title = issue.title.clone();
-    let ready_issue = ReadyIssue::from(issue);
+    let mut ready_issue = ReadyIssue::from(issue);
+    // The command projection deliberately omits relation tables. Reuse the
+    // labels already loaded for scoring so the issue payload and contention
+    // evidence describe the same candidate without another query.
+    ready_issue.labels.clone_from(&labels);
     let evidence = SchedulerEvidence {
         priority: PriorityEvidence {
             value: ready_issue.priority.0,

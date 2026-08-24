@@ -8,7 +8,7 @@ mod common;
 
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env};
 use serde_json::{Value, json};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::time::{Duration, Instant};
 
 const DISABLE_FAST_OPEN_ENV: (&str, &str) = ("BR_DISABLE_READ_ONLY_FAST_OPEN", "1");
@@ -220,7 +220,15 @@ fn status_and_report_commands() -> Vec<MatrixCommand> {
             "graph_all_compact",
             strings(["graph", "--all", "--compact"]),
         ),
-        exact_command("orphans_robot", strings(["orphans", "--robot"])),
+        exact_command(
+            "orphans_robot_explicit_stale_opt_out",
+            strings([
+                "--no-auto-import",
+                "--no-auto-flush",
+                "orphans",
+                "--robot",
+            ]),
+        ),
     ]
 }
 
@@ -418,6 +426,30 @@ fn cli_read_only_fast_open_matrix_bypasses_held_write_lock() {
     assert!(
         combined.contains("lock") || combined.contains("timed out"),
         "conservative failure should mention lock contention, got: {combined}"
+    );
+}
+
+#[test]
+fn cli_read_only_fast_open_fails_when_the_authoritative_jsonl_probe_fails() {
+    let _log =
+        common::test_log("cli_read_only_fast_open_fails_when_the_authoritative_jsonl_probe_fails");
+    let seed = seed_workspace();
+    let jsonl_path = seed.workspace.root.join(".beads/issues.jsonl");
+    let preserved_jsonl_path = seed.workspace.root.join(".beads/issues.preserved.jsonl");
+    fs::rename(&jsonl_path, &preserved_jsonl_path).expect("preserve regular JSONL fixture");
+    fs::create_dir(&jsonl_path).expect("plant a non-regular JSONL path");
+
+    let run = run_br(&seed.workspace, ["list", "--json"], "fast_probe_error");
+    assert!(
+        !run.status.success(),
+        "an authoritative JSONL probe error must fail instead of serving stale DB state\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    let combined = format!("{} {}", run.stdout, run.stderr).to_ascii_lowercase();
+    assert!(
+        combined.contains("jsonl") || combined.contains("sync path"),
+        "probe failure should identify the rejected JSONL path: {combined}"
     );
 }
 

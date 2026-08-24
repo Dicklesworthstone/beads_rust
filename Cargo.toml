@@ -153,6 +153,7 @@ cap-primitives = "=4.0.3"
 # threads aborts with 0xC0000409, corrupting the exit code.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
 
