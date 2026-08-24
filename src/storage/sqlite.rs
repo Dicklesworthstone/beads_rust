@@ -10,7 +10,8 @@ use crate::model::{
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
+    apply_runtime_compatible_schema, apply_schema, attest_runtime_schema_cookie, execute_batch,
+    record_runtime_schema_witness, runtime_schema_compatible, runtime_schema_witness_matches,
     table_exists,
 };
 use crate::sync::{
@@ -2336,16 +2337,26 @@ impl SqliteStorage {
         let schema_current = connection_user_version(&conn)
             .or_else(|| database_header_user_version(path))
             .is_some_and(|version| version >= u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0));
+        let schema_cookie_before = crate::storage::schema::runtime_schema_cookie(&conn)?;
         let runtime_compatible = runtime_schema_compatible(&conn);
+        let schema_cookie_after = crate::storage::schema::runtime_schema_cookie(&conn)?;
 
-        if schema_current && runtime_compatible {
+        let attested_cookie = if schema_current && runtime_compatible {
             crate::storage::schema::apply_runtime_pragmas(&conn)?;
+            if schema_cookie_before == schema_cookie_after {
+                schema_cookie_after
+            } else {
+                attest_runtime_schema_cookie(&conn)?
+            }
         } else if runtime_compatible {
             apply_runtime_compatible_schema(&conn)?;
+            attest_runtime_schema_cookie(&conn)?
         } else {
             apply_schema(&conn)?;
-        }
+            attest_runtime_schema_cookie(&conn)?
+        };
         Self::ensure_known_metadata_defaults(&conn)?;
+        record_runtime_schema_witness(&conn, attested_cookie)?;
         Ok(Self {
             conn,
             write_authority: None,
@@ -2402,10 +2413,12 @@ impl SqliteStorage {
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
         // A current version stamp is not a complete runtime witness: reviewed
         // migrations and interrupted/manual repairs can leave any required
-        // table, column, or index absent without changing that stamp. Use the
-        // same authoritative compatibility contract as ordinary open so a
-        // fast read never bypasses the existing schema healer.
-        runtime_schema_compatible(&self.conn)
+        // table, column, or index absent without changing that stamp. Ordinary
+        // open records SQLite's schema cookie only after the complete runtime
+        // contract passes. A changed cookie forces the authoritative full
+        // check; databases created before this witness also take that safe
+        // fallback until an ordinary open records one.
+        runtime_schema_witness_matches(&self.conn) || runtime_schema_compatible(&self.conn)
     }
 
     /// Open an existing current-schema database for a token-bound recovery write.
@@ -2557,6 +2570,8 @@ impl SqliteStorage {
         // mid-session: the connection is already open with correct pragmas and we only
         // need to restore the DDL without re-running heavier first-open migrations.
         apply_runtime_compatible_schema(&self.conn)?;
+        let attested_cookie = attest_runtime_schema_cookie(&self.conn)?;
+        record_runtime_schema_witness(&self.conn, attested_cookie)?;
         Ok(())
     }
 
@@ -32093,6 +32108,16 @@ mod tests {
 
         // Reset data tables
         storage.reset_data_tables().unwrap();
+
+        assert!(
+            storage.fast_open_runtime_schema_is_compatible(),
+            "reset must attest the recreated schema for subsequent fast opens"
+        );
+        assert_eq!(
+            storage.detect_recoverable_open_anomaly().unwrap(),
+            None,
+            "reset must not duplicate the persisted runtime schema witness"
+        );
 
         // Config and metadata should be preserved
         assert_eq!(

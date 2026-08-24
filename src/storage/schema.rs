@@ -9,6 +9,24 @@ use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
 pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
+
+const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    hash
+}
+
+// Conservatively invalidate persisted fast-open witnesses whenever this schema
+// module changes. Deriving the token from the implementation itself prevents a
+// new runtime compatibility predicate from accidentally trusting witnesses
+// minted by an older predicate because somebody forgot a manual revision bump.
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: u64 = fnv1a_64(include_bytes!("schema.rs"));
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -1806,6 +1824,98 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     }
 
     compatible
+}
+
+pub(crate) fn runtime_schema_cookie(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA schema_version")?
+        .get(0)
+        .and_then(SqliteValue::as_integer)
+        .ok_or_else(|| BeadsError::internal("PRAGMA schema_version returned no integer value"))
+}
+
+/// Validate the complete runtime schema against one stable SQLite schema
+/// generation and return that exact generation for later witness recording.
+/// A caller must never re-read the cookie when persisting the witness: DDL may
+/// commit after this fence, in which case the older recorded cookie safely
+/// fails to match on the next fast open.
+pub(crate) fn attest_runtime_schema_cookie(conn: &Connection) -> Result<i64> {
+    let before = runtime_schema_cookie(conn)?;
+    if !runtime_schema_compatible(conn) {
+        return Err(BeadsError::Config(
+            "runtime schema remains incompatible after repair".to_string(),
+        ));
+    }
+    let after = runtime_schema_cookie(conn)?;
+    if before != after {
+        return Err(BeadsError::Config(format!(
+            "runtime schema changed while compatibility was being attested ({before} -> {after})"
+        )));
+    }
+    Ok(after)
+}
+
+fn runtime_schema_witness_value(cookie: i64) -> String {
+    format!(
+        "schema-{CURRENT_SCHEMA_VERSION}.contract-{RUNTIME_SCHEMA_CONTRACT_TOKEN:016x}.cookie-{cookie}"
+    )
+}
+
+/// Return whether the database still has the exact SQLite schema cookie that
+/// was recorded after the authoritative runtime contract last passed.
+///
+/// This is the steady-state fast-open witness. Any DDL (including a dropped
+/// table, column, or required index) changes SQLite's schema cookie and forces
+/// the caller back through the full compatibility checker and healer.
+pub(crate) fn runtime_schema_witness_matches(conn: &Connection) -> bool {
+    let Ok(cookie) = runtime_schema_cookie(conn) else {
+        return false;
+    };
+    let expected = runtime_schema_witness_value(cookie);
+    conn.query_row_with_params(
+        "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+        &[SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY)],
+    )
+    .ok()
+    .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+    .is_some_and(|value| value == expected)
+}
+
+/// Record an exact schema cookie that was already attested against the complete
+/// runtime contract. This deliberately does not re-read the current cookie.
+pub(crate) fn record_runtime_schema_witness(conn: &Connection, attested_cookie: i64) -> Result<()> {
+    let value = runtime_schema_witness_value(attested_cookie);
+    let existing = conn.query_with_params(
+        "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+        &[SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY)],
+    )?;
+    if existing
+        .first()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_text))
+        == Some(value.as_str())
+    {
+        return Ok(());
+    }
+
+    conn.execute_with_params(
+        "UPDATE metadata SET value = ? WHERE key = ?",
+        &[
+            SqliteValue::from(value.as_str()),
+            SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY),
+        ],
+    )?;
+    conn.execute_with_params(
+        "INSERT INTO metadata (key, value)
+         SELECT ?, ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM metadata WHERE key = ? LIMIT 1
+         )",
+        &[
+            SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY),
+            SqliteValue::from(value),
+            SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Run schema migrations for existing databases.
@@ -4534,6 +4644,59 @@ mod tests {
         assert!(
             !runtime_schema_compatible(&conn),
             "legacy config/metadata primary keys should force the full repair path"
+        );
+    }
+
+    #[test]
+    fn test_runtime_schema_witness_invalidates_on_ddl_and_recovers_after_repair() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("runtime_schema_witness.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        assert!(runtime_schema_compatible(&conn));
+        assert!(
+            !runtime_schema_witness_matches(&conn),
+            "a database without a recorded witness must use the full compatibility check"
+        );
+
+        let attested_cookie =
+            attest_runtime_schema_cookie(&conn).expect("attest initial runtime schema");
+        record_runtime_schema_witness(&conn, attested_cookie).expect("record witness");
+        assert!(runtime_schema_witness_matches(&conn));
+
+        conn.execute("DROP TABLE labels").expect("damage schema");
+        record_runtime_schema_witness(&conn, attested_cookie)
+            .expect("record only the previously attested generation");
+        assert!(
+            !runtime_schema_witness_matches(&conn),
+            "DDL between attestation and recording must not become trusted"
+        );
+        assert!(!runtime_schema_compatible(&conn));
+
+        apply_schema(&conn).expect("repair schema");
+        assert!(runtime_schema_compatible(&conn));
+        assert!(
+            !runtime_schema_witness_matches(&conn),
+            "repair DDL must remain untrusted until the full contract is recorded"
+        );
+
+        let repaired_cookie =
+            attest_runtime_schema_cookie(&conn).expect("attest repaired runtime schema");
+        record_runtime_schema_witness(&conn, repaired_cookie).expect("record repaired witness");
+        assert!(runtime_schema_witness_matches(&conn));
+        let witness_count = conn
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM metadata WHERE key = ?",
+                &[SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY)],
+            )
+            .expect("count witness rows")
+            .get(0)
+            .and_then(SqliteValue::as_integer);
+        assert_eq!(
+            witness_count,
+            Some(1),
+            "re-recording after DDL must not create a duplicate metadata key"
         );
     }
 

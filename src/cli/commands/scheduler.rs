@@ -404,6 +404,7 @@ fn score_candidate(
         inputs.stale_threshold_minutes,
     );
 
+    let is_unassigned = scheduler_issue_is_unassigned(&issue);
     let priority_contribution =
         i64::from(4_i32.saturating_sub(issue.priority.0.clamp(0, 4))) * PRIORITY_WEIGHT;
     let dependency_contribution = usize_to_i64(dependent_count)
@@ -411,10 +412,12 @@ fn score_candidate(
         .min(MAX_DEPENDENT_CONTRIBUTION);
     let is_stale = stale_claim.is_stale;
     let stale_contribution = if is_stale { 4 } else { 0 };
-    let (fairness_contribution, fairness_reason) = match issue.assignee.as_deref() {
-        None | Some("") => (3, "unassigned work is easiest to allocate fairly"),
-        Some(_) if is_stale => (1, "assigned work appears stale enough to revisit"),
-        Some(_) => (-2, "freshly assigned work should not attract new agents"),
+    let (fairness_contribution, fairness_reason) = if is_unassigned {
+        (3, "unassigned work is easiest to allocate fairly")
+    } else if is_stale {
+        (1, "assigned work appears stale enough to revisit")
+    } else {
+        (-2, "freshly assigned work should not attract new agents")
     };
     let domain_contribution = (6_i64 / usize_to_i64(domain_count).max(1)).max(1);
 
@@ -446,7 +449,7 @@ fn score_candidate(
             ..stale_claim
         },
         fairness: FairnessEvidence {
-            unassigned: ready_issue.assignee.is_none(),
+            unassigned: is_unassigned,
             contribution: fairness_contribution,
             reason: fairness_reason,
         },
@@ -483,6 +486,10 @@ fn score_candidate(
         evidence,
         rationale,
     }
+}
+
+fn scheduler_issue_is_unassigned(issue: &crate::model::Issue) -> bool {
+    issue.assignee.as_deref().is_none_or(str::is_empty)
 }
 
 fn count_candidate_domains(
@@ -646,8 +653,8 @@ fn print_scheduler_text(output: &SchedulerOutput) {
 #[cfg(test)]
 mod tests {
     use super::{
-        primary_domain, project_scheduler_relation_metadata, should_refill_scheduler_candidates,
-        stale_threshold_minutes, usize_to_i64,
+        primary_domain, project_scheduler_relation_metadata, scheduler_issue_is_unassigned,
+        should_refill_scheduler_candidates, stale_threshold_minutes, usize_to_i64,
     };
     use crate::model::{Issue, IssueType};
     use crate::storage::sqlite::ListRelationMetadata;
@@ -679,6 +686,18 @@ mod tests {
     #[test]
     fn usize_to_i64_saturates_on_overflow() {
         assert_eq!(usize_to_i64(42), 42);
+    }
+
+    #[test]
+    fn scheduler_unassigned_evidence_matches_empty_and_absent_assignees() {
+        let mut issue = Issue::default();
+        assert!(scheduler_issue_is_unassigned(&issue));
+
+        issue.assignee = Some(String::new());
+        assert!(scheduler_issue_is_unassigned(&issue));
+
+        issue.assignee = Some("agent-a".to_string());
+        assert!(!scheduler_issue_is_unassigned(&issue));
     }
 
     #[test]

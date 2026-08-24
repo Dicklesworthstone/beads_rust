@@ -8724,6 +8724,11 @@ routing:
             opened.storage.fast_open_runtime_schema_is_compatible(),
             "ordinary fallback must restore all current runtime schema objects"
         );
+        assert_eq!(
+            opened.storage.detect_recoverable_open_anomaly().unwrap(),
+            None,
+            "recording the repaired schema witness must not create duplicate metadata keys"
+        );
     }
 
     #[test]

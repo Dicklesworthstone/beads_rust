@@ -507,8 +507,9 @@ fn main() {
                     .unwrap_or_else(|| {
                         handle_error(
                             &BeadsError::SyncConflict {
-                                message: "Writable fast-open reopen has no database-family authority"
-                                    .to_string(),
+                                message:
+                                    "Writable fast-open reopen has no database-family authority"
+                                        .to_string(),
                             },
                             json_error_mode,
                             color_error_mode,
@@ -3242,10 +3243,7 @@ mod tests {
             false,
         )
         .expect("protected reopen must use the frozen startup snapshot");
-        assert!(matches!(
-            reprobe,
-            FastOpenAutoImportReprobe::ImportRequired
-        ));
+        assert!(matches!(reprobe, FastOpenAutoImportReprobe::ImportRequired));
         assert!(
             fast_storage
                 .as_ref()

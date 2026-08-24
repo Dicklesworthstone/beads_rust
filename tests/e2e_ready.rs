@@ -313,8 +313,7 @@ fn ready_cli_text_explains_when_filters_hide_ready_work() {
 
 #[test]
 fn ready_cli_text_does_not_overstate_why_active_work_is_not_ready() {
-    let _log =
-        common::test_log("ready_cli_text_does_not_overstate_why_active_work_is_not_ready");
+    let _log = common::test_log("ready_cli_text_does_not_overstate_why_active_work_is_not_ready");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
