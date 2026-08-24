@@ -523,3 +523,15 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Retry-condition predicate:** Retry only when a fresh current profile attributes at least `10%` of end-to-end latency to one new application-owned hotspot. For search, pair no-match and broad-positive shapes and exclude the already-rejected priority-bucket and relation-count-fusion approaches.
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** none
+
+### 2026-08-24 — Fresh-replacement witness checked after database reads — repaired
+
+- **Hypothesis:** Verifying the fresh-replacement witness only inside the write transaction was sufficient to make the global-empty relation proof safe.
+- **Workload(s) probed:** The exact inode-replacement counterexample `sync::tests::fresh_replacement_import_rejects_inode_replacement_after_witness`, followed by all 2,754 Linux library tests on the final source bytes.
+- **Measurement summary:** Final verification first failed with `2745 passed; 1 failed; 8 ignored`: SQLite reported `unable to open database file` before the in-transaction witness check could return the intended identity error. Moving the check only to immediately before `with_write_transaction` reproduced the same failure because validation-plan metadata and collision queries had already touched the displaced connection. Moving the check to the entry of `import_from_jsonl_snapshot_impl`, while retaining the in-transaction recheck, made the isolated counterexample pass and then produced `2746 passed; 0 failed; 8 ignored` for the full Linux library suite.
+- **Outcome:** repaired; the fresh-import relation optimization was retained only after the authority check preceded every database query and remained repeated inside the transaction.
+- **Scratch worktree:** current shared tree mirrored to hash-matched RCH worker source `/data/projects/beads_rust`
+- **Profile evidence:** final verification transcript recorded on `beads_rust-7kw0`; this is correctness evidence, not a new performance measurement.
+- **Retry-condition predicate:** Do not move or remove either check. The entry check must precede all database reads, and the transactional check must remain immediately before the global-empty proof. Any future consolidation requires an executed inode-replacement race counterexample plus the full library suite.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** `c87e1b43`
