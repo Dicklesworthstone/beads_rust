@@ -439,3 +439,4 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Retry-condition predicate:** Do not retry standalone blocked preflight rewrites. The local-blocker tail is dominated by the subsequent blocked-row query; retry only with an independently profiled `get_blocked_issues_for_command_output` lever that itself clears both median and p95 gates.
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** uncommitted candidates; manually reversed by pass 37
+
