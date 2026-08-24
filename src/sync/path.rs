@@ -1625,9 +1625,7 @@ impl PinnedJsonlName {
     /// probe composes with those handles, but deliberately omit delete sharing:
     /// the opened leaf cannot be renamed or replaced until its stable file ID
     /// has been compared with the retained authority handle.
-    pub(super) fn open_optional_regular_for_authority_identity(
-        &self,
-    ) -> Result<Option<OpenedJsonlSource>> {
+    fn open_optional_regular_for_authority_identity(&self) -> Result<Option<OpenedJsonlSource>> {
         let share_mode = Self::FILE_SHARE_READ | Self::FILE_SHARE_WRITE;
         let Some(file) = self.open_relative_regular_once_with_share_mode(share_mode)? else {
             return Ok(None);
@@ -1848,7 +1846,7 @@ pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
 }
 
 #[cfg(windows)]
-pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
+fn pin_windows_name_without_leaf_open(path: &Path) -> Result<PinnedJsonlName> {
     let absolute_target = absolute_jsonl_source_path(path)?;
     let leaf = absolute_target.file_name().ok_or_else(|| {
         BeadsError::Config(format!(
@@ -1876,9 +1874,30 @@ pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
         display_path: absolute_target,
     };
     pinned.parent.verify_route()?;
-    let _ = pinned.open_optional_regular_for_authority_identity()?;
+    Ok(pinned)
+}
+
+#[cfg(windows)]
+pub(crate) fn pin_jsonl_target(path: &Path) -> Result<PinnedJsonlName> {
+    let pinned = pin_windows_name_without_leaf_open(path)?;
+    let _ = pinned.open_optional_regular()?;
     pinned.parent.verify_route()?;
     Ok(pinned)
+}
+
+/// Opens one Windows authority path through a retained no-follow parent
+/// capability and returns its exact volume/file-index identity.
+///
+/// Unlike [`pin_jsonl_target`], this probe shares writes because database and
+/// lock-sidecar handles remain writable while their authority is verified. It
+/// still denies delete sharing during both identity opens, so the named leaf
+/// cannot be replaced while its handle identity is compared.
+#[cfg(windows)]
+pub(super) fn open_regular_authority_identity(path: &Path) -> Result<Option<JsonlFileIdentity>> {
+    let pinned = pin_windows_name_without_leaf_open(path)?;
+    let opened = pinned.open_optional_regular_for_authority_identity()?;
+    pinned.parent.verify_route()?;
+    Ok(opened.map(|source| source.identity()))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3889,6 +3908,42 @@ mod tests {
                 .to_string()
                 .contains("cannot certify directory-entry durability")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_generic_jsonl_pin_rejects_an_existing_writer() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+        let temp = TempDir::new().expect("create Windows temp directory");
+        let parent = temp.path().join("parent");
+        let target = parent.join("issues.jsonl");
+        std::fs::create_dir(&parent).expect("create Windows JSONL parent");
+        std::fs::write(&target, b"{\"id\":\"br-writer\"}\n").expect("write Windows JSONL source");
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(
+                PinnedJsonlName::FILE_SHARE_READ
+                    | PinnedJsonlName::FILE_SHARE_WRITE
+                    | FILE_SHARE_DELETE,
+            )
+            .open(&target)
+            .expect("open compatible Windows writer");
+
+        let error = pin_jsonl_target(&target)
+            .expect_err("generic JSONL pin must not admit an existing writer");
+        assert!(
+            error
+                .to_string()
+                .contains("Could not open pinned Windows JSONL leaf"),
+            "unexpected writer-exclusion error: {error}"
+        );
+
+        drop(writer);
+        pin_jsonl_target(&target).expect("JSONL pin should succeed after the writer closes");
     }
 
     #[cfg(windows)]

@@ -708,10 +708,7 @@ impl DatabaseFamilyWriteLock {
                     )));
                 }
             }
-            install_database_candidate_no_replace(
-                &candidate,
-                &self.canonical_database_path,
-            )?;
+            install_database_candidate_no_replace(&candidate, &self.canonical_database_path)?;
             installed = Some(candidate_file);
             break;
         }
@@ -846,8 +843,8 @@ impl DatabaseFamilyWriteLock {
             }
         }
         let retained_index = retained_index.ok_or_else(|| BeadsError::SyncConflict {
-                message: "Restored database inode was not retained under lock".to_string(),
-            })?;
+            message: "Restored database inode was not retained under lock".to_string(),
+        })?;
         let restored_lock = database_authority.retired_locks.swap_remove(retained_index);
         verify_locked_file_identity(
             &restored_lock,
@@ -1496,15 +1493,9 @@ fn authority_path_identity(
     }
     #[cfg(windows)]
     {
-        let pinned = pin_jsonl_target(authority_path)?;
-        let opened = pinned
-            .open_optional_regular_for_authority_identity()?
-            .ok_or_else(|| {
-                BeadsError::Config(format!(
-                    "Locked {role} path disappeared at {path_display}"
-                ))
-            })?;
-        let identity = opened.identity();
+        let identity = path::open_regular_authority_identity(authority_path)?.ok_or_else(|| {
+            BeadsError::Config(format!("Locked {role} path disappeared at {path_display}"))
+        })?;
         Ok((identity.device_id(), identity.inode()))
     }
     #[cfg(not(any(unix, windows)))]
@@ -15026,7 +15017,7 @@ mod tests {
             .open(&authority_path)
             .unwrap();
         replacement
-            .set_times(std::fs::FileTimes::new().set_creation_time(held_created))
+            .set_times(std::fs::FileTimes::new().set_created(held_created))
             .unwrap();
         assert_eq!(
             replacement.metadata().unwrap().created().unwrap(),
@@ -15034,13 +15025,8 @@ mod tests {
             "the mutation must defeat the former creation-time identity witness"
         );
 
-        let error = verify_locked_file_identity(
-            &held,
-            &authority_path,
-            "test authority",
-            false,
-        )
-        .expect_err("stable handle identity must reject the distinct replacement");
+        let error = verify_locked_file_identity(&held, &authority_path, "test authority", false)
+            .expect_err("stable handle identity must reject the distinct replacement");
         assert!(error.to_string().contains("identity changed"));
     }
 

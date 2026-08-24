@@ -44,6 +44,7 @@ These are explicit design exclusions. br sync is intentionally less invasive tha
 | AW-2 | HIGH | Temp file is flushed and synced before rename | Code inspection: verify `flush()` and `sync_all()` calls |
 | AW-3 | MEDIUM | On any error during export, temp file is cleaned up | Unit test: inject error, verify no temp file remains |
 | AW-4 | CRITICAL | Partial writes never corrupt the target JSONL | Unit test: crash simulation, verify original file intact |
+| AW-5 | CRITICAL | Missing-database recovery installs a pre-locked candidate with an atomic no-replace operation, and database authority compares stable OS file IDs (Unix device/inode; Windows volume serial/file index), never timestamps | Unit tests: an existing destination remains byte-identical; a Windows replacement with equal creation time is rejected |
 
 ### 2.3 Data Loss Prevention Invariants
 
