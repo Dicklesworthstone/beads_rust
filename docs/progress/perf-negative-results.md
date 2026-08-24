@@ -391,3 +391,52 @@ Entries preserve failed experiments as reusable evidence. A retry is justified o
 - **Retry-condition predicate:** Retry only after a fresh profile identifies a broader or materially simpler startup connection-reuse lever plausibly clearing both `10%` gates without widening receipt authority, fallback behavior, or the command surface.
 - **Bead id (if applicable):** `beads_rust-7kw0`
 - **Commit (if attempted):** attempted in `1f9f43d24a050a6a2494d31f83f3e1f0759f6d32`; source hunks reversed by pass 3 pending a normal corrective commit
+
+### 2026-08-23 — Two-statement external-parent guard — superseded
+
+- **Hypothesis:** A cheap indexed external-`issue_id` prefix query could bypass the disproportionately expensive epic-parent join when a project has no external parent-child endpoints.
+- **Workload(s) probed:** The tracked 970-issue `ready --limit 0 --json` fixture with no external endpoints, plus a copied counterfixture containing an open local epic and an imported `external:fixture:child` parent-child edge.
+- **Measurement summary:** The common fixture improved by `18.2935%` at median and `18.2870%` at p95, but the endpoint-present counterfixture regressed by `2.6830%` at median and `12.8402%` at p95 because it paid both the guard and authoritative join as separate statements. Pass 6 replaced it with one lazy `CASE` statement; that retained the common-path gain while bringing the counterfixture to `+2.4257%` median and `-1.4911%` p95.
+- **Outcome:** superseded
+- **Scratch worktree:** build source `/tmp/beads_rust_perf_20260824_pass05` on `ts1`; fixtures `/tmp/beads_rust_ab_20260824_pass02` and `/tmp/beads_rust_ab_20260824_pass05_external` on `csd`
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass05-ab-forward.json`, `pass05-ab-reverse.json`, `pass05-external-forward.json`, and `pass05-external-reverse.json`
+- **Retry-condition predicate:** Do not retry the separate-query form; use the retained single-statement lazy guard unless a future engine profile proves statement setup immaterial on endpoint-present workloads.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** intermediate form in `3412d9c7`; superseded by `7303778f`
+
+### 2026-08-23 — Correlated ready-label JSON aggregate — rejected
+
+- **Hypothesis:** Folding ordered labels into a cardinality-neutral ready projection would eliminate the separate indexed label-hydration statement, which accounted for `22,543,486` instructions in the retained profile.
+- **Workload(s) probed:** Exact retained `ready --limit 0 --json` fixture on quiet `csd`, with 50 forward-order and 50 reverse-order observations per binary and byte-identical stdout.
+- **Measurement summary:** The retained binary measured median `50.106471 ms` and p95 `57.193146 ms`; the correlated `json_group_array` projection measured median `66.508351 ms` and p95 `72.219323 ms`, regressions of `32.7341%` and `26.2727%`. The bootstrap candidate/retained median-ratio interval was `1.310766..1.339892`, wholly regressive. Pass 9 manually restored the retained bytes.
+- **Outcome:** rejected
+- **Scratch worktree:** build source `/tmp/beads_rust_perf_20260824_pass08` on `ts1`; A/B fixture `/tmp/beads_rust_ab_20260824_pass02` on `csd`
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass08-ab-forward.json` and `pass08-ab-reverse.json`
+- **Retry-condition predicate:** Retry label-query fusion only if a new label-heavy representative profile attributes at least `10%` of end-to-end latency to hydration and query-plan evidence supports a cardinality-neutral set-based plan without per-ready-row correlated aggregation.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** uncommitted candidate; manually reversed by pass 9
+
+### 2026-08-24 — Materialized blocked-ID ready filtering — rejected
+
+- **Hypothesis:** Materializing the healthy blocked-cache IDs, running the existing subquery-free ready candidate query, and filtering through a Rust `HashSet` would eliminate fsqlite's expensive correlated `NOT IN` fallback while preserving order and applying `LIMIT` after blocked filtering.
+- **Workload(s) probed:** Retained default synchronized `ready --limit 0 --json` on quiet `ts2`, with 50 forward-order and 50 reverse-order observations per binary and byte-identical output.
+- **Measurement summary:** The retained binary measured median `68.600332 ms` and p95 `72.425712 ms`; the candidate measured median `53.698286 ms` (`21.7230%` faster) but p95 `83.893060 ms` (`15.8333%` slower). The bootstrap candidate/retained median-ratio interval was `0.747916..0.850672`, but the visibly bimodal tail failed both the `>=10%` p95-improvement gate and the `<=5%` secondary-regression ceiling. Pass 24 restored the retained bytes.
+- **Outcome:** rejected
+- **Scratch worktree:** build source `/tmp/beads_rust_perf_20260824_pass23` on `ts1`; A/B fixture `/tmp/beads_rust_ab_20260824_pass20` on `ts2`
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass23-forward.json` and `pass23-reverse.json`
+- **Retry-condition predicate:** Do not retry whole blocked-ID materialization. Retry only if a current profile identifies a non-bimodal, single-statement lever that preserves the median gain while improving representative p95 by at least `10%` and keeping every secondary regression within `5%`.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** uncommitted candidate; manually reversed by pass 24
+
+### 2026-08-24 — Blocked-command preflight short-circuits — rejected
+
+- **Hypothesis:** Short-circuiting `may_have_blocked_command_results` on a nonempty local blocked cache would avoid eager external probes; a second refinement used a tiny cache query followed by the retained external probe only on a miss.
+- **Workload(s) probed:** Default `blocked --json` on quiet `ts2`, with 50 forward-order and 50 reverse-order observations per binary on both the tracked one-local-blocker fixture and an empty-cache/no-external counterfixture.
+- **Measurement summary:** The final two-stage candidate improved the local-blocker median from `91.233935 ms` to `75.456966 ms` (`17.2929%`) but p95 only from `98.838227 ms` to `93.156323 ms` (`5.7487%`), missing the `>=10%` p95 gate. On the empty fixture it improved median `43.0444%` and p95 `49.2048%`; all output bytes matched. The preceding single-`CASE` form improved local median `28.0666%` but local p95 only `5.9801%`, while regressing empty-cache p95 `32.0240%`. Pass 37 restored the retained bytes.
+- **Outcome:** rejected
+- **Scratch worktree:** build sources `/tmp/beads_rust_perf_20260824_pass35` and `pass36` on `ts1`; fixtures `/tmp/beads_rust_ab_20260824_pass35` and `pass36` on `ts2`
+- **Profile evidence:** `tests/artifacts/perf/beads-perf-20260824T-profile-first/pass35-local-forward.json`, `pass35-local-reverse.json`, `pass35-empty-forward.json`, `pass35-empty-reverse.json`, `pass36-local-forward.json`, `pass36-local-reverse.json`, `pass36-empty-forward.json`, and `pass36-empty-reverse.json`
+- **Retry-condition predicate:** Do not retry standalone blocked preflight rewrites. The local-blocker tail is dominated by the subsequent blocked-row query; retry only with an independently profiled `get_blocked_issues_for_command_output` lever that itself clears both median and p95 gates.
+- **Bead id (if applicable):** `beads_rust-7kw0`
+- **Commit (if attempted):** uncommitted candidates; manually reversed by pass 37
+

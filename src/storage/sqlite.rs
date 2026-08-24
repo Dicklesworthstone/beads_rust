@@ -14,9 +14,10 @@ use crate::storage::schema::{
     table_exists,
 };
 use crate::sync::{
-    METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
-    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, METADATA_SYNC_MERGE_PENDING,
-    METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent, SyncMergePendingReceipt,
+    FreshDatabaseReplacementWitness, METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME,
+    METADATA_JSONL_SIZE, METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
+    METADATA_SYNC_MERGE_PENDING, METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent,
+    SyncMergePendingReceipt,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
@@ -13913,7 +13914,12 @@ impl SqliteStorage {
         let mut dependent_counts: HashMap<String, usize> = HashMap::new();
 
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
-            let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
+            // Numbered parameters let both UNION arms share the same bindings,
+            // preserving the 900-ID chunk boundary without exceeding SQLite's
+            // variable ceiling.
+            let placeholders: Vec<String> = (1..=chunk.len())
+                .map(|parameter_index| format!("?{parameter_index}"))
+                .collect();
             let joined = placeholders.join(",");
 
             let params: Vec<SqliteValue> = chunk
@@ -13921,39 +13927,31 @@ impl SqliteStorage {
                 .map(|issue_id| SqliteValue::from(issue_id.as_str()))
                 .collect();
 
-            // Query dependency counts (issue_id = the issue that depends on something)
-            let dep_sql = format!(
-                "SELECT issue_id, COUNT(*) FROM dependencies WHERE issue_id IN ({joined}) GROUP BY issue_id"
+            // Tag 0 means dependency count (the issue depends on something);
+            // tag 1 means dependent count (other issues depend on this issue).
+            let sql = format!(
+                "SELECT 0, issue_id, COUNT(*) FROM dependencies \
+                 WHERE issue_id IN ({joined}) GROUP BY issue_id \
+                 UNION ALL \
+                 SELECT 1, depends_on_id, COUNT(*) FROM dependencies \
+                 WHERE depends_on_id IN ({joined}) GROUP BY depends_on_id"
             );
-            let rows = self.conn.query_with_params(&dep_sql, &params)?;
+            let rows = self.conn.query_with_params(&sql, &params)?;
             for row in &rows {
+                let relation_kind = row.get(0).and_then(SqliteValue::as_integer);
                 let issue_id = row
-                    .get(0)
+                    .get(1)
                     .and_then(SqliteValue::as_text)
                     .unwrap_or("")
                     .to_string();
-                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
+                let count = row.get(2).and_then(SqliteValue::as_integer).unwrap_or(0);
                 if count > 0 {
-                    *dependency_counts.entry(issue_id).or_insert(0) +=
-                        usize::try_from(count).unwrap_or(0);
-                }
-            }
-
-            // Query dependent counts (depends_on_id = the issue that others depend on)
-            let dpt_sql = format!(
-                "SELECT depends_on_id, COUNT(*) FROM dependencies WHERE depends_on_id IN ({joined}) GROUP BY depends_on_id"
-            );
-            let rows = self.conn.query_with_params(&dpt_sql, &params)?;
-            for row in &rows {
-                let issue_id = row
-                    .get(0)
-                    .and_then(SqliteValue::as_text)
-                    .unwrap_or("")
-                    .to_string();
-                let count = row.get(1).and_then(SqliteValue::as_integer).unwrap_or(0);
-                if count > 0 {
-                    *dependent_counts.entry(issue_id).or_insert(0) +=
-                        usize::try_from(count).unwrap_or(0);
+                    let counts = match relation_kind {
+                        Some(0) => &mut dependency_counts,
+                        Some(1) => &mut dependent_counts,
+                        _ => continue,
+                    };
+                    *counts.entry(issue_id).or_insert(0) += usize::try_from(count).unwrap_or(0);
                 }
             }
         }
@@ -17468,6 +17466,35 @@ impl SqliteStorage {
                 SqliteValue::from(issue_id),
                 SqliteValue::from(issue_id),
             ],
+        )?;
+
+        Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0)
+    }
+
+    /// Verify that a fresh-replacement witness still belongs to this storage's
+    /// attached database-family authority and current inode.
+    pub(crate) fn verify_fresh_database_replacement_witness(
+        &self,
+        witness: &FreshDatabaseReplacementWitness,
+    ) -> Result<()> {
+        let authority = self
+            .write_authority
+            .as_ref()
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message: "Fresh database import has no attached database-family authority"
+                    .to_string(),
+            })?;
+        authority.verify_fresh_database_replacement_witness(witness)
+    }
+
+    /// Prove with one query that no owned import-relation rows exist anywhere
+    /// in the current transaction.
+    pub(crate) fn import_relation_tables_are_globally_empty_in_tx(&self) -> Result<bool> {
+        let row = self.conn.query_row(
+            "SELECT
+                 NOT EXISTS(SELECT 1 FROM labels)
+                 AND NOT EXISTS(SELECT 1 FROM dependencies)
+                 AND NOT EXISTS(SELECT 1 FROM comments)",
         )?;
 
         Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0)
@@ -23367,6 +23394,91 @@ mod tests {
         let all_counts = storage.count_all_relation_counts().unwrap();
 
         assert_eq!(all_counts, chunked_counts);
+    }
+
+    #[test]
+    fn test_count_relation_counts_union_routes_dependency_and_dependent_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+
+        for id in [
+            "bd-dependency-only",
+            "bd-dependent-only",
+            "bd-both",
+            "bd-self",
+            "bd-incoming-dependent",
+            "bd-incoming-both",
+        ] {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES
+                 ('bd-dependency-only', 'external:a', 'blocks', '2025-04-01T00:00:00Z'),
+                 ('bd-incoming-dependent', 'bd-dependent-only', 'blocks', '2025-04-01T00:00:00Z'),
+                 ('bd-both', 'external:b', 'blocks', '2025-04-01T00:00:00Z'),
+                 ('bd-incoming-both', 'bd-both', 'blocks', '2025-04-01T00:00:00Z'),
+                 ('bd-self', 'bd-self', 'blocks', '2025-04-01T00:00:00Z')",
+            )
+            .unwrap();
+
+        let empty = storage.count_relation_counts_for_issues(&[]).unwrap();
+        assert!(empty.0.is_empty());
+        assert!(empty.1.is_empty());
+
+        // Repeating an ID inside one IN-list must not multiply its grouped count.
+        let ids = [
+            "bd-dependency-only",
+            "bd-dependency-only",
+            "bd-dependent-only",
+            "bd-both",
+            "bd-self",
+        ]
+        .map(str::to_string);
+        let (dependency_counts, dependent_counts) =
+            storage.count_relation_counts_for_issues(&ids).unwrap();
+
+        assert_eq!(dependency_counts.get("bd-dependency-only"), Some(&1));
+        assert!(!dependent_counts.contains_key("bd-dependency-only"));
+        assert!(!dependency_counts.contains_key("bd-dependent-only"));
+        assert_eq!(dependent_counts.get("bd-dependent-only"), Some(&1));
+        assert_eq!(dependency_counts.get("bd-both"), Some(&1));
+        assert_eq!(dependent_counts.get("bd-both"), Some(&1));
+        assert_eq!(dependency_counts.get("bd-self"), Some(&1));
+        assert_eq!(dependent_counts.get("bd-self"), Some(&1));
+    }
+
+    #[test]
+    fn test_count_relation_counts_union_preserves_nine_hundred_id_chunks() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
+        let ids = (0..=900)
+            .map(|index| format!("bd-bulk-{index:03}"))
+            .collect::<Vec<_>>();
+
+        for id in [ids[0].as_str(), ids[900].as_str(), "bd-bulk-incoming"] {
+            let issue = make_issue(id, id, Status::Open, 1, None, t1, None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .conn
+            .execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) VALUES
+                 ('bd-bulk-000', 'external:bulk', 'blocks', '2025-04-01T00:00:00Z'),
+                 ('bd-bulk-incoming', 'bd-bulk-900', 'blocks', '2025-04-01T00:00:00Z')",
+            )
+            .unwrap();
+
+        let (dependency_counts, dependent_counts) =
+            storage.count_relation_counts_for_issues(&ids).unwrap();
+
+        assert_eq!(dependency_counts.get("bd-bulk-000"), Some(&1));
+        assert_eq!(dependent_counts.get("bd-bulk-900"), Some(&1));
+        assert_eq!(dependency_counts.len(), 1);
+        assert_eq!(dependent_counts.len(), 1);
     }
 
     #[test]

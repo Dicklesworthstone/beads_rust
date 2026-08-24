@@ -269,6 +269,18 @@ struct DatabaseInodeAuthority {
     retired_locks: Vec<File>,
 }
 
+/// Linear proof that this authority installed the database inode as an empty
+/// replacement.
+///
+/// The fields stay private and the witness is deliberately neither `Clone`
+/// nor `Copy`: only the locked installation path can mint it, and exactly one
+/// fresh-database import may consume it.
+#[derive(Debug)]
+pub(crate) struct FreshDatabaseReplacementWitness {
+    authority_path_sha256: String,
+    installed_identity: (u64, u64),
+}
+
 /// Composite advisory authority for every mutation of one database family.
 ///
 /// The workspace lock preserves existing single-workspace serialization, the
@@ -562,7 +574,9 @@ impl DatabaseFamilyWriteLock {
     /// The replacement is locked before it becomes visible at the canonical
     /// database path. A hard-link alias therefore cannot acquire a competing
     /// inode authority in the interval between creation and binding.
-    pub(crate) fn install_empty_database_replacement_and_bind(&self) -> Result<()> {
+    pub(crate) fn install_empty_database_replacement_and_bind(
+        &self,
+    ) -> Result<FreshDatabaseReplacementWitness> {
         self.verify_common_authority()?;
         let mut database_authority =
             self.database_authority
@@ -657,6 +671,62 @@ impl DatabaseFamilyWriteLock {
         }
         database_authority.identity = Some(replacement_identity);
         drop(database_authority);
+        Ok(FreshDatabaseReplacementWitness {
+            authority_path_sha256: self.authority_path_sha256.clone(),
+            installed_identity: replacement_identity,
+        })
+    }
+
+    /// Verify that a fresh-replacement witness still names this authority and
+    /// its currently installed database inode.
+    pub(crate) fn verify_fresh_database_replacement_witness(
+        &self,
+        witness: &FreshDatabaseReplacementWitness,
+    ) -> Result<()> {
+        self.verify_common_authority()?;
+        if witness.authority_path_sha256 != self.authority_path_sha256 {
+            return Err(BeadsError::SyncConflict {
+                message: "Fresh database replacement witness belongs to another authority"
+                    .to_string(),
+            });
+        }
+
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        let database_lock =
+            database_authority
+                .lock
+                .as_ref()
+                .ok_or_else(|| BeadsError::SyncConflict {
+                    message: "Fresh database replacement witness has no held inode authority"
+                        .to_string(),
+                })?;
+        verify_locked_file_identity(
+            database_lock,
+            &self.canonical_database_path,
+            "fresh database replacement authority",
+            true,
+        )?;
+        let current_identity = additive_metadata_identity(
+            &fs::metadata(&self.canonical_database_path).map_err(|error| {
+                BeadsError::Config(format!(
+                    "Could not re-witness fresh database replacement {}: {error}",
+                    database_path_descriptor(&self.canonical_database_path)
+                ))
+            })?,
+        );
+        if database_authority.identity != Some(current_identity)
+            || current_identity != witness.installed_identity
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Fresh database replacement witness no longer names the installed inode"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -12586,6 +12656,7 @@ fn stream_import_actions_in_tx(
     metadata: &ImportMetadataMaps,
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
+    fresh_relation_tables_proven_empty: bool,
 ) -> Result<ImportResult> {
     let mut tx_result = base_result.clone();
     let mut seen_external_refs = HashSet::new();
@@ -12626,7 +12697,13 @@ fn stream_import_actions_in_tx(
         };
 
         apply_collision_renames(&mut issue, collision_renames);
-        process_import_action(storage, &action, &issue, &mut tx_result)?;
+        process_import_action(
+            storage,
+            &action,
+            &issue,
+            &mut tx_result,
+            fresh_relation_tables_proven_empty,
+        )?;
 
         if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
             storage,
@@ -12729,6 +12806,31 @@ pub(crate) fn import_from_jsonl_snapshot(
     config: &ImportConfig,
     expected_prefix: Option<&str>,
 ) -> Result<ImportResult> {
+    import_from_jsonl_snapshot_impl(storage, source, config, expected_prefix, None)
+}
+
+/// Import into the exact empty replacement installed by a database-family
+/// authority. The linear witness cannot be manufactured by ordinary import
+/// callers, and the transaction still proves that all owned relation tables
+/// remain globally empty before enabling the insert-only relation path.
+pub(crate) fn import_from_jsonl_snapshot_into_fresh_replacement(
+    storage: &mut SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+    witness: FreshDatabaseReplacementWitness,
+) -> Result<ImportResult> {
+    import_from_jsonl_snapshot_impl(storage, source, config, expected_prefix, Some(witness))
+}
+
+#[allow(clippy::too_many_lines)]
+fn import_from_jsonl_snapshot_impl(
+    storage: &mut SqliteStorage,
+    source: &JsonlSourceSnapshot,
+    config: &ImportConfig,
+    expected_prefix: Option<&str>,
+    fresh_witness: Option<FreshDatabaseReplacementWitness>,
+) -> Result<ImportResult> {
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(
             source.display_path(),
@@ -12789,6 +12891,18 @@ pub(crate) fn import_from_jsonl_snapshot(
     );
 
     let apply_result = storage.with_write_transaction(|storage| -> Result<ImportResult> {
+        let fresh_relation_tables_proven_empty = if let Some(witness) = fresh_witness.as_ref() {
+            storage.verify_fresh_database_replacement_witness(witness)?;
+            if !storage.import_relation_tables_are_globally_empty_in_tx()? {
+                return Err(BeadsError::SyncConflict {
+                    message: "Fresh database replacement gained relation rows before import"
+                        .to_string(),
+                });
+            }
+            true
+        } else {
+            false
+        };
         let tx_result = stream_import_actions_in_tx(
             storage,
             source,
@@ -12798,6 +12912,7 @@ pub(crate) fn import_from_jsonl_snapshot(
             &metadata,
             &result,
             &progress,
+            fresh_relation_tables_proven_empty,
         )?;
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
@@ -12846,11 +12961,14 @@ fn process_import_action(
     action: &CollisionAction,
     issue: &Issue,
     result: &mut ImportResult,
+    fresh_relation_tables_proven_empty: bool,
 ) -> Result<()> {
     match action {
         CollisionAction::Insert => {
-            if insert_new_import_issue(storage, issue)?
-                && !storage.has_owned_relation_rows_for_import(&issue.id)?
+            let inserted = insert_new_import_issue(storage, issue)?;
+            if inserted
+                && (fresh_relation_tables_proven_empty
+                    || !storage.has_owned_relation_rows_for_import(&issue.id)?)
             {
                 storage.insert_new_issue_relations_for_import_in_tx(issue)?;
             } else {
@@ -13493,7 +13611,7 @@ fn run_reconcile_apply_tx(
 
             let computed_hash = crate::util::content_hash(&issue);
             apply_collision_renames(&mut issue, collision_renames);
-            process_import_action(storage, action, &issue, &mut import_result)?;
+            process_import_action(storage, action, &issue, &mut import_result, false)?;
 
             match kind {
                 ReconcileActionKind::Create | ReconcileActionKind::Update => {
@@ -14714,6 +14832,31 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
         }
+    }
+
+    fn fresh_replacement_import_fixture() -> (
+        TempDir,
+        PathBuf,
+        PathBuf,
+        Arc<DatabaseFamilyWriteLock>,
+        SqliteStorage,
+        FreshDatabaseReplacementWitness,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        let authority = Arc::new(
+            blocking_database_family_write_lock_with_timeout(&beads_dir, &db_path, Some(2_000))
+                .unwrap(),
+        );
+        let witness = authority
+            .install_empty_database_replacement_and_bind()
+            .unwrap();
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        storage.attach_write_authority(Arc::clone(&authority));
+        (temp, beads_dir, jsonl_path, authority, storage, witness)
     }
 
     #[test]
@@ -19540,6 +19683,132 @@ mod tests {
         assert!(
             storage.get_comments("bd-new").unwrap().is_empty(),
             "fresh import must delete stale owned comments"
+        );
+    }
+
+    #[test]
+    fn ordinary_import_into_empty_storage_does_not_require_fresh_replacement_witness() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp = TempDir::new().unwrap();
+        let jsonl_path = temp.path().join("issues.jsonl");
+        let mut issue = make_test_issue("bd-ordinary", "Ordinary empty import");
+        issue.labels = vec!["ordinary".to_string()];
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        assert_eq!(result.created_count, 1);
+        assert_eq!(
+            storage.get_labels("bd-ordinary").unwrap(),
+            vec!["ordinary".to_string()]
+        );
+    }
+
+    #[test]
+    fn fresh_replacement_import_inserts_relations_after_global_empty_proof() {
+        let (_temp, _beads_dir, jsonl_path, _authority, mut storage, witness) =
+            fresh_replacement_import_fixture();
+        let mut issue = make_test_issue("bd-fresh", "Fresh replacement import");
+        issue.labels = vec!["fresh".to_string()];
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+
+        let result = import_from_jsonl_snapshot_into_fresh_replacement(
+            &mut storage,
+            &source,
+            &ImportConfig::default(),
+            Some("bd-"),
+            witness,
+        )
+        .unwrap();
+
+        assert_eq!(result.created_count, 1);
+        assert_eq!(
+            storage.get_labels("bd-fresh").unwrap(),
+            vec!["fresh".to_string()]
+        );
+    }
+
+    #[test]
+    fn fresh_replacement_import_aborts_if_orphan_appears_after_witness() {
+        let (_temp, _beads_dir, jsonl_path, _authority, mut storage, witness) =
+            fresh_replacement_import_fixture();
+        let issue = make_test_issue("bd-new", "Must not import");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        storage
+            .execute_test_sql(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO labels (issue_id, label) VALUES ('bd-orphan', 'stale');
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+
+        let error = import_from_jsonl_snapshot_into_fresh_replacement(
+            &mut storage,
+            &source,
+            &ImportConfig::default(),
+            Some("bd-"),
+            witness,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("gained relation rows before import"),
+            "unexpected error: {error}"
+        );
+        assert!(storage.get_issue("bd-new").unwrap().is_none());
+    }
+
+    #[test]
+    fn fresh_replacement_import_rejects_inode_replacement_after_witness() {
+        let (temp, _beads_dir, jsonl_path, authority, mut storage, witness) =
+            fresh_replacement_import_fixture();
+        let issue = make_test_issue("bd-new", "Must not import");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+        let source = capture_jsonl_source_snapshot(&jsonl_path).unwrap();
+        let db_path = authority.canonical_database_path();
+        let displaced = temp.path().join("displaced.db");
+        fs::rename(db_path, &displaced).unwrap();
+        fs::copy(&displaced, db_path).unwrap();
+
+        let error = import_from_jsonl_snapshot_into_fresh_replacement(
+            &mut storage,
+            &source,
+            &ImportConfig::default(),
+            Some("bd-"),
+            witness,
+        )
+        .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("Database inode changed") || rendered.contains("identity changed"),
+            "unexpected error: {rendered}"
         );
     }
 
