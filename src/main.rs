@@ -419,7 +419,7 @@ fn main() {
                 None => None,
             };
         }
-        let should_attempt_auto_import = {
+        let mut should_attempt_auto_import = {
             match storage_result.as_mut() {
                 Some(res) if ctx.overrides.read_only_fast_open => auto_import_probe(
                     &res.storage,
@@ -456,6 +456,43 @@ fn main() {
                 };
             }
 
+            // The first read-only probe is deliberately advisory: JSONL or
+            // the pending-merge receipt can change before we join the writer
+            // queue. Reclassify both under the database-family authority
+            // before dropping the read-only handle or opening anything that
+            // can recover, migrate, or import. A pending/uncertain receipt
+            // fails closed to the already-open read-only command; a JSONL
+            // change that disappeared while waiting avoids the writable
+            // reopen entirely.
+            if ctx.overrides.read_only_fast_open
+                && let (Some(res), Some(authority)) =
+                    (storage_result.as_ref(), auto_import_write_lock.as_ref())
+            {
+                match reprobe_fast_open_auto_import_under_authority(
+                    res,
+                    paths,
+                    authority,
+                    allow_external_jsonl,
+                ) {
+                    Ok(FastOpenAutoImportReprobe::ImportRequired) => {}
+                    Ok(FastOpenAutoImportReprobe::Current) => {
+                        should_attempt_auto_import = false;
+                    }
+                    Ok(FastOpenAutoImportReprobe::Pending(state)) => {
+                        if !pending_merge_warning_emitted {
+                            emit_pending_sync_merge_warning(&state, json_error_mode);
+                        }
+                        should_attempt_auto_import = false;
+                    }
+                    Err(error) => {
+                        emit_pending_sync_merge_inspection_warning(&error, json_error_mode);
+                        should_attempt_auto_import = false;
+                    }
+                }
+            }
+        }
+
+        if should_attempt_auto_import {
             if ctx.overrides.read_only_fast_open {
                 let mut writable_overrides = ctx.overrides.clone();
                 writable_overrides.read_only_fast_open = false;
@@ -1313,6 +1350,37 @@ fn inspect_pending_sync_merge_for_startup_under_authority(
     commands::doctor::inspect_pending_sync_merge_under_authority(db_path, authority)
 }
 
+#[derive(Debug)]
+enum FastOpenAutoImportReprobe {
+    Current,
+    ImportRequired,
+    Pending(commands::doctor::PendingSyncMergeState),
+}
+
+fn reprobe_fast_open_auto_import_under_authority(
+    storage_result: &config::OpenStorageResult,
+    paths: &config::ConfigPaths,
+    authority: &Arc<beads_rust::sync::DatabaseFamilyWriteLock>,
+    allow_external_jsonl: bool,
+) -> Result<FastOpenAutoImportReprobe> {
+    if let Some(state) =
+        inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority)?
+    {
+        return Ok(FastOpenAutoImportReprobe::Pending(state));
+    }
+
+    if auto_import_probe(
+        &storage_result.storage,
+        &paths.beads_dir,
+        &paths.jsonl_path,
+        allow_external_jsonl,
+    )? {
+        Ok(FastOpenAutoImportReprobe::ImportRequired)
+    } else {
+        Ok(FastOpenAutoImportReprobe::Current)
+    }
+}
+
 fn emit_pending_sync_merge_warning(
     state: &commands::doctor::PendingSyncMergeState,
     json_mode: bool,
@@ -1537,6 +1605,43 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         Commands::Dep { command } => is_read_only_dep_command(command),
         Commands::Label { command } => is_read_only_label_listing(command),
         Commands::Query { command } => is_read_only_query_command(command),
+        _ => false,
+    }
+}
+
+/// Commands whose default freshness contract can use a nonmutating JSONL
+/// probe on a current-schema read-only connection, reopening writable storage
+/// only after a positive probe has been repeated under database-family
+/// authority. This is intentionally narrower than all read-only fast-open
+/// commands: activity-bearing stats/status and issue-specific lint retain the
+/// ordinary startup path.
+const fn supports_auto_import_read_only_probe(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Sync(args) => args.status,
+        Commands::List(_)
+        | Commands::Show(_)
+        | Commands::Search(_)
+        | Commands::Coordination { .. }
+        | Commands::Ready(_)
+        | Commands::Scheduler(_)
+        | Commands::Blocked(_)
+        | Commands::Count(_)
+        | Commands::Stale(_)
+        | Commands::Changelog(_)
+        | Commands::Graph(_)
+        | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
+        | Commands::Comments(beads_rust::cli::CommentsArgs {
+            command: None | Some(beads_rust::cli::CommentCommands::List(_)),
+            ..
+        })
+        | Commands::Epic {
+            command: beads_rust::cli::EpicCommands::Status(_),
+        } => true,
+        Commands::Lint(args) => args.ids.is_empty(),
+        Commands::Label { command } => is_read_only_label_listing(command),
+        Commands::Dep { command } => is_read_only_dep_command(command),
+        Commands::Query { command } => is_read_only_query_command(command),
+        Commands::Stats(args) | Commands::Status(args) => args.no_activity,
         _ => false,
     }
 }
@@ -2018,8 +2123,8 @@ fn build_cli_overrides(cli: &Cli) -> config::CliOverrides {
     let read_only_fast_open = !cli.no_db
         && !read_only_fast_open_disabled_for_cli()
         && supports_read_only_fast_open(&cli.command)
-        && cli.no_auto_import
-        && cli.no_auto_flush;
+        && ((cli.no_auto_import && cli.no_auto_flush)
+            || supports_auto_import_read_only_probe(&cli.command));
 
     let mut overrides = config::CliOverrides::default();
     overrides.db.clone_from(&cli.db);
@@ -2412,12 +2517,12 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_requires_explicit_stale_and_flush_opt_out() {
+    fn read_only_fast_open_supports_explicit_opt_out_and_default_safe_probe() {
         let list = Cli::parse_from(["br", "list"]);
-        assert!(!build_cli_overrides(&list).read_only_fast_open);
+        assert!(build_cli_overrides(&list).read_only_fast_open);
 
         let list_with_lock_timeout = Cli::parse_from(["br", "--lock-timeout", "50", "list"]);
-        assert!(!build_cli_overrides(&list_with_lock_timeout).read_only_fast_open);
+        assert!(build_cli_overrides(&list_with_lock_timeout).read_only_fast_open);
 
         let stats = Cli::parse_from(["br", "stats"]);
         assert!(!build_cli_overrides(&stats).read_only_fast_open);
@@ -2426,7 +2531,7 @@ mod tests {
         assert!(build_cli_overrides(&stats_no_auto).read_only_fast_open);
 
         let stats_no_activity = Cli::parse_from(["br", "stats", "--no-activity"]);
-        assert!(!build_cli_overrides(&stats_no_activity).read_only_fast_open);
+        assert!(build_cli_overrides(&stats_no_activity).read_only_fast_open);
 
         let status = Cli::parse_from(["br", "status"]);
         assert!(!build_cli_overrides(&status).read_only_fast_open);
@@ -2436,10 +2541,10 @@ mod tests {
         assert!(build_cli_overrides(&status_no_auto).read_only_fast_open);
 
         let status_no_activity = Cli::parse_from(["br", "status", "--no-activity"]);
-        assert!(!build_cli_overrides(&status_no_activity).read_only_fast_open);
+        assert!(build_cli_overrides(&status_no_activity).read_only_fast_open);
 
         let sync_status = Cli::parse_from(["br", "sync", "--status"]);
-        assert!(!build_cli_overrides(&sync_status).read_only_fast_open);
+        assert!(build_cli_overrides(&sync_status).read_only_fast_open);
 
         let sync_flush = Cli::parse_from(["br", "sync", "--flush-only"]);
         assert!(!build_cli_overrides(&sync_flush).read_only_fast_open);
@@ -2479,13 +2584,13 @@ mod tests {
         assert!(build_cli_overrides(&comments_shorthand).read_only_fast_open);
 
         let label_list_all = Cli::parse_from(["br", "label", "list-all"]);
-        assert!(!build_cli_overrides(&label_list_all).read_only_fast_open);
+        assert!(build_cli_overrides(&label_list_all).read_only_fast_open);
 
         let label_list_unique = Cli::parse_from(["br", "label", "list"]);
-        assert!(!build_cli_overrides(&label_list_unique).read_only_fast_open);
+        assert!(build_cli_overrides(&label_list_unique).read_only_fast_open);
 
         let count = Cli::parse_from(["br", "count", "--by", "status"]);
-        assert!(!build_cli_overrides(&count).read_only_fast_open);
+        assert!(build_cli_overrides(&count).read_only_fast_open);
 
         let label_list_issue = Cli::parse_from([
             "br",
@@ -2499,7 +2604,7 @@ mod tests {
 
         let comments_no_auto_import =
             Cli::parse_from(["br", "--no-auto-import", "comments", "list", "bd-abc"]);
-        assert!(!build_cli_overrides(&comments_no_auto_import).read_only_fast_open);
+        assert!(build_cli_overrides(&comments_no_auto_import).read_only_fast_open);
 
         let mutating = Cli::parse_from([
             "br",
@@ -2552,57 +2657,57 @@ mod tests {
     }
 
     #[test]
-    fn default_read_commands_do_not_fast_open_for_auto_import_probe() {
+    fn default_read_commands_fast_open_only_for_safe_auto_import_probe() {
         let ready = Cli::parse_from(["br", "ready"]);
-        assert!(!build_cli_overrides(&ready).read_only_fast_open);
+        assert!(build_cli_overrides(&ready).read_only_fast_open);
 
         let blocked = Cli::parse_from(["br", "blocked"]);
-        assert!(!build_cli_overrides(&blocked).read_only_fast_open);
+        assert!(build_cli_overrides(&blocked).read_only_fast_open);
 
         let show = Cli::parse_from(["br", "show", "br-123"]);
-        assert!(!build_cli_overrides(&show).read_only_fast_open);
+        assert!(build_cli_overrides(&show).read_only_fast_open);
 
         let comments_list = Cli::parse_from(["br", "comments", "list", "br-123"]);
-        assert!(!build_cli_overrides(&comments_list).read_only_fast_open);
+        assert!(build_cli_overrides(&comments_list).read_only_fast_open);
 
         let search = Cli::parse_from(["br", "search", "needle"]);
-        assert!(!build_cli_overrides(&search).read_only_fast_open);
+        assert!(build_cli_overrides(&search).read_only_fast_open);
 
         let stale = Cli::parse_from(["br", "stale"]);
-        assert!(!build_cli_overrides(&stale).read_only_fast_open);
+        assert!(build_cli_overrides(&stale).read_only_fast_open);
 
         let lint = Cli::parse_from(["br", "lint"]);
-        assert!(!build_cli_overrides(&lint).read_only_fast_open);
+        assert!(build_cli_overrides(&lint).read_only_fast_open);
 
         let lint_issue = Cli::parse_from(["br", "lint", "br-123"]);
         assert!(!build_cli_overrides(&lint_issue).read_only_fast_open);
 
         let changelog = Cli::parse_from(["br", "changelog"]);
-        assert!(!build_cli_overrides(&changelog).read_only_fast_open);
+        assert!(build_cli_overrides(&changelog).read_only_fast_open);
 
         let graph = Cli::parse_from(["br", "graph", "--all"]);
-        assert!(!build_cli_overrides(&graph).read_only_fast_open);
+        assert!(build_cli_overrides(&graph).read_only_fast_open);
 
         let orphans = Cli::parse_from(["br", "orphans"]);
-        assert!(!build_cli_overrides(&orphans).read_only_fast_open);
+        assert!(build_cli_overrides(&orphans).read_only_fast_open);
 
         let epic_status = Cli::parse_from(["br", "epic", "status"]);
-        assert!(!build_cli_overrides(&epic_status).read_only_fast_open);
+        assert!(build_cli_overrides(&epic_status).read_only_fast_open);
 
         let dep_tree = Cli::parse_from(["br", "dep", "tree", "br-123"]);
-        assert!(!build_cli_overrides(&dep_tree).read_only_fast_open);
+        assert!(build_cli_overrides(&dep_tree).read_only_fast_open);
 
         let dep_list = Cli::parse_from(["br", "dep", "list", "br-123"]);
-        assert!(!build_cli_overrides(&dep_list).read_only_fast_open);
+        assert!(build_cli_overrides(&dep_list).read_only_fast_open);
 
         let dep_cycles = Cli::parse_from(["br", "dep", "cycles"]);
-        assert!(!build_cli_overrides(&dep_cycles).read_only_fast_open);
+        assert!(build_cli_overrides(&dep_cycles).read_only_fast_open);
 
         let query_run = Cli::parse_from(["br", "query", "run", "mine", "--format", "json"]);
-        assert!(!build_cli_overrides(&query_run).read_only_fast_open);
+        assert!(build_cli_overrides(&query_run).read_only_fast_open);
 
         let query_list = Cli::parse_from(["br", "query", "list"]);
-        assert!(!build_cli_overrides(&query_list).read_only_fast_open);
+        assert!(build_cli_overrides(&query_list).read_only_fast_open);
     }
 
     #[test]
@@ -2625,7 +2730,7 @@ mod tests {
 
         let no_auto_import_only =
             Cli::parse_from(["br", "--no-auto-import", "query", "run", "mine"]);
-        assert!(!build_cli_overrides(&no_auto_import_only).read_only_fast_open);
+        assert!(build_cli_overrides(&no_auto_import_only).read_only_fast_open);
 
         let query_save = Cli::parse_from([
             "br",
@@ -2878,6 +2983,84 @@ mod tests {
             !db_path.exists(),
             "advisory inspection must remain read-only"
         );
+    }
+
+    #[test]
+    fn fast_open_import_reprobe_rechecks_freshness_and_pending_receipt_under_authority() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let bootstrap = config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+            .expect("bootstrap storage");
+        let paths = bootstrap.paths.clone();
+        drop(bootstrap);
+
+        let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
+        let fast_storage =
+            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage");
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(1_000),
+            )
+            .expect("database authority"),
+        );
+        assert!(matches!(
+            reprobe_fast_open_auto_import_under_authority(
+                &fast_storage,
+                &paths,
+                &authority,
+                false,
+            )
+            .expect("current reprobe"),
+            FastOpenAutoImportReprobe::Current
+        ));
+
+        fs::write(&paths.jsonl_path, b"{\"id\":\"br-new\"}\n").expect("write newer JSONL");
+        assert!(matches!(
+            reprobe_fast_open_auto_import_under_authority(
+                &fast_storage,
+                &paths,
+                &authority,
+                false,
+            )
+            .expect("stale reprobe"),
+            FastOpenAutoImportReprobe::ImportRequired
+        ));
+        drop(authority);
+        drop(fast_storage);
+
+        let mut writable =
+            config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+                .expect("writable storage");
+        writable
+            .storage
+            .set_metadata("sync_merge_pending_v1", "legacy-receipt")
+            .expect("plant pending receipt");
+        drop(writable);
+
+        let fast_storage =
+            config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage");
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(1_000),
+            )
+            .expect("database authority"),
+        );
+        assert!(matches!(
+            reprobe_fast_open_auto_import_under_authority(
+                &fast_storage,
+                &paths,
+                &authority,
+                false,
+            )
+            .expect("pending reprobe"),
+            FastOpenAutoImportReprobe::Pending(_)
+        ));
     }
 
     #[test]
