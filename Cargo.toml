@@ -147,6 +147,14 @@ signal-hook = "0.4.4"
 # Capability-relative Windows filesystem access. Pin exactly because the
 # no-follow/open-at implementation is part of sync's hostile-path boundary.
 cap-primitives = "=4.0.3"
+# Direct process termination for `shutdown::exit_process` (#439): the CRT
+# `exit()` path runs atexit/TLS teardown after `ExitProcess` has already
+# terminated every other thread, and any destructor that joins one of those
+# threads aborts with 0xC0000409, corrupting the exit code.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(not(windows))'.dependencies]
 mimalloc = "0.1.52"
@@ -219,11 +227,12 @@ self_update = [
 # `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
 
 [lints.rust]
-# Deny (not forbid): two sanctioned `#[allow(unsafe_code)]` carve-outs exist —
+# Deny (not forbid): three sanctioned `#[allow(unsafe_code)]` carve-outs exist —
 # `sync::db_inode_lock` for the SQLite-compatible database-inode range lock
 # (no safe wrapper exists on macOS/Windows, GitHub #412) and
 # `shutdown::restore_default_sigpipe_unix` for the one-line `signal(SIGPIPE,
-# SIG_DFL)` that keeps `br list | head` from aborting (GitHub #434).
+# SIG_DFL)` that keeps `br list | head` from aborting (GitHub #434), and
+# `shutdown::exit_process` for the Windows `TerminateProcess` exit path (#439).
 unsafe_code = "deny"
 
 [lints.clippy]

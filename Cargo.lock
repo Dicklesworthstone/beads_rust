@@ -454,6 +454,7 @@ dependencies = [
  "unicode-width",
  "vergen-gix 10.0.0",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

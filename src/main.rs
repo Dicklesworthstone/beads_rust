@@ -216,7 +216,7 @@ fn main() {
                                  Underlying error: {e}",
                             );
                         }
-                        std::process::exit(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
+                        beads_rust::shutdown::exit_process(beads_rust::cli::commands::doctor_subsystems::exit_codes::DoctorExitCode::ConcurrencyLost.as_i32());
                     }
                     if doctor_args.subcommand.is_none() {
                         if is_unwritable_write_lock_open_error(&lock_path, &e) {
@@ -859,7 +859,7 @@ fn main() {
     if let Some(exit_code) = beads_rust::shutdown::exit_code() {
         drop(storage_result);
         drop(write_lock);
-        std::process::exit(exit_code);
+        beads_rust::shutdown::exit_process(exit_code);
     }
 
     // Phase 5: Auto-Flush (with advisory flock to serialize concurrent access)
@@ -915,7 +915,7 @@ fn main() {
     }
 
     if let Some(err) = beads_rust::output::take_output_serialization_failure() {
-        std::process::exit(err.exit_code());
+        beads_rust::shutdown::exit_process(err.exit_code());
     }
 
     // A command emitted its normal output and any auto-flush has now completed,
@@ -926,8 +926,18 @@ fn main() {
     if let Some(exit_code) = beads_rust::output::take_pending_exit_code() {
         drop(storage_result);
         drop(write_lock);
-        std::process::exit(exit_code);
+        beads_rust::shutdown::exit_process(exit_code);
     }
+
+    // Successful exit goes through the same funnel as every other exit
+    // path (#439): on Windows, letting `main` return would reach the CRT
+    // `exit()` teardown, where an atexit/TLS destructor joining a thread
+    // that `ExitProcess` already terminated aborts with 0xC0000409 and
+    // corrupts the exit code of a command that worked. Storage is dropped
+    // first so `SqliteStorage::Drop` checkpoints the WAL (#270).
+    drop(storage_result);
+    drop(write_lock);
+    beads_rust::shutdown::exit_process(0);
 }
 
 struct StartupContext {
@@ -1678,7 +1688,7 @@ fn handle_error(err: &BeadsError, json_mode: bool, color_mode: bool) -> ! {
         eprintln!("{}", structured.to_human(color_mode));
     }
 
-    std::process::exit(exit_code);
+    beads_rust::shutdown::exit_process(exit_code);
 }
 
 fn emit_read_only_doctor_write_lock_diagnostic(
@@ -1729,7 +1739,7 @@ fn emit_read_only_doctor_write_lock_diagnostic(
         );
     }
 
-    std::process::exit(exit_code.as_i32());
+    beads_rust::shutdown::exit_process(exit_code.as_i32());
 }
 
 fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bool {
@@ -1786,7 +1796,7 @@ fn emit_read_only_doctor_live_write_lock_diagnostic(
         );
     }
 
-    std::process::exit(exit_code.as_i32());
+    beads_rust::shutdown::exit_process(exit_code.as_i32());
 }
 
 fn read_only_doctor_live_write_lock_triage_payload(

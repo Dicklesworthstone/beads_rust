@@ -722,7 +722,7 @@ fn refuse_doctor_mutation_if_merge_pending(
         }
     };
     emit_refused_unsafe(operation, &refusal.0, &refusal.1, ctx);
-    std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+    crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
 }
 
 impl FilesystemPathKind {
@@ -11433,7 +11433,7 @@ fn execute_repair_indexes(
     {
         if let Err(err) = authority.verify_database_authority() {
             emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
-            std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+            crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
         }
         Arc::clone(authority)
     } else {
@@ -11441,7 +11441,7 @@ fn execute_repair_indexes(
             Ok(authority) => authority,
             Err(err) => {
                 emit_concurrency_lost(beads_dir, &err, ctx, "--repair-indexes");
-                std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
             }
         }
     };
@@ -11454,7 +11454,7 @@ fn execute_repair_indexes(
             evidence,
         } => {
             emit_refused_unsafe("--repair-indexes", &reason, &evidence, ctx);
-            std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+            crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
         }
     }
 
@@ -12625,7 +12625,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             {
                 if let Err(err) = authority.verify_database_authority() {
                     emit_concurrency_lost(&beads_dir, &err, ctx, "doctor undo");
-                    std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                    crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
                 }
                 Arc::clone(authority)
             } else {
@@ -12637,7 +12637,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     Ok(authority) => authority,
                     Err(err) => {
                         emit_concurrency_lost(&beads_dir, &err, ctx, "doctor undo");
-                        std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                        crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
                     }
                 }
             };
@@ -12679,7 +12679,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         // exit 1, which conflicted with the per-`DoctorExitCode` contract
         // and made CI / pre-commit hooks unable to distinguish "no
         // workspace here" from "workspace has findings".
-        std::process::exit(DoctorExitCode::NoInput.as_i32());
+        crate::shutdown::exit_process(DoctorExitCode::NoInput.as_i32());
     };
 
     let paths = match config::resolve_paths(&beads_dir, cli.db.as_ref()) {
@@ -12711,7 +12711,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 checks,
             };
             print_report(&report, ctx)?;
-            std::process::exit(1);
+            crate::shutdown::exit_process(1);
         }
     };
 
@@ -12758,7 +12758,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             // handle in the same process would deadlock on Linux.
             if let Err(err) = authority.verify_database_authority() {
                 emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
-                std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
             }
             Some(Arc::clone(authority))
         } else {
@@ -12784,13 +12784,13 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                         .and_then(|_| authority.verify_database_authority())
                     {
                         emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
-                        std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                        crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
                     }
                     Some(authority)
                 }
                 Err(err) => {
                     emit_concurrency_lost(&beads_dir, &err, ctx, "--repair");
-                    std::process::exit(DoctorExitCode::ConcurrencyLost.as_i32());
+                    crate::shutdown::exit_process(DoctorExitCode::ConcurrencyLost.as_i32());
                 }
             }
         }
@@ -12818,7 +12818,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 evidence,
             } => {
                 emit_refused_unsafe("--repair", &reason, &evidence, ctx);
-                std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+                crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
             }
         }
     }
@@ -13379,7 +13379,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         initial.report.ok = !has_non_ok(&initial.report.checks);
         print_report(&initial.report, ctx)?;
         if !initial.report.ok {
-            std::process::exit(DoctorExitCode::FindingsPresent.as_i32());
+            crate::shutdown::exit_process(DoctorExitCode::FindingsPresent.as_i32());
         }
         return Ok(());
     }
@@ -13716,7 +13716,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             print_report(&initial.report, ctx)?;
             ctx.error("Refusing JSONL rebuild: filtered out by --only/--skip");
         }
-        std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
+        crate::shutdown::exit_process(DoctorExitCode::RefusedUnsafe.as_i32());
     }
 
     let Some(jsonl_path) = initial.jsonl_path.as_ref() else {
