@@ -727,6 +727,7 @@ impl DatabaseFamilyWriteLock {
                     .to_string(),
             });
         }
+        drop(database_authority);
         Ok(())
     }
 
@@ -12823,7 +12824,9 @@ pub(crate) fn import_from_jsonl_snapshot_into_fresh_replacement(
     import_from_jsonl_snapshot_impl(storage, source, config, expected_prefix, Some(witness))
 }
 
-#[allow(clippy::too_many_lines)]
+// Taking ownership is deliberate: callers must relinquish the linear witness,
+// while the transaction closure may need to borrow it across internal BUSY retries.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn import_from_jsonl_snapshot_impl(
     storage: &mut SqliteStorage,
     source: &JsonlSourceSnapshot,
