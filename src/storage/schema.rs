@@ -15,7 +15,7 @@ const fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     let mut index = 0;
     while index < bytes.len() {
-        hash ^= u64::from(bytes[index]);
+        hash ^= bytes[index] as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         index += 1;
     }

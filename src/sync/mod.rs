@@ -267,7 +267,7 @@ fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Res
     use rustix::fs::{CWD, RenameFlags, renameat_with};
 
     match renameat_with(CWD, candidate, CWD, target, RenameFlags::NOREPLACE) {
-        Ok(()) => crate::util::sync_parent_directory(target).map_err(BeadsError::Io),
+        Ok(()) => Ok(()),
         Err(error) if error == rustix::io::Errno::EXIST => Err(BeadsError::SyncConflict {
             message:
                 "Database appeared before the atomic no-replace installation; refusing to overwrite it"
@@ -284,7 +284,7 @@ fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Res
 #[cfg(windows)]
 fn install_database_candidate_no_replace(candidate: &Path, target: &Path) -> Result<()> {
     match db_inode_lock::rename_database_candidate_no_replace(candidate, target) {
-        Ok(()) => crate::util::sync_parent_directory(target).map_err(BeadsError::Io),
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(BeadsError::SyncConflict {
                 message:
@@ -314,6 +314,19 @@ struct DatabaseInodeAuthority {
     lock: Option<File>,
     identity: Option<(u64, u64)>,
     retired_locks: Vec<File>,
+}
+
+/// Relationship between the canonical database path and the inode retained by
+/// a database-family authority.
+///
+/// Recovery uses this after a failed no-replace installation. Only `Held` is
+/// safe to stage out as the recovery attempt's own replacement; `Foreign`
+/// must be left byte-for-byte untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DatabaseTargetAuthorityState {
+    Missing,
+    Held,
+    Foreign,
 }
 
 /// Linear proof that this authority installed the database inode as an empty
@@ -693,6 +706,12 @@ impl DatabaseFamilyWriteLock {
                 }
             }
             candidate_file.sync_all()?;
+            let candidate_identity = authority_file_identity(
+                &candidate_file,
+                &candidate,
+                "database replacement candidate",
+                &database_path_descriptor(&candidate),
+            )?;
             match fs::symlink_metadata(&self.canonical_database_path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Ok(_) => {
@@ -709,29 +728,81 @@ impl DatabaseFamilyWriteLock {
                 }
             }
             install_database_candidate_no_replace(&candidate, &self.canonical_database_path)?;
-            installed = Some(candidate_file);
+            installed = Some((candidate_file, candidate_identity));
             break;
         }
-        let replacement_lock = installed.ok_or_else(|| {
+        let (replacement_lock, replacement_identity) = installed.ok_or_else(|| {
             BeadsError::Config(
                 "Could not allocate a unique locked database replacement candidate".to_string(),
             )
         })?;
-        let replacement_identity = verify_locked_file_identity(
-            &replacement_lock,
-            &self.canonical_database_path,
-            "installed database replacement authority",
-            true,
-        )?;
         if let Some(previous_lock) = database_authority.lock.replace(replacement_lock) {
             database_authority.retired_locks.push(previous_lock);
         }
         database_authority.identity = Some(replacement_identity);
         drop(database_authority);
+        // The no-replace rename has already committed the candidate to the
+        // canonical namespace. Bind and verify that inode before the parent
+        // durability barrier so even an fsync failure leaves recovery able to
+        // distinguish its own installed generation from a foreign target.
+        self.verify_database_authority()?;
+        crate::util::sync_parent_directory(&self.canonical_database_path)
+            .map_err(BeadsError::Io)?;
         Ok(FreshDatabaseReplacementWitness {
             authority_path_sha256: self.authority_path_sha256.clone(),
             installed_identity: replacement_identity,
         })
+    }
+
+    /// Classify the canonical target without mistaking a retained, renamed
+    /// original inode for the currently visible database generation.
+    pub(crate) fn database_target_authority_state(
+        &self,
+    ) -> Result<DatabaseTargetAuthorityState> {
+        self.verify_common_authority()?;
+        let target_metadata = match fs::symlink_metadata(&self.canonical_database_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Ok(DatabaseTargetAuthorityState::Foreign);
+            }
+            Ok(_) => Some(authority_path_identity(
+                &self.canonical_database_path,
+                "database recovery target",
+                &database_path_descriptor(&self.canonical_database_path),
+            )?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(BeadsError::Config(format!(
+                    "Could not classify database recovery target {}: {error}",
+                    database_path_descriptor(&self.canonical_database_path)
+                )));
+            }
+        };
+        let Some(target_identity) = target_metadata else {
+            return Ok(DatabaseTargetAuthorityState::Missing);
+        };
+
+        let database_authority =
+            self.database_authority
+                .lock()
+                .map_err(|_| BeadsError::SyncConflict {
+                    message: "Database inode authority state was poisoned".to_string(),
+                })?;
+        let Some(database_lock) = database_authority.lock.as_ref() else {
+            return Ok(DatabaseTargetAuthorityState::Foreign);
+        };
+        let retained_identity = authority_file_identity(
+            database_lock,
+            &self.canonical_database_path,
+            "retained database recovery authority",
+            &database_path_descriptor(&self.canonical_database_path),
+        )?;
+        if database_authority.identity == Some(retained_identity)
+            && retained_identity == target_identity
+        {
+            Ok(DatabaseTargetAuthorityState::Held)
+        } else {
+            Ok(DatabaseTargetAuthorityState::Foreign)
+        }
     }
 
     /// Verify that a fresh-replacement witness still names this authority and

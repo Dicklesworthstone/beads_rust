@@ -746,6 +746,7 @@ struct RecoveryBackupSet {
     db_path: PathBuf,
     recovery_dir: PathBuf,
     stamp: String,
+    had_original_database: bool,
     files: Vec<RecoveryBackupPath>,
     verified_files: Vec<RecoveryBackupVerification>,
 }
@@ -2917,6 +2918,7 @@ fn prepare_missing_database_cleanup_for_recovery(
         db_path: db_path.to_path_buf(),
         recovery_dir,
         stamp,
+        had_original_database: false,
         files: Vec::new(),
         verified_files: Vec::new(),
     })
@@ -2939,10 +2941,12 @@ fn move_database_family_to_recovery(
         MissingRenameSourcePolicy::Skip,
     )?;
 
+    let had_original_database = files.iter().any(|(original, _)| original == db_path);
     Ok(RecoveryBackupSet {
         db_path: db_path.to_path_buf(),
         recovery_dir,
         stamp: stamp.to_string(),
+        had_original_database,
         files,
         verified_files,
     })
@@ -9921,6 +9925,7 @@ routing:
             db_path: db_path.clone(),
             recovery_dir: recovery_dir.clone(),
             stamp: "fixed-stamp".to_string(),
+            had_original_database: true,
             files: vec![(wal_path.clone(), wal_backup_file.clone())],
             verified_files: Vec::new(),
         })
