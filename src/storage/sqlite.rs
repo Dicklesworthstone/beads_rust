@@ -1505,7 +1505,6 @@ impl BlockedCacheRefreshPlan {
 enum ReadyIssueProjection {
     Full,
     Command,
-    StructuredCommand,
     Summary,
 }
 
@@ -1589,14 +1588,6 @@ impl ReadyIssueProjection {
                          issue_type, assignee, owner, estimated_minutes, created_at, created_by,
                          updated_at"
             }
-            Self::StructuredCommand => {
-                r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
-                         issue_type, assignee, owner, estimated_minutes, created_at, created_by,
-                         updated_at,
-                         (SELECT json_group_array(label ORDER BY label)
-                          FROM labels
-                          WHERE labels.issue_id = issues.id)"
-            }
             Self::Summary => {
                 r"SELECT id, title, status, priority, issue_type, created_at, updated_at"
             }
@@ -1607,7 +1598,6 @@ impl ReadyIssueProjection {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
-            Self::StructuredCommand => SqliteStorage::structured_ready_issue_from_row(row),
             Self::Summary => SqliteStorage::command_summary_issue_from_row(row),
         }
     }
@@ -9232,28 +9222,6 @@ impl SqliteStorage {
         self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Command)
     }
 
-    /// Get ready issues with labels projected for structured command output.
-    ///
-    /// This ready-only projection attaches each issue's ordered labels through
-    /// a cardinality-neutral scalar aggregate. It avoids the separate dynamic
-    /// `IN (...)` label query while preserving the shared command projection
-    /// used by scheduler and coordination callers.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the database query or label JSON decoding fails.
-    pub fn get_ready_structured_issues_for_command_output(
-        &self,
-        filters: &ReadyFilters,
-        sort: ReadySortPolicy,
-    ) -> Result<Vec<Issue>> {
-        self.get_ready_issues_with_projection(
-            filters,
-            sort,
-            ReadyIssueProjection::StructuredCommand,
-        )
-    }
-
     /// Get ready issues optimized for compact text command rendering.
     ///
     /// Hydrates only the columns read by ready text/table output and ordering.
@@ -15162,18 +15130,6 @@ impl SqliteStorage {
             dependencies: vec![],
             comments: vec![],
         })
-    }
-
-    fn structured_ready_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
-        let mut issue = Self::ready_issue_from_row(row)?;
-        let labels_json = row.get(14).and_then(SqliteValue::as_text).unwrap_or("[]");
-        issue.labels = serde_json::from_str(labels_json).map_err(|error| {
-            BeadsError::Config(format!(
-                "Malformed structured-ready labels JSON for {}: {error}",
-                issue.id
-            ))
-        })?;
-        Ok(issue)
     }
 
     fn blocked_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
@@ -27161,76 +27117,6 @@ mod tests {
             .collect();
 
         assert_eq!(projected, full);
-    }
-
-    #[test]
-    fn test_ready_structured_projection_preserves_labels_and_unlabeled_rows() {
-        let mut storage = SqliteStorage::open_memory().unwrap();
-        let created_at = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
-
-        for (id, offset) in [
-            ("bd-ready-unlabeled", 0),
-            ("bd-ready-one-label", 1),
-            ("bd-ready-many-labels", 2),
-        ] {
-            let issue = make_issue(
-                id,
-                id,
-                Status::Open,
-                1,
-                None,
-                created_at + chrono::Duration::seconds(offset),
-                None,
-            );
-            storage.create_issue(&issue, "tester").unwrap();
-        }
-
-        storage
-            .add_label("bd-ready-one-label", "one.label", "tester")
-            .unwrap();
-        for label in ["zeta", "punct,:[]\"\\\n", "alpha"] {
-            storage
-                .conn
-                .execute_with_params(
-                    "INSERT INTO labels (issue_id, label) VALUES (?, ?)",
-                    &[
-                        SqliteValue::from("bd-ready-many-labels"),
-                        SqliteValue::from(label),
-                    ],
-                )
-                .unwrap();
-        }
-
-        let project = |storage: &SqliteStorage| {
-            storage
-                .get_ready_structured_issues_for_command_output(
-                    &ReadyFilters::default(),
-                    ReadySortPolicy::Priority,
-                )
-                .unwrap()
-                .into_iter()
-                .map(|issue| (issue.id, issue.labels))
-                .collect::<HashMap<_, _>>()
-        };
-
-        let projected = project(&storage);
-        assert_eq!(projected.len(), 3, "unlabeled issues must be retained");
-        assert_eq!(projected["bd-ready-unlabeled"], Vec::<String>::new());
-        assert_eq!(projected["bd-ready-one-label"], ["one.label"]);
-        assert_eq!(
-            projected["bd-ready-many-labels"],
-            ["alpha", "punct,:[]\"\\\n", "zeta"]
-        );
-
-        storage
-            .conn
-            .execute("DROP TABLE blocked_issues_cache")
-            .unwrap();
-        assert_eq!(
-            project(&storage),
-            projected,
-            "stale-cache fallback must use the same structured projection"
-        );
     }
 
     #[test]

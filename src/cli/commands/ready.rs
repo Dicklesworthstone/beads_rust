@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_ready_output_uses_label_projection_without_changing_text_projection() {
+    fn structured_ready_output_uses_batched_label_hydration_without_changing_text_projection() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         for id in ["bd-ready-labeled", "bd-ready-unlabeled"] {
             let issue = crate::model::Issue {
@@ -430,13 +430,14 @@ mod tests {
             .unwrap();
 
         for format in [OutputFormat::Json, OutputFormat::Toon] {
-            let issues = get_ready_issues_for_output(
+            let mut issues = get_ready_issues_for_output(
                 &storage,
                 &ReadyFilters::default(),
                 ReadySortPolicy::Priority,
                 format,
             )
             .unwrap();
+            hydrate_ready_labels(&storage, &mut issues).unwrap();
             assert_eq!(
                 issues.len(),
                 2,
