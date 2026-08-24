@@ -951,12 +951,11 @@ impl DatabaseFamilyWriteLock {
     /// The caller keeps the replacement inode locked across the rename, so
     /// hard-link aliases never observe the new inode without its authority.
     pub(crate) fn adopt_locked_database_replacement(&self, replacement_lock: File) -> Result<()> {
-        self.verify_common_authority()?;
-        let replacement_identity = verify_locked_file_identity(
+        let replacement_identity = authority_file_identity(
             &replacement_lock,
             &self.canonical_database_path,
             "installed database replacement authority",
-            true,
+            &database_path_descriptor(&self.canonical_database_path),
         )?;
         let mut database_authority =
             self.database_authority
@@ -969,7 +968,10 @@ impl DatabaseFamilyWriteLock {
         }
         database_authority.identity = Some(replacement_identity);
         drop(database_authority);
-        Ok(())
+        // Record the pre-locked inode first: if the post-rename route or
+        // identity check fails, the installed generation remains retained
+        // instead of silently losing its authority.
+        self.verify_database_authority()
     }
 
     /// Clear the inode component after an authorized rollback restores the

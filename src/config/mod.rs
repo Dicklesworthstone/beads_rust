@@ -1922,17 +1922,28 @@ fn recovery_restore_failure(
 }
 
 fn rollback_renamed_paths(renamed_paths: &[RecoveryBackupPath], operation: &str) -> Result<()> {
+    let mut first_sync_error = None;
     for (original, renamed) in renamed_paths.iter().rev() {
-        crate::util::durable_rename(renamed, original).with_context(|| {
+        fs::rename(renamed, original).with_context(|| {
             format!(
                 "Failed to roll back {operation}: restore '{}' from '{}'",
                 original.display(),
                 renamed.display()
             )
         })?;
+        if let Err(error) = crate::util::sync_rename_parent_directories(renamed, original)
+            && first_sync_error.is_none()
+        {
+            first_sync_error = Some(BeadsError::WithContext {
+                context: format!(
+                    "Rolled back {operation}, but failed to make the restored namespace durable"
+                ),
+                source: Box::new(error),
+            });
+        }
     }
 
-    Ok(())
+    first_sync_error.map_or(Ok(()), Err)
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -2106,7 +2117,7 @@ where
             }
         }
 
-        if let Err(rename_err) = crate::util::durable_rename(&original, &renamed) {
+        if let Err(rename_err) = fs::rename(&original, &renamed) {
             if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
                 warn!(
                     operation,
@@ -2122,7 +2133,23 @@ where
             return Err(rename_err.into());
         }
 
-        renamed_paths.push((original, renamed));
+        renamed_paths.push((original.clone(), renamed.clone()));
+        if let Err(sync_err) = crate::util::sync_rename_parent_directories(&original, &renamed) {
+            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Completed a namespace rename while attempting to {operation}, but parent-directory sync failed ({sync_err}); rollback also failed"
+                    ),
+                    source: Box::new(rollback_err),
+                });
+            }
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Completed and rolled back a namespace rename while attempting to {operation}, but parent-directory sync failed"
+                ),
+                source: Box::new(sync_err),
+            });
+        }
     }
 
     Ok(renamed_paths)
@@ -2187,7 +2214,7 @@ where
             }
         };
 
-        if let Err(rename_err) = crate::util::durable_rename(&original, &renamed) {
+        if let Err(rename_err) = fs::rename(&original, &renamed) {
             if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
                 warn!(
                     operation,
@@ -2204,6 +2231,22 @@ where
         }
 
         renamed_paths.push((original.clone(), renamed.clone()));
+        if let Err(sync_err) = crate::util::sync_rename_parent_directories(&original, &renamed) {
+            if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
+                return Err(BeadsError::WithContext {
+                    context: format!(
+                        "Completed a namespace rename while attempting to {operation}, but parent-directory sync failed ({sync_err}); rollback also failed"
+                    ),
+                    source: Box::new(rollback_err),
+                });
+            }
+            return Err(BeadsError::WithContext {
+                context: format!(
+                    "Completed and rolled back a namespace rename while attempting to {operation}, but parent-directory sync failed"
+                ),
+                source: Box::new(sync_err),
+            });
+        }
         if let Err(verify_err) = verify_recovery_backup_artifact(&renamed, &fingerprint) {
             if let Err(rollback_err) = rollback_renamed_paths(&renamed_paths, operation) {
                 return Err(BeadsError::WithContext {
@@ -2760,7 +2803,7 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     // up AFTER the rename so any error there doesn't roll back the
     // successful swap — stale `-wal`/`-shm` left alongside a clean DB
     // are recovered automatically on next open.
-    if let Err(err) = crate::util::durable_rename(&temp_path, db_path) {
+    if let Err(err) = fs::rename(&temp_path, db_path) {
         tracing::warn!(
             error = %err,
             temp_path = %temp_path.display(),
@@ -2787,6 +2830,15 @@ fn compact_database_via_vacuum_into_in_place_with_reopener(
     }
     write_authority.adopt_locked_database_replacement(replacement_lock)?;
     write_authority.verify_database_authority()?;
+    if let Err(error) = crate::util::sync_rename_parent_directories(&temp_path, db_path) {
+        return Err(BeadsError::WithContext {
+            context: format!(
+                "Installed the compacted database at '{}' under retained inode authority, but failed to make the namespace replacement durable",
+                db_path.display()
+            ),
+            source: Box::new(error),
+        });
+    }
 
     // Clean up the stale sidecars from the pre-compaction file. These
     // describe a DIFFERENT file layout than the one we just installed, so
@@ -2914,13 +2966,30 @@ fn prepare_missing_database_cleanup_for_recovery(
     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
+    // A missing main database can still have stale engine sidecars. Preserve
+    // those artifacts for inspection, but never include the canonical DB path
+    // in this rename batch: a non-cooperating writer may create it after the
+    // authority's missing-path witness, and only the atomic no-replace install
+    // is allowed to decide which generation owns that namespace entry.
+    let (files, verified_files) = rename_existing_paths_with_backup_verification(
+        database_family_paths(db_path)
+            .into_iter()
+            .skip(1)
+            .map(|original| {
+                let backup =
+                    recovery_dir.join(recovery_backup_filename(&original, &stamp, "bak"));
+                (original, backup)
+            }),
+        "move orphaned database sidecars into recovery",
+        MissingRenameSourcePolicy::Skip,
+    )?;
     Ok(RecoveryBackupSet {
         db_path: db_path.to_path_buf(),
         recovery_dir,
         stamp,
         had_original_database: false,
-        files: Vec::new(),
-        verified_files: Vec::new(),
+        files,
+        verified_files,
     })
 }
 

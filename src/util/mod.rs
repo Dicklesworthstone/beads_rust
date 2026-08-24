@@ -158,6 +158,17 @@ pub fn durable_rename(from: &Path, to: &Path) -> io::Result<()> {
     durable_rename_with_parent_sync(from, to, sync_directory)
 }
 
+/// Fsync both parent directories after a rename whose namespace mutation has
+/// already succeeded.
+///
+/// Callers that maintain rollback or inode-authority bookkeeping should use a
+/// plain `fs::rename`, record the successful namespace change, and then call
+/// this function. That ordering keeps a post-rename fsync error distinguishable
+/// from a rename that never happened.
+pub(crate) fn sync_rename_parent_directories(from: &Path, to: &Path) -> io::Result<()> {
+    sync_rename_parent_directories_with(from, to, sync_directory)
+}
+
 fn durable_rename_with_parent_sync<F>(from: &Path, to: &Path, sync_dir: F) -> io::Result<()>
 where
     F: FnMut(&Path) -> io::Result<()>,

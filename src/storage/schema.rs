@@ -11,22 +11,14 @@ use crate::util::content_hash_from_parts;
 pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 
-const fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        index += 1;
-    }
-    hash
-}
-
-// Conservatively invalidate persisted fast-open witnesses whenever this schema
-// module changes. Deriving the token from the implementation itself prevents a
-// new runtime compatibility predicate from accidentally trusting witnesses
-// minted by an older predicate because somebody forgot a manual revision bump.
-const RUNTIME_SCHEMA_CONTRACT_TOKEN: u64 = fnv1a_64(include_bytes!("schema.rs"));
+// Persisted witnesses are valid only for this exact compatibility predicate.
+// Keep this short, descriptive token in lockstep with any predicate expansion
+// or semantic change. Hashing this entire 200+ KiB module in a `const fn`
+// caused rustc to interpret hundreds of thousands of loop iterations on every
+// schema rebuild, overwhelming the compile-time savings of the runtime fast
+// path itself.
+const RUNTIME_SCHEMA_CONTRACT_TOKEN: &str =
+    "v2-exact-columns-fks-indexes-history-autoincrement-cookie-fenced";
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -2249,7 +2241,7 @@ pub(crate) fn attest_runtime_schema_cookie(conn: &Connection) -> Result<i64> {
 
 fn runtime_schema_witness_value(cookie: i64) -> String {
     format!(
-        "schema-{CURRENT_SCHEMA_VERSION}.contract-{RUNTIME_SCHEMA_CONTRACT_TOKEN:016x}.cookie-{cookie}"
+        "schema-{CURRENT_SCHEMA_VERSION}.contract-{RUNTIME_SCHEMA_CONTRACT_TOKEN}.cookie-{cookie}"
     )
 }
 
