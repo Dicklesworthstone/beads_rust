@@ -1003,19 +1003,29 @@ fn has_non_ok(checks: &[CheckResult]) -> bool {
         .any(|check| !matches!(check.status, CheckStatus::Ok))
 }
 
-/// Inspect pending sync-merge metadata through a current-schema read-only
-/// connection and one coherent read transaction.
+/// Result of an advisory pending-merge inspection that retains the exact
+/// current-schema read-only storage handle used for classification.
+#[derive(Debug)]
+pub struct PendingSyncMergeReadOnlyInspection {
+    pub state: Option<PendingSyncMergeState>,
+    pub storage: SqliteStorage,
+}
+
+/// Inspect pending sync-merge metadata and retain the read-only storage handle
+/// that produced the classification.
 ///
-/// This is an advisory inspection for doctor reporting and startup warnings.
-/// Mutation gates must use [`inspect_pending_sync_merge_under_authority`].
-/// Missing databases, stale/future schemas, open failures, and query failures
-/// are errors rather than being mistaken for the safe absent state.
+/// The path-shape and schema checks intentionally match
+/// [`inspect_pending_sync_merge_at_path`]. Callers may reuse `storage` for a
+/// subsequent read-only command, avoiding a second open without weakening the
+/// advisory classification.
 ///
 /// # Errors
 ///
 /// Returns an error if the database family cannot be inspected from a stable
 /// snapshot.
-pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<PendingSyncMergeState>> {
+pub fn inspect_pending_sync_merge_at_path_retaining_storage(
+    db_path: &Path,
+) -> Result<PendingSyncMergeReadOnlyInspection> {
     match fs::symlink_metadata(db_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(BeadsError::SyncConflict {
@@ -1061,9 +1071,24 @@ pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<Pendi
             ),
         }
     })?;
-    Ok(PendingSyncMergeState::from_inspection(
-        storage.inspect_pending_sync_merge()?,
-    ))
+    let state = PendingSyncMergeState::from_inspection(storage.inspect_pending_sync_merge()?);
+    Ok(PendingSyncMergeReadOnlyInspection { state, storage })
+}
+
+/// Inspect pending sync-merge metadata through a current-schema read-only
+/// connection and one coherent read transaction.
+///
+/// This is an advisory inspection for doctor reporting and startup warnings.
+/// Mutation gates must use [`inspect_pending_sync_merge_under_authority`].
+/// Missing databases, stale/future schemas, open failures, and query failures
+/// are errors rather than being mistaken for the safe absent state.
+///
+/// # Errors
+///
+/// Returns an error if the database family cannot be inspected from a stable
+/// snapshot.
+pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<PendingSyncMergeState>> {
+    Ok(inspect_pending_sync_merge_at_path_retaining_storage(db_path)?.state)
 }
 
 /// Inspect pending sync-merge metadata while the caller holds inode-bound
@@ -14109,11 +14134,15 @@ mod tests {
     fn pending_sync_merge_read_only_inspector_accepts_valid_v2_receipt() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("beads.db");
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            create_sample_issue(&mut storage, "bd-retained", "retained handle sentinel");
+        }
         let receipt = install_valid_pending_merge_receipt(&db_path);
 
-        let state = inspect_pending_sync_merge_at_path(&db_path)
-            .expect("inspect pending receipt")
-            .expect("pending receipt must be visible");
+        let inspection = inspect_pending_sync_merge_at_path_retaining_storage(&db_path)
+            .expect("inspect and retain pending receipt storage");
+        let state = inspection.state.expect("pending receipt must be visible");
 
         assert_eq!(state.condition, PendingSyncMergeCondition::Valid);
         assert_eq!(
@@ -14123,6 +14152,40 @@ mod tests {
         assert_eq!(state.phase.as_deref(), Some("database_committed"));
         assert_eq!(state.resolution.as_deref(), Some("manual"));
         assert_eq!(state.expected_jsonl_issue_count, Some(0));
+        assert!(
+            inspection
+                .storage
+                .get_issue("bd-retained")
+                .expect("query retained storage")
+                .is_some(),
+            "the exact storage handle that classified the receipt must remain usable"
+        );
+    }
+
+    #[test]
+    fn pending_sync_merge_retaining_inspector_preserves_absent_classification_and_bytes() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let before = database_family_bytes(&db_path);
+
+        let inspection = inspect_pending_sync_merge_at_path_retaining_storage(&db_path)
+            .expect("inspect current-schema database without receipt");
+
+        assert!(
+            inspection.state.is_none(),
+            "exact absence of both receipt keys must stay classified as absent"
+        );
+        assert_eq!(
+            inspection.storage.count_issues().unwrap(),
+            0,
+            "retained classification handle must support the subsequent read"
+        );
+        assert_eq!(
+            database_family_bytes(&db_path),
+            before,
+            "retaining the read-only handle must not change DB/WAL/SHM/journal bytes"
+        );
     }
 
     #[test]
