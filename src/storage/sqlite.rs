@@ -10974,6 +10974,27 @@ impl SqliteStorage {
             return Ok(true);
         }
 
+        if blocking_only {
+            // The epic-parent join below is disproportionately expensive in
+            // fsqlite even when the external-child range is empty. Guard that
+            // common case with the same indexed prefix probe first.
+            let rows = self.conn.query(
+                "SELECT 1
+                 FROM dependencies INDEXED BY idx_dependencies_issue
+                 WHERE issue_id >= 'external:'
+                   AND issue_id < 'external;'
+                   AND type = 'parent-child'
+                 LIMIT 1",
+            )?;
+            if rows.is_empty() {
+                // Preserve the old join's fail-closed schema validation: a
+                // malformed issues table must still surface as a query error.
+                self.conn
+                    .query("SELECT id, issue_type FROM issues LIMIT 0")?;
+                return Ok(false);
+            }
+        }
+
         let parent_sql = if blocking_only {
             "SELECT 1
              FROM dependencies d INDEXED BY idx_dependencies_issue
@@ -22405,6 +22426,87 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, BeadsError::Validation { field, .. } if field == "depends_on_id"));
+    }
+
+    #[test]
+    fn test_has_external_dependencies_preserves_empty_direct_and_malformed_target_semantics() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 3, 0, 0, 0).unwrap();
+        let issue = make_issue("bd-direct", "Direct", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        assert!(!storage.has_external_dependencies(true).unwrap());
+        assert!(!storage.has_external_dependencies(false).unwrap());
+
+        storage
+            .add_dependency("bd-direct", "external:project:related", "related", "tester")
+            .unwrap();
+        assert!(!storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+
+        storage
+            .add_dependency(
+                "bd-direct",
+                "external::malformed-project",
+                "blocks",
+                "tester",
+            )
+            .unwrap();
+        assert!(storage.has_external_dependencies(true).unwrap());
+    }
+
+    #[test]
+    fn test_has_external_dependencies_checks_all_external_parent_child_candidates() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 7, 4, 0, 0, 0).unwrap();
+        let task_parent = make_issue(
+            "bd-task-parent",
+            "Task parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        let mut epic_parent = make_issue(
+            "bd-epic-parent",
+            "Epic parent",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        epic_parent.issue_type = IssueType::Epic;
+        storage.create_issue(&task_parent, "tester").unwrap();
+        storage.create_issue(&epic_parent, "tester").unwrap();
+
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:aaa:task-child",
+            "bd-task-parent",
+            t1,
+        );
+        insert_external_parent_child_dependency(
+            &storage,
+            "external::malformed-epic-child",
+            "bd-epic-parent",
+            t1,
+        );
+
+        assert!(storage.has_external_dependencies(true).unwrap());
+        assert!(storage.has_external_dependencies(false).unwrap());
+    }
+
+    #[test]
+    fn test_has_external_dependencies_propagates_guard_index_errors() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .conn
+            .execute("DROP INDEX idx_dependencies_issue")
+            .unwrap();
+
+        assert!(storage.has_external_dependencies(true).is_err());
     }
 
     #[test]
