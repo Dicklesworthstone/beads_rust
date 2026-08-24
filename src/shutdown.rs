@@ -202,6 +202,12 @@ fn install_unix() {
 /// on this path anyway (they don't under `std::process::exit` either), so
 /// the only cleanup we owe here is flushing the std stream buffers, which
 /// this function does on every platform before exiting.
+// The single `unsafe` block below is the `#439` Windows `TerminateProcess`
+// carve-out sanctioned in Cargo.toml's `[lints.rust]` note (alongside
+// `sync::db_inode_lock` and `restore_default_sigpipe_unix`); without this
+// attribute the crate-level `#![deny(unsafe_code)]` fails every
+// `x86_64-pc-windows-msvc` build.
+#[allow(unsafe_code)]
 pub fn exit_process(code: i32) -> ! {
     use std::io::Write as _;
     let _ = std::io::stdout().flush();

@@ -227,11 +227,12 @@ self_update = [
 # `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
 
 [lints.rust]
-# Deny (not forbid): two sanctioned `#[allow(unsafe_code)]` carve-outs exist —
+# Deny (not forbid): three sanctioned `#[allow(unsafe_code)]` carve-outs exist —
 # `sync::db_inode_lock` for the SQLite-compatible database-inode range lock
 # (no safe wrapper exists on macOS/Windows, GitHub #412) and
 # `shutdown::restore_default_sigpipe_unix` for the one-line `signal(SIGPIPE,
-# SIG_DFL)` that keeps `br list | head` from aborting (GitHub #434).
+# SIG_DFL)` that keeps `br list | head` from aborting (GitHub #434), and
+# `shutdown::exit_process` for the Windows `TerminateProcess` exit path (#439).
 unsafe_code = "deny"
 
 [lints.clippy]
