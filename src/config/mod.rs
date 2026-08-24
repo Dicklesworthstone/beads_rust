@@ -4303,6 +4303,14 @@ fn import_config_for_resolved_jsonl(
         allow_external_jsonl: explicit_allow_external_jsonl
             || implicit_external_jsonl_allowed(beads_dir, db_path, jsonl_path),
         show_progress: false,
+        // Every caller re-ingests the workspace's own resolved sidecar
+        // (rebuild/recovery/bootstrap), never a foreign JSONL. The configured
+        // prefix is the default for NEW ids, not a project-wide invariant, so
+        // mixed-prefix workspaces (e.g. migrated legacy `<project>-<n>` ids)
+        // must round-trip untouched — matching auto-import and reconcile.
+        // Validating here made every automatic recovery fail with "Prefix
+        // mismatch" on such workspaces (GitHub #440).
+        skip_prefix_validation: true,
         ..Default::default()
     }
 }
