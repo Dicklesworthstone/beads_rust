@@ -1270,13 +1270,7 @@ pub fn blocking_database_family_write_lock_with_timeout(
                 });
             }
         }
-        (None, None) => {
-            if fs::symlink_metadata(&canonical_after).is_ok() {
-                return Err(BeadsError::SyncConflict {
-                    message: "Database appeared while acquiring its write authority".to_string(),
-                });
-            }
-        }
+        (None, None) => verify_database_authority_path_still_missing(&canonical_after)?,
         _ => unreachable!("database inode authority lock and identity must be paired"),
     }
     Ok(DatabaseFamilyWriteLock {
@@ -1454,6 +1448,7 @@ fn authority_file_identity(
     {
         use std::os::unix::fs::MetadataExt;
 
+        let _ = authority_path;
         Ok((metadata.dev(), metadata.ino()))
     }
     #[cfg(windows)]
@@ -1531,6 +1526,19 @@ fn verify_locked_file_identity(
         )));
     }
     Ok(opened)
+}
+
+fn verify_database_authority_path_still_missing(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(BeadsError::SyncConflict {
+            message: "Database appeared while acquiring its write authority".to_string(),
+        }),
+        Err(error) => Err(BeadsError::Config(format!(
+            "Could not re-inspect missing database authority {}: {error}",
+            database_path_descriptor(path)
+        ))),
+    }
 }
 
 fn write_lock_timeout_error(lock_path_display: &str, role: &str, timeout_ms: u64) -> BeadsError {
@@ -14991,6 +14999,16 @@ mod tests {
         );
         assert_eq!(fs::read(&target).unwrap(), b"concurrent generation");
         assert_eq!(fs::read(&candidate).unwrap(), b"candidate generation");
+    }
+
+    #[test]
+    fn missing_database_authority_witness_propagates_non_not_found_errors() {
+        let error = verify_database_authority_path_still_missing(Path::new("invalid\0database"))
+            .expect_err("invalid path errors must not be classified as stable absence");
+        assert!(
+            matches!(&error, BeadsError::Config(_)),
+            "non-NotFound inspection failure must fail closed: {error}"
+        );
     }
 
     #[cfg(windows)]

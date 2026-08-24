@@ -2400,19 +2400,12 @@ impl SqliteStorage {
     }
 
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
-        // Current-version databases created by the pre-#398 reviewed
-        // migration could lack the v16/v17 capacity tables while retaining
-        // the current version stamp. Keep the common fast path to one
-        // nonmutating statement, but validate every column used at runtime so
-        // those historical databases fall back to the full schema healer.
-        self.conn
-            .query_row(
-                "SELECT
-                    EXISTS(SELECT issue_id, capacity_kind, capacity_name FROM capacity_exemptions LIMIT 0),
-                    EXISTS(SELECT issue_id, capacity_kind, capacity_name, action FROM capacity_exemption_history LIMIT 0),
-                    EXISTS(SELECT issue_id, actor, harness, session FROM capacity_occupancy LIMIT 0)",
-            )
-            .is_ok()
+        // A current version stamp is not a complete runtime witness: reviewed
+        // migrations and interrupted/manual repairs can leave any required
+        // table, column, or index absent without changing that stamp. Use the
+        // same authoritative compatibility contract as ordinary open so a
+        // fast read never bypasses the existing schema healer.
+        runtime_schema_compatible(&self.conn)
     }
 
     /// Open an existing current-schema database for a token-bound recovery write.
@@ -28337,10 +28330,7 @@ mod tests {
 
         {
             let storage = SqliteStorage::open(&db_path).unwrap();
-            storage
-                .conn
-                .execute("DROP TABLE capacity_occupancy")
-                .unwrap();
+            storage.conn.execute("DROP TABLE labels").unwrap();
             assert_eq!(
                 connection_user_version(&storage.conn),
                 Some(u32::try_from(CURRENT_SCHEMA_VERSION).unwrap()),
@@ -32368,7 +32358,9 @@ mod tests {
             )
             .unwrap();
 
-        let readiness = storage.ready_readiness_probe(false).unwrap();
+        let readiness = storage
+            .ready_readiness_probe(&ReadyFilters::default())
+            .unwrap();
 
         assert!(readiness.has_candidate_status);
         assert!(

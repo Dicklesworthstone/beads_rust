@@ -6,6 +6,7 @@
 
 mod common;
 
+use beads_rust::franken_sync::Connection;
 use common::cli::{BrRun, BrWorkspace, parse_created_id, run_br, run_br_with_env};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
@@ -310,13 +311,14 @@ fn run_command(workspace: &BrWorkspace, command: &MatrixCommand, disable_fast_op
         );
     }
 
-    // The read-only fast path is opt-in: it is only selected when the caller
-    // has also waived auto-import and auto-flush, since both of those write.
-    // Ask for it explicitly rather than relying on the bare command happening
-    // to avoid the workspace write lock.
-    let mut args: Vec<&str> = vec!["--no-auto-import", "--no-auto-flush"];
-    args.extend(command.args.iter().map(String::as_str));
-    run_br(workspace, args, &format!("{}_fast", command.label))
+    // Exercise the default synchronized-probe path. Individual matrix entries
+    // carry explicit opt-outs only when that command intentionally owns a
+    // separate auto-import contract (currently bare `orphans`).
+    run_br(
+        workspace,
+        command.args.iter().map(String::as_str),
+        &format!("{}_fast", command.label),
+    )
 }
 
 fn assert_outputs_match(command: &MatrixCommand, fast: &BrRun, conservative: &BrRun) {
@@ -445,6 +447,61 @@ fn cli_read_only_fast_open_fails_when_the_authoritative_jsonl_probe_fails() {
     assert!(
         combined.contains("jsonl") || combined.contains("sync path"),
         "probe failure should identify the rejected JSONL path: {combined}"
+    );
+}
+
+#[test]
+fn cli_fast_open_healing_reuses_its_authority_for_a_newer_jsonl_import() {
+    let _log =
+        common::test_log("cli_fast_open_healing_reuses_its_authority_for_a_newer_jsonl_import");
+    let workspace = BrWorkspace::new();
+    run_success(&workspace, &["init"], "init");
+    let issue_id = create_issue(
+        &workspace,
+        &["create", "Database-side title"],
+        "create_issue",
+    );
+
+    let db_path = workspace.root.join(".beads/beads.db");
+    let connection =
+        Connection::open(db_path.to_string_lossy().into_owned()).expect("open database fixture");
+    connection
+        .execute("DROP TABLE capacity_occupancy")
+        .expect("make the current-version runtime schema incomplete");
+    connection.close().expect("close database fixture");
+
+    let jsonl_path = workspace.root.join(".beads/issues.jsonl");
+    let contents = fs::read_to_string(&jsonl_path).expect("read current JSONL");
+    let rewritten = contents
+        .lines()
+        .map(|line| {
+            let mut issue: Value = serde_json::from_str(line).expect("parse JSONL issue");
+            if issue["id"].as_str() == Some(issue_id.as_str()) {
+                issue["title"] = Value::String("JSONL-side title".to_string());
+                issue["updated_at"] = Value::String("2099-01-01T00:00:00Z".to_string());
+                issue["content_hash"] = Value::Null;
+            }
+            serde_json::to_string(&issue).expect("serialize JSONL issue")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&jsonl_path, format!("{rewritten}\n")).expect("write newer JSONL");
+
+    let run = run_br(
+        &workspace,
+        ["--lock-timeout", "50", "list", "--json"],
+        "heal_then_import",
+    );
+    assert!(
+        run.status.success(),
+        "fast-open healing must reuse its retained authority for auto-import\nstdout:\n{}\nstderr:\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stdout.contains("JSONL-side title"),
+        "the newer JSONL generation must be imported: {}",
+        run.stdout
     );
 }
 

@@ -403,8 +403,13 @@ fn main() {
             &paths.db_path,
             &paths.jsonl_path,
         );
-        let mut auto_import_write_lock = None;
-        if !ctx.overrides.read_only_fast_open && write_lock.is_none() {
+        let mut auto_import_write_lock = storage_result
+            .as_ref()
+            .and_then(config::OpenStorageResult::retained_database_write_authority);
+        if !ctx.overrides.read_only_fast_open
+            && write_lock.is_none()
+            && auto_import_write_lock.is_none()
+        {
             let lock_timeout = ctx.write_lock_timeout();
             auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
                 beads_rust::sync::blocking_database_family_write_lock_with_timeout(
@@ -440,7 +445,10 @@ fn main() {
         };
 
         if should_attempt_auto_import {
-            if ctx.overrides.read_only_fast_open && write_lock.is_none() {
+            if ctx.overrides.read_only_fast_open
+                && write_lock.is_none()
+                && auto_import_write_lock.is_none()
+            {
                 let lock_timeout = ctx.write_lock_timeout();
                 auto_import_write_lock = match ctx.beads_dir.as_deref().map(|beads_dir| {
                     beads_rust::sync::blocking_database_family_write_lock_with_timeout(
@@ -493,11 +501,40 @@ fn main() {
             if ctx.overrides.read_only_fast_open {
                 let mut writable_overrides = ctx.overrides.clone();
                 writable_overrides.read_only_fast_open = false;
-                if let Some(authority) = auto_import_write_lock.as_ref().or(write_lock.as_ref()) {
-                    writable_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
-                }
+                let authority = auto_import_write_lock
+                    .as_ref()
+                    .or(write_lock.as_ref())
+                    .unwrap_or_else(|| {
+                        handle_error(
+                            &BeadsError::SyncConflict {
+                                message: "Writable fast-open reopen has no database-family authority"
+                                    .to_string(),
+                            },
+                            json_error_mode,
+                            color_error_mode,
+                        )
+                    });
+                writable_overrides.mark_database_family_lock_held(&paths.beads_dir, authority);
+                let frozen_startup = storage_result
+                    .as_ref()
+                    .map(config::OpenStorageResult::retained_startup_config)
+                    .unwrap_or_else(|| {
+                        handle_error(
+                            &BeadsError::SyncConflict {
+                                message: "Writable fast-open reopen lost its startup snapshot"
+                                    .to_string(),
+                            },
+                            json_error_mode,
+                            color_error_mode,
+                        )
+                    });
                 drop(storage_result.take());
-                match config::open_storage_with_cli(&paths.beads_dir, &writable_overrides) {
+                match config::open_storage_with_startup_config_under_write_lock(
+                    frozen_startup,
+                    &writable_overrides,
+                    false,
+                    authority,
+                ) {
                     Ok(writable_res) => storage_result = Some(writable_res),
                     Err(e) => handle_error(&e, json_error_mode, color_error_mode),
                 }
@@ -1367,12 +1404,24 @@ fn reopen_and_reprobe_fast_open_auto_import_under_authority(
 
     // The pre-lock read-only connection may refer to an inode that a writer
     // replaced while this process waited for authority. Never make a
-    // post-lock freshness decision through that orphaned handle.
+    // post-lock freshness decision through that orphaned handle. Retain the
+    // original startup snapshot so config drift cannot mix DB and JSONL
+    // routing generations during the protected reopen.
+    let frozen_startup = storage_result
+        .as_ref()
+        .map(config::OpenStorageResult::retained_startup_config)
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "Canonical fast-open storage disappeared before its protected reopen"
+                .to_string(),
+        })?;
     drop(storage_result.take());
-    *storage_result = Some(config::open_storage_with_cli(
-        &paths.beads_dir,
+    let reopened = config::open_storage_with_startup_config_under_write_lock(
+        frozen_startup,
         &canonical_overrides,
-    )?);
+        false,
+        authority,
+    )?;
+    *storage_result = Some(reopened);
 
     if let Some(state) =
         inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority)?
@@ -3147,6 +3196,63 @@ mod tests {
             Some("replacement"),
             "the protected reprobe must replace the pre-lock orphaned handle"
         );
+    }
+
+    #[test]
+    fn fast_open_import_reprobe_retains_frozen_jsonl_route_during_metadata_drift() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let metadata_path = beads_dir.join("metadata.json");
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"first.jsonl"}"#,
+        )
+        .expect("write initial metadata");
+
+        let bootstrap = config::open_storage_with_cli(&beads_dir, &config::CliOverrides::default())
+            .expect("bootstrap storage");
+        let paths = bootstrap.paths.clone();
+        drop(bootstrap);
+        fs::write(&paths.jsonl_path, b"{\"id\":\"br-route-drift\"}\n")
+            .expect("write first routed JSONL");
+
+        let fast_overrides = build_cli_overrides(&Cli::parse_from(["br", "ready"]));
+        let mut fast_storage =
+            Some(config::open_storage_with_cli(&beads_dir, &fast_overrides).expect("fast storage"));
+        let authority = Arc::new(
+            beads_rust::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &paths.db_path,
+                Some(1_000),
+            )
+            .expect("database authority"),
+        );
+        fs::write(
+            &metadata_path,
+            r#"{"database":"beads.db","jsonl_export":"second.jsonl"}"#,
+        )
+        .expect("rewrite metadata route");
+
+        let reprobe = reopen_and_reprobe_fast_open_auto_import_under_authority(
+            &mut fast_storage,
+            &paths,
+            &fast_overrides,
+            &authority,
+            false,
+        )
+        .expect("protected reopen must use the frozen startup snapshot");
+        assert!(matches!(
+            reprobe,
+            FastOpenAutoImportReprobe::ImportRequired
+        ));
+        assert!(
+            fast_storage
+                .as_ref()
+                .is_some_and(|result| result.paths == paths),
+            "metadata drift must not reroute the protected storage reopen"
+        );
+        assert!(!beads_dir.join("second.jsonl").exists());
     }
 
     #[test]

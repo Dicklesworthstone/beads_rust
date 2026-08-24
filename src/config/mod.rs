@@ -3204,6 +3204,36 @@ pub struct OpenStorageResult {
 }
 
 impl OpenStorageResult {
+    /// Clone the database-family authority retained by a writable startup
+    /// fallback, if any.
+    ///
+    /// Read-only fast-open can discover that schema healing is required and
+    /// acquire authority inside the config layer. Startup orchestration must
+    /// reuse that exact capability for a subsequent JSONL freshness reprobe;
+    /// opening the same lock through another descriptor would self-deadlock.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_database_write_authority(
+        &self,
+    ) -> Option<Arc<crate::sync::DatabaseFamilyWriteLock>> {
+        self.write_authority.as_ref().map(Arc::clone)
+    }
+
+    /// Reconstruct the immutable startup snapshot that opened this context.
+    ///
+    /// Protected fast-open reopens use this snapshot so a concurrent metadata
+    /// or config-file rewrite cannot mix storage from one routing generation
+    /// with JSONL from another.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_startup_config(&self) -> StartupConfig {
+        StartupConfig {
+            paths: self.paths.clone(),
+            layers: self.startup_layers.clone(),
+            merged_config: ConfigLayer::merge_layers(&self.startup_layers),
+        }
+    }
+
     pub(crate) fn import_context(
         &mut self,
     ) -> (
@@ -8680,7 +8710,7 @@ routing:
         let fixture = Connection::open(db_path.to_string_lossy().into_owned())
             .expect("open runtime-incomplete fixture");
         fixture
-            .execute("DROP TABLE capacity_occupancy")
+            .execute("DROP TABLE labels")
             .expect("drop required runtime table");
         fixture.close().expect("close fixture");
 

@@ -294,17 +294,15 @@ fn hydrate_ready_labels(storage: &SqliteStorage, issues: &mut [crate::model::Iss
 }
 
 fn empty_ready_message(storage: &SqliteStorage, filters: &ReadyFilters) -> Result<&'static str> {
+    if !storage.has_active_issues()? {
+        return Ok("✨ All work complete — no issues to work on");
+    }
     if ready_filters_are_restrictive(filters) {
         return Ok(
             "✨ No ready issues match the requested filters or configured ready status group",
         );
     }
-    let has_non_closed_issues = storage.has_active_issues()?;
-    Ok(if has_non_closed_issues {
-        "✨ No ready issues — all remaining work is blocked, deferred, or in progress"
-    } else {
-        "✨ All work complete — no issues to work on"
-    })
+    Ok("✨ No ready issues — remaining work is not currently actionable")
 }
 
 fn ready_filters_are_restrictive(filters: &ReadyFilters) -> bool {

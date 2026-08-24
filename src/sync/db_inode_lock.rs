@@ -53,11 +53,11 @@
 //! surrounding authority state machine (`retired_locks`, rebind, restore) is
 //! unchanged.
 //!
-//! This module is the crate's single sanctioned `unsafe` exemption. Its small
-//! syscall surface (`fcntl`, `LockFileEx`, and Windows `MoveFileExW` without
-//! replacement) has no safe standard-library wrapper with the required lock
-//! and no-clobber semantics. Everything else in the crate remains
-//! `#![deny(unsafe_code)]`.
+//! This module is one of the crate's three sanctioned `unsafe` exemptions. Its
+//! small syscall surface (`fcntl`, `LockFileEx`, and Windows `MoveFileExW`
+//! without replacement) has no safe standard-library wrapper with the required
+//! lock and no-clobber semantics. The other two exemptions are the Unix and
+//! Windows shutdown paths documented in `Cargo.toml`.
 
 use std::fs::{File, TryLockError};
 

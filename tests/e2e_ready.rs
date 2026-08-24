@@ -268,6 +268,18 @@ fn ready_cli_text_explains_when_filters_hide_ready_work() {
 
     let init = run_br(&workspace, ["init"], "init");
     assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let completed = run_br(
+        &workspace,
+        ["ready", "--assignee", "nobody"],
+        "ready_filtered_complete",
+    );
+    assert!(
+        completed.stdout.contains("All work complete"),
+        "restrictive filters must not hide a genuinely completed workspace: {}",
+        completed.stdout
+    );
+
     let created = run_br(
         &workspace,
         ["create", "Unassigned ready work"],
@@ -295,6 +307,37 @@ fn ready_cli_text_explains_when_filters_hide_ready_work() {
     assert!(
         !result.stdout.contains("all remaining work is blocked"),
         "filtered empty output must not misdiagnose visible ready work: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn ready_cli_text_does_not_overstate_why_active_work_is_not_ready() {
+    let _log =
+        common::test_log("ready_cli_text_does_not_overstate_why_active_work_is_not_ready");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    let created = run_br(&workspace, ["create", "Rework queue item"], "create_rework");
+    let issue_id = parse_created_id(&created.stdout);
+    let update = run_br(
+        &workspace,
+        ["update", &issue_id, "--status", "rework"],
+        "mark_rework",
+    );
+    assert!(update.status.success(), "update failed: {}", update.stderr);
+
+    let result = run_br(&workspace, ["ready"], "ready_non_actionable");
+    assert!(result.status.success(), "ready failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("not currently actionable"),
+        "active work outside the ready group needs a truthful generic explanation: {}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("all remaining work is blocked"),
+        "ready output must not invent an exhaustive cause list: {}",
         result.stdout
     );
 }
