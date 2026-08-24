@@ -15,6 +15,61 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.4.1 -- 2026-08-24 (Release)
+
+Windows recovery wave. v0.4.0 was effectively unusable on Windows (GitHub
+#438): every command -- including `br init` on a fresh repo -- failed with
+`internal error: windows lock files are closed`. This release restores
+Windows to working order and fixes a write-blocking recovery bug affecting
+migrated workspaces on every platform.
+
+### Windows: total 0.4.0 breakage fixed (GitHub #438)
+
+- The storage stack moves to fsqlite 0.3.9
+  ([70a0ea4b](https://github.com/Dicklesworthstone/beads_rust/commit/70a0ea4b)).
+  Root cause was upstream: a Windows read-only open became sidecar-less in
+  fsqlite 0.3.x, but four lock-path consumers were missed, so every
+  read-only open+close cycle -- which br's sync-authority inspection
+  performs on every command -- failed. Fixed in frankensqlite
+  `2fda33ab0` + `7ed48fee1` (shipped in fsqlite 0.3.9), verified on real
+  Windows hardware against both the 0.3.6 and 0.3.8 failure modes.
+
+### Windows: clean process exit, honest exit codes (GitHub #439, [0b74719e](https://github.com/Dicklesworthstone/beads_rust/commit/0b74719e))
+
+- Every `br` command on Windows previously panicked at exit with
+  `threads should not terminate unexpectedly` (0xC0000409), corrupting
+  `$LASTEXITCODE` even for successful commands. Deliberate exits are now
+  routed through a single shutdown funnel
+  ([05ab336d](https://github.com/Dicklesworthstone/beads_rust/commit/05ab336d))
+  that flushes stdout/stderr and exits via `TerminateProcess` with the
+  real code on Windows (plain `std::process::exit` elsewhere), after
+  storage is dropped so WAL checkpointing (#270) is preserved. The
+  Windows call is the crate's third sanctioned `unsafe_code` carve-out
+  ([eb068133](https://github.com/Dicklesworthstone/beads_rust/commit/eb068133)).
+
+### Recovery no longer rejects migrated workspaces (GitHub #440, [08404d53](https://github.com/Dicklesworthstone/beads_rust/commit/08404d53))
+
+- Any write that triggered automatic JSONL recovery failed with
+  `Prefix mismatch ... expected bd` when `issues.jsonl` contained legacy
+  non-`bd-`-prefixed ids (e.g. imported/migrated trackers). Recovery and
+  rebuild paths now skip prefix validation for the workspace's own
+  sidecar -- consistent with auto-import and reconcile, which already
+  did -- and round-trip mixed prefixes untouched, with an e2e regression
+  test proving ids survive un-renamed.
+
+### Storage and sync correctness
+
+- Fresh-database replacement now verifies its witness before snapshot
+  import queries, and the linear witness survives transaction retries
+  ([c87e1b43](https://github.com/Dicklesworthstone/beads_rust/commit/c87e1b43),
+  [2676ba7a](https://github.com/Dicklesworthstone/beads_rust/commit/2676ba7a)).
+- Measured performance wins retained from the profile-first campaign:
+  fused relation-count queries, SQL-side label projection for structured
+  `ready` output (GitHub #309), fast-open synchronized default reads, and
+  short-circuited empty external epic joins
+  ([70928a3f](https://github.com/Dicklesworthstone/beads_rust/commit/70928a3f),
+  [0064a5dd](https://github.com/Dicklesworthstone/beads_rust/commit/0064a5dd)).
+
 ## v0.4.0 -- 2026-08-22 (Release)
 
 Restricted-filesystem robustness wave plus one CLI capability. The headline
