@@ -489,7 +489,10 @@ fn score_candidate(
 }
 
 fn scheduler_issue_is_unassigned(issue: &crate::model::Issue) -> bool {
-    issue.assignee.as_deref().is_none_or(str::is_empty)
+    issue
+        .assignee
+        .as_deref()
+        .is_none_or(|assignee| assignee.trim().is_empty())
 }
 
 fn count_candidate_domains(
@@ -694,6 +697,9 @@ mod tests {
         assert!(scheduler_issue_is_unassigned(&issue));
 
         issue.assignee = Some(String::new());
+        assert!(scheduler_issue_is_unassigned(&issue));
+
+        issue.assignee = Some("  \t ".to_string());
         assert!(scheduler_issue_is_unassigned(&issue));
 
         issue.assignee = Some("agent-a".to_string());

@@ -2356,7 +2356,12 @@ impl SqliteStorage {
             attest_runtime_schema_cookie(&conn)?
         };
         Self::ensure_known_metadata_defaults(&conn)?;
-        record_runtime_schema_witness(&conn, attested_cookie)?;
+        if let Err(error) = record_runtime_schema_witness(&conn, attested_cookie) {
+            tracing::debug!(
+                %error,
+                "runtime schema witness could not be recorded; future fast opens will revalidate"
+            );
+        }
         Ok(Self {
             conn,
             write_authority: None,
@@ -2418,7 +2423,8 @@ impl SqliteStorage {
         // contract passes. A changed cookie forces the authoritative full
         // check; databases created before this witness also take that safe
         // fallback until an ordinary open records one.
-        runtime_schema_witness_matches(&self.conn) || runtime_schema_compatible(&self.conn)
+        runtime_schema_witness_matches(&self.conn)
+            || attest_runtime_schema_cookie(&self.conn).is_ok()
     }
 
     /// Open an existing current-schema database for a token-bound recovery write.
@@ -2571,7 +2577,12 @@ impl SqliteStorage {
         // need to restore the DDL without re-running heavier first-open migrations.
         apply_runtime_compatible_schema(&self.conn)?;
         let attested_cookie = attest_runtime_schema_cookie(&self.conn)?;
-        record_runtime_schema_witness(&self.conn, attested_cookie)?;
+        if let Err(error) = record_runtime_schema_witness(&self.conn, attested_cookie) {
+            tracing::debug!(
+                %error,
+                "reset schema witness could not be recorded; future fast opens will revalidate"
+            );
+        }
         Ok(())
     }
 
@@ -32110,7 +32121,7 @@ mod tests {
         storage.reset_data_tables().unwrap();
 
         assert!(
-            storage.fast_open_runtime_schema_is_compatible(),
+            crate::storage::schema::runtime_schema_witness_matches(&storage.conn),
             "reset must attest the recreated schema for subsequent fast opens"
         );
         assert_eq!(

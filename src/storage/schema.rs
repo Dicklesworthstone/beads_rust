@@ -15,7 +15,7 @@ const fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325;
     let mut index = 0;
     while index < bytes.len() {
-        hash ^= bytes[index] as u64;
+        hash ^= u64::from(bytes[index]);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         index += 1;
     }
@@ -56,6 +56,39 @@ struct ExpectedSchemaColumn {
     not_null: bool,
     default_value: Option<&'static str>,
     primary_key_position: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuxiliaryRuntimeColumn {
+    expected: ExpectedSchemaColumn,
+    additive_definition: Option<&'static str>,
+}
+
+const fn auxiliary_runtime_column(
+    name: &'static str,
+    data_type: &'static str,
+    not_null: bool,
+    default_value: Option<&'static str>,
+    primary_key_position: i64,
+    additive_definition: Option<&'static str>,
+) -> AuxiliaryRuntimeColumn {
+    AuxiliaryRuntimeColumn {
+        expected: ExpectedSchemaColumn {
+            name,
+            data_type,
+            not_null,
+            default_value,
+            primary_key_position,
+        },
+        additive_definition,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedRuntimeIndex {
+    name: &'static str,
+    columns: &'static [&'static str],
+    partial: bool,
 }
 
 const GATE_RESULT_HISTORY_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -154,8 +187,6 @@ const GATE_RESULT_HISTORY_INDEXES: &[(&str, &[&str])] = &[
 
 const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
     "idx_blocked_cache_blocked_at",
-    "idx_close_metadata_bypassed",
-    "idx_close_metadata_recorded_at",
     "idx_comments_created_at",
     "idx_comments_issue",
     "idx_config_key",
@@ -172,7 +203,6 @@ const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
     "idx_events_type",
     "idx_gate_result_history_issue",
     "idx_gate_result_history_scope",
-    "idx_gate_results_issue",
     "idx_issues_assignee",
     "idx_issues_content_hash",
     "idx_issues_created_at",
@@ -1186,6 +1216,160 @@ const EVENT_COLUMNS: &[(&str, &str)] = &[
     ("model", "TEXT"),
 ];
 
+// Complete runtime column manifests for auxiliary tables. `Some(definition)`
+// marks a column SQLite can add without inventing audit data or installing an
+// incorrect non-constant default. `None` means a malformed existing table must
+// fail closed; a missing table is still created canonically by SCHEMA_SQL.
+const CLOSE_METADATA_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
+    auxiliary_runtime_column("issue_id", "TEXT", false, None, 1, None),
+    auxiliary_runtime_column("closed_by_agent_name", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("closed_by_harness", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("closed_by_model", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column(
+        "bypassed_policy",
+        "INTEGER",
+        true,
+        Some("0"),
+        0,
+        Some("INTEGER NOT NULL DEFAULT 0"),
+    ),
+    auxiliary_runtime_column("bypass_reason", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("policy_gates_fired", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column(
+        "recorded_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+        None,
+    ),
+];
+const CLOSE_METADATA_INDEXES: &[ExpectedRuntimeIndex] = &[
+    ExpectedRuntimeIndex {
+        name: "idx_close_metadata_recorded_at",
+        columns: &["recorded_at"],
+        partial: false,
+    },
+    ExpectedRuntimeIndex {
+        name: "idx_close_metadata_bypassed",
+        columns: &["bypassed_policy"],
+        partial: true,
+    },
+];
+
+const GATE_RESULTS_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
+    auxiliary_runtime_column("issue_id", "TEXT", true, None, 1, None),
+    auxiliary_runtime_column("gate", "TEXT", true, None, 2, None),
+    auxiliary_runtime_column("provider", "TEXT", true, None, 3, None),
+    auxiliary_runtime_column(
+        "passed",
+        "INTEGER",
+        true,
+        Some("0"),
+        0,
+        Some("INTEGER NOT NULL DEFAULT 0"),
+    ),
+    auxiliary_runtime_column("note", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("recorded_by", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column(
+        "recorded_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+        None,
+    ),
+];
+const GATE_RESULTS_INDEXES: &[ExpectedRuntimeIndex] = &[ExpectedRuntimeIndex {
+    name: "idx_gate_results_issue",
+    columns: &["issue_id"],
+    partial: false,
+}];
+
+const CAPACITY_EXEMPTION_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
+    auxiliary_runtime_column("issue_id", "TEXT", true, None, 1, None),
+    auxiliary_runtime_column("capacity_kind", "TEXT", true, None, 2, None),
+    auxiliary_runtime_column("capacity_name", "TEXT", true, None, 3, None),
+    auxiliary_runtime_column("provider", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("reason", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("granted_by", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column(
+        "granted_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+        None,
+    ),
+    auxiliary_runtime_column("expires_at", "DATETIME", false, None, 0, Some("DATETIME")),
+    auxiliary_runtime_column("ended_at", "DATETIME", false, None, 0, Some("DATETIME")),
+    auxiliary_runtime_column("ended_action", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("ended_by", "TEXT", false, None, 0, Some("TEXT")),
+];
+const CAPACITY_EXEMPTION_INDEXES: &[ExpectedRuntimeIndex] = &[ExpectedRuntimeIndex {
+    name: "idx_capacity_exemptions_capacity",
+    columns: &["capacity_kind", "capacity_name"],
+    partial: false,
+}];
+
+const CAPACITY_EXEMPTION_HISTORY_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
+    auxiliary_runtime_column("id", "INTEGER", false, None, 1, None),
+    auxiliary_runtime_column("issue_id", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("capacity_kind", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("capacity_name", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("action", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("provider", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("reason", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("actor", "TEXT", true, None, 0, None),
+    auxiliary_runtime_column("expires_at", "DATETIME", false, None, 0, Some("DATETIME")),
+    auxiliary_runtime_column(
+        "recorded_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+        None,
+    ),
+];
+const CAPACITY_EXEMPTION_HISTORY_INDEXES: &[ExpectedRuntimeIndex] = &[ExpectedRuntimeIndex {
+    name: "idx_capacity_exemption_history_issue",
+    columns: &["issue_id", "id"],
+    partial: false,
+}];
+
+const CAPACITY_OCCUPANCY_COLUMNS: &[AuxiliaryRuntimeColumn] = &[
+    auxiliary_runtime_column("issue_id", "TEXT", false, None, 1, None),
+    auxiliary_runtime_column("actor", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("agent_name", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("harness", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column("session", "TEXT", false, None, 0, Some("TEXT")),
+    auxiliary_runtime_column(
+        "recorded_at",
+        "DATETIME",
+        true,
+        Some("CURRENT_TIMESTAMP"),
+        0,
+        None,
+    ),
+];
+const CAPACITY_OCCUPANCY_INDEXES: &[ExpectedRuntimeIndex] = &[
+    ExpectedRuntimeIndex {
+        name: "idx_capacity_occupancy_actor",
+        columns: &["actor"],
+        partial: true,
+    },
+    ExpectedRuntimeIndex {
+        name: "idx_capacity_occupancy_harness",
+        columns: &["harness"],
+        partial: true,
+    },
+    ExpectedRuntimeIndex {
+        name: "idx_capacity_occupancy_session",
+        columns: &["session"],
+        partial: true,
+    },
+];
+
 fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
     if !table_exists(conn, table) {
         return Ok(());
@@ -1199,6 +1383,179 @@ fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> R
     }
 
     Ok(())
+}
+
+fn ensure_auxiliary_runtime_columns(
+    conn: &Connection,
+    table: &str,
+    columns: &[AuxiliaryRuntimeColumn],
+) -> Result<()> {
+    if !table_exists(conn, table) {
+        return Ok(());
+    }
+
+    if let Some(column) = columns.iter().find(|column| {
+        column.additive_definition.is_none() && !column_exists(conn, table, column.expected.name)
+    }) {
+        return Err(BeadsError::Config(format!(
+            "Cannot safely repair malformed {table} table: required column '{}' cannot be added without changing audit semantics",
+            column.expected.name
+        )));
+    }
+
+    for column in columns {
+        if let Some(definition) = column.additive_definition
+            && !column_exists(conn, table, column.expected.name)
+        {
+            conn.execute(&format!(
+                "ALTER TABLE {table} ADD COLUMN {} {definition}",
+                column.expected.name
+            ))?;
+        }
+    }
+
+    if !auxiliary_runtime_columns_canonical(conn, table, columns)
+        || !auxiliary_runtime_issue_foreign_key_canonical(conn, table)
+    {
+        return Err(BeadsError::Config(format!(
+            "Cannot safely repair malformed {table} table: column constraints or issue cascade are not canonical"
+        )));
+    }
+
+    Ok(())
+}
+
+fn auxiliary_runtime_columns_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[AuxiliaryRuntimeColumn],
+) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(rows) = conn.query(&format!("PRAGMA table_info('{escaped_table}')")) else {
+        return false;
+    };
+    if rows.len() != columns.len() {
+        return false;
+    }
+
+    columns.iter().all(|column| {
+        let expected = column.expected;
+        rows.iter().any(|row| {
+            let name = row.get(1).and_then(SqliteValue::as_text);
+            let data_type = row.get(2).and_then(SqliteValue::as_text);
+            let not_null = row
+                .get(3)
+                .and_then(SqliteValue::as_integer)
+                .is_some_and(|value| value != 0);
+            let default_value = row.get(4).and_then(SqliteValue::as_text);
+            let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
+
+            name == Some(expected.name)
+                && data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected.data_type))
+                && not_null == expected.not_null
+                && sql_default_matches(default_value, expected.default_value)
+                && primary_key_position == Some(expected.primary_key_position)
+        })
+    })
+}
+
+fn auxiliary_runtime_issue_foreign_key_canonical(conn: &Connection, table: &str) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(rows) = conn.query(&format!("PRAGMA foreign_key_list('{escaped_table}')")) else {
+        return false;
+    };
+    if rows.len() != 1 {
+        return false;
+    }
+    let row = &rows[0];
+    row.get(1).and_then(SqliteValue::as_integer) == Some(0)
+        && row.get(2).and_then(SqliteValue::as_text) == Some("issues")
+        && row.get(3).and_then(SqliteValue::as_text) == Some("issue_id")
+        && row.get(4).and_then(SqliteValue::as_text) == Some("id")
+        && row
+            .get(5)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("NO ACTION"))
+        && row
+            .get(6)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+}
+
+fn table_declares_autoincrement_primary_key(conn: &Connection, table: &str, column: &str) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(row) = conn.query_row(&format!(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{escaped_table}'"
+    )) else {
+        return false;
+    };
+    let Some(sql) = row.get(0).and_then(SqliteValue::as_text) else {
+        return false;
+    };
+    let normalized = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    normalized.contains(&format!(
+        "{} integer primary key autoincrement",
+        column.to_ascii_lowercase()
+    ))
+}
+
+fn auxiliary_runtime_indexes_canonical(
+    conn: &Connection,
+    table: &str,
+    indexes: &[ExpectedRuntimeIndex],
+) -> bool {
+    let escaped_table = table.replace('\'', "''");
+    let Ok(index_rows) = conn.query(&format!("PRAGMA index_list('{escaped_table}')")) else {
+        return false;
+    };
+
+    indexes.iter().all(|expected| {
+        let Some(index_row) = index_rows
+            .iter()
+            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(expected.name))
+        else {
+            return false;
+        };
+        let explicit_non_unique = index_row.get(2).and_then(SqliteValue::as_integer) == Some(0)
+            && index_row
+                .get(3)
+                .and_then(SqliteValue::as_text)
+                .is_some_and(|value| value.eq_ignore_ascii_case("c"));
+        let partial = index_row
+            .get(4)
+            .and_then(SqliteValue::as_integer)
+            .is_some_and(|value| value != 0);
+        if !explicit_non_unique || partial != expected.partial {
+            return false;
+        }
+
+        let escaped_index = expected.name.replace('\'', "''");
+        let Ok(column_rows) = conn.query(&format!("PRAGMA index_info('{escaped_index}')")) else {
+            return false;
+        };
+        column_rows.len() == expected.columns.len()
+            && column_rows.iter().zip(expected.columns).enumerate().all(
+                |(position, (row, expected_name))| {
+                    row.get(0).and_then(SqliteValue::as_integer) == i64::try_from(position).ok()
+                        && row.get(2).and_then(SqliteValue::as_text) == Some(*expected_name)
+                },
+            )
+    })
+}
+
+fn auxiliary_runtime_table_canonical(
+    conn: &Connection,
+    table: &str,
+    columns: &[AuxiliaryRuntimeColumn],
+    indexes: &[ExpectedRuntimeIndex],
+) -> bool {
+    auxiliary_runtime_columns_canonical(conn, table, columns)
+        && auxiliary_runtime_issue_foreign_key_canonical(conn, table)
+        && auxiliary_runtime_indexes_canonical(conn, table, indexes)
 }
 
 fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) -> bool {
@@ -1717,6 +2074,15 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
     ensure_columns(conn, "dependencies", DEPENDENCY_COLUMNS)?;
     ensure_columns(conn, "comments", COMMENT_COLUMNS)?;
     ensure_columns(conn, "events", EVENT_COLUMNS)?;
+    ensure_auxiliary_runtime_columns(conn, "close_metadata", CLOSE_METADATA_COLUMNS)?;
+    ensure_auxiliary_runtime_columns(conn, "gate_results", GATE_RESULTS_COLUMNS)?;
+    ensure_auxiliary_runtime_columns(conn, "capacity_exemptions", CAPACITY_EXEMPTION_COLUMNS)?;
+    ensure_auxiliary_runtime_columns(
+        conn,
+        "capacity_exemption_history",
+        CAPACITY_EXEMPTION_HISTORY_COLUMNS,
+    )?;
+    ensure_auxiliary_runtime_columns(conn, "capacity_occupancy", CAPACITY_OCCUPANCY_COLUMNS)?;
 
     // Intentionally do not rebuild idx_issues_ready here.
     //
@@ -1761,25 +2127,45 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     );
     let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
+    let close_metadata_ok = auxiliary_runtime_table_canonical(
+        conn,
+        "close_metadata",
+        CLOSE_METADATA_COLUMNS,
+        CLOSE_METADATA_INDEXES,
+    );
+    let gate_results_ok = auxiliary_runtime_table_canonical(
+        conn,
+        "gate_results",
+        GATE_RESULTS_COLUMNS,
+        GATE_RESULTS_INDEXES,
+    );
     let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
     // v16/v17 capacity tables (#384). Checking them here means a database
     // stamped at the current version but missing these tables (e.g. one
     // produced by a pre-#398 reviewed migration, which never created them)
     // is healed by `apply_schema` on the next open instead of failing at
     // runtime with "no such table".
-    let capacity_ok = table_has_columns(
+    let capacity_exemptions_ok = auxiliary_runtime_table_canonical(
         conn,
         "capacity_exemptions",
-        &["issue_id", "capacity_kind", "capacity_name"],
-    ) && table_has_columns(
-        conn,
-        "capacity_exemption_history",
-        &["issue_id", "capacity_kind", "capacity_name", "action"],
-    ) && table_has_columns(
+        CAPACITY_EXEMPTION_COLUMNS,
+        CAPACITY_EXEMPTION_INDEXES,
+    );
+    let capacity_exemption_history_ok =
+        auxiliary_runtime_table_canonical(
+            conn,
+            "capacity_exemption_history",
+            CAPACITY_EXEMPTION_HISTORY_COLUMNS,
+            CAPACITY_EXEMPTION_HISTORY_INDEXES,
+        ) && table_declares_autoincrement_primary_key(conn, "capacity_exemption_history", "id");
+    let capacity_occupancy_ok = auxiliary_runtime_table_canonical(
         conn,
         "capacity_occupancy",
-        &["issue_id", "actor", "harness", "session"],
+        CAPACITY_OCCUPANCY_COLUMNS,
+        CAPACITY_OCCUPANCY_INDEXES,
     );
+    let capacity_ok =
+        capacity_exemptions_ok && capacity_exemption_history_ok && capacity_occupancy_ok;
     let indexes_ok = REQUIRED_RUNTIME_INDEXES
         .iter()
         .all(|index| index_exists(conn, index));
@@ -1797,6 +2183,8 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && export_hashes_ok
         && blocked_cache_ok
         && child_counters_ok
+        && close_metadata_ok
+        && gate_results_ok
         && gate_history_ok
         && capacity_ok
         && indexes_ok;
@@ -1816,7 +2204,12 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             export_hashes_ok,
             blocked_cache_ok,
             child_counters_ok,
+            close_metadata_ok,
+            gate_results_ok,
             gate_history_ok,
+            capacity_exemptions_ok,
+            capacity_exemption_history_ok,
+            capacity_occupancy_ok,
             capacity_ok,
             indexes_ok,
             "runtime schema compatibility check failed"
@@ -1867,17 +2260,20 @@ fn runtime_schema_witness_value(cookie: i64) -> String {
 /// table, column, or required index) changes SQLite's schema cookie and forces
 /// the caller back through the full compatibility checker and healer.
 pub(crate) fn runtime_schema_witness_matches(conn: &Connection) -> bool {
-    let Ok(cookie) = runtime_schema_cookie(conn) else {
+    let Ok(cookie_before) = runtime_schema_cookie(conn) else {
         return false;
     };
-    let expected = runtime_schema_witness_value(cookie);
-    conn.query_row_with_params(
-        "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
-        &[SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY)],
-    )
-    .ok()
-    .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
-    .is_some_and(|value| value == expected)
+    let expected = runtime_schema_witness_value(cookie_before);
+    let witness_matches = conn
+        .query_row_with_params(
+            "SELECT value FROM metadata WHERE key = ? ORDER BY rowid DESC LIMIT 1",
+            &[SqliteValue::from(RUNTIME_SCHEMA_WITNESS_KEY)],
+        )
+        .ok()
+        .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+        .is_some_and(|value| value == expected);
+    witness_matches
+        && runtime_schema_cookie(conn).is_ok_and(|cookie_after| cookie_after == cookie_before)
 }
 
 /// Record an exact schema cookie that was already attested against the complete
@@ -2553,7 +2949,13 @@ fn attest_gate_result_history_indexes(conn: &Connection) -> Result<()> {
 fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
     attest_gate_result_history_columns(conn)?;
     attest_gate_result_history_foreign_key(conn)?;
-    attest_gate_result_history_indexes(conn)
+    attest_gate_result_history_indexes(conn)?;
+    if !table_declares_autoincrement_primary_key(conn, "gate_result_history", "id") {
+        return Err(schema_migration_shape_error(
+            "gate_result_history.id is not declared INTEGER PRIMARY KEY AUTOINCREMENT",
+        ));
+    }
+    Ok(())
 }
 
 fn apply_gate_result_history_migration_in_transaction(conn: &Connection) -> Result<()> {
@@ -3207,11 +3609,14 @@ mod tests {
             "ON gate_result_history(issue_id, id)",
             "ON gate_result_history(id, issue_id)",
         );
+        let malformed_autoincrement = GATE_RESULT_HISTORY_MIGRATION_SQL
+            .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "INTEGER PRIMARY KEY");
 
         for (label, schema_sql) in [
             ("column_type", malformed_type),
             ("foreign_key", malformed_foreign_key),
             ("index_order", malformed_index),
+            ("autoincrement", malformed_autoincrement),
         ] {
             let (_temp, conn) = reviewed_v14_with_gate_history_schema(&schema_sql);
             let error = run_migrations_atomic(
@@ -4645,6 +5050,153 @@ mod tests {
             !runtime_schema_compatible(&conn),
             "legacy config/metadata primary keys should force the full repair path"
         );
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_and_heals_incomplete_capacity_table() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("incomplete_capacity_occupancy.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX IF EXISTS idx_capacity_occupancy_actor;
+            DROP INDEX IF EXISTS idx_capacity_occupancy_harness;
+            DROP INDEX IF EXISTS idx_capacity_occupancy_session;
+            DROP TABLE capacity_occupancy;
+            CREATE TABLE capacity_occupancy (
+                issue_id TEXT PRIMARY KEY,
+                actor TEXT,
+                harness TEXT,
+                session TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_capacity_occupancy_actor
+                ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+            CREATE INDEX idx_capacity_occupancy_harness
+                ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+            CREATE INDEX idx_capacity_occupancy_session
+                ON capacity_occupancy(session) WHERE session IS NOT NULL;
+            ",
+        )
+        .expect("plant current-version table missing agent_name");
+
+        assert!(
+            current_schema_version_declared(&conn),
+            "the mutation must leave the current version stamp in place"
+        );
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "the complete runtime contract must reject a live table missing a used column"
+        );
+        assert!(
+            attest_runtime_schema_cookie(&conn).is_err(),
+            "an incomplete runtime contract must never mint a durable witness"
+        );
+
+        apply_schema(&conn).expect("heal additive capacity column");
+        assert!(column_exists(&conn, "capacity_occupancy", "agent_name"));
+        assert!(runtime_schema_compatible(&conn));
+
+        let repaired_cookie =
+            attest_runtime_schema_cookie(&conn).expect("attest repaired capacity table");
+        record_runtime_schema_witness(&conn, repaired_cookie).expect("record repaired witness");
+        assert!(runtime_schema_witness_matches(&conn));
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_fails_closed_on_unsafe_audit_column_gap() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("unsafe_capacity_occupancy_gap.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX IF EXISTS idx_capacity_occupancy_actor;
+            DROP INDEX IF EXISTS idx_capacity_occupancy_harness;
+            DROP INDEX IF EXISTS idx_capacity_occupancy_session;
+            DROP TABLE capacity_occupancy;
+            CREATE TABLE capacity_occupancy (
+                issue_id TEXT PRIMARY KEY,
+                actor TEXT,
+                agent_name TEXT,
+                harness TEXT,
+                session TEXT,
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            CREATE INDEX idx_capacity_occupancy_actor
+                ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+            CREATE INDEX idx_capacity_occupancy_harness
+                ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+            CREATE INDEX idx_capacity_occupancy_session
+                ON capacity_occupancy(session) WHERE session IS NOT NULL;
+            ",
+        )
+        .expect("plant current-version table missing recorded_at");
+
+        assert!(!runtime_schema_compatible(&conn));
+        let error = apply_schema(&conn)
+            .expect_err("repair must not invent a historical occupancy timestamp");
+        assert!(
+            error.to_string().contains("required column 'recorded_at'"),
+            "unexpected repair error: {error}"
+        );
+        assert!(
+            attest_runtime_schema_cookie(&conn).is_err(),
+            "an unsafe audit gap must remain unwitnessed"
+        );
+    }
+
+    #[test]
+    fn test_runtime_schema_contract_rejects_missing_auxiliary_pk_and_cascade() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("noncanonical_capacity_occupancy.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("schema");
+
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX IF EXISTS idx_capacity_occupancy_actor;
+            DROP INDEX IF EXISTS idx_capacity_occupancy_harness;
+            DROP INDEX IF EXISTS idx_capacity_occupancy_session;
+            DROP TABLE capacity_occupancy;
+            CREATE TABLE capacity_occupancy (
+                issue_id TEXT,
+                actor TEXT,
+                agent_name TEXT,
+                harness TEXT,
+                session TEXT,
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_capacity_occupancy_actor
+                ON capacity_occupancy(actor) WHERE actor IS NOT NULL;
+            CREATE INDEX idx_capacity_occupancy_harness
+                ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
+            CREATE INDEX idx_capacity_occupancy_session
+                ON capacity_occupancy(session) WHERE session IS NOT NULL;
+            ",
+        )
+        .expect("plant all columns and indexes without the canonical PK or cascade");
+
+        assert!(
+            !runtime_schema_compatible(&conn),
+            "column names alone must not attest state-table replacement and cascade semantics"
+        );
+        let error = apply_schema(&conn)
+            .expect_err("repair must fail closed rather than discard or reinterpret audit rows");
+        assert!(
+            error
+                .to_string()
+                .contains("column constraints or issue cascade are not canonical"),
+            "unexpected repair error: {error}"
+        );
+        assert!(attest_runtime_schema_cookie(&conn).is_err());
     }
 
     #[test]
