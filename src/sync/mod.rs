@@ -12834,6 +12834,14 @@ fn import_from_jsonl_snapshot_impl(
     expected_prefix: Option<&str>,
     fresh_witness: Option<FreshDatabaseReplacementWitness>,
 ) -> Result<ImportResult> {
+    // Reject a displaced fresh replacement before any metadata or collision
+    // query touches the now-unlinked SQLite connection.  The transaction
+    // rechecks the witness below so a later inode swap still fails closed
+    // before the insert-only relation path is enabled.
+    if let Some(witness) = fresh_witness.as_ref() {
+        storage.verify_fresh_database_replacement_witness(witness)?;
+    }
+
     if let Some(ref beads_dir) = config.beads_dir {
         validate_sync_path_with_external(
             source.display_path(),
