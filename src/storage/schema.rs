@@ -5072,6 +5072,10 @@ mod tests {
                 ON capacity_occupancy(harness) WHERE harness IS NOT NULL;
             CREATE INDEX idx_capacity_occupancy_session
                 ON capacity_occupancy(session) WHERE session IS NOT NULL;
+            INSERT INTO issues (id, title)
+                VALUES ('capacity-fixture', 'Capacity migration fixture');
+            INSERT INTO capacity_occupancy (issue_id, actor, harness, session)
+                VALUES ('capacity-fixture', 'actor-a', 'harness-a', 'session-a');
             ",
         )
         .expect("plant current-version table missing agent_name");
@@ -5092,6 +5096,29 @@ mod tests {
         apply_schema(&conn).expect("heal additive capacity column");
         assert!(column_exists(&conn, "capacity_occupancy", "agent_name"));
         assert!(runtime_schema_compatible(&conn));
+        let preserved = conn
+            .query_row_with_params(
+                "SELECT actor, harness, session, agent_name FROM capacity_occupancy WHERE issue_id = ?",
+                &[SqliteValue::from("capacity-fixture")],
+            )
+            .expect("query preserved occupancy row");
+        assert_eq!(
+            preserved.get(0).and_then(SqliteValue::as_text),
+            Some("actor-a")
+        );
+        assert_eq!(
+            preserved.get(1).and_then(SqliteValue::as_text),
+            Some("harness-a")
+        );
+        assert_eq!(
+            preserved.get(2).and_then(SqliteValue::as_text),
+            Some("session-a")
+        );
+        assert_eq!(
+            preserved.get(3).and_then(SqliteValue::as_text),
+            None,
+            "the additive nullable column must not fabricate agent attribution"
+        );
 
         let repaired_cookie =
             attest_runtime_schema_cookie(&conn).expect("attest repaired capacity table");

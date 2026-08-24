@@ -756,9 +756,7 @@ impl DatabaseFamilyWriteLock {
 
     /// Classify the canonical target without mistaking a retained, renamed
     /// original inode for the currently visible database generation.
-    pub(crate) fn database_target_authority_state(
-        &self,
-    ) -> Result<DatabaseTargetAuthorityState> {
+    pub(crate) fn database_target_authority_state(&self) -> Result<DatabaseTargetAuthorityState> {
         self.verify_common_authority()?;
         let target_metadata = match fs::symlink_metadata(&self.canonical_database_path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {

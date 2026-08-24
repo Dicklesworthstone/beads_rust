@@ -1058,8 +1058,6 @@ fn open_when_db_file_is_missing(
             })
         }
         JsonlRecoveryStrategy::DeferToExplicitImport => {
-            let cleanup_set =
-                prepare_missing_database_cleanup_for_recovery(&paths.db_path, beads_dir)?;
             warn!(
                 db_path = %paths.db_path.display(),
                 jsonl_path = %paths.jsonl_path.display(),
@@ -1069,9 +1067,12 @@ fn open_when_db_file_is_missing(
                 message: "Missing-database deferred recovery has no database-family authority"
                     .to_string(),
             })?;
-            let _fresh_witness = authority.install_empty_database_replacement_and_bind()?;
-            let mut storage = SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?;
-            storage.attach_write_authority(Arc::clone(authority));
+            let (storage, cleanup_set) = prepare_fresh_storage_for_deferred_import(
+                &paths.db_path,
+                beads_dir,
+                lock_timeout,
+                authority,
+            )?;
             Ok(SqliteRecoveryOpenResult {
                 storage,
                 auto_rebuilt: false,
@@ -1162,43 +1163,18 @@ fn prepare_fresh_storage_for_deferred_import(
     lock_timeout: Option<u64>,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> Result<(SqliteStorage, RecoveryBackupSet)> {
-    let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
+    let (mut storage, backup_set) = rebuild_database_family_with_backup(
+        db_path,
+        beads_dir,
+        write_authority,
+        SuccessfulRecoveryDisposition::RetainBackupUntilCommandSuccess,
+        |fresh_witness| {
+            write_authority.verify_fresh_database_replacement_witness(&fresh_witness)?;
+            SqliteStorage::open_with_timeout(db_path, lock_timeout)
+        },
+    )?;
     let recovery_dir = backup_set.recovery_dir.clone();
-    if let Err(install_err) = write_authority.install_empty_database_replacement_and_bind() {
-        if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
-            return Err(recovery_restore_failure(
-                &backup_set,
-                &install_err,
-                restore_err,
-            ));
-        }
-        if backup_set.files.is_empty() {
-            write_authority.clear_database_inode_after_authorized_remove()?;
-        } else {
-            write_authority.restore_retained_database_inode_after_authorized_replace()?;
-        }
-        return Err(install_err);
-    }
-    let storage = match SqliteStorage::open_with_timeout(db_path, lock_timeout) {
-        Ok(storage) => storage,
-        Err(open_err) => {
-            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
-                return Err(recovery_restore_failure(
-                    &backup_set,
-                    &open_err,
-                    restore_err,
-                ));
-            }
-            if backup_set.files.is_empty() {
-                write_authority.clear_database_inode_after_authorized_remove()?;
-            } else {
-                write_authority.restore_retained_database_inode_after_authorized_replace()?;
-            }
-            return Err(open_err);
-        }
-    };
     write_authority.verify_database_authority()?;
-    let mut storage = storage;
     storage.attach_write_authority(Arc::clone(write_authority));
     warn!(
         db_path = %db_path.display(),
@@ -2878,25 +2854,55 @@ fn rebuild_database_family_with_backup<T, F>(
 where
     F: FnOnce(FreshDatabaseReplacementWitness) -> Result<T>,
 {
-    let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
+    rebuild_database_family_with_backup_before_install(
+        db_path,
+        beads_dir,
+        write_authority,
+        successful_disposition,
+        || {},
+        rebuild,
+    )
+}
+
+fn rebuild_database_family_with_backup_before_install<T, B, F>(
+    db_path: &Path,
+    beads_dir: &Path,
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+    successful_disposition: SuccessfulRecoveryDisposition,
+    before_install: B,
+    rebuild: F,
+) -> Result<(T, RecoveryBackupSet)>
+where
+    B: FnOnce(),
+    F: FnOnce(FreshDatabaseReplacementWitness) -> Result<T>,
+{
+    let mut backup_set =
+        prepare_database_family_backup_for_recovery(db_path, beads_dir, write_authority)?;
+    before_install();
     let fresh_witness = match write_authority.install_empty_database_replacement_and_bind() {
         Ok(witness) => witness,
         Err(install_err) => {
-            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
-                return Err(recovery_restore_failure(
-                    &backup_set,
-                    &install_err,
-                    restore_err,
-                ));
-            }
-            if backup_set.files.is_empty() {
-                write_authority.clear_database_inode_after_authorized_remove()?;
-            } else {
-                write_authority.restore_retained_database_inode_after_authorized_replace()?;
-            }
-            return Err(install_err);
+            return Err(finish_failed_database_recovery(
+                &backup_set,
+                write_authority,
+                install_err,
+                RecoveryFailurePhase::Install,
+            ));
         }
     };
+    if !backup_set.had_original_database {
+        if let Err(sidecar_err) = write_authority
+            .verify_fresh_database_replacement_witness(&fresh_witness)
+            .and_then(|()| move_orphaned_database_sidecars_to_recovery(&mut backup_set))
+        {
+            return Err(finish_failed_database_recovery(
+                &backup_set,
+                write_authority,
+                sidecar_err,
+                RecoveryFailurePhase::Install,
+            ));
+        }
+    }
 
     match rebuild(fresh_witness) {
         Ok(value)
@@ -2909,44 +2915,108 @@ where
             Ok(()) => Ok((value, backup_set)),
             Err(finalize_err) => {
                 drop(value);
-                if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set)
-                {
-                    return Err(recovery_restore_failure(
-                        &backup_set,
-                        &finalize_err,
-                        restore_err,
-                    ));
-                }
-                if backup_set.files.is_empty() {
-                    write_authority.clear_database_inode_after_authorized_remove()?;
-                } else {
-                    write_authority.restore_retained_database_inode_after_authorized_replace()?;
-                }
-                Err(finalize_err)
+                Err(finish_failed_database_recovery(
+                    &backup_set,
+                    write_authority,
+                    finalize_err,
+                    RecoveryFailurePhase::Rebuild,
+                ))
             }
         },
-        Err(rebuild_err) => {
-            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
-                warn!(
-                    db_path = %db_path.display(),
-                    recovery_dir = %backup_set.recovery_dir.display(),
-                    restore_error = %restore_err,
-                    "Failed to restore original database after unsuccessful rebuild"
-                );
-                return Err(recovery_restore_failure(
-                    &backup_set,
-                    &rebuild_err,
-                    restore_err,
-                ));
-            }
-            if backup_set.files.is_empty() {
-                write_authority.clear_database_inode_after_authorized_remove()?;
-            } else {
-                write_authority.restore_retained_database_inode_after_authorized_replace()?;
-            }
-            write_authority.verify_database_authority()?;
-            Err(rebuild_err)
-        }
+        Err(rebuild_err) => Err(finish_failed_database_recovery(
+            &backup_set,
+            write_authority,
+            rebuild_err,
+            RecoveryFailurePhase::Rebuild,
+        )),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryFailurePhase {
+    Install,
+    Rebuild,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryRollbackDisposition {
+    Restored,
+    PreservedLiveTarget,
+}
+
+fn finish_failed_database_recovery(
+    backup_set: &RecoveryBackupSet,
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+    recovery_err: BeadsError,
+    phase: RecoveryFailurePhase,
+) -> BeadsError {
+    match rollback_database_family_after_recovery_failure(backup_set, write_authority, phase) {
+        Ok(RecoveryRollbackDisposition::Restored) => recovery_err,
+        Ok(RecoveryRollbackDisposition::PreservedLiveTarget) => BeadsError::WithContext {
+            context: format!(
+                "Database recovery stopped after another canonical database generation appeared; left it untouched and retained recovery artifacts in '{}'",
+                backup_set.recovery_dir.display()
+            ),
+            source: Box::new(recovery_err),
+        },
+        Err(restore_err) => recovery_restore_failure(backup_set, &recovery_err, restore_err),
+    }
+}
+
+fn rollback_database_family_after_recovery_failure(
+    backup_set: &RecoveryBackupSet,
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+    phase: RecoveryFailurePhase,
+) -> Result<RecoveryRollbackDisposition> {
+    use crate::sync::DatabaseTargetAuthorityState;
+
+    let target_state = write_authority.database_target_authority_state()?;
+    let live_sidecar_exists = database_family_paths(&backup_set.db_path)
+        .into_iter()
+        .skip(1)
+        .try_fold(false, |found, path| match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(found),
+            Err(error) => Err(BeadsError::WithContext {
+                context: "Failed to inspect the live database family before recovery rollback"
+                    .to_string(),
+                source: Box::new(error),
+            }),
+        })?;
+    let preserve_live_target = target_state == DatabaseTargetAuthorityState::Foreign
+        || (target_state == DatabaseTargetAuthorityState::Missing && live_sidecar_exists)
+        || (phase == RecoveryFailurePhase::Install
+            && target_state == DatabaseTargetAuthorityState::Held
+            && live_sidecar_exists);
+    if preserve_live_target {
+        warn!(
+            db_path = %backup_set.db_path.display(),
+            recovery_dir = %backup_set.recovery_dir.display(),
+            ?target_state,
+            "Preserving a live database generation that recovery does not exclusively own"
+        );
+        return Ok(RecoveryRollbackDisposition::PreservedLiveTarget);
+    }
+
+    restore_database_family_after_failed_rebuild(backup_set)?;
+    if backup_set.had_original_database {
+        write_authority.restore_retained_database_inode_after_authorized_replace()?;
+    } else {
+        write_authority.clear_database_inode_after_authorized_remove()?;
+    }
+    write_authority.verify_database_authority()?;
+    Ok(RecoveryRollbackDisposition::Restored)
+}
+
+fn prepare_database_family_backup_for_recovery(
+    db_path: &Path,
+    beads_dir: &Path,
+    write_authority: &crate::sync::DatabaseFamilyWriteLock,
+) -> Result<RecoveryBackupSet> {
+    if write_authority.bind_database_inode_for_mutation()? {
+        prepare_missing_database_cleanup_for_recovery(db_path, beads_dir)
+    } else {
+        backup_database_family_for_recovery(db_path, beads_dir)
     }
 }
 
@@ -2966,31 +3036,36 @@ fn prepare_missing_database_cleanup_for_recovery(
     let stamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
     let recovery_dir = recovery_dir_for_db_path(db_path, beads_dir);
     fs::create_dir_all(&recovery_dir)?;
-    // A missing main database can still have stale engine sidecars. Preserve
-    // those artifacts for inspection, but never include the canonical DB path
-    // in this rename batch: a non-cooperating writer may create it after the
-    // authority's missing-path witness, and only the atomic no-replace install
-    // is allowed to decide which generation owns that namespace entry.
-    let (files, verified_files) = rename_existing_paths_with_backup_verification(
-        database_family_paths(db_path)
-            .into_iter()
-            .skip(1)
-            .map(|original| {
-                let backup =
-                    recovery_dir.join(recovery_backup_filename(&original, &stamp, "bak"));
-                (original, backup)
-            }),
-        "move orphaned database sidecars into recovery",
-        MissingRenameSourcePolicy::Skip,
-    )?;
     Ok(RecoveryBackupSet {
         db_path: db_path.to_path_buf(),
         recovery_dir,
         stamp,
         had_original_database: false,
-        files,
-        verified_files,
+        files: Vec::new(),
+        verified_files: Vec::new(),
     })
+}
+
+fn move_orphaned_database_sidecars_to_recovery(backup_set: &mut RecoveryBackupSet) -> Result<()> {
+    debug_assert!(!backup_set.had_original_database);
+    let (files, verified_files) = rename_existing_paths_with_backup_verification(
+        database_family_paths(&backup_set.db_path)
+            .into_iter()
+            .skip(1)
+            .map(|original| {
+                let backup = backup_set.recovery_dir.join(recovery_backup_filename(
+                    &original,
+                    &backup_set.stamp,
+                    "bak",
+                ));
+                (original, backup)
+            }),
+        "move orphaned database sidecars into recovery",
+        MissingRenameSourcePolicy::Skip,
+    )?;
+    backup_set.files.extend(files);
+    backup_set.verified_files.extend(verified_files);
+    Ok(())
 }
 
 fn move_database_family_to_recovery(
@@ -3594,32 +3669,83 @@ impl OpenStorageResult {
         let Some(backup_set) = self.pending_recovery_backup.clone() else {
             return Ok(());
         };
-        let had_original_database_family = !backup_set.files.is_empty();
+        let had_original_database_family = backup_set.had_original_database;
+        let write_authority = Arc::clone(self.write_authority.as_ref().ok_or_else(|| {
+            BeadsError::SyncConflict {
+                message: "Restoring a deferred recovery backup requires database-family authority"
+                    .to_string(),
+            }
+        })?);
+        if backup_set.files.len() != backup_set.verified_files.len() {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing deferred recovery rollback because the verified backup manifest in '{}' is incomplete; the live database was left untouched",
+                    backup_set.recovery_dir.display()
+                ),
+            });
+        }
+        for ((original, backup), verification) in
+            backup_set.files.iter().zip(&backup_set.verified_files)
+        {
+            if verification.original != original.display().to_string()
+                || verification.backup != backup.display().to_string()
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing deferred recovery rollback because the verified backup manifest in '{}' does not match its recovery paths; the live database was left untouched",
+                        backup_set.recovery_dir.display()
+                    ),
+                });
+            }
+            match fs::symlink_metadata(backup) {
+                Ok(_) => {
+                    let expected = RecoveryArtifactFingerprint {
+                        kind: verification.kind.clone(),
+                        size_bytes: verification.size_bytes,
+                        sha256: verification.sha256.clone(),
+                        symlink_target: verification.symlink_target.clone(),
+                    };
+                    verify_recovery_backup_artifact(backup, &expected).map_err(|error| {
+                        BeadsError::WithContext {
+                            context: format!(
+                                "Refusing deferred recovery rollback because a verified backup in '{}' changed; the live database was left untouched",
+                                backup_set.recovery_dir.display()
+                            ),
+                            source: Box::new(error),
+                        }
+                    })?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BeadsError::SyncConflict {
+                        message: format!(
+                            "Refusing deferred recovery rollback because an expected verified backup is missing from '{}'; the live database was left untouched",
+                            backup_set.recovery_dir.display()
+                        ),
+                    });
+                }
+                Err(error) => {
+                    return Err(BeadsError::WithContext {
+                        context: format!(
+                            "Could not inspect a deferred recovery backup in '{}'",
+                            backup_set.recovery_dir.display()
+                        ),
+                        source: Box::new(error),
+                    });
+                }
+            }
+        }
+        if write_authority.database_target_authority_state()?
+            != crate::sync::DatabaseTargetAuthorityState::Held
+        {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing deferred recovery rollback because the live database is no longer the retained replacement generation; it was left untouched"
+                    .to_string(),
+            });
+        }
 
         self.storage = SqliteStorage::open_memory()?;
-        let backup_artifacts_remain = backup_set
-            .files
-            .iter()
-            .any(|(_, backup)| fs::symlink_metadata(backup).is_ok());
-        // A missing original database has no backup artifacts, but the fresh
-        // placeholder family still has to be staged out of the routed path
-        // before its inode authority can be cleared. When an original family
-        // did exist, only attempt restoration while its verified backups are
-        // still present; otherwise preserve the current path fail-closed.
-        if !had_original_database_family || backup_artifacts_remain {
-            restore_database_family_after_failed_rebuild(&backup_set)?;
-        }
+        restore_database_family_after_failed_rebuild(&backup_set)?;
         if had_original_database_family {
-            let write_authority =
-                self.write_authority
-                    .as_ref()
-                    .ok_or_else(|| {
-                        BeadsError::SyncConflict {
-                    message:
-                        "Restoring a deferred recovery backup requires database-family authority"
-                            .to_string(),
-                }
-                    })?;
             write_authority.restore_retained_database_inode_after_authorized_replace()?;
             write_authority.verify_database_authority()?;
             let mut restored_storage =
@@ -3632,9 +3758,9 @@ impl OpenStorageResult {
                     source: Box::new(reopen_err),
                 })?;
             write_authority.verify_database_authority()?;
-            restored_storage.attach_write_authority(Arc::clone(write_authority));
+            restored_storage.attach_write_authority(Arc::clone(&write_authority));
             self.storage = restored_storage;
-        } else if let Some(write_authority) = self.write_authority.as_ref() {
+        } else {
             write_authority.clear_database_inode_after_authorized_remove()?;
         }
         self.loaded_jsonl_state = JsonlSourceStateWitness::Missing;
@@ -8223,6 +8349,74 @@ routing:
     }
 
     #[test]
+    fn deferred_recovery_restore_rejects_changed_verified_backup_without_touching_live_db() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+
+        let original_issue = Issue {
+            id: "bd-original".to_string(),
+            title: "Original on-disk issue".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            ..Issue::default()
+        };
+        let mut storage = SqliteStorage::open(&db_path).expect("create seed db");
+        storage
+            .set_config("issue_prefix", "bd")
+            .expect("seed issue prefix");
+        storage
+            .create_issue(&original_issue, "tester")
+            .expect("seed original issue");
+        drop(storage);
+        insert_duplicate_issue_prefix_config_row(&db_path, "bd");
+        write_single_issue_jsonl(&jsonl_path, "bd-import", "Deferred import payload");
+
+        let mut storage_ctx =
+            open_storage_with_cli_deferred_jsonl_recovery(&beads_dir, &CliOverrides::default())
+                .expect("prepare deferred recovery");
+        let backup_path = storage_ctx
+            .pending_recovery_backup
+            .as_ref()
+            .expect("pending recovery")
+            .files
+            .iter()
+            .find(|(original, _)| original == &db_path)
+            .map(|(_, backup)| backup.clone())
+            .expect("database backup path");
+        fs::write(&backup_path, b"tampered backup bytes").expect("tamper backup");
+        let live_before = fs::read(&db_path).expect("read live placeholder before rejection");
+
+        let error = storage_ctx
+            .restore_pending_recovery_backup()
+            .expect_err("changed verified backup must fail closed");
+
+        assert!(
+            error.to_string().contains("verified backup") && error.to_string().contains("changed"),
+            "unexpected integrity error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read live placeholder after rejection"),
+            live_before,
+            "failed restore must not mutate the live replacement"
+        );
+        assert!(
+            storage_ctx.pending_recovery_backup.is_some(),
+            "failed restore must retain pending recovery state"
+        );
+        assert!(
+            storage_ctx
+                .storage
+                .get_issue("bd-original")
+                .expect("query live placeholder")
+                .is_none(),
+            "failed restore must leave the fresh placeholder open"
+        );
+    }
+
+    #[test]
     fn deferred_recovery_restore_for_missing_db_cleans_up_fresh_database_family() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -8642,6 +8836,154 @@ routing:
 
         assert_eq!(issue.title, "Recovered from JSONL only");
         assert!(db_path.is_file(), "database should be rebuilt from JSONL");
+    }
+
+    #[test]
+    fn missing_database_recovery_collision_preserves_concurrent_family() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        let authority = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &db_path,
+            Some(1_000),
+        )
+        .expect("acquire missing database authority");
+
+        let error = rebuild_database_family_with_backup_before_install(
+            &db_path,
+            &beads_dir,
+            &authority,
+            SuccessfulRecoveryDisposition::FinalizeImmediately,
+            || {
+                fs::write(&db_path, b"concurrent database generation")
+                    .expect("plant concurrent database");
+                fs::write(&sidecar_path, b"concurrent sidecar generation")
+                    .expect("plant concurrent sidecar");
+            },
+            |_| Ok(()),
+        )
+        .expect_err("atomic install must reject the concurrent database");
+
+        assert!(
+            error.to_string().contains("left it untouched"),
+            "unexpected collision error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read concurrent database"),
+            b"concurrent database generation"
+        );
+        assert_eq!(
+            fs::read(&sidecar_path).expect("read concurrent sidecar"),
+            b"concurrent sidecar generation"
+        );
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        assert_eq!(
+            fs::read_dir(recovery_dir)
+                .expect("list recovery dir")
+                .count(),
+            0,
+            "a collided generation must not be moved into recovery"
+        );
+    }
+
+    #[test]
+    fn retained_database_recovery_collision_preserves_target_and_original_backup() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&db_path, b"original database generation").expect("write original database");
+        let authority = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &db_path,
+            Some(1_000),
+        )
+        .expect("acquire existing database authority");
+
+        let error = rebuild_database_family_with_backup_before_install(
+            &db_path,
+            &beads_dir,
+            &authority,
+            SuccessfulRecoveryDisposition::FinalizeImmediately,
+            || {
+                fs::write(&db_path, b"concurrent database generation")
+                    .expect("plant concurrent database");
+                fs::write(&sidecar_path, b"concurrent sidecar generation")
+                    .expect("plant concurrent sidecar");
+            },
+            |_| Ok(()),
+        )
+        .expect_err("atomic install must reject the concurrent database");
+
+        assert!(
+            error.to_string().contains("left it untouched"),
+            "unexpected collision error: {error}"
+        );
+        assert_eq!(
+            fs::read(&db_path).expect("read concurrent database"),
+            b"concurrent database generation"
+        );
+        assert_eq!(
+            fs::read(&sidecar_path).expect("read concurrent sidecar"),
+            b"concurrent sidecar generation"
+        );
+        let recovery_dir = recovery_dir_for_db_path(&db_path, &beads_dir);
+        let recovery_bytes: Vec<Vec<u8>> = fs::read_dir(recovery_dir)
+            .expect("list recovery dir")
+            .map(|entry| fs::read(entry.expect("recovery entry").path()).expect("read recovery"))
+            .collect();
+        assert!(
+            recovery_bytes
+                .iter()
+                .any(|bytes| bytes == b"original database generation"),
+            "the retained original database must remain recoverable"
+        );
+        assert!(
+            recovery_bytes
+                .iter()
+                .all(|bytes| bytes != b"concurrent database generation"
+                    && bytes != b"concurrent sidecar generation"),
+            "concurrent family bytes must never be moved into recovery"
+        );
+    }
+
+    #[test]
+    fn missing_database_failed_rebuild_restores_orphaned_sidecars() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let sidecar_path = PathBuf::from(format!("{}-wal-cert", db_path.display()));
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(&sidecar_path, b"orphaned sidecar").expect("write orphaned sidecar");
+        let authority = crate::sync::blocking_database_family_write_lock_with_timeout(
+            &beads_dir,
+            &db_path,
+            Some(1_000),
+        )
+        .expect("acquire missing database authority");
+
+        let error = rebuild_database_family_with_backup(
+            &db_path,
+            &beads_dir,
+            &authority,
+            SuccessfulRecoveryDisposition::FinalizeImmediately,
+            |_| -> Result<()> { Err(BeadsError::Config("forced rebuild failure".to_string())) },
+        )
+        .expect_err("forced rebuild must fail");
+
+        assert!(error.to_string().contains("forced rebuild failure"));
+        assert!(!db_path.exists(), "fresh placeholder must be staged out");
+        assert_eq!(
+            fs::read(sidecar_path).expect("read restored sidecar"),
+            b"orphaned sidecar"
+        );
+        authority
+            .verify_database_authority()
+            .expect("authority must return to the missing-database state");
     }
 
     #[test]
