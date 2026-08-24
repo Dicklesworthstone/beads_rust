@@ -16,14 +16,16 @@ use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
-    ExpectedJsonlSourceRef, ExportConfig, ImportConfig, ImportResult, JsonlSourceSnapshot,
-    JsonlSourceStateWitness, JsonlTombstoneFilter, PreservedIssue, auto_flush,
-    blocking_database_family_write_lock_with_timeout, capture_optional_jsonl_source,
-    dirty_issues_missing_from_jsonl, export_to_jsonl_with_policy_expected_under_authority,
-    finalize_export_under_authority, import_from_jsonl_snapshot, preflight_import_snapshot,
-    restore_dirty_issues_after_rebuild, restore_tombstones_after_rebuild,
-    scan_jsonl_snapshot_for_tombstone_filter, snapshot_dirty_live_issues, snapshot_tombstones,
-    tombstones_missing_from_jsonl_tombstones, verify_jsonl_source_snapshot_current,
+    ExpectedJsonlSourceRef, ExportConfig, FreshDatabaseReplacementWitness, ImportConfig,
+    ImportResult, JsonlSourceSnapshot, JsonlSourceStateWitness, JsonlTombstoneFilter,
+    PreservedIssue, auto_flush, blocking_database_family_write_lock_with_timeout,
+    capture_optional_jsonl_source, dirty_issues_missing_from_jsonl,
+    export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
+    import_from_jsonl_snapshot, import_from_jsonl_snapshot_into_fresh_replacement,
+    preflight_import_snapshot, restore_dirty_issues_after_rebuild,
+    restore_tombstones_after_rebuild, scan_jsonl_snapshot_for_tombstone_filter,
+    snapshot_dirty_live_issues, snapshot_tombstones, tombstones_missing_from_jsonl_tombstones,
+    verify_jsonl_source_snapshot_current,
 };
 use crate::util::id::{
     IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
@@ -946,7 +948,7 @@ fn open_sqlite_storage_with_recovery_strategy(
         let authority = write_authority.ok_or_else(|| BeadsError::SyncConflict {
             message: "Missing database creation has no database-family authority".to_string(),
         })?;
-        authority.install_empty_database_replacement_and_bind()?;
+        let _fresh_witness = authority.install_empty_database_replacement_and_bind()?;
         authority.verify_database_authority()?;
     }
 
@@ -1066,7 +1068,7 @@ fn open_when_db_file_is_missing(
                 message: "Missing-database deferred recovery has no database-family authority"
                     .to_string(),
             })?;
-            authority.install_empty_database_replacement_and_bind()?;
+            let _fresh_witness = authority.install_empty_database_replacement_and_bind()?;
             let mut storage = SqliteStorage::open_with_timeout(&paths.db_path, lock_timeout)?;
             storage.attach_write_authority(Arc::clone(authority));
             Ok(SqliteRecoveryOpenResult {
@@ -1836,7 +1838,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
         beads_dir,
         write_authority,
         successful_disposition,
-        || {
+        |fresh_witness| {
             let rebuilt = rebuild_database_family(
                 db_path,
                 lock_timeout,
@@ -1844,6 +1846,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
                 import_config,
                 &prefix,
                 write_authority,
+                fresh_witness,
             )?;
             jsonl_authority.verify_jsonl_authority()?;
             let current_source = crate::sync::capture_jsonl_source_snapshot(source.display_path())?;
@@ -2236,14 +2239,20 @@ fn rebuild_database_family(
     import_config: &ImportConfig,
     prefix: &str,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    fresh_witness: FreshDatabaseReplacementWitness,
 ) -> Result<(SqliteStorage, ImportResult)> {
     write_authority.verify_database_authority()?;
     let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
     storage.attach_write_authority(Arc::clone(write_authority));
     write_authority.verify_database_authority()?;
     storage.set_config("issue_prefix", prefix)?;
-    let import_result =
-        import_from_jsonl_snapshot(&mut storage, source, import_config, Some(prefix))?;
+    let import_result = import_from_jsonl_snapshot_into_fresh_replacement(
+        &mut storage,
+        source,
+        import_config,
+        Some(prefix),
+        fresh_witness,
+    )?;
 
     // Drain the WAL to the main DB file so the follow-up maintenance (VACUUM,
     // REINDEX, VACUUM INTO) operates against what is actually on disk.
@@ -2814,26 +2823,29 @@ fn rebuild_database_family_with_backup<T, F>(
     rebuild: F,
 ) -> Result<(T, RecoveryBackupSet)>
 where
-    F: FnOnce() -> Result<T>,
+    F: FnOnce(FreshDatabaseReplacementWitness) -> Result<T>,
 {
     let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
-    if let Err(install_err) = write_authority.install_empty_database_replacement_and_bind() {
-        if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
-            return Err(recovery_restore_failure(
-                &backup_set,
-                &install_err,
-                restore_err,
-            ));
+    let fresh_witness = match write_authority.install_empty_database_replacement_and_bind() {
+        Ok(witness) => witness,
+        Err(install_err) => {
+            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
+                return Err(recovery_restore_failure(
+                    &backup_set,
+                    &install_err,
+                    restore_err,
+                ));
+            }
+            if backup_set.files.is_empty() {
+                write_authority.clear_database_inode_after_authorized_remove()?;
+            } else {
+                write_authority.restore_retained_database_inode_after_authorized_replace()?;
+            }
+            return Err(install_err);
         }
-        if backup_set.files.is_empty() {
-            write_authority.clear_database_inode_after_authorized_remove()?;
-        } else {
-            write_authority.restore_retained_database_inode_after_authorized_replace()?;
-        }
-        return Err(install_err);
-    }
+    };
 
-    match rebuild() {
+    match rebuild(fresh_witness) {
         Ok(value)
             if successful_disposition
                 == SuccessfulRecoveryDisposition::RetainBackupUntilCommandSuccess =>

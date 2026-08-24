@@ -14,9 +14,10 @@ use crate::storage::schema::{
     table_exists,
 };
 use crate::sync::{
-    METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
-    METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, METADATA_SYNC_MERGE_PENDING,
-    METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent, SyncMergePendingReceipt,
+    FreshDatabaseReplacementWitness, METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME,
+    METADATA_JSONL_SIZE, METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME,
+    METADATA_SYNC_MERGE_PENDING, METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent,
+    SyncMergePendingReceipt,
 };
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
@@ -17424,6 +17425,35 @@ impl SqliteStorage {
                 SqliteValue::from(issue_id),
                 SqliteValue::from(issue_id),
             ],
+        )?;
+
+        Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0)
+    }
+
+    /// Verify that a fresh-replacement witness still belongs to this storage's
+    /// attached database-family authority and current inode.
+    pub(crate) fn verify_fresh_database_replacement_witness(
+        &self,
+        witness: &FreshDatabaseReplacementWitness,
+    ) -> Result<()> {
+        let authority = self
+            .write_authority
+            .as_ref()
+            .ok_or_else(|| BeadsError::SyncConflict {
+                message: "Fresh database import has no attached database-family authority"
+                    .to_string(),
+            })?;
+        authority.verify_fresh_database_replacement_witness(witness)
+    }
+
+    /// Prove with one query that no owned import-relation rows exist anywhere
+    /// in the current transaction.
+    pub(crate) fn import_relation_tables_are_globally_empty_in_tx(&self) -> Result<bool> {
+        let row = self.conn.query_row(
+            "SELECT
+                 NOT EXISTS(SELECT 1 FROM labels)
+                 AND NOT EXISTS(SELECT 1 FROM dependencies)
+                 AND NOT EXISTS(SELECT 1 FROM comments)",
         )?;
 
         Ok(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(0) != 0)
