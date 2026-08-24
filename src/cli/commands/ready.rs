@@ -203,11 +203,9 @@ fn execute_inner(
     }
     match output_format {
         OutputFormat::Json => {
-            hydrate_ready_labels(storage, &mut ready_issues)?;
             early_ctx.json_array(ready_issues.into_iter().map(ReadyIssue::from));
         }
         OutputFormat::Toon => {
-            hydrate_ready_labels(storage, &mut ready_issues)?;
             let ready_output: Vec<ReadyIssue> =
                 ready_issues.into_iter().map(ReadyIssue::from).collect();
             early_ctx.toon_with_stats(&ready_output, args.stats);
@@ -274,25 +272,6 @@ fn execute_inner(
     Ok(())
 }
 
-/// Populate `labels` on ready issues for structured output (#309).
-///
-/// The ready candidate query hydrates only the columns stored directly on the
-/// `issues` row; labels live in a separate table, so JSON/TOON consumers need a
-/// single extra batched lookup to get full parity with `br list --json`.
-fn hydrate_ready_labels(storage: &SqliteStorage, issues: &mut [crate::model::Issue]) -> Result<()> {
-    if issues.is_empty() {
-        return Ok(());
-    }
-    let ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
-    let mut labels_by_id = storage.get_labels_for_issues(&ids)?;
-    for issue in issues.iter_mut() {
-        if let Some(labels) = labels_by_id.remove(&issue.id) {
-            issue.labels = labels;
-        }
-    }
-    Ok(())
-}
-
 fn empty_ready_message(storage: &SqliteStorage) -> Result<&'static str> {
     let has_non_closed_issues = storage.has_active_issues()?;
     Ok(if has_non_closed_issues {
@@ -313,7 +292,7 @@ fn get_ready_issues_for_output(
             storage.get_ready_summary_issues_for_command_output(filters, sort_policy)
         }
         OutputFormat::Json | OutputFormat::Toon => {
-            storage.get_ready_issues_for_command_output(filters, sort_policy)
+            storage.get_ready_structured_issues_for_command_output(filters, sort_policy)
         }
     }
 }
@@ -412,5 +391,61 @@ mod tests {
         assert_eq!(p[1].0, 1);
         assert_eq!(p[2].0, 2);
         info!("test_parse_priorities: assertions passed");
+    }
+
+    #[test]
+    fn structured_ready_output_uses_label_projection_without_changing_text_projection() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["bd-ready-labeled", "bd-ready-unlabeled"] {
+            let issue = crate::model::Issue {
+                id: id.to_string(),
+                title: id.to_string(),
+                ..crate::model::Issue::default()
+            };
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_label("bd-ready-labeled", "projected", "tester")
+            .unwrap();
+
+        for format in [OutputFormat::Json, OutputFormat::Toon] {
+            let issues = get_ready_issues_for_output(
+                &storage,
+                &ReadyFilters::default(),
+                ReadySortPolicy::Priority,
+                format,
+            )
+            .unwrap();
+            assert_eq!(
+                issues.len(),
+                2,
+                "structured output must retain unlabeled rows"
+            );
+            assert_eq!(
+                issues
+                    .iter()
+                    .find(|issue| issue.id == "bd-ready-labeled")
+                    .unwrap()
+                    .labels,
+                ["projected"]
+            );
+            assert!(
+                issues
+                    .iter()
+                    .find(|issue| issue.id == "bd-ready-unlabeled")
+                    .unwrap()
+                    .labels
+                    .is_empty()
+            );
+        }
+
+        let text_issues = get_ready_issues_for_output(
+            &storage,
+            &ReadyFilters::default(),
+            ReadySortPolicy::Priority,
+            OutputFormat::Text,
+        )
+        .unwrap();
+        assert!(text_issues.iter().all(|issue| issue.labels.is_empty()));
     }
 }
