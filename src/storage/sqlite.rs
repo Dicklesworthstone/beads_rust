@@ -40,6 +40,9 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static CHANGE_USER_VERSION_AFTER_RUNTIME_COMPATIBILITY: std::cell::Cell<u32> =
         const { std::cell::Cell::new(0) };
+    #[cfg(unix)]
+    static SWAP_NAMESPACE_SIDECAR_BEFORE_OPEN: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Number of mutations between WAL checkpoint attempts.
@@ -1837,6 +1840,13 @@ impl SqliteStorage {
         Ok(())
     }
 
+    #[cfg(all(test, unix))]
+    fn arm_namespace_sidecar_swap_before_open_for_test(victim: PathBuf) {
+        SWAP_NAMESPACE_SIDECAR_BEFORE_OPEN.with(|pending| {
+            *pending.borrow_mut() = Some(victim);
+        });
+    }
+
     pub(crate) fn attach_write_authority(
         &mut self,
         authority: Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -2330,11 +2340,13 @@ impl SqliteStorage {
     ///
     /// Returns an error if the connection cannot be established or schema application fails.
     pub fn open_with_timeout(path: &Path, lock_timeout_ms: Option<u64>) -> Result<Self> {
-        // GitHub #403: a group/other-readable namespace sidecar makes the open
-        // below fail with a bare "unable to open database file" naming the
-        // sidecar. Repair the mode (or explain it) before the engine gets a
-        // chance to mis-attribute the failure to the database.
-        heal_namespace_sidecar_modes(path)?;
+        // This generic opener may be used by read-only or library callers that
+        // do not hold the database-family authority. It must never repair
+        // namespace sidecars: even a chmod is a database-family mutation, and
+        // a raw header alone cannot rule out a future user_version in WAL.
+        // Authority-aware startup/recovery callers use
+        // `open_with_timeout_under_write_authority` below.
+        refuse_known_future_schema_header(path)?;
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
         // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
@@ -2407,6 +2419,25 @@ impl SqliteStorage {
         })
     }
 
+    /// Open while holding the exact database-family authority, repairing
+    /// over-permissive fsqlite namespace sidecars before the engine open.
+    ///
+    /// The repair is fail-closed: the authority must protect this exact path,
+    /// the live database inode must already be bound, and the effective schema
+    /// version must be provably non-future before any permission bit changes.
+    pub(crate) fn open_with_timeout_under_write_authority(
+        path: &Path,
+        lock_timeout_ms: Option<u64>,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<Self> {
+        heal_namespace_sidecar_modes_under_authority(path, authority)?;
+        authority.verify_database_authority()?;
+        let mut storage = Self::open_with_timeout(path, lock_timeout_ms)?;
+        authority.verify_database_authority()?;
+        storage.attach_write_authority(Arc::clone(authority));
+        Ok(storage)
+    }
+
     pub(crate) fn open_current_read_only(path: &Path) -> Result<Option<Self>> {
         let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         // Cheap header pre-filter: only reject when the file is definitively not
@@ -2419,9 +2450,12 @@ impl SqliteStorage {
             return Ok(None);
         }
 
-        // GitHub #403: read-only commands take this path, and they wedge on an
-        // over-permissive namespace sidecar exactly like writers do.
-        heal_namespace_sidecar_modes(path)?;
+        // A lock-free read-only fast open must be observational only. If a
+        // namespace sidecar needs repair, decline this path so startup can
+        // acquire the database-family authority and perform the repair there.
+        if namespace_sidecar_mode_repair_required(path)? {
+            return Ok(None);
+        }
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2473,7 +2507,14 @@ impl SqliteStorage {
             return Ok(None);
         }
 
-        heal_namespace_sidecar_modes(path)?;
+        // This legacy helper is intentionally nonmutating. Its sole production
+        // caller already holds authority, but the authority is not part of this
+        // API and therefore cannot justify a chmod here.
+        if namespace_sidecar_mode_repair_required(path)? {
+            return Err(BeadsError::SyncConflict {
+                message: "Token-bound reconciliation requires authority-gated fsqlite namespace sidecar repair before opening the database".to_string(),
+            });
+        }
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -15739,71 +15780,261 @@ fn remove_temp_db_files(path: &Path) {
     }
 }
 
-/// Repair over-permissive modes on the fsqlite namespace sidecars that live
-/// beside `db_path`, before anything tries to open the database (GitHub #403).
+/// Report whether an fsqlite namespace sidecar needs an owner-only mode repair.
 ///
 /// fsqlite refuses to open `<db>-fsqlite-ns-gate` / `-fsqlite-ns-use` when the
 /// file carries any bit in `0o077`, and the refusal surfaces as a bare
 /// `Database error: unable to open database file: '<sidecar>'`, which reads as
-/// database corruption and wedges every `br` command — reads included — until
-/// a human notices the mode. The sidecars are regenerable engine state, not
-/// user data, so when this process can chmod them we strip the group/other
-/// bits and continue. When we cannot, we return an error that names the file,
-/// the observed mode, and the required mode instead of letting the engine
-/// report an unattributable `DATABASE_ERROR`.
-///
-/// A `chmod` succeeds only for the file's owner (or root), so attempting it is
-/// itself the ownership test — no uid probing is needed in a crate that
-/// forbids `unsafe`.
-///
-/// # Errors
-///
-/// Returns an error when a sidecar is over-permissive and this process cannot
-/// restore owner-only permissions.
-fn heal_namespace_sidecar_modes(db_path: &Path) -> Result<()> {
+/// database corruption. This preflight is deliberately observational so the
+/// lock-free read-only opener can decline instead of chmod.
+fn namespace_sidecar_mode_repair_required(db_path: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
         for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
-            let mut sidecar = db_path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            let sidecar = PathBuf::from(sidecar);
-
-            let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
-                continue;
+            let sidecar = database_sidecar_path(db_path, suffix);
+            let metadata = match std::fs::symlink_metadata(&sidecar) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(BeadsError::Io(error)),
             };
-            // A symlinked sidecar is out of scope: following it would chmod a
-            // file outside the database family.
             if !metadata.is_file() || metadata.file_type().is_symlink() {
-                continue;
-            }
-            let mode = metadata.permissions().mode();
-            if mode.trailing_zeros() >= 6 {
-                continue;
-            }
-
-            let repaired = mode & !0o077;
-            if let Err(err) =
-                std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(repaired))
-            {
-                return Err(BeadsError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "fsqlite namespace sidecar {} has mode {:04o}; fsqlite requires \
-                         owner-only permissions (0600) and this process could not repair it \
-                         ({err}). The database itself is fine — run `chmod 0600 {}` (or have \
-                         its owner do so) and retry.",
-                        sidecar.display(),
-                        mode & 0o7777,
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing unsafe fsqlite namespace sidecar {}: expected a regular file, not a symlink or special file",
                         sidecar.display()
                     ),
-                )));
+                });
             }
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Ok(true);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = db_path;
+    }
+    Ok(false)
+}
+
+fn database_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
+fn future_schema_error(version: u32, current_schema_version: u32) -> BeadsError {
+    BeadsError::Config(format!(
+        "Database schema version {version} is newer than this br binary supports \
+         ({current_schema_version}); refusing to modify or downgrade it"
+    ))
+}
+
+fn refuse_known_future_schema_header(db_path: &Path) -> Result<()> {
+    let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+    if let Some(version) = database_header_user_version(db_path)
+        && version > current_schema_version
+    {
+        return Err(future_schema_error(version, current_schema_version));
+    }
+    Ok(())
+}
+
+/// Prove that chmod cannot precede a known or WAL-uncertain future schema.
+///
+/// A 32-byte SQLite WAL contains only its header; it has no frames and cannot
+/// override page 1's user_version. Any larger or malformed WAL is left
+/// untouched because the effective version cannot be proven without opening
+/// the engine, and the over-permissive namespace sidecar prevents that open.
+fn verify_namespace_healing_schema_precondition(db_path: &Path) -> Result<()> {
+    let current_schema_version = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+    let header_version = database_header_user_version(db_path).ok_or_else(|| {
+        BeadsError::SyncConflict {
+            message: "Refusing fsqlite namespace sidecar repair because the database header does not prove a readable schema version"
+                .to_string(),
+        }
+    })?;
+    if header_version > current_schema_version {
+        return Err(future_schema_error(
+            header_version,
+            current_schema_version,
+        ));
+    }
+
+    let wal_path = database_sidecar_path(db_path, "-wal");
+    let wal_metadata = match std::fs::symlink_metadata(&wal_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(BeadsError::Io(error)),
+    };
+    if let Some(metadata) = wal_metadata {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(BeadsError::SyncConflict {
+                message: "Refusing fsqlite namespace sidecar repair because the WAL path is not a regular file"
+                    .to_string(),
+            });
+        }
+        if !matches!(metadata.len(), 0 | 32) {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Refusing fsqlite namespace sidecar repair because a {}-byte WAL makes the effective schema version uncertain",
+                    metadata.len()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_namespace_healing_authority(
+    db_path: &Path,
+    authority: &crate::sync::DatabaseFamilyWriteLock,
+) -> Result<()> {
+    let planned_authority = crate::sync::database_write_authority_sha256(db_path)?;
+    if planned_authority != authority.authority_path_sha256() {
+        return Err(BeadsError::SyncConflict {
+            message:
+                "Fsqlite namespace sidecar repair path does not match the held database-family authority"
+                    .to_string(),
+        });
+    }
+    authority.verify_database_authority()?;
+    if authority.database_target_authority_state()?
+        != crate::sync::DatabaseTargetAuthorityState::Held
+    {
+        return Err(BeadsError::SyncConflict {
+            message: "Fsqlite namespace sidecar repair requires a bound live database inode authority"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn maybe_swap_namespace_sidecar_before_open_for_test(sidecar: &Path) -> Result<()> {
+    let victim = SWAP_NAMESPACE_SIDECAR_BEFORE_OPEN.with(|pending| pending.borrow_mut().take());
+    let Some(victim) = victim else {
+        return Ok(());
+    };
+    let retained = database_sidecar_path(sidecar, ".test-retained-before-symlink-swap");
+    std::fs::rename(sidecar, &retained)?;
+    std::os::unix::fs::symlink(victim, sidecar)?;
+    Ok(())
+}
+
+#[cfg(not(all(test, unix)))]
+fn maybe_swap_namespace_sidecar_before_open_for_test(_sidecar: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Repair namespace sidecar modes only under the exact live database-family
+/// authority. Every chmod targets a no-follow file handle whose inode is
+/// matched to both the pre-open and immediate pre-chmod path witnesses.
+fn heal_namespace_sidecar_modes_under_authority(
+    db_path: &Path,
+    authority: &crate::sync::DatabaseFamilyWriteLock,
+) -> Result<()> {
+    verify_namespace_healing_authority(db_path, authority)?;
+    if !namespace_sidecar_mode_repair_required(db_path)? {
+        return Ok(());
+    }
+    verify_namespace_healing_schema_precondition(db_path)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        for suffix in crate::config::FSQLITE_NAMESPACE_SIDECAR_SUFFIXES {
+            let sidecar = database_sidecar_path(db_path, suffix);
+            let initial_metadata = match std::fs::symlink_metadata(&sidecar) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(BeadsError::Io(error)),
+            };
+            if initial_metadata.file_type().is_symlink() || !initial_metadata.is_file() {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Refusing unsafe fsqlite namespace sidecar {}: expected a regular file, not a symlink or special file",
+                        sidecar.display()
+                    ),
+                });
+            }
+            let observed_mode = initial_metadata.permissions().mode();
+            if observed_mode & 0o077 == 0 {
+                continue;
+            }
+
+            maybe_swap_namespace_sidecar_before_open_for_test(&sidecar)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            let sidecar_file = options.open(&sidecar).map_err(|error| {
+                BeadsError::SyncConflict {
+                    message: format!(
+                        "Fsqlite namespace sidecar {} changed before a no-follow repair handle could be opened: {error}",
+                        sidecar.display()
+                    ),
+                }
+            })?;
+            let handle_metadata = sidecar_file.metadata()?;
+            let pre_chmod_metadata = std::fs::symlink_metadata(&sidecar)?;
+            let initial_identity = (initial_metadata.dev(), initial_metadata.ino());
+            let handle_identity = (handle_metadata.dev(), handle_metadata.ino());
+            let pre_chmod_identity = (pre_chmod_metadata.dev(), pre_chmod_metadata.ino());
+            if !handle_metadata.is_file()
+                || pre_chmod_metadata.file_type().is_symlink()
+                || !pre_chmod_metadata.is_file()
+                || initial_identity != handle_identity
+                || handle_identity != pre_chmod_identity
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Fsqlite namespace sidecar {} changed identity before its mode repair",
+                        sidecar.display()
+                    ),
+                });
+            }
+
+            verify_namespace_healing_authority(db_path, authority)?;
+            verify_namespace_healing_schema_precondition(db_path)?;
+            let repaired_mode = handle_metadata.permissions().mode() & !0o077;
+            sidecar_file
+                .set_permissions(std::fs::Permissions::from_mode(repaired_mode))
+                .map_err(|error| {
+                    BeadsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "fsqlite namespace sidecar {} has mode {:04o}; fsqlite requires owner-only permissions and the authority-gated handle repair failed ({error})",
+                            sidecar.display(),
+                            observed_mode & 0o7777
+                        ),
+                    ))
+                })?;
+
+            let repaired_metadata = sidecar_file.metadata()?;
+            let final_path_metadata = std::fs::symlink_metadata(&sidecar)?;
+            if repaired_metadata.permissions().mode() & 0o077 != 0
+                || final_path_metadata.file_type().is_symlink()
+                || !final_path_metadata.is_file()
+                || (repaired_metadata.dev(), repaired_metadata.ino()) != handle_identity
+                || (final_path_metadata.dev(), final_path_metadata.ino()) != handle_identity
+            {
+                return Err(BeadsError::SyncConflict {
+                    message: format!(
+                        "Fsqlite namespace sidecar {} changed identity while its mode repair was being verified",
+                        sidecar.display()
+                    ),
+                });
+            }
+            verify_namespace_healing_authority(db_path, authority)?;
+
             tracing::debug!(
                 sidecar = %sidecar.display(),
-                observed_mode = format!("{:04o}", mode & 0o7777),
-                repaired_mode = format!("{:04o}", repaired & 0o7777),
+                observed_mode = format!("{:04o}", observed_mode & 0o7777),
+                repaired_mode = format!("{:04o}", repaired_mode & 0o7777),
                 "repaired over-permissive fsqlite namespace sidecar mode",
             );
         }

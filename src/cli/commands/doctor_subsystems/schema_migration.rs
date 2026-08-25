@@ -3620,7 +3620,7 @@ mod tests {
         .expect("completed undo must be idempotent");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     #[test]
     fn undo_atomically_displaces_the_authority_held_main_with_hardlink_aliases() {
         let (_temp, migration) = reviewed_v14_migration_context();
