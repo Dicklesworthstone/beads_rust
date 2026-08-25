@@ -65,6 +65,8 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
         "Validate required artifacts present",
         "Generate combined checksums",
         "Verify all checksums",
+        "Create archive (tar.gz)",
+        "Create archive (zip)",
         "Sign release archive with Ed25519",
         "Generate changelog",
     ] {
@@ -144,7 +146,8 @@ fn release_signatures_use_the_documented_current_trust_anchor() -> Result<(), St
     let signing_script = release_step_script("Sign release archive with Ed25519")?;
 
     require_contains(&readme, CURRENT_MINISIGN_PUBLIC_KEY)?;
-    require_contains(&workflow, CURRENT_MINISIGN_PUBLIC_KEY)?;
+    let public_key_env = format!("MINISIGN_PUBLIC_KEY: '{CURRENT_MINISIGN_PUBLIC_KEY}'");
+    require_contains(&workflow, &public_key_env)?;
     require_not_contains(&workflow, RETIRED_MINISIGN_PUBLIC_KEY)?;
     require_contains(
         &changelog_script,
@@ -158,6 +161,20 @@ fn release_signatures_use_the_documented_current_trust_anchor() -> Result<(), St
         &signing_script,
         "minisign -Vm \"$archive\" -x \"$signature\" -P \"$MINISIGN_PUBLIC_KEY\"",
     )
+}
+
+#[test]
+fn release_archives_include_the_repository_license() -> Result<(), String> {
+    let tar_script = release_step_script("Create archive (tar.gz)")?;
+    let zip_script = release_step_script("Create archive (zip)")?;
+
+    for script in [&tar_script, &zip_script] {
+        require_contains(script, "cp ../../../LICENSE LICENSE")?;
+    }
+    require_contains(&tar_script, "tar -czvf")?;
+    require_contains(&tar_script, "br LICENSE")?;
+    require_contains(&zip_script, "zip -j")?;
+    require_contains(&zip_script, "br.exe LICENSE")
 }
 
 #[test]

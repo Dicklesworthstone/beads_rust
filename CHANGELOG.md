@@ -113,12 +113,22 @@ replacement, crash, and schema-drift races.
   rider-bearing `LICENSE` via `license-file` instead of incorrectly declaring
   the package as plain SPDX MIT
   ([413f9948](https://github.com/Dicklesworthstone/beads_rust/commit/413f9948)).
+- Every platform archive now contains the rider-bearing `LICENSE`. Release
+  signing is fail-closed for all seven archives, including the Windows zip:
+  the job requires the secret key, verifies each generated signature against
+  the current `RWS7nGFf...` trust anchor, and refuses release creation unless
+  every exact archive, checksum, and `.minisig` triplet is present and nonempty.
+  Generated release notes no longer advertise the retired unrecoverable key
+  ([ada0b658](https://github.com/Dicklesworthstone/beads_rust/commit/ada0b658),
+  [78fc31a1](https://github.com/Dicklesworthstone/beads_rust/commit/78fc31a1)).
 - New inline and end-to-end counterexamples cover custom ready groups, scheduler
   label/assignee evidence, canonical-inode fast-open reprobes, config-route
   drift, future schemas in WAL, same-cookie version changes, runtime schema
   shape drift, schema-migration crash resume/rollback, and Windows replacement
-  identity. Performance figures above remain revision-scoped; this changelog
-  does not promote earlier gate runs into exact-current release certification.
+  identity. Workflow-fragment tests pin the archive/signature inventory,
+  current-vs-retired key boundary, and missing-secret/missing-sidecar failures.
+  Performance figures above remain revision-scoped; this changelog does not
+  promote earlier gate runs into exact-current release certification.
 
 ## v0.4.1 -- 2026-08-24 (Release)
 
